@@ -1,0 +1,59 @@
+<div id="sale-detail-inner">
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+    <span class="pill {% if detail.sale.status.to_string() == "Confirmed" %}income{% else if detail.sale.status.to_string() == "Cancelled" %}expense{% endif %}">{{ detail.sale.status }}</span>
+    <span class="pill {% if detail.payment_status.to_string() == "Paid" %}income{% else %}expense{% endif %}">{{ detail.payment_status }}</span>
+    <span class="pill">{{ detail.sale.payment_type }}</span>
+    <span style="font-weight:700;font-size:16px">
+      {% if let Some(n) = detail.sale.sale_number %}{{ n }}{% else %}Draft #{{ detail.sale.id }}{% endif %}
+    </span>
+  </div>
+  <div class="muted" style="margin-bottom:4px">
+    {% if detail.sale.customer_name.is_empty() %}Walk-in{% else %}{{ detail.sale.customer_name }}{% endif %}
+    • {{ detail.sale.sale_date }}{% if let Some(due) = detail.sale.due_date %} • due {{ due }}{% endif %}
+  </div>
+  {% if let Some(r) = detail.sale.receipt_no %}
+    <div class="muted">receipt {{ r }}</div>
+  {% endif %}
+  {% if !detail.sale.notes.is_empty() %}
+    <div class="muted">{{ detail.sale.notes }}</div>
+  {% endif %}
+  {% if let Some(c) = detail.sale.cancel_reason %}
+    <div class="flash error" style="margin:8px 0">Cancelled: {{ c }}</div>
+  {% endif %}
+  <div class="stat" style="font-size:24px;margin:8px 0">${{ detail.total }} <span class="muted" style="font-size:13px">paid {{ detail.paid }} • due {{ detail.due }}</span></div>
+
+  <div class="muted" style="margin:12px 0 6px 0;font-weight:700">Lines ({{ detail.lines.len() }})</div>
+  {% if detail.lines.is_empty() %}
+    <div class="muted" style="padding:12px;text-align:center;border:1px dashed var(--border);border-radius:12px">No lines yet — add one from the form.</div>
+  {% else %}
+    {% for line in detail.lines %}
+    <div class="tx" id="sale-line-{{ line.id }}">
+      <div class="tx-left">
+        <span style="font-weight:600">product #{{ line.product_id }}</span>
+        <span class="muted">{{ line.qty }} × ${{ line.unit_price }} = ${{ line.subtotal() }}</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="tx-amount income">{{ line.subtotal() }}</span>
+        {% if detail.sale.status.to_string() == "Draft" %}
+          <button class="ghost" hx-delete="/web/sales/{{ detail.sale.id }}/lines/{{ line.id }}" hx-target="#sale-detail" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">✕</button>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+
+  <div class="muted" style="margin:12px 0 6px 0;font-weight:700">Payments ({{ detail.payments.len() }})</div>
+  {% if detail.payments.is_empty() %}
+    <div class="muted">No payments recorded.</div>
+  {% else %}
+    {% for pay in detail.payments %}
+    <div class="tx" id="sale-payment-{{ pay.id }}">
+      <div class="tx-left">
+        <span style="font-weight:600">account #{{ pay.account_id }}</span>
+        <span class="muted">{{ pay.date }}</span>
+      </div>
+      <span class="tx-amount income">{{ pay.amount }}</span>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>

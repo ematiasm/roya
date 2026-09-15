@@ -12,6 +12,15 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
 - Validation: `amount > 0`, negative balance blocked when `ALLOW_NEGATIVE_BALANCE=false`.
 - Dashboard with total balance across all accounts.
 - **REST API** and **Web (Askama + HTMX, no page reload)**.
+- **Sales** — Draft → Confirmed → Cancelled orchestrator (Odoo-style):
+  - Draft creates lines with no stock/finance side effects.
+  - Confirm assigns `YYYY-SALE-NNNNNN`, deducts stock (`Out`, reason `Sale`),
+    Cash posts 1 Income, Credit opens a receivable (due = total).
+  - Credit payments each post 1 Income; overpay ⇒ 400; Paid when due = 0.
+  - Cancel of Confirmed re-enters stock (`In`, reason `Sale-return`) and posts
+    Expense refunds, guarded by `ALLOW_NEGATIVE_BALANCE`.
+  - `sale_number` UNIQUE, immutable, NULL only in Draft/Cancelled-from-Draft.
+  - Finance/stock rows are written only via services, reference = `sale_number`.
 
 ## Architecture
 
@@ -85,6 +94,11 @@ Current migrations:
 - `20240101000004_create_products.sql` — `products` (UNIQUE sku, category FK SET NULL)
 - `20240101000005_create_product_barcodes.sql` — `product_barcodes` (CASCADE, UNIQUE code)
 - `20240101000006_create_stock_movements.sql` — `stock_movements` (RESTRICT, CHECK type/reason)
+- `20240101000007_create_doc_sequences.sql` — `doc_sequences` PK(doc_type, year)
+- `20240101000008_create_sales.sql` — `sales` (UNIQUE sale_number NULL-distinct, CHECKs)
+- `20240101000009_create_sale_lines.sql` — `sale_lines` (CASCADE sale, RESTRICT product)
+- `20240101000010_create_sale_payments.sql` — `sale_payments` (CASCADE sale, RESTRICT account)
+- `20240101000011_expand_stock_reason_sale_return.sql` — adds `Sale-return` reason
 
 ## REST API
 
@@ -154,15 +168,62 @@ curl http://localhost:3000/api/negative-stock
 # -> { negative_stock: [...] }
 ```
 
+```bash
+# Sales (Draft -> Confirmed -> Cancelled orchestrator)
+curl -X POST http://localhost:3000/api/sales \
+  -H "Content-Type: application/json" \
+  -d '{"customer_name":"Ana","payment_type":"Cash","sale_date":"2024-05-02"}'
+# -> 201 sale detail (sale_number null while Draft; Credit needs due_date)
+
+curl -X POST http://localhost:3000/api/sales/1/lines \
+  -H "Content-Type: application/json" \
+  -d '{"product_id":1,"qty":"3"}'
+# -> 201 line (unit_price defaults to list price; unknown product => 404, qty <= 0 => 400)
+
+curl -X PUT http://localhost:3000/api/sales/1 \
+  -H "Content-Type: application/json" \
+  -d '{"customer_name":"Ana Gomez"}'
+# -> 200 detail (Draft only; edit Confirmed => 400)
+
+curl -X POST http://localhost:3000/api/sales/1/confirm \
+  -H "Content-Type: application/json" \
+  -d '{"account_id":1}'
+# -> 200 detail with sale_number "2024-SALE-000001"; deducts stock,
+#    Cash posts 1 Income. Credit: send {} (no account), posts nothing, due = total.
+#    Double confirm => 400.
+
+curl -X POST http://localhost:3000/api/sales/1/payments \
+  -H "Content-Type: application/json" \
+  -d '{"account_id":1,"amount":"15","date":"2024-05-10"}'
+# -> 201 payment + 1 Income (Credit sales; overpay => 400)
+
+curl -X PUT http://localhost:3000/api/sales/lines/1 \
+  -H "Content-Type: application/json" \
+  -d '{"qty":"2","unit_price":"10"}'
+curl -X DELETE http://localhost:3000/api/sales/lines/1
+# -> Draft line edit / remove (204)
+
+curl -X POST http://localhost:3000/api/sales/1/cancel \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"customer return"}'
+# -> 200 Cancelled; Confirmed re-enters stock + Expense refunds
+#    (overdraft guard applies); Draft cancel is a no-op (number stays null).
+
+curl http://localhost:3000/api/sales
+# -> { sales: [detail with total/paid/due/payment_status] }
+curl http://localhost:3000/api/sales/debt
+# -> { debt: [Confirmed sales with due > 0] }
+```
+
 Error format:
 
 ```json
 { "error": "amount must be > 0" }
 ```
 
-- `400` validation (empty name, amount <=0, from>to, insufficient funds)
-- `404` not found
-- `409` duplicate account name (UNIQUE)
+- `400` validation (empty name, amount <=0, from>to, insufficient funds, sale guards below)
+- `404` not found (incl. unknown product/account on sale confirm/pay)
+- `409` duplicate account name (UNIQUE), duplicate sku/barcode/receipt_no/sale_number
 
 Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to avoid float rounding. Never uses `f32/f64`.
 
@@ -188,6 +249,18 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
   - Create product: `POST /web/products` (HTMX)
   - Record movement: `POST /web/stock-movements` (HTMX)
 
+`GET /sales` — sales:
+
+- Sale list with status/debt badges (HTMX `GET /web/sales`)
+- Sale detail with lines + payments (HTMX `GET /web/sales/:id`, line delete via `hx-delete` in Draft)
+- Outstanding debt — Confirmed sales with due > 0 (HTMX `GET /web/sales/debt`)
+- Forms:
+  - New sale Draft: `POST /web/sales` (HTMX)
+  - Add line: `POST /web/sales/:id/lines` (HTMX)
+  - Confirm: `POST /web/sales/:id/confirm` (HTMX)
+  - Record payment: `POST /web/sales/:id/payments` (HTMX)
+  - Cancel: `POST /web/sales/:id/cancel` (HTMX)
+
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX loaded via CDN `https://unpkg.com/htmx.org@1.9.12`.
 
 ## Configuration
@@ -209,6 +282,11 @@ All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger
   - `create Expense`: `projected = current_balance - amount` must be `>=0`.
   - `update`: recomputes `current - old_signed + new_signed`.
   - `delete Income`: `projected = current - amount` must be `>=0`.
+- `Sale` rules: Draft editable (lines/customer/dates); Confirmed/Cancelled immutable
+  except Cancel. `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
+  Draft/Cancelled-from-Draft. Credit requires `due_date >= sale_date`, Cash forbids it.
+  `qty > 0`, `unit_price >= 0`, payments reject overpay (`paid + amount <= total`).
+  No new env vars for sales (reuses `ALLOW_NEGATIVE_BALANCE` / `ALLOW_NEGATIVE_STOCK`).
   - Balance read path: `SELECT kind, amount FROM transactions WHERE account_id=?` summed in Rust (not `SUM()` which would cast TEXT→REAL).
 
 ## SQLite → Postgres Migration (without rewriting logic)
@@ -317,22 +395,28 @@ src/error.rs
 src/services/account.rs
 src/services/transaction.rs
 src/services/inventory.rs
+src/services/sales.rs      — Draft/Confirm/Pay/Cancel orchestrator (calls Inventory + Transaction services, never SQLs their tables)
 src/repositories/account_repo.rs
 src/repositories/transaction_repo.rs
 src/repositories/category_repo.rs
 src/repositories/product_repo.rs
 src/repositories/barcode_repo.rs
 src/repositories/stock_repo.rs
+src/repositories/sale_repo.rs          — Sale/SaleLine/SalePayment SQLite impl
+src/repositories/doc_sequence_repo.rs  — atomic YYYY-SALE-NNNNNN numbering
 src/routes/api.rs
 src/routes/web.rs
 src/routes/inventory_api.rs
 src/routes/inventory_web.rs
+src/routes/sales_api.rs    — REST /api/sales, lines, payments, confirm/cancel, debt
+src/routes/sales_web.rs    — Web /sales Askama + HTMX
 src/routes/mod.rs
 templates/base.html
 templates/dashboard.html
 templates/account_detail.html
 templates/products.html
-templates/partials/*.html
+templates/sales.html
+templates/partials/*.html  — incl. sale_list.html, sale_detail.html
 migrations/*.sql
 ```
 
