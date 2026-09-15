@@ -49,7 +49,7 @@
     {% for pay in detail.payments %}
     <div class="tx" id="sale-payment-{{ pay.id }}">
       <div class="tx-left">
-        <span style="font-weight:600">account #{{ pay.account_id }}</span>
+        <span style="font-weight:600">account #{{ pay.account_id }} • method #{{ pay.method_id }}</span>
         <span class="muted">{{ pay.date }}</span>
       </div>
       <span class="tx-amount income">{{ pay.amount }}</span>

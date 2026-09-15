@@ -6,9 +6,12 @@
 //
 // Numbering: YYYY-SALE-NNNNNN assigned on confirm via `doc_sequences` row
 // UPDATE (UPSERT + RETURNING, atomic). Draft touches nothing. Cash confirm
-// creates 1 payment + Income; Credit confirm creates receivable, no Income.
-// Overpay rejected. Double confirm / edit Confirmed rejected. Cancel from
-// Confirmed re-enters stock + refunds guarded by allow flags. Service /
+// creates 1 payment (account+method) + Income; Credit confirm creates
+// receivable, no Income. Payments carry account+method, N per sale to mixed
+// accounts/methods with SUM <= total. Pair validated against
+// account_payment_methods allowlist (400) before any stock/sequence/finance
+// touch. Overpay rejected. Double confirm / edit Confirmed rejected. Cancel
+// from Confirmed re-enters stock + refunds guarded by allow flags. Service /
 // untracked lines sellable without stock moves. Decimal-as-TEXT via repos.
 //
 // Atomicity note: true shared SQLite tx across services would require
@@ -27,11 +30,12 @@ use crate::models::{
 };
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, DocSequenceRepository,
-    ProductRepository, SaleRepository, StockMovementRepository, TransactionRepository,
+    PaymentMethodRepository, ProductRepository, SaleRepository, StockMovementRepository,
+    TransactionRepository,
 };
 
 #[derive(Clone)]
-pub struct SalesService<SR, DR, C, P, B, S, A, T>
+pub struct SalesService<SR, DR, C, P, B, S, A, T, PM>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -41,14 +45,16 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PM: PaymentMethodRepository,
 {
     pub sales: SR,
     pub sequences: DR,
     pub inventory: crate::services::InventoryService<C, P, B, S>,
     pub transactions: crate::services::TransactionService<A, T>,
+    pub payment_methods: PM,
 }
 
-impl<SR, DR, C, P, B, S, A, T> SalesService<SR, DR, C, P, B, S, A, T>
+impl<SR, DR, C, P, B, S, A, T, PM> SalesService<SR, DR, C, P, B, S, A, T, PM>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -58,19 +64,51 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PM: PaymentMethodRepository,
 {
     pub fn new(
         sales: SR,
         sequences: DR,
         inventory: crate::services::InventoryService<C, P, B, S>,
         transactions: crate::services::TransactionService<A, T>,
+        payment_methods: PM,
     ) -> Self {
         Self {
             sales,
             sequences,
             inventory,
             transactions,
+            payment_methods,
         }
+    }
+
+    async fn ensure_method_allowed(
+        &self,
+        account_id: i64,
+        method_id: i64,
+    ) -> AppResult<()> {
+        let method = self
+            .payment_methods
+            .find_method(method_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("method {method_id} not found")))?;
+        if !method.is_active {
+            return Err(AppError::Validation(format!(
+                "method {} is inactive",
+                method.name
+            )));
+        }
+        if !self
+            .payment_methods
+            .is_allowed(account_id, method_id)
+            .await?
+        {
+            return Err(AppError::Validation(format!(
+                "method {} not allowed for account {account_id}",
+                method.name
+            )));
+        }
+        Ok(())
     }
 
     // -- validation helpers -------------------------------------------------
@@ -366,6 +404,7 @@ where
         &self,
         sale_id: i64,
         cash_account_id: Option<i64>,
+        cash_method_id: Option<i64>,
     ) -> AppResult<SaleDetail> {
         let sale = self
             .sales
@@ -420,7 +459,10 @@ where
         match sale.payment_type {
             PaymentType::Cash => {
                 let account_id = cash_account_id.ok_or_else(|| {
-                    AppError::Validation("cash sale requires account".into())
+                    AppError::Validation("cash sale requires account and method".into())
+                })?;
+                let method_id = cash_method_id.ok_or_else(|| {
+                    AppError::Validation("cash sale requires account and method".into())
                 })?;
                 if sale.due_date.is_some() {
                     return Err(AppError::Validation(
@@ -432,9 +474,11 @@ where
                         "account {account_id} not found"
                     )));
                 }
+                // Allowlist validated before any stock/sequence/finance touch.
+                self.ensure_method_allowed(account_id, method_id).await?;
             }
             PaymentType::Credit => {
-                if cash_account_id.is_some() {
+                if cash_account_id.is_some() || cash_method_id.is_some() {
                     return Err(AppError::Validation(
                         "credit sale must not include cash account".into(),
                     ));
@@ -483,6 +527,7 @@ where
         // Finance: Cash => 1 payment + Income now; Credit => receivable, no Income.
         if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
             let account_id = cash_account_id.unwrap();
+            let method_id = cash_method_id.unwrap();
             self.transactions
                 .create(
                     account_id,
@@ -493,7 +538,7 @@ where
                 )
                 .await?;
             self.sales
-                .create_payment(sale_id, account_id, total, sale.sale_date)
+                .create_payment(sale_id, account_id, method_id, total, sale.sale_date)
                 .await?;
         }
 
@@ -507,6 +552,7 @@ where
         &self,
         sale_id: i64,
         account_id: i64,
+        method_id: i64,
         amount: Decimal,
         date: NaiveDate,
     ) -> AppResult<SalePayment> {
@@ -528,6 +574,8 @@ where
                 "account {account_id} not found"
             )));
         }
+        // Allowlist validated before any finance touch (no stock here either).
+        self.ensure_method_allowed(account_id, method_id).await?;
         let lines = self.sales.list_lines(sale_id).await?;
         let payments = self.sales.list_payments(sale_id).await?;
         let (total, paid, _) = Self::totals(&lines, &payments);
@@ -550,7 +598,7 @@ where
             )
             .await?;
         self.sales
-            .create_payment(sale_id, account_id, amount, date)
+            .create_payment(sale_id, account_id, method_id, amount, date)
             .await
     }
 
@@ -670,9 +718,10 @@ mod tests {
     use super::*;
     use crate::models::{NewProduct, ProductKind};
     use crate::repositories::{
-        SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-        SqliteDocSequenceRepository, SqliteProductRepository, SqliteSaleRepository,
-        SqliteStockMovementRepository, SqliteTransactionRepository,
+        PaymentMethodRepository, SqliteAccountRepository, SqliteBarcodeRepository,
+        SqliteCategoryRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
+        SqliteProductRepository, SqliteSaleRepository, SqliteStockMovementRepository,
+        SqliteTransactionRepository,
     };
     use crate::services::{InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -687,6 +736,7 @@ mod tests {
         SqliteStockMovementRepository,
         SqliteAccountRepository,
         SqliteTransactionRepository,
+        SqlitePaymentMethodRepository,
     >;
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -725,6 +775,7 @@ mod tests {
             SqliteDocSequenceRepository::new(pool.clone()),
             inventory,
             transactions,
+            SqlitePaymentMethodRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -796,11 +847,29 @@ mod tests {
     }
 
     async fn seed_account(s: &Svc, name: &str) -> crate::models::Account {
-        s.transactions
-            .accounts
-            .create(name)
+        s.transactions.accounts.create(name).await.unwrap()
+    }
+
+    async fn cash_method(s: &Svc) -> i64 {
+        s.payment_methods
+            .find_method_by_name("Cash")
             .await
             .unwrap()
+            .unwrap()
+            .id
+    }
+
+    async fn method_by_name(s: &Svc, name: &str) -> i64 {
+        s.payment_methods
+            .find_method_by_name(name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    async fn allow(s: &Svc, account_id: i64, method_id: i64) {
+        s.payment_methods.allow(account_id, method_id).await.unwrap()
     }
 
     async fn tx_count(pool: &sqlx::SqlitePool) -> i64 {
@@ -850,6 +919,8 @@ mod tests {
         let prod = seed_product(&s, "AC2", "10").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "caja").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
                 customer_name: "Ana".into(),
@@ -864,7 +935,7 @@ mod tests {
         assert!(sale.sale_number.is_none());
         s.add_line(sale.id, prod.id, dec("3"), None).await.unwrap();
 
-        let detail = s.confirm(sale.id, Some(acc.id)).await.unwrap();
+        let detail = s.confirm(sale.id, Some(acc.id), Some(cash)).await.unwrap();
         let number = detail.sale.sale_number.clone().unwrap();
         assert_eq!(number, "2024-SALE-000001");
         assert_eq!(detail.total, dec("30"));
@@ -906,7 +977,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
-        let detail = s.confirm(sale.id, None).await.unwrap();
+        let detail = s.confirm(sale.id, None, None).await.unwrap();
         assert!(detail.sale.sale_number.is_some());
         assert_eq!(detail.total, dec("24"));
         assert_eq!(detail.paid, Decimal::ZERO);
@@ -924,6 +995,8 @@ mod tests {
         let prod = seed_product(&s, "AC4", "20").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "banco").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
                 customer_name: "Deudor".into(),
@@ -936,11 +1009,12 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
-        s.confirm(sale.id, None).await.unwrap();
+        s.confirm(sale.id, None, None).await.unwrap();
 
         s.record_payment(
             sale.id,
             acc.id,
+            cash,
             dec("15"),
             NaiveDate::from_ymd_opt(2024, 5, 10).unwrap(),
         )
@@ -957,6 +1031,7 @@ mod tests {
             .record_payment(
                 sale.id,
                 acc.id,
+                cash,
                 dec("30"),
                 NaiveDate::from_ymd_opt(2024, 5, 11).unwrap(),
             )
@@ -969,6 +1044,7 @@ mod tests {
         s.record_payment(
             sale.id,
             acc.id,
+            cash,
             dec("25"),
             NaiveDate::from_ymd_opt(2024, 5, 12).unwrap(),
         )
@@ -989,6 +1065,8 @@ mod tests {
         let prod = seed_product(&s, "AC5", "10").await;
         seed_stock(&s, prod.id, "5").await;
         let acc = seed_account(&s, "caja5").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
 
         // Unknown product on add_line => 404.
         let sale = s
@@ -1016,7 +1094,7 @@ mod tests {
 
         // Unknown account on Cash confirm => 404.
         s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
-        let err = s.confirm(sale.id, Some(99999)).await.unwrap_err();
+        let err = s.confirm(sale.id, Some(99999), Some(cash)).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
 
         // Unknown account on payment => 404.
@@ -1032,9 +1110,9 @@ mod tests {
             .await
             .unwrap();
         s.add_line(csale.id, prod.id, dec("1"), None).await.unwrap();
-        s.confirm(csale.id, None).await.unwrap();
+        s.confirm(csale.id, None, None).await.unwrap();
         let err = s
-            .record_payment(csale.id, 99999, dec("5"), sale_date())
+            .record_payment(csale.id, 99999, cash, dec("5"), sale_date())
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
@@ -1049,6 +1127,8 @@ mod tests {
         let prod = seed_product(&s, "AC6", "10").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "caja6").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
                 customer_name: "E".into(),
@@ -1061,10 +1141,10 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
-        s.confirm(sale.id, Some(acc.id)).await.unwrap();
+        s.confirm(sale.id, Some(acc.id), Some(cash)).await.unwrap();
 
         // Double confirm => 400/409.
-        let err = s.confirm(sale.id, Some(acc.id)).await.unwrap_err();
+        let err = s.confirm(sale.id, Some(acc.id), Some(cash)).await.unwrap_err();
         assert!(
             matches!(err, AppError::Validation(_) | AppError::Conflict(_)),
             "got {err:?}"
@@ -1100,6 +1180,8 @@ mod tests {
         let prod = seed_product(&s, "AC7", "10").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "caja7").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
                 customer_name: "R".into(),
@@ -1112,7 +1194,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("4"), None).await.unwrap(); // total 40
-        let confirmed = s.confirm(sale.id, Some(acc.id)).await.unwrap();
+        let confirmed = s.confirm(sale.id, Some(acc.id), Some(cash)).await.unwrap();
         let number = confirmed.sale.sale_number.clone().unwrap();
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("6"));
         assert_eq!(tx_count(&pool).await, 1);
@@ -1147,6 +1229,8 @@ mod tests {
         let prod = seed_product(&s, "AC7G", "10").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "caja7g").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
                 customer_name: "G".into(),
@@ -1159,7 +1243,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
-        s.confirm(sale.id, Some(acc.id)).await.unwrap();
+        s.confirm(sale.id, Some(acc.id), Some(cash)).await.unwrap();
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
         // Drain account: Income 20, then Expense 20 => balance 0.
         s.transactions
@@ -1185,6 +1269,8 @@ mod tests {
         let prod2 = seed_product(&s2, "AC7G2", "10").await;
         seed_stock(&s2, prod2.id, "10").await;
         let acc2 = seed_account(&s2, "caja7g2").await;
+        let cash2 = method_by_name(&s2, "Cash").await;
+        allow(&s2, acc2.id, cash2).await;
         let sale2 = s2
             .create_draft(NewSale {
                 customer_name: "G".into(),
@@ -1197,7 +1283,7 @@ mod tests {
             .await
             .unwrap();
         s2.add_line(sale2.id, prod2.id, dec("2"), None).await.unwrap();
-        s2.confirm(sale2.id, Some(acc2.id)).await.unwrap();
+        s2.confirm(sale2.id, Some(acc2.id), Some(cash2)).await.unwrap();
         s2.transactions
             .create(
                 acc2.id,
@@ -1219,6 +1305,8 @@ mod tests {
         let (s, pool) = svc().await;
         let svc_prod = seed_service(&s, "TRI-SRV").await;
         let acc = seed_account(&s, "caja-tri").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
                 customer_name: "Serv".into(),
@@ -1232,7 +1320,7 @@ mod tests {
             .unwrap();
         s.add_line(sale.id, svc_prod.id, dec("2"), None).await.unwrap();
         let before = movement_count(&pool).await;
-        let detail = s.confirm(sale.id, Some(acc.id)).await.unwrap();
+        let detail = s.confirm(sale.id, Some(acc.id), Some(cash)).await.unwrap();
         assert_eq!(detail.total, dec("60"));
         // No stock movements for service lines.
         assert_eq!(movement_count(&pool).await, before);
@@ -1245,6 +1333,8 @@ mod tests {
         let prod = seed_product(&s, "TRI-NUM", "5").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "caja-num").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
 
         let a = s
             .create_draft(NewSale {
@@ -1271,8 +1361,8 @@ mod tests {
             .unwrap();
         s.add_line(b.id, prod.id, dec("1"), None).await.unwrap();
 
-        let da = s.confirm(a.id, Some(acc.id)).await.unwrap();
-        let db = s.confirm(b.id, Some(acc.id)).await.unwrap();
+        let da = s.confirm(a.id, Some(acc.id), Some(cash)).await.unwrap();
+        let db = s.confirm(b.id, Some(acc.id), Some(cash)).await.unwrap();
         assert_ne!(
             da.sale.sale_number.unwrap(),
             db.sale.sale_number.unwrap()
@@ -1306,6 +1396,8 @@ mod tests {
         let prod = seed_product(&s, "TRI-STRICT", "10").await;
         seed_stock(&s, prod.id, "5").await;
         let acc = seed_account(&s, "caja-strict").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
                 customer_name: "S".into(),
@@ -1318,11 +1410,170 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("10"), None).await.unwrap();
-        let err = s.confirm(sale.id, Some(acc.id)).await.unwrap_err();
+        let err = s.confirm(sale.id, Some(acc.id), Some(cash)).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // Still Draft, no number.
         let d = s.get_detail(sale.id).await.unwrap();
         assert_eq!(d.sale.status, crate::models::SaleStatus::Draft);
         assert!(d.sale.sale_number.is_none());
+    }
+
+    #[tokio::test]
+    async fn red_payment_methods_seeded_without_other() {
+        let (_s, pool) = svc().await;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM payment_methods ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<String> = rows.into_iter().map(|r| r.0).collect();
+        assert_eq!(names, vec!["Cash", "CreditCard", "Debit", "QR", "Transfer"]);
+    }
+
+    #[tokio::test]
+    async fn methods_confirm_cash_requires_method() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "M-REQ", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "m-req").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = s
+            .create_draft(NewSale {
+                customer_name: "M".into(),
+                payment_type: PaymentType::Cash,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
+        // Missing method => 400.
+        let err = s.confirm(sale.id, Some(acc.id), None).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        // Missing account => 400.
+        let err = s.confirm(sale.id, None, Some(cash)).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn methods_disallowed_pair_rejected_without_side_effects() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "M-DENY", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "m-deny").await;
+        let cash = cash_method(&s).await;
+        // No allowlist row: Cash not allowed for this account.
+        let sale = s
+            .create_draft(NewSale {
+                customer_name: "D".into(),
+                payment_type: PaymentType::Cash,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        let moves_before = movement_count(&pool).await;
+        let tx_before = tx_count(&pool).await;
+        let err = s
+            .confirm(sale.id, Some(acc.id), Some(cash))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        // No stock/finance touch, still Draft without number.
+        assert_eq!(movement_count(&pool).await, moves_before);
+        assert_eq!(tx_count(&pool).await, tx_before);
+        let d = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(d.sale.status, crate::models::SaleStatus::Draft);
+        assert!(d.sale.sale_number.is_none());
+    }
+
+    #[tokio::test]
+    async fn methods_mixed_payments_across_accounts() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "M-MIX", "20").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc_a = seed_account(&s, "m-mix-a").await;
+        let acc_b = seed_account(&s, "m-mix-b").await;
+        let cash = cash_method(&s).await;
+        let transfer = method_by_name(&s, "Transfer").await;
+        allow(&s, acc_a.id, cash).await;
+        allow(&s, acc_b.id, transfer).await;
+        let sale = s
+            .create_draft(NewSale {
+                customer_name: "Mix".into(),
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
+        s.confirm(sale.id, None, None).await.unwrap();
+        s.record_payment(
+            sale.id,
+            acc_a.id,
+            cash,
+            dec("15"),
+            NaiveDate::from_ymd_opt(2024, 5, 10).unwrap(),
+        )
+        .await
+        .unwrap();
+        s.record_payment(
+            sale.id,
+            acc_b.id,
+            transfer,
+            dec("25"),
+            NaiveDate::from_ymd_opt(2024, 5, 11).unwrap(),
+        )
+        .await
+        .unwrap();
+        let d = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(d.paid, dec("40"));
+        assert_eq!(d.due, Decimal::ZERO);
+        assert_eq!(d.payment_status, PaymentStatus::Paid);
+        assert_eq!(d.payments.len(), 2);
+        assert_eq!(tx_count(&pool).await, 2);
+    }
+
+    #[tokio::test]
+    async fn methods_record_payment_rejects_disallowed_without_finance_touch() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "M-PAY-DENY", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "m-pay-deny").await;
+        let cash = cash_method(&s).await;
+        let qr = method_by_name(&s, "QR").await;
+        allow(&s, acc.id, cash).await;
+        // QR not allowed for this account.
+        let sale = s
+            .create_draft(NewSale {
+                customer_name: "P".into(),
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
+        s.confirm(sale.id, None, None).await.unwrap();
+        let tx_before = tx_count(&pool).await;
+        let err = s
+            .record_payment(sale.id, acc.id, qr, dec("5"), sale_date())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert_eq!(tx_count(&pool).await, tx_before);
+        let d = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(d.paid, Decimal::ZERO);
     }
 }

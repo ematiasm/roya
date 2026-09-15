@@ -10,10 +10,12 @@ use sqlx::SqlitePool;
 
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-    SqliteDocSequenceRepository, SqliteProductRepository, SqliteSaleRepository,
-    SqliteStockMovementRepository, SqliteTransactionRepository,
+    SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
+    SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
 };
-use crate::services::{AccountService, InventoryService, SalesService, TransactionService};
+use crate::services::{
+    AccountService, InventoryService, PaymentMethodService, SalesService, TransactionService,
+};
 
 pub type InventorySvc = InventoryService<
     SqliteCategoryRepository,
@@ -31,7 +33,10 @@ pub type SalesSvc = SalesService<
     SqliteStockMovementRepository,
     SqliteAccountRepository,
     SqliteTransactionRepository,
+    SqlitePaymentMethodRepository,
 >;
+
+pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,6 +46,7 @@ pub struct AppState {
         TransactionService<SqliteAccountRepository, SqliteTransactionRepository>,
     pub inventory_service: InventorySvc,
     pub sales_service: SalesSvc,
+    pub payment_method_service: MethodSvc,
     pub allow_negative: bool,
     pub allow_negative_stock: bool,
 }
@@ -59,11 +65,14 @@ impl AppState {
             SqliteStockMovementRepository::new(pool.clone()),
             allow_negative_stock,
         );
+        let method_repo = SqlitePaymentMethodRepository::new(pool.clone());
+        let payment_method_service = PaymentMethodService::new(method_repo.clone());
         let sales_service = SalesService::new(
             SqliteSaleRepository::new(pool.clone()),
             SqliteDocSequenceRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
+            method_repo,
         );
         Self {
             pool,
@@ -71,6 +80,7 @@ impl AppState {
             transaction_service,
             inventory_service,
             sales_service,
+            payment_method_service,
             allow_negative,
             allow_negative_stock,
         }

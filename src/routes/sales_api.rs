@@ -63,6 +63,7 @@ pub struct UpdateLineRequest {
 #[derive(Debug, Deserialize)]
 pub struct RecordPaymentRequest {
     pub account_id: i64,
+    pub method_id: i64,
     pub amount: Decimal,
     pub date: NaiveDate,
 }
@@ -71,6 +72,8 @@ pub struct RecordPaymentRequest {
 pub struct ConfirmSaleRequest {
     #[serde(default)]
     pub account_id: Option<i64>,
+    #[serde(default)]
+    pub method_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -185,7 +188,13 @@ async fn record_payment(
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let payment = state
         .sales_service
-        .record_payment(id, payload.account_id, payload.amount, payload.date)
+        .record_payment(
+            id,
+            payload.account_id,
+            payload.method_id,
+            payload.amount,
+            payload.date,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(payment))))
 }
@@ -195,7 +204,10 @@ async fn confirm_sale(
     Path(id): Path<i64>,
     Json(payload): Json<ConfirmSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let detail = state.sales_service.confirm(id, payload.account_id).await?;
+    let detail = state
+        .sales_service
+        .confirm(id, payload.account_id, payload.method_id)
+        .await?;
     Ok(Json(serde_json::json!(detail)))
 }
 
@@ -347,6 +359,25 @@ mod tests {
         v.get("id").and_then(|x| x.as_i64()).unwrap()
     }
 
+    async fn cash_method_id(pool: &sqlx::SqlitePool) -> i64 {
+        let row: (i64,) = sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        row.0
+    }
+
+    async fn allow_cash(pool: &sqlx::SqlitePool, account_id: i64) -> i64 {
+        let mid = cash_method_id(pool).await;
+        sqlx::query("INSERT OR IGNORE INTO account_payment_methods (account_id, method_id) VALUES (?, ?)")
+            .bind(account_id)
+            .bind(mid)
+            .execute(pool)
+            .await
+            .unwrap();
+        mid
+    }
+
     fn draft_body(customer: &str, payment_type: &str) -> serde_json::Value {
         let (due_date, sale_date) = ("2024-06-01", "2024-05-02");
         if payment_type == "Credit" {
@@ -366,10 +397,12 @@ mod tests {
     #[tokio::test]
     async fn ac8_sale_number_unique_immutable_null_only_draft_via_rest() {
         let state = test_state().await;
+        let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let pid = seed_product(&app, "AC8-P", "Product").await;
         seed_stock(&app, pid, "10").await;
         let acc = seed_account(&app, "caja8").await;
+        let cash = allow_cash(&pool, acc).await;
 
         // Draft has NULL sale_number.
         let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Ana", "Cash")).await;
@@ -395,7 +428,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{aid}/confirm"),
-            serde_json::json!({ "account_id": acc }),
+            serde_json::json!({ "account_id": acc, "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm: {v}");
@@ -427,7 +460,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{bid}/confirm"),
-            serde_json::json!({ "account_id": acc }),
+            serde_json::json!({ "account_id": acc, "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm b: {v}");
@@ -489,6 +522,7 @@ mod tests {
         let app = crate::routes::router(state);
         let sid = seed_product(&app, "AC9-SRV", "Service").await;
         let acc = seed_account(&app, "caja9").await;
+        let cash = allow_cash(&pool, acc).await;
 
         let moves_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM stock_movements")
             .fetch_one(&pool)
@@ -512,7 +546,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/confirm"),
-            serde_json::json!({ "account_id": acc }),
+            serde_json::json!({ "account_id": acc, "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm service sale: {v}");
@@ -537,6 +571,7 @@ mod tests {
         let pid = seed_product(&app, "AC10-P", "Product").await;
         seed_stock(&app, pid, "10").await;
         let acc = seed_account(&app, "caja10").await;
+        let cash = allow_cash(&pool, acc).await;
 
         let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Ref", "Cash")).await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
@@ -556,7 +591,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/confirm"),
-            serde_json::json!({ "account_id": acc }),
+            serde_json::json!({ "account_id": acc, "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm: {v}");
@@ -624,10 +659,12 @@ mod tests {
     #[tokio::test]
     async fn debt_endpoint_lists_unpaid_confirmed_only() {
         let state = test_state().await;
+        let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let pid = seed_product(&app, "DEBT-P", "Product").await;
         seed_stock(&app, pid, "10").await;
         let acc = seed_account(&app, "cajaD").await;
+        let cash = allow_cash(&pool, acc).await;
 
         let (st, v) = get_json(app.clone(), "/api/sales/debt").await;
         assert_eq!(st, StatusCode::OK, "empty debt: {v}");
@@ -663,7 +700,7 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/payments"),
-            serde_json::json!({ "account_id": acc, "amount": "5", "date": "2024-05-10" }),
+            serde_json::json!({ "account_id": acc, "method_id": cash, "amount": "5", "date": "2024-05-10" }),
         )
         .await;
         assert_eq!(st, StatusCode::CREATED);
@@ -673,7 +710,7 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/payments"),
-            serde_json::json!({ "account_id": acc, "amount": "15", "date": "2024-05-11" }),
+            serde_json::json!({ "account_id": acc, "method_id": cash, "amount": "15", "date": "2024-05-11" }),
         )
         .await;
         assert_eq!(st, StatusCode::CREATED);
@@ -685,7 +722,7 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/payments"),
-            serde_json::json!({ "account_id": acc, "amount": "1", "date": "2024-05-12" }),
+            serde_json::json!({ "account_id": acc, "method_id": cash, "amount": "1", "date": "2024-05-12" }),
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "overpay must be 400");
@@ -708,5 +745,48 @@ mod tests {
             st == StatusCode::BAD_REQUEST || st == StatusCode::NOT_FOUND,
             "edit confirmed / unknown product: {st}"
         );
+    }
+
+    #[tokio::test]
+    async fn method_allowlist_enforced_via_rest() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let pid = seed_product(&app, "M-REST", "Product").await;
+        seed_stock(&app, pid, "10").await;
+        let acc = seed_account(&app, "m-rest").await;
+        let cash = cash_method_id(&pool).await;
+        // No allowlist row for (acc, Cash): confirm must be 400 with no side effects.
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Ana", "Cash")).await;
+        assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
+        let id = v
+            .get("sale")
+            .and_then(|s| s.get("id"))
+            .or_else(|| v.get("id"))
+            .and_then(|x| x.as_i64())
+            .unwrap();
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/sales/{id}/lines"),
+            serde_json::json!({ "product_id": pid, "qty": "1" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let tx_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/sales/{id}/confirm"),
+            serde_json::json!({ "account_id": acc, "method_id": cash }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "disallowed pair must be 400");
+        let tx_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tx_before.0, tx_after.0, "no finance touch on 400");
     }
 }

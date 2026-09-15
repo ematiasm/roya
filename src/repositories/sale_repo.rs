@@ -61,6 +61,7 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> SalePayment {
         id: row.get("id"),
         sale_id: row.get("sale_id"),
         account_id: row.get("account_id"),
+        method_id: row.get("method_id"),
         amount: parse_decimal(&amt_str),
         date: row.get("date"),
         created_at: row.get("created_at"),
@@ -114,6 +115,7 @@ pub trait SaleRepository: Send + Sync {
         &self,
         sale_id: i64,
         account_id: i64,
+        method_id: i64,
         amount: Decimal,
         date: NaiveDate,
     ) -> AppResult<SalePayment>;
@@ -348,16 +350,18 @@ impl SaleRepository for SqliteSaleRepository {
         &self,
         sale_id: i64,
         account_id: i64,
+        method_id: i64,
         amount: Decimal,
         date: NaiveDate,
     ) -> AppResult<SalePayment> {
         let row = sqlx::query(
-            r#"INSERT INTO sale_payments (sale_id, account_id, amount, date)
-               VALUES (?, ?, ?, ?)
-               RETURNING id, sale_id, account_id, amount, date, created_at"#,
+            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date)
+               VALUES (?, ?, ?, ?, ?)
+               RETURNING id, sale_id, account_id, method_id, amount, date, created_at"#,
         )
         .bind(sale_id)
         .bind(account_id)
+        .bind(method_id)
         .bind(amount.to_string())
         .bind(date)
         .fetch_one(&self.pool)
@@ -368,7 +372,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>> {
         let rows = sqlx::query(
-            r#"SELECT id, sale_id, account_id, amount, date, created_at
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, created_at
                FROM sale_payments WHERE sale_id = ? ORDER BY id"#,
         )
         .bind(sale_id)
