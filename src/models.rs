@@ -207,6 +207,9 @@ impl std::str::FromStr for MovementType {
 pub enum MovementReason {
     Purchase,
     Sale,
+    #[serde(rename = "Sale-return", alias = "SaleReturn", alias = "sale_return", alias = "salereturn")]
+    #[sqlx(rename = "Sale-return")]
+    SaleReturn,
     Loss,
     Adjust,
     Initial,
@@ -217,6 +220,7 @@ impl std::fmt::Display for MovementReason {
         match self {
             Self::Purchase => write!(f, "Purchase"),
             Self::Sale => write!(f, "Sale"),
+            Self::SaleReturn => write!(f, "Sale-return"),
             Self::Loss => write!(f, "Loss"),
             Self::Adjust => write!(f, "Adjust"),
             Self::Initial => write!(f, "Initial"),
@@ -230,6 +234,9 @@ impl std::str::FromStr for MovementReason {
         match s.to_lowercase().as_str() {
             "purchase" => Ok(Self::Purchase),
             "sale" => Ok(Self::Sale),
+            "sale-return" | "sale_return" | "salereturn" | "sale return" => {
+                Ok(Self::SaleReturn)
+            }
             "loss" => Ok(Self::Loss),
             "adjust" => Ok(Self::Adjust),
             "initial" => Ok(Self::Initial),
@@ -333,4 +340,192 @@ pub struct ProductStock {
     pub stock: Decimal,
     /// `max_stock - stock` when `stock <= min_stock`, else `None`.
     pub suggested: Option<Decimal>,
+}
+
+// ---------------------------------------------------------------------------
+// M2 sales domain (orchestrator, Odoo-style). Decimal-as-TEXT like finance.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum SaleStatus {
+    Draft,
+    Confirmed,
+    Cancelled,
+}
+
+impl std::fmt::Display for SaleStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Draft => write!(f, "Draft"),
+            Self::Confirmed => write!(f, "Confirmed"),
+            Self::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+impl std::str::FromStr for SaleStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "draft" => Ok(Self::Draft),
+            "confirmed" => Ok(Self::Confirmed),
+            "cancelled" | "canceled" => Ok(Self::Cancelled),
+            _ => Err(format!("invalid sale status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PaymentType {
+    Cash,
+    Credit,
+}
+
+impl std::fmt::Display for PaymentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cash => write!(f, "Cash"),
+            Self::Credit => write!(f, "Credit"),
+        }
+    }
+}
+
+impl std::str::FromStr for PaymentType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "cash" => Ok(Self::Cash),
+            "credit" => Ok(Self::Credit),
+            _ => Err(format!("invalid payment type: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum PaymentStatus {
+    Paid,
+    Partial,
+    Unpaid,
+}
+
+impl std::fmt::Display for PaymentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paid => write!(f, "Paid"),
+            Self::Partial => write!(f, "Partial"),
+            Self::Unpaid => write!(f, "Unpaid"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Sale {
+    pub id: i64,
+    pub sale_number: Option<String>,
+    pub status: SaleStatus,
+    pub payment_type: PaymentType,
+    pub customer_name: String,
+    pub sale_date: NaiveDate,
+    pub due_date: Option<NaiveDate>,
+    pub receipt_no: Option<String>,
+    pub notes: String,
+    pub cancel_reason: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+    pub confirmed_at: Option<chrono::NaiveDateTime>,
+    pub cancelled_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleLine {
+    pub id: i64,
+    pub sale_id: i64,
+    pub product_id: i64,
+    /// Decimal qty > 0, stored as TEXT.
+    pub qty: Decimal,
+    /// Decimal unit_price >= 0, frozen at confirm, stored as TEXT.
+    pub unit_price: Decimal,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+impl SaleLine {
+    pub fn subtotal(&self) -> Decimal {
+        self.qty * self.unit_price
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SalePayment {
+    pub id: i64,
+    pub sale_id: i64,
+    pub account_id: i64,
+    /// Decimal amount > 0, stored as TEXT.
+    pub amount: Decimal,
+    pub date: NaiveDate,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocSequence {
+    pub doc_type: String,
+    pub year: i32,
+    pub last_number: i64,
+}
+
+/// Service-level input for sale creation (Draft).
+#[derive(Debug, Clone)]
+pub struct NewSale {
+    pub customer_name: String,
+    pub payment_type: PaymentType,
+    pub sale_date: NaiveDate,
+    pub due_date: Option<NaiveDate>,
+    pub receipt_no: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// Service-level patch for Draft header edits.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateSaleDraft {
+    pub customer_name: Option<String>,
+    pub sale_date: Option<NaiveDate>,
+    pub due_date: Option<Option<NaiveDate>>,
+    pub receipt_no: Option<Option<String>>,
+    pub notes: Option<String>,
+}
+
+/// Aggregated sale view with derived totals (never stored as truth).
+#[derive(Debug, Clone, Serialize)]
+pub struct SaleDetail {
+    pub sale: Sale,
+    pub lines: Vec<SaleLine>,
+    pub payments: Vec<SalePayment>,
+    pub total: Decimal,
+    pub paid: Decimal,
+    pub due: Decimal,
+    pub payment_status: PaymentStatus,
+}
+
+impl SaleDetail {
+    pub fn payment_status_for(total: Decimal, paid: Decimal) -> PaymentStatus {
+        let due = total - paid;
+        if due <= Decimal::ZERO {
+            PaymentStatus::Paid
+        } else if paid > Decimal::ZERO {
+            PaymentStatus::Partial
+        } else {
+            PaymentStatus::Unpaid
+        }
+    }
+}
+
+/// Format `YYYY-SALE-NNNNNN` with zero-padded 6-digit sequence.
+pub fn format_sale_number(year: i32, seq: i64) -> String {
+    format!("{year}-SALE-{seq:06}")
 }

@@ -1,0 +1,29 @@
+<div id="sale-list-inner">
+  <div class="muted" style="margin-bottom:10px">{{ title }} • {{ sales.len() }} sales • totals derived (total − paid = due)</div>
+  {% if sales.is_empty() %}
+    <div class="muted" style="padding:16px;text-align:center;border:1px dashed var(--border);border-radius:12px">Nothing here yet.</div>
+  {% else %}
+    {% for d in sales %}
+    <div class="tx" id="sale-{{ d.sale.id }}">
+      <div class="tx-left">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="pill {% if d.sale.status.to_string() == "Confirmed" %}income{% else if d.sale.status.to_string() == "Cancelled" %}expense{% endif %}">{{ d.sale.status }}</span>
+          <span class="pill {% if d.payment_status.to_string() == "Paid" %}income{% else %}expense{% endif %}">{{ d.payment_status }}</span>
+          <span class="pill">{{ d.sale.payment_type }}</span>
+          <span style="font-weight:600">{% if d.sale.customer_name.is_empty() %}Walk-in{% else %}{{ d.sale.customer_name }}{% endif %}</span>
+          {% if let Some(n) = d.sale.sale_number %}
+            <span class="muted" style="font-size:12px">{{ n }}</span>
+          {% else %}
+            <span class="muted" style="font-size:12px">draft #{{ d.sale.id }}</span>
+          {% endif %}
+        </div>
+        <span class="muted">#{{ d.sale.id }} • {{ d.sale.sale_date }} • total {{ d.total }} • paid {{ d.paid }} • due {{ d.due }}</span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center">
+        <span class="tx-amount {% if d.due.is_sign_positive() %}expense{% else %}income{% endif %}">{{ d.total }}</span>
+        <button class="ghost" hx-get="/web/sales/{{ d.sale.id }}" hx-target="#sale-detail" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">View</button>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>

@@ -1,0 +1,210 @@
+{% extends "base.html" %}
+{% block title %}Roya — Sales{% endblock %}
+{% block content %}
+<div style="margin-bottom:16px;display:flex;gap:8px;align-items:center">
+  <a href="/" class="muted">← Dashboard</a>
+  <a href="/products" class="muted">Products</a>
+  <span class="badge">sales • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %} • {% if allow_negative %}overdraft allowed{% else %}overdraft blocked{% endif %}</span>
+</div>
+<div class="grid">
+  <div style="display:flex;flex-direction:column;gap:24px">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin:0">Sales</h2>
+        <button class="ghost" hx-get="/web/sales" hx-target="#sale-list" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">↻ Refresh</button>
+      </div>
+      <div id="sale-list"
+           hx-get="/web/sales"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/sale_list.html" %}
+      </div>
+    </div>
+
+    <div class="card" id="sale-detail-section">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin:0">Sale Detail</h2>
+      </div>
+      <div id="sale-detail">
+        <div class="muted">Click <b>View</b> on a sale to see lines and payments.</div>
+      </div>
+    </div>
+
+    <div class="card" id="debt-section">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin:0">Outstanding Debt</h2>
+        <button class="ghost" hx-get="/web/sales/debt" hx-target="#sale-debt" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">↻ Refresh</button>
+      </div>
+      <div id="sale-debt"
+           hx-get="/web/sales/debt"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        <div class="muted">Loading…</div>
+      </div>
+      <div class="muted" style="margin-top:8px">Confirmed sales with due &gt; 0 (total − paid). Pay them with the form on the right.</div>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:24px">
+    <div class="card">
+      <h2>New Sale (Draft)</h2>
+      <form hx-post="/web/sales" hx-target="#sale-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#sale-debt','refresh'); }">
+        <div>
+          <label>Customer</label>
+          <input type="text" name="customer_name" placeholder="Walk-in…" maxlength="128" />
+        </div>
+        <div class="row">
+          <div>
+            <label>Type</label>
+            <select name="payment_type" required>
+              <option value="Cash">Cash</option>
+              <option value="Credit">Credit</option>
+            </select>
+          </div>
+          <div>
+            <label>Sale date</label>
+            <input type="date" name="sale_date" required value="{{ today }}" />
+          </div>
+        </div>
+        <div>
+          <label>Due date (Credit only)</label>
+          <input type="date" name="due_date" />
+        </div>
+        <div>
+          <label>Receipt no (optional)</label>
+          <input type="text" name="receipt_no" placeholder="ticket-123" maxlength="64" />
+        </div>
+        <div>
+          <label>Notes</label>
+          <input type="text" name="notes" placeholder="…" maxlength="512" />
+        </div>
+        <button type="submit">Create Draft</button>
+        <div class="muted">Draft creates no stock or finance rows. Also at <code>POST /api/sales</code></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Add Line (Draft only)</h2>
+      <form hx-post="/web/sales/0/lines" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#sale-list','refresh')"
+            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/lines'">
+        <div>
+          <label>Sale ID</label>
+          <input type="number" name="sale_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Product</label>
+          <select name="product_id" required>
+            {% for p in products %}
+            <option value="{{ p.id }}">{{ p.sku }} — {{ p.name }} (${{ p.sale_price }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="row">
+          <div>
+            <label>Qty</label>
+            <input type="number" name="qty" step="0.01" min="0.01" required placeholder="1" />
+          </div>
+          <div>
+            <label>Unit price (empty = list)</label>
+            <input type="number" name="unit_price" step="0.01" min="0" placeholder="list price" />
+          </div>
+        </div>
+        <button type="submit">Add Line</button>
+        <div class="muted">Unknown product ⇒ 404, qty ≤ 0 ⇒ 400. Also at <code>POST /api/sales/:id/lines</code></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Confirm Sale</h2>
+      <form hx-post="/web/sales/0/confirm" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
+            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/confirm'">
+        <div>
+          <label>Sale ID</label>
+          <input type="number" name="sale_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Cash account ID (Cash only)</label>
+          <select name="account_id">
+            <option value="">— none (Credit) —</option>
+            {% for acc in accounts %}
+            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <button type="submit" class="secondary">Confirm</button>
+        <div class="muted">Assigns <code>YYYY-SALE-NNNNNN</code>, deducts stock, Cash posts 1 Income. Double confirm ⇒ 400.</div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Record Payment (Credit)</h2>
+      <form hx-post="/web/sales/0/payments" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
+            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/payments'">
+        <div>
+          <label>Sale ID</label>
+          <input type="number" name="sale_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Account</label>
+          <select name="account_id" required>
+            {% for acc in accounts %}
+            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="row">
+          <div>
+            <label>Amount</label>
+            <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+          </div>
+          <div>
+            <label>Date</label>
+            <input type="date" name="date" required value="{{ today }}" />
+          </div>
+        </div>
+        <button type="submit" class="secondary">Record Payment</button>
+        <div class="muted">Each payment posts 1 Income. Overpay ⇒ 400. Also at <code>POST /api/sales/:id/payments</code></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Cancel Sale</h2>
+      <form hx-post="/web/sales/0/cancel" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
+            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/cancel'">
+        <div>
+          <label>Sale ID</label>
+          <input type="number" name="sale_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Reason</label>
+          <input type="text" name="reason" placeholder="customer return…" maxlength="256" />
+        </div>
+        <button type="submit" class="ghost">Cancel Sale</button>
+        <div class="muted">Confirmed ⇒ stock re-enters + Expense refunds (overdraft guard applies).</div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>REST API</h2>
+      <div class="muted" style="font-size:13px;line-height:1.7">
+        <code>GET /api/sales</code><br/>
+        <code>POST /api/sales</code><br/>
+        <code>GET /api/sales/debt</code><br/>
+        <code>GET /api/sales/:id</code><br/>
+        <code>PUT /api/sales/:id</code><br/>
+        <code>POST /api/sales/:id/lines</code><br/>
+        <code>PUT /api/sales/lines/:line_id</code><br/>
+        <code>DELETE /api/sales/lines/:line_id</code><br/>
+        <code>POST /api/sales/:id/payments</code><br/>
+        <code>POST /api/sales/:id/confirm</code><br/>
+        <code>POST /api/sales/:id/cancel</code><br/>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.body.addEventListener('sale-created', function(){ htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); });
+  document.body.addEventListener('sale-changed', function(){ htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); });
+</script>
+{% endblock %}
