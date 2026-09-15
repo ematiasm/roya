@@ -1,0 +1,16 @@
+# Local Pi runtime state
+.atl/
+
+# Rust
+/target/
+**/*.rs.bk
+
+# DB
+roya.db
+roya.db-*
+*.db
+.env
+
+# OS
+.DS_Store
+Thumbs.db

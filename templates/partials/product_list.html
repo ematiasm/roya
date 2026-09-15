@@ -1,0 +1,32 @@
+<div id="product-list-inner">
+  <div class="muted" style="margin-bottom:10px">{{ products.len() }} products • stock derived from movements</div>
+  {% if products.is_empty() %}
+    <div class="muted" style="padding:16px;text-align:center;border:1px dashed var(--border);border-radius:12px">No products yet — create one on the right.</div>
+  {% else %}
+    {% for ps in products %}
+    <div class="tx" id="product-{{ ps.product.id }}">
+      <div class="tx-left">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="pill {% if ps.product.kind.to_string() == "Service" %}expense{% else %}income{% endif %}">{{ ps.product.kind }}</span>
+          <span style="font-weight:600">{{ ps.product.name }}</span>
+          <span class="muted" style="font-size:12px">{{ ps.product.sku }} • {{ ps.product.unit }} • ${{ ps.product.sale_price }}</span>
+          {% if !ps.product.track_stock %}
+            <span class="muted" style="font-size:12px">untracked</span>
+          {% else %}
+            {% if ps.stock.is_sign_negative() %}
+              <span class="pill expense">negative</span>
+            {% endif %}
+          {% endif %}
+          {% if let Some(sug) = ps.suggested %}
+            <span class="pill expense">low • suggest {{ sug }}</span>
+          {% endif %}
+        </div>
+        <span class="muted">#{{ ps.product.id }} • stock {{ ps.stock }}{% if let Some(min) = ps.product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • max {{ max }}{% endif %}</span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center">
+        <span class="tx-amount {% if ps.stock.is_sign_negative() %}expense{% else %}income{% endif %}">{{ ps.stock }}</span>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>

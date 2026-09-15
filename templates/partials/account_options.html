@@ -1,0 +1,3 @@
+{% for acc in accounts %}
+<option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+{% endfor %}

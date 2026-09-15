@@ -1,0 +1,28 @@
+<div id="tx-list-inner">
+  {% if transactions.is_empty() %}
+    <div class="muted" style="padding:16px;text-align:center;border:1px dashed var(--border);border-radius:12px">No transactions for this filter.</div>
+  {% else %}
+    {% for tx in transactions %}
+    <div class="tx" id="tx-{{ tx.id }}">
+      <div class="tx-left">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="pill {% if tx.is_income() %}income{% else %}expense{% endif %}">{{ tx.kind }}</span>
+          <span style="font-weight:600">{{ tx.description }}</span>
+          <span class="muted" style="font-size:12px">acct #{{ tx.account_id }}</span>
+        </div>
+        <span class="muted">{{ tx.date }} • #{{ tx.id }}</span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center">
+        <span class="tx-amount {% if tx.is_income() %}income{% else %}expense{% endif %}">
+          {% if tx.is_expense() %}-{% endif %}${{ tx.amount }}
+        </span>
+        <button class="ghost" style="font-size:12px;padding:6px 10px"
+                hx-delete="/web/transactions/{{ tx.id }}"
+                hx-target="#tx-{{ tx.id }}"
+                hx-swap="outerHTML"
+                hx-confirm="Delete transaction #{{ tx.id }}?">✕</button>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>

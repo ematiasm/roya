@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Roya — {{ account.name }}{% endblock %}
+{% block content %}
+<a href="/" class="muted">← Back to dashboard</a>
+<div class="card" style="margin-top:16px">
+  <div class="muted">Account</div>
+  <div style="display:flex;justify-content:space-between;align-items:center">
+    <h2 style="font-size:24px;margin:0">{{ account.name }}</h2>
+    <span class="balance {% if account.is_negative() %}negative{% else %}positive{% endif %}" style="font-size:22px">${{ account.balance }}</span>
+  </div>
+  <div class="muted">Derived balance • ID {{ account.id }} • Created {{ account.created_at }}</div>
+</div>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <h2>History</h2>
+    <span class="badge">{{ transactions.len() }} transactions</span>
+  </div>
+  {% if transactions.is_empty() %}
+    <div class="muted">No transactions yet. Add one from the dashboard.</div>
+  {% else %}
+    {% for tx in transactions %}
+    <div class="tx" id="tx-{{ tx.id }}">
+      <div class="tx-left">
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="pill {% if tx.is_income() %}income{% else %}expense{% endif %}">{{ tx.kind }}</span>
+          <span style="font-weight:600">{{ tx.description }}</span>
+        </div>
+        <span class="muted">{{ tx.date }} • #{{ tx.id }}</span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center">
+        <span class="tx-amount {% if tx.is_income() %}income{% else %}expense{% endif %}">
+          {% if tx.is_expense() %}-{% endif %}${{ tx.amount }}
+        </span>
+        <button class="ghost" style="font-size:12px;padding:6px 10px"
+                hx-delete="/web/transactions/{{ tx.id }}"
+                hx-target="#tx-{{ tx.id }}"
+                hx-swap="outerHTML"
+                hx-confirm="Delete transaction #{{ tx.id }}?">✕</button>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>
+{% endblock %}

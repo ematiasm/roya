@@ -1,0 +1,23 @@
+<div id="stock-list-inner">
+  {% if items.is_empty() %}
+    <div class="muted" style="padding:16px;text-align:center;border:1px dashed var(--border);border-radius:12px">Stock OK — nothing to reorder.</div>
+  {% else %}
+    {% for ps in items %}
+    <div class="tx" id="stock-{{ ps.product.id }}">
+      <div class="tx-left">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="pill expense">low</span>
+          <span style="font-weight:600">{{ ps.product.name }}</span>
+          <span class="muted" style="font-size:12px">{{ ps.product.sku }}</span>
+        </div>
+        <span class="muted">stock {{ ps.stock }}{% if let Some(min) = ps.product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • max {{ max }}{% endif %}</span>
+      </div>
+      <div style="display:flex;gap:12px;align-items:center">
+        {% if let Some(sug) = ps.suggested %}
+          <span class="tx-amount expense">+{{ sug }}</span>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>

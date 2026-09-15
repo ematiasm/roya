@@ -1,0 +1,53 @@
+strict_tdd: true
+context: |
+  roya is a Rust project.
+  Detected markers: Cargo.toml.
+  Primary test command: cargo test.
+  Unit tests: cargo test (cargo test).
+  Integration tests: none.
+  E2E tests: none.
+rules:
+  proposal:
+    require_problem_statement: true
+  spec:
+    require_acceptance_criteria: true
+  design:
+    require_tradeoffs: true
+  tasks:
+    protect_review_workload: true
+  apply:
+    test_command: "cargo test"
+  verify:
+    test_command: "cargo test"
+testing:
+  detected: "2026-09-14"
+  runner:
+    command: "cargo test"
+    framework: "cargo test"
+  layers:
+    unit: "cargo test"
+    integration: ""
+    e2e: ""
+  commands:
+    unit:
+      - scope: "."
+        command: "cargo test"
+        framework: "cargo test"
+    integration:
+      []
+    e2e:
+      []
+  coverage:
+    command: ""
+    commands:
+      []
+quality:
+  lint: ""
+  lint_commands:
+    []
+  typecheck: ""
+  typecheck_commands:
+    []
+  format: ""
+  format_commands:
+    []

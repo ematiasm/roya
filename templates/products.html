@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% block title %}Roya — Products{% endblock %}
+{% block content %}
+<div style="margin-bottom:16px;display:flex;gap:8px;align-items:center">
+  <a href="/" class="muted">← Dashboard</a>
+  <span class="badge">inventory • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %}</span>
+</div>
+<div class="grid">
+  <div style="display:flex;flex-direction:column;gap:24px">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin:0">Products</h2>
+        <button class="ghost" hx-get="/web/products" hx-target="#product-list" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">↻ Refresh</button>
+      </div>
+      <div class="toolbar">
+        <select id="filter-category" name="category_id" hx-get="/web/products" hx-target="#product-list" hx-trigger="change">
+          <option value="">All categories</option>
+          {% for cat in categories %}
+          <option value="{{ cat.id }}">{{ cat.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div id="product-list"
+           hx-get="/web/products"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/product_list.html" %}
+      </div>
+    </div>
+
+    <div class="card" id="low-stock-section">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin:0">Low Stock</h2>
+        <button class="ghost" hx-get="/web/low-stock" hx-target="#low-stock-list" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">↻ Refresh</button>
+      </div>
+      <div id="low-stock-list"
+           hx-get="/web/low-stock"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        <div class="muted">Loading…</div>
+      </div>
+      <div class="muted" style="margin-top:8px">Suggested reorder = max − stock when stock ≤ min.</div>
+    </div>
+  </div>
+
+  <div style="display:flex;flex-direction:column;gap:24px">
+    <div class="card">
+      <h2>New Category</h2>
+      <form hx-post="/web/categories" hx-swap="none" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#product-list','refresh'); htmx.ajax('GET','/web/category-options','#filter-category'); }">
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" placeholder="Beverages, Services…" required maxlength="128" />
+        </div>
+        <div>
+          <label>Parent ID (optional)</label>
+          <input type="number" name="parent_id" placeholder="empty = root" min="1" />
+        </div>
+        <button type="submit">Create Category</button>
+        <div class="muted">Also available at <code>POST /api/categories</code></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>New Product</h2>
+      <form hx-post="/web/products" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
+        <div>
+          <label>SKU</label>
+          <input type="text" name="sku" placeholder="YERBA-500" required maxlength="64" />
+        </div>
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" placeholder="Yerba 500g" required maxlength="128" />
+        </div>
+        <div class="row">
+          <div>
+            <label>Kind</label>
+            <select name="kind" required>
+              <option value="Product">Product</option>
+              <option value="Service">Service</option>
+            </select>
+          </div>
+          <div>
+            <label>Unit</label>
+            <input type="text" name="unit" placeholder="un, kg, lt…" required maxlength="16" value="un" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Sale price</label>
+            <input type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required />
+          </div>
+          <div>
+            <label>Cost price</label>
+            <input type="number" name="cost_price" step="0.01" min="0" placeholder="0" value="0" />
+          </div>
+        </div>
+        <div>
+          <label>Category ID (optional)</label>
+          <input type="number" name="category_id" placeholder="empty = none" min="1" />
+        </div>
+        <div>
+          <label style="display:flex;gap:8px;align-items:center;text-transform:none;letter-spacing:normal"><input type="checkbox" name="track_stock" value="1" checked style="width:auto" /> Track stock</label>
+        </div>
+        <div class="row">
+          <div>
+            <label>Min stock</label>
+            <input type="number" name="min_stock" step="0.01" min="0" placeholder="5" value="5" />
+          </div>
+          <div>
+            <label>Max stock</label>
+            <input type="number" name="max_stock" step="0.01" min="0" placeholder="50" value="50" />
+          </div>
+        </div>
+        <button type="submit">Create Product</button>
+        <div class="muted">Services: untick stock + empty min/max. Also at <code>POST /api/products</code></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Stock Movement</h2>
+      <form hx-post="/web/stock-movements" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
+        <div>
+          <label>Product ID</label>
+          <input type="number" name="product_id" required min="1" placeholder="1" />
+        </div>
+        <div class="row">
+          <div>
+            <label>Type</label>
+            <select name="type" required>
+              <option value="In">In</option>
+              <option value="Out">Out</option>
+              <option value="Adjust">Adjust</option>
+            </select>
+          </div>
+          <div>
+            <label>Qty</label>
+            <input type="number" name="qty" step="0.01" required placeholder="1" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Reason</label>
+            <select name="reason" required>
+              <option value="Initial">Initial</option>
+              <option value="Purchase">Purchase</option>
+              <option value="Sale">Sale</option>
+              <option value="Loss">Loss</option>
+              <option value="Adjust">Adjust</option>
+            </select>
+          </div>
+          <div>
+            <label>Date</label>
+            <input type="date" name="date" required value="{{ today }}" />
+          </div>
+        </div>
+        <div>
+          <label>Reference (optional)</label>
+          <input type="text" name="reference" placeholder="remito-123" maxlength="256" />
+        </div>
+        <button type="submit" class="secondary">Record Movement</button>
+        <div class="muted">In=+qty, Out=−qty, Adjust=signed delta. Also at <code>POST /api/stock-movements</code></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>REST API</h2>
+      <div class="muted" style="font-size:13px;line-height:1.7">
+        <code>GET /api/categories</code><br/>
+        <code>POST /api/categories</code><br/>
+        <code>GET /api/products</code><br/>
+        <code>POST /api/products</code><br/>
+        <code>GET /api/products/:id/stock</code><br/>
+        <code>POST /api/products/:id/barcodes</code><br/>
+        <code>GET /api/stock-movements?product_id=</code><br/>
+        <code>POST /api/stock-movements</code><br/>
+        <code>GET /api/low-stock</code><br/>
+        <code>GET /api/negative-stock</code><br/>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.body.addEventListener('product-created', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
+  document.body.addEventListener('movement-created', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
+  document.body.addEventListener('category-created', function(){ htmx.trigger('#product-list','refresh'); });
+</script>
+{% endblock %}
