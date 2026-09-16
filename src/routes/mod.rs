@@ -8,7 +8,7 @@ pub mod sales_web;
 pub mod suppliers_web;
 pub mod web;
 
-use axum::Router;
+use axum::{http::StatusCode, response::IntoResponse, Json, Router};
 use sqlx::SqlitePool;
 use tower_http::services::ServeDir;
 
@@ -141,7 +141,18 @@ pub fn router(state: AppState) -> Router {
         .merge(purchases_web::router())
         .merge(suppliers_web::router())
         .nest_service("/static", ServeDir::new("static"))
+        .fallback(route_not_found)
         .with_state(state)
+}
+
+/// Distinctive body for the router-level 404 fallback. A routing miss must be
+/// distinguishable from a handler-level 404 (which returns its own message),
+/// so the smoke suite can use this marker as an oracle for the routing table.
+async fn route_not_found() -> impl IntoResponse {
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "route not found" })),
+    )
 }
 
 #[cfg(test)]

@@ -4,6 +4,8 @@ mod models;
 mod repositories;
 mod routes;
 mod services;
+#[cfg(test)]
+mod smoke_tests;
 
 use std::net::SocketAddr;
 
