@@ -7,11 +7,21 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
 ## Features
 
 - **Account** — `id, name, cached_balance, created_at`
-- **Transaction** — `id, account_id (FK), kind (Income/Expense), amount (Decimal), description, date (NaiveDate), created_at`
+- **Transaction** — `id, account_id (FK), kind (Income/Expense), amount (Decimal), description, reference (nullable, opaque), date (NaiveDate), created_at`
 - Balance is **always derived** `SUM(Income) - SUM(Expense)` — `cached_balance` is kept in sync transactionally but never trusted for reads.
 - Validation: `amount > 0`, negative balance blocked when `ALLOW_NEGATIVE_BALANCE=false`.
 - Dashboard with total balance across all accounts.
 - **REST API** and **Web (Askama + HTMX, no page reload)**.
+- **Money traceability** — every payment row knows the finance transaction it
+  produced (`sale_payments.transaction_id` / `purchase_payments.transaction_id`,
+  FK to `transactions(id)` RESTRICT) and the refund it received
+  (`refund_transaction_id`); the transaction carries the source document number
+  in the immutable `transactions.reference` (`YYYY-SALE-NNNNNN` /
+  `YYYY-PURCH-NNNNNN`), while `description` stays user-editable free text.
+  Manual transactions have `reference = NULL`. Historical payments keep
+  `transaction_id = NULL` (when several transactions share a document number
+  there is no deterministic way to know which one a payment created), but they
+  are still fully traceable through `reference`.
 - **Sales** — Draft → Confirmed → Cancelled orchestrator (Odoo-style):
   - Draft creates lines with no stock/finance side effects.
   - Confirm assigns `YYYY-SALE-NNNNNN`, deducts stock (`Out`, reason `Sale`),
@@ -23,7 +33,8 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
   - Cancel of Confirmed re-enters stock (`In`, reason `Sale-return`) and posts
     Expense refunds, guarded by `ALLOW_NEGATIVE_BALANCE`.
   - `sale_number` UNIQUE, immutable, NULL only in Draft/Cancelled-from-Draft.
-  - Finance/stock rows are written only via services, reference = `sale_number`.
+  - Finance/stock rows are written only via services, reference = `sale_number`;
+    each payment stores the id of the Income it created.
 - **Suppliers (M3)** — `suppliers(id, name UNIQUE, phone, notes, is_active)` plus the
   `product_supplier_costs` satellite holding the per-supplier price with its previous
   value and date. A new cost that differs shifts current → previous (value and date);
@@ -37,7 +48,8 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
   - Confirm assigns `YYYY-PURCH-NNNNNN`, receives stock (`In`, reason `Purchase`) per
     tracked line, updates the satellite cost per line, Cash posts 1 payment + 1 Expense,
     Credit stays payable (`due = total`, no Expense until paid).
-  - Credit payments each post 1 Expense (`reference = purchase_number`); N per purchase,
+  - Credit payments each post 1 Expense (`reference = purchase_number`) and the
+    payment stores the Expense id; N per purchase,
     mixed accounts/methods, sum ≤ total; Paid when due = 0; overpay ⇒ 400.
   - Cancel of Confirmed returns stock (`Out`, reason `Purchase-return`, the M1 CHECK
     expansion) and posts Income refunds per payment; a refund is money entering, so the
@@ -156,6 +168,10 @@ Current migrations:
 - `20240101000017_create_purchase_payments.sql` — `purchase_payments` (CASCADE purchase,
   RESTRICT account/method)
 - `20240101000018_expand_stock_reason_purchase_return.sql` — adds `Purchase-return` reason
+- `20240101000019_link_payments_to_transactions.sql` — `transactions.reference`
+  (backfilled only from descriptions that exactly match the document number
+  shape) plus `sale_payments` / `purchase_payments` `transaction_id` and
+  `refund_transaction_id` FKs to `transactions(id)` RESTRICT
 
 ## REST API
 
@@ -190,6 +206,8 @@ curl "http://localhost:3000/api/transactions?account_id=1&from=2024-01-01&to=202
 curl -X POST http://localhost:3000/api/transactions \
   -H "Content-Type: application/json" \
   -d '{"account_id":1,"type":"Income","amount":"1000.50","description":"Salary","date":"2024-01-15"}'
+# response includes "reference": null; add "reference":"opaque-id" to stamp
+# an opaque source id (documents use their YYYY-SALE-NNNNNN / YYYY-PURCH-NNNNNN)
 
 curl -X PUT http://localhost:3000/api/transactions/1 \
   -H "Content-Type: application/json" \
@@ -470,6 +488,11 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
 
 ## Validation & Balance Rules
 
+- `Transaction.reference` is opaque and nullable: document flows stamp the
+  sale/purchase number, manual transactions leave it NULL. The payment →
+  transaction FK is RESTRICT, so a linked movement cannot be deleted while a
+  payment references it; cancelling a document links the refund transaction in
+  `refund_transaction_id` without touching the original `transaction_id`.
 - `Account.name` trimmed, non-empty, ≤64, UNIQUE.
 - `Transaction.amount` parsed as `Decimal`, must be `> 0`. Stored as **TEXT** in SQLite to preserve precision (SQLite has no native Decimal; `NUMERIC` affinity would coerce to REAL and lose digits — see `sqlx-sqlite` docs). Repositories encode/decode via string and sum in Rust to keep Decimal exactness.
 - `Transaction.date` = `NaiveDate` (YYYY-MM-DD).

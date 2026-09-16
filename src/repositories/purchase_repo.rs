@@ -65,6 +65,8 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> PurchasePayment {
         method_id: row.get("method_id"),
         amount: parse_decimal(&amt_str),
         date: row.get("date"),
+        transaction_id: row.get("transaction_id"),
+        refund_transaction_id: row.get("refund_transaction_id"),
         created_at: row.get("created_at"),
     }
 }
@@ -110,6 +112,8 @@ pub trait PurchaseRepository: Send + Sync {
         -> AppResult<PurchaseLine>;
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
+    /// Create the payment row and link it to the finance transaction it produced
+    /// (`transaction_id`); NULL only for historical rows.
     async fn create_payment(
         &self,
         purchase_id: i64,
@@ -117,6 +121,14 @@ pub trait PurchaseRepository: Send + Sync {
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
+        transaction_id: Option<i64>,
+    ) -> AppResult<PurchasePayment>;
+    /// Link the refund transaction created by cancelling the purchase to the
+    /// payment row it refunds. The original `transaction_id` is left untouched.
+    async fn set_payment_refund_transaction(
+        &self,
+        payment_id: i64,
+        refund_transaction_id: i64,
     ) -> AppResult<PurchasePayment>;
     async fn list_payments(&self, purchase_id: i64) -> AppResult<Vec<PurchasePayment>>;
 }
@@ -355,17 +367,36 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
+        transaction_id: Option<i64>,
     ) -> AppResult<PurchasePayment> {
         let row = sqlx::query(
-            r#"INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date)
-               VALUES (?, ?, ?, ?, ?)
-               RETURNING id, purchase_id, account_id, method_id, amount, date, created_at"#,
+            r#"INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, transaction_id)
+               VALUES (?, ?, ?, ?, ?, ?)
+               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
         )
         .bind(purchase_id)
         .bind(account_id)
         .bind(method_id)
         .bind(amount.to_string())
         .bind(date)
+        .bind(transaction_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(row_to_payment(row))
+    }
+
+    async fn set_payment_refund_transaction(
+        &self,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<PurchasePayment> {
+        let row = sqlx::query(
+            r#"UPDATE purchase_payments SET refund_transaction_id = ? WHERE id = ?
+               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
+        )
+        .bind(refund_transaction_id)
+        .bind(payment_id)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -374,7 +405,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
 
     async fn list_payments(&self, purchase_id: i64) -> AppResult<Vec<PurchasePayment>> {
         let rows = sqlx::query(
-            r#"SELECT id, purchase_id, account_id, method_id, amount, date, created_at
+            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at
                FROM purchase_payments WHERE purchase_id = ? ORDER BY id"#,
         )
         .bind(purchase_id)

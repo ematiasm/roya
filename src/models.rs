@@ -55,6 +55,8 @@ pub struct Transaction {
     pub kind: TransactionKind,
     pub amount: Decimal,
     pub description: String,
+    /// Opaque source reference (document number). NULL for manual transactions.
+    pub reference: Option<String>,
     pub date: NaiveDate,
     pub created_at: chrono::NaiveDateTime,
 }
@@ -90,6 +92,8 @@ pub struct CreateTransactionRequest {
     pub kind: TransactionKind,
     pub amount: Decimal,
     pub description: Option<String>,
+    /// Optional opaque source reference; manual transactions omit it.
+    pub reference: Option<String>,
     pub date: NaiveDate,
 }
 
@@ -477,6 +481,10 @@ pub struct SalePayment {
     /// Decimal amount > 0, stored as TEXT.
     pub amount: Decimal,
     pub date: NaiveDate,
+    /// Finance transaction this payment created (NULL for historical rows).
+    pub transaction_id: Option<i64>,
+    /// Refund transaction created when the sale was cancelled, if any.
+    pub refund_transaction_id: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -731,6 +739,10 @@ pub struct PurchasePayment {
     /// Decimal amount > 0, stored as TEXT.
     pub amount: Decimal,
     pub date: NaiveDate,
+    /// Finance transaction this payment created (NULL for historical rows).
+    pub transaction_id: Option<i64>,
+    /// Refund transaction created when the purchase was cancelled, if any.
+    pub refund_transaction_id: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 

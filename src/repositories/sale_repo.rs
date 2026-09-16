@@ -64,6 +64,8 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> SalePayment {
         method_id: row.get("method_id"),
         amount: parse_decimal(&amt_str),
         date: row.get("date"),
+        transaction_id: row.get("transaction_id"),
+        refund_transaction_id: row.get("refund_transaction_id"),
         created_at: row.get("created_at"),
     }
 }
@@ -111,6 +113,8 @@ pub trait SaleRepository: Send + Sync {
         -> AppResult<SaleLine>;
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
+    /// Create the payment row and link it to the finance transaction it produced
+    /// (`transaction_id`); NULL only for historical rows.
     async fn create_payment(
         &self,
         sale_id: i64,
@@ -118,6 +122,14 @@ pub trait SaleRepository: Send + Sync {
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
+        transaction_id: Option<i64>,
+    ) -> AppResult<SalePayment>;
+    /// Link the refund transaction created by cancelling the sale to the payment
+    /// row it refunds. The original `transaction_id` is left untouched.
+    async fn set_payment_refund_transaction(
+        &self,
+        payment_id: i64,
+        refund_transaction_id: i64,
     ) -> AppResult<SalePayment>;
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>>;
 }
@@ -353,17 +365,36 @@ impl SaleRepository for SqliteSaleRepository {
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
+        transaction_id: Option<i64>,
     ) -> AppResult<SalePayment> {
         let row = sqlx::query(
-            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date)
-               VALUES (?, ?, ?, ?, ?)
-               RETURNING id, sale_id, account_id, method_id, amount, date, created_at"#,
+            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, transaction_id)
+               VALUES (?, ?, ?, ?, ?, ?)
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
         )
         .bind(sale_id)
         .bind(account_id)
         .bind(method_id)
         .bind(amount.to_string())
         .bind(date)
+        .bind(transaction_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(row_to_payment(row))
+    }
+
+    async fn set_payment_refund_transaction(
+        &self,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<SalePayment> {
+        let row = sqlx::query(
+            r#"UPDATE sale_payments SET refund_transaction_id = ? WHERE id = ?
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
+        )
+        .bind(refund_transaction_id)
+        .bind(payment_id)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -372,7 +403,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>> {
         let rows = sqlx::query(
-            r#"SELECT id, sale_id, account_id, method_id, amount, date, created_at
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at
                FROM sale_payments WHERE sale_id = ? ORDER BY id"#,
         )
         .bind(sale_id)
