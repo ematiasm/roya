@@ -818,3 +818,69 @@ pub struct PurchaseSuggestions {
     pub suggestions: Vec<PurchaseSuggestion>,
     pub without_supplier: Vec<PurchaseSuggestionWithoutSupplier>,
 }
+
+// ---------------------------------------------------------------------------
+// M4 customers (Slice K1). Customer CRUD only: the sales link and the derived
+// balance/ageing arrive in a later slice. Decimal-as-TEXT like the rest of the
+// project. A name is not unique on purpose; duplicates are reported as a
+// warning instead of blocking. is_walkin marks the single seeded cash default
+// ("Consumidor final"), which can never be deleted or deactivated.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Customer {
+    pub id: i64,
+    pub name: String,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub tax_id: Option<String>,
+    pub notes: Option<String>,
+    /// The seeded cash default. Exactly one row has this set.
+    pub is_walkin: bool,
+    pub is_active: bool,
+    /// Decimal >= 0 stored as TEXT; NULL means no limit.
+    pub credit_limit: Option<Decimal>,
+    /// Default credit term in days; NULL means no default term.
+    pub payment_days: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// Service-level input for customer creation. `is_walkin` is accepted only when
+/// no walk-in exists yet, which after the seed means never.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewCustomer {
+    pub name: String,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub tax_id: Option<String>,
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub is_walkin: bool,
+    /// None means no limit.
+    pub credit_limit: Option<Decimal>,
+    /// None means no default term.
+    pub payment_days: Option<i64>,
+}
+
+/// Service-level patch for customer edits. `Option<Option<T>>` distinguishes
+/// "leave unchanged" (`None`) from "clear" (`Some(None)`). `is_walkin` is not
+/// editable.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateCustomer {
+    pub name: Option<String>,
+    pub phone: Option<Option<String>>,
+    pub address: Option<Option<String>>,
+    pub tax_id: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
+    pub credit_limit: Option<Option<Decimal>>,
+    pub payment_days: Option<Option<i64>>,
+}
+
+/// Outcome of creating a customer: the new row plus any customers that already
+/// had that exact name, so the interface can warn without blocking (AC15).
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomerCreateResult {
+    pub customer: Customer,
+    pub name_matches: Vec<Customer>,
+}
