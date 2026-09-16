@@ -1,0 +1,65 @@
+/* Tailwind CSS v4 entrypoint for Roya.
+ *
+ * Build:  scripts/build-css.sh   (or: tailwindcss --input assets/tailwind.css --output static/tailwind.css --minify)
+ * The generated file static/tailwind.css is committed so `cargo run` works
+ * without the standalone CLI installed.
+ */
+@import "tailwindcss" source(none);
+
+/* Only scan the Askama templates; nothing else in the repo defines classes. */
+@source "../templates";
+
+/* Dark palette (kept in sync with the original hand-written stylesheet). */
+@theme {
+  --font-sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+
+  --color-bg: #0f1115;
+  --color-surface: #151821;
+  --color-card: #1a1d24;
+  --color-border: #2a2e3a;
+  --color-text: #e6e8eb;
+  --color-muted: #9aa0b0;
+  --color-accent: #6ee7b7;
+  --color-accent2: #60a5fa;
+  --color-danger: #f87171;
+  --color-income: #34d399;
+  --color-expense: #f87171;
+}
+
+/* Element defaults that keep the original visual language. */
+@layer base {
+  body {
+    @apply bg-bg font-sans text-text;
+  }
+
+  a {
+    @apply text-accent2 no-underline hover:underline;
+  }
+
+  label {
+    @apply block text-[13px] font-semibold tracking-[0.04em] text-muted uppercase;
+  }
+
+  input,
+  select,
+  textarea {
+    @apply w-full rounded-[10px] border border-border bg-bg px-3 py-2.5 text-sm text-text focus:border-accent2 focus:outline-none;
+  }
+
+  button {
+    @apply cursor-pointer rounded-[10px] border-0 bg-accent px-3.5 py-2.5 font-bold text-[#0a0f0d] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+}
+
+/* htmx toggles .htmx-request at runtime; utilities cannot express that pair. */
+@layer components {
+  .htmx-indicator {
+    opacity: 0;
+    transition: opacity 0.2s;
+  }
+
+  .htmx-request .htmx-indicator {
+    opacity: 1;
+  }
+}

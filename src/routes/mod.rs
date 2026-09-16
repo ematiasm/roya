@@ -7,6 +7,7 @@ pub mod web;
 
 use axum::Router;
 use sqlx::SqlitePool;
+use tower_http::services::ServeDir;
 
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
@@ -95,5 +96,47 @@ pub fn router(state: AppState) -> Router {
         .merge(inventory_web::router())
         .merge(sales_api::router())
         .merge(sales_web::router())
+        .nest_service("/static", ServeDir::new("static"))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+    use tower::ServiceExt;
+
+    use super::{router, AppState};
+
+    async fn test_state() -> AppState {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        AppState::new(pool, false, true)
+    }
+
+    #[tokio::test]
+    async fn static_assets_are_served_from_disk() {
+        let app = router(test_state().await);
+        for uri in ["/static/htmx.min.js", "/static/tailwind.css"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri} should be served");
+        }
+    }
 }

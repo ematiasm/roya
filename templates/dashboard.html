@@ -1,20 +1,20 @@
 {% extends "base.html" %}
 {% block title %}Roya — Dashboard{% endblock %}
 {% block content %}
-<div class="grid">
-  <div style="display:flex;flex-direction:column;gap:24px">
+<div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
+  <div class="flex flex-col gap-6">
     <!-- Total -->
-    <div class="card">
-      <div class="muted">Total Balance</div>
-      <div class="stat" id="total-balance">${{ total_balance }}</div>
-      <div class="muted">{% if allow_negative %}Negative balances allowed{% else %}Negative balances blocked{% endif %} • Derived from transactions</div>
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="text-[13px] text-muted">Total Balance</div>
+      <div class="text-[32px] font-bold" id="total-balance">${{ total_balance }}</div>
+      <div class="text-[13px] text-muted">{% if allow_negative %}Negative balances allowed{% else %}Negative balances blocked{% endif %} • Derived from transactions</div>
     </div>
 
     <!-- Accounts -->
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <h2 style="margin:0">Accounts</h2>
-        <button class="ghost" hx-get="/web/accounts" hx-target="#account-list" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">↻ Refresh</button>
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Accounts</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/accounts" hx-target="#account-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
       <div id="account-list"
            hx-get="/web/accounts"
@@ -25,44 +25,44 @@
     </div>
 
     <!-- Transaction history (filtered) -->
-    <div class="card" id="tx-section">
-      <h2>Recent Transactions</h2>
-      <div class="toolbar">
-        <select id="filter-account" name="account_id" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-from,#filter-to" hx-trigger="change">
+    <div class="rounded-2xl border border-border bg-card p-5" id="tx-section">
+      <h2 class="mb-3 text-lg font-semibold">Recent Transactions</h2>
+      <div class="mb-3 flex flex-wrap gap-2">
+        <select class="min-w-[120px] flex-1" id="filter-account" name="account_id" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-from,#filter-to" hx-trigger="change">
           <option value="">All accounts</option>
           {% for acc in accounts %}
           <option value="{{ acc.id }}">{{ acc.name }}</option>
           {% endfor %}
         </select>
-        <input id="filter-from" type="date" name="from" placeholder="From" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-to" hx-trigger="change" />
-        <input id="filter-to" type="date" name="to" placeholder="To" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-from" hx-trigger="change" />
+        <input class="min-w-[120px] flex-1" id="filter-from" type="date" name="from" placeholder="From" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-to" hx-trigger="change" />
+        <input class="min-w-[120px] flex-1" id="filter-to" type="date" name="to" placeholder="To" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-from" hx-trigger="change" />
       </div>
       <div id="tx-list" hx-get="/web/transactions" hx-trigger="load" hx-swap="innerHTML">
-        <div class="muted">Loading…</div>
+        <div class="text-[13px] text-muted">Loading…</div>
       </div>
     </div>
   </div>
 
-  <div style="display:flex;flex-direction:column;gap:24px">
+  <div class="flex flex-col gap-6">
     <!-- Create Account -->
-    <div class="card">
-      <h2>Create Account</h2>
-      <form hx-post="/web/accounts" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Create Account</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/accounts" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
         <div>
           <label>Name</label>
           <input type="text" name="name" placeholder="Cash, Bank, MercadoPago…" required maxlength="64" />
         </div>
         <button type="submit">Create Account</button>
-        <div class="muted">HTMX — no page reload. Also available at <code>POST /api/accounts</code></div>
+        <div class="text-[13px] text-muted">HTMX — no page reload. Also available at <code>POST /api/accounts</code></div>
       </form>
       <!-- hidden OOB target for account options refresh -->
-      <div id="account-options" style="display:none"></div>
+      <div id="account-options" class="hidden"></div>
     </div>
 
     <!-- Create Transaction -->
-    <div class="card">
-      <h2>New Transaction</h2>
-      <form hx-post="/web/transactions" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#tx-list','refresh'); }">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">New Transaction</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/transactions" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#tx-list','refresh'); }">
         <div>
           <label>Account</label>
           <select name="account_id" required id="tx-account-select">
@@ -70,9 +70,9 @@
             <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
             {% endfor %}
           </select>
-          <div class="muted">If empty, create an account first.</div>
+          <div class="text-[13px] text-muted">If empty, create an account first.</div>
         </div>
-        <div class="row">
+        <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
             <label>Type</label>
             <select name="type" required>
@@ -93,19 +93,19 @@
           <label>Date</label>
           <input type="date" name="date" required value="{{ today }}" />
         </div>
-        <button type="submit" class="secondary">Add Transaction</button>
-        <div class="muted">Balance is always derived <code>SUM(Income) − SUM(Expense)</code>. Amount must be &gt; 0.</div>
+        <button type="submit" class="bg-accent2 text-white">Add Transaction</button>
+        <div class="text-[13px] text-muted">Balance is always derived <code>SUM(Income) − SUM(Expense)</code>. Amount must be &gt; 0.</div>
       </form>
     </div>
 
-    <div class="card">
-      <h2>REST API</h2>
-      <div class="muted" style="font-size:13px;line-height:1.7">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
+      <div class="text-[13px] leading-[1.7] text-muted">
         <code>GET /api/accounts</code><br/>
-        <code>POST /api/accounts</code> <span class="muted">{ name }</span><br/>
+        <code>POST /api/accounts</code> <span class="text-[13px] text-muted">{ name }</span><br/>
         <code>GET /api/accounts/:id</code><br/>
         <code>GET /api/transactions?account_id=&from=&to=</code><br/>
-        <code>POST /api/transactions</code> <span class="muted">{ account_id, type, amount, description, date }</span><br/>
+        <code>POST /api/transactions</code> <span class="text-[13px] text-muted">{ account_id, type, amount, description, date }</span><br/>
         <code>PUT /api/transactions/:id</code><br/>
         <code>DELETE /api/transactions/:id</code><br/>
       </div>

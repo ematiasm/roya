@@ -82,6 +82,8 @@ ALLOW_NEGATIVE_BALANCE=true cargo run   # allow overdraft
 
 Visit `http://localhost:3000` for the dashboard. REST examples below.
 
+Static assets (`static/tailwind.css` and `static/htmx.min.js`) are committed and served locally at `/static/*`, so there is no CDN or npm setup. See [Styles & local assets](#styles--local-assets) to rebuild the CSS.
+
 ## Migrations (sqlx-cli)
 
 Migrations live in `migrations/*.sql` and are **embedded** (`sqlx::migrate!("./migrations")`), so `cargo run` applies them even without `sqlx-cli`. Use `sqlx-cli` only to create new ones:
@@ -278,7 +280,31 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
   - Record payment: `POST /web/sales/:id/payments` (HTMX)
   - Cancel: `POST /web/sales/:id/cancel` (HTMX)
 
-All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX loaded via CDN `https://unpkg.com/htmx.org@1.9.12`.
+All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
+
+Navigation: the header links Dashboard, Products and Sales; page-level links reach the detail/back views.
+
+## Styles & local assets
+
+The UI is styled with Tailwind CSS v4 utilities. The source of truth is `assets/tailwind.css`; the compiled stylesheet is committed at `static/tailwind.css`. Both files under `static/` are served by Axum at `/static/*` (`tower-http` `ServeDir` nested in `routes::router`), so the app has no CDN dependencies:
+
+- `static/tailwind.css` — compiled Tailwind stylesheet
+- `static/htmx.min.js` — HTMX 1.9.12
+
+Rebuild the CSS after changing templates or the entrypoint. The standalone Tailwind CLI is a dev-time tool only; it is not a Rust dependency and is not committed:
+
+```bash
+# Standalone CLI in PATH
+scripts/build-css.sh
+
+# Or with an explicit binary location
+TAILWINDCSS=~/.local/bin/tailwindcss scripts/build-css.sh
+
+# Or directly
+tailwindcss --input assets/tailwind.css --output static/tailwind.css --minify
+```
+
+The entrypoint imports Tailwind, scans only `templates/` (`@source`), and defines the dark palette as `@theme` tokens (`bg`, `surface`, `card`, `border`, `text`, `muted`, `accent`, `accent2`, `danger`, `income`, `expense`). Commit the regenerated `static/tailwind.css` together with the template change so `cargo run` keeps working without the CLI installed.
 
 ## Configuration
 
@@ -440,6 +466,10 @@ templates/products.html
 templates/sales.html
 templates/partials/*.html  — incl. sale_list.html, sale_detail.html
 migrations/*.sql
+assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/, @theme palette)
+static/tailwind.css        — compiled stylesheet (committed; rebuild via scripts/build-css.sh)
+static/htmx.min.js         — HTMX 1.9.12 served locally (no CDN)
+scripts/build-css.sh       — regenerates static/tailwind.css with the standalone CLI
 ```
 
 `src/templates/` placeholder exists for spec compliance; Askama loads from `templates/` at crate root (standard).
@@ -449,7 +479,7 @@ migrations/*.sql
 - No Diesel/SeaORM.
 - No microservices, no mandatory Docker (just `cargo run`).
 - No auth (local single-user).
-- `tower-http` trace + cors only.
+- `tower-http` trace + cors + static file serving (`ServeDir`).
 
 ## Tests (manual)
 

@@ -1,22 +1,22 @@
 <div id="tx-list-inner">
   {% if transactions.is_empty() %}
-    <div class="muted" style="padding:16px;text-align:center;border:1px dashed var(--border);border-radius:12px">No transactions for this filter.</div>
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No transactions for this filter.</div>
   {% else %}
     {% for tx in transactions %}
-    <div class="tx" id="tx-{{ tx.id }}">
-      <div class="tx-left">
-        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <span class="pill {% if tx.is_income() %}income{% else %}expense{% endif %}">{{ tx.kind }}</span>
-          <span style="font-weight:600">{{ tx.description }}</span>
-          <span class="muted" style="font-size:12px">acct #{{ tx.account_id }}</span>
+    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="tx-{{ tx.id }}">
+      <div class="flex flex-col">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if tx.is_income() %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ tx.kind }}</span>
+          <span class="font-semibold">{{ tx.description }}</span>
+          <span class="text-xs text-muted">acct #{{ tx.account_id }}</span>
         </div>
-        <span class="muted">{{ tx.date }} • #{{ tx.id }}</span>
+        <span class="text-[13px] text-muted">{{ tx.date }} • #{{ tx.id }}</span>
       </div>
-      <div style="display:flex;gap:12px;align-items:center">
-        <span class="tx-amount {% if tx.is_income() %}income{% else %}expense{% endif %}">
+      <div class="flex items-center gap-3">
+        <span class="font-bold tabular-nums {% if tx.is_income() %}text-income{% else %}text-expense{% endif %}">
           {% if tx.is_expense() %}-{% endif %}${{ tx.amount }}
         </span>
-        <button class="ghost" style="font-size:12px;padding:6px 10px"
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
                 hx-delete="/web/transactions/{{ tx.id }}"
                 hx-target="#tx-{{ tx.id }}"
                 hx-swap="outerHTML"

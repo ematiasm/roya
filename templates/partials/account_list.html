@@ -1,16 +1,16 @@
 <div>
-  <div class="muted" style="margin-bottom:10px">Total: <span style="font-weight:700;color:var(--text)">${{ total_balance }}</span> across {{ accounts.len() }} accounts</div>
+  <div class="mb-2.5 text-[13px] text-muted">Total: <span class="font-bold text-text">${{ total_balance }}</span> across {{ accounts.len() }} accounts</div>
   {% if accounts.is_empty() %}
-    <div class="muted" style="padding:16px;text-align:center;border:1px dashed var(--border);border-radius:12px">No accounts yet — create one on the right.</div>
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No accounts yet — create one on the right.</div>
   {% else %}
     {% for acc in accounts %}
-    <a href="/accounts/{{ acc.id }}" style="text-decoration:none;color:inherit">
-      <div class="account-row">
+    <a href="/accounts/{{ acc.id }}" class="block text-inherit no-underline hover:no-underline">
+      <div class="mb-2.5 flex items-center justify-between rounded-xl border border-border bg-surface px-4 py-3.5 transition-colors hover:border-accent2">
         <div>
-          <div class="account-name">{{ acc.name }}</div>
-          <div class="muted">#{{ acc.id }} • {{ acc.created_at.format("%Y-%m-%d") }}</div>
+          <div class="font-semibold">{{ acc.name }}</div>
+          <div class="text-[13px] text-muted">#{{ acc.id }} • {{ acc.created_at.format("%Y-%m-%d") }}</div>
         </div>
-        <div class="balance {% if acc.is_negative() %}negative{% else %}positive{% endif %}">${{ acc.balance }}</div>
+        <div class="font-bold tabular-nums {% if acc.is_negative() %}text-danger{% else %}text-income{% endif %}">${{ acc.balance }}</div>
       </div>
     </a>
     {% endfor %}

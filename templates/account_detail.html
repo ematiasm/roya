@@ -1,38 +1,38 @@
 {% extends "base.html" %}
 {% block title %}Roya — {{ account.name }}{% endblock %}
 {% block content %}
-<a href="/" class="muted">← Back to dashboard</a>
-<div class="card" style="margin-top:16px">
-  <div class="muted">Account</div>
-  <div style="display:flex;justify-content:space-between;align-items:center">
-    <h2 style="font-size:24px;margin:0">{{ account.name }}</h2>
-    <span class="balance {% if account.is_negative() %}negative{% else %}positive{% endif %}" style="font-size:22px">${{ account.balance }}</span>
+<a href="/" class="text-[13px] text-muted">← Back to dashboard</a>
+<div class="mt-4 rounded-2xl border border-border bg-card p-5">
+  <div class="text-[13px] text-muted">Account</div>
+  <div class="flex items-center justify-between gap-3">
+    <h2 class="m-0 text-2xl font-semibold">{{ account.name }}</h2>
+    <span class="text-[22px] font-bold tabular-nums {% if account.is_negative() %}text-danger{% else %}text-income{% endif %}">${{ account.balance }}</span>
   </div>
-  <div class="muted">Derived balance • ID {{ account.id }} • Created {{ account.created_at }}</div>
+  <div class="text-[13px] text-muted">Derived balance • ID {{ account.id }} • Created {{ account.created_at }}</div>
 </div>
 
-<div class="card">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-    <h2>History</h2>
-    <span class="badge">{{ transactions.len() }} transactions</span>
+<div class="mt-6 rounded-2xl border border-border bg-card p-5">
+  <div class="mb-3 flex items-center justify-between">
+    <h2 class="text-lg font-semibold">History</h2>
+    <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">{{ transactions.len() }} transactions</span>
   </div>
   {% if transactions.is_empty() %}
-    <div class="muted">No transactions yet. Add one from the dashboard.</div>
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No transactions yet. Add one from the dashboard.</div>
   {% else %}
     {% for tx in transactions %}
-    <div class="tx" id="tx-{{ tx.id }}">
-      <div class="tx-left">
-        <div style="display:flex;gap:8px;align-items:center">
-          <span class="pill {% if tx.is_income() %}income{% else %}expense{% endif %}">{{ tx.kind }}</span>
-          <span style="font-weight:600">{{ tx.description }}</span>
+    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="tx-{{ tx.id }}">
+      <div class="flex flex-col">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if tx.is_income() %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ tx.kind }}</span>
+          <span class="font-semibold">{{ tx.description }}</span>
         </div>
-        <span class="muted">{{ tx.date }} • #{{ tx.id }}</span>
+        <span class="text-[13px] text-muted">{{ tx.date }} • #{{ tx.id }}</span>
       </div>
-      <div style="display:flex;gap:12px;align-items:center">
-        <span class="tx-amount {% if tx.is_income() %}income{% else %}expense{% endif %}">
+      <div class="flex items-center gap-3">
+        <span class="font-bold tabular-nums {% if tx.is_income() %}text-income{% else %}text-expense{% endif %}">
           {% if tx.is_expense() %}-{% endif %}${{ tx.amount }}
         </span>
-        <button class="ghost" style="font-size:12px;padding:6px 10px"
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
                 hx-delete="/web/transactions/{{ tx.id }}"
                 hx-target="#tx-{{ tx.id }}"
                 hx-swap="outerHTML"
