@@ -30,17 +30,28 @@ async fn main() -> anyhow::Result<()> {
     let allow_negative_stock = std::env::var("ALLOW_NEGATIVE_STOCK")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(true);
+    let enforce_credit_limit = std::env::var("ENFORCE_CREDIT_LIMIT")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true);
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
-    tracing::info!(%database_url, allow_negative, allow_negative_stock, port, "starting roya");
+    tracing::info!(
+        %database_url,
+        allow_negative,
+        allow_negative_stock,
+        enforce_credit_limit,
+        port,
+        "starting roya"
+    );
 
     let pool = db::create_pool(&database_url).await?;
     tracing::info!("database ready (migrations applied)");
 
-    let state = routes::AppState::new(pool, allow_negative, allow_negative_stock);
+    let state =
+        routes::AppState::new_with_credit_limit(pool, allow_negative, allow_negative_stock, enforce_credit_limit);
 
     let cors = CorsLayer::new()
         .allow_origin(HeaderValue::from_static("*"))

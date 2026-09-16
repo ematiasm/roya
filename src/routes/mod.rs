@@ -14,13 +14,14 @@ use tower_http::services::ServeDir;
 
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-    SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
-    SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteSaleRepository,
-    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTransactionRepository,
+    SqliteCustomerRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
+    SqliteProductRepository, SqliteProductSupplierCostRepository, SqlitePurchaseRepository,
+    SqliteSaleRepository, SqliteStockMovementRepository, SqliteSupplierRepository,
+    SqliteTransactionRepository,
 };
 use crate::services::{
-    AccountService, InventoryService, PaymentMethodService, PurchasesService, SalesService,
-    SupplierService, TransactionService,
+    AccountService, CustomerService, InventoryService, PaymentMethodService, PurchasesService,
+    SalesService, SupplierService, TransactionService,
 };
 
 pub type InventorySvc = InventoryService<
@@ -40,7 +41,10 @@ pub type SalesSvc = SalesService<
     SqliteAccountRepository,
     SqliteTransactionRepository,
     SqlitePaymentMethodRepository,
+    SqliteCustomerRepository,
 >;
+
+pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
 
@@ -69,15 +73,30 @@ pub struct AppState {
         TransactionService<SqliteAccountRepository, SqliteTransactionRepository>,
     pub inventory_service: InventorySvc,
     pub sales_service: SalesSvc,
+    pub customer_service: CustomerSvc,
     pub payment_method_service: MethodSvc,
     pub supplier_service: SupplierSvc,
     pub purchases_service: PurchasesSvc,
     pub allow_negative: bool,
     pub allow_negative_stock: bool,
+    /// `ENFORCE_CREDIT_LIMIT` (default true): the sales service rejects a credit
+    /// confirm whose projected debt exceeds the customer's limit.
+    pub enforce_credit_limit: bool,
 }
 
 impl AppState {
+    /// Compatibility constructor: credit-limit enforcement defaults to true,
+    /// exactly like `main` when the env var is absent.
     pub fn new(pool: SqlitePool, allow_negative: bool, allow_negative_stock: bool) -> Self {
+        Self::new_with_credit_limit(pool, allow_negative, allow_negative_stock, true)
+    }
+
+    pub fn new_with_credit_limit(
+        pool: SqlitePool,
+        allow_negative: bool,
+        allow_negative_stock: bool,
+        enforce_credit_limit: bool,
+    ) -> Self {
         let acc_repo = SqliteAccountRepository::new(pool.clone());
         let tx_repo = SqliteTransactionRepository::new(pool.clone());
         let account_service = AccountService::new(acc_repo.clone(), tx_repo.clone());
@@ -92,12 +111,16 @@ impl AppState {
         );
         let method_repo = SqlitePaymentMethodRepository::new(pool.clone());
         let payment_method_service = PaymentMethodService::new(method_repo.clone());
+        let customer_service =
+            CustomerService::new(SqliteCustomerRepository::new(pool.clone()));
         let sales_service = SalesService::new(
             SqliteSaleRepository::new(pool.clone()),
             SqliteDocSequenceRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
             method_repo.clone(),
+            customer_service.clone(),
+            enforce_credit_limit,
         );
         // M3: suppliers + product/supplier cost satellite are consumed by the
         // purchases orchestrator; both share the same SQLite repos as the rest
@@ -120,11 +143,13 @@ impl AppState {
             transaction_service,
             inventory_service,
             sales_service,
+            customer_service,
             payment_method_service,
             supplier_service,
             purchases_service,
             allow_negative,
             allow_negative_stock,
+            enforce_credit_limit,
         }
     }
 }

@@ -442,6 +442,10 @@ pub struct Sale {
     pub sale_number: Option<String>,
     pub status: SaleStatus,
     pub payment_type: PaymentType,
+    /// The owning customer; the seeded walk-in for anonymous cash sales.
+    pub customer_id: i64,
+    /// Frozen snapshot of the customer's name at creation time, so correcting the
+    /// customer never rewrites history.
     pub customer_name: String,
     pub sale_date: NaiveDate,
     pub due_date: Option<NaiveDate>,
@@ -514,10 +518,11 @@ pub struct DocSequence {
     pub last_number: i64,
 }
 
-/// Service-level input for sale creation (Draft).
+/// Service-level input for sale creation (Draft). The service resolves the
+/// customer through `CustomerService` and freezes `customer_name` from it.
 #[derive(Debug, Clone)]
 pub struct NewSale {
-    pub customer_name: String,
+    pub customer_id: i64,
     pub payment_type: PaymentType,
     pub sale_date: NaiveDate,
     pub due_date: Option<NaiveDate>,
@@ -525,10 +530,10 @@ pub struct NewSale {
     pub notes: Option<String>,
 }
 
-/// Service-level patch for Draft header edits.
+/// Service-level patch for Draft header edits. The customer (and therefore the
+/// name snapshot) is fixed at creation; only dates, receipt and notes are edited.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateSaleDraft {
-    pub customer_name: Option<String>,
     pub sale_date: Option<NaiveDate>,
     pub due_date: Option<Option<NaiveDate>>,
     pub receipt_no: Option<Option<String>>,

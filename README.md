@@ -23,9 +23,23 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
   there is no deterministic way to know which one a payment created), but they
   are still fully traceable through `reference`.
 - **Sales** — Draft → Confirmed → Cancelled orchestrator (Odoo-style):
+  - Every sale carries a mandatory `customer_id` (`NOT NULL`, indexed, RESTRICT).
+    Cash sales default to the seeded walk-in (`Consumidor final`) in the sale
+    form; `customer_name` is frozen as a snapshot of the customer's name at
+    creation time, so correcting a customer never rewrites history.
   - Draft creates lines with no stock/finance side effects.
   - Confirm assigns `YYYY-SALE-NNNNNN`, deducts stock (`Out`, reason `Sale`),
     Cash posts 1 Income with method, Credit opens a receivable (due = total).
+  - Credit rejects the walk-in customer (400): a receivable needs a real
+    customer. When the customer has a `credit_limit` and
+    `ENFORCE_CREDIT_LIMIT=true` (the default), confirming a credit sale whose
+    projected debt (`customer debt + total`) exceeds the limit returns 400 with
+    the projected figure; a null limit is never checked. The debt is derived
+    from confirmed credit sales minus their payments, so cancelled sales stop
+    counting.
+  - For a credit sale without `due_date`, the due date defaults to
+    `sale_date + customer.payment_days`; without a term on the customer it is
+    required (400). An explicit date always wins.
   - Payments carry `account_id + method_id` (N per sale, mixed accounts/methods,
     sum ≤ total); each posts 1 Income; overpay ⇒ 400; Paid when due = 0.
   - `account_payment_methods` allowlist enforced (400) before any stock/sequence/
@@ -112,6 +126,7 @@ cp env.example .env
 # DATABASE_URL=sqlite://roya.db
 # ALLOW_NEGATIVE_BALANCE=false
 # ALLOW_NEGATIVE_STOCK=true
+# ENFORCE_CREDIT_LIMIT=true
 # RUST_LOG=info
 
 # 4. Run (migrations run automatically via sqlx::migrate! at startup)
@@ -257,8 +272,10 @@ curl http://localhost:3000/api/negative-stock
 # Sales (Draft -> Confirmed -> Cancelled orchestrator)
 curl -X POST http://localhost:3000/api/sales \
   -H "Content-Type: application/json" \
-  -d '{"customer_name":"Ana","payment_type":"Cash","sale_date":"2024-05-02"}'
-# -> 201 sale detail (sale_number null while Draft; Credit needs due_date)
+  -d '{"customer_id":1,"payment_type":"Cash","sale_date":"2024-05-02"}'
+# -> 201 sale detail (customer_id required: unknown => 404; customer_name is
+#    snapshotted from the customer. sale_number null while Draft; for Credit
+#    due_date is optional when the customer has a payment term.)
 
 curl -X POST http://localhost:3000/api/sales/1/lines \
   -H "Content-Type: application/json" \
@@ -267,8 +284,9 @@ curl -X POST http://localhost:3000/api/sales/1/lines \
 
 curl -X PUT http://localhost:3000/api/sales/1 \
   -H "Content-Type: application/json" \
-  -d '{"customer_name":"Ana Gomez"}'
-# -> 200 detail (Draft only; edit Confirmed => 400)
+  -d '{"notes":"llamar antes de entregar"}'
+# -> 200 detail (Draft only; the customer and name snapshot are immutable;
+#    edit Confirmed => 400)
 
 curl -X POST http://localhost:3000/api/sales/1/confirm \
   -H "Content-Type: application/json" \
@@ -483,6 +501,7 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
 | `DATABASE_URL` | `sqlite://roya.db` | SQLite file (or `postgres://...`) |
 | `ALLOW_NEGATIVE_BALANCE` | `false` | If `false`, Expense that would make balance negative is rejected (also on edit/delete of Income) |
 | `ALLOW_NEGATIVE_STOCK` | `true` | If `false`, Out that would make stock negative is rejected (400, stock unchanged); if `true`, Out succeeds (201) and product appears in negative list |
+| `ENFORCE_CREDIT_LIMIT` | `true` | If `true`, confirming a credit sale whose projected debt exceeds the customer's `credit_limit` is rejected (400); a null limit is unlimited either way. If `false`, the sale is confirmed and the interface reports the customer as over limit |
 | `PORT` | `3000` | HTTP port |
 | `RUST_LOG` | `info` | tracing filter |
 
@@ -500,13 +519,21 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
   - `create Expense`: `projected = current_balance - amount` must be `>=0`.
   - `update`: recomputes `current - old_signed + new_signed`.
   - `delete Income`: `projected = current - amount` must be `>=0`.
-- `Sale` rules: Draft editable (lines/customer/dates); Confirmed/Cancelled immutable
-  except Cancel. `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
-  Draft/Cancelled-from-Draft. Credit requires `due_date >= sale_date`, Cash forbids it.
-  `qty > 0`, `unit_price >= 0`, payments carry `account_id + method_id` (N per sale,
+- `Sale` rules: Draft editable (lines/dates/notes); Confirmed/Cancelled immutable
+  except Cancel. The customer is fixed at creation: `customer_id` is mandatory
+  (`NOT NULL`, RESTRICT) and `customer_name` is the customer's name snapshotted
+  at creation, never rewritten by later corrections. Credit to the walk-in
+  returns 400; with `ENFORCE_CREDIT_LIMIT=true` and a customer limit, confirming
+  a credit sale whose projected debt (`confirmed credit sales − their payments`
+  plus this sale) exceeds the limit returns 400 with the projected figure; a
+  null limit is never checked and `ENFORCE_CREDIT_LIMIT=false` confirms the sale
+  (the customer reads as over limit). Credit without `due_date` defaults to
+  `sale_date + payment_days`, and without a term the due date is required.
+  `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
+  Draft/Cancelled-from-Draft. Cash forbids `due_date`. `qty > 0`,
+  `unit_price >= 0`, payments carry `account_id + method_id` (N per sale,
   mixed, sum ≤ total), reject overpay (`paid + amount <= total`) and disallowed
   `(account,method)` (400, no stock/sequence/finance touch).
-  No new env vars for sales (reuses `ALLOW_NEGATIVE_BALANCE` / `ALLOW_NEGATIVE_STOCK`).
 - `PaymentMethod` rules: `name` UNIQUE, `is_active` 0/1; allowlist
   `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id` RESTRICT
   NOT NULL; unknown method => 404, inactive/disallowed => 400.

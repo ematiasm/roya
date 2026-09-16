@@ -4,13 +4,23 @@
 ```
 routes/customers_api.rs + customers_web.rs -> CustomerService
   -> CustomerRepository + CustomerReceiptRepository
-  -> SalesService (read sales and their payments for the balance, apply a receipt through it)
   -> PaymentMethodService (allowlist check, reused from finance)
-  -> TransactionService (the movement of each allocation, reached through SalesService)
+
+routes/sales_*.rs -> SalesService
+  -> CustomerService (validate the customer, reject credit to the walk-in, credit limit)
+  -> CustomerReceiptRepository (apply a receipt through the sales it covers)
+  -> InventoryService, TransactionService, PaymentMethodService
 ```
 Customers sit **above** sales, exactly like sales sit above finance and inventory: customers may read
-sales, sales never read customers' tables, and finance never learns that customers exist. Balance and
-ageing are derived by reading confirmed credit sales and their payments, never stored.
+sales, sales never read customers' tables, and finance never learns that customers exist.
+
+**Correction made during slicing.** The first version of this design had `CustomerService` reading sales
+through `SalesService` to compute the balance. That is circular: sales needs customers to validate a sale,
+and customers would need sales to derive a balance. The receivable is therefore owned by the module it is
+derived from: `SalesService` exposes the customer balance, the statement and the ageing, because they are
+computed from sales and payments, while `CustomerService` owns the customer entity and its rules (the
+walk-in, the credit limit value, the payment term, duplicate names). Routes compose the two. No service
+depends on a service that depends on it.
 
 ## Migrations
 1. `create_customers` — table, index on `is_active`, index on `is_walkin`, and the seeded walk-in row

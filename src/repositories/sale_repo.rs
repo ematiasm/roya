@@ -29,6 +29,7 @@ fn row_to_sale(row: sqlx::sqlite::SqliteRow) -> Sale {
         sale_number: row.get("sale_number"),
         status: status_from_str(&status_str),
         payment_type: payment_type_from_str(&payment_str),
+        customer_id: row.get("customer_id"),
         customer_name: row.get("customer_name"),
         sale_date: row.get("sale_date"),
         due_date: row.get("due_date"),
@@ -89,10 +90,15 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 
 #[async_trait]
 pub trait SaleRepository: Send + Sync {
-    async fn create_sale(&self, input: &NewSale) -> AppResult<Sale>;
+    /// `customer_name` is the snapshot resolved by the service through
+    /// `CustomerService`; this layer never reads the `customers` table.
+    async fn create_sale(&self, input: &NewSale, customer_name: &str) -> AppResult<Sale>;
     async fn find_sale(&self, id: i64) -> AppResult<Option<Sale>>;
     async fn find_sale_by_number(&self, number: &str) -> AppResult<Option<Sale>>;
     async fn list_sales(&self) -> AppResult<Vec<Sale>>;
+    /// Confirmed credit sales of one customer, oldest first. Feeds the derived
+    /// receivable used by the credit-limit check; cancelled sales never count.
+    async fn list_confirmed_credit_sales(&self, customer_id: i64) -> AppResult<Vec<Sale>>;
     /// Update Draft header fields (service guarantees Draft status).
     async fn update_draft(&self, id: i64, patch: &UpdateSaleDraft) -> AppResult<Sale>;
     /// Transition Draft -> Confirmed with assigned number.
@@ -147,7 +153,7 @@ impl SqliteSaleRepository {
 
 #[async_trait]
 impl SaleRepository for SqliteSaleRepository {
-    async fn create_sale(&self, input: &NewSale) -> AppResult<Sale> {
+    async fn create_sale(&self, input: &NewSale, customer_name: &str) -> AppResult<Sale> {
         let receipt = input.receipt_no.clone().and_then(|s| {
             let t = s.trim().to_string();
             if t.is_empty() {
@@ -159,12 +165,13 @@ impl SaleRepository for SqliteSaleRepository {
         let notes = input.notes.clone().unwrap_or_default();
         let row = sqlx::query(
             r#"INSERT INTO sales
-               (status, payment_type, customer_name, sale_date, due_date, receipt_no, notes)
-               VALUES ('Draft', ?, ?, ?, ?, ?, ?)
-               RETURNING id, sale_number, status, payment_type, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               (status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes)
+               VALUES ('Draft', ?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(input.payment_type.to_string())
-        .bind(input.customer_name.clone())
+        .bind(input.customer_id)
+        .bind(customer_name)
         .bind(input.sale_date)
         .bind(input.due_date)
         .bind(receipt)
@@ -177,7 +184,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn find_sale(&self, id: i64) -> AppResult<Option<Sale>> {
         let row = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE id = ?"#,
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -187,7 +194,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn find_sale_by_number(&self, number: &str) -> AppResult<Option<Sale>> {
         let row = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE sale_number = ?"#,
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE sale_number = ?"#,
         )
         .bind(number)
         .fetch_optional(&self.pool)
@@ -197,8 +204,21 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn list_sales(&self) -> AppResult<Vec<Sale>> {
         let rows = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales ORDER BY id"#,
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales ORDER BY id"#,
         )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_sale).collect())
+    }
+
+    async fn list_confirmed_credit_sales(&self, customer_id: i64) -> AppResult<Vec<Sale>> {
+        let rows = sqlx::query(
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at
+               FROM sales
+               WHERE customer_id = ? AND status = 'Confirmed' AND payment_type = 'Credit'
+               ORDER BY id"#,
+        )
+        .bind(customer_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_sale).collect())
@@ -210,7 +230,6 @@ impl SaleRepository for SqliteSaleRepository {
             .await?
             .ok_or_else(|| AppError::NotFound(format!("sale {id} not found")))?;
 
-        let customer_name = patch.customer_name.clone().unwrap_or(existing.customer_name);
         let sale_date = patch.sale_date.unwrap_or(existing.sale_date);
         let due_date = match &patch.due_date {
             Some(inner) => *inner,
@@ -231,11 +250,10 @@ impl SaleRepository for SqliteSaleRepository {
 
         let row = sqlx::query(
             r#"UPDATE sales
-               SET customer_name = ?, sale_date = ?, due_date = ?, receipt_no = ?, notes = ?,
+               SET sale_date = ?, due_date = ?, receipt_no = ?, notes = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
-        .bind(customer_name)
         .bind(sale_date)
         .bind(due_date)
         .bind(receipt_no)
@@ -253,7 +271,7 @@ impl SaleRepository for SqliteSaleRepository {
                SET sale_number = ?, status = 'Confirmed',
                    confirmed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(sale_number)
         .bind(id)
@@ -277,7 +295,7 @@ impl SaleRepository for SqliteSaleRepository {
                SET status = 'Cancelled', cancel_reason = ?,
                    cancelled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(clean)
         .bind(id)
@@ -410,5 +428,216 @@ impl SaleRepository for SqliteSaleRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_payment).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    async fn memory_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true)
+            // Same posture as db::create_pool so the walk-in backstops fire
+            // exactly as they do in production.
+            .pragma("recursive_triggers", "1");
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap()
+    }
+
+    /// AC16: the K2 migration runs against a database that already has sales,
+    /// lines and payments. It must backfill every sale to the seeded walk-in and
+    /// enforce `NOT NULL` without losing a single child row (the parent swap
+    /// would otherwise cascade-delete them).
+    #[tokio::test]
+    async fn ac16_add_sales_customer_backfills_walkin_and_preserves_rows() {
+        let pool = memory_pool().await;
+
+        // Replay every migration except the K2 one so the legacy schema is real.
+        let migrator = sqlx::migrate!("./migrations");
+        let mut applied: Vec<String> = Vec::new();
+        for migration in migrator.iter() {
+            if migration.description.contains("add sales customer") {
+                continue;
+            }
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(&pool)
+                .await
+                .unwrap();
+            applied.push(migration.description.to_string());
+        }
+        assert!(
+            applied.iter().any(|d| d.contains("create sales")),
+            "legacy sales schema must exist before K2: {applied:?}"
+        );
+        assert!(
+            applied.iter().any(|d| d.contains("create customers")),
+            "K1 customers schema must exist before K2: {applied:?}"
+        );
+
+        // Legacy data going through the rebuild: sale + line + payment.
+        let (walkin_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let (account_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO accounts (name) VALUES ('legacy wallet') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (method_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let (product_id,): (i64,) = sqlx::query_as(
+            r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock)
+               VALUES ('LEGACY-P', 'legacy prod', 'Product', 'un', '10', 1)
+               RETURNING id"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (legacy_sale_id,): (i64,) = sqlx::query_as(
+            r#"INSERT INTO sales (sale_number, status, payment_type, customer_name, sale_date, due_date)
+               VALUES ('2024-SALE-000001', 'Confirmed', 'Credit', 'Legacy buyer', '2024-05-02', '2024-06-01')
+               RETURNING id"#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO sale_lines (sale_id, product_id, qty, unit_price)
+               VALUES (?, ?, '2', '10')"#,
+        )
+        .bind(legacy_sale_id)
+        .bind(product_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date)
+               VALUES (?, ?, ?, '5', '2024-05-10')"#,
+        )
+        .bind(legacy_sale_id)
+        .bind(account_id)
+        .bind(method_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Apply the K2 migration to the populated database.
+        let k2 = migrator
+            .iter()
+            .find(|m| m.description.contains("add sales customer"))
+            .expect("add_sales_customer migration is missing");
+        sqlx::raw_sql(k2.sql.clone())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Backfill: the legacy sale belongs to the walk-in and keeps its snapshot.
+        let (customer_id, customer_name): (i64, String) =
+            sqlx::query_as("SELECT customer_id, customer_name FROM sales WHERE id = ?")
+                .bind(legacy_sale_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            customer_id, walkin_id,
+            "legacy sales must be backfilled to the seeded walk-in"
+        );
+        assert_eq!(
+            customer_name, "Legacy buyer",
+            "the legacy customer_name snapshot must not be rewritten"
+        );
+
+        // Child rows survived the parent rebuild.
+        let (lines,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?")
+                .bind(legacy_sale_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let (payments,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
+                .bind(legacy_sale_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(lines, 1, "the rebuild must preserve sale lines");
+        assert_eq!(payments, 1, "the rebuild must preserve sale payments");
+
+        // NOT NULL and FK enforcement on the rebuilt column.
+        assert!(
+            sqlx::query("INSERT INTO sales (status, payment_type, sale_date) VALUES ('Draft', 'Cash', '2024-05-03')")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "customer_id must be NOT NULL"
+        );
+        assert!(
+            sqlx::query(
+                "INSERT INTO sales (status, payment_type, customer_id, sale_date) VALUES ('Draft', 'Cash', 99999, '2024-05-03')"
+            )
+            .execute(&pool)
+            .await
+            .is_err(),
+            "unknown customers must be rejected by the foreign key"
+        );
+
+        // Indexes recreated (the old ones die with the dropped table).
+        let (customer_idx,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_sales_customer_id'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(customer_idx, 1, "customer_id must be indexed");
+        let (kept_idx,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_sales_status', 'idx_sales_sale_date')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kept_idx, 2, "pre-existing sales indexes must survive");
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check").execute(&pool).await.is_ok(),
+            "the rebuilt database must pass the foreign key check"
+        );
+    }
+
+    /// AC17: the sales storage layer never reads another module's tables, so
+    /// `customers` is reached exclusively through `CustomerService`. The needles
+    /// are assembled at runtime so this assertion cannot match its own source.
+    #[test]
+    fn ac17_sale_repository_never_reads_the_customers_table() {
+        let source = include_str!("sale_repo.rs");
+        // Only the production half; the migration fixture below reconstructs the
+        // pre-K2 schema and would otherwise match its own needles.
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("source must have a production half");
+        assert!(
+            production.len() < source.len(),
+            "the test module marker must split the source"
+        );
+        let table = "customers";
+        for verb in ["FROM", "JOIN", "INTO", "UPDATE", "TABLE"] {
+            let needle = format!("{verb} {table}");
+            assert!(
+                !production.contains(&needle),
+                "sale_repo must not run `{needle}` SQL; sales reach customers through CustomerService"
+            );
+        }
     }
 }

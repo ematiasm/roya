@@ -35,6 +35,7 @@ struct SalesTemplate {
     products: Vec<crate::models::Product>,
     accounts: Vec<crate::models::AccountWithBalance>,
     methods: Vec<crate::models::PaymentMethod>,
+    customers: Vec<crate::models::Customer>,
     allow_negative: bool,
     allow_negative_stock: bool,
     today: String,
@@ -133,6 +134,7 @@ async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppEr
     let products = state.inventory_service.products.list().await?;
     let accounts = state.account_service.list_with_balances().await?;
     let methods = state.payment_method_service.list().await?;
+    let customers = state.customer_service.list_customers(true).await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = SalesTemplate {
         title: "All sales".to_string(),
@@ -141,6 +143,7 @@ async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppEr
         products,
         accounts,
         methods,
+        customers,
         allow_negative: state.allow_negative,
         allow_negative_stock: state.allow_negative_stock,
         today,
@@ -175,7 +178,7 @@ async fn web_sale_detail(
 #[derive(Debug, Deserialize)]
 pub struct CreateSaleForm {
     #[serde(default)]
-    pub customer_name: String,
+    pub customer_id: Option<i64>,
     #[serde(default)]
     pub payment_type: String,
     #[serde(default)]
@@ -259,10 +262,13 @@ async fn web_create_sale(
             AppError::Validation("invalid due_date (YYYY-MM-DD)".into())
         })?)
     };
+    let customer_id = form
+        .customer_id
+        .ok_or_else(|| AppError::Validation("customer is required".into()))?;
     let _sale = state
         .sales_service
         .create_draft(crate::models::NewSale {
-            customer_name: form.customer_name,
+            customer_id,
             payment_type,
             sale_date: parse_date_or_today(&form.sale_date)?,
             due_date,
@@ -461,7 +467,9 @@ mod tests {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Same posture as db::create_pool: customer triggers fire under REPLACE.
+            .pragma("recursive_triggers", "1");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -469,6 +477,24 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         AppState::new(pool, false, true)
+    }
+
+    async fn seed_customer(state: &AppState, name: &str) -> crate::models::Customer {
+        state
+            .customer_service
+            .create_customer(crate::models::NewCustomer {
+                name: name.into(),
+                phone: None,
+                address: None,
+                tax_id: None,
+                notes: None,
+                is_walkin: false,
+                credit_limit: None,
+                payment_days: None,
+            })
+            .await
+            .unwrap()
+            .customer
     }
 
     async fn get_html(app: axum::Router, uri: &str) -> (StatusCode, String) {
@@ -651,12 +677,14 @@ mod tests {
             .find(|m| m.name == "Cash")
             .expect("Cash method is seeded by migrations");
 
+        let payer = seed_customer(&state, "Web Payer").await;
+
         let mut sale_ids = Vec::new();
         for _ in 0..2 {
             let sale = state
                 .sales_service
                 .create_draft(NewSale {
-                    customer_name: "Web Payer".into(),
+                    customer_id: payer.id,
                     payment_type: PaymentType::Credit,
                     sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
                     due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
@@ -736,12 +764,14 @@ mod tests {
             .await
             .unwrap();
 
+        let typist = seed_customer(&state, "Web Typist").await;
+
         let mut sale_ids = Vec::new();
         for _ in 0..2 {
             let sale = state
                 .sales_service
                 .create_draft(NewSale {
-                    customer_name: "Web Typist".into(),
+                    customer_id: typist.id,
                     payment_type: PaymentType::Credit,
                     sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
                     due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
@@ -841,8 +871,12 @@ mod tests {
     #[tokio::test]
     async fn web_create_sale_then_list_shows_it() {
         let state = test_state().await;
+        let customer = seed_customer(&state, "Web Client").await;
         let app = crate::routes::router(state);
-        let body = "customer_name=Web+Client&payment_type=Cash&sale_date=2024-05-02";
+        let body = format!(
+            "customer_id={}&payment_type=Cash&sale_date=2024-05-02",
+            customer.id
+        );
         let req = Request::builder()
             .method("POST")
             .uri("/web/sales")
@@ -858,5 +892,44 @@ mod tests {
             html.contains("Web Client"),
             "fragment should contain new customer: {html:.300}"
         );
+    }
+
+    // -- K2: the sale form carries a mandatory customer -----------------------
+
+    /// AC2: the selector defaults to the walk-in, so a cash sale needs no choice.
+    #[tokio::test]
+    async fn k2_sale_form_defaults_to_the_walkin_customer() {
+        let app = crate::routes::router(test_state().await);
+        let (status, html) = get_html(app, "/sales").await;
+        assert_eq!(status, StatusCode::OK);
+        let select_start = html
+            .find("name=\"customer_id\"")
+            .expect("the sale form must render a customer selector");
+        let select_end = html[select_start..]
+            .find("</select>")
+            .expect("customer selector must close");
+        let select = &html[select_start..select_start + select_end];
+        let selected_option = select
+            .split("<option")
+            .find(|option| option.contains("selected"))
+            .expect("the walk-in option must carry selected");
+        assert!(
+            selected_option.contains("Consumidor final"),
+            "the preselected option must be the walk-in: {selected_option}"
+        );
+    }
+
+    /// AC2: omitting the customer in the form is a 400, never an ownerless sale.
+    #[tokio::test]
+    async fn k2_sale_form_without_customer_is_rejected() {
+        let app = crate::routes::router(test_state().await);
+        let (status, body) = post_form(
+            app,
+            "/web/sales",
+            "payment_type=Cash&sale_date=2024-05-02",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_lowercase().contains("customer"), "{body}");
     }
 }

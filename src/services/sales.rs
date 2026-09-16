@@ -25,17 +25,19 @@ use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    format_sale_number, MovementReason, MovementType, NewMovement, NewSale, PaymentStatus,
-    PaymentType, ProductKind, Sale, SaleDetail, SaleLine, SalePayment, UpdateSaleDraft,
+    format_sale_number, Customer, MovementReason, MovementType, NewMovement, NewSale,
+    PaymentStatus, PaymentType, ProductKind, Sale, SaleDetail, SaleLine, SalePayment,
+    UpdateSaleDraft,
 };
 use crate::repositories::{
-    AccountRepository, BarcodeRepository, CategoryRepository, DocSequenceRepository,
-    PaymentMethodRepository, ProductRepository, SaleRepository, StockMovementRepository,
-    TransactionRepository,
+    AccountRepository, BarcodeRepository, CategoryRepository, CustomerRepository,
+    DocSequenceRepository, PaymentMethodRepository, ProductRepository, SaleRepository,
+    StockMovementRepository, TransactionRepository,
 };
+use crate::services::CustomerService;
 
 #[derive(Clone)]
-pub struct SalesService<SR, DR, C, P, B, S, A, T, PM>
+pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -46,15 +48,22 @@ where
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
     PM: PaymentMethodRepository,
+    CR: CustomerRepository,
 {
     pub sales: SR,
     pub sequences: DR,
     pub inventory: crate::services::InventoryService<C, P, B, S>,
     pub transactions: crate::services::TransactionService<A, T>,
     pub payment_methods: PM,
+    /// Sales reach customers only through this service: the sale rows store a
+    /// snapshot, and no sales repository runs SQL against the `customers` table.
+    pub customers: CustomerService<CR>,
+    /// `ENFORCE_CREDIT_LIMIT`: when false an over-limit credit sale is confirmed
+    /// and the interface reports the customer as over limit instead.
+    pub enforce_credit_limit: bool,
 }
 
-impl<SR, DR, C, P, B, S, A, T, PM> SalesService<SR, DR, C, P, B, S, A, T, PM>
+impl<SR, DR, C, P, B, S, A, T, PM, CR> SalesService<SR, DR, C, P, B, S, A, T, PM, CR>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -65,6 +74,7 @@ where
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
     PM: PaymentMethodRepository,
+    CR: CustomerRepository,
 {
     pub fn new(
         sales: SR,
@@ -72,6 +82,8 @@ where
         inventory: crate::services::InventoryService<C, P, B, S>,
         transactions: crate::services::TransactionService<A, T>,
         payment_methods: PM,
+        customers: CustomerService<CR>,
+        enforce_credit_limit: bool,
     ) -> Self {
         Self {
             sales,
@@ -79,6 +91,8 @@ where
             inventory,
             transactions,
             payment_methods,
+            customers,
+            enforce_credit_limit,
         }
     }
 
@@ -113,14 +127,45 @@ where
 
     // -- validation helpers -------------------------------------------------
 
-    fn clean_customer(name: &str) -> AppResult<String> {
-        let t = name.trim();
-        if t.chars().count() > 128 {
-            return Err(AppError::Validation(
-                "customer_name must be <= 128 chars".into(),
-            ));
+    /// Effective due date. An explicit date wins; for a credit sale without one
+    /// the customer's payment term supplies the default (`sale_date + days`), and
+    /// without a term the due date is required. Cash never carries one.
+    fn resolve_due_date(
+        payment_type: PaymentType,
+        sale_date: NaiveDate,
+        requested: Option<NaiveDate>,
+        customer: &Customer,
+    ) -> AppResult<Option<NaiveDate>> {
+        match payment_type {
+            PaymentType::Cash => {
+                if requested.is_some() {
+                    return Err(AppError::Validation(
+                        "due_date must be NULL for Cash".into(),
+                    ));
+                }
+                Ok(None)
+            }
+            PaymentType::Credit => {
+                let due = match requested {
+                    Some(date) => date,
+                    None => {
+                        let days = customer.payment_days.ok_or_else(|| {
+                            AppError::Validation(
+                                "due_date is required for Credit when the customer has no payment term"
+                                    .into(),
+                            )
+                        })?;
+                        sale_date + chrono::Duration::days(days)
+                    }
+                };
+                if due < sale_date {
+                    return Err(AppError::Validation(
+                        "due_date must be >= sale_date".into(),
+                    ));
+                }
+                Ok(Some(due))
+            }
         }
-        Ok(t.to_string())
     }
 
     fn clean_notes(notes: &Option<String>) -> AppResult<String> {
@@ -148,33 +193,6 @@ where
                 }
             }
         }
-    }
-
-    fn validate_dates(
-        payment_type: PaymentType,
-        sale_date: NaiveDate,
-        due_date: Option<NaiveDate>,
-    ) -> AppResult<()> {
-        match payment_type {
-            PaymentType::Cash => {
-                if due_date.is_some() {
-                    return Err(AppError::Validation(
-                        "due_date must be NULL for Cash".into(),
-                    ));
-                }
-            }
-            PaymentType::Credit => {
-                let due = due_date.ok_or_else(|| {
-                    AppError::Validation("due_date is required for Credit".into())
-                })?;
-                if due < sale_date {
-                    return Err(AppError::Validation(
-                        "due_date must be >= sale_date".into(),
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 
     fn totals(lines: &[SaleLine], payments: &[SalePayment]) -> (Decimal, Decimal, Decimal) {
@@ -219,19 +237,23 @@ where
     // -- Draft ---------------------------------------------------------------
 
     pub async fn create_draft(&self, input: NewSale) -> AppResult<Sale> {
-        let customer_name = Self::clean_customer(&input.customer_name)?;
+        // Unknown customer => 404; the row is never created.
+        let customer = self.customers.get_customer(input.customer_id).await?;
         let notes = Self::clean_notes(&input.notes)?;
         let receipt_no = Self::clean_receipt(&input.receipt_no)?;
-        Self::validate_dates(input.payment_type, input.sale_date, input.due_date)?;
+        let due_date =
+            Self::resolve_due_date(input.payment_type, input.sale_date, input.due_date, &customer)?;
         let clean = NewSale {
-            customer_name,
+            customer_id: customer.id,
             payment_type: input.payment_type,
             sale_date: input.sale_date,
-            due_date: input.due_date,
+            due_date,
             receipt_no,
             notes: Some(notes),
         };
-        self.sales.create_sale(&clean).await
+        // The name is a snapshot of the customer as it is today; later corrections
+        // to the customer never rewrite this sale.
+        self.sales.create_sale(&clean, &customer.name).await
     }
 
     pub async fn update_draft(&self, id: i64, patch: UpdateSaleDraft) -> AppResult<Sale> {
@@ -243,9 +265,6 @@ where
         Self::ensure_draft(&sale)?;
 
         // Validate patch fields before delegating.
-        if let Some(ref name) = patch.customer_name {
-            Self::clean_customer(name)?;
-        }
         if let Some(ref notes) = patch.notes {
             if notes.chars().count() > 512 {
                 return Err(AppError::Validation("notes must be <= 512 chars".into()));
@@ -254,19 +273,21 @@ where
         if let Some(ref receipt_opt) = patch.receipt_no {
             Self::clean_receipt(receipt_opt)?;
         }
-        // Compute prospective dates for validation.
+        // The customer is fixed at creation, so the term used to resolve a cleared
+        // due date comes from that same customer.
+        let customer = self.customers.get_customer(sale.customer_id).await?;
         let new_sale_date = patch.sale_date.unwrap_or(sale.sale_date);
-        let new_due_date = match &patch.due_date {
+        let requested_due = match &patch.due_date {
             Some(inner) => *inner,
             None => sale.due_date,
         };
-        Self::validate_dates(sale.payment_type, new_sale_date, new_due_date)?;
+        let new_due_date =
+            Self::resolve_due_date(sale.payment_type, new_sale_date, requested_due, &customer)?;
 
-        // Normalize patch (trim customer/notes) before repo update.
+        // Normalize patch (trim notes) before repo update.
         let norm = UpdateSaleDraft {
-            customer_name: patch.customer_name.map(|s| s.trim().to_string()),
             sale_date: patch.sale_date,
-            due_date: patch.due_date,
+            due_date: Some(new_due_date),
             receipt_no: patch.receipt_no.map(|opt| {
                 opt.map(|s| {
                     let t = s.trim();
@@ -398,6 +419,21 @@ where
             .collect())
     }
 
+    /// Derived receivable of one customer: confirmed credit sales (lines total)
+    /// minus the payments received on them. Cancelled sales never count. The
+    /// per-sale math runs in `Decimal` (the columns are TEXT), so the credit-limit
+    /// check never passes through floating point.
+    async fn customer_debt(&self, customer_id: i64) -> AppResult<Decimal> {
+        let mut debt = Decimal::ZERO;
+        for sale in self.sales.list_confirmed_credit_sales(customer_id).await? {
+            let lines = self.sales.list_lines(sale.id).await?;
+            let payments = self.sales.list_payments(sale.id).await?;
+            let (total, paid, _) = Self::totals(&lines, &payments);
+            debt += total - paid;
+        }
+        Ok(debt)
+    }
+
     // -- Confirm ---------------------------------------------------------------
 
     pub async fn confirm(
@@ -487,6 +523,28 @@ where
                     return Err(AppError::Validation(
                         "due_date is required for Credit".into(),
                     ));
+                }
+                // Credit is a real receivable, so it needs a real customer:
+                // "Consumidor final" cannot owe money.
+                let customer = self.customers.get_customer(sale.customer_id).await?;
+                if customer.is_walkin {
+                    return Err(AppError::Validation(
+                        "cannot sell on credit to the walk-in customer; choose a customer".into(),
+                    ));
+                }
+                // A null limit is unlimited: the flag never acts as a bypass for a
+                // customer who never set one.
+                if self.enforce_credit_limit {
+                    if let Some(limit) = customer.credit_limit {
+                        let debt = self.customer_debt(customer.id).await?;
+                        let projected = debt + total;
+                        if projected > limit {
+                            return Err(AppError::Validation(format!(
+                                "credit limit exceeded for {}: projected debt {projected} > limit {limit}",
+                                customer.name
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -743,16 +801,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewProduct, ProductKind};
+    use crate::models::{NewCustomer, NewProduct, ProductKind};
     use crate::repositories::{
-        PaymentMethodRepository, SqliteAccountRepository, SqliteBarcodeRepository,
-        SqliteCategoryRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
-        SqliteProductRepository, SqliteSaleRepository, SqliteStockMovementRepository,
-        SqliteTransactionRepository,
+        CustomerRepository, PaymentMethodRepository, SqliteAccountRepository,
+        SqliteBarcodeRepository, SqliteCategoryRepository, SqliteCustomerRepository,
+        SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
+        SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
     };
-    use crate::services::{InventoryService, TransactionService};
+    use crate::services::{CustomerService, InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+
+    /// The seeded walk-in is the first row in every fresh test database.
+    const WALKIN_ID: i64 = 1;
+    /// `svc_with_flags` seeds this non-walk-in customer, so the existing tests have
+    /// a valid credit customer without extra setup.
+    const CREDIT_CUSTOMER_ID: i64 = 2;
 
     type Svc = SalesService<
         SqliteSaleRepository,
@@ -764,13 +828,17 @@ mod tests {
         SqliteAccountRepository,
         SqliteTransactionRepository,
         SqlitePaymentMethodRepository,
+        SqliteCustomerRepository,
     >;
 
     async fn test_pool() -> sqlx::SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Same posture as db::create_pool: the walk-in triggers must fire
+            // under REPLACE conflict resolution too.
+            .pragma("recursive_triggers", "1");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -783,6 +851,16 @@ mod tests {
     async fn svc_with_flags(
         allow_stock: bool,
         allow_balance: bool,
+    ) -> (Svc, sqlx::SqlitePool) {
+        svc_with_credit_flag(allow_stock, allow_balance, true).await
+    }
+
+    /// K2: builds the service with `ENFORCE_CREDIT_LIMIT` injected the same way
+    /// production does, plus the deterministic non-walk-in credit customer.
+    async fn svc_with_credit_flag(
+        allow_stock: bool,
+        allow_balance: bool,
+        enforce_credit_limit: bool,
     ) -> (Svc, sqlx::SqlitePool) {
         let pool = test_pool().await;
         let inventory = InventoryService::new(
@@ -797,12 +875,28 @@ mod tests {
             SqliteTransactionRepository::new(pool.clone()),
             allow_balance,
         );
+        let customers = CustomerService::new(SqliteCustomerRepository::new(pool.clone()));
+        customers
+            .create_customer(NewCustomer {
+                name: "Credit Customer".into(),
+                phone: None,
+                address: None,
+                tax_id: None,
+                notes: None,
+                is_walkin: false,
+                credit_limit: None,
+                payment_days: None,
+            })
+            .await
+            .unwrap();
         let s = SalesService::new(
             SqliteSaleRepository::new(pool.clone()),
             SqliteDocSequenceRepository::new(pool.clone()),
             inventory,
             transactions,
             SqlitePaymentMethodRepository::new(pool.clone()),
+            customers,
+            enforce_credit_limit,
         );
         (s, pool)
     }
@@ -899,6 +993,72 @@ mod tests {
         s.payment_methods.allow(account_id, method_id).await.unwrap()
     }
 
+    async fn walkin_of(s: &Svc) -> crate::models::Customer {
+        s.customers
+            .customers
+            .find_walkin()
+            .await
+            .unwrap()
+            .expect("the walk-in is seeded by migration 20")
+    }
+
+    async fn seed_customer(
+        s: &Svc,
+        name: &str,
+        limit: Option<&str>,
+        payment_days: Option<i64>,
+    ) -> crate::models::Customer {
+        s.customers
+            .create_customer(NewCustomer {
+                name: name.into(),
+                phone: None,
+                address: None,
+                tax_id: None,
+                notes: None,
+                is_walkin: false,
+                credit_limit: limit.map(dec),
+                payment_days,
+            })
+            .await
+            .unwrap()
+            .customer
+    }
+
+    async fn draft_with_line(
+        s: &Svc,
+        customer_id: i64,
+        payment_type: PaymentType,
+        due_date: Option<NaiveDate>,
+        product_id: i64,
+        qty: &str,
+    ) -> crate::models::Sale {
+        let sale = s
+            .create_draft(NewSale {
+                customer_id,
+                payment_type,
+                sale_date: sale_date(),
+                due_date,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, product_id, dec(qty), None)
+            .await
+            .unwrap();
+        sale
+    }
+
+    async fn sale_sequence_last(pool: &sqlx::SqlitePool) -> Option<i64> {
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT last_number FROM doc_sequences WHERE doc_type = 'SALE'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .map(|r| r.0)
+    }
+
     async fn tx_count(pool: &sqlx::SqlitePool) -> i64 {
         sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM transactions")
             .fetch_one(pool)
@@ -924,7 +1084,7 @@ mod tests {
         seed_stock(&s, prod.id, "10").await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Juan".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -950,7 +1110,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Ana".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -994,7 +1154,7 @@ mod tests {
         seed_stock(&s, prod.id, "10").await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Cred".into(),
+                customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
                 due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
@@ -1026,7 +1186,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Deudor".into(),
+                customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
                 due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
@@ -1098,7 +1258,7 @@ mod tests {
         // Unknown product on add_line => 404.
         let sale = s
             .create_draft(NewSale {
-                customer_name: "X".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1127,7 +1287,7 @@ mod tests {
         // Unknown account on payment => 404.
         let csale = s
             .create_draft(NewSale {
-                customer_name: "C".into(),
+                customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
                 due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
@@ -1158,7 +1318,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "E".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1190,7 +1350,7 @@ mod tests {
             .update_draft(
                 sale.id,
                 UpdateSaleDraft {
-                    customer_name: Some("Otro".into()),
+                    notes: Some("Otro".into()),
                     ..Default::default()
                 },
             )
@@ -1211,7 +1371,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "R".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1260,7 +1420,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "G".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1300,7 +1460,7 @@ mod tests {
         allow(&s2, acc2.id, cash2).await;
         let sale2 = s2
             .create_draft(NewSale {
-                customer_name: "G".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1336,7 +1496,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Serv".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1365,7 +1525,7 @@ mod tests {
 
         let a = s
             .create_draft(NewSale {
-                customer_name: "A".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1377,7 +1537,7 @@ mod tests {
         s.add_line(a.id, prod.id, dec("1"), None).await.unwrap();
         let b = s
             .create_draft(NewSale {
-                customer_name: "B".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1398,7 +1558,7 @@ mod tests {
         // Draft -> Cancelled is a no-op for stock/finance.
         let c = s
             .create_draft(NewSale {
-                customer_name: "C".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1427,7 +1587,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "S".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1467,7 +1627,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "M".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1495,7 +1655,7 @@ mod tests {
         // No allowlist row: Cash not allowed for this account.
         let sale = s
             .create_draft(NewSale {
-                customer_name: "D".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1533,7 +1693,7 @@ mod tests {
         allow(&s, acc_b.id, transfer).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Mix".into(),
+                customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
                 due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
@@ -1582,7 +1742,7 @@ mod tests {
         // QR not allowed for this account.
         let sale = s
             .create_draft(NewSale {
-                customer_name: "P".into(),
+                customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
                 due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
@@ -1616,7 +1776,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Link".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1659,7 +1819,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Link".into(),
+                customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
                 due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
@@ -1732,7 +1892,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Link".into(),
+                customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
                 due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
@@ -1795,7 +1955,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Edit".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1836,7 +1996,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let sale = s
             .create_draft(NewSale {
-                customer_name: "Restrict".into(),
+                customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
                 due_date: None,
@@ -1861,5 +2021,315 @@ mod tests {
             .unwrap()
             .iter()
             .any(|t| t.id == tx_id));
+    }
+
+    // -- K2: mandatory customer, credit rules, ENFORCE_CREDIT_LIMIT ---------
+
+    /// AC2: an unknown customer id is a 404; a known customer is stored with its
+    /// name snapshotted at creation time.
+    #[tokio::test]
+    async fn k2_ac2_unknown_customer_is_404_and_name_is_snapshotted() {
+        let (s, _) = svc().await;
+        let err = s
+            .create_draft(NewSale {
+                customer_id: 99999,
+                payment_type: PaymentType::Cash,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+
+        let customer = seed_customer(&s, "Ana", None, None).await;
+        let sale = s
+            .create_draft(NewSale {
+                customer_id: customer.id,
+                payment_type: PaymentType::Cash,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(sale.customer_id, customer.id);
+        assert_eq!(sale.customer_name, "Ana");
+    }
+
+    /// Deliverable rule: correcting the customer never rewrites history, so the
+    /// snapshot on an existing sale survives a rename.
+    #[tokio::test]
+    async fn k2_snapshot_name_survives_customer_rename() {
+        let (s, _) = svc().await;
+        let customer = seed_customer(&s, "Ana", None, None).await;
+        let sale = s
+            .create_draft(NewSale {
+                customer_id: customer.id,
+                payment_type: PaymentType::Cash,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+
+        s.customers
+            .update_customer(
+                customer.id,
+                crate::models::UpdateCustomer {
+                    name: Some("Ana Pérez".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let stored = s.sales.find_sale(sale.id).await.unwrap().unwrap();
+        assert_eq!(stored.customer_name, "Ana");
+        assert_eq!(stored.customer_id, customer.id);
+    }
+
+    /// AC3: credit to the walk-in is rejected at confirm time and touches
+    /// nothing: no sequence, no stock, no finance, still Draft.
+    #[tokio::test]
+    async fn k2_ac3_credit_walkin_rejected_without_side_effects() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "K2-AC3", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let walkin = walkin_of(&s).await;
+        let sale = draft_with_line(
+            &s,
+            walkin.id,
+            PaymentType::Credit,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "2",
+        )
+        .await;
+
+        let movements_before = movement_count(&pool).await;
+        let txs_before = tx_count(&pool).await;
+        let sequence_before = sale_sequence_last(&pool).await;
+
+        let err = s.confirm(sale.id, None, None).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+        let detail = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(
+            detail.sale.status,
+            crate::models::SaleStatus::Draft,
+            "a rejected credit sale must stay Draft"
+        );
+        assert!(detail.sale.sale_number.is_none());
+        assert_eq!(movement_count(&pool).await, movements_before);
+        assert_eq!(tx_count(&pool).await, txs_before);
+        assert_eq!(sale_sequence_last(&pool).await, sequence_before);
+    }
+
+    /// AC4/AC7: the limit check uses the projected debt (current debt + sale
+    /// total) and rejects with that figure in the message. The credit draft's
+    /// due date comes from the customer's payment term (AC7).
+    #[tokio::test]
+    async fn k2_ac4_credit_limit_blocks_over_limit_with_projected_figure() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "K2-AC4", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let customer = seed_customer(&s, "Limited", Some("100"), Some(30)).await;
+
+        // Debt 30 stays within the limit of 100.
+        let first = draft_with_line(
+            &s,
+            customer.id,
+            PaymentType::Credit,
+            None,
+            prod.id,
+            "3",
+        )
+        .await;
+        assert_eq!(
+            first.due_date,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            "due_date must default to sale_date + payment_days (2024-05-02 + 30)"
+        );
+        s.confirm(first.id, None, None).await.unwrap();
+
+        // Projected 30 + 80 = 110 > 100 => 400 with the projection.
+        let second = draft_with_line(
+            &s,
+            customer.id,
+            PaymentType::Credit,
+            None,
+            prod.id,
+            "8",
+        )
+        .await;
+        let movements_before = movement_count(&pool).await;
+        let err = s.confirm(second.id, None, None).await.unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("110"),
+                    "the 400 must carry the projected debt: {msg}"
+                );
+                assert!(msg.contains("100"), "the 400 must carry the limit: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let detail = s.get_detail(second.id).await.unwrap();
+        assert_eq!(detail.sale.status, crate::models::SaleStatus::Draft);
+        assert_eq!(
+            movement_count(&pool).await,
+            movements_before,
+            "a blocked confirm must not move stock"
+        );
+    }
+
+    /// AC5: with the flag off the same over-limit sale confirms, and the derived
+    /// debt proves it is over the limit (the over_limit read is a later slice).
+    #[tokio::test]
+    async fn k2_ac5_flag_off_confirms_over_limit_sale() {
+        let (s, _) = svc_with_credit_flag(true, false, false).await;
+        let prod = seed_product(&s, "K2-AC5", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let customer = seed_customer(&s, "Flag Off", Some("50"), None).await;
+        let sale = draft_with_line(
+            &s,
+            customer.id,
+            PaymentType::Credit,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "6",
+        )
+        .await;
+
+        let detail = s.confirm(sale.id, None, None).await.unwrap();
+        assert_eq!(detail.sale.status, crate::models::SaleStatus::Confirmed);
+        let debt = s.customer_debt(customer.id).await.unwrap();
+        assert_eq!(debt, dec("60"));
+        assert!(debt > dec("50"), "the customer is over the limit: {debt}");
+    }
+
+    /// AC6: a null limit is unlimited with the flag on or off.
+    #[tokio::test]
+    async fn k2_ac6_null_limit_never_blocks() {
+        for enforce in [true, false] {
+            let (s, _) = svc_with_credit_flag(true, false, enforce).await;
+            let prod = seed_product(&s, "K2-AC6", "10").await;
+            seed_stock(&s, prod.id, "100").await;
+            let customer = seed_customer(&s, "No Limit", None, None).await;
+            let sale = draft_with_line(
+                &s,
+                customer.id,
+                PaymentType::Credit,
+                Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                prod.id,
+                "99",
+            )
+            .await;
+            let detail = s.confirm(sale.id, None, None).await.unwrap();
+            assert_eq!(
+                detail.sale.status,
+                crate::models::SaleStatus::Confirmed,
+                "enforce_credit_limit={enforce} must not block a null limit"
+            );
+        }
+    }
+
+    /// AC7: a credit sale without a due date takes `sale_date + payment_days`;
+    /// without a term the due date is required. An explicit date still wins.
+    #[tokio::test]
+    async fn k2_ac7_due_date_defaults_from_payment_days_or_400() {
+        let (s, _) = svc().await;
+        let term_customer = seed_customer(&s, "Term", None, Some(15)).await;
+        let sale = s
+            .create_draft(NewSale {
+                customer_id: term_customer.id,
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            sale.due_date,
+            Some(NaiveDate::from_ymd_opt(2024, 5, 17).unwrap()),
+            "due_date must default to sale_date + payment_days"
+        );
+
+        // An explicit date wins over the term.
+        let explicit = s
+            .create_draft(NewSale {
+                customer_id: term_customer.id,
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 7, 1).unwrap()),
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit.due_date,
+            Some(NaiveDate::from_ymd_opt(2024, 7, 1).unwrap())
+        );
+
+        // No term and no date => 400 at creation.
+        let no_term = seed_customer(&s, "No Term", None, None).await;
+        let err = s
+            .create_draft(NewSale {
+                customer_id: no_term.id,
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    /// Triangulation: payments and cancelled sales move the debt the limit is
+    /// checked against, and the boundary (projected == limit) does not block.
+    #[tokio::test]
+    async fn k2_tri_debt_ignores_cancelled_and_paid_amounts() {
+        let (s, _) = svc_with_flags(true, true).await;
+        let prod = seed_product(&s, "K2-TRI", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let acc = seed_account(&s, "k2-tri").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let customer = seed_customer(&s, "Tri", Some("100"), None).await;
+        let due = Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap());
+
+        // Debt 60, within the limit.
+        let first =
+            draft_with_line(&s, customer.id, PaymentType::Credit, due, prod.id, "6").await;
+        s.confirm(first.id, None, None).await.unwrap();
+
+        // Paying 40 leaves 20 of debt, so another 70 fits (90 <= 100).
+        s.record_payment(first.id, acc.id, cash, dec("40"), sale_date())
+            .await
+            .unwrap();
+        let second =
+            draft_with_line(&s, customer.id, PaymentType::Credit, due, prod.id, "7").await;
+        s.confirm(second.id, None, None).await.unwrap();
+
+        // Cancelling the first sale removes its remaining 20 => debt 70.
+        s.cancel(first.id, Some("tri".into())).await.unwrap();
+        assert_eq!(s.customer_debt(customer.id).await.unwrap(), dec("70"));
+
+        // Boundary: projected debt exactly equal to the limit is allowed.
+        let boundary =
+            draft_with_line(&s, customer.id, PaymentType::Credit, due, prod.id, "3").await;
+        let detail = s.confirm(boundary.id, None, None).await.unwrap();
+        assert_eq!(detail.sale.status, crate::models::SaleStatus::Confirmed);
+        assert_eq!(s.customer_debt(customer.id).await.unwrap(), dec("100"));
     }
 }
