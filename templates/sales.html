@@ -85,8 +85,7 @@
 
     <div class="rounded-2xl border border-border bg-card p-5">
       <h2 class="mb-3 text-lg font-semibold">Add Line (Draft only)</h2>
-      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/lines" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#sale-list','refresh')"
-            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/lines'">
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/lines" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#sale-list','refresh')">
         <div>
           <label>Sale ID</label>
           <input type="number" name="sale_id" required min="1" placeholder="1" />
@@ -116,8 +115,7 @@
 
     <div class="rounded-2xl border border-border bg-card p-5">
       <h2 class="mb-3 text-lg font-semibold">Confirm Sale</h2>
-      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/confirm" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
-            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/confirm'">
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/confirm" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }">
         <div>
           <label>Sale ID</label>
           <input type="number" name="sale_id" required min="1" placeholder="1" />
@@ -147,8 +145,7 @@
 
     <div class="rounded-2xl border border-border bg-card p-5">
       <h2 class="mb-3 text-lg font-semibold">Record Payment (Credit)</h2>
-      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/payments" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
-            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/payments'">
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/payments" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }">
         <div>
           <label>Sale ID</label>
           <input type="number" name="sale_id" required min="1" placeholder="1" />
@@ -186,8 +183,7 @@
 
     <div class="rounded-2xl border border-border bg-card p-5">
       <h2 class="mb-3 text-lg font-semibold">Cancel Sale</h2>
-      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/cancel" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
-            onsubmit="this.action='/web/sales/'+this.sale_id.value+'/cancel'">
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/cancel" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }">
         <div>
           <label>Sale ID</label>
           <input type="number" name="sale_id" required min="1" placeholder="1" />
