@@ -11,6 +11,27 @@
   <div class="text-[13px] text-muted">Derived balance • ID {{ account.id }} • Created {{ account.created_at }}</div>
 </div>
 
+<div class="mt-6 rounded-2xl border border-border bg-card p-5" id="payment-methods">
+  <h2 class="mb-3 text-lg font-semibold">Payment methods</h2>
+  {% if !has_methods %}
+  <div class="mb-3 rounded-xl border border-danger/40 bg-danger/10 p-3 text-[13px] text-danger" data-payment-methods-warning="true">
+    No payment methods configured — this account cannot record payments. Select at least one method and save.
+  </div>
+  {% endif %}
+  <form method="post" action="/accounts/{{ account.id }}/payment-methods" class="flex flex-col gap-2.5">
+    <div class="flex flex-wrap gap-x-5 gap-y-2">
+      {% for m in methods %}
+      <label class="flex items-center gap-2 text-[13px]">
+        <input type="checkbox" name="method_ids" value="{{ m.id }}" {% if m.allowed %}checked{% endif %} />
+        {{ m.name }}{% if !m.is_active %} <span class="text-muted">(inactive)</span>{% endif %}
+      </label>
+      {% endfor %}
+    </div>
+    <div class="text-[13px] text-muted">Saving replaces this account's allowlist. At least one method is required.</div>
+    <button type="submit" class="self-start">Save payment methods</button>
+  </form>
+</div>
+
 <div class="mt-6 rounded-2xl border border-border bg-card p-5">
   <div class="mb-3 flex items-center justify-between">
     <h2 class="text-lg font-semibold">History</h2>

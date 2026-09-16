@@ -104,7 +104,7 @@ where
             .await?
         {
             return Err(AppError::Validation(format!(
-                "method {} not allowed for account {account_id}",
+                "method {} is not allowed for account {account_id}; configure the account's payment methods and try again",
                 method.name
             )));
         }

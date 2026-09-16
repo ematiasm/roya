@@ -52,11 +52,17 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
 - **Payment methods (M0)** — `payment_methods(id, name UNIQUE, is_active)` seeded
   `Cash, Transfer, Debit, CreditCard, QR` (no `Other`); `account_payment_methods`
   allowlist `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id`
-  RESTRICT NOT NULL. `sales` has no `account_id`. Defaults seeded:
-  `Caja→Cash`, `Banco→Transfer,Debit,CreditCard`, `MP→QR,Transfer`
-  (migration applies them where those accounts already exist; new `Caja`/`Banco`/`MP`
-  accounts get them via `PaymentMethodService::ensure_defaults_for_account`; no
-  accounts are auto-created).
+  RESTRICT NOT NULL. `sales` has no `account_id`.
+  The allowlist is **explicit configuration, never a silent default**: the dashboard
+  create-account form requires ticking at least one method, the account detail page
+  (`/accounts/:id`) lets you replace the set, and REST uses
+  `GET/PUT /api/accounts/:id/payment-methods` (empty list ⇒ 400, unknown id ⇒ 404).
+  Accounts with no methods are flagged on the dashboard list and detail page, and a
+  payment on them fails with a 400 that points to the configuration.
+  Migration 12 still seeds `Caja→Cash`, `Banco→Transfer,Debit,CreditCard`,
+  `MP→QR,Transfer` for accounts that already exist, and
+  `PaymentMethodService::ensure_defaults_for_account` keeps that mapping reusable;
+  no accounts are auto-created.
 
 ## Architecture
 
@@ -167,6 +173,16 @@ curl -X POST http://localhost:3000/api/accounts \
 
 curl http://localhost:3000/api/accounts/1
 # -> { id,name,balance,created_at, transactions: [...] }
+
+# Payment methods allowlist (explicit; an empty list is rejected)
+curl http://localhost:3000/api/accounts/1/payment-methods
+# -> { account_id, allowed_method_ids:[1], methods:[{id,name,is_active,allowed}, ...] }
+
+curl -X PUT http://localhost:3000/api/accounts/1/payment-methods \
+  -H "Content-Type: application/json" \
+  -d '{"method_ids":[2,3]}'
+# replaces the account's set (no merge); unknown id => 404, [] => 400
+# Accounts without methods cannot record payments; the UI flags them.
 
 # Transactions
 curl "http://localhost:3000/api/transactions?account_id=1&from=2024-01-01&to=2024-12-31"

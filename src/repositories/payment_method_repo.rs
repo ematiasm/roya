@@ -15,7 +15,11 @@ pub trait PaymentMethodRepository: Send + Sync {
     async fn find_method_by_name(&self, name: &str) -> AppResult<Option<PaymentMethod>>;
     async fn is_allowed(&self, account_id: i64, method_id: i64) -> AppResult<bool>;
     async fn allow(&self, account_id: i64, method_id: i64) -> AppResult<()>;
+    /// Replace the account's allowlist atomically (delete + insert).
+    async fn replace_allowed(&self, account_id: i64, method_ids: &[i64]) -> AppResult<()>;
     async fn list_allowed(&self, account_id: i64) -> AppResult<Vec<PaymentMethod>>;
+    /// Account ids whose allowlist is empty (self-diagnosing UI warning).
+    async fn list_accounts_without_methods(&self) -> AppResult<Vec<i64>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +122,26 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         Ok(())
     }
 
+    async fn replace_allowed(&self, account_id: i64, method_ids: &[i64]) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM account_payment_methods WHERE account_id = ?")
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+        for method_id in method_ids {
+            sqlx::query(
+                r#"INSERT INTO account_payment_methods (account_id, method_id) VALUES (?, ?)"#,
+            )
+            .bind(account_id)
+            .bind(method_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_db_err)?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn list_allowed(&self, account_id: i64) -> AppResult<Vec<PaymentMethod>> {
         let rows = sqlx::query(
             r#"SELECT m.id, m.name, m.is_active, m.created_at
@@ -129,5 +153,17 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_method).collect())
+    }
+
+    async fn list_accounts_without_methods(&self) -> AppResult<Vec<i64>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            r#"SELECT a.id FROM accounts a
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM account_payment_methods apm WHERE apm.account_id = a.id
+               ) ORDER BY a.id"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
     }
 }
