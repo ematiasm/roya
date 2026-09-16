@@ -52,8 +52,20 @@
           <label>Name</label>
           <input type="text" name="name" placeholder="Cash, Bank, MercadoPago…" required maxlength="64" />
         </div>
+        <fieldset class="rounded-xl border border-border p-3">
+          <legend class="px-1 text-[13px] text-muted">Accepted payment methods</legend>
+          <div class="flex flex-wrap gap-x-4 gap-y-2">
+            {% for m in methods %}
+            <label class="flex items-center gap-1.5 text-[13px]">
+              <input type="checkbox" name="method_ids" value="{{ m.id }}" />
+              {{ m.name }}
+            </label>
+            {% endfor %}
+          </div>
+          <div class="mt-2 text-[13px] text-muted">Select at least one. An account with no methods cannot record payments.</div>
+        </fieldset>
         <button type="submit">Create Account</button>
-        <div class="text-[13px] text-muted">HTMX — no page reload. Also available at <code>POST /api/accounts</code></div>
+        <div class="text-[13px] text-muted">HTMX — no page reload. Also available at <code>POST /api/accounts</code> + <code>PUT /api/accounts/:id/payment-methods</code></div>
       </form>
       <!-- hidden OOB target for account options refresh -->
       <div id="account-options" class="hidden"></div>
@@ -104,6 +116,8 @@
         <code>GET /api/accounts</code><br/>
         <code>POST /api/accounts</code> <span class="text-[13px] text-muted">{ name }</span><br/>
         <code>GET /api/accounts/:id</code><br/>
+        <code>GET /api/accounts/:id/payment-methods</code><br/>
+        <code>PUT /api/accounts/:id/payment-methods</code> <span class="text-[13px] text-muted">{ method_ids: [1, 2] }</span><br/>
         <code>GET /api/transactions?account_id=&from=&to=</code><br/>
         <code>POST /api/transactions</code> <span class="text-[13px] text-muted">{ account_id, type, amount, description, date }</span><br/>
         <code>PUT /api/transactions/:id</code><br/>

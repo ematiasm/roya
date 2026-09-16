@@ -9,6 +9,9 @@
         <div>
           <div class="font-semibold">{{ acc.name }}</div>
           <div class="text-[13px] text-muted">#{{ acc.id }} • {{ acc.created_at.format("%Y-%m-%d") }}</div>
+          {% if accounts_without_methods.missing(acc.id) %}
+          <div class="mt-1.5 inline-block rounded-full border border-danger/40 bg-danger/10 px-2 py-0.5 text-[11px] font-bold tracking-[0.02em] text-danger" data-payment-methods-warning="true">⚠ No payment methods configured</div>
+          {% endif %}
         </div>
         <div class="font-bold tabular-nums {% if acc.is_negative() %}text-danger{% else %}text-income{% endif %}">${{ acc.balance }}</div>
       </div>

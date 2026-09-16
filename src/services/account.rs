@@ -39,6 +39,14 @@ where
         self.accounts.create(trimmed).await
     }
 
+    /// 404 when the account does not exist; used by the payment-method routes.
+    pub async fn require_exists(&self, id: i64) -> AppResult<()> {
+        if !self.accounts.exists(id).await? {
+            return Err(AppError::NotFound(format!("account {id} not found")));
+        }
+        Ok(())
+    }
+
     pub async fn list_with_balances(&self) -> AppResult<Vec<AccountWithBalance>> {
         self.accounts.list_with_balances().await
     }
