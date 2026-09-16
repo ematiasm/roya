@@ -15,12 +15,23 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
 - **Sales** — Draft → Confirmed → Cancelled orchestrator (Odoo-style):
   - Draft creates lines with no stock/finance side effects.
   - Confirm assigns `YYYY-SALE-NNNNNN`, deducts stock (`Out`, reason `Sale`),
-    Cash posts 1 Income, Credit opens a receivable (due = total).
-  - Credit payments each post 1 Income; overpay ⇒ 400; Paid when due = 0.
+    Cash posts 1 Income with method, Credit opens a receivable (due = total).
+  - Payments carry `account_id + method_id` (N per sale, mixed accounts/methods,
+    sum ≤ total); each posts 1 Income; overpay ⇒ 400; Paid when due = 0.
+  - `account_payment_methods` allowlist enforced (400) before any stock/sequence/
+    finance touch.
   - Cancel of Confirmed re-enters stock (`In`, reason `Sale-return`) and posts
     Expense refunds, guarded by `ALLOW_NEGATIVE_BALANCE`.
   - `sale_number` UNIQUE, immutable, NULL only in Draft/Cancelled-from-Draft.
   - Finance/stock rows are written only via services, reference = `sale_number`.
+- **Payment methods (M0)** — `payment_methods(id, name UNIQUE, is_active)` seeded
+  `Cash, Transfer, Debit, CreditCard, QR` (no `Other`); `account_payment_methods`
+  allowlist `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id`
+  RESTRICT NOT NULL. `sales` has no `account_id`. Defaults seeded:
+  `Caja→Cash`, `Banco→Transfer,Debit,CreditCard`, `MP→QR,Transfer`
+  (migration applies them where those accounts already exist; new `Caja`/`Banco`/`MP`
+  accounts get them via `PaymentMethodService::ensure_defaults_for_account`; no
+  accounts are auto-created).
 
 ## Architecture
 
@@ -99,6 +110,10 @@ Current migrations:
 - `20240101000009_create_sale_lines.sql` — `sale_lines` (CASCADE sale, RESTRICT product)
 - `20240101000010_create_sale_payments.sql` — `sale_payments` (CASCADE sale, RESTRICT account)
 - `20240101000011_expand_stock_reason_sale_return.sql` — adds `Sale-return` reason
+- `20240101000012_payment_methods.sql` — `payment_methods` + `account_payment_methods`
+  allowlist + `sale_payments.method_id` + seeds (`Cash,Transfer,Debit,CreditCard,QR`;
+  sensible combos `Caja→Cash`, `Banco→Transfer,Debit,CreditCard`, `MP→QR,Transfer`
+  applied where those accounts exist, plus `ensure_defaults_for_account` helper)
 
 ## REST API
 
@@ -187,15 +202,17 @@ curl -X PUT http://localhost:3000/api/sales/1 \
 
 curl -X POST http://localhost:3000/api/sales/1/confirm \
   -H "Content-Type: application/json" \
-  -d '{"account_id":1}'
+  -d '{"account_id":1,"method_id":1}'
 # -> 200 detail with sale_number "2024-SALE-000001"; deducts stock,
-#    Cash posts 1 Income. Credit: send {} (no account), posts nothing, due = total.
+#    Cash posts 1 Income with method. Credit: send {} (no account/method),
+#    posts nothing, due = total. Disallowed (account,method) => 400, no touch.
 #    Double confirm => 400.
 
 curl -X POST http://localhost:3000/api/sales/1/payments \
   -H "Content-Type: application/json" \
-  -d '{"account_id":1,"amount":"15","date":"2024-05-10"}'
-# -> 201 payment + 1 Income (Credit sales; overpay => 400)
+  -d '{"account_id":1,"method_id":1,"amount":"15","date":"2024-05-10"}'
+# -> 201 payment + 1 Income (Credit sales; N payments, mixed accounts/methods,
+#    sum <= total; disallowed pair => 400, no finance touch; overpay => 400)
 
 curl -X PUT http://localhost:3000/api/sales/lines/1 \
   -H "Content-Type: application/json" \
@@ -285,8 +302,13 @@ All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger
 - `Sale` rules: Draft editable (lines/customer/dates); Confirmed/Cancelled immutable
   except Cancel. `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
   Draft/Cancelled-from-Draft. Credit requires `due_date >= sale_date`, Cash forbids it.
-  `qty > 0`, `unit_price >= 0`, payments reject overpay (`paid + amount <= total`).
+  `qty > 0`, `unit_price >= 0`, payments carry `account_id + method_id` (N per sale,
+  mixed, sum ≤ total), reject overpay (`paid + amount <= total`) and disallowed
+  `(account,method)` (400, no stock/sequence/finance touch).
   No new env vars for sales (reuses `ALLOW_NEGATIVE_BALANCE` / `ALLOW_NEGATIVE_STOCK`).
+- `PaymentMethod` rules: `name` UNIQUE, `is_active` 0/1; allowlist
+  `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id` RESTRICT
+  NOT NULL; unknown method => 404, inactive/disallowed => 400.
   - Balance read path: `SELECT kind, amount FROM transactions WHERE account_id=?` summed in Rust (not `SUM()` which would cast TEXT→REAL).
 
 ## SQLite → Postgres Migration (without rewriting logic)

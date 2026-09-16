@@ -466,10 +466,30 @@ pub struct SalePayment {
     pub id: i64,
     pub sale_id: i64,
     pub account_id: i64,
+    pub method_id: i64,
     /// Decimal amount > 0, stored as TEXT.
     pub amount: Decimal,
     pub date: NaiveDate,
     pub created_at: chrono::NaiveDateTime,
+}
+
+// ---------------------------------------------------------------------------
+// M0 payment methods (finance-owned allowlist). Seeded Cash/Transfer/Debit/
+// CreditCard/QR, no Other. account_payment_methods PK(both) RESTRICT both.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentMethod {
+    pub id: i64,
+    pub name: String,
+    pub is_active: bool,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountPaymentMethod {
+    pub account_id: i64,
+    pub method_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

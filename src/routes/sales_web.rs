@@ -30,6 +30,7 @@ struct SalesTemplate {
     debt: Vec<SaleDetail>,
     products: Vec<crate::models::Product>,
     accounts: Vec<crate::models::AccountWithBalance>,
+    methods: Vec<crate::models::PaymentMethod>,
     allow_negative: bool,
     allow_negative_stock: bool,
     today: String,
@@ -127,6 +128,7 @@ async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppEr
     let debt = state.sales_service.outstanding_debt().await?;
     let products = state.inventory_service.products.list().await?;
     let accounts = state.account_service.list_with_balances().await?;
+    let methods = state.payment_method_service.list().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = SalesTemplate {
         title: "All sales".to_string(),
@@ -134,6 +136,7 @@ async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppEr
         debt,
         products,
         accounts,
+        methods,
         allow_negative: state.allow_negative,
         allow_negative_stock: state.allow_negative_stock,
         today,
@@ -202,11 +205,14 @@ pub struct UpdateLineForm {
 pub struct ConfirmSaleForm {
     #[serde(default)]
     pub account_id: String,
+    #[serde(default)]
+    pub method_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RecordPaymentForm {
     pub account_id: i64,
+    pub method_id: i64,
     #[serde(default)]
     pub amount: String,
     #[serde(default)]
@@ -317,7 +323,11 @@ async fn web_confirm_sale(
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
     let account_id = parse_opt_i64(&form.account_id, "account_id")?;
-    let detail = state.sales_service.confirm(id, account_id).await?;
+    let method_id = parse_opt_i64(&form.method_id, "method_id")?;
+    let detail = state
+        .sales_service
+        .confirm(id, account_id, method_id)
+        .await?;
     if is_htmx(&headers) {
         return changed(detail);
     }
@@ -334,7 +344,7 @@ async fn web_record_payment(
     let date = parse_date_or_today(&form.date)?;
     state
         .sales_service
-        .record_payment(id, form.account_id, amount, date)
+        .record_payment(id, form.account_id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
         let detail = state.sales_service.get_detail(id).await?;
