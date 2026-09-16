@@ -557,20 +557,31 @@ where
         }
 
         // Finance: Cash => 1 payment + 1 Expense now; Credit => payable only.
+        // The Expense is stamped with reference = purchase_number and linked back
+        // from the payment row it produced.
         if purchase.payment_type == PaymentType::Cash && total > Decimal::ZERO {
             let account_id = cash_account_id.expect("validated above");
             let method_id = cash_method_id.expect("validated above");
-            self.transactions
-                .create(
+            let expense = self
+                .transactions
+                .create_with_reference(
                     account_id,
                     crate::models::TransactionKind::Expense,
                     total,
+                    Some(purchase_number.clone()),
                     Some(purchase_number.clone()),
                     purchase.purchase_date,
                 )
                 .await?;
             self.purchases
-                .create_payment(purchase_id, account_id, method_id, total, purchase.purchase_date)
+                .create_payment(
+                    purchase_id,
+                    account_id,
+                    method_id,
+                    total,
+                    purchase.purchase_date,
+                    Some(expense.id),
+                )
                 .await?;
         }
 
@@ -642,18 +653,28 @@ where
             .ok_or_else(|| {
                 AppError::Internal("confirmed purchase missing purchase_number".into())
             })?;
-        // Each payment generates one M0 Expense with reference = purchase_number.
-        self.transactions
-            .create(
+        // Each payment generates one M0 Expense stamped with reference =
+        // purchase_number and linked from the payment row it produced.
+        let expense = self
+            .transactions
+            .create_with_reference(
                 account_id,
                 crate::models::TransactionKind::Expense,
                 amount,
+                Some(purchase_number.clone()),
                 Some(purchase_number),
                 date,
             )
             .await?;
         self.purchases
-            .create_payment(purchase_id, account_id, method_id, amount, date)
+            .create_payment(
+                purchase_id,
+                account_id,
+                method_id,
+                amount,
+                date,
+                Some(expense.id),
+            )
             .await
     }
 
@@ -729,16 +750,22 @@ where
         }
 
         // Refund Income per paid amount to the originating accounts. A purchase
-        // refund is money entering: no negative-balance guard applies.
+        // refund is money entering: no negative-balance guard applies. Each refund
+        // is linked back from the payment row it refunds.
         for pay in &payments {
-            self.transactions
-                .create(
+            let refund = self
+                .transactions
+                .create_with_reference(
                     pay.account_id,
                     crate::models::TransactionKind::Income,
                     pay.amount,
                     Some(purchase_number.clone()),
+                    Some(purchase_number.clone()),
                     purchase.purchase_date,
                 )
+                .await?;
+            self.purchases
+                .set_payment_refund_transaction(pay.id, refund.id)
                 .await?;
         }
 
@@ -2262,5 +2289,108 @@ mod tests {
             "purchase_return".parse::<MovementReason>().unwrap(),
             MovementReason::PurchaseReturn
         );
+    }
+
+    // -- money traceability: payment <-> transaction links ---------------------
+
+    #[tokio::test]
+    async fn link_cash_confirm_payment_carries_its_transaction_and_reference() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "LINK-CASH", "5").await;
+        seed_stock(&s, prod.id, "10").await;
+        let sup = seed_supplier(&s, "LINK CASH SUP").await;
+        let acc = seed_account(&s, "link-cash").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(purchase.id, prod.id, dec("2"), Some(dec("10")))
+            .await
+            .unwrap(); // total 20
+
+        let detail = s
+            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .await
+            .unwrap();
+        let number = detail.purchase.purchase_number.clone().unwrap();
+
+        let payments = s.purchases.list_payments(purchase.id).await.unwrap();
+        assert_eq!(payments.len(), 1);
+        let tx_id = payments[0]
+            .transaction_id
+            .expect("payment must link the transaction it created");
+        assert!(payments[0].refund_transaction_id.is_none());
+
+        let rows = s
+            .transactions
+            .transactions
+            .list_by_account(acc.id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, tx_id);
+        assert_eq!(rows[0].kind, TransactionKind::Expense);
+        assert_eq!(rows[0].reference.as_deref(), Some(number.as_str()));
+        assert_eq!(rows[0].description, number);
+    }
+
+    #[tokio::test]
+    async fn link_credit_payment_and_cancel_refund_keeps_original_transaction() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "LINK-CREDIT", "5").await;
+        let sup = seed_supplier(&s, "LINK CREDIT SUP").await;
+        let acc = seed_account(&s, "link-credit").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(purchase.id, prod.id, dec("2"), Some(dec("20")))
+            .await
+            .unwrap(); // total 40
+        let detail = s.confirm(purchase.id, None, None).await.unwrap();
+        let number = detail.purchase.purchase_number.clone().unwrap();
+
+        let paid = s
+            .record_payment(purchase.id, acc.id, cash, dec("15"), d(2024, 5, 10))
+            .await
+            .unwrap();
+        let paid_tx_id = paid
+            .transaction_id
+            .expect("credit payment must link its Expense");
+
+        let rows = s
+            .transactions
+            .transactions
+            .list_by_account(acc.id)
+            .await
+            .unwrap();
+        let expense = rows.iter().find(|t| t.id == paid_tx_id).unwrap();
+        assert_eq!(expense.kind, TransactionKind::Expense);
+        assert_eq!(expense.reference.as_deref(), Some(number.as_str()));
+
+        s.cancel(purchase.id, Some("return".into())).await.unwrap();
+
+        let payments = s.purchases.list_payments(purchase.id).await.unwrap();
+        assert_eq!(payments.len(), 1);
+        assert_eq!(
+            payments[0].transaction_id,
+            Some(paid_tx_id),
+            "the original link must stay intact after cancel"
+        );
+        let refund_id = payments[0]
+            .refund_transaction_id
+            .expect("cancel must link the refund it created");
+        assert_ne!(refund_id, paid_tx_id);
+
+        let rows = s
+            .transactions
+            .transactions
+            .list_by_account(acc.id)
+            .await
+            .unwrap();
+        let refund = rows.iter().find(|t| t.id == refund_id).unwrap();
+        assert_eq!(refund.kind, TransactionKind::Income);
+        assert_eq!(refund.amount, dec("15"));
+        assert_eq!(refund.reference.as_deref(), Some(number.as_str()));
     }
 }

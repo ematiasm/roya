@@ -94,11 +94,12 @@ async fn create_transaction(
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let tx = state
         .transaction_service
-        .create(
+        .create_with_reference(
             payload.account_id,
             payload.kind,
             payload.amount,
             payload.description,
+            payload.reference,
             payload.date,
         )
         .await?;
@@ -347,5 +348,248 @@ mod tests {
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK);
         assert!(allowed_names(&v).is_empty());
+    }
+
+    // -- transaction reference (money traceability) -----------------------------
+
+    #[tokio::test]
+    async fn transaction_api_reference_is_null_for_manual_transactions() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let acc = create_account(&app, "ApiManualRef").await;
+
+        let (status, v) = send(
+            app.clone(),
+            "POST",
+            "/api/transactions",
+            Some("application/json"),
+            serde_json::json!({
+                "account_id": acc,
+                "type": "Income",
+                "amount": "100.50",
+                "description": "Salary",
+                "date": "2024-01-15"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        assert!(v.get("reference").is_some(), "reference must be exposed: {v}");
+        assert!(v["reference"].is_null(), "manual transaction has no reference: {v}");
+
+        let stored: (Option<String>,) =
+            sqlx::query_as("SELECT reference FROM transactions WHERE id = ?")
+                .bind(v["id"].as_i64().unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0, None);
+
+        // The list response exposes the same field.
+        let (status, v) = send(
+            app.clone(),
+            "GET",
+            &format!("/api/transactions?account_id={acc}"),
+            None,
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(v["transactions"][0]["reference"].is_null(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn transaction_api_persists_explicit_reference() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let acc = create_account(&app, "ApiExplicitRef").await;
+
+        let (status, v) = send(
+            app.clone(),
+            "POST",
+            "/api/transactions",
+            Some("application/json"),
+            serde_json::json!({
+                "account_id": acc,
+                "type": "Income",
+                "amount": "20",
+                "description": "opaque note",
+                "reference": "OPAQUE-REF-1",
+                "date": "2024-01-16"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        assert_eq!(v["reference"], "OPAQUE-REF-1", "{v}");
+
+        let stored: (Option<String>,) =
+            sqlx::query_as("SELECT reference FROM transactions WHERE id = ?")
+                .bind(v["id"].as_i64().unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored.0.as_deref(), Some("OPAQUE-REF-1"));
+    }
+
+    #[tokio::test]
+    async fn transaction_api_delete_manual_returns_204_and_removes_row() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let acc = create_account(&app, "ApiDelete").await;
+
+        // Fund the account so the Expense create passes the balance guard.
+        let (status, v) = send(
+            app.clone(),
+            "POST",
+            "/api/transactions",
+            Some("application/json"),
+            serde_json::json!({
+                "account_id": acc,
+                "type": "Income",
+                "amount": "100",
+                "description": "float",
+                "date": "2024-01-14"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+
+        let (status, v) = send(
+            app.clone(),
+            "POST",
+            "/api/transactions",
+            Some("application/json"),
+            serde_json::json!({
+                "account_id": acc,
+                "type": "Expense",
+                "amount": "12.50",
+                "description": "manual",
+                "date": "2024-01-15"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        let tx_id = v["id"].as_i64().unwrap();
+
+        // Manual delete path keeps its previous status code.
+        let (status, body) = send(
+            app.clone(),
+            "DELETE",
+            &format!("/api/transactions/{tx_id}"),
+            None,
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+        let stored: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions WHERE id = ?")
+            .bind(tx_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored.0, 0, "manual delete must remove the row");
+    }
+
+    #[tokio::test]
+    async fn transaction_api_delete_linked_returns_409_and_keeps_row() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let acc = create_account(&app, "ApiDeleteLinked").await;
+
+        // Fund the account so the Expense create passes the balance guard.
+        let (status, v) = send(
+            app.clone(),
+            "POST",
+            "/api/transactions",
+            Some("application/json"),
+            serde_json::json!({
+                "account_id": acc,
+                "type": "Income",
+                "amount": "100",
+                "description": "float",
+                "date": "2024-01-14"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+
+        let (status, v) = send(
+            app.clone(),
+            "POST",
+            "/api/transactions",
+            Some("application/json"),
+            serde_json::json!({
+                "account_id": acc,
+                "type": "Expense",
+                "amount": "12.50",
+                "description": "sale payment",
+                "date": "2024-01-15"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        let tx_id = v["id"].as_i64().unwrap();
+
+        // Synthetic sale payment pointing at the money row (RESTRICT).
+        let sale_id: (i64,) = sqlx::query_as(
+            "INSERT INTO sales (status, payment_type, customer_name, sale_date) \
+             VALUES ('Confirmed', 'Cash', 'fixture', '2024-01-15') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sale_payments \
+             (sale_id, account_id, method_id, amount, date, transaction_id) \
+             VALUES (?, ?, 1, '12.50', '2024-01-15', ?)",
+        )
+        .bind(sale_id.0)
+        .bind(acc)
+        .bind(tx_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let (status, body) = send(
+            app.clone(),
+            "DELETE",
+            &format!("/api/transactions/{tx_id}"),
+            None,
+            String::new(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "linked delete must be 409, got {body}"
+        );
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("cancel the document"),
+            "message must be actionable, got: {msg}"
+        );
+
+        let stored: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions WHERE id = ?")
+            .bind(tx_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored.0, 1, "linked row must survive");
+        let linked: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE transaction_id = ?")
+                .bind(tx_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked.0, 1, "payment must stay linked");
     }
 }
