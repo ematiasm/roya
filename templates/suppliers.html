@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Roya — Suppliers{% endblock %}
+{% block content %}
+<div class="mb-4 flex items-center gap-2">
+  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/purchases" class="text-[13px] text-muted">Purchases</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">suppliers • product/supplier cost satellite</span>
+</div>
+<div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
+  <div class="flex flex-col gap-6">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Suppliers &amp; Costs</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML">↻ Refresh</button>
+      </div>
+      <div id="supplier-list"
+           hx-get="/web/suppliers"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/supplier_list.html" %}
+      </div>
+      <div class="mt-2 text-[13px] text-muted">A new cost that differs from the current one shifts current → previous with its date; the raised/lowered alert is derived, never stored. Confirm a purchase to update the satellite from the line cost.</div>
+    </div>
+  </div>
+
+  <div class="flex flex-col gap-6">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">New Supplier</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" placeholder="Distribuidora Sur…" required maxlength="128" />
+        </div>
+        <div>
+          <label>Phone (optional)</label>
+          <input type="text" name="phone" placeholder="11 5555-5555" maxlength="32" />
+        </div>
+        <div>
+          <label>Notes (optional)</label>
+          <input type="text" name="notes" placeholder="…" maxlength="512" />
+        </div>
+        <button type="submit">Create Supplier</button>
+        <div class="text-[13px] text-muted">Duplicate name ⇒ 409. Also at <code>POST /api/suppliers</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Edit Supplier</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/suppliers/edit" hx-target="#supplier-list" hx-swap="innerHTML">
+        <div>
+          <label>Supplier ID</label>
+          <input type="number" name="id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" required maxlength="128" placeholder="Name" />
+        </div>
+        <div>
+          <label>Phone (empty clears)</label>
+          <input type="text" name="phone" maxlength="32" />
+        </div>
+        <div>
+          <label>Notes (empty clears)</label>
+          <input type="text" name="notes" maxlength="512" />
+        </div>
+        <button type="submit">Save Supplier</button>
+        <div class="text-[13px] text-muted">Also at <code>PUT /api/suppliers/:id</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Record Product Cost</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/supplier-costs" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div>
+          <label>Supplier</label>
+          <select name="supplier_id" required>
+            {% for s in suppliers %}
+            <option value="{{ s.supplier.id }}">{{ s.supplier.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Product</label>
+          <select name="product_id" required>
+            {% for p in products %}
+            <option value="{{ p.id }}">{{ p.sku }} — {{ p.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Cost</label>
+            <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" />
+          </div>
+          <div>
+            <label>Date</label>
+            <input type="date" name="date" value="{{ today }}" />
+          </div>
+        </div>
+        <button type="submit">Record Cost</button>
+        <div class="text-[13px] text-muted">Unknown product/supplier ⇒ 400; a date older than the current cost date ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
+      <div class="text-[13px] leading-[1.7] text-muted">
+        <code>GET /api/suppliers</code><br/>
+        <code>POST /api/suppliers</code><br/>
+        <code>GET /api/suppliers/:id</code><br/>
+        <code>PUT /api/suppliers/:id</code><br/>
+        <code>POST /api/suppliers/:id/activate</code><br/>
+        <code>POST /api/suppliers/:id/deactivate</code><br/>
+        <code>DELETE /api/suppliers/:id</code><br/>
+        <code>GET /api/product-supplier-costs?product_id=</code><br/>
+        <code>POST /api/product-supplier-costs</code><br/>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.body.addEventListener('supplier-created', function(){ htmx.trigger('#supplier-list','refresh'); });
+  document.body.addEventListener('supplier-changed', function(){ htmx.trigger('#supplier-list','refresh'); });
+  document.body.addEventListener('supplier-deleted', function(){ htmx.trigger('#supplier-list','refresh'); });
+  document.body.addEventListener('supplier-cost-recorded', function(){ htmx.trigger('#supplier-list','refresh'); });
+</script>
+{% endblock %}

@@ -28,11 +28,11 @@
 - [x] T11: service tests AC1-AC7, AC9-AC12
 
 ## Slice G — routes + UI
-- [ ] T12: REST `/api/suppliers`, `/api/product-supplier-costs`, `/api/purchases`,
+- [x] T12: REST `/api/suppliers`, `/api/product-supplier-costs`, `/api/purchases`,
       `/api/purchases/suggestions`
-- [ ] T13: Web `/purchases` Askama + HTMX parity, including the suggestion panel
-- [ ] T14: route-level tests AC8, AC11, AC12, AC14
-- [ ] T15: README update (flows, migrations, endpoints)
+- [x] T13: Web `/purchases` Askama + HTMX parity, including the suggestion panel
+- [x] T14: route-level tests AC8, AC11, AC12, AC14
+- [x] T15: README update (flows, migrations, endpoints)
 
 ## Verify
 - [ ] `cargo test` full suite green; manual smoke: seed supplier, register cost, build

@@ -1,8 +1,11 @@
 pub mod api;
 pub mod inventory_api;
 pub mod inventory_web;
+pub mod purchases_api;
+pub mod purchases_web;
 pub mod sales_api;
 pub mod sales_web;
+pub mod suppliers_web;
 pub mod web;
 
 use axum::Router;
@@ -12,10 +15,12 @@ use tower_http::services::ServeDir;
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
     SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
-    SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
+    SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteSaleRepository,
+    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTransactionRepository,
 };
 use crate::services::{
-    AccountService, InventoryService, PaymentMethodService, SalesService, TransactionService,
+    AccountService, InventoryService, PaymentMethodService, PurchasesService, SalesService,
+    SupplierService, TransactionService,
 };
 
 pub type InventorySvc = InventoryService<
@@ -39,6 +44,23 @@ pub type SalesSvc = SalesService<
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
 
+pub type SupplierSvc =
+    SupplierService<SqliteSupplierRepository, SqliteProductSupplierCostRepository>;
+
+pub type PurchasesSvc = PurchasesService<
+    SqlitePurchaseRepository,
+    SqliteDocSequenceRepository,
+    SqliteSupplierRepository,
+    SqliteProductSupplierCostRepository,
+    SqliteCategoryRepository,
+    SqliteProductRepository,
+    SqliteBarcodeRepository,
+    SqliteStockMovementRepository,
+    SqliteAccountRepository,
+    SqliteTransactionRepository,
+    SqlitePaymentMethodRepository,
+>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -48,6 +70,8 @@ pub struct AppState {
     pub inventory_service: InventorySvc,
     pub sales_service: SalesSvc,
     pub payment_method_service: MethodSvc,
+    pub supplier_service: SupplierSvc,
+    pub purchases_service: PurchasesSvc,
     pub allow_negative: bool,
     pub allow_negative_stock: bool,
 }
@@ -73,7 +97,22 @@ impl AppState {
             SqliteDocSequenceRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
-            method_repo,
+            method_repo.clone(),
+        );
+        // M3: suppliers + product/supplier cost satellite are consumed by the
+        // purchases orchestrator; both share the same SQLite repos as the rest
+        // of the app.
+        let supplier_service = SupplierService::new(
+            SqliteSupplierRepository::new(pool.clone()),
+            SqliteProductSupplierCostRepository::new(pool.clone()),
+        );
+        let purchases_service = PurchasesService::new(
+            SqlitePurchaseRepository::new(pool.clone()),
+            SqliteDocSequenceRepository::new(pool.clone()),
+            supplier_service.clone(),
+            inventory_service.clone(),
+            transaction_service.clone(),
+            PaymentMethodService::new(method_repo),
         );
         Self {
             pool,
@@ -82,6 +121,8 @@ impl AppState {
             inventory_service,
             sales_service,
             payment_method_service,
+            supplier_service,
+            purchases_service,
             allow_negative,
             allow_negative_stock,
         }
@@ -96,6 +137,9 @@ pub fn router(state: AppState) -> Router {
         .merge(inventory_web::router())
         .merge(sales_api::router())
         .merge(sales_web::router())
+        .merge(purchases_api::router())
+        .merge(purchases_web::router())
+        .merge(suppliers_web::router())
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state)
 }
