@@ -1,5 +1,9 @@
 // Slice D: sales web `/sales` Askama + HTMX (T7), parity with products page.
 // Thin handlers over SalesService; fragments in partials/sale_*.html.
+// Typed-id actions (add line, confirm, pay, cancel) post to collection web
+// endpoints with the sale id in the form body, because HTMX cannot interpolate
+// a path from an input value; the `/web/sales/{id}/...` paths stay for existing
+// callers.
 use askama::Template;
 use axum::{
     extract::{Form, Path, State},
@@ -186,6 +190,8 @@ pub struct CreateSaleForm {
 
 #[derive(Debug, Deserialize)]
 pub struct AddLineForm {
+    #[serde(default)]
+    pub sale_id: i64,
     pub product_id: i64,
     #[serde(default)]
     pub qty: String,
@@ -204,6 +210,8 @@ pub struct UpdateLineForm {
 #[derive(Debug, Deserialize)]
 pub struct ConfirmSaleForm {
     #[serde(default)]
+    pub sale_id: i64,
+    #[serde(default)]
     pub account_id: String,
     #[serde(default)]
     pub method_id: String,
@@ -211,6 +219,8 @@ pub struct ConfirmSaleForm {
 
 #[derive(Debug, Deserialize)]
 pub struct RecordPaymentForm {
+    #[serde(default)]
+    pub sale_id: i64,
     pub account_id: i64,
     pub method_id: i64,
     #[serde(default)]
@@ -221,6 +231,8 @@ pub struct RecordPaymentForm {
 
 #[derive(Debug, Deserialize)]
 pub struct CancelSaleForm {
+    #[serde(default)]
+    pub sale_id: i64,
     #[serde(default)]
     pub reason: String,
 }
@@ -371,11 +383,57 @@ async fn web_cancel_sale(
     Ok(Redirect::to("/sales").into_response())
 }
 
+// ---------------------------------------------------------------------------
+// Collection endpoints (typed id in the form body)
+// ---------------------------------------------------------------------------
+
+// HTMX posts the literal `hx-post` URL and never reads the form `action`
+// property, so typed-id forms cannot interpolate a path segment. These
+// adapters take the sale id from the submitted body and delegate to the
+// path-based handlers above, keeping both URL shapes working (mirrors
+// `purchases_web`).
+
+async fn web_add_line_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AddLineForm>,
+) -> Result<axum::response::Response, AppError> {
+    web_add_line(state, headers, Path(form.sale_id), Form(form)).await
+}
+
+async fn web_confirm_sale_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ConfirmSaleForm>,
+) -> Result<axum::response::Response, AppError> {
+    web_confirm_sale(state, headers, Path(form.sale_id), Form(form)).await
+}
+
+async fn web_record_payment_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RecordPaymentForm>,
+) -> Result<axum::response::Response, AppError> {
+    web_record_payment(state, headers, Path(form.sale_id), Form(form)).await
+}
+
+async fn web_cancel_sale_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CancelSaleForm>,
+) -> Result<axum::response::Response, AppError> {
+    web_cancel_sale(state, headers, Path(form.sale_id), Form(form)).await
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/sales", get(sales_page))
         .route("/web/sales", get(web_sale_list).post(web_create_sale))
         .route("/web/sales/debt", get(web_sale_debt))
+        .route("/web/sales/lines", post(web_add_line_collection))
+        .route("/web/sales/confirm", post(web_confirm_sale_collection))
+        .route("/web/sales/payments", post(web_record_payment_collection))
+        .route("/web/sales/cancel", post(web_cancel_sale_collection))
         .route("/web/sales/{id}", get(web_sale_detail))
         .route("/web/sales/{id}/lines", post(web_add_line))
         .route(
@@ -425,6 +483,20 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
+    async fn post_form(app: axum::Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
     #[tokio::test]
     async fn web_sales_page_renders() {
         let app = crate::routes::router(test_state().await);
@@ -455,6 +527,314 @@ mod tests {
         assert!(
             html.contains("debt") || html.contains("Debt") || html.contains("OK"),
             "debt fragment should render: {html:.200}"
+        );
+    }
+
+    /// Regression: the typed-id forms used `hx-post="/web/sales/0/..."` plus a
+    /// dead `onsubmit` action rewrite. HTMX ignores the form `.action`, so every
+    /// typed-id form posted to sale 0 and the server answered 404. Pin the
+    /// rendered page to the collection endpoints and prove each target resolves.
+    #[tokio::test]
+    async fn web_sales_forms_target_registered_collection_routes() {
+        let app = crate::routes::router(test_state().await);
+        let (status, html) = get_html(app.clone(), "/sales").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut targets = Vec::new();
+        let mut rest = html.as_str();
+        while let Some(start) = rest.find("hx-post=\"") {
+            let after = &rest[start + "hx-post=\"".len()..];
+            let end = after.find('"').expect("unterminated hx-post attribute");
+            targets.push(after[..end].to_string());
+            rest = &after[end..];
+        }
+        assert!(!targets.is_empty(), "page must render hx-post forms");
+
+        for target in &targets {
+            assert!(
+                !target.contains("/0/"),
+                "dead `/0/` placeholder target still rendered: {target}"
+            );
+        }
+        for expected in [
+            "/web/sales/lines",
+            "/web/sales/confirm",
+            "/web/sales/payments",
+            "/web/sales/cancel",
+        ] {
+            assert!(
+                targets.iter().any(|t| t == expected),
+                "rendered page must post to {expected}: {targets:?}"
+            );
+        }
+        assert!(
+            !html.contains("this.action="),
+            "dead onsubmit action rewrite still rendered"
+        );
+
+        // Any request that does not resolve to a registered route hits this
+        // sentinel, so a teapot response is a routing miss (an empty-body POST
+        // to a real handler fails extraction or validation instead).
+        let app = app.fallback(|| async { StatusCode::IM_A_TEAPOT });
+        for target in &targets {
+            let req = Request::builder()
+                .method("POST")
+                .uri(target)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::IM_A_TEAPOT,
+                "{target} does not resolve to a registered route"
+            );
+        }
+    }
+
+    /// Behavioral: the payment form posts to the collection endpoint with the
+    /// sale id in the body; the payment must land on that sale, not another.
+    #[tokio::test]
+    async fn web_collection_payment_records_on_the_sale_in_the_body() {
+        use crate::models::{
+            MovementReason, MovementType, NewMovement, NewProduct, NewSale, PaymentType,
+            ProductKind,
+        };
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "WEB-PAY".into(),
+                name: "prod WEB-PAY".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(10),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::ZERO),
+                max_stock: Some(Decimal::from(100)),
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .inventory_service
+            .record_movement(NewMovement {
+                product_id: product.id,
+                qty: Decimal::from(10),
+                movement_type: MovementType::In,
+                reason: MovementReason::Initial,
+                reference: String::new(),
+                date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            })
+            .await
+            .unwrap();
+        let account = state.account_service.create("Caja").await.unwrap();
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(account.id, "Caja")
+            .await
+            .unwrap();
+        let cash = state
+            .payment_method_service
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash")
+            .expect("Cash method is seeded by migrations");
+
+        let mut sale_ids = Vec::new();
+        for _ in 0..2 {
+            let sale = state
+                .sales_service
+                .create_draft(NewSale {
+                    customer_name: "Web Payer".into(),
+                    payment_type: PaymentType::Credit,
+                    sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                })
+                .await
+                .unwrap();
+            state
+                .sales_service
+                .add_line(sale.id, product.id, Decimal::from(2), None)
+                .await
+                .unwrap();
+            state
+                .sales_service
+                .confirm(sale.id, None, None)
+                .await
+                .unwrap();
+            sale_ids.push(sale.id);
+        }
+        let (paid, untouched) = (sale_ids[0], sale_ids[1]);
+
+        // Same body shape the rendered payment form submits.
+        let body = format!(
+            "sale_id={paid}&account_id={}&method_id={}&amount=10.00&date=2024-05-02",
+            account.id, cash.id
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/sales/payments")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let paid_detail = state.sales_service.get_detail(paid).await.unwrap();
+        assert_eq!(
+            paid_detail.payments.len(),
+            1,
+            "payment must reach sale {paid}"
+        );
+        let untouched_detail = state.sales_service.get_detail(untouched).await.unwrap();
+        assert!(
+            untouched_detail.payments.is_empty(),
+            "sale {untouched} must stay unpaid"
+        );
+    }
+
+    /// Triangulation: lines/confirm/cancel collection endpoints also act on the
+    /// sale id from the body and leave the other sale untouched.
+    #[tokio::test]
+    async fn web_collection_endpoints_act_on_the_body_sale_id() {
+        use crate::models::{NewProduct, NewSale, PaymentType, ProductKind, SaleStatus};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "WEB-SVC".into(),
+                name: "svc WEB-SVC".into(),
+                kind: ProductKind::Service,
+                category_id: None,
+                unit: "hr".into(),
+                sale_price: Decimal::from(30),
+                cost_price: Decimal::ZERO,
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+
+        let mut sale_ids = Vec::new();
+        for _ in 0..2 {
+            let sale = state
+                .sales_service
+                .create_draft(NewSale {
+                    customer_name: "Web Typist".into(),
+                    payment_type: PaymentType::Credit,
+                    sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                })
+                .await
+                .unwrap();
+            sale_ids.push(sale.id);
+        }
+        let (target, other) = (sale_ids[0], sale_ids[1]);
+
+        // Add line: only the body's sale gains a line.
+        let (status, _) = post_form(
+            app.clone(),
+            "/web/sales/lines",
+            &format!("sale_id={target}&product_id={}&qty=1", product.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            state
+                .sales_service
+                .get_detail(target)
+                .await
+                .unwrap()
+                .lines
+                .len(),
+            1
+        );
+        assert_eq!(
+            state
+                .sales_service
+                .get_detail(other)
+                .await
+                .unwrap()
+                .lines
+                .len(),
+            0
+        );
+
+        // Confirm: only the body's sale leaves Draft.
+        let (status, _) = post_form(
+            app.clone(),
+            "/web/sales/confirm",
+            &format!("sale_id={target}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            state.sales_service.get_detail(target).await.unwrap().sale.status,
+            SaleStatus::Confirmed
+        );
+        assert_eq!(
+            state.sales_service.get_detail(other).await.unwrap().sale.status,
+            SaleStatus::Draft
+        );
+
+        // Cancel: only the body's sale is cancelled.
+        let (status, _) = post_form(
+            app.clone(),
+            "/web/sales/cancel",
+            &format!("sale_id={target}&reason=changed+mind"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            state.sales_service.get_detail(target).await.unwrap().sale.status,
+            SaleStatus::Cancelled
+        );
+        assert_eq!(
+            state.sales_service.get_detail(other).await.unwrap().sale.status,
+            SaleStatus::Draft
+        );
+
+        // Legacy path-based route still works with the id in the path and no
+        // sale_id field in the body (shared form struct stays backward compatible).
+        let (status, _) = post_form(
+            app.clone(),
+            &format!("/web/sales/{other}/lines"),
+            &format!("product_id={}&qty=1", product.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            state
+                .sales_service
+                .get_detail(other)
+                .await
+                .unwrap()
+                .lines
+                .len(),
+            1
         );
     }
 
