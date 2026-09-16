@@ -1,0 +1,70 @@
+# Capability: purchases (M3)
+
+## Purpose
+Buy merchandise, know what each supplier charges and when that price changed, and let the reorder
+suggestion become an actual purchase order — the mirror of sales on the money-out side.
+
+## Entities
+
+### suppliers
+`id`, `name` (UNIQUE, ≤ 128), `phone`, `notes`, `is_active`, `created_at`, `updated_at`.
+
+### product_supplier_costs
+`id`, `product_id` → products ON DELETE RESTRICT, `supplier_id` → suppliers ON DELETE RESTRICT,
+`current_cost`, `current_cost_updated_at`, `previous_cost`, `previous_cost_updated_at`,
+`is_preferred`, `supplier_sku`, `created_at`, `UNIQUE(product_id, supplier_id)`.
+
+This satellite is the only place a product meets a supplier. `products` holds no supplier reference.
+A partial unique index enforces at most one preferred supplier per product.
+
+### purchases
+`id`, `purchase_number` (UNIQUE, nullable), `supplier_id` → suppliers ON DELETE RESTRICT,
+`status` (`Draft` | `Confirmed` | `Cancelled`), `payment_type` (`Cash` | `Credit`),
+`purchase_date`, `due_date`, `supplier_invoice_no`, `notes`, `cancel_reason`, and the same audit
+timestamps as a sale.
+
+### purchase_lines
+`id`, `purchase_id` → purchases ON DELETE CASCADE, `product_id` → products ON DELETE RESTRICT,
+`qty` (> 0), `unit_cost` (frozen at confirmation).
+
+### purchase_payments
+Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount`, `date`,
+`transaction_id`, `refund_transaction_id`.
+
+## Rules
+- **A draft is the purchase order.** It can be built from the reorder suggestion and edited freely;
+  it touches no stock, no finance and no cost until confirmed.
+- **Confirmation** assigns `YYYY-PURCH-NNNNNN`, freezes line costs, issues one `In` movement with reason
+  `Purchase` per stock-tracked line, and then records one payment and one `Expense` for cash, or leaves
+  a payable for credit.
+- **Reception is complete.** There is no partial receiving; goods arrive together.
+- **Cost rule.** On confirmation the satellite is updated per line: a cost that *differs* from the
+  current one shifts the current value and its date into `previous`, and the new value becomes current.
+  A repeated identical cost refreshes only the date, so `previous` keeps the last genuinely different
+  price and the derived raised/lowered alert stays meaningful (`100 → 120 → 120 → 120` still reports
+  a raise against 100). The alert is derived; nothing is stored.
+- **A purchase never writes `products.cost_price`.** That column is the fallback for products with no
+  supplier row, such as services. The read rule is: if the satellite has rows for the product, the
+  satellite wins; otherwise the column.
+- **Reference cost** is the preferred supplier's current cost, else the cheapest, else none.
+- **Reorder suggestion** lists products at or below `min_stock` with `suggested = max_stock − stock`,
+  the chosen supplier and its satellite cost. Products with no satellite row are returned in a separate
+  `without_supplier` list and are never silently dropped.
+- A product may appear only once per purchase, for the same reason as sales.
+- **Cancelling** a confirmed purchase returns the goods to the supplier (`Out`, reason
+  `Purchase-return`) and refunds the money paid as an `Income` per payment. Unlike the sales refund,
+  this is money *entering* the account, so it cannot overdraft and needs no balance guard.
+- Deleting a supplier or product with history is refused (RESTRICT); deactivate instead.
+
+## Interface
+- REST: `GET/POST /api/suppliers`, `GET/PUT /api/suppliers/{id}`, cost endpoints,
+  `GET/POST /api/purchases`, `GET/PUT /api/purchases/{id}`, lines, payments, `confirm`,
+  `cancel`, and `GET /api/purchases/suggestions`.
+- Web: `/purchases` with the purchase list, the "Sugerido" panel that seeds a draft, the draft line
+  editor and the confirm, pay and cancel forms; `/suppliers` with the cost satellite and its
+  raise/lower badge.
+
+## Verification
+`src/services/purchases.rs` and `src/services/suppliers.rs` (AC1–AC14 and the cost-rule cases),
+`src/routes/purchases_api.rs`, `src/routes/purchases_web.rs`, `src/routes/suppliers_web.rs`, and the
+purchase flow in `src/smoke_tests.rs`.
