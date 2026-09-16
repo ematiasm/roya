@@ -694,6 +694,56 @@ curl -X POST http://localhost:3000/api/transactions -H "Content-Type: applicatio
 curl "http://localhost:3000/api/transactions?account_id=1"
 ```
 
+## Tests (Rust smoke suite)
+
+`cargo test` runs the unit suites plus the HTTP smoke suite in
+`src/smoke_tests.rs`. The smoke tests build the app exactly like `main` does
+(in-memory SQLite with the real migrations + `AppState::new`) and drive the full
+router, form extraction and Askama rendering.
+
+- **Business flows** (one per test): account with payment methods, tracked
+  product and supplier cost; cash sale confirm (stock down, exactly one linked
+  Income); credit sale pay/overpay/cancel (stock re-entered, linked refund, the
+  original transaction link kept); purchase from the suggestion endpoint
+  (confirm Cash, linked Expense, cancel reversal); the no-methods payment guard;
+  and the account-balance + payment-traceability invariants (every payment's
+  `transaction_id` and, when present, its `refund_transaction_id` resolve to a
+  real transaction whose `reference` is the document number; a refund must also
+  reverse its own payment: same account, opposite kind and equal amount; and
+  globally no transaction id may be claimed by two payments, so equal-amount
+  cross-payment swaps fail even though every fact matches. That ownership rule
+  is only reachable through direct database tampering: the application always
+  creates a fresh refund per payment and no route accepts
+  `refund_transaction_id`).
+- **Generic form-wiring guard**: for the seeded `/`, `/accounts/{id}`,
+  `/products`, `/sales`, `/purchases` and `/suppliers` pages (plus the sale and
+  purchase detail fragments) it extracts every `hx-get`, `hx-post`, `hx-put`,
+  `hx-patch` and `hx-delete` target with the HTTP verb htmx will send, the
+  native `action`/`onsubmit` wiring of rendered forms, and the application URLs
+  written inside `hx-on` bodies and inline scripts (verb from
+  `htmx.ajax('POST', ...)`, GET by default) after decoding HTML entities and
+  unwrapping single- or double-quoted attributes and plain backticks, then
+  probes each target against the router with that real verb. Selectors (`#...`),
+  event names and non-path string literals are ignored. A URL built dynamically
+  (concatenation or `${}` template interpolation around an application path) is
+  rejected with a message that asks for a plain quoted literal, so it cannot
+  hide from static verification.
+- **Routing oracle and verb check**: unmatched paths answer
+  `404 {"error":"route not found"}` and a registered path probed with the wrong
+  verb answers `405`; both fail the guard. A dead target masked by a path-param
+  route (`hx-post="/web/sales/does-not-exist"`) and a GET-only path used as an
+  `hx-post` target are caught. Handler-level 404s keep their own message, and
+  the guard probes against its own freshly seeded app instance so the real
+  handlers it may run cannot mutate the apps used by the flow assertions.
+- **Typed-id shells**: `/`, `/sales` and `/purchases` are the pages where the
+  user types the id into the form, so a concrete numeric path segment in a
+  form-bound target is rejected (`/web/sales/1/confirm`) while data-bound record
+  links such as the list View buttons stay valid. A `:` is a placeholder marker
+  only in the path, so `datetime` query values pass.
+- **Native forms**: a `this.action=` rewrite inside `onsubmit` fails the guard
+  (htmx ignores the form action property), and native `action=` targets are
+  probed with their form method like any other target.
+
 ## License
 
 MIT
