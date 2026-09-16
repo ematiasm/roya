@@ -549,3 +549,92 @@ impl SaleDetail {
 pub fn format_sale_number(year: i32, seq: i64) -> String {
     format!("{year}-SALE-{seq:06}")
 }
+
+// ---------------------------------------------------------------------------
+// M3 purchases: suppliers + product/supplier cost satellite (Slice E).
+// Decimal-as-TEXT like finance/inventory. The price alert is derived from
+// previous vs current, never stored; `products.cost_price` stays as the
+// fallback for products without satellite rows.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Supplier {
+    pub id: i64,
+    pub name: String,
+    pub phone: Option<String>,
+    pub notes: Option<String>,
+    pub is_active: bool,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductSupplierCost {
+    pub id: i64,
+    pub product_id: i64,
+    pub supplier_id: i64,
+    /// Decimal >= 0, stored as TEXT.
+    pub current_cost: Decimal,
+    pub current_cost_updated_at: NaiveDate,
+    /// Decimal >= 0 or NULL when there is no older recorded price.
+    pub previous_cost: Option<Decimal>,
+    pub previous_cost_updated_at: Option<NaiveDate>,
+    pub is_preferred: bool,
+    /// The supplier's own code for this product, stored as TEXT.
+    pub supplier_sku: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+impl ProductSupplierCost {
+    /// Derived alert: compare the recorded previous price against the current one.
+    pub fn price_alert(&self) -> PriceAlert {
+        PriceAlert::compare(self.previous_cost, self.current_cost)
+    }
+}
+
+/// Derived price movement between the previous and current satellite costs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum PriceAlert {
+    Raised,
+    Lowered,
+    Unchanged,
+}
+
+impl PriceAlert {
+    /// `None` previous means no movement to compare yet => Unchanged.
+    pub fn compare(previous: Option<Decimal>, current: Decimal) -> Self {
+        match previous {
+            Some(p) if current > p => Self::Raised,
+            Some(p) if current < p => Self::Lowered,
+            _ => Self::Unchanged,
+        }
+    }
+}
+
+impl std::fmt::Display for PriceAlert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raised => write!(f, "Raised"),
+            Self::Lowered => write!(f, "Lowered"),
+            Self::Unchanged => write!(f, "Unchanged"),
+        }
+    }
+}
+
+/// Service-level input for supplier creation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewSupplier {
+    pub name: String,
+    pub phone: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// Service-level patch for supplier edits. `Option<Option<T>>` distinguishes
+/// "leave unchanged" (`None`) from "clear" (`Some(None)`).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateSupplier {
+    pub name: Option<String>,
+    pub phone: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
+}
