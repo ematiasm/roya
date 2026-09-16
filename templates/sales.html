@@ -1,17 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Roya — Sales{% endblock %}
 {% block content %}
-<div style="margin-bottom:16px;display:flex;gap:8px;align-items:center">
-  <a href="/" class="muted">← Dashboard</a>
-  <a href="/products" class="muted">Products</a>
-  <span class="badge">sales • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %} • {% if allow_negative %}overdraft allowed{% else %}overdraft blocked{% endif %}</span>
+<div class="mb-4 flex items-center gap-2">
+  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/products" class="text-[13px] text-muted">Products</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">sales • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %} • {% if allow_negative %}overdraft allowed{% else %}overdraft blocked{% endif %}</span>
 </div>
-<div class="grid">
-  <div style="display:flex;flex-direction:column;gap:24px">
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <h2 style="margin:0">Sales</h2>
-        <button class="ghost" hx-get="/web/sales" hx-target="#sale-list" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">↻ Refresh</button>
+<div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
+  <div class="flex flex-col gap-6">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Sales</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/sales" hx-target="#sale-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
       <div id="sale-list"
            hx-get="/web/sales"
@@ -21,39 +21,39 @@
       </div>
     </div>
 
-    <div class="card" id="sale-detail-section">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <h2 style="margin:0">Sale Detail</h2>
+    <div class="rounded-2xl border border-border bg-card p-5" id="sale-detail-section">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Sale Detail</h2>
       </div>
       <div id="sale-detail">
-        <div class="muted">Click <b>View</b> on a sale to see lines and payments.</div>
+        <div class="text-[13px] text-muted">Click <b>View</b> on a sale to see lines and payments.</div>
       </div>
     </div>
 
-    <div class="card" id="debt-section">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <h2 style="margin:0">Outstanding Debt</h2>
-        <button class="ghost" hx-get="/web/sales/debt" hx-target="#sale-debt" hx-swap="innerHTML" style="font-size:12px;padding:6px 10px">↻ Refresh</button>
+    <div class="rounded-2xl border border-border bg-card p-5" id="debt-section">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Outstanding Debt</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/sales/debt" hx-target="#sale-debt" hx-swap="innerHTML">↻ Refresh</button>
       </div>
       <div id="sale-debt"
            hx-get="/web/sales/debt"
            hx-trigger="refresh from:body, load"
            hx-swap="innerHTML">
-        <div class="muted">Loading…</div>
+        <div class="text-[13px] text-muted">Loading…</div>
       </div>
-      <div class="muted" style="margin-top:8px">Confirmed sales with due &gt; 0 (total − paid). Pay them with the form on the right.</div>
+      <div class="mt-2 text-[13px] text-muted">Confirmed sales with due &gt; 0 (total − paid). Pay them with the form on the right.</div>
     </div>
   </div>
 
-  <div style="display:flex;flex-direction:column;gap:24px">
-    <div class="card">
-      <h2>New Sale (Draft)</h2>
-      <form hx-post="/web/sales" hx-target="#sale-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#sale-debt','refresh'); }">
+  <div class="flex flex-col gap-6">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">New Sale (Draft)</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales" hx-target="#sale-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#sale-debt','refresh'); }">
         <div>
           <label>Customer</label>
           <input type="text" name="customer_name" placeholder="Walk-in…" maxlength="128" />
         </div>
-        <div class="row">
+        <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
             <label>Type</label>
             <select name="payment_type" required>
@@ -79,13 +79,13 @@
           <input type="text" name="notes" placeholder="…" maxlength="512" />
         </div>
         <button type="submit">Create Draft</button>
-        <div class="muted">Draft creates no stock or finance rows. Also at <code>POST /api/sales</code></div>
+        <div class="text-[13px] text-muted">Draft creates no stock or finance rows. Also at <code>POST /api/sales</code></div>
       </form>
     </div>
 
-    <div class="card">
-      <h2>Add Line (Draft only)</h2>
-      <form hx-post="/web/sales/0/lines" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#sale-list','refresh')"
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Add Line (Draft only)</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/lines" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#sale-list','refresh')"
             onsubmit="this.action='/web/sales/'+this.sale_id.value+'/lines'">
         <div>
           <label>Sale ID</label>
@@ -99,7 +99,7 @@
             {% endfor %}
           </select>
         </div>
-        <div class="row">
+        <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
             <label>Qty</label>
             <input type="number" name="qty" step="0.01" min="0.01" required placeholder="1" />
@@ -110,13 +110,13 @@
           </div>
         </div>
         <button type="submit">Add Line</button>
-        <div class="muted">Unknown product ⇒ 404, qty ≤ 0 ⇒ 400. Also at <code>POST /api/sales/:id/lines</code></div>
+        <div class="text-[13px] text-muted">Unknown product ⇒ 404, qty ≤ 0 ⇒ 400. Also at <code>POST /api/sales/:id/lines</code></div>
       </form>
     </div>
 
-    <div class="card">
-      <h2>Confirm Sale</h2>
-      <form hx-post="/web/sales/0/confirm" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Confirm Sale</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/confirm" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
             onsubmit="this.action='/web/sales/'+this.sale_id.value+'/confirm'">
         <div>
           <label>Sale ID</label>
@@ -140,14 +140,14 @@
             {% endfor %}
           </select>
         </div>
-        <button type="submit" class="secondary">Confirm</button>
-        <div class="muted">Assigns <code>YYYY-SALE-NNNNNN</code>, deducts stock, Cash posts 1 Income with method. Disallowed pair ⇒ 400, no stock/finance touch. Double confirm ⇒ 400.</div>
+        <button type="submit" class="bg-accent2 text-white">Confirm</button>
+        <div class="text-[13px] text-muted">Assigns <code>YYYY-SALE-NNNNNN</code>, deducts stock, Cash posts 1 Income with method. Disallowed pair ⇒ 400, no stock/finance touch. Double confirm ⇒ 400.</div>
       </form>
     </div>
 
-    <div class="card">
-      <h2>Record Payment (Credit)</h2>
-      <form hx-post="/web/sales/0/payments" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Record Payment (Credit)</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/payments" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
             onsubmit="this.action='/web/sales/'+this.sale_id.value+'/payments'">
         <div>
           <label>Sale ID</label>
@@ -169,7 +169,7 @@
             {% endfor %}
           </select>
         </div>
-        <div class="row">
+        <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
             <label>Amount</label>
             <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
@@ -179,14 +179,14 @@
             <input type="date" name="date" required value="{{ today }}" />
           </div>
         </div>
-        <button type="submit" class="secondary">Record Payment</button>
-        <div class="muted">Each payment posts 1 Income with method (N per sale, mixed accounts/methods, sum ≤ total). Disallowed pair ⇒ 400, no finance touch. Overpay ⇒ 400. Also at <code>POST /api/sales/:id/payments</code></div>
+        <button type="submit" class="bg-accent2 text-white">Record Payment</button>
+        <div class="text-[13px] text-muted">Each payment posts 1 Income with method (N per sale, mixed accounts/methods, sum ≤ total). Disallowed pair ⇒ 400, no finance touch. Overpay ⇒ 400. Also at <code>POST /api/sales/:id/payments</code></div>
       </form>
     </div>
 
-    <div class="card">
-      <h2>Cancel Sale</h2>
-      <form hx-post="/web/sales/0/cancel" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Cancel Sale</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/sales/0/cancel" hx-target="#sale-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { htmx.trigger('#sale-list','refresh'); htmx.trigger('#sale-debt','refresh'); }"
             onsubmit="this.action='/web/sales/'+this.sale_id.value+'/cancel'">
         <div>
           <label>Sale ID</label>
@@ -196,14 +196,14 @@
           <label>Reason</label>
           <input type="text" name="reason" placeholder="customer return…" maxlength="256" />
         </div>
-        <button type="submit" class="ghost">Cancel Sale</button>
-        <div class="muted">Confirmed ⇒ stock re-enters + Expense refunds (overdraft guard applies).</div>
+        <button type="submit" class="border border-border bg-transparent text-text">Cancel Sale</button>
+        <div class="text-[13px] text-muted">Confirmed ⇒ stock re-enters + Expense refunds (overdraft guard applies).</div>
       </form>
     </div>
 
-    <div class="card">
-      <h2>REST API</h2>
-      <div class="muted" style="font-size:13px;line-height:1.7">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
+      <div class="text-[13px] leading-[1.7] text-muted">
         <code>GET /api/sales</code><br/>
         <code>POST /api/sales</code><br/>
         <code>GET /api/sales/debt</code><br/>
