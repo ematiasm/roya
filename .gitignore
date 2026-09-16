@@ -14,3 +14,6 @@ roya.db-*
 # OS
 .DS_Store
 Thumbs.db
+
+# Local code graph index
+.codegraph/
