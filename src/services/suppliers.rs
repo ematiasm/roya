@@ -1,0 +1,868 @@
+// M3 suppliers + product/supplier cost satellite (Slice E).
+//
+// SupplierService owns supplier CRUD (trim/validate name/phone/notes,
+// deactivate, RESTRICT-aware delete) and the frozen option-A cost rule: a new
+// cost that differs from the current one shifts current -> previous (value and
+// date) and stores the new value with its date; an equal cost only refreshes
+// the confirmation date, preserving the last genuinely different previous so
+// the alert keeps working. The "supplier raised the price" alert is derived
+// from previous vs current, never stored. `products.cost_price` is never
+// written here: the satellite wins when the product has rows, and callers fall
+// back to the column only when it does not.
+use chrono::NaiveDate;
+use rust_decimal::Decimal;
+
+use crate::error::{AppError, AppResult};
+use crate::models::{NewSupplier, PriceAlert, ProductSupplierCost, Supplier, UpdateSupplier};
+use crate::repositories::{ProductSupplierCostRepository, SupplierRepository};
+
+#[derive(Clone)]
+pub struct SupplierService<SR, CR>
+where
+    SR: SupplierRepository,
+    CR: ProductSupplierCostRepository,
+{
+    pub suppliers: SR,
+    pub costs: CR,
+}
+
+impl<SR, CR> SupplierService<SR, CR>
+where
+    SR: SupplierRepository,
+    CR: ProductSupplierCostRepository,
+{
+    pub fn new(suppliers: SR, costs: CR) -> Self {
+        Self { suppliers, costs }
+    }
+
+    // -- validation helpers ---------------------------------------------------
+
+    fn clean_name(name: &str) -> AppResult<String> {
+        let t = name.trim();
+        if t.is_empty() {
+            return Err(AppError::Validation("supplier name is required".into()));
+        }
+        if t.chars().count() > 128 {
+            return Err(AppError::Validation(
+                "supplier name must be <= 128 chars".into(),
+            ));
+        }
+        Ok(t.to_string())
+    }
+
+    fn clean_phone(phone: &Option<String>) -> AppResult<Option<String>> {
+        match phone {
+            None => Ok(None),
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    return Ok(None);
+                }
+                if t.chars().count() > 32 {
+                    return Err(AppError::Validation("phone must be <= 32 chars".into()));
+                }
+                Ok(Some(t.to_string()))
+            }
+        }
+    }
+
+    fn clean_notes(notes: &Option<String>) -> AppResult<Option<String>> {
+        match notes {
+            None => Ok(None),
+            Some(s) => {
+                let t = s.trim();
+                if t.is_empty() {
+                    return Ok(None);
+                }
+                if t.chars().count() > 512 {
+                    return Err(AppError::Validation("notes must be <= 512 chars".into()));
+                }
+                Ok(Some(t.to_string()))
+            }
+        }
+    }
+
+    // -- supplier CRUD --------------------------------------------------------
+
+    pub async fn create_supplier(&self, input: NewSupplier) -> AppResult<Supplier> {
+        let clean = NewSupplier {
+            name: Self::clean_name(&input.name)?,
+            phone: Self::clean_phone(&input.phone)?,
+            notes: Self::clean_notes(&input.notes)?,
+        };
+        self.suppliers.create(&clean).await
+    }
+
+    pub async fn update_supplier(&self, id: i64, patch: UpdateSupplier) -> AppResult<Supplier> {
+        self.get_supplier(id).await?;
+        let mut clean = UpdateSupplier::default();
+        if let Some(ref name) = patch.name {
+            clean.name = Some(Self::clean_name(name)?);
+        }
+        if let Some(ref phone) = patch.phone {
+            clean.phone = Some(Self::clean_phone(phone)?);
+        }
+        if let Some(ref notes) = patch.notes {
+            clean.notes = Some(Self::clean_notes(notes)?);
+        }
+        self.suppliers.update(id, &clean).await
+    }
+
+    pub async fn get_supplier(&self, id: i64) -> AppResult<Supplier> {
+        self.suppliers
+            .find_by_id(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("supplier {id} not found")))
+    }
+
+    pub async fn list_suppliers(&self) -> AppResult<Vec<Supplier>> {
+        self.suppliers.list().await
+    }
+
+    /// Deactivate (`false`) a supplier instead of deleting it when it has history.
+    pub async fn set_active(&self, id: i64, active: bool) -> AppResult<Supplier> {
+        self.get_supplier(id).await?;
+        self.suppliers.set_active(id, active).await
+    }
+
+    /// RESTRICT-aware delete: a supplier with cost rows cannot be deleted
+    /// (future purchases add the same restriction); deactivate it instead.
+    pub async fn delete_supplier(&self, id: i64) -> AppResult<()> {
+        self.get_supplier(id).await?;
+        if self.costs.count_by_supplier(id).await? > 0 {
+            return Err(AppError::Validation(
+                "cannot delete supplier with cost rows; deactivate it instead".into(),
+            ));
+        }
+        if !self.suppliers.delete(id).await? {
+            return Err(AppError::NotFound(format!("supplier {id} not found")));
+        }
+        Ok(())
+    }
+
+    // -- product/supplier cost satellite --------------------------------------
+
+    /// Record a (product, supplier) cost. First call creates the row. A later
+    /// call with a different cost shifts current -> previous with its date and
+    /// stores the new value with `when`; a later call with the same cost only
+    /// refreshes `current_cost_updated_at`, keeping the last distinct previous.
+    /// Unknown product/supplier surface as Validation through the repository FK
+    /// mapping. `products.cost_price` is deliberately untouched.
+    pub async fn record_cost(
+        &self,
+        product_id: i64,
+        supplier_id: i64,
+        cost: Decimal,
+        when: NaiveDate,
+    ) -> AppResult<ProductSupplierCost> {
+        if cost < Decimal::ZERO {
+            return Err(AppError::Validation("cost must be >= 0".into()));
+        }
+        match self.costs.find(product_id, supplier_id).await? {
+            None => {
+                self.costs
+                    .create_cost(product_id, supplier_id, cost, when)
+                    .await
+            }
+            Some(existing) => {
+                if when < existing.current_cost_updated_at {
+                    return Err(AppError::Validation(
+                        "cost date cannot precede the current cost date".into(),
+                    ));
+                }
+                if existing.current_cost == cost {
+                    // Same price: do not shift, or the last genuinely different
+                    // previous would be lost and the derived alert would always
+                    // read Unchanged. Only refresh the confirmation date.
+                    self.costs
+                        .refresh_cost_date(product_id, supplier_id, when)
+                        .await
+                } else {
+                    self.costs
+                        .shift_cost(product_id, supplier_id, cost, when)
+                        .await
+                }
+            }
+        }
+    }
+
+    pub async fn find_cost(
+        &self,
+        product_id: i64,
+        supplier_id: i64,
+    ) -> AppResult<Option<ProductSupplierCost>> {
+        self.costs.find(product_id, supplier_id).await
+    }
+
+    pub async fn list_costs_for_product(
+        &self,
+        product_id: i64,
+    ) -> AppResult<Vec<ProductSupplierCost>> {
+        self.costs.list_by_product(product_id).await
+    }
+
+    /// Mark a supplier as the preferred one for a product, clearing any other
+    /// preferred row of that product.
+    pub async fn set_preferred(
+        &self,
+        product_id: i64,
+        supplier_id: i64,
+    ) -> AppResult<ProductSupplierCost> {
+        self.costs
+            .find(product_id, supplier_id)
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "cost row for product {product_id} and supplier {supplier_id} not found"
+                ))
+            })?;
+        self.costs.set_preferred(product_id, supplier_id).await
+    }
+
+    pub async fn clear_preferred(&self, product_id: i64) -> AppResult<()> {
+        self.costs.clear_preferred(product_id).await
+    }
+
+    /// Derived read rule: preferred supplier's current cost, else the lowest
+    /// current cost, else `None` meaning the caller falls back to
+    /// `products.cost_price`. Values are Decimals (TEXT ordering cannot be used).
+    pub async fn reference_cost(&self, product_id: i64) -> AppResult<Option<Decimal>> {
+        let costs = self.costs.list_by_product(product_id).await?;
+        if costs.is_empty() {
+            return Ok(None);
+        }
+        if let Some(preferred) = costs.iter().find(|c| c.is_preferred) {
+            return Ok(Some(preferred.current_cost));
+        }
+        Ok(costs.iter().map(|c| c.current_cost).min())
+    }
+
+    /// Derived price alert for a (product, supplier) pair, `None` if no row.
+    pub async fn price_alert(
+        &self,
+        product_id: i64,
+        supplier_id: i64,
+    ) -> AppResult<Option<PriceAlert>> {
+        Ok(self
+            .costs
+            .find(product_id, supplier_id)
+            .await?
+            .map(|c| c.price_alert()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{NewProduct, NewSupplier, PriceAlert, ProductKind, Supplier, UpdateSupplier};
+    use crate::repositories::{
+        ProductRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
+        SqliteProductRepository, SqliteProductSupplierCostRepository,
+        SqliteStockMovementRepository, SqliteSupplierRepository,
+    };
+    use crate::services::InventoryService;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::SqlitePool;
+    use std::str::FromStr;
+
+    type Svc = SupplierService<SqliteSupplierRepository, SqliteProductSupplierCostRepository>;
+
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn svc() -> (Svc, SqlitePool) {
+        let pool = test_pool().await;
+        let s = SupplierService::new(
+            SqliteSupplierRepository::new(pool.clone()),
+            SqliteProductSupplierCostRepository::new(pool.clone()),
+        );
+        (s, pool)
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    async fn seed_product(pool: &SqlitePool, sku: &str, cost_price: &str) -> i64 {
+        SqliteProductRepository::new(pool.clone())
+            .create(&NewProduct {
+                sku: sku.into(),
+                name: format!("prod {sku}"),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: dec("10"),
+                cost_price: dec(cost_price),
+                track_stock: true,
+                min_stock: Some(dec("0")),
+                max_stock: Some(dec("10")),
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn seed_supplier(s: &Svc, name: &str) -> Supplier {
+        s.create_supplier(NewSupplier {
+            name: name.into(),
+            phone: None,
+            notes: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    // -- AC9 (satellite part) -------------------------------------------------
+
+    #[tokio::test]
+    async fn ac9_first_record_sets_current_without_previous() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC9-1", "5").await;
+        let sup = seed_supplier(&s, "AC9 SUP").await;
+
+        let row = s
+            .record_cost(p, sup.id, dec("10.50"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        assert_eq!(row.current_cost, dec("10.50"));
+        assert_eq!(row.current_cost_updated_at, d(2024, 5, 1));
+        assert_eq!(row.previous_cost, None);
+        assert_eq!(row.previous_cost_updated_at, None);
+        assert!(!row.is_preferred);
+    }
+
+    #[tokio::test]
+    async fn ac9_second_record_shifts_current_into_previous_with_dates() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC9-2", "5").await;
+        let sup = seed_supplier(&s, "AC9 SUP 2").await;
+
+        s.record_cost(p, sup.id, dec("10"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        let row = s
+            .record_cost(p, sup.id, dec("12.25"), d(2024, 5, 10))
+            .await
+            .unwrap();
+
+        assert_eq!(row.current_cost, dec("12.25"));
+        assert_eq!(row.current_cost_updated_at, d(2024, 5, 10));
+        assert_eq!(row.previous_cost, Some(dec("10")));
+        assert_eq!(row.previous_cost_updated_at, Some(d(2024, 5, 1)));
+    }
+
+    #[tokio::test]
+    async fn ac9_price_alert_is_derived_from_previous_vs_current() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC9-3", "5").await;
+        let sup = seed_supplier(&s, "AC9 SUP 3").await;
+
+        let first = s
+            .record_cost(p, sup.id, dec("10"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        assert_eq!(first.price_alert(), PriceAlert::Unchanged);
+
+        let raised = s
+            .record_cost(p, sup.id, dec("12"), d(2024, 5, 2))
+            .await
+            .unwrap();
+        assert_eq!(raised.price_alert(), PriceAlert::Raised);
+
+        let lowered = s
+            .record_cost(p, sup.id, dec("8"), d(2024, 5, 3))
+            .await
+            .unwrap();
+        assert_eq!(lowered.price_alert(), PriceAlert::Lowered);
+
+        // Repeating the same cost must not erase the last distinct price:
+        // previous stays 12, so the alert is still Lowered.
+        let repeated = s
+            .record_cost(p, sup.id, dec("8"), d(2024, 5, 4))
+            .await
+            .unwrap();
+        assert_eq!(repeated.previous_cost, Some(dec("12")));
+        assert_eq!(repeated.price_alert(), PriceAlert::Lowered);
+
+        let raised_again = s
+            .record_cost(p, sup.id, dec("9"), d(2024, 5, 5))
+            .await
+            .unwrap();
+        assert_eq!(raised_again.previous_cost, Some(dec("8")));
+        assert_eq!(raised_again.price_alert(), PriceAlert::Raised);
+
+        assert_eq!(
+            s.price_alert(p, sup.id).await.unwrap(),
+            Some(PriceAlert::Raised)
+        );
+        assert_eq!(s.price_alert(p, 999_999).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn ac9_repeated_identical_cost_preserves_previous_and_its_date() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC9-4", "5").await;
+        let sup = seed_supplier(&s, "AC9 SUP 4").await;
+
+        s.record_cost(p, sup.id, dec("100"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.record_cost(p, sup.id, dec("120"), d(2024, 5, 2))
+            .await
+            .unwrap();
+        let repeated = s
+            .record_cost(p, sup.id, dec("120"), d(2024, 5, 5))
+            .await
+            .unwrap();
+
+        assert_eq!(repeated.current_cost, dec("120"));
+        assert_eq!(repeated.previous_cost, Some(dec("100")));
+        assert_eq!(repeated.previous_cost_updated_at, Some(d(2024, 5, 1)));
+    }
+
+    #[tokio::test]
+    async fn ac9_repeated_identical_cost_refreshes_current_date() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC9-5", "5").await;
+        let sup = seed_supplier(&s, "AC9 SUP 5").await;
+
+        s.record_cost(p, sup.id, dec("120"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        let refreshed = s
+            .record_cost(p, sup.id, dec("120"), d(2024, 5, 7))
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed.current_cost, dec("120"));
+        assert_eq!(refreshed.current_cost_updated_at, d(2024, 5, 7));
+        assert_eq!(refreshed.previous_cost, None);
+    }
+
+    #[tokio::test]
+    async fn ac9_alert_survives_repeated_cost_and_tracks_next_real_change() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC9-6", "5").await;
+        let sup = seed_supplier(&s, "AC9 SUP 6").await;
+
+        s.record_cost(p, sup.id, dec("100"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.record_cost(p, sup.id, dec("120"), d(2024, 5, 2))
+            .await
+            .unwrap();
+        for day in [5, 6, 7] {
+            let repeated = s
+                .record_cost(p, sup.id, dec("120"), d(2024, 5, day))
+                .await
+                .unwrap();
+            assert_eq!(repeated.previous_cost, Some(dec("100")));
+            assert_eq!(repeated.price_alert(), PriceAlert::Raised);
+        }
+
+        let lowered = s
+            .record_cost(p, sup.id, dec("90"), d(2024, 5, 8))
+            .await
+            .unwrap();
+        assert_eq!(lowered.previous_cost, Some(dec("120")));
+        assert_eq!(lowered.price_alert(), PriceAlert::Lowered);
+
+        let raised = s
+            .record_cost(p, sup.id, dec("95"), d(2024, 5, 9))
+            .await
+            .unwrap();
+        assert_eq!(raised.previous_cost, Some(dec("90")));
+        assert_eq!(raised.price_alert(), PriceAlert::Raised);
+    }
+
+    // -- AC10 -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ac10_reference_cost_prefers_satellite_and_never_writes_cost_price() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC10-1", "5").await;
+        let sup = seed_supplier(&s, "AC10 SUP").await;
+
+        s.record_cost(p, sup.id, dec("9.50"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let prod = SqliteProductRepository::new(pool.clone())
+            .find_by_id(p)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prod.cost_price, dec("5"), "cost_price must stay untouched");
+
+        assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("9.50")));
+    }
+
+    #[tokio::test]
+    async fn ac10_reference_cost_absent_without_rows() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC10-2", "5").await;
+        assert_eq!(s.reference_cost(p).await.unwrap(), None);
+    }
+
+    // -- AC13 -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ac13_delete_supplier_with_cost_rows_blocked() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC13-1", "5").await;
+        let sup = seed_supplier(&s, "AC13 SUP").await;
+        s.record_cost(p, sup.id, dec("7"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let err = s.delete_supplier(sup.id).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(s.get_supplier(sup.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ac13_delete_supplier_without_history_works() {
+        let (s, _pool) = svc().await;
+        let sup = seed_supplier(&s, "AC13 FREE").await;
+        s.delete_supplier(sup.id).await.unwrap();
+        assert!(matches!(
+            s.get_supplier(sup.id).await.unwrap_err(),
+            AppError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ac13_product_delete_blocked_when_cost_row_exists() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "AC13-2", "5").await;
+        let sup = seed_supplier(&s, "AC13 SUP 2").await;
+        s.record_cost(p, sup.id, dec("7"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let inventory = InventoryService::new(
+            SqliteCategoryRepository::new(pool.clone()),
+            SqliteProductRepository::new(pool.clone()),
+            SqliteBarcodeRepository::new(pool.clone()),
+            SqliteStockMovementRepository::new(pool.clone()),
+            true,
+        );
+        let err = inventory.delete_product(p).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(SqliteProductRepository::new(pool.clone())
+            .find_by_id(p)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    // -- preferred supplier ---------------------------------------------------
+
+    #[tokio::test]
+    async fn preferred_switch_clears_previous_supplier_for_product() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "PREF-1", "5").await;
+        let other = seed_product(&pool, "PREF-2", "5").await;
+        let a = seed_supplier(&s, "PREF A").await;
+        let b = seed_supplier(&s, "PREF B").await;
+        s.record_cost(p, a.id, dec("9"), d(2024, 5, 1)).await.unwrap();
+        s.record_cost(p, b.id, dec("8"), d(2024, 5, 1)).await.unwrap();
+        s.record_cost(other, a.id, dec("9"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.set_preferred(other, a.id).await.unwrap();
+
+        let first = s.set_preferred(p, a.id).await.unwrap();
+        assert!(first.is_preferred);
+        let second = s.set_preferred(p, b.id).await.unwrap();
+        assert!(second.is_preferred);
+
+        assert!(!s.find_cost(p, a.id).await.unwrap().unwrap().is_preferred);
+        assert!(s.find_cost(p, b.id).await.unwrap().unwrap().is_preferred);
+        // Another product keeps its own preferred supplier.
+        assert!(s.find_cost(other, a.id).await.unwrap().unwrap().is_preferred);
+    }
+
+    // -- triangulation --------------------------------------------------------
+
+    #[tokio::test]
+    async fn tri_supplier_name_is_trimmed_and_duplicate_is_conflict() {
+        let (s, _pool) = svc().await;
+        let created = s
+            .create_supplier(NewSupplier {
+                name: "  Distribuidora Sur  ".into(),
+                phone: Some("  555-1234  ".into()),
+                notes: Some("  entrega martes  ".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.name, "Distribuidora Sur");
+        assert_eq!(created.phone.as_deref(), Some("555-1234"));
+        assert_eq!(created.notes.as_deref(), Some("entrega martes"));
+
+        let err = s
+            .create_supplier(NewSupplier {
+                name: "Distribuidora Sur".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+        assert!(s.suppliers.find_by_name("Distribuidora Sur").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn tri_supplier_validation_rejects_empty_and_oversized_fields() {
+        let (s, _pool) = svc().await;
+        for bad in ["", "   "] {
+            let err = s
+                .create_supplier(NewSupplier {
+                    name: bad.into(),
+                    phone: None,
+                    notes: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        }
+        let long_name = "n".repeat(129);
+        let long_phone = "9".repeat(33);
+        let long_notes = "x".repeat(513);
+        let err = s
+            .create_supplier(NewSupplier {
+                name: long_name,
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        let err = s
+            .create_supplier(NewSupplier {
+                name: "Largo".into(),
+                phone: Some(long_phone),
+                notes: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        let err = s
+            .create_supplier(NewSupplier {
+                name: "Largo".into(),
+                phone: None,
+                notes: Some(long_notes),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn tri_update_supplier_changes_conflicts_and_clears_fields() {
+        let (s, _pool) = svc().await;
+        let a = s
+            .create_supplier(NewSupplier {
+                name: "A".into(),
+                phone: Some("111".into()),
+                notes: Some("n".into()),
+            })
+            .await
+            .unwrap();
+        let _b = seed_supplier(&s, "B").await;
+
+        let updated = s
+            .update_supplier(
+                a.id,
+                UpdateSupplier {
+                    name: Some("A2".into()),
+                    phone: Some(Some("  222  ".into())),
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "A2");
+        assert_eq!(updated.phone.as_deref(), Some("222"));
+        assert_eq!(updated.notes.as_deref(), Some("n"));
+
+        // Renaming onto another supplier's name is a conflict.
+        let err = s
+            .update_supplier(
+                a.id,
+                UpdateSupplier {
+                    name: Some("B".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+
+        // Some(None) clears the field.
+        let cleared = s
+            .update_supplier(
+                a.id,
+                UpdateSupplier {
+                    phone: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.phone, None);
+
+        let err = s
+            .update_supplier(999_999, UpdateSupplier::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn tri_deactivate_supplier_keeps_cost_rows() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "TRI-DEACT", "5").await;
+        let sup = seed_supplier(&s, "TRI DEACT").await;
+        s.record_cost(p, sup.id, dec("6"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let off = s.set_active(sup.id, false).await.unwrap();
+        assert!(!off.is_active);
+        assert!(s.find_cost(p, sup.id).await.unwrap().is_some());
+        assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("6")));
+        let all = s.list_suppliers().await.unwrap();
+        assert!(all.iter().any(|x| x.id == sup.id && !x.is_active));
+        assert!(matches!(
+            s.delete_supplier(sup.id).await.unwrap_err(),
+            AppError::Validation(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn tri_negative_cost_rejected_without_creating_row() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "TRI-NEG", "5").await;
+        let sup = seed_supplier(&s, "TRI NEG").await;
+        let err = s
+            .record_cost(p, sup.id, dec("-0.01"), d(2024, 5, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(s.find_cost(p, sup.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tri_backdated_cost_rejected_keeping_row_unchanged() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "TRI-DATE", "5").await;
+        let sup = seed_supplier(&s, "TRI DATE").await;
+        s.record_cost(p, sup.id, dec("10"), d(2024, 5, 10))
+            .await
+            .unwrap();
+        let err = s
+            .record_cost(p, sup.id, dec("11"), d(2024, 5, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+        let row = s.find_cost(p, sup.id).await.unwrap().unwrap();
+        assert_eq!(row.current_cost, dec("10"));
+        assert_eq!(row.current_cost_updated_at, d(2024, 5, 10));
+        assert_eq!(row.previous_cost, None);
+    }
+
+    #[tokio::test]
+    async fn tri_unknown_product_or_supplier_cost_rejected() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "TRI-FK", "5").await;
+        let sup = seed_supplier(&s, "TRI FK").await;
+
+        let err = s
+            .record_cost(999_999, sup.id, dec("1"), d(2024, 5, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        let err = s
+            .record_cost(p, 999_999, dec("1"), d(2024, 5, 1))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert_eq!(s.reference_cost(p).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn tri_partial_unique_index_blocks_second_preferred_row() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "TRI-PREF", "5").await;
+        let a = seed_supplier(&s, "TRI PREF A").await;
+        let b = seed_supplier(&s, "TRI PREF B").await;
+        s.record_cost(p, a.id, dec("9"), d(2024, 5, 1)).await.unwrap();
+        s.record_cost(p, b.id, dec("8"), d(2024, 5, 1)).await.unwrap();
+        s.set_preferred(p, a.id).await.unwrap();
+
+        let err = sqlx::query(
+            r#"UPDATE product_supplier_costs SET is_preferred = 1
+               WHERE product_id = ? AND supplier_id = ?"#,
+        )
+        .bind(p)
+        .bind(b.id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tri_reference_cost_prefers_marked_supplier_over_cheapest_then_lowest() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "TRI-REF", "5").await;
+        let cheap = seed_supplier(&s, "TRI REF CHEAP").await;
+        let marked = seed_supplier(&s, "TRI REF MARKED").await;
+        s.record_cost(p, cheap.id, dec("7"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.record_cost(p, marked.id, dec("9"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        // No preferred yet: lowest wins.
+        assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("7")));
+        s.set_preferred(p, marked.id).await.unwrap();
+        // Preferred wins even when it is not the cheapest.
+        assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("9")));
+        s.clear_preferred(p).await.unwrap();
+        assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("7")));
+    }
+
+    #[tokio::test]
+    async fn tri_set_preferred_requires_existing_cost_row() {
+        let (s, pool) = svc().await;
+        let p = seed_product(&pool, "TRI-PREF-MISS", "5").await;
+        let sup = seed_supplier(&s, "TRI PREF MISS").await;
+        let err = s.set_preferred(p, sup.id).await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+}

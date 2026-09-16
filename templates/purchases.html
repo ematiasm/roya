@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block title %}Roya — Purchases{% endblock %}
+{% block content %}
+<div class="mb-4 flex items-center gap-2">
+  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/suppliers" class="text-[13px] text-muted">Suppliers</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">purchases • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %} • {% if allow_negative %}overdraft allowed{% else %}overdraft blocked{% endif %}</span>
+</div>
+<div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
+  <div class="flex flex-col gap-6">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Purchases</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/purchases" hx-target="#purchase-list" hx-swap="innerHTML">↻ Refresh</button>
+      </div>
+      <div id="purchase-list"
+           hx-get="/web/purchases"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/purchase_list.html" %}
+      </div>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5" id="suggestion-section">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Sugerido</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/purchases/suggestions" hx-target="#suggestion-list" hx-swap="innerHTML">↻ Refresh</button>
+      </div>
+      <div id="suggestion-list"
+           hx-get="/web/purchases/suggestions"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/suggestion_list.html" %}
+      </div>
+      <div class="mt-2 text-[13px] text-muted">Sugerido = max − stock when stock ≤ min. Supplier = preferred satellite row, else cheapest current cost. Products without a cost row are listed separately.</div>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5" id="purchase-detail-section">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Purchase Detail</h2>
+      </div>
+      <div id="purchase-detail">
+        <div class="text-[13px] text-muted">Click <b>View</b> on a purchase to see lines and payments.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="flex flex-col gap-6">
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">New Purchase (Draft)</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/purchases" hx-target="#purchase-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div>
+          <label>Supplier</label>
+          <select name="supplier_id" required>
+            {% for s in suppliers %}
+            <option value="{{ s.id }}">{{ s.name }}{% if !s.is_active %} (inactive){% endif %}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Type</label>
+            <select name="payment_type" required>
+              <option value="Cash">Cash</option>
+              <option value="Credit">Credit</option>
+            </select>
+          </div>
+          <div>
+            <label>Purchase date</label>
+            <input type="date" name="purchase_date" required value="{{ today }}" />
+          </div>
+        </div>
+        <div>
+          <label>Due date (Credit only)</label>
+          <input type="date" name="due_date" />
+        </div>
+        <div>
+          <label>Supplier invoice no (optional)</label>
+          <input type="text" name="supplier_invoice_no" placeholder="A-0001" maxlength="64" />
+        </div>
+        <div>
+          <label>Notes</label>
+          <input type="text" name="notes" placeholder="…" maxlength="512" />
+        </div>
+        <button type="submit">Create Draft</button>
+        <div class="text-[13px] text-muted">Draft touches no stock, no finance and no satellite cost. Also at <code>POST /api/purchases</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Add Line (Draft only)</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/purchases/lines" hx-target="#purchase-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">
+        <div>
+          <label>Purchase ID</label>
+          <input type="number" name="purchase_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Product</label>
+          <select name="product_id" required>
+            {% for p in products %}
+            <option value="{{ p.id }}">{{ p.sku }} — {{ p.name }} (cost ${{ p.cost_price }})</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Qty</label>
+            <input type="number" name="qty" step="0.01" min="0.01" required placeholder="1" />
+          </div>
+          <div>
+            <label>Unit cost (empty = product cost)</label>
+            <input type="number" name="unit_cost" step="0.01" min="0" placeholder="product cost" />
+          </div>
+        </div>
+        <button type="submit">Add Line</button>
+        <div class="text-[13px] text-muted">Unknown product ⇒ 404, qty ≤ 0 ⇒ 400, same product twice ⇒ 400. Also at <code>POST /api/purchases/:id/lines</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Confirm Purchase</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/purchases/confirm" hx-target="#purchase-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">
+        <div>
+          <label>Purchase ID</label>
+          <input type="number" name="purchase_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Cash account (Cash only)</label>
+          <select name="account_id">
+            <option value="">— none (Credit) —</option>
+            {% for acc in accounts %}
+            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Method (Cash only, must be allowed for account)</label>
+          <select name="method_id">
+            <option value="">— none (Credit) —</option>
+            {% for m in methods %}
+            <option value="{{ m.id }}">{{ m.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <button type="submit" class="bg-accent2 text-white">Confirm</button>
+        <div class="text-[13px] text-muted">Assigns <code>YYYY-PURCH-NNNNNN</code>, receives stock, updates the satellite cost; Cash posts 1 Expense. Disallowed pair ⇒ 400, no stock/finance touch. Double confirm ⇒ 400.</div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Record Payment (Credit)</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/purchases/payments" hx-target="#purchase-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">
+        <div>
+          <label>Purchase ID</label>
+          <input type="number" name="purchase_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Account</label>
+          <select name="account_id" required>
+            {% for acc in accounts %}
+            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Method (required, must be allowed for account)</label>
+          <select name="method_id" required>
+            {% for m in methods %}
+            <option value="{{ m.id }}">{{ m.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Amount</label>
+            <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+          </div>
+          <div>
+            <label>Date</label>
+            <input type="date" name="date" required value="{{ today }}" />
+          </div>
+        </div>
+        <button type="submit" class="bg-accent2 text-white">Record Payment</button>
+        <div class="text-[13px] text-muted">Each payment posts 1 Expense with method (N per purchase, mixed accounts/methods, sum ≤ total). Disallowed pair ⇒ 400, no finance touch. Overpay ⇒ 400.</div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Cancel Purchase</h2>
+      <form class="flex flex-col gap-2.5" hx-post="/web/purchases/cancel" hx-target="#purchase-detail" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">
+        <div>
+          <label>Purchase ID</label>
+          <input type="number" name="purchase_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Reason</label>
+          <input type="text" name="reason" placeholder="wrong order…" maxlength="256" />
+        </div>
+        <button type="submit" class="border border-border bg-transparent text-text">Cancel Purchase</button>
+        <div class="text-[13px] text-muted">Draft ⇒ discard, no side effects. Confirmed ⇒ stock back (<code>Purchase-return</code>) + Income refund per payment.</div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
+      <div class="text-[13px] leading-[1.7] text-muted">
+        <code>GET /api/suppliers</code><br/>
+        <code>POST /api/suppliers</code><br/>
+        <code>GET /api/suppliers/:id</code><br/>
+        <code>PUT /api/suppliers/:id</code><br/>
+        <code>POST /api/suppliers/:id/activate</code><br/>
+        <code>POST /api/suppliers/:id/deactivate</code><br/>
+        <code>DELETE /api/suppliers/:id</code><br/>
+        <code>GET /api/product-supplier-costs?product_id=</code><br/>
+        <code>POST /api/product-supplier-costs</code><br/>
+        <code>GET /api/purchases</code><br/>
+        <code>POST /api/purchases</code><br/>
+        <code>GET /api/purchases/:id</code><br/>
+        <code>PUT /api/purchases/:id</code><br/>
+        <code>POST /api/purchases/:id/lines</code><br/>
+        <code>PUT /api/purchases/lines/:line_id</code><br/>
+        <code>DELETE /api/purchases/lines/:line_id</code><br/>
+        <code>POST /api/purchases/:id/confirm</code><br/>
+        <code>POST /api/purchases/:id/payments</code><br/>
+        <code>POST /api/purchases/:id/cancel</code><br/>
+        <code>GET /api/purchases/suggestions</code><br/>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.body.addEventListener('purchase-created', function(){ htmx.trigger('#purchase-list','refresh'); });
+  document.body.addEventListener('purchase-changed', function(){ htmx.trigger('#purchase-list','refresh'); });
+</script>
+{% endblock %}

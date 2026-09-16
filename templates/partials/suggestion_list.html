@@ -1,0 +1,57 @@
+<div id="suggestion-list-inner">
+  <div class="mb-3 flex flex-wrap gap-2 [&>*]:flex-1" id="suggestion-seed-options">
+    <div>
+      <label>Draft type</label>
+      <select name="payment_type">
+        <option value="Cash">Cash</option>
+        <option value="Credit">Credit</option>
+      </select>
+    </div>
+    <div>
+      <label>Purchase date</label>
+      <input type="date" name="purchase_date" value="{{ today }}" />
+    </div>
+    <div>
+      <label>Due date (Credit)</label>
+      <input type="date" name="due_date" />
+    </div>
+  </div>
+  {% if !has_suggestions %}
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">Stock OK — nothing to reorder.</div>
+  {% else %}
+    {% for s in suggestions.suggestions %}
+    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="suggestion-{{ s.product.id }}">
+      <div class="flex flex-col">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">low</span>
+          <span class="font-semibold">{{ s.product.name }}</span>
+          <span class="text-xs text-muted">{{ s.product.sku }}</span>
+        </div>
+        <span class="text-[13px] text-muted">stock {{ s.stock }} • sugerido {{ s.suggested_qty }} × ${{ s.unit_cost }} • {{ s.supplier_name }}</span>
+      </div>
+      <div class="flex items-center gap-3">
+        <span class="font-bold tabular-nums text-expense">{{ s.subtotal }}</span>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                hx-post="/web/purchases/from-suggestion"
+                hx-vals='{"product_id": {{ s.product.id }}}'
+                hx-include="#suggestion-seed-options"
+                hx-target="#purchase-detail"
+                hx-swap="innerHTML"
+                hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">→ Draft</button>
+      </div>
+    </div>
+    {% endfor %}
+    {% if !suggestions.without_supplier.is_empty() %}
+      <div class="mt-2 mb-1.5 font-bold text-[13px] text-muted">Without supplier cost ({{ suggestions.without_supplier.len() }})</div>
+      {% for w in suggestions.without_supplier %}
+      <div class="mb-2 flex items-center justify-between rounded-[10px] border border-dashed border-border px-3.5 py-3" id="suggestion-nosup-{{ w.product.id }}">
+        <div class="flex flex-col">
+          <span class="font-semibold">{{ w.product.name }}</span>
+          <span class="text-[13px] text-muted">{{ w.product.sku }} • stock {{ w.stock }} • sugerido {{ w.suggested_qty }}</span>
+        </div>
+        <a href="/suppliers" class="text-xs">record cost</a>
+      </div>
+      {% endfor %}
+    {% endif %}
+  {% endif %}
+</div>

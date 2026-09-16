@@ -24,6 +24,31 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
     Expense refunds, guarded by `ALLOW_NEGATIVE_BALANCE`.
   - `sale_number` UNIQUE, immutable, NULL only in Draft/Cancelled-from-Draft.
   - Finance/stock rows are written only via services, reference = `sale_number`.
+- **Suppliers (M3)** — `suppliers(id, name UNIQUE, phone, notes, is_active)` plus the
+  `product_supplier_costs` satellite holding the per-supplier price with its previous
+  value and date. A new cost that differs shifts current → previous (value and date);
+  a same-cost confirmation only refreshes the date so the last distinct price survives.
+  The raised/lowered alert is derived (previous vs current), never stored.
+  `products.cost_price` stays the fallback for products with no satellite row; delete
+  is RESTRICT-aware (deactivate instead).
+- **Purchases (M3)** — Draft → Confirmed → Cancelled orchestrator mirroring sales:
+  - Draft (the pedido) is edited freely and touches no stock, no finance and no
+    satellite cost; it can be seeded from the suggestion panel.
+  - Confirm assigns `YYYY-PURCH-NNNNNN`, receives stock (`In`, reason `Purchase`) per
+    tracked line, updates the satellite cost per line, Cash posts 1 payment + 1 Expense,
+    Credit stays payable (`due = total`, no Expense until paid).
+  - Credit payments each post 1 Expense (`reference = purchase_number`); N per purchase,
+    mixed accounts/methods, sum ≤ total; Paid when due = 0; overpay ⇒ 400.
+  - Cancel of Confirmed returns stock (`Out`, reason `Purchase-return`, the M1 CHECK
+    expansion) and posts Income refunds per payment; a refund is money entering, so the
+    balance guard never blocks it. Draft cancel is a discard with no side effects.
+  - `account_payment_methods` allowlist enforced (400) before any stock/sequence/
+    finance touch; `purchase_number` UNIQUE, immutable, NULL only while Draft (or
+    cancelled before ever being confirmed).
+- **Sugerido (purchase suggestion)** — low-stock tracked products with suggested
+  qty = `max_stock − stock`, the chosen supplier (preferred satellite row, else cheapest
+  current cost), satellite cost and subtotal. Products without a satellite row are
+  returned in `without_supplier`, never silently dropped.
 - **Payment methods (M0)** — `payment_methods(id, name UNIQUE, is_active)` seeded
   `Cash, Transfer, Debit, CreditCard, QR` (no `Other`); `account_payment_methods`
   allowlist `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id`
@@ -116,6 +141,15 @@ Current migrations:
   allowlist + `sale_payments.method_id` + seeds (`Cash,Transfer,Debit,CreditCard,QR`;
   sensible combos `Caja→Cash`, `Banco→Transfer,Debit,CreditCard`, `MP→QR,Transfer`
   applied where those accounts exist, plus `ensure_defaults_for_account` helper)
+- `20240101000013_create_suppliers.sql` — `suppliers` (UNIQUE name, index on `is_active`)
+- `20240101000014_create_product_supplier_costs.sql` — `product_supplier_costs`
+  (UNIQUE product+supplier, one-preferred-per-product partial index)
+- `20240101000015_create_purchases.sql` — `purchases` (UNIQUE purchase_number NULL-distinct,
+  CHECKs, indexes on status/supplier/purchase_date)
+- `20240101000016_create_purchase_lines.sql` — `purchase_lines` (CASCADE purchase, RESTRICT product)
+- `20240101000017_create_purchase_payments.sql` — `purchase_payments` (CASCADE purchase,
+  RESTRICT account/method)
+- `20240101000018_expand_stock_reason_purchase_return.sql` — adds `Purchase-return` reason
 
 ## REST API
 
@@ -234,15 +268,91 @@ curl http://localhost:3000/api/sales/debt
 # -> { debt: [Confirmed sales with due > 0] }
 ```
 
+```bash
+# Suppliers + product/supplier costs (M3)
+curl -X POST http://localhost:3000/api/suppliers \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Distribuidora Sur","phone":"11 5555-5555"}'
+# -> 201 supplier (name trimmed; duplicate => 409)
+
+curl http://localhost:3000/api/suppliers
+curl http://localhost:3000/api/suppliers/1
+curl -X PUT http://localhost:3000/api/suppliers/1 \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"11 4444-4444"}'
+curl -X POST http://localhost:3000/api/suppliers/1/deactivate   # 200 is_active false
+curl -X POST http://localhost:3000/api/suppliers/1/activate
+curl -X DELETE http://localhost:3000/api/suppliers/1
+# -> 204 when unused; 400 when cost rows/purchases exist (deactivate instead)
+
+curl -X POST http://localhost:3000/api/product-supplier-costs \
+  -H "Content-Type: application/json" \
+  -d '{"product_id":1,"supplier_id":1,"cost":"800","date":"2024-05-01"}'
+# -> 201 satellite row; a later different cost shifts current -> previous
+
+curl "http://localhost:3000/api/product-supplier-costs?product_id=1"
+# -> { costs: [current_cost, previous_cost, dates, is_preferred] }
+
+# Purchases (Draft -> Confirmed -> Cancelled orchestrator)
+curl -X POST http://localhost:3000/api/purchases \
+  -H "Content-Type: application/json" \
+  -d '{"supplier_id":1,"payment_type":"Cash","purchase_date":"2024-05-02"}'
+# -> 201 purchase detail (purchase_number null while Draft; Credit needs due_date)
+
+curl -X POST http://localhost:3000/api/purchases/1/lines \
+  -H "Content-Type: application/json" \
+  -d '{"product_id":1,"qty":"10"}'
+# -> 201 line (unit_cost defaults to products.cost_price; unknown product => 404,
+#    qty <= 0 or unit_cost < 0 => 400, repeated product => 400)
+
+curl -X PUT http://localhost:3000/api/purchases/1 \
+  -H "Content-Type: application/json" \
+  -d '{"notes":"pedido semanal"}'
+# -> 200 detail (Draft only; edit Confirmed => 400)
+
+curl -X POST http://localhost:3000/api/purchases/1/confirm \
+  -H "Content-Type: application/json" \
+  -d '{"account_id":1,"method_id":1}'
+# -> 200 detail with purchase_number "2024-PURCH-000001"; receives stock (In,
+#    reason Purchase) and updates the satellite cost. Credit: send {} (no
+#    account/method), due = total, no Expense. Disallowed (account,method) => 400
+#    with no stock/finance touch. Double confirm => 400.
+
+curl -X POST http://localhost:3000/api/purchases/1/payments \
+  -H "Content-Type: application/json" \
+  -d '{"account_id":1,"method_id":1,"amount":"500","date":"2024-05-10"}'
+# -> 201 payment + 1 Expense (Credit purchases; sum <= total; overpay => 400;
+#    disallowed pair => 400 with no finance touch)
+
+curl -X PUT http://localhost:3000/api/purchases/lines/1 \
+  -H "Content-Type: application/json" \
+  -d '{"qty":"8","unit_cost":"810"}'
+curl -X DELETE http://localhost:3000/api/purchases/lines/1   # -> 204
+
+curl -X POST http://localhost:3000/api/purchases/1/cancel \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"wrong order"}'
+# -> 200 Cancelled; Confirmed returns stock (Out, reason Purchase-return) and posts
+#    Income refunds per payment (no balance guard); Draft cancel is a discard
+#    (purchase_number stays null).
+
+curl http://localhost:3000/api/purchases
+# -> { purchases: [detail with total/paid/due/payment_status] }
+curl http://localhost:3000/api/purchases/suggestions
+# -> { suggestions: [low-stock rows with supplier/qty/cost/subtotal],
+#      without_supplier: [low-stock products with no satellite row] }
+```
+
 Error format:
 
 ```json
 { "error": "amount must be > 0" }
 ```
 
-- `400` validation (empty name, amount <=0, from>to, insufficient funds, sale guards below)
-- `404` not found (incl. unknown product/account on sale confirm/pay)
-- `409` duplicate account name (UNIQUE), duplicate sku/barcode/receipt_no/sale_number
+- `400` validation (empty name, amount <=0, from>to, insufficient funds, sale/purchase guards below)
+- `404` not found (incl. unknown product/account/supplier on purchase and sale flows)
+- `409` duplicate account name (UNIQUE), duplicate sku/barcode/receipt_no/sale_number,
+  duplicate supplier name, duplicate preferred cost row
 
 Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to avoid float rounding. Never uses `f32/f64`.
 
@@ -280,9 +390,35 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
   - Record payment: `POST /web/sales/:id/payments` (HTMX)
   - Cancel: `POST /web/sales/:id/cancel` (HTMX)
 
+`GET /purchases` — purchases (M3):
+
+- Purchase list with status + payable badges (HTMX `GET /web/purchases`, derived total/paid/due)
+- Sugerido panel rendering the suggestion with a `→ Draft` seed button per row
+  (HTMX `GET /web/purchases/suggestions`, seed via `POST /web/purchases/from-suggestion`)
+- Purchase detail with lines and payments; the Draft line editor saves qty/unit cost in
+  place and removes lines (HTMX `GET /web/purchases/:id`, POST/DELETE
+  `/web/purchases/:id/lines/:line_id`)
+- Forms:
+  - New purchase Draft: `POST /web/purchases` (HTMX)
+  - Add line: `POST /web/purchases/lines` (HTMX)
+  - Confirm: `POST /web/purchases/confirm` (HTMX)
+  - Record payment: `POST /web/purchases/payments` (HTMX)
+  - Cancel: `POST /web/purchases/cancel` (HTMX)
+
+`GET /suppliers` — suppliers + cost satellite (M3):
+
+- Supplier list with active/inactive badge and every satellite cost row (derived
+  raised/lowered alert, preferred marker) (HTMX `GET /web/suppliers`)
+- Forms:
+  - Create supplier: `POST /web/suppliers` (HTMX)
+  - Edit supplier: `POST /web/suppliers/edit` (HTMX)
+  - Activate/deactivate: `POST /web/suppliers/:id/activate|deactivate` (HTMX)
+  - Delete supplier: `DELETE /web/suppliers/:id` (HTMX, RESTRICT-aware)
+  - Record product cost: `POST /web/supplier-costs` (HTMX)
+
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
-Navigation: the header links Dashboard, Products and Sales; page-level links reach the detail/back views.
+Navigation: the header links Dashboard, Products, Sales, Purchases and Suppliers; page-level links reach the detail/back views.
 
 ## Styles & local assets
 
@@ -336,6 +472,24 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
   `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id` RESTRICT
   NOT NULL; unknown method => 404, inactive/disallowed => 400.
   - Balance read path: `SELECT kind, amount FROM transactions WHERE account_id=?` summed in Rust (not `SUM()` which would cast TEXT→REAL).
+- `Supplier` rules: `name` trimmed, non-empty, ≤128, UNIQUE; `phone` ≤32 and `notes`
+  ≤512 (empty clears to NULL); delete blocked (400) when the supplier has cost rows or
+  purchases (RESTRICT) — deactivate instead.
+- `ProductSupplierCost` rules (frozen option A): `current_cost >= 0`; a later cost that
+  differs shifts current → previous with both dates, an equal cost only refreshes
+  `current_cost_updated_at`; the cost date can never precede the current cost date
+  (400); at most one `is_preferred=1` per product; the raised/lowered alert is derived
+  from `previous_cost` vs `current_cost` and never stored. `products.cost_price` is not
+  written by purchases: the satellite wins when rows exist, otherwise the column.
+- `Purchase` rules: Draft editable (lines/header); Confirmed/Cancelled immutable except
+  Cancel. `purchase_number` immutable once set (`YYYY-PURCH-NNNNNN`), NULL only in
+  Draft/Cancelled-from-Draft. Credit requires `due_date >= purchase_date`, Cash forbids
+  it. `qty > 0`, `unit_cost >= 0`, no duplicated product per purchase, payments carry
+  `account_id + method_id` (mixed, sum ≤ total), reject overpay and disallowed
+  `(account,method)` (400, no stock/sequence/finance touch). Confirm updates the
+  satellite per line; cancelling a Confirmed purchase returns stock and refunds paid
+  amounts as Income. No new env vars for purchases (reuses `ALLOW_NEGATIVE_BALANCE` /
+  `ALLOW_NEGATIVE_STOCK`).
 
 ## SQLite → Postgres Migration (without rewriting logic)
 
@@ -444,6 +598,8 @@ src/services/account.rs
 src/services/transaction.rs
 src/services/inventory.rs
 src/services/sales.rs      — Draft/Confirm/Pay/Cancel orchestrator (calls Inventory + Transaction services, never SQLs their tables)
+src/services/suppliers.rs  — supplier CRUD + product/supplier satellite cost rule
+src/services/purchases.rs  — Draft/Confirm/Pay/Cancel + suggestion builder (orchestrates stock, finance, satellite)
 src/repositories/account_repo.rs
 src/repositories/transaction_repo.rs
 src/repositories/category_repo.rs
@@ -451,20 +607,29 @@ src/repositories/product_repo.rs
 src/repositories/barcode_repo.rs
 src/repositories/stock_repo.rs
 src/repositories/sale_repo.rs          — Sale/SaleLine/SalePayment SQLite impl
-src/repositories/doc_sequence_repo.rs  — atomic YYYY-SALE-NNNNNN numbering
+src/repositories/supplier_repo.rs      — Supplier SQLite impl (RESTRICT-aware delete)
+src/repositories/product_supplier_cost_repo.rs — satellite cost SQLite impl
+src/repositories/purchase_repo.rs      — Purchase/PurchaseLine/PurchasePayment SQLite impl
+src/repositories/doc_sequence_repo.rs  — atomic YYYY-SALE-NNNNNN / YYYY-PURCH-NNNNNN numbering
 src/routes/api.rs
 src/routes/web.rs
 src/routes/inventory_api.rs
 src/routes/inventory_web.rs
 src/routes/sales_api.rs    — REST /api/sales, lines, payments, confirm/cancel, debt
 src/routes/sales_web.rs    — Web /sales Askama + HTMX
+src/routes/purchases_api.rs — REST /api/suppliers, /api/product-supplier-costs, /api/purchases
+src/routes/purchases_web.rs — Web /purchases Askama + HTMX (incl. Sugerido)
+src/routes/suppliers_web.rs — Web /suppliers Askama + HTMX
 src/routes/mod.rs
 templates/base.html
 templates/dashboard.html
 templates/account_detail.html
 templates/products.html
 templates/sales.html
-templates/partials/*.html  — incl. sale_list.html, sale_detail.html
+templates/purchases.html
+templates/suppliers.html
+templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_list.html,
+                             purchase_detail.html, supplier_list.html, suggestion_list.html
 migrations/*.sql
 assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/, @theme palette)
 static/tailwind.css        — compiled stylesheet (committed; rebuild via scripts/build-css.sh)
