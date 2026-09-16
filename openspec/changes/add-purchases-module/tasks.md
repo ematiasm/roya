@@ -17,15 +17,15 @@
 - [x] T5: tests AC9 partially, AC10, AC13 at service level
 
 ## Slice F — purchases domain + orchestrator
-- [ ] T6: migrations `create_purchases`, `create_purchase_lines`, `create_purchase_payments`,
+- [x] T6: migrations `create_purchases`, `create_purchase_lines`, `create_purchase_payments`,
       `expand_stock_reason_purchase_return`
-- [ ] T7: models `Purchase`, `PurchaseLine`, `PurchasePayment` + DTOs
-- [ ] T8: `PurchaseRepository` trait + SQLite impl (`PURCH` sequence reuse)
-- [ ] T9: `PurchasesService` (Draft/Confirm/Pay/Cancel, orchestrated stock + finance,
+- [x] T7: models `Purchase`, `PurchaseLine`, `PurchasePayment` + DTOs
+- [x] T8: `PurchaseRepository` trait + SQLite impl (`PURCH` sequence reuse)
+- [x] T9: `PurchasesService` (Draft/Confirm/Pay/Cancel, orchestrated stock + finance,
       satellite update on confirm)
-- [ ] T10: suggestion builder (low-stock + chosen supplier + satellite cost +
+- [x] T10: suggestion builder (low-stock + chosen supplier + satellite cost +
       `without_supplier` list)
-- [ ] T11: service tests AC1-AC7, AC9-AC12
+- [x] T11: service tests AC1-AC7, AC9-AC12
 
 ## Slice G — routes + UI
 - [ ] T12: REST `/api/suppliers`, `/api/product-supplier-costs`, `/api/purchases`,

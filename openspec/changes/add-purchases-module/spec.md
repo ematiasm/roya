@@ -81,7 +81,8 @@
 - [ ] AC6: Double confirm => 400; any edit of a Confirmed purchase => 400.
 - [ ] AC7: Cancel Confirmed returns stock (`Purchase-return`) and refunds paid amounts as Income
       per originating account; no balance guard can block it.
-- [ ] AC8: `purchase_number` UNIQUE, immutable, NULL only in Draft.
+- [ ] AC8: `purchase_number` UNIQUE and immutable; set on confirm, NULL while Draft and in a
+      purchase cancelled before ever being confirmed.
 - [ ] AC9: Confirm updates the satellite: previous <- current with its date, current <- line cost.
 - [ ] AC10: A purchase never writes `products.cost_price`; read rule prefers the satellite
       when rows exist, otherwise falls back to the column.

@@ -210,6 +210,9 @@ pub enum MovementReason {
     #[serde(rename = "Sale-return", alias = "SaleReturn", alias = "sale_return", alias = "salereturn")]
     #[sqlx(rename = "Sale-return")]
     SaleReturn,
+    #[serde(rename = "Purchase-return", alias = "PurchaseReturn", alias = "purchase_return", alias = "purchasereturn")]
+    #[sqlx(rename = "Purchase-return")]
+    PurchaseReturn,
     Loss,
     Adjust,
     Initial,
@@ -221,6 +224,7 @@ impl std::fmt::Display for MovementReason {
             Self::Purchase => write!(f, "Purchase"),
             Self::Sale => write!(f, "Sale"),
             Self::SaleReturn => write!(f, "Sale-return"),
+            Self::PurchaseReturn => write!(f, "Purchase-return"),
             Self::Loss => write!(f, "Loss"),
             Self::Adjust => write!(f, "Adjust"),
             Self::Initial => write!(f, "Initial"),
@@ -236,6 +240,9 @@ impl std::str::FromStr for MovementReason {
             "sale" => Ok(Self::Sale),
             "sale-return" | "sale_return" | "salereturn" | "sale return" => {
                 Ok(Self::SaleReturn)
+            }
+            "purchase-return" | "purchase_return" | "purchasereturn" | "purchase return" => {
+                Ok(Self::PurchaseReturn)
             }
             "loss" => Ok(Self::Loss),
             "adjust" => Ok(Self::Adjust),
@@ -637,4 +644,165 @@ pub struct UpdateSupplier {
     pub name: Option<String>,
     pub phone: Option<Option<String>>,
     pub notes: Option<Option<String>>,
+}
+
+// ---------------------------------------------------------------------------
+// M3 purchases domain (mirror orchestrator of M2 sales). Decimal-as-TEXT like
+// finance/inventory. The purchase Draft is the pedido: it touches no stock, no
+// finance and no satellite cost until confirmed.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PurchaseStatus {
+    Draft,
+    Confirmed,
+    Cancelled,
+}
+
+impl std::fmt::Display for PurchaseStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Draft => write!(f, "Draft"),
+            Self::Confirmed => write!(f, "Confirmed"),
+            Self::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+impl std::str::FromStr for PurchaseStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "draft" => Ok(Self::Draft),
+            "confirmed" => Ok(Self::Confirmed),
+            "cancelled" | "canceled" => Ok(Self::Cancelled),
+            _ => Err(format!("invalid purchase status: {s}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Purchase {
+    pub id: i64,
+    /// `YYYY-PURCH-NNNNNN`, NULL only while Draft, immutable once assigned.
+    pub purchase_number: Option<String>,
+    pub supplier_id: i64,
+    pub status: PurchaseStatus,
+    pub payment_type: PaymentType,
+    pub purchase_date: NaiveDate,
+    /// Required when `payment_type` is Credit, NULL for Cash.
+    pub due_date: Option<NaiveDate>,
+    pub supplier_invoice_no: Option<String>,
+    pub notes: String,
+    pub cancel_reason: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+    pub confirmed_at: Option<chrono::NaiveDateTime>,
+    pub cancelled_at: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurchaseLine {
+    pub id: i64,
+    pub purchase_id: i64,
+    pub product_id: i64,
+    /// Decimal qty > 0, stored as TEXT.
+    pub qty: Decimal,
+    /// Decimal unit_cost >= 0, frozen at confirm, stored as TEXT.
+    pub unit_cost: Decimal,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+impl PurchaseLine {
+    pub fn subtotal(&self) -> Decimal {
+        self.qty * self.unit_cost
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurchasePayment {
+    pub id: i64,
+    pub purchase_id: i64,
+    pub account_id: i64,
+    pub method_id: i64,
+    /// Decimal amount > 0, stored as TEXT.
+    pub amount: Decimal,
+    pub date: NaiveDate,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// Service-level input for purchase creation (Draft).
+#[derive(Debug, Clone)]
+pub struct NewPurchase {
+    pub supplier_id: i64,
+    pub payment_type: PaymentType,
+    pub purchase_date: NaiveDate,
+    pub due_date: Option<NaiveDate>,
+    pub supplier_invoice_no: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// Service-level patch for Draft header edits.
+#[derive(Debug, Clone, Default)]
+pub struct UpdatePurchaseDraft {
+    pub supplier_id: Option<i64>,
+    pub payment_type: Option<PaymentType>,
+    pub purchase_date: Option<NaiveDate>,
+    pub due_date: Option<Option<NaiveDate>>,
+    pub supplier_invoice_no: Option<Option<String>>,
+    pub notes: Option<String>,
+}
+
+/// Aggregated purchase view with derived totals (never stored as truth).
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchaseDetail {
+    pub purchase: Purchase,
+    pub lines: Vec<PurchaseLine>,
+    pub payments: Vec<PurchasePayment>,
+    pub total: Decimal,
+    pub paid: Decimal,
+    pub due: Decimal,
+    pub payment_status: PaymentStatus,
+}
+
+impl PurchaseDetail {
+    pub fn payment_status_for(total: Decimal, paid: Decimal) -> PaymentStatus {
+        SaleDetail::payment_status_for(total, paid)
+    }
+}
+
+/// Format `YYYY-PURCH-NNNNNN` with zero-padded 6-digit sequence.
+pub fn format_purchase_number(year: i32, seq: i64) -> String {
+    format!("{year}-PURCH-{seq:06}")
+}
+
+/// One low-stock product with a chosen supplier from the cost satellite.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchaseSuggestion {
+    pub product: Product,
+    pub stock: Decimal,
+    pub suggested_qty: Decimal,
+    pub supplier_id: i64,
+    pub supplier_name: String,
+    pub unit_cost: Decimal,
+    pub subtotal: Decimal,
+}
+
+/// Low-stock product with no satellite row: never silently dropped, returned
+/// in the `without_supplier` list so the user can pick a one-off supplier.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchaseSuggestionWithoutSupplier {
+    pub product: Product,
+    pub stock: Decimal,
+    pub suggested_qty: Decimal,
+}
+
+/// The pedido suggestion: costed low-stock lines plus the unsourced ones.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PurchaseSuggestions {
+    pub suggestions: Vec<PurchaseSuggestion>,
+    pub without_supplier: Vec<PurchaseSuggestionWithoutSupplier>,
 }

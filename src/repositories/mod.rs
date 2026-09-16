@@ -5,6 +5,7 @@ pub mod doc_sequence_repo;
 pub mod payment_method_repo;
 pub mod product_repo;
 pub mod product_supplier_cost_repo;
+pub mod purchase_repo;
 pub mod sale_repo;
 pub mod stock_repo;
 pub mod supplier_repo;
@@ -19,6 +20,7 @@ pub use product_repo::{ProductRepository, SqliteProductRepository};
 pub use product_supplier_cost_repo::{
     ProductSupplierCostRepository, SqliteProductSupplierCostRepository,
 };
+pub use purchase_repo::{PurchaseRepository, SqlitePurchaseRepository};
 pub use sale_repo::{SaleRepository, SqliteSaleRepository};
 pub use stock_repo::{SqliteStockMovementRepository, StockMovementRepository};
 pub use supplier_repo::{SqliteSupplierRepository, SupplierRepository};
