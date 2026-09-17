@@ -24,14 +24,14 @@
 // abandoned sequence number.
 use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
     format_purchase_number, MovementReason, MovementType, NewMovement, NewPurchase,
-    PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchasePayment, PurchaseStatus,
-    PurchaseSuggestion, PurchaseSuggestionWithoutSupplier, PurchaseSuggestions,
-    UpdatePurchaseDraft,
+    PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchasePayment,
+    PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
+    PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, UpdatePurchaseDraft,
 };
 
 #[derive(Clone)]
@@ -189,6 +189,7 @@ where
     fn ensure_unique_product(
         lines: &[PurchaseLine],
         product_id: i64,
+        product_name: &str,
         exclude_line: Option<i64>,
     ) -> AppResult<()> {
         let duplicated = lines
@@ -196,7 +197,7 @@ where
             .any(|l| l.product_id == product_id && Some(l.id) != exclude_line);
         if duplicated {
             return Err(AppError::Validation(format!(
-                "product {product_id} already has a line in this purchase; record a different price in a separate purchase"
+                "product {product_name} already has a line in this purchase; record a different price in a separate purchase"
             )));
         }
         Ok(())
@@ -296,7 +297,7 @@ where
         let product = self.inventory.get_product(product_id).await?;
         // Duplicate product on the same purchase is a 400 before any write.
         let lines = self.purchases.list_lines(purchase_id).await?;
-        Self::ensure_unique_product(&lines, product_id, None)?;
+        Self::ensure_unique_product(&lines, product_id, &product.name, None)?;
         let cost = match unit_cost {
             Some(c) => {
                 if c < Decimal::ZERO {
@@ -340,7 +341,8 @@ where
         }
         // Same uniqueness rule as add_line; the line's own product is excluded.
         let lines = self.purchases.list_lines(line.purchase_id).await?;
-        Self::ensure_unique_product(&lines, line.product_id, Some(line_id))?;
+        let product = self.inventory.get_product(line.product_id).await?;
+        Self::ensure_unique_product(&lines, line.product_id, &product.name, Some(line_id))?;
         self.purchases.update_line(line_id, qty, unit_cost).await
     }
 
@@ -374,6 +376,80 @@ where
             .await?
             .ok_or_else(|| AppError::NotFound(format!("purchase {purchase_id} not found")))?;
         self.detail_for(purchase).await
+    }
+
+    /// Record-page view for `/purchases/{id}`: resolves supplier, product,
+    /// account and method names through the existing read paths, so the route
+    /// never runs SQL of its own and never prints an internal key.
+    pub async fn get_record(&self, purchase_id: i64) -> AppResult<PurchaseRecord> {
+        let detail = self.get_detail(purchase_id).await?;
+        self.record_from_detail(detail).await
+    }
+
+    async fn record_from_detail(&self, detail: PurchaseDetail) -> AppResult<PurchaseRecord> {
+        let supplier_name = self
+            .suppliers
+            .get_supplier(detail.purchase.supplier_id)
+            .await?
+            .name;
+
+        let mut lines = Vec::with_capacity(detail.lines.len());
+        for line in detail.lines {
+            let product = self.inventory.get_product(line.product_id).await?;
+            lines.push(PurchaseLineView {
+                id: line.id,
+                product_name: product.name,
+                product_sku: product.sku,
+                qty: line.qty,
+                unit_cost: line.unit_cost,
+                subtotal: line.subtotal(),
+            });
+        }
+
+        let account_names: BTreeMap<i64, String> = self
+            .transactions
+            .accounts
+            .list()
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.name))
+            .collect();
+        let method_names: BTreeMap<i64, String> = self
+            .payment_methods
+            .list()
+            .await?
+            .into_iter()
+            .map(|method| (method.id, method.name))
+            .collect();
+
+        let payments = detail
+            .payments
+            .into_iter()
+            .map(|payment| PurchasePaymentView {
+                id: payment.id,
+                account_name: account_names
+                    .get(&payment.account_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown account".to_string()),
+                method_name: method_names
+                    .get(&payment.method_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown method".to_string()),
+                amount: payment.amount,
+                date: payment.date,
+            })
+            .collect();
+
+        Ok(PurchaseRecord {
+            purchase: detail.purchase,
+            supplier_name,
+            lines,
+            payments,
+            total: detail.total,
+            paid: detail.paid,
+            due: detail.due,
+            payment_status: detail.payment_status,
+        })
     }
 
     /// All purchases with derived totals, oldest first (repository order).

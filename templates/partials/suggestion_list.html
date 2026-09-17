@@ -31,12 +31,14 @@
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums text-expense">{{ s.subtotal }}</span>
+        {# Seeding answers `HX-Redirect: /purchases/{id}`, so this is a navigation,
+           not a swap: it deliberately carries no hx-target (nothing on this page
+           is replaced), and hx-swap="none" says so. #}
         <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
                 hx-post="/web/purchases/from-suggestion"
                 hx-vals='{"product_id": {{ s.product.id }}}'
                 hx-include="#suggestion-seed-options"
-                hx-target="#purchase-detail"
-                hx-swap="innerHTML"
+                hx-swap="none"
                 hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">→ Draft</button>
       </div>
     </div>

@@ -850,6 +850,104 @@ fn check_rendered_wiring_shape(
     Ok(())
 }
 
+/// Every `hx-target` / `hx-include` attribute value on the page, with the
+/// attribute it came from. Templates write these selectors literally, so the raw
+/// attribute scan is exact.
+fn hx_selector_attrs(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for attr in ["hx-target", "hx-include"] {
+        let needle = format!("{attr}=\"");
+        let mut rest = html;
+        while let Some(start) = rest.find(&needle) {
+            let after = &rest[start + needle.len()..];
+            let end = after
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated {attr} attribute"));
+            out.push((attr.to_string(), after[..end].to_string()));
+            rest = &after[end..];
+        }
+    }
+    out
+}
+
+/// A selector a page declares external, bound to the guarded page that must
+/// render it. The guard reads that host page in the same run, so a declaration
+/// cannot name a selector no page renders.
+#[derive(Clone)]
+struct ExternalSelector {
+    selector: &'static str,
+    host: &'static str,
+}
+
+/// The HTML the guarded run rendered, keyed by page label, so a declaration can
+/// be checked against the page that actually hosts it.
+type RenderedPages = std::collections::BTreeMap<&'static str, String>;
+
+/// `hx-target` / `hx-include` must point at an element a page actually renders,
+/// not just at a route that resolves. A page's selectors are read the same way
+/// for every seeded page, and each page names the few selectors it may reach on
+/// a host document instead:
+///
+/// - a detail fragment renders into the record-page wrapper (`#sale-record`,
+///   `#purchase-record`), which the fragment itself does not emit; and
+/// - an out-of-band-swapped element is inserted into the host page the same way,
+///   so its selectors belong to the host too (the picker results fragment reuses
+///   the host picker's `#line-picker` and money region).
+///
+/// Every declaration is a bound check against the named host page in the same
+/// run, so a declaration that no page renders fails. Anything not declared
+/// external must match an `id` in this page's HTML. The codebase targets elements
+/// with absolute `#id` selectors; any other form fails loudly instead of being
+/// skipped.
+fn check_same_page_selectors(
+    page: &str,
+    html: &str,
+    external_selectors: &[ExternalSelector],
+    rendered_pages: &RenderedPages,
+) -> Result<(), String> {
+    // Declarations first: an unused bogus declaration must not hide.
+    for declared in external_selectors {
+        let host_html = rendered_pages.get(declared.host).ok_or_else(|| {
+            format!(
+                "{page}: external selector {:?} names host page {:?}, which is not in the guarded page list",
+                declared.selector, declared.host
+            )
+        })?;
+        let Some(id) = declared.selector.strip_prefix('#').filter(|id| !id.is_empty()) else {
+            return Err(format!(
+                "{page}: external selector {:?} must be an absolute #id so its host page can be checked",
+                declared.selector
+            ));
+        };
+        if !host_html.contains(&format!("id=\"{id}\"")) {
+            return Err(format!(
+                "{page}: external selector {:?} is declared external, but host page {:?} does not render it",
+                declared.selector, declared.host
+            ));
+        }
+    }
+
+    for (attr, value) in hx_selector_attrs(html) {
+        for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            if external_selectors.iter().any(|e| e.selector == token) {
+                continue;
+            }
+            if !token.starts_with('#') || token.len() == 1 {
+                return Err(format!(
+                    "{page}: {attr}=\"{value}\" uses selector {token:?}; this guard resolves absolute #id selectors, so extend it rather than skipping a new form"
+                ));
+            }
+            let id = &token[1..];
+            if !html.contains(&format!("id=\"{id}\"")) {
+                return Err(format!(
+                    "{page}: {attr}=\"{value}\" points at {token:?}, but no element with id={id:?} is rendered on this page"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Probe one target with the verb htmx (or the browser form) will actually
 /// send. Both a routing fallback and a 405 mean the wiring is dead: 405 means
 /// the path is registered for a different verb, which is the exact shape of a
@@ -1049,58 +1147,171 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     }
 }
 
-/// The seeded pages the wiring guard renders, each with the rule its own URLs
-/// must satisfy: `concrete_ids_are_defects` is true exactly for a page whose
-/// URL carries no id and whose forms have no data-bound ids, where a concrete
-/// numeric id in a form-bound target would be a defect. Record pages and detail
-/// fragments carry the ids they render data for, so there it is legitimate.
-/// Both the guard and the mutation pin test read this list, so a page's rule is
-/// declared once and cannot be relaxed in passing.
-fn guarded_pages(fixture: &WiringFixture) -> Vec<(&'static str, String, bool)> {
+/// One seeded page under the wiring guard.
+#[derive(Clone)]
+struct GuardedPage {
+    label: &'static str,
+    path: String,
+    /// True for a page whose URL carries no id and whose forms have no
+    /// data-bound ids: a concrete numeric id in a form-bound request target is a
+    /// defect there. Record pages and detail fragments carry the ids they render.
+    concrete_ids_are_defects: bool,
+    /// Selectors this page legitimately points at on a host document, each bound
+    /// to the page that must render it (see `check_same_page_selectors`). Empty
+    /// for full pages, which must resolve every selector in their own HTML.
+    external_selectors: Vec<ExternalSelector>,
+}
+
+/// The seeded pages the wiring guard renders. Both the guard and the mutation pin
+/// tests read this list, so each page's rules are declared once and cannot be
+/// relaxed in passing.
+fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
     vec![
-        ("dashboard", "/".to_string(), true),
-        (
-            "account detail",
-            format!("/accounts/{}", fixture.account),
-            false,
-        ),
-        ("products", "/products".to_string(), false),
-        ("sales", "/sales".to_string(), true),
-        ("purchases", "/purchases".to_string(), true),
-        ("suppliers", "/suppliers".to_string(), false),
-        ("customers", "/customers".to_string(), true),
+        GuardedPage {
+            label: "dashboard",
+            path: "/".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "account detail",
+            path: format!("/accounts/{}", fixture.account),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "products",
+            path: "/products".to_string(),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "sales",
+            path: "/sales".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "purchases",
+            path: "/purchases".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "suppliers",
+            path: "/suppliers".to_string(),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "customers",
+            path: "/customers".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
         // The list/detail fragments the pages refresh over HTMX carry more
         // targets (View buttons, inline line editors), so guard the seeded
         // details too.
-        (
-            "sale record page",
-            format!("/sales/{}", fixture.sale),
-            false,
-        ),
-        (
-            "sale detail fragment",
-            format!("/web/sales/{}", fixture.sale),
-            false,
-        ),
-        (
-            "product search fragment",
-            format!(
-                "/web/product-search?q=GUARD-P&line_action=/web/sales/{}/lines&line_target=%23sale-record-money",
+        GuardedPage {
+            label: "sale record page",
+            path: format!("/sales/{}", fixture.sale),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "purchase record page",
+            path: format!("/purchases/{}", fixture.purchase),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "sale detail fragment",
+            path: format!("/web/sales/{}", fixture.sale),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![ExternalSelector {
+                selector: "#sale-record",
+                host: "sale record page",
+            }],
+        },
+        GuardedPage {
+            label: "product search fragment",
+            path: format!(
+                "/web/product-search?q=GUARD-P&price=sale&line_action=/web/sales/{}/lines&line_target=%23sale-record-money",
                 fixture.sale
             ),
-            false,
-        ),
-        (
-            "purchase detail fragment",
-            format!("/web/purchases/{}", fixture.purchase),
-            false,
-        ),
-        (
-            "customer statement",
-            format!("/customers/{}", fixture.customer),
-            false,
-        ),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![
+                ExternalSelector {
+                    selector: "#line-picker",
+                    host: "sale record page",
+                },
+                ExternalSelector {
+                    selector: "#sale-record-money",
+                    host: "sale record page",
+                },
+            ],
+        },
+        GuardedPage {
+            label: "purchase product search fragment",
+            path: format!(
+                "/web/product-search?q=GUARD-P&price=cost&line_action=/web/purchases/{}/lines&line_target=%23purchase-record-money",
+                fixture.purchase
+            ),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![
+                ExternalSelector {
+                    selector: "#line-picker",
+                    host: "purchase record page",
+                },
+                ExternalSelector {
+                    selector: "#purchase-record-money",
+                    host: "purchase record page",
+                },
+            ],
+        },
+        GuardedPage {
+            label: "purchase detail fragment",
+            path: format!("/web/purchases/{}", fixture.purchase),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![ExternalSelector {
+                selector: "#purchase-record",
+                host: "purchase record page",
+            }],
+        },
+        GuardedPage {
+            label: "customer statement",
+            path: format!("/customers/{}", fixture.customer),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
     ]
+}
+
+/// Render every guarded page, then apply both rules to the same run: route
+/// resolution per page, and selector declarations bound to the host page the run
+/// rendered. A declaration cannot pass by membership alone.
+async fn assert_guarded_pages_are_wired(
+    app: &Router,
+    probe_app: &Router,
+    pages: &[GuardedPage],
+) -> Result<(), String> {
+    let mut rendered: RenderedPages = RenderedPages::new();
+    for page in pages {
+        let (status, html) = get(app, &page.path).await;
+        if status != StatusCode::OK {
+            return Err(format!("{} {}: {html:.400}", page.label, page.path));
+        }
+        assert_htmx_targets_are_wired(probe_app, page.label, &html, page.concrete_ids_are_defects)
+            .await?;
+        rendered.insert(page.label, html);
+    }
+    for page in pages {
+        let html = rendered
+            .get(page.label)
+            .ok_or_else(|| format!("{} was not rendered", page.label))?;
+        check_same_page_selectors(page.label, html, &page.external_selectors, &rendered)?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1114,13 +1325,9 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
     let (probe_app, probe_pool) = test_app().await;
     let _probe_fixture = seed_wiring_fixture(&probe_app, &probe_pool).await;
 
-    for (label, path, concrete_ids_are_defects) in guarded_pages(&fixture) {
-        let (status, html) = get(&app, &path).await;
-        assert_eq!(status, StatusCode::OK, "{label} {path}: {html:.400}");
-        assert_htmx_targets_are_wired(&probe_app, label, &html, concrete_ids_are_defects)
-            .await
-            .unwrap_or_else(|err| panic!("{err}"));
-    }
+    assert_guarded_pages_are_wired(&app, &probe_app, &guarded_pages(&fixture))
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2180,20 +2387,23 @@ async fn wiring_guard_rejects_a_hardcoded_id_form_added_to_the_sales_list() {
     let (app, pool) = test_app().await;
     let fixture = seed_wiring_fixture(&app, &pool).await;
 
-    let (_, sales_path, concrete_ids_are_defects) = guarded_pages(&fixture)
+    let sales_page = guarded_pages(&fixture)
         .into_iter()
-        .find(|(label, _, _)| *label == "sales")
+        .find(|page| page.label == "sales")
         .expect("the sales list must be declared in the guarded page list");
-    let (status, html) = get(&app, &sales_path).await;
-    assert_eq!(status, StatusCode::OK, "{sales_path}: {html:.400}");
+    let (status, html) = get(&app, &sales_page.path).await;
+    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", sales_page.path);
 
     // Exactly the verifier's mutation: one extra form with a concrete id.
     let mutant = format!(
         "{html}<form hx-post=\"/web/sales/1/lines\"><input name=\"qty\" value=\"1\" /></form>"
     );
-    let err =
-        check_rendered_wiring_shape("sales list (mutated)", &mutant, concrete_ids_are_defects)
-            .unwrap_err();
+    let err = check_rendered_wiring_shape(
+        "sales list (mutated)",
+        &mutant,
+        sales_page.concrete_ids_are_defects,
+    )
+    .unwrap_err();
     assert!(
         err.contains("hardcodes a concrete id segment"),
         "the guard must reject a hardcoded id on the sales list: {err}"
@@ -2201,18 +2411,224 @@ async fn wiring_guard_rejects_a_hardcoded_id_form_added_to_the_sales_list() {
 
     // The mirror: on the record page a concrete id is legitimate — the URL
     // carries the record id and the line ids are data-bound.
-    let (_, record_path, record_ids_are_defects) = guarded_pages(&fixture)
+    let record_page = guarded_pages(&fixture)
         .into_iter()
-        .find(|(label, _, _)| *label == "sale record page")
+        .find(|page| page.label == "sale record page")
         .expect("the sale record page must be declared in the guarded page list");
     assert!(
-        !record_ids_are_defects,
+        !record_page.concrete_ids_are_defects,
         "the record page carries the ids it renders and must stay out of the rule"
     );
-    let (status, record_html) = get(&app, &record_path).await;
-    assert_eq!(status, StatusCode::OK, "{record_path}: {record_html:.400}");
-    check_rendered_wiring_shape("sale record page", &record_html, record_ids_are_defects)
-        .unwrap_or_else(|err| panic!("concrete ids must stay legitimate on the record page: {err}"));
+    let (status, record_html) = get(&app, &record_page.path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}: {record_html:.400}",
+        record_page.path
+    );
+    check_rendered_wiring_shape(
+        "sale record page",
+        &record_html,
+        record_page.concrete_ids_are_defects,
+    )
+    .unwrap_or_else(|err| panic!("concrete ids must stay legitimate on the record page: {err}"));
+}
+
+/// The mirror pin: adding a form with a hardcoded id to the purchases list must
+/// fail the guard. The list carries no legitimate concrete id, so its flag must
+/// stay true; the new record page carries the ids it renders, so its flag must
+/// stay false. Reading both from the same list the guard uses means a future flip
+/// fails here before the mutation can ship.
+#[tokio::test]
+async fn wiring_guard_rejects_a_hardcoded_id_form_added_to_the_purchases_list() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+
+    let purchases_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "purchases")
+        .expect("the purchases list must be declared in the guarded page list");
+    assert!(
+        purchases_page.concrete_ids_are_defects,
+        "the purchases list carries no legitimate concrete id and must stay under the rule"
+    );
+    let (status, html) = get(&app, &purchases_page.path).await;
+    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", purchases_page.path);
+
+    // Exactly the verifier's mutation: one extra form with a concrete id.
+    let mutant = format!(
+        "{html}<form hx-post=\"/web/purchases/1/lines\"><input name=\"qty\" value=\"1\" /></form>"
+    );
+    let err = check_rendered_wiring_shape(
+        "purchases list (mutated)",
+        &mutant,
+        purchases_page.concrete_ids_are_defects,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("hardcodes a concrete id segment"),
+        "the guard must reject a hardcoded id on the purchases list: {err}"
+    );
+
+    // The mirror: on the purchase record page a concrete id is legitimate — the URL
+    // carries the record id and the line ids are data-bound.
+    let record_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "purchase record page")
+        .expect("the purchase record page must be declared in the guarded page list");
+    assert!(
+        !record_page.concrete_ids_are_defects,
+        "the record page carries the ids it renders and must stay out of the rule"
+    );
+    let (status, record_html) = get(&app, &record_page.path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}: {record_html:.400}",
+        record_page.path
+    );
+    check_rendered_wiring_shape(
+        "purchase record page",
+        &record_html,
+        record_page.concrete_ids_are_defects,
+    )
+    .unwrap_or_else(|err| {
+        panic!("concrete ids must stay legitimate on the purchase record page: {err}")
+    });
+}
+
+/// The dangling-selector shape, pinned. Route resolution cannot see a selector
+/// that matches no rendered element, so this rule closes that gap: a control
+/// aimed at the removed `#purchase-detail` panel must fail, and so must removing
+/// the panel an existing control targets. The message names the page and the
+/// missing selector.
+#[tokio::test]
+async fn wiring_guard_rejects_hx_target_selectors_that_no_element_matches() {
+    // The rule in isolation: a selector that resolves passes, one that does not
+    // fails and names both the page and the selector.
+    check_same_page_selectors(
+        "control",
+        r##"<div id="panel"></div><button hx-target="#panel"></button>"##,
+        &[],
+        &RenderedPages::new(),
+    )
+    .unwrap();
+    let err = check_same_page_selectors(
+        "control",
+        r##"<button hx-target="#purchase-detail"></button>"##,
+        &[],
+        &RenderedPages::new(),
+    )
+    .unwrap_err();
+    assert!(err.contains("control"), "{err}");
+    assert!(err.contains("#purchase-detail"), "{err}");
+
+    let (app, pool) = test_app().await;
+    let _fixture = seed_wiring_fixture(&app, &pool).await;
+
+    // Mutation A: the verifier's shape — a control aimed at the removed panel.
+    let (status, purchases) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK, "{purchases:.400}");
+    let dangling = format!("{purchases}<button hx-target=\"#purchase-detail\"></button>");
+    let err = check_same_page_selectors("purchases", &dangling, &[], &RenderedPages::new()).unwrap_err();
+    eprintln!("dangling selector rejected: {err}");
+    assert!(err.contains("purchases"), "{err}");
+    assert!(err.contains("#purchase-detail"), "{err}");
+
+    // Mutation B: remove the panel an existing control targets.
+    let (status, sales) = get(&app, "/sales").await;
+    assert_eq!(status, StatusCode::OK, "{sales:.400}");
+    let removed = sales.replacen("id=\"sale-debt\"", "", 1);
+    assert_ne!(removed, sales, "the mutation must remove the targeted panel");
+    let err = check_same_page_selectors("sales", &removed, &[], &RenderedPages::new()).unwrap_err();
+    eprintln!("removed panel rejected: {err}");
+    assert!(err.contains("sales"), "{err}");
+    assert!(err.contains("#sale-debt"), "{err}");
+}
+
+/// The page-external exemptions are load-bearing and real: each selector a
+/// fragment may reach is rendered by the host page it swaps into, and the
+/// fragment check fails without the declaration.
+#[tokio::test]
+async fn fragment_external_selectors_resolve_on_their_host_record_pages() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+
+    let (status, sale_page) = get(&app, &format!("/sales/{}", fixture.sale)).await;
+    assert_eq!(status, StatusCode::OK, "{sale_page:.400}");
+    for id in ["sale-record", "sale-record-money", "line-picker"] {
+        assert!(
+            sale_page.contains(&format!("id=\"{id}\"")),
+            "the sale host page must render #{id} for its fragments"
+        );
+    }
+
+    let (status, purchase_page) = get(&app, &format!("/purchases/{}", fixture.purchase)).await;
+    assert_eq!(status, StatusCode::OK, "{purchase_page:.400}");
+    for id in ["purchase-record", "purchase-record-money", "line-picker"] {
+        assert!(
+            purchase_page.contains(&format!("id=\"{id}\"")),
+            "the purchase host page must render #{id} for its fragments"
+        );
+    }
+
+    // The shared search fragment is guarded in its purchase context too: it adds
+    // against the purchase money region and shows the cost.
+    let (status, purchase_search) = get(
+        &app,
+        &format!(
+            "/web/product-search?q=GUARD-P&price=cost&line_action=/web/purchases/{}/lines&line_target=%23purchase-record-money",
+            fixture.purchase
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{purchase_search}");
+    assert!(
+        purchase_search.contains("hx-target=\"#purchase-record-money\""),
+        "the purchase results add against the purchase money region: {purchase_search}"
+    );
+    assert!(
+        purchase_search.contains("cost $10"),
+        "the purchase results show the cost: {purchase_search}"
+    );
+
+    // Without the declared exemption the fragment genuinely fails, so the
+    // exemption is not decorative.
+    let (_, fragment) = get(&app, &format!("/web/sales/{}", fixture.sale)).await;
+    let err = check_same_page_selectors("sale detail fragment", &fragment, &[], &RenderedPages::new()).unwrap_err();
+    assert!(err.contains("#sale-record"), "{err}");
+}
+
+/// A declaration must be a bound check, not a trust list: declaring a selector
+/// that no page renders must fail the guard, within the same run.
+#[tokio::test]
+async fn wiring_guard_rejects_an_external_selector_no_host_page_renders() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+    let (probe_app, probe_pool) = test_app().await;
+    let _probe_fixture = seed_wiring_fixture(&probe_app, &probe_pool).await;
+
+    // The healthy declarations resolve on their host pages.
+    let mut pages = guarded_pages(&fixture);
+    assert_guarded_pages_are_wired(&app, &probe_app, &pages)
+        .await
+        .unwrap_or_else(|err| panic!("the declared exemptions must resolve: {err}"));
+
+    // Mutation: declare a selector that exists nowhere, on a real page.
+    let fragment = pages
+        .iter_mut()
+        .find(|page| page.label == "sale detail fragment")
+        .expect("the sale detail fragment is guarded");
+    fragment.external_selectors.push(ExternalSelector {
+        selector: "#purchase-detail",
+        host: "sale record page",
+    });
+    let err = assert_guarded_pages_are_wired(&app, &probe_app, &pages)
+        .await
+        .unwrap_err();
+    eprintln!("bogus exemption rejected: {err}");
+    assert!(err.contains("sale detail fragment"), "{err}");
+    assert!(err.contains("#purchase-detail"), "{err}");
 }
 
 /// Blind spot 5: a colon in the query string is not a template placeholder.
@@ -2839,6 +3255,11 @@ async fn sidebar_marks_the_active_entry_from_the_server_on_every_page() {
             format!("/sales/{}", fixture.sale),
             "sales",
         ),
+        (
+            "purchase record page",
+            format!("/purchases/{}", fixture.purchase),
+            "purchases",
+        ),
     ];
     for (label, path, expected) in pages {
         let (status, html) = get(&app, &path).await;
@@ -3036,7 +3457,7 @@ async fn line_picker_loads_a_sale_without_a_click() {
     // Typing a name, a SKU or a barcode each find the product, through the same
     // search path the field uses.
     let search = format!(
-        "/web/product-search?line_action={base}/lines&line_target=%23sale-record-money"
+        "/web/product-search?price=sale&line_action={base}/lines&line_target=%23sale-record-money"
     );
     for needle in ["scan", "SCAN-P", "7791234567890"] {
         let (status, fragment) = get(&app, &format!("{search}&q={needle}")).await;
@@ -3144,6 +3565,236 @@ async fn line_picker_loads_a_sale_without_a_click() {
         "a failed resolution adds nothing"
     );
     assert_eq!(after["total"], before["total"]);
+}
+
+/// The same loop as the sale page, against the purchase record: the picker posts
+/// the typed value to the purchase line endpoint, the response carries the updated
+/// lines, the running total and the out-of-band picker, and the repeated-product
+/// rule surfaces as a clear 400 instead of a crash.
+#[tokio::test]
+async fn purchase_line_picker_adds_lines_without_a_click() {
+    let (app, pool) = test_app().await;
+    let product_a = create_product_via_web(&app, &pool, "PSCAN-A", "1", "50").await;
+    let product_b = create_product_via_web(&app, &pool, "PSCAN-B", "1", "50").await;
+    record_stock_via_web(&app, product_a, "20").await;
+    record_stock_via_web(&app, product_b, "5").await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{product_a}/barcodes"),
+        json!({ "code": "7791234567891" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode A: {body}");
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{product_b}/barcodes"),
+        json!({ "code": "7791234567892" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode B: {body}");
+    let supplier = create_supplier_via_web(&app, &pool, "ScanSupplier").await;
+
+    let (status, body) = post_form(
+        &app,
+        "/web/purchases",
+        &format!("supplier_id={supplier}&payment_type=Cash&purchase_date=2024-05-10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let purchase = find_only_purchase_id(&app).await;
+    let base = format!("/web/purchases/{purchase}");
+
+    // Typing a name, a SKU or a barcode each find the product through the same
+    // search path the field uses; the result is its own add action against the
+    // purchase line endpoint and carries the current stock.
+    let search = format!(
+        "/web/product-search?price=cost&line_action={base}/lines&line_target=%23purchase-record-money"
+    );
+    for needle in ["PSCAN-A", "7791234567891"] {
+        let (status, fragment) = get(&app, &format!("{search}&q={needle}")).await;
+        assert_eq!(status, StatusCode::OK, "{fragment}");
+        assert!(fragment.contains("product PSCAN-A"), "{needle}: {fragment}");
+        assert!(
+            fragment.contains("stock 20"),
+            "{needle}: stock travels: {fragment}"
+        );
+        assert!(
+            fragment.contains(&format!("hx-post=\"{base}/lines\"")),
+            "{needle}: {fragment}"
+        );
+        assert!(fragment.contains("hx-include=\"#line-picker\""), "{fragment}");
+        assert!(
+            fragment.contains(&format!("hx-vals='{{\"product_id\": {product_a}}}'")),
+            "{fragment}"
+        );
+        assert!(
+            fragment.contains("cost $10"),
+            "{needle}: the purchase picker must show the cost: {fragment}"
+        );
+        assert!(
+            !fragment.contains("$25"),
+            "{needle}: the purchase picker must not show the sale price: {fragment}"
+        );
+    }
+
+    // The record page offers the field, its debounced search and the sibling
+    // results container, and no catalogue select.
+    let (status, page) = get(&app, &format!("/purchases/{purchase}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        !page.contains("<select name=\"product_id\""),
+        "the catalogue select must be gone: {page:.600}"
+    );
+    assert!(
+        page.contains("hx-get=\"/web/product-search\""),
+        "{page:.600}"
+    );
+    assert!(
+        page.contains("id=\"purchase-record-money\""),
+        "{page:.600}"
+    );
+
+    // Scan 1: the reader types the barcode and presses Enter. The form carries the
+    // field and the quantity, never a product id. The empty cost falls back to the
+    // product cost price (10).
+    let (status, added) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567891&qty=2&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("product PSCAN-A"), "{added:.600}");
+    assert!(
+        added.contains("$20"),
+        "running total after the scan: {added:.800}"
+    );
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // Scan 2: a different product, and the picker comes back ready again.
+    let (status, added) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567892&qty=3&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("$50"), "running total: {added:.800}");
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // Removing a line updates the running total from the same response.
+    let detail = purchase_detail(&app, purchase).await;
+    let line_id = detail["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["qty"] == json!("2"))
+        .and_then(|line| line["id"].as_i64())
+        .expect("the scanned line");
+    let (status, removed) = send(
+        &app,
+        "DELETE",
+        &format!("{base}/lines/{line_id}"),
+        None,
+        true,
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert!(
+        removed.contains("$30"),
+        "running total after removal: {removed:.800}"
+    );
+    assert!(
+        !removed.contains(&format!("id=\"purchase-line-{line_id}\"")),
+        "the removed line is gone: {removed:.800}"
+    );
+
+    // The repeated-product rule surfaces as a clear 400 with the actionable
+    // message, and the picker form names its action so the notice region can say
+    // which action failed. Product B is still on the purchase after the removal.
+    let before = purchase_detail(&app, purchase).await;
+    let (status, repeated) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567892&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{repeated}");
+    assert!(repeated.contains("already has a line"), "{repeated}");
+    assert!(repeated.contains("separate purchase"), "{repeated}");
+    assert!(
+        repeated.contains("product PSCAN-B"),
+        "the rejection must name the product, not its id: {repeated}"
+    );
+    assert!(
+        !repeated.contains(&format!("product {product_b} already has a line")),
+        "the rejection must not leak the bare product id: {repeated}"
+    );
+    assert!(
+        page.contains("data-action=\"Add line\""),
+        "the notice must be able to name the failed action: {page:.600}"
+    );
+    let after = purchase_detail(&app, purchase).await;
+    assert_eq!(
+        after["lines"].as_array().unwrap().len(),
+        before["lines"].as_array().unwrap().len(),
+        "the repeated product adds nothing"
+    );
+    assert_eq!(after["total"], before["total"]);
+
+    // An unknown value is a clear 400 naming the search count, and adds nothing.
+    let (status, err) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=does-not-exist&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err.contains("no exact match"), "{err}");
+    assert!(err.contains("0 matches"), "{err}");
+    assert_eq!(
+        purchase_detail(&app, purchase).await["lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        after["lines"].as_array().unwrap().len(),
+        "a failed resolution adds nothing"
+    );
+}
+
+/// The shared results fragment shows the price the calling context works in:
+/// a sale line is sold at the sale price, a purchase line is bought at the
+/// cost. The endpoint takes the price kind from the picker, so the number can
+/// never be the other context's price.
+#[tokio::test]
+async fn product_search_shows_the_context_price() {
+    let (app, pool) = test_app().await;
+    create_product_via_web(&app, &pool, "PRICE-P", "1", "50").await;
+
+    let (status, sale) = get(
+        &app,
+        "/web/product-search?q=PRICE-P&price=sale&line_action=/web/sales/1/lines&line_target=%23sale-record-money",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sale}");
+    assert!(sale.contains("$25"), "a sale shows its sale price: {sale}");
+    assert!(!sale.contains("$10"), "a sale must not show the cost: {sale}");
+
+    let (status, purchase) = get(
+        &app,
+        "/web/product-search?q=PRICE-P&price=cost&line_action=/web/purchases/1/lines&line_target=%23purchase-record-money",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{purchase}");
+    assert!(
+        purchase.contains("cost $10"),
+        "a purchase shows the cost price: {purchase}"
+    );
+    assert!(
+        !purchase.contains("$25"),
+        "a purchase must not show the sale price: {purchase}"
+    );
 }
 
 // ---------------------------------------------------------------------------

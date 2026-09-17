@@ -53,6 +53,8 @@ struct ProductSearchResultsPartial {
     matches: Vec<ProductStock>,
     line_action: String,
     line_target: String,
+    /// True when the calling context buys: show the cost, not the sale price.
+    show_cost: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,11 +193,15 @@ pub struct ProductSearchQuery {
     #[serde(default)]
     pub product: String,
     /// The record's line endpoint and swap target, supplied by the picker form so
-    /// the fragment stays generic (sales today, purchases next).
+    /// the fragment stays generic (sales and purchases share it).
     #[serde(default)]
     pub line_action: String,
     #[serde(default)]
     pub line_target: String,
+    /// Which price the calling context works in: `cost` for a purchase line,
+    /// `sale` (the default) for a sale line. Only that number is shown.
+    #[serde(default)]
+    pub price: String,
 }
 
 /// `GET /web/product-search?q=`: the bounded picker read. Matching and stock
@@ -215,6 +221,7 @@ async fn web_product_search(
         matches,
         line_action: params.line_action.trim().to_string(),
         line_target: params.line_target.trim().to_string(),
+        show_cost: params.price.trim().eq_ignore_ascii_case("cost"),
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;

@@ -1,71 +1,247 @@
-<div id="purchase-detail-inner">
-  <div class="mb-2 flex flex-wrap items-center gap-2">
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if view.detail.purchase.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if view.detail.purchase.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ view.detail.purchase.status }}</span>
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if view.detail.due.is_sign_positive() %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{% if view.detail.due.is_sign_positive() %}payable{% else %}settled{% endif %}</span>
-    <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ view.detail.purchase.payment_type }}</span>
+{# Purchase record body (redesign-interface N3; product picker N4).
+
+   Rendered both by `/purchases/{id}` inside the shell and standalone by every
+   action response that swaps `#purchase-record`, so the same context travels with
+   the fragment either way. The status gate below is presentation only: the
+   service stays the authority and refuses edits to a confirmed purchase.
+
+   `record_money` wraps the running total and the lines so one response carries
+   both: adding a line swaps that region while the picker is replaced out of
+   band, empty and focused, ready for the next scan. #}
+{% import "partials/product_search_results.html" as picker %}
+{% macro record_money(record) %}
+<div id="purchase-record-money">
+  <div class="my-2 text-2xl font-bold">${{ record.total }} <span class="text-[13px] text-muted">paid {{ record.paid }} • due {{ record.due }}</span></div>
+
+  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
+  {% if record.lines.is_empty() %}
+    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet{% if record.purchase.status.to_string() == "Draft" %} — add one below.{% else %}.{% endif %}</div>
+  {% else %}
+    <div class="overflow-x-auto">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+            <th class="py-2 pr-3">Product</th>
+            <th class="py-2 pr-3 text-right">Qty</th>
+            <th class="py-2 pr-3 text-right">Unit cost</th>
+            <th class="py-2 pr-3 text-right">Subtotal</th>
+            {% if record.purchase.status.to_string() == "Draft" %}<th class="py-2"></th>{% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for line in record.lines %}
+          <tr class="border-b border-border/60" id="purchase-line-{{ line.id }}">
+            <td class="py-2.5 pr-3">
+              <span class="font-semibold">{{ line.product_name }}</span>
+              <span class="text-[13px] text-muted"> · {{ line.product_sku }}</span>
+            </td>
+            <td class="py-2.5 pr-3 text-right tabular-nums">{{ line.qty }}</td>
+            <td class="py-2.5 pr-3 text-right tabular-nums">${{ line.unit_cost }}</td>
+            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">${{ line.subtotal }}</td>
+            {% if record.purchase.status.to_string() == "Draft" %}
+            <td class="py-2.5 text-right">
+              <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                      hx-delete="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
+                      hx-target="#purchase-record" hx-swap="innerHTML"
+                      aria-label="Remove line">✕</button>
+            </td>
+            {% endif %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+{% endmacro %}
+
+<div id="purchase-record-inner" data-purchase-record>
+  <div class="mb-3 flex flex-wrap items-center gap-2">
+    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.purchase.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if record.purchase.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.purchase.status }}</span>
+    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.payment_status }}</span>
+    <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.purchase.payment_type }}</span>
     <span class="text-base font-bold">
-      {% if let Some(n) = view.detail.purchase.purchase_number %}{{ n }}{% else %}Draft #{{ view.detail.purchase.id }}{% endif %}
+      {% if let Some(n) = record.purchase.purchase_number %}{{ n }}{% else %}Draft purchase{% endif %}
     </span>
   </div>
   <div class="mb-1 text-[13px] text-muted">
-    {{ view.supplier_name }}
-    • {{ view.detail.purchase.purchase_date }}{% if let Some(due) = view.detail.purchase.due_date %} • due {{ due }}{% endif %}
+    {{ record.supplier_name }}
+    • {{ record.purchase.purchase_date }}{% if let Some(due) = record.purchase.due_date %} • due {{ due }}{% endif %}
   </div>
-  {% if let Some(inv) = view.detail.purchase.supplier_invoice_no %}
+  {% if let Some(inv) = record.purchase.supplier_invoice_no %}
     <div class="text-[13px] text-muted">invoice {{ inv }}</div>
   {% endif %}
-  {% if !view.detail.purchase.notes.is_empty() %}
-    <div class="text-[13px] text-muted">{{ view.detail.purchase.notes }}</div>
+  {% if !record.purchase.notes.is_empty() %}
+    <div class="text-[13px] text-muted">{{ record.purchase.notes }}</div>
   {% endif %}
-  {% if let Some(c) = view.detail.purchase.cancel_reason %}
-    <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger">Cancelled: {{ c }}</div>
-  {% endif %}
-  <div class="my-2 text-2xl font-bold">${{ view.detail.total }} <span class="text-[13px] text-muted">paid {{ view.detail.paid }} • due {{ view.detail.due }}</span></div>
-
-  <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ view.detail.lines.len() }})</div>
-  {% if view.detail.lines.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet — add one from the form.</div>
-  {% else %}
-    {% for line in view.detail.lines %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="purchase-line-{{ line.id }}">
-      <div class="flex flex-col">
-        <span class="font-semibold">product #{{ line.product_id }}</span>
-        <span class="text-[13px] text-muted">{{ line.qty }} × ${{ line.unit_cost }} = ${{ line.subtotal() }}</span>
-      </div>
-      <div class="flex items-center gap-2">
-        {% if view.detail.purchase.status.to_string() == "Draft" %}
-        <form class="flex items-center gap-2" hx-post="/web/purchases/{{ view.detail.purchase.id }}/lines/{{ line.id }}" hx-target="#purchase-detail" hx-swap="innerHTML">
-          <div>
-            <label>Qty</label>
-            <input type="number" name="qty" step="0.01" min="0.01" required value="{{ line.qty }}" />
-          </div>
-          <div>
-            <label>Unit cost</label>
-            <input type="number" name="unit_cost" step="0.01" min="0" required value="{{ line.unit_cost }}" />
-          </div>
-          <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Save</button>
-        </form>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-delete="/web/purchases/{{ view.detail.purchase.id }}/lines/{{ line.id }}" hx-target="#purchase-detail" hx-swap="innerHTML">✕</button>
-        {% else %}
-          <span class="font-bold tabular-nums text-expense">{{ line.subtotal() }}</span>
-        {% endif %}
-      </div>
-    </div>
-    {% endfor %}
+  {% if let Some(c) = record.purchase.cancel_reason %}
+    <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-cancel-reason>Cancelled: {{ c }}</div>
   {% endif %}
 
-  <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ view.detail.payments.len() }})</div>
-  {% if view.detail.payments.is_empty() %}
+  {% call record_money(record) %}
+
+  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ record.payments.len() }})</div>
+  {% if record.payments.is_empty() %}
     <div class="text-[13px] text-muted">No payments recorded.</div>
   {% else %}
-    {% for pay in view.detail.payments %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="purchase-payment-{{ pay.id }}">
-      <div class="flex flex-col">
-        <span class="font-semibold">account #{{ pay.account_id }} • method #{{ pay.method_id }}</span>
-        <span class="text-[13px] text-muted">{{ pay.date }}</span>
-      </div>
-      <span class="font-bold tabular-nums text-expense">{{ pay.amount }}</span>
+    <div class="overflow-x-auto">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+            <th class="py-2 pr-3">Date</th>
+            <th class="py-2 pr-3">Account</th>
+            <th class="py-2 pr-3">Method</th>
+            <th class="py-2 pr-3 text-right">Amount</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for pay in record.payments %}
+          <tr class="border-b border-border/60" id="purchase-payment-{{ pay.id }}">
+            <td class="py-2.5 pr-3 tabular-nums">{{ pay.date }}</td>
+            <td class="py-2.5 pr-3">{{ pay.account_name }}</td>
+            <td class="py-2.5 pr-3">{{ pay.method_name }}</td>
+            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">${{ pay.amount }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
-    {% endfor %}
+  {% endif %}
+
+  {# Actions in context, gated by status. Destructive actions ask first. #}
+  {% if record.purchase.status.to_string() == "Draft" %}
+  <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
+    <div class="rounded-2xl border border-border bg-card p-4" id="add-line">
+      <h2 class="mb-3 text-base font-semibold">Add line</h2>
+      {% call picker::line_picker(false, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = product cost)", "product cost", "cost") %}
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-4" id="confirm-purchase">
+      <h2 class="mb-3 text-base font-semibold">Confirm purchase</h2>
+      <form class="flex flex-col gap-2.5" data-action="Confirm purchase"
+            hx-post="/web/purchases/{{ record.purchase.id }}/confirm"
+            hx-target="#purchase-record" hx-swap="innerHTML">
+        <div>
+          <label for="confirm-account">Cash account (Cash only)</label>
+          <select id="confirm-account" name="account_id">
+            <option value="">— none (Credit) —</option>
+            {% for acc in accounts %}
+            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="confirm-method">Method (Cash only, must be allowed for account)</label>
+          <select id="confirm-method" name="method_id">
+            <option value="">— none (Credit) —</option>
+            {% for m in methods %}
+            <option value="{{ m.id }}">{{ m.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <button type="submit" class="bg-accent2 text-white">Confirm</button>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-4" id="edit-header">
+      <h2 class="mb-3 text-base font-semibold">Edit header</h2>
+      <form class="flex flex-col gap-2.5" data-action="Edit header"
+            hx-post="/web/purchases/{{ record.purchase.id }}/header"
+            hx-target="#purchase-record" hx-swap="innerHTML">
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label for="header-purchase-date">Purchase date</label>
+            <input type="date" id="header-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
+          </div>
+          <div>
+            <label for="header-due-date">Due date (Credit only)</label>
+            <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.purchase.due_date %}{{ due }}{% endif %}" />
+          </div>
+        </div>
+        <div>
+          <label for="header-supplier-invoice-no">Supplier invoice no (optional)</label>
+          <input type="text" id="header-supplier-invoice-no" name="supplier_invoice_no" maxlength="64" value="{% if let Some(inv) = record.purchase.supplier_invoice_no %}{{ inv }}{% endif %}" />
+        </div>
+        <div>
+          <label for="header-notes">Notes</label>
+          <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" />
+        </div>
+        <button type="submit">Save header</button>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-4" id="discard-purchase">
+      <h2 class="mb-3 text-base font-semibold">Discard draft</h2>
+      <form class="flex flex-col gap-2.5" data-action="Discard draft"
+            hx-post="/web/purchases/{{ record.purchase.id }}/cancel"
+            hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
+            hx-target="#purchase-record" hx-swap="innerHTML">
+        <div>
+          <label for="discard-reason">Reason (optional)</label>
+          <input type="text" id="discard-reason" name="reason" maxlength="256" />
+        </div>
+        <button type="submit" class="border border-border bg-transparent text-text">Discard draft</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+    {% if record.purchase.status.to_string() == "Confirmed" %}
+    <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
+      {% if record.purchase.payment_type.to_string() == "Credit" %}
+      <div class="rounded-2xl border border-border bg-card p-4" id="record-payment">
+        <h2 class="mb-3 text-base font-semibold">Record payment</h2>
+        <form class="flex flex-col gap-2.5" data-action="Record payment"
+              hx-post="/web/purchases/{{ record.purchase.id }}/payments"
+              hx-target="#purchase-record" hx-swap="innerHTML">
+          <div>
+            <label for="payment-account">Account</label>
+            <select id="payment-account" name="account_id" required>
+              {% for acc in accounts %}
+              <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label for="payment-method">Method (must be allowed for account)</label>
+            <select id="payment-method" name="method_id" required>
+              {% for m in methods %}
+              <option value="{{ m.id }}">{{ m.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="flex gap-2.5 [&>*]:flex-1">
+            <div>
+              <label for="payment-amount">Amount</label>
+              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+            </div>
+            <div>
+              <label for="payment-date">Date</label>
+              <input type="date" id="payment-date" name="date" required value="{{ today }}" />
+            </div>
+          </div>
+          <button type="submit" class="bg-accent2 text-white">Record payment</button>
+        </form>
+      </div>
+      {% endif %}
+
+      <div class="rounded-2xl border border-border bg-card p-4" id="cancel-purchase">
+        <h2 class="mb-3 text-base font-semibold">Cancel purchase</h2>
+        <form class="flex flex-col gap-2.5" data-action="Cancel purchase"
+              hx-post="/web/purchases/{{ record.purchase.id }}/cancel"
+              hx-confirm="Cancel this purchase? Stock returns and recorded payments are refunded."
+              hx-target="#purchase-record" hx-swap="innerHTML">
+          <div>
+            <label for="cancel-reason">Reason</label>
+            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="wrong order…" />
+          </div>
+          <button type="submit" class="border border-border bg-transparent text-text">Cancel purchase</button>
+        </form>
+      </div>
+    </div>
+    {% endif %}
   {% endif %}
 </div>
+
+{# The line response keeps the picker outside the swapped money region and swaps
+   it out of band with an empty, focused field, so the next scan lands there. #}
+{% if oob_picker %}{% call picker::line_picker(true, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = product cost)", "product cost", "cost") %}{% endif %}

@@ -546,18 +546,24 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /purchases` — purchases (M3):
 
-- Purchase list with status + payable badges (HTMX `GET /web/purchases`, derived total/paid/due)
+- Purchase list with status/payable badges; each row links to its record (HTMX `GET /web/purchases`)
+- `/purchases/:id` — record page with the header (status, number or draft state,
+  supplier, dates, totals, payment status), the lines table with product name and
+  SKU, unit cost and subtotal, and the payments table with account and method
+  names; the product picker matches name, SKU and barcode and shows current stock;
+  an unknown id is a 404
 - Sugerido panel rendering the suggestion with a `→ Draft` seed button per row
-  (HTMX `GET /web/purchases/suggestions`, seed via `POST /web/purchases/from-suggestion`)
-- Purchase detail with lines and payments; the Draft line editor saves qty/unit cost in
-  place and removes lines (HTMX `GET /web/purchases/:id`, POST/DELETE
-  `/web/purchases/:id/lines/:line_id`)
-- Forms:
-  - New purchase Draft: `POST /web/purchases` (HTMX)
-  - Add line: `POST /web/purchases/lines` (HTMX)
-  - Confirm: `POST /web/purchases/confirm` (HTMX)
-  - Record payment: `POST /web/purchases/payments` (HTMX)
-  - Cancel: `POST /web/purchases/cancel` (HTMX)
+  (HTMX `GET /web/purchases/suggestions`, seed via `POST /web/purchases/from-suggestion`,
+  which opens the new draft's record)
+- Actions, gated by status and offered in context on the record page:
+  - New purchase Draft: `POST /web/purchases` (HTMX, answers `HX-Redirect` to the new record)
+  - Add line (Draft): `POST /web/purchases/:id/lines` (HTMX, scanner or picker; the
+    repeated-product rule is a clear 400)
+  - Edit header (Draft): `POST /web/purchases/:id/header` (HTMX)
+  - Confirm: `POST /web/purchases/:id/confirm` (HTMX)
+  - Record payment (Confirmed, Credit): `POST /web/purchases/:id/payments` (HTMX)
+  - Cancel (Confirmed) / discard (Draft): `POST /web/purchases/:id/cancel` (HTMX,
+    `hx-confirm` asks first)
 
 `GET /suppliers` — suppliers + cost satellite (M3):
 

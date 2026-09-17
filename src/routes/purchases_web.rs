@@ -1,15 +1,13 @@
-// Slice G (T13): purchases web `/purchases` Askama + HTMX, parity with the
-// sales/products pages. Thin handlers over PurchasesService; fragments live in
-// partials/purchase_*.html and cross-page refresh uses HX-Trigger events.
-//
-// Typed-id actions (add line, confirm, pay, cancel) post to collection web
-// endpoints with the purchase id in the form body, because HTMX cannot
-// interpolate a path from an input value. Fragment actions on a known purchase
-// (line save/remove) use the `/web/purchases/{id}/lines/{line_id}` paths.
+// Purchases web: the `/purchases` list and the `/purchases/{id}` record page,
+// Askama + HTMX. Thin handlers over PurchasesService; the record body lives in
+// partials/purchase_detail.html and every action posts to
+// `/web/purchases/{id}/...`, so the id always comes from the URL. The old
+// collection endpoints (id in the form body) stay registered for existing
+// callers.
 use askama::Template;
 use axum::{
     extract::{Form, Path, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
@@ -20,8 +18,9 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewPurchase, PaymentType, PurchaseDetail, PurchaseSuggestions};
-use crate::repositories::ProductRepository;
+use crate::models::{
+    NewPurchase, PaymentType, PurchaseDetail, PurchaseRecord, PurchaseStatus, PurchaseSuggestions,
+};
 use crate::routes::AppState;
 
 // ---------------------------------------------------------------------------
@@ -42,12 +41,29 @@ struct PurchasesTemplate {
     purchases: Vec<PurchaseView>,
     suggestions: PurchaseSuggestions,
     has_suggestions: bool,
-    products: Vec<crate::models::Product>,
     suppliers: Vec<crate::models::Supplier>,
-    accounts: Vec<crate::models::AccountWithBalance>,
-    methods: Vec<crate::models::PaymentMethod>,
     allow_negative: bool,
     allow_negative_stock: bool,
+    today: String,
+    nav_key: &'static str,
+}
+
+/// The `/purchases/{id}` record page. The page-header values are struct fields,
+/// so the shared component and the record body read them straight from the shell.
+#[derive(Template)]
+#[template(path = "purchase.html")]
+struct PurchasePageTemplate {
+    /// Purchase number, or "Draft purchase" before confirmation.
+    page_title: String,
+    page_breadcrumb_label: String,
+    page_breadcrumb_href: String,
+    /// Empty label = no primary action (a cancelled purchase is read-only).
+    page_action_href: String,
+    page_action_label: String,
+    record: PurchaseRecord,
+    oob_picker: bool,
+    accounts: Vec<crate::models::AccountWithBalance>,
+    methods: Vec<crate::models::PaymentMethod>,
     today: String,
     nav_key: &'static str,
 }
@@ -59,10 +75,16 @@ struct PurchaseListPartial {
     purchases: Vec<PurchaseView>,
 }
 
+/// The record body, shared by the page and by every action response that swaps
+/// `#purchase-record`, so the action forms travel with the fragment either way.
 #[derive(Template)]
 #[template(path = "partials/purchase_detail.html")]
 struct PurchaseDetailPartial {
-    view: PurchaseView,
+    record: PurchaseRecord,
+    oob_picker: bool,
+    accounts: Vec<crate::models::AccountWithBalance>,
+    methods: Vec<crate::models::PaymentMethod>,
+    today: String,
 }
 
 #[derive(Template)]
@@ -136,18 +158,6 @@ fn clean_opt(s: &str) -> Option<String> {
     }
 }
 
-async fn purchase_view(state: &AppState, id: i64) -> AppResult<PurchaseView> {
-    let detail = state.purchases_service.get_detail(id).await?;
-    let supplier = state
-        .supplier_service
-        .get_supplier(detail.purchase.supplier_id)
-        .await?;
-    Ok(PurchaseView {
-        detail,
-        supplier_name: supplier.name,
-    })
-}
-
 async fn purchase_views(state: &AppState) -> AppResult<Vec<PurchaseView>> {
     let details = state.purchases_service.list_details().await?;
     let mut out = Vec::with_capacity(details.len());
@@ -164,13 +174,6 @@ async fn purchase_views(state: &AppState) -> AppResult<Vec<PurchaseView>> {
     Ok(out)
 }
 
-fn triggered(html: String, event: &str) -> Response {
-    let mut resp = Html(html).into_response();
-    resp.headers_mut()
-        .insert("HX-Trigger", event.parse().unwrap());
-    resp
-}
-
 fn render_list(view: Vec<PurchaseView>, title: &str) -> AppResult<Html<String>> {
     let html = PurchaseListPartial {
         title: title.to_string(),
@@ -181,19 +184,60 @@ fn render_list(view: Vec<PurchaseView>, title: &str) -> AppResult<Html<String>> 
     Ok(Html(html))
 }
 
-/// List fragment + `HX-Trigger` refresh event, for mutating web handlers.
-async fn list_response(state: &AppState, event: &str) -> AppResult<Response> {
-    let view = purchase_views(state).await?;
-    let html = render_list(view, "All purchases")?;
-    Ok(triggered(html.0, event))
+/// Everything the record body renders: the resolved record plus the option
+/// lists its action forms need. The product picker searches
+/// `/web/product-search` instead of carrying the whole catalogue.
+struct PurchaseRecordContext {
+    record: PurchaseRecord,
+    accounts: Vec<crate::models::AccountWithBalance>,
+    methods: Vec<crate::models::PaymentMethod>,
+    today: String,
 }
 
-async fn changed(state: &AppState, id: i64) -> AppResult<Response> {
-    let view = purchase_view(state, id).await?;
-    let html = PurchaseDetailPartial { view }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(triggered(html, "purchase-changed"))
+async fn record_context(state: &AppState, purchase_id: i64) -> AppResult<PurchaseRecordContext> {
+    let record = state.purchases_service.get_record(purchase_id).await?;
+    let accounts = state.account_service.list_with_balances().await?;
+    let methods = state.payment_method_service.list().await?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    Ok(PurchaseRecordContext {
+        record,
+        accounts,
+        methods,
+        today,
+    })
+}
+
+fn render_record(context: PurchaseRecordContext, oob_picker: bool) -> AppResult<Html<String>> {
+    let html = PurchaseDetailPartial {
+        record: context.record,
+        oob_picker,
+        accounts: context.accounts,
+        methods: context.methods,
+        today: context.today,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Html(html))
+}
+
+/// Record-body response that keeps the cross-region `purchase-changed` refresh
+/// event, so the subscribed list region updates after an action.
+async fn changed(state: &AppState, purchase_id: i64) -> AppResult<Response> {
+    changed_with_picker(state, purchase_id, false).await
+}
+
+/// Line-add response: the same body plus the out-of-band picker, empty and
+/// focused, so the scanner can feed the next line without a click.
+async fn changed_with_picker(
+    state: &AppState,
+    purchase_id: i64,
+    oob_picker: bool,
+) -> AppResult<Response> {
+    let html = render_record(record_context(state, purchase_id).await?, oob_picker)?.0;
+    let mut resp = Html(html).into_response();
+    resp.headers_mut()
+        .insert("HX-Trigger", "purchase-changed".parse().unwrap());
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------
@@ -205,23 +249,56 @@ async fn purchases_page(State(state): State<AppState>) -> Result<Html<String>, A
     let suggestions = state.purchases_service.suggestions().await?;
     let has_suggestions =
         !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
-    let products = state.inventory_service.products.list().await?;
     let suppliers = state.supplier_service.list_suppliers().await?;
-    let accounts = state.account_service.list_with_balances().await?;
-    let methods = state.payment_method_service.list().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = PurchasesTemplate {
         title: "All purchases".to_string(),
         purchases,
         suggestions,
         has_suggestions,
-        products,
         suppliers,
-        accounts,
-        methods,
         allow_negative: state.allow_negative,
         allow_negative_stock: state.allow_negative_stock,
         today,
+        nav_key: "purchases",
+    };
+    Ok(Html(
+        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+    ))
+}
+
+/// `/purchases/{id}`: a real page inside the shell. The label is the purchase
+/// number or its draft state, and the single header action slot mirrors the
+/// status.
+async fn purchase_record_page(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, AppError> {
+    let context = record_context(&state, id).await?;
+    let label = match &context.record.purchase.purchase_number {
+        Some(number) => number.clone(),
+        None => "Draft purchase".to_string(),
+    };
+    let (action_href, action_label) = if context.record.purchase.status == PurchaseStatus::Draft {
+        ("#add-line".to_string(), "Add line".to_string())
+    } else if context.record.purchase.status == PurchaseStatus::Confirmed
+        && context.record.purchase.payment_type == PaymentType::Credit
+    {
+        ("#record-payment".to_string(), "Record payment".to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    let tmpl = PurchasePageTemplate {
+        page_title: label,
+        page_breadcrumb_label: "Purchases".to_string(),
+        page_breadcrumb_href: "/purchases".to_string(),
+        page_action_href: action_href,
+        page_action_label: action_label,
+        record: context.record,
+        oob_picker: false,
+        accounts: context.accounts,
+        methods: context.methods,
+        today: context.today,
         nav_key: "purchases",
     };
     Ok(Html(
@@ -238,10 +315,7 @@ async fn web_purchase_detail(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    let view = purchase_view(&state, id).await?;
-    let html = PurchaseDetailPartial { view }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let html = render_record(record_context(&state, id).await?, false)?.0;
     Ok(Html(html).into_response())
 }
 
@@ -281,8 +355,15 @@ pub struct CreatePurchaseForm {
 
 #[derive(Debug, Deserialize)]
 pub struct AddLineForm {
+    #[serde(default)]
     pub purchase_id: i64,
-    pub product_id: i64,
+    /// An explicit id arrives from a clicked result; a scan arrives as `product`.
+    #[serde(default)]
+    pub product_id: Option<i64>,
+    /// The typed or scanned value. The inventory service resolves it: exact
+    /// barcode, then exact SKU (case-insensitive), then a numeric id.
+    #[serde(default)]
+    pub product: String,
     #[serde(default)]
     pub qty: String,
     #[serde(default)]
@@ -299,6 +380,7 @@ pub struct UpdateLineForm {
 
 #[derive(Debug, Deserialize)]
 pub struct ConfirmPurchaseForm {
+    #[serde(default)]
     pub purchase_id: i64,
     #[serde(default)]
     pub account_id: String,
@@ -308,6 +390,7 @@ pub struct ConfirmPurchaseForm {
 
 #[derive(Debug, Deserialize)]
 pub struct RecordPaymentForm {
+    #[serde(default)]
     pub purchase_id: i64,
     pub account_id: i64,
     pub method_id: i64,
@@ -319,9 +402,22 @@ pub struct RecordPaymentForm {
 
 #[derive(Debug, Deserialize)]
 pub struct CancelPurchaseForm {
+    #[serde(default)]
     pub purchase_id: i64,
     #[serde(default)]
     pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdatePurchaseHeaderForm {
+    #[serde(default)]
+    pub purchase_date: String,
+    #[serde(default)]
+    pub due_date: String,
+    #[serde(default)]
+    pub supplier_invoice_no: String,
+    #[serde(default)]
+    pub notes: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -348,7 +444,7 @@ async fn web_create_purchase(
     headers: HeaderMap,
     Form(form): Form<CreatePurchaseForm>,
 ) -> AppResult<Response> {
-    state
+    let purchase = state
         .purchases_service
         .create_draft(NewPurchase {
             supplier_id: form.supplier_id,
@@ -359,27 +455,55 @@ async fn web_create_purchase(
             notes: clean_opt(&form.notes),
         })
         .await?;
+    let location = format!("/purchases/{}", purchase.id);
     if is_htmx(&headers) {
-        return list_response(&state, "purchase-created").await;
+        // AC4: htmx performs a real navigation to the new record, so an id is
+        // never typed and the back button keeps working.
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("HX-Redirect", location)
+            .body(axum::body::Body::empty())
+            .map_err(|e| AppError::Internal(e.to_string()));
     }
-    Ok(Redirect::to("/purchases").into_response())
+    Ok(Redirect::to(&location).into_response())
 }
 
 async fn web_add_line(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
 ) -> AppResult<Response> {
     let qty = parse_required_decimal(&form.qty, "qty")?;
     let unit_cost = parse_opt_decimal(&form.unit_cost, "unit_cost")?;
+    // An explicit product id (a clicked result) wins over the typed text; a scan
+    // or an Enter carries only the value and resolves through inventory.
+    let product_id = match form.product_id.filter(|id| *id > 0) {
+        Some(id) => id,
+        None => state
+            .inventory_service
+            .resolve_product_ref(&form.product)
+            .await?
+            .id,
+    };
     state
         .purchases_service
-        .add_line(form.purchase_id, form.product_id, qty, unit_cost)
+        .add_line(id, product_id, qty, unit_cost)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, form.purchase_id).await;
+        return changed_with_picker(&state, id, true).await;
     }
-    Ok(Redirect::to("/purchases").into_response())
+    Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
+}
+
+/// Collection adapter: the typed-id form posts the purchase id in the body and
+/// delegates to the path-based handler, so both URL shapes keep working.
+async fn web_add_line_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AddLineForm>,
+) -> AppResult<Response> {
+    web_add_line(state, headers, Path(form.purchase_id), Form(form)).await
 }
 
 async fn web_update_line(
@@ -397,7 +521,7 @@ async fn web_update_line(
     if is_htmx(&headers) {
         return changed(&state, purchase_id).await;
     }
-    Ok(Redirect::to("/purchases").into_response())
+    Ok(Redirect::to(&format!("/purchases/{purchase_id}")).into_response())
 }
 
 async fn web_remove_line(
@@ -411,50 +535,103 @@ async fn web_remove_line(
 async fn web_confirm_purchase(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Path(id): Path<i64>,
     Form(form): Form<ConfirmPurchaseForm>,
 ) -> AppResult<Response> {
     let account_id = parse_opt_i64(&form.account_id, "account_id")?;
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
-    state
-        .purchases_service
-        .confirm(form.purchase_id, account_id, method_id)
-        .await?;
+    state.purchases_service.confirm(id, account_id, method_id).await?;
     if is_htmx(&headers) {
-        return changed(&state, form.purchase_id).await;
+        return changed(&state, id).await;
     }
-    Ok(Redirect::to("/purchases").into_response())
+    Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
+}
+
+async fn web_confirm_purchase_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ConfirmPurchaseForm>,
+) -> AppResult<Response> {
+    web_confirm_purchase(state, headers, Path(form.purchase_id), Form(form)).await
 }
 
 async fn web_record_payment(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
 ) -> AppResult<Response> {
     let amount = parse_required_decimal(&form.amount, "amount")?;
     let date = parse_date_or_today(&form.date)?;
     state
         .purchases_service
-        .record_payment(form.purchase_id, form.account_id, form.method_id, amount, date)
+        .record_payment(id, form.account_id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, form.purchase_id).await;
+        return changed(&state, id).await;
     }
-    Ok(Redirect::to("/purchases").into_response())
+    Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
+}
+
+async fn web_record_payment_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RecordPaymentForm>,
+) -> AppResult<Response> {
+    web_record_payment(state, headers, Path(form.purchase_id), Form(form)).await
 }
 
 async fn web_cancel_purchase(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Path(id): Path<i64>,
     Form(form): Form<CancelPurchaseForm>,
 ) -> AppResult<Response> {
     state
         .purchases_service
-        .cancel(form.purchase_id, clean_opt(&form.reason))
+        .cancel(id, clean_opt(&form.reason))
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, form.purchase_id).await;
+        return changed(&state, id).await;
     }
-    Ok(Redirect::to("/purchases").into_response())
+    Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
+}
+
+async fn web_cancel_purchase_collection(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CancelPurchaseForm>,
+) -> AppResult<Response> {
+    web_cancel_purchase(state, headers, Path(form.purchase_id), Form(form)).await
+}
+
+/// Edit the draft header in place (dates, invoice, notes); the supplier and the
+/// payment type stay fixed at creation, as the service enforces.
+async fn web_update_purchase_header(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<UpdatePurchaseHeaderForm>,
+) -> AppResult<Response> {
+    let purchase_date = parse_opt_date(&form.purchase_date, "purchase_date")?;
+    let due_date = parse_opt_date(&form.due_date, "due_date")?;
+    state
+        .purchases_service
+        .update_draft(
+            id,
+            crate::models::UpdatePurchaseDraft {
+                purchase_date,
+                due_date: Some(due_date),
+                supplier_invoice_no: Some(clean_opt(&form.supplier_invoice_no)),
+                notes: Some(form.notes),
+                ..Default::default()
+            },
+        )
+        .await?;
+    if is_htmx(&headers) {
+        return changed(&state, id).await;
+    }
+    Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
 
 /// Seed a Draft pedido from one suggested low-stock product: the service
@@ -502,14 +679,21 @@ async fn web_seed_from_suggestion(
         )
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, purchase.id).await;
+        // The seeded draft opens its record, so the suggestion ends on the page
+        // where its line can be reviewed and confirmed.
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("HX-Redirect", format!("/purchases/{}", purchase.id))
+            .body(axum::body::Body::empty())
+            .map_err(|e| AppError::Internal(e.to_string()));
     }
-    Ok(Redirect::to("/purchases").into_response())
+    Ok(Redirect::to(&format!("/purchases/{}", purchase.id)).into_response())
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/purchases", get(purchases_page))
+        .route("/purchases/{id}", get(purchase_record_page))
         .route(
             "/web/purchases",
             get(web_purchase_list).post(web_create_purchase),
@@ -519,15 +703,32 @@ pub fn router() -> Router<AppState> {
             "/web/purchases/from-suggestion",
             post(web_seed_from_suggestion),
         )
-        .route("/web/purchases/lines", post(web_add_line))
-        .route("/web/purchases/confirm", post(web_confirm_purchase))
-        .route("/web/purchases/payments", post(web_record_payment))
-        .route("/web/purchases/cancel", post(web_cancel_purchase))
+        .route("/web/purchases/lines", post(web_add_line_collection))
+        .route(
+            "/web/purchases/confirm",
+            post(web_confirm_purchase_collection),
+        )
+        .route(
+            "/web/purchases/payments",
+            post(web_record_payment_collection),
+        )
+        .route(
+            "/web/purchases/cancel",
+            post(web_cancel_purchase_collection),
+        )
         .route("/web/purchases/{id}", get(web_purchase_detail))
+        .route("/web/purchases/{id}/lines", post(web_add_line))
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}",
             post(web_update_line).delete(web_remove_line),
         )
+        .route(
+            "/web/purchases/{id}/header",
+            post(web_update_purchase_header),
+        )
+        .route("/web/purchases/{id}/confirm", post(web_confirm_purchase))
+        .route("/web/purchases/{id}/payments", post(web_record_payment))
+        .route("/web/purchases/{id}/cancel", post(web_cancel_purchase))
 }
 
 #[cfg(test)]
@@ -540,6 +741,7 @@ mod tests {
     use std::str::FromStr;
     use tower::ServiceExt;
 
+    use crate::models::PaymentType;
     use crate::routes::AppState;
 
     async fn test_state() -> AppState {
@@ -622,6 +824,244 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
     }
 
+    /// POST like the record page does, keeping the response status, the
+    /// `HX-Redirect` header and the body for assertions.
+    async fn post_form_response(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let redirect = resp
+            .headers()
+            .get("HX-Redirect")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, redirect, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The opening tag that carries `needle`, for attribute assertions such as
+    /// `hx-confirm` on the cancel control.
+    fn element_tag_containing<'a>(html: &'a str, needle: &str) -> &'a str {
+        let pos = html
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not rendered: {html:.600}"));
+        let start = html[..pos]
+            .rfind('<')
+            .expect("the attribute must sit inside a tag");
+        let end = pos + html[pos..].find('>').expect("unterminated tag");
+        &html[start..=end]
+    }
+
+    /// A row's rendered HTML, sliced from its `id` to the closing `</tr>`.
+    fn row_with_id<'a>(html: &'a str, id: &str) -> &'a str {
+        let start = html
+            .find(&format!("id=\"{id}\""))
+            .unwrap_or_else(|| panic!("row {id} not rendered: {html:.600}"));
+        let after = &html[start..];
+        let end = after
+            .find("</tr>")
+            .unwrap_or_else(|| panic!("row {id} has no closing tag"));
+        &after[..end]
+    }
+
+    /// Cuts the `<form>...</form>` region that contains `needle`, for structural
+    /// assertions such as "the results container is not inside the picker form".
+    fn enclosing_form<'a>(html: &'a str, needle: &str) -> &'a str {
+        let pos = html
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not rendered: {html:.600}"));
+        let start = html[..pos].rfind("<form").expect("needle must sit in a form");
+        let end = html[pos..].find("</form>").expect("form must close");
+        &html[start..pos + end + "</form>".len()]
+    }
+
+    /// The line response must bring the picker back out of band, empty and
+    /// focused, so the next scan lands without a click.
+    fn assert_oob_picker_is_empty_and_focused(html: &str) {
+        let oob_pos = html
+            .find("hx-swap-oob=\"true\"")
+            .unwrap_or_else(|| panic!("the picker must come back out of band: {html:.800}"));
+        let tag_start = html[..oob_pos].rfind('<').unwrap();
+        let tag_end = oob_pos + html[oob_pos..].find('>').unwrap();
+        let oob_tag = &html[tag_start..=tag_end];
+        assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
+        let oob = &html[tag_start..];
+        assert!(
+            oob.contains("autofocus"),
+            "the picker must come back focused: {oob:.400}"
+        );
+        let input_pos = oob
+            .find("id=\"product-picker\"")
+            .expect("the out-of-band picker renders its field");
+        let input_start = oob[..input_pos].rfind('<').unwrap();
+        let input_end = input_pos + oob[input_pos..].find('>').unwrap();
+        let input_tag = &oob[input_start..=input_end];
+        assert!(
+            !input_tag.contains("value="),
+            "the picker must come back empty: {input_tag}"
+        );
+    }
+
+    /// Everything a record-page test needs to address the seeded document.
+    struct RecordFixture {
+        purchase_id: i64,
+        line_id: i64,
+        product_id: i64,
+        product_name: String,
+        product_sku: String,
+        supplier_id: i64,
+        supplier_name: String,
+        account_id: i64,
+        method_id: i64,
+        account_name: String,
+        method_name: String,
+    }
+
+    /// One draft purchase with one line, plus an account configured with Cash, so a
+    /// record-page test can drive draft, confirmed, paid and cancelled states.
+    async fn seed_record_fixture(state: &AppState, payment_type: PaymentType) -> RecordFixture {
+        use crate::models::{NewProduct, NewPurchase, NewSupplier, ProductKind};
+        use chrono::NaiveDate;
+        use rust_decimal::Decimal;
+
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "REC-PUR".into(),
+                name: "Record purchase product".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(10),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Record Supplier".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let purchase = state
+            .purchases_service
+            .create_draft(NewPurchase {
+                supplier_id: supplier.id,
+                payment_type,
+                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                due_date: match payment_type {
+                    PaymentType::Credit => Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                    PaymentType::Cash => None,
+                },
+                supplier_invoice_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let line = state
+            .purchases_service
+            .add_line(purchase.id, product.id, Decimal::from(2), None)
+            .await
+            .unwrap();
+        let account = state.account_service.create("Caja").await.unwrap();
+        // Purchase payments are Expenses; fund the account so the guard flag under
+        // test is the record shape, not a zero balance.
+        state
+            .transaction_service
+            .create(
+                account.id,
+                crate::models::TransactionKind::Income,
+                Decimal::from(1000),
+                Some("fixture funding".into()),
+                NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(account.id, "Caja")
+            .await
+            .unwrap();
+        let method = state
+            .payment_method_service
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash")
+            .expect("Cash is seeded by migrations");
+
+        RecordFixture {
+            purchase_id: purchase.id,
+            line_id: line.id,
+            product_id: product.id,
+            product_name: product.name,
+            product_sku: product.sku,
+            supplier_id: supplier.id,
+            supplier_name: supplier.name,
+            account_id: account.id,
+            method_id: method.id,
+            account_name: account.name,
+            method_name: method.name,
+        }
+    }
+
+    /// A second product for scan and click flows, so the fixture's own line is
+    /// never repeated by accident.
+    async fn seed_extra_product(
+        state: &AppState,
+        sku: &str,
+        barcode: Option<&str>,
+    ) -> crate::models::Product {
+        use crate::models::{NewProduct, ProductKind};
+        use rust_decimal::Decimal;
+
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: sku.into(),
+                name: format!("prod {sku}"),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(10),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        if let Some(code) = barcode {
+            state
+                .inventory_service
+                .add_barcode(product.id, code)
+                .await
+                .unwrap();
+        }
+        product
+    }
+
     #[tokio::test]
     async fn web_draft_line_editor_add_update_remove() {
         let state = test_state().await;
@@ -702,6 +1142,650 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("Purchases"), "page should mention Purchases");
         assert!(html.contains("Sugerido"), "page should have the suggestion panel");
+    }
+
+    // -- N3: the purchase record page ------------------------------------------
+
+    /// The typed-id forms are gone. The purchases list renders no `purchase_id`
+    /// input, drops the side-panel detail target and links every row to its record
+    /// page, so an id is never typed. (redesign-interface N3)
+    #[tokio::test]
+    async fn web_purchases_page_has_no_typed_id_forms_and_links_records() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("name=\"purchase_id\""),
+            "the purchases list must not ask for a typed purchase id: {html:.600}"
+        );
+        assert!(
+            !html.contains("id=\"purchase-detail\""),
+            "the side-panel detail must be gone: {html:.600}"
+        );
+        assert!(
+            html.contains(&format!("href=\"/purchases/{}\"", fixture.purchase_id)),
+            "every row must link to its record: {html:.600}"
+        );
+        assert!(
+            html.contains("Sugerido"),
+            "the suggestion panel stays on the list page: {html:.600}"
+        );
+    }
+
+    /// AC4: creating a purchase answers `HX-Redirect` to its record, so htmx
+    /// performs a real navigation and no id is typed.
+    #[tokio::test]
+    async fn web_create_purchase_redirects_to_the_record() {
+        let state = test_state().await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(crate::models::NewSupplier {
+                name: "Redirect Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+        let body = format!(
+            "supplier_id={}&payment_type=Cash&purchase_date=2024-05-02",
+            supplier.id
+        );
+        let (status, redirect, resp) = post_form_response(app, "/web/purchases", &body).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let redirect = redirect.expect("AC4: the create response must carry HX-Redirect");
+        assert!(redirect.starts_with("/purchases/"), "{redirect}");
+        let purchase_id: i64 = redirect["/purchases/".len()..]
+            .parse()
+            .unwrap_or_else(|_| panic!("HX-Redirect must end in the purchase id: {redirect}"));
+        let detail = state
+            .purchases_service
+            .get_detail(purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.supplier_id, supplier.id);
+    }
+
+    /// The non-HTMX form path also lands on the record page, so a browser without
+    /// htmx still never sees a list to retype an id from.
+    #[tokio::test]
+    async fn web_create_purchase_redirects_a_plain_form_to_the_record() {
+        let state = test_state().await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(crate::models::NewSupplier {
+                name: "Plain Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+        let body = format!(
+            "supplier_id={}&payment_type=Cash&purchase_date=2024-05-02",
+            supplier.id
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("a plain create must redirect to the record")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(location.starts_with("/purchases/"), "{location}");
+    }
+
+    /// AC5 + name resolution: `/purchases/{id}` is a real page inside the shell
+    /// carrying the supplier name, product names and SKUs, and account and method
+    /// names; an unknown id is 404 with the existing error shape.
+    #[tokio::test]
+    async fn web_purchase_record_page_resolves_names_and_unknown_id_is_404() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        state
+            .purchases_service
+            .confirm(fixture.purchase_id, None, None)
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .record_payment(
+                fixture.purchase_id,
+                fixture.account_id,
+                fixture.method_id,
+                Decimal::from(10),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        let payment_id = detail.payments[0].id;
+        let purchase_number = detail
+            .purchase
+            .purchase_number
+            .clone()
+            .expect("a confirmed purchase carries its number");
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/purchases/{}", fixture.purchase_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("data-page-header"), "record uses the page header");
+        assert!(
+            html.contains("data-nav=\"purchases\"") && html.contains("aria-current=\"page\""),
+            "record page keeps the purchases nav key"
+        );
+        assert!(html.contains(&fixture.supplier_name), "{html:.600}");
+        assert!(html.contains(&purchase_number), "{html:.600}");
+
+        let line_row = row_with_id(&html, &format!("purchase-line-{}", fixture.line_id));
+        assert!(line_row.contains(&fixture.product_name), "{line_row}");
+        assert!(line_row.contains(&fixture.product_sku), "{line_row}");
+        assert!(!line_row.contains("product #"), "{line_row}");
+
+        let payment_row = row_with_id(&html, &format!("purchase-payment-{payment_id}"));
+        assert!(payment_row.contains(&fixture.account_name), "{payment_row}");
+        assert!(payment_row.contains(&fixture.method_name), "{payment_row}");
+        assert!(!payment_row.contains("account #"), "{payment_row}");
+        assert!(!payment_row.contains("method #"), "{payment_row}");
+
+        let (status, body) = get_html(app, "/purchases/999999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("purchase 999999 not found"), "{body}");
+        assert!(!body.contains("route not found"), "{body}");
+    }
+
+    /// AC6: the actions offered match the document status. A draft can add a line,
+    /// edit its header, confirm and discard; a confirmed credit purchase can record
+    /// payments and cancel but cannot edit lines or the header; a cancelled one is
+    /// read-only and shows its reason.
+    #[tokio::test]
+    async fn web_purchase_record_actions_are_status_gated() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+        let base = format!("/web/purchases/{}", fixture.purchase_id);
+
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/purchases/{}", fixture.purchase_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for target in [
+            format!("{base}/lines"),
+            format!("{base}/header"),
+            format!("{base}/confirm"),
+            format!("{base}/cancel"),
+        ] {
+            assert!(
+                html.contains(&target),
+                "a draft must offer {target}: {html:.400}"
+            );
+        }
+        assert!(
+            !html.contains(&format!("{base}/payments")),
+            "a draft must not offer payment recording"
+        );
+
+        state
+            .purchases_service
+            .confirm(fixture.purchase_id, None, None)
+            .await
+            .unwrap();
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/purchases/{}", fixture.purchase_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(&format!("{base}/payments")),
+            "a confirmed credit purchase must offer payment recording"
+        );
+        assert!(html.contains(&format!("{base}/cancel")));
+        assert!(
+            !html.contains(&format!("{base}/lines")),
+            "a confirmed purchase must not edit lines"
+        );
+        assert!(
+            !html.contains(&format!("{base}/header")),
+            "a confirmed purchase must not edit its header"
+        );
+
+        state
+            .purchases_service
+            .cancel(fixture.purchase_id, Some("wrong order".to_string()))
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("wrong order"),
+            "a cancelled purchase must show its reason: {html:.400}"
+        );
+        for target in [
+            format!("{base}/lines"),
+            format!("{base}/header"),
+            format!("{base}/confirm"),
+            format!("{base}/payments"),
+            format!("{base}/cancel"),
+        ] {
+            assert!(
+                !html.contains(&target),
+                "a cancelled purchase must be read-only, found {target}"
+            );
+        }
+    }
+
+    /// Triangulation for AC6: a confirmed Cash purchase is settled at confirm, so
+    /// it offers cancel but no payment form, and its lines and header stay frozen.
+    #[tokio::test]
+    async fn web_purchase_record_confirmed_cash_has_no_payment_form() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                fixture.purchase_id,
+                Some(fixture.account_id),
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+        let base = format!("/web/purchases/{}", fixture.purchase_id);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains(&format!("{base}/cancel")),
+            "a confirmed cash purchase can still be cancelled"
+        );
+        assert!(
+            !html.contains(&format!("{base}/payments")),
+            "a confirmed cash purchase must not offer payment recording"
+        );
+        assert!(
+            !html.contains(&format!("{base}/lines")),
+            "a confirmed cash purchase must not edit lines"
+        );
+        assert!(
+            !html.contains(&format!("{base}/header")),
+            "a confirmed cash purchase must not edit its header"
+        );
+    }
+
+    /// Triangulation for the status gate: the template is presentation only.
+    /// Posting the hidden draft actions directly at a confirmed purchase still
+    /// reaches the service, which refuses them (400) and leaves the document
+    /// untouched.
+    #[tokio::test]
+    async fn web_purchase_record_confirmed_refuses_draft_actions_at_the_service() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                fixture.purchase_id,
+                Some(fixture.account_id),
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+        let base = format!("/web/purchases/{}", fixture.purchase_id);
+
+        // Header edit: refused, and the header keeps its values.
+        let (status, _, body) = post_form_response(
+            app.clone(),
+            &format!("{base}/header"),
+            "purchase_date=2024-05-03&due_date=&supplier_invoice_no=X&notes=nope",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.purchase_date.to_string(), "2024-05-02");
+        assert!(detail.purchase.notes.is_empty());
+
+        // Line add: the same route that works on a draft is refused by the service.
+        let (status, _, body) = post_form_response(
+            app,
+            &format!("{base}/lines"),
+            &format!("product={}&qty=1&unit_cost=", fixture.product_sku),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(after.lines.len(), detail.lines.len());
+    }
+
+    /// AC7: cancelling asks for confirmation before the request is sent; the
+    /// confirm control carries `hx-confirm`. The same holds for discarding a draft.
+    #[tokio::test]
+    async fn web_purchase_record_cancel_asks_for_confirmation() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+
+        let cancel_needle = format!("hx-post=\"/web/purchases/{}/cancel\"", fixture.purchase_id);
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/purchases/{}", fixture.purchase_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let discard = element_tag_containing(&html, &cancel_needle);
+        assert!(
+            discard.contains("hx-confirm"),
+            "discarding a draft must ask first: {discard}"
+        );
+
+        state
+            .purchases_service
+            .confirm(fixture.purchase_id, None, None)
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let cancel = element_tag_containing(&html, &cancel_needle);
+        assert!(
+            cancel.contains("hx-confirm"),
+            "cancelling a confirmed purchase must ask first: {cancel}"
+        );
+    }
+
+    /// The record-page actions swap the record body and keep the
+    /// `purchase-changed` refresh event, so the URL stays stable and subscribed
+    /// regions update.
+    #[tokio::test]
+    async fn web_purchase_record_header_edit_swaps_the_body_and_triggers_refresh() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let body = "purchase_date=2024-05-03&due_date=&supplier_invoice_no=A-9&notes=edited+note";
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/web/purchases/{}/header", fixture.purchase_id))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("HX-Trigger").map(|v| v.to_str().unwrap()),
+            Some("purchase-changed")
+        );
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let html = String::from_utf8_lossy(&bytes).to_string();
+        assert!(html.contains("purchase-record-inner"), "{html:.400}");
+        assert!(html.contains("edited note"), "{html:.400}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.notes, "edited note");
+        assert_eq!(detail.purchase.purchase_date.to_string(), "2024-05-03");
+        assert_eq!(detail.purchase.supplier_invoice_no.as_deref(), Some("A-9"));
+    }
+
+    // -- N4: the product picker on the purchase record page --------------------
+
+    /// The catalogue `<select>` is replaced by one field that searches with a
+    /// debounce, submits on Enter and clears on Escape; the results container is a
+    /// sibling of the form, and every result is its own add action against the
+    /// purchase line endpoint.
+    #[tokio::test]
+    async fn n4_purchase_record_offers_the_picker_instead_of_the_catalogue_select() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("<select name=\"product_id\""),
+            "the whole-catalogue select must be gone: {html:.800}"
+        );
+
+        let picker = enclosing_form(&html, "id=\"product-picker\"");
+        assert!(
+            picker.contains(&format!("hx-post=\"/web/purchases/{}/lines\"", fixture.purchase_id)),
+            "{picker}"
+        );
+        assert!(
+            picker.contains("data-action=\"Add line\""),
+            "the notice must name the failed line action: {picker}"
+        );
+        assert!(picker.contains("hx-get=\"/web/product-search\""), "{picker}");
+        assert!(
+            picker.contains("delay:"),
+            "the search must be debounced: {picker}"
+        );
+        assert!(
+            picker.contains("hx-target=\"#product-search-results\""),
+            "{picker}"
+        );
+        assert!(
+            picker.contains("hx-on:keyup")
+                && picker.contains("Escape")
+                && picker.contains("this.value"),
+            "Escape must clear the field declaratively: {picker}"
+        );
+        assert!(
+            picker.contains("name=\"qty\"") && picker.contains("value=\"1\""),
+            "a scan and a click must both carry the default quantity: {picker}"
+        );
+        assert!(
+            !picker.contains("id=\"product-search-results\""),
+            "the results container must be a sibling of the picker form, never inside it: {picker}"
+        );
+        assert!(
+            html.contains("id=\"product-search-results\""),
+            "the page must render the sibling results container: {html:.600}"
+        );
+        assert!(
+            html.contains("id=\"purchase-record-money\""),
+            "adding a line swaps the money region, which carries the total and the lines"
+        );
+    }
+
+    /// AC9 + AC10: an exact barcode submits the line in one step, the same response
+    /// carries the updated lines, the running total and an out-of-band picker that
+    /// is empty and focused, and an empty cost falls back to the product's cost
+    /// price.
+    #[tokio::test]
+    async fn n4_purchase_line_scan_adds_in_one_step_and_resets_the_picker() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let scanned = seed_extra_product(&state, "SCAN-PUR", Some("7791234567891")).await;
+        let app = crate::routes::router(state.clone());
+
+        // Exactly what the picker form posts on Enter: the typed value and the
+        // quantity, no product id and no click.
+        let (status, _, added) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            "product=7791234567891&qty=2&unit_cost=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.lines.len(), 2, "the scan adds its own line");
+        let line = detail
+            .lines
+            .iter()
+            .find(|line| line.product_id == scanned.id)
+            .expect("the scanned line");
+        assert_eq!(line.qty, Decimal::from(2));
+        assert_eq!(
+            line.unit_cost,
+            Decimal::from(10),
+            "an empty cost falls back to the product cost price"
+        );
+
+        // One response carries the lines, the running total and the OOB picker, so
+        // lines and total can never drift.
+        assert!(added.contains(&scanned.name), "{added:.600}");
+        assert!(
+            added.contains("$40"),
+            "the running total travels with the lines: {added:.800}"
+        );
+        assert_oob_picker_is_empty_and_focused(&added);
+    }
+
+    /// AC10 (clicked result): a result is its own add action; the request includes
+    /// the picker form, so the quantity travels, and supplies the product id
+    /// itself. The typed text is not an exact match on purpose.
+    #[tokio::test]
+    async fn n4_purchase_line_clicked_result_uses_the_picker_quantity() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let clicked_product = seed_extra_product(&state, "CLICK-PUR", None).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, body) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            &format!(
+                "product=record&qty=3&unit_cost=&product_id={}",
+                clicked_product.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        let clicked = detail
+            .lines
+            .iter()
+            .find(|line| line.product_id == clicked_product.id)
+            .expect("the clicked line");
+        assert_eq!(clicked.qty, Decimal::from(3));
+        assert_eq!(clicked.unit_cost, Decimal::from(10));
+        assert_eq!(detail.total, Decimal::from(50));
+        assert!(body.contains("$50"), "{body:.800}");
+    }
+
+    /// AC12: an unresolvable value is a clear 400 that names the number of partial
+    /// matches the search found, and it adds nothing.
+    #[tokio::test]
+    async fn n4_purchase_line_unknown_value_is_400_and_adds_nothing() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let before = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+
+        let (status, _, body) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            "product=record&qty=1&unit_cost=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("no exact match"), "{body}");
+        assert!(
+            body.contains("1 match"),
+            "the message must name the search count: {body}"
+        );
+
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.lines.len(),
+            before.lines.len(),
+            "a failed resolution adds no line"
+        );
+        assert_eq!(after.total, before.total);
+    }
+
+    /// The repeated-product rule is a deliberate rejection, not a crash: the route
+    /// answers 400 with the actionable message, and the picker form names its action
+    /// so the notice region reads "Add line failed — …" instead of a bare error.
+    #[tokio::test]
+    async fn web_purchase_line_repeated_product_is_a_clear_400() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let before = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+
+        let (status, _, body) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            &format!("product={}&qty=1&unit_cost=", fixture.product_sku),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("already has a line"), "{body}");
+        assert!(
+            body.contains("separate purchase"),
+            "the message must point at the supported path: {body}"
+        );
+
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.lines.len(),
+            before.lines.len(),
+            "the repeated product adds no line"
+        );
+        assert_eq!(after.total, before.total);
     }
 
     #[tokio::test]
@@ -800,10 +1884,14 @@ mod tests {
         );
 
         let body = format!("product_id={pid}&payment_type=Cash&purchase_date=2024-05-02");
-        assert_eq!(
-            post_form(app.clone(), "/web/purchases/from-suggestion", &body).await,
-            StatusCode::OK
-        );
+        let (status, redirect, resp) =
+            post_form_response(app.clone(), "/web/purchases/from-suggestion", &body).await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let redirect = redirect.expect("seeding a draft must land on its record");
+        assert!(redirect.starts_with("/purchases/"), "{redirect}");
+        let redirected_id: i64 = redirect["/purchases/".len()..]
+            .parse()
+            .unwrap_or_else(|_| panic!("HX-Redirect must end in the purchase id: {redirect}"));
 
         let (status, html) = get_html(app.clone(), "/web/purchases").await;
         assert_eq!(status, StatusCode::OK);
@@ -822,11 +1910,15 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let purchase_id = v["purchases"][0]["purchase"]["id"].as_i64().unwrap();
+        assert_eq!(
+            redirected_id, purchase_id,
+            "the seed must navigate to the draft it just created"
+        );
         let (st, detail) = get_html(app.clone(), &format!("/web/purchases/{purchase_id}")).await;
         assert_eq!(st, StatusCode::OK);
         assert!(
-            detail.contains("product #") && detail.contains("48"),
-            "seeded line should show suggested qty: {detail:.400}"
+            detail.contains("prod WEB-SUG") && detail.contains("48"),
+            "seeded line should show the product name and suggested qty: {detail:.400}"
         );
     }
 }

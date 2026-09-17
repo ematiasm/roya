@@ -837,6 +837,44 @@ impl PurchaseDetail {
     }
 }
 
+/// One purchase line resolved for `/purchases/{id}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchaseLineView {
+    pub id: i64,
+    pub product_name: String,
+    pub product_sku: String,
+    pub qty: Decimal,
+    pub unit_cost: Decimal,
+    pub subtotal: Decimal,
+}
+
+/// One purchase payment resolved for `/purchases/{id}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchasePaymentView {
+    pub id: i64,
+    pub account_name: String,
+    pub method_name: String,
+    pub amount: Decimal,
+    pub date: NaiveDate,
+}
+
+/// The purchase record page payload: the stored document plus every child with
+/// its internal keys replaced by display names (`products.cost_price` stays the
+/// fallback the service already applies for an empty line cost). Totals stay
+/// derived.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchaseRecord {
+    pub purchase: Purchase,
+    /// Purchases store only the supplier id; the name is resolved for display.
+    pub supplier_name: String,
+    pub lines: Vec<PurchaseLineView>,
+    pub payments: Vec<PurchasePaymentView>,
+    pub total: Decimal,
+    pub paid: Decimal,
+    pub due: Decimal,
+    pub payment_status: PaymentStatus,
+}
+
 /// Format `YYYY-PURCH-NNNNNN` with zero-padded 6-digit sequence.
 pub fn format_purchase_number(year: i32, seq: i64) -> String {
     format!("{year}-PURCH-{seq:06}")
