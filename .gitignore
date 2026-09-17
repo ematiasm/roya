@@ -17,3 +17,13 @@ Thumbs.db
 
 # Local code graph index
 .codegraph/
+
+# Node artifacts must never enter this repo: there is no Node toolchain
+package-lock.json
+node_modules/
+
+# E2E browser suite (Python + uv)
+e2e/.venv/
+e2e/.artifacts/
+e2e/__pycache__/
+e2e/.pytest_cache/
