@@ -910,4 +910,62 @@ mod tests {
         assert!(msg.contains("60"), "projected figure must be visible: {msg}");
         assert!(msg.contains("50"), "limit must be visible: {msg}");
     }
+
+    /// AC3: a credit sale for the walk-in is a 400 over REST too, and the draft
+    /// keeps its status and its NULL sale number.
+    #[tokio::test]
+    async fn k2_rest_credit_to_walkin_is_rejected() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let pid = seed_product(&app, "K2-WALKIN", "Product").await;
+        seed_stock(&app, pid, "10").await;
+        let (walkin_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            serde_json::json!({
+                "customer_id": walkin_id, "payment_type": "Credit",
+                "sale_date": "2024-05-02", "due_date": "2024-06-02"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "draft: {v}");
+        let sale_id = v["sale"]["id"].as_i64().unwrap();
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/sales/{sale_id}/lines"),
+            serde_json::json!({ "product_id": pid, "qty": "1" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        let (st, v) = post_json(
+            app.clone(),
+            &format!("/api/sales/{sale_id}/confirm"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "walk-in credit: {v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("walk-in"),
+            "actionable message: {v}"
+        );
+        let (st, v) = get_json(app, &format!("/api/sales/{sale_id}")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["sale"]["status"], "Draft");
+        assert!(
+            v["sale"]["sale_number"].is_null(),
+            "a blocked confirm assigns no number: {v}"
+        );
+    }
 }

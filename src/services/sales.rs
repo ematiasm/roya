@@ -906,6 +906,21 @@ where
                 receipt_id,
             )
             .await
+            .map_err(|e| match e {
+                // The database trigger refuses a payment grouped under another
+                // customer's receipt. Surfacing it as a Validation keeps the
+                // interface's contract a clean 400 even if a future caller passes a
+                // receipt id directly; no route offers that path.
+                AppError::Database(ref db)
+                    if db.to_string().contains("another customer's receipt") =>
+                {
+                    AppError::Validation(
+                        "the receipt belongs to another customer; a payment can only be grouped under a receipt of its own customer"
+                            .into(),
+                    )
+                }
+                other => other,
+            })
     }
 
     // -- Cancel / Return -----------------------------------------------------------

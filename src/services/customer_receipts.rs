@@ -1453,4 +1453,86 @@ mod tests {
         assert_eq!(paid.receipt_id, Some(ana_receipt.id));
     }
 
+    /// Slice M: even a caller that hands the service a receipt id cannot group a
+    /// payment under another customer's receipt. The trigger aborts the insert;
+    /// the service maps that to a clean Validation (400) instead of a database
+    /// error, and no payment row is written. No route exposes the receipt id at
+    /// all, so this is the backstop behind the interface.
+    #[tokio::test]
+    async fn service_refuses_grouping_a_payment_under_another_customers_receipt() {
+        let (s, pool) = svc().await;
+        let product = seed_product(&s, "R-23", "10").await;
+        let ana = seed_customer(&s, "Ana").await;
+        let beto = seed_customer(&s, "Beto").await;
+        let account = seed_account(&s, "Caja").await;
+        let cash = method_id(&s, "Cash").await;
+        allow(&s, account, cash).await;
+        let ana_sale = credit_sale(&s, ana, product, "3", d(2024, 6, 1)).await; // 30
+        let beto_receipt = s
+            .receipts
+            .create(&NewReceipt {
+                customer_id: beto,
+                account_id: account,
+                method_id: cash,
+                date: d(2024, 6, 20),
+                notes: None,
+            })
+            .await
+            .unwrap();
+
+        let err = s
+            .sales
+            .record_payment_with_receipt(
+                ana_sale.sale.id,
+                account,
+                cash,
+                dec("10"),
+                d(2024, 6, 20),
+                Some(beto_receipt.id),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("another customer"),
+            "the message must name the rule: {err}"
+        );
+        assert_eq!(
+            payment_count(&pool).await,
+            0,
+            "the refused grouping writes no payment"
+        );
+        assert_eq!(s.sales.customer_balance(ana).await.unwrap(), dec("30"));
+        assert_eq!(
+            s.receipts.list_allocations(beto_receipt.id).await.unwrap().len(),
+            0
+        );
+
+        // The same call with a receipt of the sale's own customer still works.
+        let ana_receipt = s
+            .receipts
+            .create(&NewReceipt {
+                customer_id: ana,
+                account_id: account,
+                method_id: cash,
+                date: d(2024, 6, 20),
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let paid = s
+            .sales
+            .record_payment_with_receipt(
+                ana_sale.sale.id,
+                account,
+                cash,
+                dec("10"),
+                d(2024, 6, 20),
+                Some(ana_receipt.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paid.receipt_id, Some(ana_receipt.id));
+        assert_eq!(s.sales.customer_balance(ana).await.unwrap(), dec("20"));
+    }
 }

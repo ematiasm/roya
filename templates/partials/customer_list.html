@@ -1,0 +1,53 @@
+<div id="customer-list-inner">
+  {% if let Some(w) = warning %}
+    <div class="mb-3 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger">{{ w }}</div>
+  {% endif %}
+  {% if customers.is_empty() %}
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No customers yet — create one on the right.</div>
+  {% else %}
+    {% for r in customers %}
+    <div class="mb-3 rounded-[10px] border border-border bg-surface px-3.5 py-3" id="customer-{{ r.customer.id }}">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div class="flex flex-col">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if r.customer.is_active %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{% if r.customer.is_active %}active{% else %}inactive{% endif %}</span>
+            {% if r.customer.is_walkin %}
+            <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">walk-in</span>
+            {% endif %}
+            {% if r.over_limit %}
+            <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">over limit</span>
+            {% endif %}
+            <span class="font-semibold">{{ r.customer.name }}</span>
+            {% if let Some(phone) = r.customer.phone %}
+            <span class="text-xs text-muted">{{ phone }}</span>
+            {% endif %}
+          </div>
+          <span class="text-[13px] text-muted">#{{ r.customer.id }} • {% if let Some(limit) = r.customer.credit_limit %}limit {{ limit }}{% else %}no limit{% endif %}{% if let Some(days) = r.customer.payment_days %} • term {{ days }}d{% endif %}</span>
+          <span class="text-[13px] text-muted">ageing: current {{ r.ageing.current }} • 1-30 {{ r.ageing.overdue_1_30 }} • 31-60 {{ r.ageing.overdue_31_60 }} • 61+ {{ r.ageing.overdue_61_plus }}</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="font-bold tabular-nums {% if r.balance.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ r.balance }}</span>
+          <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/customers/{{ r.customer.id }}">Statement</a>
+          {% if r.customer.is_active %}
+          <form hx-post="/web/customers/deactivate" hx-target="#customer-list" hx-swap="innerHTML">
+            <input type="hidden" name="customer_id" value="{{ r.customer.id }}" />
+            <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Deactivate</button>
+          </form>
+          {% else %}
+          <form hx-post="/web/customers/activate" hx-target="#customer-list" hx-swap="innerHTML">
+            <input type="hidden" name="customer_id" value="{{ r.customer.id }}" />
+            <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Activate</button>
+          </form>
+          {% endif %}
+          {% if !r.customer.is_walkin %}
+          <form hx-post="/web/customers/delete" hx-target="#customer-list" hx-swap="innerHTML">
+            <input type="hidden" name="customer_id" value="{{ r.customer.id }}" />
+            <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">✕</button>
+          </form>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% endfor %}
+  {% endif %}
+</div>

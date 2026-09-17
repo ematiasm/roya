@@ -1,4 +1,6 @@
 pub mod api;
+pub mod customers_api;
+pub mod customers_web;
 pub mod inventory_api;
 pub mod inventory_web;
 pub mod purchases_api;
@@ -14,14 +16,14 @@ use tower_http::services::ServeDir;
 
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-    SqliteCustomerRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
-    SqliteProductRepository, SqliteProductSupplierCostRepository, SqlitePurchaseRepository,
-    SqliteSaleRepository, SqliteStockMovementRepository, SqliteSupplierRepository,
-    SqliteTransactionRepository,
+    SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
+    SqlitePaymentMethodRepository, SqliteProductRepository,
+    SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteSaleRepository,
+    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTransactionRepository,
 };
 use crate::services::{
-    AccountService, CustomerService, InventoryService, PaymentMethodService, PurchasesService,
-    SalesService, SupplierService, TransactionService,
+    AccountService, CustomerReceiptService, CustomerService, InventoryService,
+    PaymentMethodService, PurchasesService, SalesService, SupplierService, TransactionService,
 };
 
 pub type InventorySvc = InventoryService<
@@ -45,6 +47,23 @@ pub type SalesSvc = SalesService<
 >;
 
 pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
+
+/// Receipts: the grouped payments of one handover of money. It wraps the same
+/// sales service the routes use, so every grouped payment reaches sales and
+/// finance exactly like any other payment.
+pub type ReceiptSvc = CustomerReceiptService<
+    SqliteCustomerReceiptRepository,
+    SqliteSaleRepository,
+    SqliteDocSequenceRepository,
+    SqliteCategoryRepository,
+    SqliteProductRepository,
+    SqliteBarcodeRepository,
+    SqliteStockMovementRepository,
+    SqliteAccountRepository,
+    SqliteTransactionRepository,
+    SqlitePaymentMethodRepository,
+    SqliteCustomerRepository,
+>;
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
 
@@ -74,6 +93,7 @@ pub struct AppState {
     pub inventory_service: InventorySvc,
     pub sales_service: SalesSvc,
     pub customer_service: CustomerSvc,
+    pub customer_receipt_service: ReceiptSvc,
     pub payment_method_service: MethodSvc,
     pub supplier_service: SupplierSvc,
     pub purchases_service: PurchasesSvc,
@@ -122,6 +142,14 @@ impl AppState {
             customer_service.clone(),
             enforce_credit_limit,
         );
+        // M4: collections group the payments one handover of money produced; the
+        // receipt service composes the same sales service and the finance-owned
+        // (account, method) allowlist the rest of the app uses.
+        let customer_receipt_service = CustomerReceiptService::new(
+            SqliteCustomerReceiptRepository::new(pool.clone()),
+            sales_service.clone(),
+            payment_method_service.clone(),
+        );
         // M3: suppliers + product/supplier cost satellite are consumed by the
         // purchases orchestrator; both share the same SQLite repos as the rest
         // of the app.
@@ -144,6 +172,7 @@ impl AppState {
             inventory_service,
             sales_service,
             customer_service,
+            customer_receipt_service,
             payment_method_service,
             supplier_service,
             purchases_service,
@@ -158,6 +187,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(api::router())
         .merge(web::router())
+        .merge(customers_api::router())
+        .merge(customers_web::router())
         .merge(inventory_api::router())
         .merge(inventory_web::router())
         .merge(sales_api::router())

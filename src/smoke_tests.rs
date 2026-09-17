@@ -177,6 +177,15 @@ async fn supplier_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
     row.0
 }
 
+async fn customer_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT id FROM customers WHERE name = ?")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
 async fn create_account_via_web(
     app: &Router,
     pool: &SqlitePool,
@@ -961,11 +970,13 @@ async fn unmatched_route_returns_recognisable_404_body() {
 // ---------------------------------------------------------------------------
 
 /// Minimal seeded world for the wiring guard: account + methods, product with
-/// stock, supplier with satellite cost, one draft sale and one purchase.
+/// stock, supplier with satellite cost, one draft sale, one purchase and one
+/// customer whose statement page the guard renders.
 struct WiringFixture {
     account: i64,
     sale: i64,
     purchase: i64,
+    customer: i64,
 }
 
 async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
@@ -999,10 +1010,20 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     assert_eq!(status, StatusCode::OK, "seed purchase: {resp}");
     let purchase = find_only_purchase_id(app).await;
 
+    let (status, resp) = post_form(
+        app,
+        "/web/customers",
+        "name=GuardCustomer&phone=555-0100&credit_limit=500&payment_days=30",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed customer: {resp}");
+    let customer = customer_id_by_name(pool, "GuardCustomer").await;
+
     WiringFixture {
         account,
         sale,
         purchase,
+        customer,
     }
 }
 
@@ -1031,6 +1052,7 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
         ("sales", "/sales".to_string(), true),
         ("purchases", "/purchases".to_string(), true),
         ("suppliers", "/suppliers".to_string(), false),
+        ("customers", "/customers".to_string(), true),
         // The list/detail fragments the pages refresh over HTMX carry more
         // targets (View buttons, inline line editors), so guard the seeded
         // details too.
@@ -1042,6 +1064,11 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
         (
             "purchase detail fragment",
             format!("/web/purchases/{}", fixture.purchase),
+            false,
+        ),
+        (
+            "customer statement",
+            format!("/customers/{}", fixture.customer),
             false,
         ),
     ];
@@ -1351,6 +1378,145 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
         json!("Draft")
     );
 }
+
+    /// M4 collection flow over HTTP: create a customer, sell on credit, collect
+    /// part of it through the form, then assert the derived balance, the ageing
+    /// buckets and that the receipt total equals the sum of its allocations
+    /// while every grouped payment keeps its own finance link.
+    #[tokio::test]
+    async fn collection_flow_derives_balance_ageing_and_receipt_total() {
+        let (app, pool) = test_app().await;
+        let cash = method_id(&pool, "Cash").await;
+        let account = create_account_via_web(&app, &pool, "CollectWallet", &[cash]).await;
+        let product = create_product_via_web(&app, &pool, "COLLECT-P", "1", "50").await;
+        record_stock_via_web(&app, product, "10").await;
+
+        // The customer is created through the same form the page renders.
+        let (status, resp) = post_form(
+            &app,
+            "/web/customers",
+            "name=Collect+Buyer&phone=555-0200&credit_limit=500&payment_days=30",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create customer: {resp}");
+        let customer = customer_id_by_name(&pool, "Collect Buyer").await;
+
+        // Credit sale of 3 x 25 = 75, due 2024-06-15.
+        let sale = create_sale_draft_for_customer(&app, customer, "Credit", "2024-06-15").await;
+        add_sale_line_via_web(&app, sale, product, "3").await;
+        confirm_sale_via_web(&app, sale, None, None).await;
+        let detail = sale_detail(&app, sale).await;
+        assert_eq!(dec(&detail["total"]), Decimal::from(75));
+        assert_eq!(dec(&detail["due"]), Decimal::from(75));
+
+        // Collect 30 through the collect form (the id travels in the body).
+        let (status, resp) = post_form(
+            &app,
+            "/web/customer-receipts",
+            &format!(
+                "customer_id={customer}&account_id={account}&method_id={cash}&amount=30&date=2024-06-20&notes=part"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "collect: {resp}");
+
+        // Derived balance and over-limit flag through the composed read.
+        let (status, body) = get(&app, &format!("/api/customers/{customer}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        assert_eq!(dec(&v["balance"]), Decimal::from(45));
+        assert_eq!(v["over_limit"], json!(false));
+        assert_eq!(v["customer"]["name"], json!("Collect Buyer"));
+
+        // Statement: one sale debit, one payment credit, balance 45, and the
+        // whole balance 5 days overdue falls in 1-30.
+        let (status, body) = get(
+            &app,
+            &format!("/api/customers/{customer}/statement?as_of=2024-06-20"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        let statement = &v["statement"];
+        assert_eq!(dec(&statement["balance"]), Decimal::from(45));
+        assert_eq!(dec(&statement["ageing"]["overdue_1_30"]), Decimal::from(45));
+        assert_eq!(dec(&statement["ageing"]["current"]), Decimal::ZERO);
+        let entries = statement["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "sale debit + payment credit: {entries:?}");
+        assert!(entries
+            .iter()
+            .any(|e| e["kind"] == json!("Sale") && dec(&e["debit"]) == Decimal::from(75)));
+        assert!(entries.iter().any(|e| e["kind"] == json!("Payment")
+            && dec(&e["credit"]) == Decimal::from(30)));
+
+        // The receivables view ages the same balance.
+        let (status, body) = get(&app, "/api/customers/ageing?as_of=2024-06-20").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        let row = v["ageing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["customer_id"] == json!(customer))
+            .unwrap_or_else(|| panic!("customer {customer} missing from ageing: {v}"));
+        assert_eq!(dec(&row["balance"]), Decimal::from(45));
+        assert_eq!(dec(&row["ageing"]["overdue_1_30"]), Decimal::from(45));
+        assert_eq!(row["name"], json!("Collect Buyer"));
+
+        // Receipt total is derived from its allocations, never stored.
+        let (status, body) = get(
+            &app,
+            &format!("/api/customer-receipts?customer_id={customer}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        let receipts = v["receipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 1, "{v}");
+        let receipt = &receipts[0];
+        let receipt_id = receipt["receipt"]["id"].as_i64().unwrap();
+        assert_eq!(dec(&receipt["total"]), Decimal::from(30));
+        let allocations = receipt["allocations"].as_array().unwrap();
+        assert_eq!(allocations.len(), 1);
+        let summed: Decimal = allocations.iter().map(|a| dec(&a["amount"])).sum();
+        assert_eq!(summed, dec(&receipt["total"]));
+        for allocation in allocations {
+            assert_eq!(allocation["receipt_id"].as_i64(), Some(receipt_id));
+            assert_eq!(allocation["sale_id"].as_i64(), Some(sale));
+            assert!(
+                allocation["transaction_id"].as_i64().is_some(),
+                "the grouped payment keeps its finance link: {allocation}"
+            );
+        }
+        let raw: Vec<(String,)> =
+            sqlx::query_as("SELECT amount FROM sale_payments WHERE receipt_id = ?")
+                .bind(receipt_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let raw_sum: Decimal = raw
+            .iter()
+            .map(|(amount,)| Decimal::from_str(amount).unwrap())
+            .sum();
+        assert_eq!(raw_sum, dec(&receipt["total"]));
+
+        // The sale still shows the receipt-linked payment, and the money
+        // invariant holds for the whole database built by the flow.
+        let detail = sale_detail(&app, sale).await;
+        assert_eq!(detail["payments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            detail["payments"][0]["receipt_id"].as_i64(),
+            Some(receipt_id)
+        );
+        assert_eq!(dec(&detail["due"]), Decimal::from(45));
+        assert_payment_links_are_traceable(&pool).await;
+
+        // The statement page renders the collected customer and the new balance.
+        let (status, html) = get(&app, &format!("/customers/{customer}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Collect Buyer"), "{html:.400}");
+        assert!(html.contains("45"), "the page shows the derived balance: {html:.400}");
+    }
 
 #[tokio::test]
 async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
