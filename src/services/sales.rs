@@ -29,7 +29,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     format_sale_number, Ageing, Customer, CustomerAgeing, CustomerStatement, MovementReason,
     MovementType, NewMovement, NewSale, PaymentStatus, PaymentType, ProductKind, Sale,
-    SaleDetail, SaleLine, SalePayment, StatementEntry, StatementEntryKind, UpdateSaleDraft,
+    SaleDetail, SaleLine, SaleLineView, SalePayment, SalePaymentView, SaleRecord,
+    StatementEntry, StatementEntryKind, UpdateSaleDraft,
 };
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, CustomerRepository,
@@ -405,6 +406,73 @@ where
             .await?
             .ok_or_else(|| AppError::NotFound(format!("sale {sale_id} not found")))?;
         self.detail_for(sale).await
+    }
+
+    /// Record-page view for `/sales/{id}`: resolves product, account and method
+    /// names through the existing inventory and finance read paths, so the
+    /// route never runs SQL of its own and never prints an internal key.
+    pub async fn get_record(&self, sale_id: i64) -> AppResult<SaleRecord> {
+        let detail = self.get_detail(sale_id).await?;
+        self.record_from_detail(detail).await
+    }
+
+    async fn record_from_detail(&self, detail: SaleDetail) -> AppResult<SaleRecord> {
+        let mut lines = Vec::with_capacity(detail.lines.len());
+        for line in detail.lines {
+            let product = self.inventory.get_product(line.product_id).await?;
+            lines.push(SaleLineView {
+                id: line.id,
+                product_name: product.name,
+                product_sku: product.sku,
+                qty: line.qty,
+                unit_price: line.unit_price,
+                subtotal: line.subtotal(),
+            });
+        }
+
+        let account_names: BTreeMap<i64, String> = self
+            .transactions
+            .accounts
+            .list()
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.name))
+            .collect();
+        let method_names: BTreeMap<i64, String> = self
+            .payment_methods
+            .list_methods()
+            .await?
+            .into_iter()
+            .map(|method| (method.id, method.name))
+            .collect();
+
+        let payments = detail
+            .payments
+            .into_iter()
+            .map(|payment| SalePaymentView {
+                id: payment.id,
+                account_name: account_names
+                    .get(&payment.account_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown account".to_string()),
+                method_name: method_names
+                    .get(&payment.method_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown method".to_string()),
+                amount: payment.amount,
+                date: payment.date,
+            })
+            .collect();
+
+        Ok(SaleRecord {
+            sale: detail.sale,
+            lines,
+            payments,
+            total: detail.total,
+            paid: detail.paid,
+            due: detail.due,
+            payment_status: detail.payment_status,
+        })
     }
 
     // -- Lists (route support, Slice D) ------------------------------------------
@@ -1414,6 +1482,59 @@ mod tests {
         assert_eq!(detail.payment_status, PaymentStatus::Unpaid);
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
         assert_eq!(tx_count(&pool).await, 0);
+    }
+
+    /// N2: the record view resolves product, account and method names through
+    /// the service read paths, so the route never runs SQL or renders an
+    /// internal key. A draft with no payments still resolves its lines.
+    #[tokio::test]
+    async fn record_view_resolves_product_account_and_method_names() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "REC-NAME", "20").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-record").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "2",
+        )
+        .await;
+        s.confirm(sale.id, None, None).await.unwrap();
+        s.record_payment(sale.id, acc.id, cash, dec("10"), sale_date())
+            .await
+            .unwrap();
+
+        let record = s.get_record(sale.id).await.unwrap();
+        assert_eq!(record.lines.len(), 1);
+        assert_eq!(record.lines[0].product_name, prod.name);
+        assert_eq!(record.lines[0].product_sku, prod.sku);
+        assert_eq!(record.lines[0].subtotal, dec("40"));
+        assert_eq!(record.payments.len(), 1);
+        assert_eq!(record.payments[0].account_name, acc.name);
+        assert_eq!(record.payments[0].method_name, "Cash");
+        assert_eq!(record.total, dec("40"));
+        assert_eq!(record.paid, dec("10"));
+        assert_eq!(record.due, dec("30"));
+        assert_eq!(record.payment_status, PaymentStatus::Partial);
+
+        let draft = draft_with_line(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "1",
+        )
+        .await;
+        let draft_record = s.get_record(draft.id).await.unwrap();
+        assert!(draft_record.payments.is_empty());
+        assert_eq!(draft_record.lines[0].product_name, prod.name);
+        assert_eq!(draft_record.lines[0].product_sku, prod.sku);
     }
 
     // -- AC4: Credit payments ---------------------------------------------------

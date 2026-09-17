@@ -398,7 +398,8 @@ struct RenderedTarget {
     method: String,
     target: String,
     /// The attribute sits on a `<form>` (shell wiring) instead of a data-bound
-    /// row/link. On typed-id pages a form target must never hardcode an id.
+    /// row/link. Where `concrete_ids_are_defects` is set, a form target must
+    /// never hardcode an id.
     form_bound: bool,
 }
 
@@ -754,15 +755,16 @@ fn extract_script_targets(html: &str) -> Result<Vec<RenderedTarget>, String> {
 /// URL-encoded `%7B`. A `:` is a placeholder marker only in the path, so
 /// date/time query values (`?from=2024-05-01T00:00`) stay legitimate.
 ///
-/// On typed-id pages a concrete numeric segment means the template hardcoded
-/// an id. A final numeric segment is a data-bound record link (the list View
-/// buttons) and stays valid; anything else, or any form-bound target, is
-/// rejected.
+/// When `concrete_ids_are_defects` is set, a concrete numeric segment means
+/// the template hardcoded an id: that page's URL carries no id and its forms
+/// have no data-bound ids. A final numeric segment on a non-form target is a
+/// data-bound record link and stays valid; anything else, or any form-bound
+/// target, is rejected.
 fn check_target_shape(
     page: &str,
     attr: &str,
     target: &str,
-    typed_id_page: bool,
+    concrete_ids_are_defects: bool,
     form_bound: bool,
 ) -> Result<(), String> {
     if target.split('/').any(|segment| segment == "0") {
@@ -785,13 +787,13 @@ fn check_target_shape(
             "{page}: {attr}=\"{target}\" still contains a template placeholder marker"
         ));
     }
-    if typed_id_page {
+    if concrete_ids_are_defects {
         let segments = path_segments(target);
         let last = segments.len().saturating_sub(1);
         for (index, segment) in segments.iter().enumerate() {
             if segment.parse::<i64>().is_ok() && (form_bound || index != last) {
                 return Err(format!(
-                    "{page}: {attr}=\"{target}\" hardcodes a concrete id segment on a typed-id page; the id must come from the form input"
+                    "{page}: {attr}=\"{target}\" hardcodes a concrete id segment on a page whose URL carries no id; the id must come from the URL or a data-bound link"
                 ));
             }
         }
@@ -801,7 +803,11 @@ fn check_target_shape(
 
 /// Native form wiring: a `this.action` rewrite is dead under htmx, and native
 /// actions are shape-checked like any other target.
-fn check_native_form(page: &str, form: &RenderedForm, typed_id_page: bool) -> Result<(), String> {
+fn check_native_form(
+    page: &str,
+    form: &RenderedForm,
+    concrete_ids_are_defects: bool,
+) -> Result<(), String> {
     if let Some(onsubmit) = &form.onsubmit {
         if onsubmit.replace(' ', "").contains("this.action=") {
             return Err(format!(
@@ -811,33 +817,35 @@ fn check_native_form(page: &str, form: &RenderedForm, typed_id_page: bool) -> Re
     }
     if let Some(action) = &form.action {
         if !action.is_empty() && action != "#" {
-            check_target_shape(page, "form action", action, typed_id_page, true)?;
+            check_target_shape(page, "form action", action, concrete_ids_are_defects, true)?;
         }
     }
     Ok(())
 }
 
 /// Shape-only guard over a rendered page: pure, so mutation tests can assert
-/// the exact rejection without building an app.
+/// the exact rejection without building an app. `concrete_ids_are_defects`
+/// applies the id-free rule to pages whose URL carries no id and whose forms
+/// have no data-bound ids.
 fn check_rendered_wiring_shape(
     page: &str,
     html: &str,
-    typed_id_page: bool,
+    concrete_ids_are_defects: bool,
 ) -> Result<(), String> {
     for target in extract_htmx_targets(html) {
         check_target_shape(
             page,
             &target.attr,
             &target.target,
-            typed_id_page,
+            concrete_ids_are_defects,
             target.form_bound,
         )?;
     }
     for target in extract_script_targets(html).map_err(|e| format!("{page}: {e}"))? {
-        check_target_shape(page, &target.attr, &target.target, typed_id_page, false)?;
+        check_target_shape(page, &target.attr, &target.target, concrete_ids_are_defects, false)?;
     }
     for form in extract_rendered_forms(html) {
-        check_native_form(page, &form, typed_id_page)?;
+        check_native_form(page, &form, concrete_ids_are_defects)?;
     }
     Ok(())
 }
@@ -882,7 +890,7 @@ async fn assert_htmx_targets_are_wired(
     probe_app: &Router,
     page: &str,
     html: &str,
-    typed_id_page: bool,
+    concrete_ids_are_defects: bool,
 ) -> Result<(), String> {
     let (status, body) = send(
         probe_app,
@@ -916,7 +924,7 @@ async fn assert_htmx_targets_are_wired(
             page,
             &target.attr,
             &target.target,
-            typed_id_page,
+            concrete_ids_are_defects,
             target.form_bound,
         )?;
         probe_or_fail(
@@ -930,7 +938,7 @@ async fn assert_htmx_targets_are_wired(
     }
 
     for target in extract_script_targets(html).map_err(|e| format!("{page}: {e}"))? {
-        check_target_shape(page, &target.attr, &target.target, typed_id_page, false)?;
+        check_target_shape(page, &target.attr, &target.target, concrete_ids_are_defects, false)?;
         probe_or_fail(
             probe_app,
             page,
@@ -942,7 +950,7 @@ async fn assert_htmx_targets_are_wired(
     }
 
     for form in extract_rendered_forms(html) {
-        check_native_form(page, &form, typed_id_page)?;
+        check_native_form(page, &form, concrete_ids_are_defects)?;
         if let Some(action) = &form.action {
             if !action.is_empty() && action != "#" {
                 probe_or_fail(probe_app, page, "form action", &form.method, action).await?;
@@ -1041,21 +1049,15 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     }
 }
 
-#[tokio::test]
-async fn seeded_pages_render_only_wired_htmx_targets() {
-    let (app, pool) = test_app().await;
-    let fixture = seed_wiring_fixture(&app, &pool).await;
-
-    // Real-verb probes run real handlers (a deactivate target really
-    // deactivates), so probe a dedicated freshly seeded app: incidental effects
-    // must never corrupt the render assertions or the other flows.
-    let (probe_app, probe_pool) = test_app().await;
-    let _probe_fixture = seed_wiring_fixture(&probe_app, &probe_pool).await;
-
-    // Typed-id shells (`/`, `/sales`, `/purchases`) must not hardcode ids in
-    // their form targets; record-bound pages and detail fragments may carry the
-    // ids they render data for.
-    let pages = [
+/// The seeded pages the wiring guard renders, each with the rule its own URLs
+/// must satisfy: `concrete_ids_are_defects` is true exactly for a page whose
+/// URL carries no id and whose forms have no data-bound ids, where a concrete
+/// numeric id in a form-bound target would be a defect. Record pages and detail
+/// fragments carry the ids they render data for, so there it is legitimate.
+/// Both the guard and the mutation pin test read this list, so a page's rule is
+/// declared once and cannot be relaxed in passing.
+fn guarded_pages(fixture: &WiringFixture) -> Vec<(&'static str, String, bool)> {
+    vec![
         ("dashboard", "/".to_string(), true),
         (
             "account detail",
@@ -1071,6 +1073,11 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
         // targets (View buttons, inline line editors), so guard the seeded
         // details too.
         (
+            "sale record page",
+            format!("/sales/{}", fixture.sale),
+            false,
+        ),
+        (
             "sale detail fragment",
             format!("/web/sales/{}", fixture.sale),
             false,
@@ -1085,11 +1092,24 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
             format!("/customers/{}", fixture.customer),
             false,
         ),
-    ];
-    for (label, path, typed_id_page) in pages {
+    ]
+}
+
+#[tokio::test]
+async fn seeded_pages_render_only_wired_htmx_targets() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+
+    // Real-verb probes run real handlers (a deactivate target really
+    // deactivates), so probe a dedicated freshly seeded app: incidental effects
+    // must never corrupt the render assertions or the other flows.
+    let (probe_app, probe_pool) = test_app().await;
+    let _probe_fixture = seed_wiring_fixture(&probe_app, &probe_pool).await;
+
+    for (label, path, concrete_ids_are_defects) in guarded_pages(&fixture) {
         let (status, html) = get(&app, &path).await;
         assert_eq!(status, StatusCode::OK, "{label} {path}: {html:.400}");
-        assert_htmx_targets_are_wired(&probe_app, label, &html, typed_id_page)
+        assert_htmx_targets_are_wired(&probe_app, label, &html, concrete_ids_are_defects)
             .await
             .unwrap_or_else(|err| panic!("{err}"));
     }
@@ -2111,15 +2131,15 @@ async fn check_refund_transaction(
 // fails loudly if the guard regresses to accepting it.
 // ---------------------------------------------------------------------------
 
-fn typed_shell_shape(html: &str) -> Result<(), String> {
+fn id_free_page_shape(html: &str) -> Result<(), String> {
     check_rendered_wiring_shape("mutation", html, true)
 }
 
-/// Blind spot 1: a hardcoded non-zero id on a typed-id shell used to pass
+/// Blind spot 1: a hardcoded non-zero id on an id-free page used to pass
 /// because only the literal `0` segment was rejected.
 #[test]
-fn wiring_guard_catches_hardcoded_numeric_id_on_typed_page() {
-    let err = typed_shell_shape(
+fn wiring_guard_catches_hardcoded_numeric_id_on_id_free_page() {
+    let err = id_free_page_shape(
         r#"<form hx-post="/web/sales/1/confirm"><input name="sale_id"></form>"#,
     )
     .unwrap_err();
@@ -2127,11 +2147,11 @@ fn wiring_guard_catches_hardcoded_numeric_id_on_typed_page() {
     assert!(err.contains("hardcodes a concrete id segment"), "{err}");
 
     // A final numeric segment is also a hardcoded id when the wiring is a form...
-    let err = typed_shell_shape(r#"<form hx-post="/web/sales/7"></form>"#).unwrap_err();
+    let err = id_free_page_shape(r#"<form hx-post="/web/sales/7"></form>"#).unwrap_err();
     assert!(err.contains("hardcodes a concrete id segment"), "{err}");
 
     // ...while a data-bound record link (bare button, final segment) is fine.
-    typed_shell_shape(r#"<button hx-get="/web/sales/7">View</button>"#).unwrap();
+    id_free_page_shape(r#"<button hx-get="/web/sales/7">View</button>"#).unwrap();
 
     // Record-bound detail fragments may target the record they render for.
     check_rendered_wiring_shape(
@@ -2142,15 +2162,60 @@ fn wiring_guard_catches_hardcoded_numeric_id_on_typed_page() {
     .unwrap();
 }
 
+/// The verifier's mutation, pinned: adding a form with a hardcoded id to the
+/// sales list must fail the guard. The only thing standing between that
+/// mutation and a green run is the rule the page list carries for "sales", and
+/// this test reads it from the same list the guard uses, so relaxing it again
+/// makes this test fail before the mutation can ship.
+#[tokio::test]
+async fn wiring_guard_rejects_a_hardcoded_id_form_added_to_the_sales_list() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+
+    let (_, sales_path, concrete_ids_are_defects) = guarded_pages(&fixture)
+        .into_iter()
+        .find(|(label, _, _)| *label == "sales")
+        .expect("the sales list must be declared in the guarded page list");
+    let (status, html) = get(&app, &sales_path).await;
+    assert_eq!(status, StatusCode::OK, "{sales_path}: {html:.400}");
+
+    // Exactly the verifier's mutation: one extra form with a concrete id.
+    let mutant = format!(
+        "{html}<form hx-post=\"/web/sales/1/lines\"><input name=\"qty\" value=\"1\" /></form>"
+    );
+    let err =
+        check_rendered_wiring_shape("sales list (mutated)", &mutant, concrete_ids_are_defects)
+            .unwrap_err();
+    assert!(
+        err.contains("hardcodes a concrete id segment"),
+        "the guard must reject a hardcoded id on the sales list: {err}"
+    );
+
+    // The mirror: on the record page a concrete id is legitimate — the URL
+    // carries the record id and the line ids are data-bound.
+    let (_, record_path, record_ids_are_defects) = guarded_pages(&fixture)
+        .into_iter()
+        .find(|(label, _, _)| *label == "sale record page")
+        .expect("the sale record page must be declared in the guarded page list");
+    assert!(
+        !record_ids_are_defects,
+        "the record page carries the ids it renders and must stay out of the rule"
+    );
+    let (status, record_html) = get(&app, &record_path).await;
+    assert_eq!(status, StatusCode::OK, "{record_path}: {record_html:.400}");
+    check_rendered_wiring_shape("sale record page", &record_html, record_ids_are_defects)
+        .unwrap_or_else(|err| panic!("concrete ids must stay legitimate on the record page: {err}"));
+}
+
 /// Blind spot 5: a colon in the query string is not a template placeholder.
 #[test]
 fn wiring_guard_allows_datetime_query_colons_but_rejects_path_colon() {
-    typed_shell_shape(
+    id_free_page_shape(
         r#"<input hx-get="/web/transactions?from=2024-05-01T00:00&to=2024-05-02T23:59" />"#,
     )
     .unwrap();
 
-    let err = typed_shell_shape(r#"<button hx-get="/web/sales/:id"></button>"#).unwrap_err();
+    let err = id_free_page_shape(r#"<button hx-get="/web/sales/:id"></button>"#).unwrap_err();
     eprintln!("path colon rejected: {err}");
     assert!(err.contains("placeholder marker"), "{err}");
 }
@@ -2760,6 +2825,11 @@ async fn sidebar_marks_the_active_entry_from_the_server_on_every_page() {
             "customer statement",
             format!("/customers/{}", fixture.customer),
             "customers",
+        ),
+        (
+            "sale record page",
+            format!("/sales/{}", fixture.sale),
+            "sales",
         ),
     ];
     for (label, path, expected) in pages {

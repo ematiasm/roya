@@ -508,15 +508,19 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /sales` — sales:
 
-- Sale list with status/debt badges (HTMX `GET /web/sales`)
-- Sale detail with lines + payments (HTMX `GET /web/sales/:id`, line delete via `hx-delete` in Draft)
+- Sale list with status/debt badges; each row links to its record (HTMX `GET /web/sales`)
+- `/sales/:id` — record page with the header (status, number or draft state, customer,
+  dates, totals, payment status), the lines table with product name and SKU, and the
+  payments table with account and method names; an unknown id is a 404
 - Outstanding debt — Confirmed sales with due > 0 (HTMX `GET /web/sales/debt`)
-- Forms:
-  - New sale Draft: `POST /web/sales` (HTMX)
-  - Add line: `POST /web/sales/:id/lines` (HTMX)
+- Actions, gated by status and offered in context on the record page:
+  - New sale Draft: `POST /web/sales` (HTMX, answers `HX-Redirect` to the new record)
+  - Add line (Draft): `POST /web/sales/:id/lines` (HTMX)
+  - Edit header (Draft): `POST /web/sales/:id/header` (HTMX)
   - Confirm: `POST /web/sales/:id/confirm` (HTMX)
-  - Record payment: `POST /web/sales/:id/payments` (HTMX)
-  - Cancel: `POST /web/sales/:id/cancel` (HTMX)
+  - Record payment (Confirmed, Credit): `POST /web/sales/:id/payments` (HTMX)
+  - Cancel (Confirmed) / discard (Draft): `POST /web/sales/:id/cancel` (HTMX,
+    `hx-confirm` asks first)
 
 `GET /customers` — customers (M4):
 

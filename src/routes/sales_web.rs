@@ -1,14 +1,13 @@
-// Slice D: sales web `/sales` Askama + HTMX (T7), parity with products page.
-// Thin handlers over SalesService; fragments in partials/sale_*.html.
-// Typed-id actions (add line, confirm, pay, cancel) post to collection web
-// endpoints with the sale id in the form body, because HTMX cannot interpolate
-// a path from an input value; the `/web/sales/{id}/...` paths stay for existing
-// callers.
+// Sales web: the `/sales` list and the `/sales/{id}` record page, Askama + HTMX.
+// Thin handlers over SalesService; the record body lives in
+// partials/sale_detail.html and every action posts to `/web/sales/{id}/...`,
+// so the id always comes from the URL. The old collection endpoints (id in the
+// form body) stay registered for existing callers.
 use askama::Template;
 use axum::{
     extract::{Form, Path, State},
-    http::HeaderMap,
-    response::{Html, IntoResponse, Redirect},
+    http::{HeaderMap, StatusCode},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
@@ -18,7 +17,7 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{PaymentType, SaleDetail};
+use crate::models::{PaymentType, SaleDetail, SaleRecord, SaleStatus, UpdateSaleDraft};
 use crate::repositories::ProductRepository;
 use crate::routes::AppState;
 
@@ -32,12 +31,29 @@ struct SalesTemplate {
     title: String,
     sales: Vec<SaleDetail>,
     debt: Vec<SaleDetail>,
-    products: Vec<crate::models::Product>,
-    accounts: Vec<crate::models::AccountWithBalance>,
-    methods: Vec<crate::models::PaymentMethod>,
     customers: Vec<crate::models::Customer>,
     allow_negative: bool,
     allow_negative_stock: bool,
+    today: String,
+    nav_key: &'static str,
+}
+
+/// The `/sales/{id}` record page. The page-header values are struct fields, so
+/// the shared component and the record body read them straight from the shell.
+#[derive(Template)]
+#[template(path = "sale.html")]
+struct SalePageTemplate {
+    /// Sale number, or "Draft sale" before confirmation.
+    page_title: String,
+    page_breadcrumb_label: String,
+    page_breadcrumb_href: String,
+    /// Empty label = no primary action (a cancelled sale is read-only).
+    page_action_href: String,
+    page_action_label: String,
+    record: SaleRecord,
+    products: Vec<crate::models::Product>,
+    accounts: Vec<crate::models::AccountWithBalance>,
+    methods: Vec<crate::models::PaymentMethod>,
     today: String,
     nav_key: &'static str,
 }
@@ -49,10 +65,16 @@ struct SaleListPartial {
     sales: Vec<SaleDetail>,
 }
 
+/// The record body, shared by the page and by every action response that swaps
+/// `#sale-record`, so the action forms travel with the fragment either way.
 #[derive(Template)]
 #[template(path = "partials/sale_detail.html")]
 struct SaleDetailPartial {
-    detail: SaleDetail,
+    record: SaleRecord,
+    products: Vec<crate::models::Product>,
+    accounts: Vec<crate::models::AccountWithBalance>,
+    methods: Vec<crate::models::PaymentMethod>,
+    today: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +113,18 @@ fn parse_opt_i64(s: &str, field: &str) -> AppResult<Option<i64>> {
         .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
+/// Empty means "not provided", which for the header edit clears the value and
+/// lets the service resolve defaults (for example a credit due date).
+fn parse_opt_date_field(s: &str, field: &str) -> AppResult<Option<NaiveDate>> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    t.parse()
+        .map(Some)
+        .map_err(|_| AppError::Validation(format!("invalid {field} (YYYY-MM-DD)")))
+}
+
 fn parse_date_or_today(s: &str) -> AppResult<NaiveDate> {
     let t = s.trim();
     if t.is_empty() {
@@ -110,15 +144,49 @@ fn render_list(sales: Vec<SaleDetail>, title: &str) -> AppResult<Html<String>> {
     Ok(Html(html))
 }
 
-fn render_detail(detail: SaleDetail) -> AppResult<Html<String>> {
-    let html = SaleDetailPartial { detail }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+/// Everything the record body renders: the resolved record plus the option
+/// lists its action forms need (the product picker stays a plain selector until
+/// slice N3).
+struct SaleRecordContext {
+    record: SaleRecord,
+    products: Vec<crate::models::Product>,
+    accounts: Vec<crate::models::AccountWithBalance>,
+    methods: Vec<crate::models::PaymentMethod>,
+    today: String,
+}
+
+async fn record_context(state: &AppState, sale_id: i64) -> AppResult<SaleRecordContext> {
+    let record = state.sales_service.get_record(sale_id).await?;
+    let products = state.inventory_service.products.list().await?;
+    let accounts = state.account_service.list_with_balances().await?;
+    let methods = state.payment_method_service.list().await?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    Ok(SaleRecordContext {
+        record,
+        products,
+        accounts,
+        methods,
+        today,
+    })
+}
+
+fn render_record(context: SaleRecordContext) -> AppResult<Html<String>> {
+    let html = SaleDetailPartial {
+        record: context.record,
+        products: context.products,
+        accounts: context.accounts,
+        methods: context.methods,
+        today: context.today,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
-fn changed(detail: SaleDetail) -> AppResult<axum::response::Response> {
-    let html = render_detail(detail)?.0;
+/// Record-body response that keeps the cross-region `sale-changed` refresh
+/// event, so subscribed list and debt regions update after an action.
+async fn changed(state: &AppState, sale_id: i64) -> AppResult<Response> {
+    let html = render_record(record_context(state, sale_id).await?)?.0;
     let mut resp = Html(html).into_response();
     resp.headers_mut()
         .insert("HX-Trigger", "sale-changed".parse().unwrap());
@@ -132,18 +200,12 @@ fn changed(detail: SaleDetail) -> AppResult<axum::response::Response> {
 async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let sales = state.sales_service.list_details().await?;
     let debt = state.sales_service.outstanding_debt().await?;
-    let products = state.inventory_service.products.list().await?;
-    let accounts = state.account_service.list_with_balances().await?;
-    let methods = state.payment_method_service.list().await?;
     let customers = state.customer_service.list_customers(true).await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = SalesTemplate {
         title: "All sales".to_string(),
         sales,
         debt,
-        products,
-        accounts,
-        methods,
         customers,
         allow_negative: state.allow_negative,
         allow_negative_stock: state.allow_negative_stock,
@@ -165,12 +227,49 @@ async fn web_sale_debt(State(state): State<AppState>) -> Result<Html<String>, Ap
     render_list(debt, "Outstanding debt")
 }
 
+/// `/sales/{id}`: a real page inside the shell. The label is the sale number or
+/// its draft state, and the single header action slot mirrors the status.
+async fn sale_record_page(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Html<String>, AppError> {
+    let context = record_context(&state, id).await?;
+    let label = match &context.record.sale.sale_number {
+        Some(number) => number.clone(),
+        None => "Draft sale".to_string(),
+    };
+    let (action_href, action_label) = if context.record.sale.status == SaleStatus::Draft {
+        ("#add-line".to_string(), "Add line".to_string())
+    } else if context.record.sale.status == SaleStatus::Confirmed
+        && context.record.sale.payment_type == PaymentType::Credit
+    {
+        ("#record-payment".to_string(), "Record payment".to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    let tmpl = SalePageTemplate {
+        page_title: label,
+        page_breadcrumb_label: "Sales".to_string(),
+        page_breadcrumb_href: "/sales".to_string(),
+        page_action_href: action_href,
+        page_action_label: action_label,
+        record: context.record,
+        products: context.products,
+        accounts: context.accounts,
+        methods: context.methods,
+        today: context.today,
+        nav_key: "sales",
+    };
+    Ok(Html(
+        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+    ))
+}
+
 async fn web_sale_detail(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
-    let detail = state.sales_service.get_detail(id).await?;
-    render_detail(detail)
+    render_record(record_context(&state, id).await?)
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +341,18 @@ pub struct CancelSaleForm {
     pub reason: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct UpdateSaleHeaderForm {
+    #[serde(default)]
+    pub sale_date: String,
+    #[serde(default)]
+    pub due_date: String,
+    #[serde(default)]
+    pub receipt_no: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
 async fn web_create_sale(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -267,7 +378,7 @@ async fn web_create_sale(
     let customer_id = form
         .customer_id
         .ok_or_else(|| AppError::Validation("customer is required".into()))?;
-    let _sale = state
+    let sale = state
         .sales_service
         .create_draft(crate::models::NewSale {
             customer_id,
@@ -278,15 +389,17 @@ async fn web_create_sale(
             notes: Some(form.notes),
         })
         .await?;
+    let location = format!("/sales/{}", sale.id);
     if is_htmx(&headers) {
-        let sales = state.sales_service.list_details().await?;
-        let html = render_list(sales, "All sales")?.0;
-        let mut resp = Html(html).into_response();
-        resp.headers_mut()
-            .insert("HX-Trigger", "sale-created".parse().unwrap());
-        return Ok(resp);
+        // AC4: htmx performs a real navigation to the new record, so an id is
+        // never typed and the back button keeps working.
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("HX-Redirect", location)
+            .body(axum::body::Body::empty())
+            .map_err(|e| AppError::Internal(e.to_string()));
     }
-    Ok(Redirect::to("/sales").into_response())
+    Ok(Redirect::to(&location).into_response())
 }
 
 async fn web_add_line(
@@ -302,10 +415,9 @@ async fn web_add_line(
         .add_line(id, form.product_id, qty, unit_price)
         .await?;
     if is_htmx(&headers) {
-        let detail = state.sales_service.get_detail(id).await?;
-        return changed(detail);
+        return changed(&state, id).await;
     }
-    Ok(Redirect::to("/sales").into_response())
+    Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
 
 async fn web_update_line(
@@ -321,10 +433,9 @@ async fn web_update_line(
         .update_line(line_id, qty, unit_price)
         .await?;
     if is_htmx(&headers) {
-        let detail = state.sales_service.get_detail(sale_id).await?;
-        return changed(detail);
+        return changed(&state, sale_id).await;
     }
-    Ok(Redirect::to("/sales").into_response())
+    Ok(Redirect::to(&format!("/sales/{sale_id}")).into_response())
 }
 
 async fn web_remove_line(
@@ -332,8 +443,7 @@ async fn web_remove_line(
     Path((sale_id, line_id)): Path<(i64, i64)>,
 ) -> Result<axum::response::Response, AppError> {
     state.sales_service.remove_line(line_id).await?;
-    let detail = state.sales_service.get_detail(sale_id).await?;
-    changed(detail)
+    changed(&state, sale_id).await
 }
 
 async fn web_confirm_sale(
@@ -344,14 +454,14 @@ async fn web_confirm_sale(
 ) -> Result<axum::response::Response, AppError> {
     let account_id = parse_opt_i64(&form.account_id, "account_id")?;
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
-    let detail = state
+    state
         .sales_service
         .confirm(id, account_id, method_id)
         .await?;
     if is_htmx(&headers) {
-        return changed(detail);
+        return changed(&state, id).await;
     }
-    Ok(Redirect::to("/sales").into_response())
+    Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
 
 async fn web_record_payment(
@@ -367,10 +477,9 @@ async fn web_record_payment(
         .record_payment(id, form.account_id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
-        let detail = state.sales_service.get_detail(id).await?;
-        return changed(detail);
+        return changed(&state, id).await;
     }
-    Ok(Redirect::to("/sales").into_response())
+    Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
 
 async fn web_cancel_sale(
@@ -384,11 +493,44 @@ async fn web_cancel_sale(
     } else {
         Some(form.reason.trim().to_string())
     };
-    let detail = state.sales_service.cancel(id, reason).await?;
+    state.sales_service.cancel(id, reason).await?;
     if is_htmx(&headers) {
-        return changed(detail);
+        return changed(&state, id).await;
     }
-    Ok(Redirect::to("/sales").into_response())
+    Ok(Redirect::to(&format!("/sales/{id}")).into_response())
+}
+
+/// Edit the draft header in place (dates, receipt, notes); the customer and the
+/// payment type stay fixed at creation, as the service enforces.
+async fn web_update_sale_header(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<UpdateSaleHeaderForm>,
+) -> Result<axum::response::Response, AppError> {
+    let sale_date = parse_opt_date_field(&form.sale_date, "sale_date")?;
+    let due_date = parse_opt_date_field(&form.due_date, "due_date")?;
+    let receipt_no = if form.receipt_no.trim().is_empty() {
+        None
+    } else {
+        Some(form.receipt_no.trim().to_string())
+    };
+    state
+        .sales_service
+        .update_draft(
+            id,
+            UpdateSaleDraft {
+                sale_date,
+                due_date: Some(due_date),
+                receipt_no: Some(receipt_no),
+                notes: Some(form.notes),
+            },
+        )
+        .await?;
+    if is_htmx(&headers) {
+        return changed(&state, id).await;
+    }
+    Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -436,6 +578,7 @@ async fn web_cancel_sale_collection(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/sales", get(sales_page))
+        .route("/sales/{id}", get(sale_record_page))
         .route("/web/sales", get(web_sale_list).post(web_create_sale))
         .route("/web/sales/debt", get(web_sale_debt))
         .route("/web/sales/lines", post(web_add_line_collection))
@@ -448,6 +591,7 @@ pub fn router() -> Router<AppState> {
             "/web/sales/{sale_id}/lines/{line_id}",
             post(web_update_line).delete(web_remove_line),
         )
+        .route("/web/sales/{id}/header", post(web_update_sale_header))
         .route("/web/sales/{id}/confirm", post(web_confirm_sale))
         .route("/web/sales/{id}/payments", post(web_record_payment))
         .route("/web/sales/{id}/cancel", post(web_cancel_sale))
@@ -463,6 +607,7 @@ mod tests {
     use std::str::FromStr;
     use tower::ServiceExt;
 
+    use crate::models::PaymentType;
     use crate::routes::AppState;
 
     async fn test_state() -> AppState {
@@ -558,67 +703,412 @@ mod tests {
         );
     }
 
-    /// Regression: the typed-id forms used `hx-post="/web/sales/0/..."` plus a
-    /// dead `onsubmit` action rewrite. HTMX ignores the form `.action`, so every
-    /// typed-id form posted to sale 0 and the server answered 404. Pin the
-    /// rendered page to the collection endpoints and prove each target resolves.
+    // -- N2: the sale record page ---------------------------------------------
+
+    /// Everything a record-page test needs to address the seeded document.
+    struct RecordFixture {
+        sale_id: i64,
+        line_id: i64,
+        product_name: String,
+        product_sku: String,
+        account_id: i64,
+        method_id: i64,
+        account_name: String,
+        method_name: String,
+    }
+
+    /// One draft sale with one line, plus an account configured with Cash, so a
+    /// record-page test can drive draft, confirmed, paid and cancelled states.
+    async fn seed_record_fixture(state: &AppState, payment_type: PaymentType) -> RecordFixture {
+        use crate::models::{NewProduct, NewSale, ProductKind};
+        use chrono::NaiveDate;
+        use rust_decimal::Decimal;
+
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "REC-P1".into(),
+                name: "Record product".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(10),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let customer = seed_customer(state, "Record Buyer").await;
+        let sale = state
+            .sales_service
+            .create_draft(NewSale {
+                customer_id: customer.id,
+                payment_type,
+                sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                due_date: match payment_type {
+                    PaymentType::Credit => {
+                        Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap())
+                    }
+                    PaymentType::Cash => None,
+                },
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let line = state
+            .sales_service
+            .add_line(sale.id, product.id, Decimal::from(2), None)
+            .await
+            .unwrap();
+        let account = state.account_service.create("Caja").await.unwrap();
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(account.id, "Caja")
+            .await
+            .unwrap();
+        let method = state
+            .payment_method_service
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash")
+            .expect("Cash is seeded by migrations");
+
+        RecordFixture {
+            sale_id: sale.id,
+            line_id: line.id,
+            product_name: product.name,
+            product_sku: product.sku,
+            account_id: account.id,
+            method_id: method.id,
+            account_name: account.name,
+            method_name: method.name,
+        }
+    }
+
+    /// The opening tag that carries `needle`, for attribute assertions such as
+    /// `hx-confirm` on the cancel control.
+    fn element_tag_containing<'a>(html: &'a str, needle: &str) -> &'a str {
+        let pos = html
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not rendered: {html:.600}"));
+        let start = html[..pos]
+            .rfind('<')
+            .expect("the attribute must sit inside a tag");
+        let end = pos + html[pos..].find('>').expect("unterminated tag");
+        &html[start..=end]
+    }
+
+    /// A row's rendered HTML, sliced from its `id` to the closing `</tr>`.
+    fn row_with_id<'a>(html: &'a str, id: &str) -> &'a str {
+        let start = html
+            .find(&format!("id=\"{id}\""))
+            .unwrap_or_else(|| panic!("row {id} not rendered: {html:.600}"));
+        let after = &html[start..];
+        let end = after
+            .find("</tr>")
+            .unwrap_or_else(|| panic!("row {id} has no closing tag"));
+        &after[..end]
+    }
+
+    /// Regression: the typed-id forms are gone. The sales list renders no
+    /// `sale_id` input, drops the side-panel detail target and links every row
+    /// to its record page, so an id is never typed. (redesign-interface N2)
     #[tokio::test]
-    async fn web_sales_forms_target_registered_collection_routes() {
-        let app = crate::routes::router(test_state().await);
-        let (status, html) = get_html(app.clone(), "/sales").await;
+    async fn web_sales_page_has_no_typed_id_forms_and_links_records() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/sales").await;
         assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("name=\"sale_id\""),
+            "the sales list must not ask for a typed sale id: {html:.600}"
+        );
+        assert!(
+            !html.contains("id=\"sale-detail\""),
+            "the side-panel detail must be gone: {html:.600}"
+        );
+        assert!(
+            html.contains(&format!("href=\"/sales/{}\"", fixture.sale_id)),
+            "every row must link to its record: {html:.600}"
+        );
+    }
 
-        let mut targets = Vec::new();
-        let mut rest = html.as_str();
-        while let Some(start) = rest.find("hx-post=\"") {
-            let after = &rest[start + "hx-post=\"".len()..];
-            let end = after.find('"').expect("unterminated hx-post attribute");
-            targets.push(after[..end].to_string());
-            rest = &after[end..];
-        }
-        assert!(!targets.is_empty(), "page must render hx-post forms");
+    /// AC4: creating a sale answers `HX-Redirect` to its record, so htmx
+    /// performs a real navigation and no id is typed.
+    #[tokio::test]
+    async fn web_create_sale_redirects_to_the_record() {
+        let state = test_state().await;
+        let customer = seed_customer(&state, "Redirect Client").await;
+        let app = crate::routes::router(state.clone());
+        let body = format!(
+            "customer_id={}&payment_type=Cash&sale_date=2024-05-02",
+            customer.id
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/sales")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let redirect = resp
+            .headers()
+            .get("HX-Redirect")
+            .expect("AC4: the create response must carry HX-Redirect")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(redirect.starts_with("/sales/"), "{redirect}");
+        let sale_id: i64 = redirect["/sales/".len()..]
+            .parse()
+            .unwrap_or_else(|_| panic!("HX-Redirect must end in the sale id: {redirect}"));
+        let detail = state.sales_service.get_detail(sale_id).await.unwrap();
+        assert_eq!(detail.sale.customer_id, customer.id);
+    }
 
-        for target in &targets {
-            assert!(
-                !target.contains("/0/"),
-                "dead `/0/` placeholder target still rendered: {target}"
-            );
-        }
-        for expected in [
-            "/web/sales/lines",
-            "/web/sales/confirm",
-            "/web/sales/payments",
-            "/web/sales/cancel",
+    /// AC5 + name resolution: `/sales/{id}` is a real page inside the shell
+    /// carrying names, not ids, for its line and payments; an unknown id is 404
+    /// with the existing error shape.
+    #[tokio::test]
+    async fn web_sale_record_page_resolves_names_and_unknown_id_is_404() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        state
+            .sales_service
+            .confirm(fixture.sale_id, None, None)
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .record_payment(
+                fixture.sale_id,
+                fixture.account_id,
+                fixture.method_id,
+                Decimal::from(10),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+            )
+            .await
+            .unwrap();
+        let payment_id = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap()
+            .payments[0]
+            .id;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("data-page-header"), "record uses the page header");
+        assert!(
+            html.contains("data-nav=\"sales\"") && html.contains("aria-current=\"page\""),
+            "record page keeps the sales nav key"
+        );
+
+        let line_row = row_with_id(&html, &format!("sale-line-{}", fixture.line_id));
+        assert!(line_row.contains(&fixture.product_name), "{line_row}");
+        assert!(line_row.contains(&fixture.product_sku), "{line_row}");
+        assert!(!line_row.contains("product #"), "{line_row}");
+
+        let payment_row = row_with_id(&html, &format!("sale-payment-{payment_id}"));
+        assert!(payment_row.contains(&fixture.account_name), "{payment_row}");
+        assert!(payment_row.contains(&fixture.method_name), "{payment_row}");
+        assert!(!payment_row.contains("account #"), "{payment_row}");
+        assert!(!payment_row.contains("method #"), "{payment_row}");
+
+        let (status, body) = get_html(app, "/sales/999999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body.contains("sale 999999 not found"), "{body}");
+        assert!(!body.contains("route not found"), "{body}");
+    }
+
+    /// AC6: the actions offered match the document status. A draft can add a
+    /// line, edit its header, confirm and discard; a confirmed credit sale can
+    /// record payments and cancel but cannot edit lines or the header; a
+    /// cancelled sale is read-only and shows its reason.
+    #[tokio::test]
+    async fn web_sale_record_actions_are_status_gated() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+        let base = format!("/web/sales/{}", fixture.sale_id);
+
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        for target in [
+            format!("{base}/lines"),
+            format!("{base}/header"),
+            format!("{base}/confirm"),
+            format!("{base}/cancel"),
         ] {
             assert!(
-                targets.iter().any(|t| t == expected),
-                "rendered page must post to {expected}: {targets:?}"
+                html.contains(&target),
+                "a draft must offer {target}: {html:.400}"
             );
         }
         assert!(
-            !html.contains("this.action="),
-            "dead onsubmit action rewrite still rendered"
+            !html.contains(&format!("{base}/payments")),
+            "a draft must not offer payment recording"
         );
 
-        // Any request that does not resolve to a registered route hits this
-        // sentinel, so a teapot response is a routing miss (an empty-body POST
-        // to a real handler fails extraction or validation instead).
-        let app = app.fallback(|| async { StatusCode::IM_A_TEAPOT });
-        for target in &targets {
-            let req = Request::builder()
-                .method("POST")
-                .uri(target)
-                .header("content-type", "application/x-www-form-urlencoded")
-                .header("HX-Request", "true")
-                .body(Body::empty())
-                .unwrap();
-            let resp = app.clone().oneshot(req).await.unwrap();
-            assert_ne!(
-                resp.status(),
-                StatusCode::IM_A_TEAPOT,
-                "{target} does not resolve to a registered route"
+        state
+            .sales_service
+            .confirm(fixture.sale_id, None, None)
+            .await
+            .unwrap();
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(&format!("{base}/payments")),
+            "a confirmed credit sale must offer payment recording"
+        );
+        assert!(html.contains(&format!("{base}/cancel")));
+        assert!(
+            !html.contains(&format!("{base}/lines")),
+            "a confirmed sale must not edit lines"
+        );
+        assert!(
+            !html.contains(&format!("{base}/header")),
+            "a confirmed sale must not edit its header"
+        );
+
+        state
+            .sales_service
+            .cancel(fixture.sale_id, Some("customer return".to_string()))
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("customer return"),
+            "a cancelled sale must show its reason: {html:.400}"
+        );
+        for target in [
+            format!("{base}/lines"),
+            format!("{base}/header"),
+            format!("{base}/confirm"),
+            format!("{base}/payments"),
+            format!("{base}/cancel"),
+        ] {
+            assert!(
+                !html.contains(&target),
+                "a cancelled sale must be read-only, found {target}"
             );
         }
+    }
+
+    /// Triangulation for AC6: a confirmed Cash sale is settled at confirm, so it
+    /// offers cancel but no payment form, and its lines and header stay frozen.
+    #[tokio::test]
+    async fn web_sale_record_confirmed_cash_has_no_payment_form() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .sales_service
+            .confirm(
+                fixture.sale_id,
+                Some(fixture.account_id),
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+        let base = format!("/web/sales/{}", fixture.sale_id);
+
+        let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains(&format!("{base}/cancel")),
+            "a confirmed cash sale can still be cancelled"
+        );
+        assert!(
+            !html.contains(&format!("{base}/payments")),
+            "a confirmed cash sale must not offer payment recording"
+        );
+        assert!(
+            !html.contains(&format!("{base}/lines")),
+            "a confirmed cash sale must not edit lines"
+        );
+        assert!(
+            !html.contains(&format!("{base}/header")),
+            "a confirmed cash sale must not edit its header"
+        );
+    }
+
+    /// AC7: cancelling asks for confirmation before the request is sent; the
+    /// confirm control carries `hx-confirm`. The same holds for discarding a
+    /// draft.
+    #[tokio::test]
+    async fn web_sale_record_cancel_asks_for_confirmation() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+
+        let cancel_needle = format!("hx-post=\"/web/sales/{}/cancel\"", fixture.sale_id);
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let discard = element_tag_containing(&html, &cancel_needle);
+        assert!(
+            discard.contains("hx-confirm"),
+            "discarding a draft must ask first: {discard}"
+        );
+
+        state
+            .sales_service
+            .confirm(fixture.sale_id, None, None)
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let cancel = element_tag_containing(&html, &cancel_needle);
+        assert!(
+            cancel.contains("hx-confirm"),
+            "cancelling a confirmed sale must ask first: {cancel}"
+        );
+    }
+
+    /// The record-page actions swap the record body and keep the `sale-changed`
+    /// refresh event, so the URL stays stable and subscribed regions update.
+    #[tokio::test]
+    async fn web_sale_record_header_edit_swaps_the_body_and_triggers_refresh() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let body = "sale_date=2024-05-03&due_date=&receipt_no=ticket-9&notes=edited+note";
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/web/sales/{}/header", fixture.sale_id))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("HX-Trigger").map(|v| v.to_str().unwrap()),
+            Some("sale-changed")
+        );
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let html = String::from_utf8_lossy(&bytes).to_string();
+        assert!(html.contains("sale-record-inner"), "{html:.400}");
+        assert!(html.contains("edited note"), "{html:.400}");
+        let detail = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        assert_eq!(detail.sale.notes, "edited note");
+        assert_eq!(detail.sale.sale_date.to_string(), "2024-05-03");
     }
 
     /// Behavioral: the payment form posts to the collection endpoint with the
@@ -870,10 +1360,13 @@ mod tests {
         );
     }
 
+    /// The non-HTMX form path also lands on the record page, so a browser
+    /// without htmx (or a plain POST) still never sees a list to retype an id
+    /// from.
     #[tokio::test]
-    async fn web_create_sale_then_list_shows_it() {
+    async fn web_create_sale_redirects_a_plain_form_to_the_record() {
         let state = test_state().await;
-        let customer = seed_customer(&state, "Web Client").await;
+        let customer = seed_customer(&state, "Plain Client").await;
         let app = crate::routes::router(state);
         let body = format!(
             "customer_id={}&payment_type=Cash&sale_date=2024-05-02",
@@ -883,17 +1376,18 @@ mod tests {
             .method("POST")
             .uri("/web/sales")
             .header("content-type", "application/x-www-form-urlencoded")
-            .header("HX-Request", "true")
             .body(Body::from(body))
             .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let (status, html) = get_html(app, "/web/sales").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            html.contains("Web Client"),
-            "fragment should contain new customer: {html:.300}"
-        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get("location")
+            .expect("a plain create must redirect to the record")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(location.starts_with("/sales/"), "{location}");
     }
 
     // -- K2: the sale form carries a mandatory customer -----------------------

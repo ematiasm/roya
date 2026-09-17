@@ -574,6 +574,49 @@ pub fn format_sale_number(year: i32, seq: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Sale record page (redesign-interface N2)
+//
+// The persisted line only carries `product_id` and the payment only carries
+// `account_id`/`method_id`. These views carry the display names the record page
+// shows, resolved by the service through the existing inventory and finance
+// read paths, never by SQL in a route.
+// ---------------------------------------------------------------------------
+
+/// One sale line resolved for `/sales/{id}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SaleLineView {
+    pub id: i64,
+    pub product_name: String,
+    pub product_sku: String,
+    pub qty: Decimal,
+    pub unit_price: Decimal,
+    pub subtotal: Decimal,
+}
+
+/// One sale payment resolved for `/sales/{id}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SalePaymentView {
+    pub id: i64,
+    pub account_name: String,
+    pub method_name: String,
+    pub amount: Decimal,
+    pub date: NaiveDate,
+}
+
+/// The sale record page payload: the stored document plus every child with its
+/// internal keys replaced by display names. Totals stay derived.
+#[derive(Debug, Clone, Serialize)]
+pub struct SaleRecord {
+    pub sale: Sale,
+    pub lines: Vec<SaleLineView>,
+    pub payments: Vec<SalePaymentView>,
+    pub total: Decimal,
+    pub paid: Decimal,
+    pub due: Decimal,
+    pub payment_status: PaymentStatus,
+}
+
+// ---------------------------------------------------------------------------
 // M3 purchases: suppliers + product/supplier cost satellite (Slice E).
 // Decimal-as-TEXT like finance/inventory. The price alert is derived from
 // previous vs current, never stored; `products.cost_price` stays as the
