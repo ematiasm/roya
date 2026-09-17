@@ -20,14 +20,16 @@
 // then mutate in order sequence -> stock -> finance -> sale row. The only
 // expected side effect on failure after validation is a sequence gap
 // (abandoned number), which matches ticket reality. Single-user, no races.
+use std::collections::BTreeMap;
+
 use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    format_sale_number, Customer, MovementReason, MovementType, NewMovement, NewSale,
-    PaymentStatus, PaymentType, ProductKind, Sale, SaleDetail, SaleLine, SalePayment,
-    UpdateSaleDraft,
+    format_sale_number, Ageing, Customer, CustomerAgeing, CustomerStatement, MovementReason,
+    MovementType, NewMovement, NewSale, PaymentStatus, PaymentType, ProductKind, Sale,
+    SaleDetail, SaleLine, SalePayment, StatementEntry, StatementEntryKind, UpdateSaleDraft,
 };
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, CustomerRepository,
@@ -208,12 +210,16 @@ where
         (total, paid, due)
     }
 
-    async fn detail_for(&self, sale: Sale) -> AppResult<SaleDetail> {
-        let lines = self.sales.list_lines(sale.id).await?;
-        let payments = self.sales.list_payments(sale.id).await?;
+    /// Fold a sale and its children into the `SaleDetail` shape every derived
+    /// read uses, so `total`/`paid`/`due` are computed in exactly one place.
+    fn assemble_detail(
+        sale: Sale,
+        lines: Vec<SaleLine>,
+        payments: Vec<SalePayment>,
+    ) -> SaleDetail {
         let (total, paid, due) = Self::totals(&lines, &payments);
         let payment_status = SaleDetail::payment_status_for(total, paid);
-        Ok(SaleDetail {
+        SaleDetail {
             sale,
             lines,
             payments,
@@ -221,7 +227,13 @@ where
             paid,
             due,
             payment_status,
-        })
+        }
+    }
+
+    async fn detail_for(&self, sale: Sale) -> AppResult<SaleDetail> {
+        let lines = self.sales.list_lines(sale.id).await?;
+        let payments = self.sales.list_payments(sale.id).await?;
+        Ok(Self::assemble_detail(sale, lines, payments))
     }
 
     fn ensure_draft(sale: &Sale) -> AppResult<()> {
@@ -407,6 +419,192 @@ where
         Ok(out)
     }
 
+    // -- Derived customer receivable (Slice K3) -------------------------------
+
+    /// Confirmed credit sales of one customer folded into the same `SaleDetail`
+    /// shape `outstanding_debt` returns. Cancelled sales never appear, cash sales
+    /// never appear, and every total comes from `assemble_detail`, so the money is
+    /// summed in Rust over the TEXT columns and never with SQL `SUM`.
+    async fn customer_credit_details(&self, customer_id: i64) -> AppResult<Vec<SaleDetail>> {
+        let rows = self.sales.list_customer_credit_ledger(customer_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(sale, lines, payments)| Self::assemble_detail(sale, lines, payments))
+            .collect())
+    }
+
+    /// Money owed by one customer: the sum of `due` (`total - paid`) over the
+    /// Confirmed credit sales. A cancelled sale contributes nothing to either
+    /// side, a fully paid sale contributes zero and a cash sale never contributes.
+    /// Drives the credit-limit check and the statement balance.
+    pub async fn customer_balance(&self, customer_id: i64) -> AppResult<Decimal> {
+        Ok(self
+            .customer_credit_details(customer_id)
+            .await?
+            .iter()
+            .map(|detail| detail.due)
+            .sum())
+    }
+
+    /// Add one sale's outstanding `due` to the bucket its `due_date` falls into
+    /// against `as_of`: due today, not yet due and no due date are current;
+    /// 1..=30, 31..=60 and >60 days late fill the other three.
+    fn add_to_ageing(ageing: &mut Ageing, detail: &SaleDetail, as_of: NaiveDate) {
+        if detail.due <= Decimal::ZERO {
+            return;
+        }
+        match detail
+            .sale
+            .due_date
+            .map(|due_date| (as_of - due_date).num_days())
+        {
+            None => ageing.current += detail.due,
+            Some(days) if days <= 0 => ageing.current += detail.due,
+            Some(days) if days <= 30 => ageing.overdue_1_30 += detail.due,
+            Some(days) if days <= 60 => ageing.overdue_31_60 += detail.due,
+            Some(_) => ageing.overdue_61_plus += detail.due,
+        }
+    }
+
+    fn ageing_of(details: &[SaleDetail], as_of: NaiveDate) -> Ageing {
+        let mut ageing = Ageing::default();
+        for detail in details {
+            Self::add_to_ageing(&mut ageing, detail, as_of);
+        }
+        ageing
+    }
+
+    /// Ageing of the derived balance against an explicit `as_of`. Only sales with
+    /// `due > 0` are bucketed, so `total()` always equals `customer_balance`.
+    pub async fn customer_ageing(
+        &self,
+        customer_id: i64,
+        as_of: NaiveDate,
+    ) -> AppResult<Ageing> {
+        let details = self.customer_credit_details(customer_id).await?;
+        Ok(Self::ageing_of(&details, as_of))
+    }
+
+    /// Chronological ledger of the confirmed credit sales: sales as debits,
+    /// payments as credits, with the running balance after every entry. The final
+    /// balance equals `customer_balance`; `as_of` labels the statement and drives
+    /// the ageing it carries. Cancelled sales contribute nothing to either side.
+    pub async fn customer_statement(
+        &self,
+        customer_id: i64,
+        as_of: NaiveDate,
+    ) -> AppResult<CustomerStatement> {
+        let details = self.customer_credit_details(customer_id).await?;
+        let balance: Decimal = details.iter().map(|detail| detail.due).sum();
+        let ageing = Self::ageing_of(&details, as_of);
+
+        // Intermediate rows kept only long enough to order the ledger before the
+        // running balance is applied. Ties on the same date stay deterministic:
+        // document number, then debits before credits, then source row id.
+        struct LedgerRow {
+            date: NaiveDate,
+            document: Option<String>,
+            kind: StatementEntryKind,
+            source_id: i64,
+            description: &'static str,
+            debit: Decimal,
+            credit: Decimal,
+        }
+
+        let mut rows: Vec<LedgerRow> = Vec::new();
+        for detail in &details {
+            let document = detail.sale.sale_number.clone();
+            rows.push(LedgerRow {
+                date: detail.sale.sale_date,
+                document: document.clone(),
+                kind: StatementEntryKind::Sale,
+                source_id: detail.sale.id,
+                description: "Credit sale",
+                debit: detail.total,
+                credit: Decimal::ZERO,
+            });
+            for payment in &detail.payments {
+                rows.push(LedgerRow {
+                    date: payment.date,
+                    document: document.clone(),
+                    kind: StatementEntryKind::Payment,
+                    source_id: payment.id,
+                    description: "Payment",
+                    debit: Decimal::ZERO,
+                    credit: payment.amount,
+                });
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.date
+                .cmp(&b.date)
+                .then_with(|| a.document.cmp(&b.document))
+                .then_with(|| {
+                    Self::statement_kind_rank(a.kind).cmp(&Self::statement_kind_rank(b.kind))
+                })
+                .then_with(|| a.source_id.cmp(&b.source_id))
+        });
+
+        let mut running = Decimal::ZERO;
+        let entries = rows
+            .into_iter()
+            .map(|row| {
+                running += row.debit - row.credit;
+                StatementEntry {
+                    date: row.date,
+                    kind: row.kind,
+                    document_number: row.document,
+                    description: row.description.to_string(),
+                    debit: row.debit,
+                    credit: row.credit,
+                    balance: running,
+                }
+            })
+            .collect();
+
+        Ok(CustomerStatement {
+            customer_id,
+            balance,
+            as_of,
+            ageing,
+            entries,
+        })
+    }
+
+    fn statement_kind_rank(kind: StatementEntryKind) -> u8 {
+        match kind {
+            StatementEntryKind::Sale => 0,
+            StatementEntryKind::Payment => 1,
+        }
+    }
+
+    /// Receivables view: every customer with a non-zero derived balance and the
+    /// ageing of that balance as of `as_of`, ordered by customer id. Runs over the
+    /// same `SaleDetail` shape `outstanding_debt` uses.
+    pub async fn ageing_all(&self, as_of: NaiveDate) -> AppResult<Vec<CustomerAgeing>> {
+        let mut balances: BTreeMap<i64, Decimal> = BTreeMap::new();
+        let mut ageings: BTreeMap<i64, Ageing> = BTreeMap::new();
+        for detail in self.list_details().await? {
+            if detail.sale.status != crate::models::SaleStatus::Confirmed
+                || detail.sale.payment_type != PaymentType::Credit
+            {
+                continue;
+            }
+            let customer_id = detail.sale.customer_id;
+            *balances.entry(customer_id).or_default() += detail.due;
+            Self::add_to_ageing(ageings.entry(customer_id).or_default(), &detail, as_of);
+        }
+        Ok(balances
+            .into_iter()
+            .filter(|(_, balance)| *balance != Decimal::ZERO)
+            .map(|(customer_id, balance)| CustomerAgeing {
+                customer_id,
+                balance,
+                ageing: ageings.get(&customer_id).copied().unwrap_or_default(),
+            })
+            .collect())
+    }
+
     /// Outstanding receivables: Confirmed sales with due > 0.
     pub async fn outstanding_debt(&self) -> AppResult<Vec<SaleDetail>> {
         let all = self.list_details().await?;
@@ -417,21 +615,6 @@ where
                     && d.due > Decimal::ZERO
             })
             .collect())
-    }
-
-    /// Derived receivable of one customer: confirmed credit sales (lines total)
-    /// minus the payments received on them. Cancelled sales never count. The
-    /// per-sale math runs in `Decimal` (the columns are TEXT), so the credit-limit
-    /// check never passes through floating point.
-    async fn customer_debt(&self, customer_id: i64) -> AppResult<Decimal> {
-        let mut debt = Decimal::ZERO;
-        for sale in self.sales.list_confirmed_credit_sales(customer_id).await? {
-            let lines = self.sales.list_lines(sale.id).await?;
-            let payments = self.sales.list_payments(sale.id).await?;
-            let (total, paid, _) = Self::totals(&lines, &payments);
-            debt += total - paid;
-        }
-        Ok(debt)
     }
 
     // -- Confirm ---------------------------------------------------------------
@@ -536,7 +719,7 @@ where
                 // customer who never set one.
                 if self.enforce_credit_limit {
                     if let Some(limit) = customer.credit_limit {
-                        let debt = self.customer_debt(customer.id).await?;
+                        let debt = self.customer_balance(customer.id).await?;
                         let projected = debt + total;
                         if projected > limit {
                             return Err(AppError::Validation(format!(
@@ -2208,7 +2391,7 @@ mod tests {
 
         let detail = s.confirm(sale.id, None, None).await.unwrap();
         assert_eq!(detail.sale.status, crate::models::SaleStatus::Confirmed);
-        let debt = s.customer_debt(customer.id).await.unwrap();
+        let debt = s.customer_balance(customer.id).await.unwrap();
         assert_eq!(debt, dec("60"));
         assert!(debt > dec("50"), "the customer is over the limit: {debt}");
     }
@@ -2323,13 +2506,576 @@ mod tests {
 
         // Cancelling the first sale removes its remaining 20 => debt 70.
         s.cancel(first.id, Some("tri".into())).await.unwrap();
-        assert_eq!(s.customer_debt(customer.id).await.unwrap(), dec("70"));
+        assert_eq!(s.customer_balance(customer.id).await.unwrap(), dec("70"));
 
         // Boundary: projected debt exactly equal to the limit is allowed.
         let boundary =
             draft_with_line(&s, customer.id, PaymentType::Credit, due, prod.id, "3").await;
         let detail = s.confirm(boundary.id, None, None).await.unwrap();
         assert_eq!(detail.sale.status, crate::models::SaleStatus::Confirmed);
-        assert_eq!(s.customer_debt(customer.id).await.unwrap(), dec("100"));
+        assert_eq!(s.customer_balance(customer.id).await.unwrap(), dec("100"));
+    }
+
+    // -- K3: derived receivable reads (balance, ageing, statement) -------------
+
+    /// Like `draft_with_line`, but with an explicit sale date so the boundary
+    /// tests can place sales far enough back to be 60+ days overdue.
+    async fn draft_on(
+        s: &Svc,
+        customer_id: i64,
+        payment_type: PaymentType,
+        date: NaiveDate,
+        due_date: Option<NaiveDate>,
+        product_id: i64,
+        qty: &str,
+    ) -> crate::models::Sale {
+        let sale = s
+            .create_draft(NewSale {
+                customer_id,
+                payment_type,
+                sale_date: date,
+                due_date,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, product_id, dec(qty), None).await.unwrap();
+        sale
+    }
+
+    /// AC8: the balance is credit sales minus the payments received on them; cash
+    /// sales never contribute and a customer without credit history owes zero.
+    #[tokio::test]
+    async fn k3_ac8_balance_is_credit_sales_minus_payments() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "K3-AC8", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let acc = seed_account(&s, "k3-ac8").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let due = Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap());
+
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            Decimal::ZERO,
+            "a customer with no credit history owes nothing"
+        );
+
+        // Two credit sales: 50 + 30 = 80.
+        let first =
+            draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit, due, prod.id, "5").await;
+        let second =
+            draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit, due, prod.id, "3").await;
+        s.confirm(first.id, None, None).await.unwrap();
+        s.confirm(second.id, None, None).await.unwrap();
+
+        // A cash sale for the same customer never contributes.
+        let cash_sale =
+            draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Cash, None, prod.id, "7").await;
+        s.confirm(cash_sale.id, Some(acc.id), Some(cash)).await.unwrap();
+
+        assert_eq!(s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(), dec("80"));
+
+        // A payment reduces the balance for that customer only.
+        s.record_payment(
+            first.id,
+            acc.id,
+            cash,
+            dec("20"),
+            NaiveDate::from_ymd_opt(2024, 5, 10).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(), dec("60"));
+
+        let other = seed_customer(&s, "Sin deuda", None, None).await;
+        assert_eq!(s.customer_balance(other.id).await.unwrap(), Decimal::ZERO);
+    }
+
+    /// AC8: a fully paid sale contributes zero, and a cancelled sale stops
+    /// counting on either side while its payment rows stay for history.
+    #[tokio::test]
+    async fn k3_ac8_fully_paid_and_cancelled_sales_leave_the_balance() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "K3-AC8C", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "k3-ac8c").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let due = Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap());
+
+        let sale =
+            draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit, due, prod.id, "4").await; // 40
+        s.confirm(sale.id, None, None).await.unwrap();
+        s.record_payment(sale.id, acc.id, cash, dec("15"), sale_date())
+            .await
+            .unwrap();
+        assert_eq!(s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(), dec("25"));
+
+        // Fully paid: the sale contributes zero.
+        s.record_payment(sale.id, acc.id, cash, dec("25"), sale_date())
+            .await
+            .unwrap();
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            Decimal::ZERO
+        );
+
+        // Cancelled: nothing on either side, and the payments are still on file.
+        s.cancel(sale.id, Some("k3".into())).await.unwrap();
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            Decimal::ZERO
+        );
+        let payments = s.sales.list_payments(sale.id).await.unwrap();
+        assert_eq!(payments.len(), 2, "cancelled sales keep their payment rows");
+        assert!(payments.iter().all(|p| p.refund_transaction_id.is_some()));
+        let ageing = s
+            .customer_ageing(CREDIT_CUSTOMER_ID, sale_date())
+            .await
+            .unwrap();
+        assert_eq!(ageing.total(), Decimal::ZERO);
+    }
+
+    /// AC9: every bucket boundary is exact — due today, 1, 30, 31, 60 and 61 days
+    /// late — a credit sale with no due date counts as current, and the buckets
+    /// sum exactly to the balance.
+    #[tokio::test]
+    async fn k3_ac9_ageing_bucket_boundaries() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "K3-AC9", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let as_of = NaiveDate::from_ymd_opt(2024, 5, 31).unwrap();
+        let base_date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+
+        // One unit per sale makes every boundary unambiguous (10 each).
+        let due_dates = [
+            NaiveDate::from_ymd_opt(2024, 5, 31).unwrap(), // due today -> current
+            NaiveDate::from_ymd_opt(2024, 6, 1).unwrap(),  // not yet due -> current
+            NaiveDate::from_ymd_opt(2024, 5, 30).unwrap(), // 1 day late
+            NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),  // 30 days late
+            NaiveDate::from_ymd_opt(2024, 4, 30).unwrap(), // 31 days late
+            NaiveDate::from_ymd_opt(2024, 4, 1).unwrap(),  // 60 days late
+            NaiveDate::from_ymd_opt(2024, 3, 31).unwrap(), // 61 days late
+        ];
+        for due_date in due_dates {
+            let sale = draft_on(
+                &s,
+                CREDIT_CUSTOMER_ID,
+                PaymentType::Credit,
+                base_date,
+                Some(due_date),
+                prod.id,
+                "1",
+            )
+            .await;
+            s.confirm(sale.id, None, None).await.unwrap();
+        }
+
+        // A credit sale with no due date counts as current.
+        let (no_due_id,): (i64,) = sqlx::query_as(
+            r#"INSERT INTO sales (sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date)
+               VALUES ('2024-SALE-000900', 'Confirmed', 'Credit', ?, 'Credit Customer', '2024-01-01', NULL)
+               RETURNING id"#,
+        )
+        .bind(CREDIT_CUSTOMER_ID)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"INSERT INTO sale_lines (sale_id, product_id, qty, unit_price)
+               VALUES (?, ?, '1', '10')"#,
+        )
+        .bind(no_due_id)
+        .bind(prod.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ageing = s
+            .customer_ageing(CREDIT_CUSTOMER_ID, as_of)
+            .await
+            .unwrap();
+        assert_eq!(
+            ageing.current,
+            dec("30"),
+            "due today, not yet due and no due date"
+        );
+        assert_eq!(ageing.overdue_1_30, dec("20"), "exactly 1 and 30 days late");
+        assert_eq!(ageing.overdue_31_60, dec("20"), "exactly 31 and 60 days late");
+        assert_eq!(ageing.overdue_61_plus, dec("10"), "exactly 61 days late");
+        assert_eq!(ageing.total(), dec("80"));
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            ageing.total()
+        );
+    }
+
+    /// AC9: the aggregate covers exactly the customers with a non-zero balance,
+    /// follows partial payments, and its buckets sum to the summed balances.
+    #[tokio::test]
+    async fn k3_ac9_ageing_all_covers_nonzero_balances() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "K3-ALL", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let acc = seed_account(&s, "k3-all").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let as_of = NaiveDate::from_ymd_opt(2024, 5, 31).unwrap();
+        let base_date = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+
+        let ana = seed_customer(&s, "Ana", None, None).await;
+        let bruno = seed_customer(&s, "Bruno", None, None).await;
+        let carla = seed_customer(&s, "Carla", None, None).await;
+
+        // Ana: 30 due today and 20 overdue by 21 days after a partial payment.
+        let a1 = draft_on(
+            &s,
+            ana.id,
+            PaymentType::Credit,
+            base_date,
+            Some(NaiveDate::from_ymd_opt(2024, 5, 31).unwrap()),
+            prod.id,
+            "3",
+        )
+        .await;
+        let a2 = draft_on(
+            &s,
+            ana.id,
+            PaymentType::Credit,
+            base_date,
+            Some(NaiveDate::from_ymd_opt(2024, 5, 10).unwrap()),
+            prod.id,
+            "4",
+        )
+        .await;
+        s.confirm(a1.id, None, None).await.unwrap();
+        s.confirm(a2.id, None, None).await.unwrap();
+        s.record_payment(
+            a2.id,
+            acc.id,
+            cash,
+            dec("10"),
+            NaiveDate::from_ymd_opt(2024, 5, 20).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Bruno: one sale more than 60 days late.
+        let b1 = draft_on(
+            &s,
+            bruno.id,
+            PaymentType::Credit,
+            base_date,
+            Some(NaiveDate::from_ymd_opt(2024, 3, 1).unwrap()),
+            prod.id,
+            "4",
+        )
+        .await;
+        s.confirm(b1.id, None, None).await.unwrap();
+
+        // Carla: fully paid, so she must not appear.
+        let c1 = draft_on(
+            &s,
+            carla.id,
+            PaymentType::Credit,
+            base_date,
+            Some(NaiveDate::from_ymd_opt(2024, 5, 31).unwrap()),
+            prod.id,
+            "1",
+        )
+        .await;
+        s.confirm(c1.id, None, None).await.unwrap();
+        s.record_payment(c1.id, acc.id, cash, dec("10"), base_date)
+            .await
+            .unwrap();
+
+        let rows = s.ageing_all(as_of).await.unwrap();
+        assert_eq!(rows.len(), 2, "only non-zero balances are listed");
+        assert_eq!(rows[0].customer_id, ana.id);
+        assert_eq!(rows[0].balance, dec("60"));
+        assert_eq!(rows[0].ageing.current, dec("30"));
+        assert_eq!(rows[0].ageing.overdue_1_30, dec("30"));
+        assert_eq!(rows[0].ageing.total(), rows[0].balance);
+        assert_eq!(rows[1].customer_id, bruno.id);
+        assert_eq!(rows[1].balance, dec("40"));
+        assert_eq!(rows[1].ageing.overdue_61_plus, dec("40"));
+        assert!(rows.iter().all(|row| row.customer_id != carla.id));
+        assert!(rows.iter().all(|row| row.customer_id != WALKIN_ID));
+
+        let summed: Decimal = rows.iter().map(|row| row.ageing.total()).sum();
+        let balances: Decimal = rows.iter().map(|row| row.balance).sum();
+        assert_eq!(summed, dec("100"));
+        assert_eq!(summed, balances);
+        for row in &rows {
+            let per_customer = s.customer_ageing(row.customer_id, as_of).await.unwrap();
+            assert_eq!(per_customer, row.ageing, "per-customer and aggregate agree");
+        }
+    }
+
+    /// The statement is chronological, its debits minus its credits equal the
+    /// balance, and the final running balance matches `customer_balance`. A fully
+    /// paid sale stays in the ledger; a cancelled one contributes nothing at all.
+    #[tokio::test]
+    async fn k3_statement_balances_out_to_the_customer_balance() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "K3-STMT", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let acc = seed_account(&s, "k3-stmt").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let as_of = NaiveDate::from_ymd_opt(2024, 8, 1).unwrap();
+
+        // 100 confirmed, then 30 + 20 paid on different dates.
+        let big = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "10",
+        )
+        .await;
+        s.confirm(big.id, None, None).await.unwrap();
+        s.record_payment(
+            big.id,
+            acc.id,
+            cash,
+            dec("30"),
+            NaiveDate::from_ymd_opt(2024, 5, 10).unwrap(),
+        )
+        .await
+        .unwrap();
+        s.record_payment(
+            big.id,
+            acc.id,
+            cash,
+            dec("20"),
+            NaiveDate::from_ymd_opt(2024, 6, 5).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // 50 fully paid: its debit and credit stay and cancel out.
+        let small = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            NaiveDate::from_ymd_opt(2024, 5, 3).unwrap(),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 3).unwrap()),
+            prod.id,
+            "5",
+        )
+        .await;
+        s.confirm(small.id, None, None).await.unwrap();
+        s.record_payment(
+            small.id,
+            acc.id,
+            cash,
+            dec("50"),
+            NaiveDate::from_ymd_opt(2024, 6, 3).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // A cancelled credit sale never shows up, payment included.
+        let gone = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            NaiveDate::from_ymd_opt(2024, 5, 4).unwrap(),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 4).unwrap()),
+            prod.id,
+            "2",
+        )
+        .await;
+        s.confirm(gone.id, None, None).await.unwrap();
+        s.record_payment(
+            gone.id,
+            acc.id,
+            cash,
+            dec("5"),
+            NaiveDate::from_ymd_opt(2024, 5, 20).unwrap(),
+        )
+        .await
+        .unwrap();
+        s.cancel(gone.id, Some("k3".into())).await.unwrap();
+
+        let statement = s
+            .customer_statement(CREDIT_CUSTOMER_ID, as_of)
+            .await
+            .unwrap();
+        assert_eq!(statement.customer_id, CREDIT_CUSTOMER_ID);
+        assert_eq!(statement.as_of, as_of);
+        assert_eq!(statement.balance, dec("50")); // 150 sales - 100 payments
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            statement.balance
+        );
+        assert_eq!(statement.ageing.total(), statement.balance);
+
+        assert_eq!(statement.entries.len(), 5, "2 sales + 3 payments");
+        let debits: Decimal = statement.entries.iter().map(|e| e.debit).sum();
+        let credits: Decimal = statement.entries.iter().map(|e| e.credit).sum();
+        assert_eq!(debits, dec("150"));
+        assert_eq!(credits, dec("100"));
+        assert_eq!(debits - credits, statement.balance);
+        assert_eq!(statement.entries.last().unwrap().balance, statement.balance);
+        for pair in statement.entries.windows(2) {
+            assert!(pair[0].date <= pair[1].date, "entries are chronological");
+        }
+        assert!(statement
+            .entries
+            .iter()
+            .any(|e| e.kind == StatementEntryKind::Sale && e.document_number.is_some()));
+        assert!(statement
+            .entries
+            .iter()
+            .any(|e| e.kind == StatementEntryKind::Payment && e.credit > Decimal::ZERO));
+        assert!(statement
+            .entries
+            .iter()
+            .all(|e| e.credit == Decimal::ZERO || e.debit == Decimal::ZERO));
+    }
+
+    /// Ties on the same date stay deterministic: document number, then debits
+    /// before credits, then source row id.
+    #[tokio::test]
+    async fn k3_statement_tied_dates_keep_a_reproducible_order() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "K3-TIE", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        let acc = seed_account(&s, "k3-tie").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let as_of = NaiveDate::from_ymd_opt(2024, 6, 30).unwrap();
+        let day = NaiveDate::from_ymd_opt(2024, 5, 2).unwrap();
+
+        // Two sales on the same date: 000001 (10) and 000002 (20).
+        let first = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            day,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "1",
+        )
+        .await;
+        let second = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            day,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+            prod.id,
+            "2",
+        )
+        .await;
+        let n1 = s
+            .confirm(first.id, None, None)
+            .await
+            .unwrap()
+            .sale
+            .sale_number
+            .unwrap();
+        let n2 = s
+            .confirm(second.id, None, None)
+            .await
+            .unwrap()
+            .sale
+            .sale_number
+            .unwrap();
+        assert!(n1 < n2, "document order follows the generated numbers");
+
+        // Two payments against the first sale on the same date: creation order.
+        s.record_payment(
+            first.id,
+            acc.id,
+            cash,
+            dec("7"),
+            NaiveDate::from_ymd_opt(2024, 5, 10).unwrap(),
+        )
+        .await
+        .unwrap();
+        s.record_payment(
+            first.id,
+            acc.id,
+            cash,
+            dec("3"),
+            NaiveDate::from_ymd_opt(2024, 5, 10).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let statement = s
+            .customer_statement(CREDIT_CUSTOMER_ID, as_of)
+            .await
+            .unwrap();
+        let lines: Vec<(StatementEntryKind, Option<String>, Decimal)> = statement
+            .entries
+            .iter()
+            .map(|e| (e.kind, e.document_number.clone(), e.balance))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                (StatementEntryKind::Sale, Some(n1.clone()), dec("10")),
+                (StatementEntryKind::Sale, Some(n2), dec("30")),
+                (StatementEntryKind::Payment, Some(n1.clone()), dec("23")),
+                (StatementEntryKind::Payment, Some(n1), dec("20")),
+            ]
+        );
+    }
+
+    /// Triangulation: the same receivable moves between buckets as `as_of`
+    /// advances, always in exactly one bucket and always with the same total.
+    #[tokio::test]
+    async fn k3_tri_ageing_moves_with_as_of_and_stays_deterministic() {
+        let (s, _) = svc().await;
+        let prod = seed_product(&s, "K3-TRI", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let due = NaiveDate::from_ymd_opt(2024, 5, 31).unwrap();
+        let sale = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            NaiveDate::from_ymd_opt(2024, 4, 1).unwrap(),
+            Some(due),
+            prod.id,
+            "1",
+        )
+        .await;
+        s.confirm(sale.id, None, None).await.unwrap();
+
+        let on_due = s.customer_ageing(CREDIT_CUSTOMER_ID, due).await.unwrap();
+        assert_eq!(on_due.current, dec("10"));
+        assert_eq!(on_due.total(), dec("10"));
+
+        let at_30 = s
+            .customer_ageing(CREDIT_CUSTOMER_ID, NaiveDate::from_ymd_opt(2024, 6, 30).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(at_30.overdue_1_30, dec("10"));
+
+        let at_60 = s
+            .customer_ageing(CREDIT_CUSTOMER_ID, NaiveDate::from_ymd_opt(2024, 7, 30).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(at_60.overdue_31_60, dec("10"));
+
+        let at_61 = s
+            .customer_ageing(CREDIT_CUSTOMER_ID, NaiveDate::from_ymd_opt(2024, 7, 31).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(at_61.overdue_61_plus, dec("10"));
+
+        let repeat = s
+            .customer_ageing(CREDIT_CUSTOMER_ID, NaiveDate::from_ymd_opt(2024, 7, 31).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(repeat, at_61, "the same as_of always yields the same buckets");
     }
 }

@@ -889,3 +889,77 @@ pub struct CustomerCreateResult {
     pub customer: Customer,
     pub name_matches: Vec<Customer>,
 }
+
+// ---------------------------------------------------------------------------
+// M4 customers (Slice K3). The receivable is derived from sales and payments,
+// so these reads live in `SalesService`: customers sits above sales, and the
+// reverse would be circular. Decimal-as-TEXT like the rest of the project, so
+// the buckets and the running balance are summed in Rust, never with SQL SUM.
+// ---------------------------------------------------------------------------
+
+/// Ageing of a derived receivable against an explicit `as_of` date. Each sale
+/// with `due > 0` falls in exactly one bucket by how many days late it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Ageing {
+    /// Not yet due, due today, or no due date at all.
+    pub current: Decimal,
+    /// 1 to 30 days past the due date.
+    pub overdue_1_30: Decimal,
+    /// 31 to 60 days past the due date.
+    pub overdue_31_60: Decimal,
+    /// More than 60 days past the due date.
+    pub overdue_61_plus: Decimal,
+}
+
+impl Ageing {
+    /// Sum of the four buckets: the receivable they were computed from.
+    pub fn total(&self) -> Decimal {
+        self.current + self.overdue_1_30 + self.overdue_31_60 + self.overdue_61_plus
+    }
+}
+
+/// One row of the receivables view: a customer with a non-zero derived balance
+/// and the ageing of that balance as of the requested date. Names stay with
+/// `CustomerService`; routes compose the two reads.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CustomerAgeing {
+    pub customer_id: i64,
+    pub balance: Decimal,
+    pub ageing: Ageing,
+}
+
+/// What produced a statement entry: a confirmed credit sale (a debit) or a
+/// payment received on one of those sales (a credit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum StatementEntryKind {
+    Sale,
+    Payment,
+}
+
+/// One line of a customer statement. `balance` is the running balance after
+/// applying this entry, so the last entry always lands on the statement total.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatementEntry {
+    pub date: NaiveDate,
+    pub kind: StatementEntryKind,
+    /// The document the entry belongs to (`YYYY-SALE-NNNNNN`). A payment carries
+    /// the sale it was applied to, which keeps tied dates orderable.
+    pub document_number: Option<String>,
+    pub description: String,
+    pub debit: Decimal,
+    pub credit: Decimal,
+    pub balance: Decimal,
+}
+
+/// Derived account statement of one customer: the full confirmed-credit ledger
+/// with its running balance, plus the ageing of the same receivable as of
+/// `as_of`. Cancelled sales contribute nothing to either side.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CustomerStatement {
+    pub customer_id: i64,
+    pub balance: Decimal,
+    pub as_of: NaiveDate,
+    pub ageing: Ageing,
+    pub entries: Vec<StatementEntry>,
+}

@@ -99,6 +99,16 @@ pub trait SaleRepository: Send + Sync {
     /// Confirmed credit sales of one customer, oldest first. Feeds the derived
     /// receivable used by the credit-limit check; cancelled sales never count.
     async fn list_confirmed_credit_sales(&self, customer_id: i64) -> AppResult<Vec<Sale>>;
+
+    /// Confirmed credit sales of one customer with their lines and payments,
+    /// oldest first, for the derived receivable reads (balance, ageing, statement).
+    /// Cancelled and cash sales never appear. The service folds these rows into the
+    /// `SaleDetail` shape `outstanding_debt` uses, so every total is computed in
+    /// Rust (`total - paid`), never with SQL `SUM`.
+    async fn list_customer_credit_ledger(
+        &self,
+        customer_id: i64,
+    ) -> AppResult<Vec<(Sale, Vec<SaleLine>, Vec<SalePayment>)>>;
     /// Update Draft header fields (service guarantees Draft status).
     async fn update_draft(&self, id: i64, patch: &UpdateSaleDraft) -> AppResult<Sale>;
     /// Transition Draft -> Confirmed with assigned number.
@@ -222,6 +232,20 @@ impl SaleRepository for SqliteSaleRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_sale).collect())
+    }
+
+    async fn list_customer_credit_ledger(
+        &self,
+        customer_id: i64,
+    ) -> AppResult<Vec<(Sale, Vec<SaleLine>, Vec<SalePayment>)>> {
+        let sales = self.list_confirmed_credit_sales(customer_id).await?;
+        let mut out = Vec::with_capacity(sales.len());
+        for sale in sales {
+            let lines = self.list_lines(sale.id).await?;
+            let payments = self.list_payments(sale.id).await?;
+            out.push((sale, lines, payments));
+        }
+        Ok(out)
     }
 
     async fn update_draft(&self, id: i64, patch: &UpdateSaleDraft) -> AppResult<Sale> {
