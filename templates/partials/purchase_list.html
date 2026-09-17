@@ -21,7 +21,7 @@
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums {% if v.detail.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ v.detail.total }}</span>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/purchases/{{ v.detail.purchase.id }}" hx-target="#purchase-detail" hx-swap="innerHTML">View</button>
+        <a href="/purchases/{{ v.detail.purchase.id }}" class="rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline">Open</a>
       </div>
     </div>
     {% endfor %}

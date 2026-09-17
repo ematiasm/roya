@@ -1,0 +1,32 @@
+{# Page header component: title, optional breadcrumb, exactly one primary action.
+
+   The including page declares the values as template locals before the include:
+
+     {% let page_title = "Products" %}
+     {% let page_breadcrumb_label = "Catalogue" %}   {# "" = no breadcrumb #}
+     {% let page_breadcrumb_href = "" %}             {# "" = plain label #}
+     {% let page_action_href = "#new-product" %}
+     {% let page_action_label = "New product" %}     {# "" = no action #}
+     {% include "partials/page_header.html" %}
+
+   Keeping one action slot is what keeps "the next obvious thing" in the same
+   place on every page. #}
+<header class="mb-6 flex flex-wrap items-end justify-between gap-4" data-page-header>
+  <div class="min-w-0">
+    {% if page_breadcrumb_label != "" %}
+    <nav class="mb-1 text-[13px] text-muted" aria-label="Breadcrumb" data-page-breadcrumb>
+      {% if page_breadcrumb_href != "" %}
+      <a href="{{ page_breadcrumb_href }}" class="text-muted">{{ page_breadcrumb_label }}</a>
+      {% else %}
+      <span>{{ page_breadcrumb_label }}</span>
+      {% endif %}
+    </nav>
+    {% endif %}
+    <h1 class="m-0 truncate text-[26px] font-bold tracking-[-0.02em]" data-page-title>{{ page_title }}</h1>
+  </div>
+  {% if page_action_label != "" %}
+  <a href="{{ page_action_href }}"
+     class="rounded-[10px] bg-accent2 px-4 py-2 text-sm font-semibold text-white no-underline hover:no-underline"
+     data-page-action>{{ page_action_label }}</a>
+  {% endif %}
+</header>

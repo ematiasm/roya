@@ -52,14 +52,18 @@
   }
 }
 
-/* htmx toggles .htmx-request at runtime; utilities cannot express that pair. */
+/* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The
+   busy indicator must be genuinely absent when idle (display:none), not merely
+   transparent: an opacity-only indicator has a non-empty box, so layout, assistive
+   tooling and tests would all agree it is "there" and an in-flight search would
+   again look identical to an idle one. */
 @layer components {
   .htmx-indicator {
-    opacity: 0;
-    transition: opacity 0.2s;
+    display: none;
   }
 
-  .htmx-request .htmx-indicator {
-    opacity: 1;
+  .htmx-request .htmx-indicator,
+  .htmx-request.htmx-indicator {
+    display: block;
   }
 }

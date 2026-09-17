@@ -27,9 +27,10 @@ use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    format_sale_number, Ageing, Customer, CustomerAgeing, CustomerStatement, MovementReason,
-    MovementType, NewMovement, NewSale, PaymentStatus, PaymentType, ProductKind, Sale,
-    SaleDetail, SaleLine, SalePayment, StatementEntry, StatementEntryKind, UpdateSaleDraft,
+    format_sale_number, Ageing, Customer, CustomerAgeing, CustomerStatement, DebtSummary,
+    MovementReason, MovementType, NewMovement, NewSale, PaymentStatus, PaymentType, ProductKind,
+    Sale, SaleDetail, SaleLine, SaleLineView, SaleListFilter, SalePayment, SalePaymentView,
+    SaleRecord, StatementEntry, StatementEntryKind, UpdateSaleDraft,
 };
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, CustomerRepository,
@@ -37,6 +38,9 @@ use crate::repositories::{
     StockMovementRepository, TransactionRepository,
 };
 use crate::services::CustomerService;
+
+/// How many of the oldest unpaid documents the sales page debt banner renders.
+pub const DEBT_BANNER_LIMIT: usize = 5;
 
 #[derive(Clone)]
 pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR>
@@ -407,6 +411,73 @@ where
         self.detail_for(sale).await
     }
 
+    /// Record-page view for `/sales/{id}`: resolves product, account and method
+    /// names through the existing inventory and finance read paths, so the
+    /// route never runs SQL of its own and never prints an internal key.
+    pub async fn get_record(&self, sale_id: i64) -> AppResult<SaleRecord> {
+        let detail = self.get_detail(sale_id).await?;
+        self.record_from_detail(detail).await
+    }
+
+    async fn record_from_detail(&self, detail: SaleDetail) -> AppResult<SaleRecord> {
+        let mut lines = Vec::with_capacity(detail.lines.len());
+        for line in detail.lines {
+            let product = self.inventory.get_product(line.product_id).await?;
+            lines.push(SaleLineView {
+                id: line.id,
+                product_name: product.name,
+                product_sku: product.sku,
+                qty: line.qty,
+                unit_price: line.unit_price,
+                subtotal: line.subtotal(),
+            });
+        }
+
+        let account_names: BTreeMap<i64, String> = self
+            .transactions
+            .accounts
+            .list()
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.name))
+            .collect();
+        let method_names: BTreeMap<i64, String> = self
+            .payment_methods
+            .list_methods()
+            .await?
+            .into_iter()
+            .map(|method| (method.id, method.name))
+            .collect();
+
+        let payments = detail
+            .payments
+            .into_iter()
+            .map(|payment| SalePaymentView {
+                id: payment.id,
+                account_name: account_names
+                    .get(&payment.account_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown account".to_string()),
+                method_name: method_names
+                    .get(&payment.method_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown method".to_string()),
+                amount: payment.amount,
+                date: payment.date,
+            })
+            .collect();
+
+        Ok(SaleRecord {
+            sale: detail.sale,
+            lines,
+            payments,
+            total: detail.total,
+            paid: detail.paid,
+            due: detail.due,
+            payment_status: detail.payment_status,
+        })
+    }
+
     // -- Lists (route support, Slice D) ------------------------------------------
 
     /// All sales with derived totals, oldest first (repository order).
@@ -417,6 +488,43 @@ where
             out.push(self.detail_for(sale).await?);
         }
         Ok(out)
+    }
+
+    /// The same derived list narrowed by the server-side list filter. The
+    /// criteria run inside the repository query, so only matching documents have
+    /// their lines and payments loaded; totals stay derived by `detail_for`,
+    /// never by a second summation.
+    pub async fn list_details_filtered(
+        &self,
+        filter: &SaleListFilter,
+    ) -> AppResult<Vec<SaleDetail>> {
+        let mut repo_filter = filter.clone();
+        if let Some(name) = &filter.customer {
+            repo_filter.customer_ids = Some(self.matching_customer_ids(name).await?);
+        }
+        let sales = self.sales.list_sales_filtered(&repo_filter).await?;
+        let mut out = Vec::with_capacity(sales.len());
+        for sale in sales {
+            out.push(self.detail_for(sale).await?);
+        }
+        Ok(out)
+    }
+
+    /// Customer ids whose current name matches `needle` after normalization. The
+    /// customers table is small by nature, so the match runs in Rust over the whole
+    /// set and the document query stays bounded to the matching ids. If the party
+    /// catalogue ever stops being small, this needs a normalized index instead.
+    async fn matching_customer_ids(&self, needle: &str) -> AppResult<Vec<i64>> {
+        let needle = crate::models::normalize_search(needle);
+        Ok(self
+            .customers
+            .customers
+            .list(false)
+            .await?
+            .into_iter()
+            .filter(|customer| crate::models::normalize_search(&customer.name).contains(&needle))
+            .map(|customer| customer.id)
+            .collect())
     }
 
     // -- Derived customer receivable (Slice K3) -------------------------------
@@ -638,6 +746,28 @@ where
                     && d.due > Decimal::ZERO
             })
             .collect())
+    }
+
+    /// The debt banner's read: the exact total owed and the number of unpaid
+    /// documents, plus the oldest few. Three batched repository reads, so its query
+    /// count stays constant as the shop's history grows; only the displayed rows
+    /// are assembled into full details. The totals are decimal sums in Rust, never
+    /// SQL `SUM` over the TEXT columns.
+    pub async fn debt_summary(&self, limit: usize) -> AppResult<DebtSummary> {
+        let ledger = self.sales.list_confirmed_credit_ledger_all().await?;
+        let mut unpaid: Vec<SaleDetail> = ledger
+            .into_iter()
+            .map(|(sale, lines, payments)| Self::assemble_detail(sale, lines, payments))
+            .filter(|detail| detail.due > Decimal::ZERO)
+            .collect();
+        let total = unpaid.iter().map(|detail| detail.due).sum();
+        let count = unpaid.len();
+        unpaid.truncate(limit);
+        Ok(DebtSummary {
+            total,
+            count,
+            oldest: unpaid,
+        })
     }
 
     // -- Confirm ---------------------------------------------------------------
@@ -1414,6 +1544,59 @@ mod tests {
         assert_eq!(detail.payment_status, PaymentStatus::Unpaid);
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
         assert_eq!(tx_count(&pool).await, 0);
+    }
+
+    /// N2: the record view resolves product, account and method names through
+    /// the service read paths, so the route never runs SQL or renders an
+    /// internal key. A draft with no payments still resolves its lines.
+    #[tokio::test]
+    async fn record_view_resolves_product_account_and_method_names() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "REC-NAME", "20").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-record").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "2",
+        )
+        .await;
+        s.confirm(sale.id, None, None).await.unwrap();
+        s.record_payment(sale.id, acc.id, cash, dec("10"), sale_date())
+            .await
+            .unwrap();
+
+        let record = s.get_record(sale.id).await.unwrap();
+        assert_eq!(record.lines.len(), 1);
+        assert_eq!(record.lines[0].product_name, prod.name);
+        assert_eq!(record.lines[0].product_sku, prod.sku);
+        assert_eq!(record.lines[0].subtotal, dec("40"));
+        assert_eq!(record.payments.len(), 1);
+        assert_eq!(record.payments[0].account_name, acc.name);
+        assert_eq!(record.payments[0].method_name, "Cash");
+        assert_eq!(record.total, dec("40"));
+        assert_eq!(record.paid, dec("10"));
+        assert_eq!(record.due, dec("30"));
+        assert_eq!(record.payment_status, PaymentStatus::Partial);
+
+        let draft = draft_with_line(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            prod.id,
+            "1",
+        )
+        .await;
+        let draft_record = s.get_record(draft.id).await.unwrap();
+        assert!(draft_record.payments.is_empty());
+        assert_eq!(draft_record.lines[0].product_name, prod.name);
+        assert_eq!(draft_record.lines[0].product_sku, prod.sku);
     }
 
     // -- AC4: Credit payments ---------------------------------------------------
@@ -3136,5 +3319,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repeat, at_61, "the same as_of always yields the same buckets");
+    }
+
+    /// N5 follow-up: the filters run in the repository, so the details loaded scale
+    /// with the matching documents, not the shop's history. The repository's
+    /// test-only read counter makes the before/after difference deterministic.
+    #[tokio::test]
+    async fn list_details_filtered_reads_only_the_result_set() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "PERF-S", "10").await;
+        seed_stock(&s, prod.id, "200").await;
+
+        // 20 drafts plus one confirmed: the filter matches exactly one document.
+        let mut matching = 0;
+        for i in 0..20 {
+            let sale = draft_with_line(
+                &s,
+                CREDIT_CUSTOMER_ID,
+                PaymentType::Credit,
+                Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                prod.id,
+                "1",
+            )
+            .await;
+            if i == 7 {
+                matching = sale.id;
+            }
+        }
+        s.confirm(matching, None, None).await.unwrap();
+
+        s.sales.reset_reads();
+        let details = s
+            .list_details_filtered(&crate::models::SaleListFilter {
+                status: Some(crate::models::SaleStatus::Confirmed),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let reads = s.sales.read_count();
+
+        assert_eq!(details.len(), 1, "the filter narrows to the confirmed sale");
+        assert_eq!(details[0].sale.id, matching);
+        assert_eq!(
+            reads, 3,
+            "one filtered query plus the matching document's lines and payments only, got {reads} reads for 20 sales"
+        );
+    }
+
+    /// N6 follow-up: the debt banner must not load every sale's details. This first
+    /// step measures the full receivable read, which is O(history).
+    #[tokio::test]
+    async fn debt_banner_reads_are_bounded() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "DEBT-P", "10").await;
+        seed_stock(&s, prod.id, "100").await;
+        for _ in 0..20 {
+            let sale = draft_with_line(
+                &s,
+                CREDIT_CUSTOMER_ID,
+                PaymentType::Credit,
+                Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                prod.id,
+                "1",
+            )
+            .await;
+            s.confirm(sale.id, None, None).await.unwrap();
+        }
+
+        s.sales.reset_reads();
+        let full = s.outstanding_debt().await.unwrap();
+        let before = s.sales.read_count();
+        assert_eq!(full.len(), 20);
+
+        s.sales.reset_reads();
+        let summary = s.debt_summary(DEBT_BANNER_LIMIT).await.unwrap();
+        let after = s.sales.read_count();
+
+        assert_eq!(summary.count, 20);
+        assert_eq!(summary.oldest.len(), DEBT_BANNER_LIMIT);
+        assert_eq!(summary.total, full.iter().map(|detail| detail.due).sum::<Decimal>());
+        assert!(
+            after < before,
+            "the banner must not scale with history: {before} reads for the full list, {after} for the banner"
+        );
+        assert_eq!(after, 3, "the banner reads in three batched queries");
     }
 }

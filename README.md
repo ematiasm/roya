@@ -508,15 +508,19 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /sales` — sales:
 
-- Sale list with status/debt badges (HTMX `GET /web/sales`)
-- Sale detail with lines + payments (HTMX `GET /web/sales/:id`, line delete via `hx-delete` in Draft)
+- Sale list with status/debt badges; each row links to its record (HTMX `GET /web/sales`)
+- `/sales/:id` — record page with the header (status, number or draft state, customer,
+  dates, totals, payment status), the lines table with product name and SKU, and the
+  payments table with account and method names; an unknown id is a 404
 - Outstanding debt — Confirmed sales with due > 0 (HTMX `GET /web/sales/debt`)
-- Forms:
-  - New sale Draft: `POST /web/sales` (HTMX)
-  - Add line: `POST /web/sales/:id/lines` (HTMX)
+- Actions, gated by status and offered in context on the record page:
+  - New sale Draft: `POST /web/sales` (HTMX, answers `HX-Redirect` to the new record)
+  - Add line (Draft): `POST /web/sales/:id/lines` (HTMX)
+  - Edit header (Draft): `POST /web/sales/:id/header` (HTMX)
   - Confirm: `POST /web/sales/:id/confirm` (HTMX)
-  - Record payment: `POST /web/sales/:id/payments` (HTMX)
-  - Cancel: `POST /web/sales/:id/cancel` (HTMX)
+  - Record payment (Confirmed, Credit): `POST /web/sales/:id/payments` (HTMX)
+  - Cancel (Confirmed) / discard (Draft): `POST /web/sales/:id/cancel` (HTMX,
+    `hx-confirm` asks first)
 
 `GET /customers` — customers (M4):
 
@@ -542,18 +546,24 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /purchases` — purchases (M3):
 
-- Purchase list with status + payable badges (HTMX `GET /web/purchases`, derived total/paid/due)
+- Purchase list with status/payable badges; each row links to its record (HTMX `GET /web/purchases`)
+- `/purchases/:id` — record page with the header (status, number or draft state,
+  supplier, dates, totals, payment status), the lines table with product name and
+  SKU, unit cost and subtotal, and the payments table with account and method
+  names; the product picker matches name, SKU and barcode and shows current stock;
+  an unknown id is a 404
 - Sugerido panel rendering the suggestion with a `→ Draft` seed button per row
-  (HTMX `GET /web/purchases/suggestions`, seed via `POST /web/purchases/from-suggestion`)
-- Purchase detail with lines and payments; the Draft line editor saves qty/unit cost in
-  place and removes lines (HTMX `GET /web/purchases/:id`, POST/DELETE
-  `/web/purchases/:id/lines/:line_id`)
-- Forms:
-  - New purchase Draft: `POST /web/purchases` (HTMX)
-  - Add line: `POST /web/purchases/lines` (HTMX)
-  - Confirm: `POST /web/purchases/confirm` (HTMX)
-  - Record payment: `POST /web/purchases/payments` (HTMX)
-  - Cancel: `POST /web/purchases/cancel` (HTMX)
+  (HTMX `GET /web/purchases/suggestions`, seed via `POST /web/purchases/from-suggestion`,
+  which opens the new draft's record)
+- Actions, gated by status and offered in context on the record page:
+  - New purchase Draft: `POST /web/purchases` (HTMX, answers `HX-Redirect` to the new record)
+  - Add line (Draft): `POST /web/purchases/:id/lines` (HTMX, scanner or picker; the
+    repeated-product rule is a clear 400)
+  - Edit header (Draft): `POST /web/purchases/:id/header` (HTMX)
+  - Confirm: `POST /web/purchases/:id/confirm` (HTMX)
+  - Record payment (Confirmed, Credit): `POST /web/purchases/:id/payments` (HTMX)
+  - Cancel (Confirmed) / discard (Draft): `POST /web/purchases/:id/cancel` (HTMX,
+    `hx-confirm` asks first)
 
 `GET /suppliers` — suppliers + cost satellite (M3):
 
@@ -568,7 +578,7 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
-Navigation: the header links Dashboard, Products, Sales, Customers, Purchases and Suppliers; page-level links reach the detail/back views.
+Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases), Catalogue (Products, Suppliers, Customers) and Cash (Accounts, currently the dashboard section). Each page's rendering struct carries a nav key and the server marks the active entry, so the state is correct without JavaScript. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path.
 
 ## Styles & local assets
 
@@ -908,6 +918,33 @@ router, form extraction and Askama rendering.
 - **Native forms**: a `this.action=` rewrite inside `onsubmit` fails the guard
   (htmx ignores the form action property), and native `action=` targets are
   probed with their form method like any other target.
+- **Referenced-id guard**: every seeded page is scanned for `product #`,
+  `account #`, `method #`, `customer #` and `supplier #` followed by digits, so a
+  list or fragment can never leak the internal id of a referenced entity. A
+  document's own id stays allowed (`draft #12`, `2024-SALE-000012`), and the scan
+  is pinned by a page-copy mutation test. The receipt list resolves account and
+  method names through the finance read paths, and the guard fixture collects a
+  receipt so the customer statement renders that list and the rule covers it.
+
+## Tests (browser suite)
+
+A second toolchain lives in `e2e/`: a Playwright browser suite that drives the
+real interface, because interaction, focus, navigation and dialogs are only
+honest in a browser. One command runs it, it never touches `roya.db`, and it
+needs nothing installed or managed for Node (Playwright's Python driver bundles
+its own Node runtime inside the suite's virtual environment):
+
+```bash
+scripts/e2e.sh          # headless; see e2e/README.md for setup and options
+```
+
+The suite builds the binary once, spawns it against a throwaway SQLite file on a
+free port whose isolation it proves from the server's own log, seeds data through
+the HTTP API reading each step's effect back, and writes a Playwright trace,
+screenshot and server log only when a test fails. `cargo test` stays independent
+of it and keeps its current speed; business rules remain in the Rust suite. The
+one-time Chromium download, the covered flows and the deliberate boundary are
+documented in [`e2e/README.md`](e2e/README.md).
 
 ## License
 

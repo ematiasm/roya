@@ -4,13 +4,19 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewProduct, Product, ProductKind};
+use crate::models::{NewProduct, Product, ProductBarcode, ProductKind};
 
 #[async_trait]
 pub trait ProductRepository: Send + Sync {
     async fn create(&self, input: &NewProduct) -> AppResult<Product>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Product>>;
     async fn find_by_sku(&self, sku: &str) -> AppResult<Option<Product>>;
+    /// Exact SKU regardless of case, used by the scanner/SKU resolution path.
+    async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>>;
+    /// Every barcode alias. The normalized catalogue search matches the whole
+    /// (small) set in Rust, so name/SKU/barcode share one matching definition; this
+    /// read owns the `product_barcodes` SQL the retired picker query used to hold.
+    async fn list_barcodes(&self) -> AppResult<Vec<ProductBarcode>>;
     async fn list(&self) -> AppResult<Vec<Product>>;
     async fn list_by_category(&self, category_id: i64) -> AppResult<Vec<Product>>;
     async fn count_by_category(&self, category_id: i64) -> AppResult<i64>;
@@ -34,6 +40,7 @@ fn kind_from_str(s: &str) -> ProductKind {
     }
 }
 
+/// Escape the LIKE wildcards in a user-typed value so `%` and `_` stay literal.
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Product {
     let sale_str: String = row.get("sale_price");
     let cost_str: String = row.get("cost_price");
@@ -133,6 +140,33 @@ impl ProductRepository for SqliteProductRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(row_to_product))
+    }
+
+    async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>> {
+        let row = sqlx::query(
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at FROM products WHERE sku = ? COLLATE NOCASE ORDER BY id LIMIT 1"#,
+        )
+        .bind(sku)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_product))
+    }
+
+    async fn list_barcodes(&self) -> AppResult<Vec<ProductBarcode>> {
+        let rows = sqlx::query(
+            "SELECT id, product_id, code, created_at FROM product_barcodes ORDER BY product_id, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProductBarcode {
+                id: row.get("id"),
+                product_id: row.get("product_id"),
+                code: row.get("code"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
     }
 
     async fn list(&self) -> AppResult<Vec<Product>> {

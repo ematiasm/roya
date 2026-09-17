@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}Roya — {{ page_title }}{% endblock %}
+{% block content %}
+{# page_title, the breadcrumb and the action slot are struct fields, so the
+   shared page-header component reads them without locals. #}
+{% include "partials/page_header.html" %}
+<div id="purchase-record">
+  {% include "partials/purchase_detail.html" %}
+</div>
+{% endblock %}

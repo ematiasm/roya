@@ -347,6 +347,140 @@ where
             .ok_or_else(|| AppError::NotFound(format!("product {id} not found")))
     }
 
+    // -- picker reads (N4) --------------------------------------------------
+
+    /// Upper bound for one picker search: enough choices without dumping the
+    /// whole catalogue into a fragment.
+    pub const PRODUCT_SEARCH_LIMIT: i64 = 10;
+
+    /// Bounded read behind `GET /web/product-search`: normalized name, SKU and
+    /// barcode matching over the small catalogue, with derived stock. The empty
+    /// query is not a search and never returns the catalogue.
+    pub async fn search_products(&self, query: &str) -> AppResult<Vec<ProductStock>> {
+        let value = query.trim();
+        if value.is_empty() {
+            return Ok(Vec::new());
+        }
+        let products = self
+            .match_catalogue(value, Some(Self::PRODUCT_SEARCH_LIMIT as usize))
+            .await?;
+        self.with_stock(products).await
+    }
+
+    /// Catalogue filter behind the products list (N5): the same normalized
+    /// name/SKU/barcode matching the picker uses, without its row bound, combined
+    /// with the existing category filter. An empty query contributes no constraint,
+    /// so the list stays whole.
+    pub async fn filter_products(
+        &self,
+        query: &str,
+        category_id: Option<i64>,
+    ) -> AppResult<Vec<ProductStock>> {
+        let value = query.trim();
+        let products = if value.is_empty() {
+            self.products.list().await?
+        } else {
+            self.match_catalogue(value, None).await?
+        };
+        let products = match category_id {
+            Some(cid) => products
+                .into_iter()
+                .filter(|product| product.category_id == Some(cid))
+                .collect(),
+            None => products,
+        };
+        self.with_stock(products).await
+    }
+
+    /// The one matching definition for the party and catalogue searches: fold both
+    /// sides with `normalize_search` so case and Spanish diacritics do not matter,
+    /// over the whole (small) catalogue fetched once. `limit` bounds the picker; the
+    /// catalogue list passes `None`. If the catalogue ever stops being small, this
+    /// needs a normalized index instead.
+    async fn match_catalogue(&self, query: &str, limit: Option<usize>) -> AppResult<Vec<Product>> {
+        let needle = crate::models::normalize_search(query);
+        let products = self.products.list().await?;
+        let by_id: std::collections::BTreeMap<i64, usize> = products
+            .iter()
+            .enumerate()
+            .map(|(index, product)| (product.id, index))
+            .collect();
+        let mut matched: std::collections::BTreeSet<usize> = products
+            .iter()
+            .enumerate()
+            .filter(|(_, product)| {
+                crate::models::normalize_search(&product.name).contains(&needle)
+                    || crate::models::normalize_search(&product.sku).contains(&needle)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for barcode in self.products.list_barcodes().await? {
+            if crate::models::normalize_search(&barcode.code).contains(&needle) {
+                if let Some(index) = by_id.get(&barcode.product_id) {
+                    matched.insert(*index);
+                }
+            }
+        }
+        let mut out: Vec<Product> = matched
+            .into_iter()
+            .map(|index| products[index].clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        if let Some(limit) = limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
+    /// Derive stock and the reorder suggestion for a product list. Shared by the
+    /// picker search and the catalogue filter so both read stock the same way.
+    async fn with_stock(&self, products: Vec<Product>) -> AppResult<Vec<ProductStock>> {
+        let mut out = Vec::with_capacity(products.len());
+        for product in products {
+            let stock = self.movements.stock_for_product(product.id).await?;
+            let suggested = Self::suggestion_for(&product, stock);
+            out.push(ProductStock {
+                product,
+                stock,
+                suggested,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Resolve one typed or scanned value for a line: exact barcode, then exact
+    /// SKU (case-insensitive), then a numeric id. That is what makes an exact scan
+    /// a single step with no selection.
+    ///
+    /// Nothing exact is a 400 naming how many partial matches the picker search
+    /// found, so the user can pick one from the list. Generic on purpose: the
+    /// purchase record page reuses it unchanged.
+    pub async fn resolve_product_ref(&self, raw: &str) -> AppResult<Product> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(AppError::Validation("product is required".into()));
+        }
+        if let Some(barcode) = self.barcodes.find_by_code(value).await? {
+            if let Some(product) = self.products.find_by_id(barcode.product_id).await? {
+                return Ok(product);
+            }
+        }
+        if let Some(product) = self.products.find_by_sku_ci(value).await? {
+            return Ok(product);
+        }
+        if let Ok(id) = value.parse::<i64>() {
+            if let Some(product) = self.products.find_by_id(id).await? {
+                return Ok(product);
+            }
+        }
+        let matches = self.search_products(value).await?;
+        let noun = if matches.len() == 1 { "match" } else { "matches" };
+        Err(AppError::Validation(format!(
+            "no exact match for \"{value}\" — the search found {} {noun}; pick one from the list",
+            matches.len()
+        )))
+    }
+
     // -- barcodes -----------------------------------------------------------
 
     pub async fn add_barcode(
@@ -874,5 +1008,143 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(row.0, 0);
+    }
+
+    // -- N4: the picker search and line-value resolution ----------------------
+
+    fn named(sku: &str, name: &str) -> NewProduct {
+        NewProduct {
+            name: name.to_string(),
+            ..product_input(sku)
+        }
+    }
+
+    /// AC8 (read side): one query path matches name, SKU and barcode, and the
+    /// result carries derived stock.
+    #[tokio::test]
+    async fn n4_search_matches_name_sku_and_barcode() {
+        let s = svc(true).await;
+        let yerba = s
+            .create_product(named("YERBA-500", "Yerba Mate"))
+            .await
+            .unwrap();
+        let galletas = s
+            .create_product(named("GAL-10", "Galletitas"))
+            .await
+            .unwrap();
+        s.add_barcode(yerba.id, "7790000000017").await.unwrap();
+        s.record_movement(movement(yerba.id, "7", MovementType::In))
+            .await
+            .unwrap();
+
+        let by_name = s.search_products("yerba").await.unwrap();
+        assert_eq!(by_name.len(), 1, "name match: {by_name:?}");
+        assert_eq!(by_name[0].product.id, yerba.id);
+        assert_eq!(by_name[0].stock, dec("7"), "stock rides along");
+
+        let by_sku = s.search_products("yerba-5").await.unwrap();
+        assert_eq!(by_sku.len(), 1, "sku match: {by_sku:?}");
+        assert_eq!(by_sku[0].product.id, yerba.id);
+
+        // The barcode matches through the product_barcodes table.
+        let by_barcode = s.search_products("7790000").await.unwrap();
+        assert_eq!(by_barcode.len(), 1, "barcode match: {by_barcode:?}");
+        assert_eq!(by_barcode[0].product.id, yerba.id);
+
+        let other = s.search_products("galletitas").await.unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].product.id, galletas.id);
+    }
+
+    /// AC8 (negative): an empty query never dumps the catalogue, the result set
+    /// is bounded, and LIKE wildcards in the typed value are literal text.
+    #[tokio::test]
+    async fn n4_search_is_bounded_and_empty_query_returns_nothing() {
+        let s = svc(true).await;
+        for i in 0..15 {
+            s.create_product(named(&format!("BULK-{i:02}"), &format!("Bulk item {i}")))
+                .await
+                .unwrap();
+        }
+
+        assert!(s.search_products("").await.unwrap().is_empty());
+        assert!(s.search_products("   ").await.unwrap().is_empty());
+        assert!(s.search_products("nothing-here").await.unwrap().is_empty());
+
+        let bulk = s.search_products("bulk").await.unwrap();
+        assert_eq!(
+            bulk.len(),
+            Svc::PRODUCT_SEARCH_LIMIT as usize,
+            "the search endpoint must stay bounded"
+        );
+
+        // `%` is a user-typed character, not a wildcard: it must not match all.
+        assert!(s.search_products("%").await.unwrap().is_empty());
+    }
+
+    /// AC9 (resolution): exact barcode, then exact SKU case-insensitive, then a
+    /// numeric id, so an exact scan needs no selection step.
+    #[tokio::test]
+    async fn n4_resolve_prefers_barcode_then_sku_then_id() {
+        let s = svc(true).await;
+        let scanned = s
+            .create_product(named("SCAN-SKU", "Scanned product"))
+            .await
+            .unwrap();
+        s.add_barcode(scanned.id, "12345").await.unwrap();
+        // Same text as the barcode on purpose: the barcode must win.
+        let sku_twin = s
+            .create_product(named("12345", "SKU twin"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            s.resolve_product_ref("12345").await.unwrap().id,
+            scanned.id,
+            "exact barcode wins"
+        );
+
+        let plain = s
+            .create_product(named("PLAIN-9", "Plain product"))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.resolve_product_ref("plain-9").await.unwrap().id,
+            plain.id,
+            "SKU match is case-insensitive"
+        );
+
+        assert_eq!(
+            s.resolve_product_ref(&sku_twin.id.to_string())
+                .await
+                .unwrap()
+                .id,
+            sku_twin.id,
+            "a numeric value resolves as an id when no barcode or SKU matches"
+        );
+    }
+
+    /// AC12: a value that resolves to nothing names the partial matches the
+    /// search found, so the user knows whether to pick or to fix the input.
+    #[tokio::test]
+    async fn n4_resolve_unknown_explains_the_search_match_count() {
+        let s = svc(true).await;
+        s.create_product(named("Y-500", "Yerba Mate")).await.unwrap();
+        s.create_product(named("Y-900", "Yerba Premium"))
+            .await
+            .unwrap();
+
+        let err = s.resolve_product_ref("yerba").await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("no exact match"), "{msg}");
+        assert!(msg.contains("2 matches"), "{msg}");
+
+        let err = s.resolve_product_ref("missing").await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("0 matches"), "{msg}");
+
+        let err = s.resolve_product_ref("").await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
     }
 }

@@ -57,6 +57,7 @@ struct CustomersTemplate {
     methods: Vec<PaymentMethod>,
     today: String,
     warning: Option<String>,
+    nav_key: &'static str,
 }
 
 #[derive(Template)]
@@ -213,6 +214,7 @@ async fn customers_page(State(state): State<AppState>) -> Result<Html<String>, A
         methods,
         today: today().to_string(),
         warning: None,
+        nav_key: "customers",
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -240,6 +242,7 @@ async fn customer_statement_page(
         methods,
         today: today().to_string(),
         warning: None,
+        nav_key: "customers",
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,

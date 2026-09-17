@@ -398,7 +398,8 @@ struct RenderedTarget {
     method: String,
     target: String,
     /// The attribute sits on a `<form>` (shell wiring) instead of a data-bound
-    /// row/link. On typed-id pages a form target must never hardcode an id.
+    /// row/link. Where `concrete_ids_are_defects` is set, a form target must
+    /// never hardcode an id.
     form_bound: bool,
 }
 
@@ -438,13 +439,27 @@ fn form_regions(html: &str) -> Vec<&str> {
     out
 }
 
-/// Value of a double-quoted attribute inside an HTML tag.
+/// Value of a double-quoted attribute inside an HTML tag. The attribute name must
+/// start at the tag or after whitespace, so `data-action` is not read as
+/// `action` and `hx-method` is not read as `method`.
 fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let needle = format!("{name}=\"");
-    let start = tag.find(&needle)?;
-    let after = &tag[start + needle.len()..];
-    let end = after.find('"')?;
-    Some(&after[..end])
+    let mut offset = 0;
+    while let Some(found) = tag[offset..].find(&needle) {
+        let start = offset + found;
+        let at_boundary = tag[..start]
+            .chars()
+            .next_back()
+            .map(|c| c.is_ascii_whitespace())
+            .unwrap_or(true);
+        if at_boundary {
+            let after = &tag[start + needle.len()..];
+            let end = after.find('"')?;
+            return Some(&after[..end]);
+        }
+        offset = start + needle.len();
+    }
+    None
 }
 
 fn htmx_targets_in(html: &str) -> Vec<(String, String, String)> {
@@ -740,15 +755,16 @@ fn extract_script_targets(html: &str) -> Result<Vec<RenderedTarget>, String> {
 /// URL-encoded `%7B`. A `:` is a placeholder marker only in the path, so
 /// date/time query values (`?from=2024-05-01T00:00`) stay legitimate.
 ///
-/// On typed-id pages a concrete numeric segment means the template hardcoded
-/// an id. A final numeric segment is a data-bound record link (the list View
-/// buttons) and stays valid; anything else, or any form-bound target, is
-/// rejected.
+/// When `concrete_ids_are_defects` is set, a concrete numeric segment means
+/// the template hardcoded an id: that page's URL carries no id and its forms
+/// have no data-bound ids. A final numeric segment on a non-form target is a
+/// data-bound record link and stays valid; anything else, or any form-bound
+/// target, is rejected.
 fn check_target_shape(
     page: &str,
     attr: &str,
     target: &str,
-    typed_id_page: bool,
+    concrete_ids_are_defects: bool,
     form_bound: bool,
 ) -> Result<(), String> {
     if target.split('/').any(|segment| segment == "0") {
@@ -771,13 +787,13 @@ fn check_target_shape(
             "{page}: {attr}=\"{target}\" still contains a template placeholder marker"
         ));
     }
-    if typed_id_page {
+    if concrete_ids_are_defects {
         let segments = path_segments(target);
         let last = segments.len().saturating_sub(1);
         for (index, segment) in segments.iter().enumerate() {
             if segment.parse::<i64>().is_ok() && (form_bound || index != last) {
                 return Err(format!(
-                    "{page}: {attr}=\"{target}\" hardcodes a concrete id segment on a typed-id page; the id must come from the form input"
+                    "{page}: {attr}=\"{target}\" hardcodes a concrete id segment on a page whose URL carries no id; the id must come from the URL or a data-bound link"
                 ));
             }
         }
@@ -787,7 +803,11 @@ fn check_target_shape(
 
 /// Native form wiring: a `this.action` rewrite is dead under htmx, and native
 /// actions are shape-checked like any other target.
-fn check_native_form(page: &str, form: &RenderedForm, typed_id_page: bool) -> Result<(), String> {
+fn check_native_form(
+    page: &str,
+    form: &RenderedForm,
+    concrete_ids_are_defects: bool,
+) -> Result<(), String> {
     if let Some(onsubmit) = &form.onsubmit {
         if onsubmit.replace(' ', "").contains("this.action=") {
             return Err(format!(
@@ -797,33 +817,133 @@ fn check_native_form(page: &str, form: &RenderedForm, typed_id_page: bool) -> Re
     }
     if let Some(action) = &form.action {
         if !action.is_empty() && action != "#" {
-            check_target_shape(page, "form action", action, typed_id_page, true)?;
+            check_target_shape(page, "form action", action, concrete_ids_are_defects, true)?;
         }
     }
     Ok(())
 }
 
 /// Shape-only guard over a rendered page: pure, so mutation tests can assert
-/// the exact rejection without building an app.
+/// the exact rejection without building an app. `concrete_ids_are_defects`
+/// applies the id-free rule to pages whose URL carries no id and whose forms
+/// have no data-bound ids.
 fn check_rendered_wiring_shape(
     page: &str,
     html: &str,
-    typed_id_page: bool,
+    concrete_ids_are_defects: bool,
 ) -> Result<(), String> {
     for target in extract_htmx_targets(html) {
         check_target_shape(
             page,
             &target.attr,
             &target.target,
-            typed_id_page,
+            concrete_ids_are_defects,
             target.form_bound,
         )?;
     }
     for target in extract_script_targets(html).map_err(|e| format!("{page}: {e}"))? {
-        check_target_shape(page, &target.attr, &target.target, typed_id_page, false)?;
+        check_target_shape(page, &target.attr, &target.target, concrete_ids_are_defects, false)?;
     }
     for form in extract_rendered_forms(html) {
-        check_native_form(page, &form, typed_id_page)?;
+        check_native_form(page, &form, concrete_ids_are_defects)?;
+    }
+    Ok(())
+}
+
+/// Every `hx-target` / `hx-include` attribute value on the page, with the
+/// attribute it came from. Templates write these selectors literally, so the raw
+/// attribute scan is exact.
+fn hx_selector_attrs(html: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for attr in ["hx-target", "hx-include"] {
+        let needle = format!("{attr}=\"");
+        let mut rest = html;
+        while let Some(start) = rest.find(&needle) {
+            let after = &rest[start + needle.len()..];
+            let end = after
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated {attr} attribute"));
+            out.push((attr.to_string(), after[..end].to_string()));
+            rest = &after[end..];
+        }
+    }
+    out
+}
+
+/// A selector a page declares external, bound to the guarded page that must
+/// render it. The guard reads that host page in the same run, so a declaration
+/// cannot name a selector no page renders.
+#[derive(Clone)]
+struct ExternalSelector {
+    selector: &'static str,
+    host: &'static str,
+}
+
+/// The HTML the guarded run rendered, keyed by page label, so a declaration can
+/// be checked against the page that actually hosts it.
+type RenderedPages = std::collections::BTreeMap<&'static str, String>;
+
+/// `hx-target` / `hx-include` must point at an element a page actually renders,
+/// not just at a route that resolves. A page's selectors are read the same way
+/// for every seeded page, and each page names the few selectors it may reach on
+/// a host document instead:
+///
+/// - a detail fragment renders into the record-page wrapper (`#sale-record`,
+///   `#purchase-record`), which the fragment itself does not emit; and
+/// - an out-of-band-swapped element is inserted into the host page the same way,
+///   so its selectors belong to the host too (the picker results fragment reuses
+///   the host picker's `#line-picker` and money region).
+///
+/// Every declaration is a bound check against the named host page in the same
+/// run, so a declaration that no page renders fails. Anything not declared
+/// external must match an `id` in this page's HTML. The codebase targets elements
+/// with absolute `#id` selectors; any other form fails loudly instead of being
+/// skipped.
+fn check_same_page_selectors(
+    page: &str,
+    html: &str,
+    external_selectors: &[ExternalSelector],
+    rendered_pages: &RenderedPages,
+) -> Result<(), String> {
+    // Declarations first: an unused bogus declaration must not hide.
+    for declared in external_selectors {
+        let host_html = rendered_pages.get(declared.host).ok_or_else(|| {
+            format!(
+                "{page}: external selector {:?} names host page {:?}, which is not in the guarded page list",
+                declared.selector, declared.host
+            )
+        })?;
+        let Some(id) = declared.selector.strip_prefix('#').filter(|id| !id.is_empty()) else {
+            return Err(format!(
+                "{page}: external selector {:?} must be an absolute #id so its host page can be checked",
+                declared.selector
+            ));
+        };
+        if !host_html.contains(&format!("id=\"{id}\"")) {
+            return Err(format!(
+                "{page}: external selector {:?} is declared external, but host page {:?} does not render it",
+                declared.selector, declared.host
+            ));
+        }
+    }
+
+    for (attr, value) in hx_selector_attrs(html) {
+        for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            if external_selectors.iter().any(|e| e.selector == token) {
+                continue;
+            }
+            if !token.starts_with('#') || token.len() == 1 {
+                return Err(format!(
+                    "{page}: {attr}=\"{value}\" uses selector {token:?}; this guard resolves absolute #id selectors, so extend it rather than skipping a new form"
+                ));
+            }
+            let id = &token[1..];
+            if !html.contains(&format!("id=\"{id}\"")) {
+                return Err(format!(
+                    "{page}: {attr}=\"{value}\" points at {token:?}, but no element with id={id:?} is rendered on this page"
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -868,7 +988,7 @@ async fn assert_htmx_targets_are_wired(
     probe_app: &Router,
     page: &str,
     html: &str,
-    typed_id_page: bool,
+    concrete_ids_are_defects: bool,
 ) -> Result<(), String> {
     let (status, body) = send(
         probe_app,
@@ -902,7 +1022,7 @@ async fn assert_htmx_targets_are_wired(
             page,
             &target.attr,
             &target.target,
-            typed_id_page,
+            concrete_ids_are_defects,
             target.form_bound,
         )?;
         probe_or_fail(
@@ -916,7 +1036,7 @@ async fn assert_htmx_targets_are_wired(
     }
 
     for target in extract_script_targets(html).map_err(|e| format!("{page}: {e}"))? {
-        check_target_shape(page, &target.attr, &target.target, typed_id_page, false)?;
+        check_target_shape(page, &target.attr, &target.target, concrete_ids_are_defects, false)?;
         probe_or_fail(
             probe_app,
             page,
@@ -928,7 +1048,7 @@ async fn assert_htmx_targets_are_wired(
     }
 
     for form in extract_rendered_forms(html) {
-        check_native_form(page, &form, typed_id_page)?;
+        check_native_form(page, &form, concrete_ids_are_defects)?;
         if let Some(action) = &form.action {
             if !action.is_empty() && action != "#" {
                 probe_or_fail(probe_app, page, "form action", &form.method, action).await?;
@@ -1019,12 +1139,243 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     assert_eq!(status, StatusCode::OK, "seed customer: {resp}");
     let customer = customer_id_by_name(pool, "GuardCustomer").await;
 
+    // A confirmed credit sale collected into a receipt, so the customer statement
+    // renders the receipt list and the referenced-id rule covers that path too.
+    let guard_sale =
+        create_sale_draft_for_customer(app, customer, "Credit", "2024-06-02").await;
+    add_sale_line_via_web(app, guard_sale, product, "1").await;
+    confirm_sale_via_web(app, guard_sale, None, None).await;
+    let (status, resp) = post_form(
+        app,
+        "/web/customer-receipts",
+        &format!(
+            "customer_id={customer}&account_id={account}&method_id={cash}&amount=10&date=2024-05-10"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed receipt: {resp}");
+
     WiringFixture {
         account,
         sale,
         purchase,
         customer,
     }
+}
+
+/// One seeded page under the wiring guard.
+#[derive(Clone)]
+struct GuardedPage {
+    label: &'static str,
+    path: String,
+    /// True for a page whose URL carries no id and whose forms have no
+    /// data-bound ids: a concrete numeric id in a form-bound request target is a
+    /// defect there. Record pages and detail fragments carry the ids they render.
+    concrete_ids_are_defects: bool,
+    /// Selectors this page legitimately points at on a host document, each bound
+    /// to the page that must render it (see `check_same_page_selectors`). Empty
+    /// for full pages, which must resolve every selector in their own HTML.
+    external_selectors: Vec<ExternalSelector>,
+}
+
+/// The seeded pages the wiring guard renders. Both the guard and the mutation pin
+/// tests read this list, so each page's rules are declared once and cannot be
+/// relaxed in passing.
+fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
+    vec![
+        GuardedPage {
+            label: "dashboard",
+            path: "/".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "account detail",
+            path: format!("/accounts/{}", fixture.account),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "products",
+            path: "/products".to_string(),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "sales",
+            path: "/sales".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "purchases",
+            path: "/purchases".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "suppliers",
+            path: "/suppliers".to_string(),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "customers",
+            path: "/customers".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        // The list/detail fragments the pages refresh over HTMX carry more
+        // targets (View buttons, inline line editors), so guard the seeded
+        // details too.
+        GuardedPage {
+            label: "sale record page",
+            path: format!("/sales/{}", fixture.sale),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "purchase record page",
+            path: format!("/purchases/{}", fixture.purchase),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "sale detail fragment",
+            path: format!("/web/sales/{}", fixture.sale),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![ExternalSelector {
+                selector: "#sale-record",
+                host: "sale record page",
+            }],
+        },
+        GuardedPage {
+            label: "product search fragment",
+            path: format!(
+                "/web/product-search?q=GUARD-P&price=sale&line_action=/web/sales/{}/lines&line_target=%23sale-record-money",
+                fixture.sale
+            ),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![
+                ExternalSelector {
+                    selector: "#line-picker",
+                    host: "sale record page",
+                },
+                ExternalSelector {
+                    selector: "#sale-record-money",
+                    host: "sale record page",
+                },
+            ],
+        },
+        GuardedPage {
+            label: "purchase product search fragment",
+            path: format!(
+                "/web/product-search?q=GUARD-P&price=cost&line_action=/web/purchases/{}/lines&line_target=%23purchase-record-money",
+                fixture.purchase
+            ),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![
+                ExternalSelector {
+                    selector: "#line-picker",
+                    host: "purchase record page",
+                },
+                ExternalSelector {
+                    selector: "#purchase-record-money",
+                    host: "purchase record page",
+                },
+            ],
+        },
+        GuardedPage {
+            label: "purchase detail fragment",
+            path: format!("/web/purchases/{}", fixture.purchase),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![ExternalSelector {
+                selector: "#purchase-record",
+                host: "purchase record page",
+            }],
+        },
+        GuardedPage {
+            label: "customer statement",
+            path: format!("/customers/{}", fixture.customer),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+    ]
+}
+
+/// Referenced entities the interface always shows by name: a product, account,
+/// payment method, customer or supplier. A document's own id is exempt, so the
+/// scan requires the entity noun before the digit, which keeps the legitimate
+/// `draft #12` and `2024-SALE-000012` allowed.
+const BARE_REFERENCED_ID_PREFIXES: [&str; 5] = [
+    "product #",
+    "account #",
+    "method #",
+    "customer #",
+    "supplier #",
+];
+
+/// The first `<entity noun> #<digits>` in a rendered page, case-insensitive, or
+/// `None`. Pure, so the mutation pin can prove the scan bites on a page copy
+/// without rendering one.
+fn bare_referenced_id(html: &str) -> Option<String> {
+    let lowered = html.to_ascii_lowercase();
+    for prefix in BARE_REFERENCED_ID_PREFIXES {
+        let mut from = 0;
+        while let Some(offset) = lowered[from..].find(prefix) {
+            let at = from + offset;
+            let digits: String = lowered[at + prefix.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !digits.is_empty() {
+                return Some(format!("{prefix}{digits}"));
+            }
+            from = at + prefix.len();
+        }
+    }
+    None
+}
+
+/// Fail when a rendered page prints a referenced entity's internal id instead of
+/// its name. The entity nouns are explicit so a document id (`draft #12`) never
+/// fails, and the message names both the page and the offending fragment.
+fn check_no_bare_referenced_ids(page: &str, html: &str) -> Result<(), String> {
+    match bare_referenced_id(html) {
+        Some(matched) => Err(format!(
+            "{page}: renders a bare referenced-entity id {matched:?}; show the entity's name instead"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Render every guarded page, then apply both rules to the same run: route
+/// resolution per page, and selector declarations bound to the host page the run
+/// rendered. A declaration cannot pass by membership alone.
+async fn assert_guarded_pages_are_wired(
+    app: &Router,
+    probe_app: &Router,
+    pages: &[GuardedPage],
+) -> Result<(), String> {
+    let mut rendered: RenderedPages = RenderedPages::new();
+    for page in pages {
+        let (status, html) = get(app, &page.path).await;
+        if status != StatusCode::OK {
+            return Err(format!("{} {}: {html:.400}", page.label, page.path));
+        }
+        check_no_bare_referenced_ids(page.label, &html)
+            .map_err(|err| format!("{} {}: {err}", page.label, page.path))?;
+        assert_htmx_targets_are_wired(probe_app, page.label, &html, page.concrete_ids_are_defects)
+            .await?;
+        rendered.insert(page.label, html);
+    }
+    for page in pages {
+        let html = rendered
+            .get(page.label)
+            .ok_or_else(|| format!("{} was not rendered", page.label))?;
+        check_same_page_selectors(page.label, html, &page.external_selectors, &rendered)?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -1038,47 +1389,9 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
     let (probe_app, probe_pool) = test_app().await;
     let _probe_fixture = seed_wiring_fixture(&probe_app, &probe_pool).await;
 
-    // Typed-id shells (`/`, `/sales`, `/purchases`) must not hardcode ids in
-    // their form targets; record-bound pages and detail fragments may carry the
-    // ids they render data for.
-    let pages = [
-        ("dashboard", "/".to_string(), true),
-        (
-            "account detail",
-            format!("/accounts/{}", fixture.account),
-            false,
-        ),
-        ("products", "/products".to_string(), false),
-        ("sales", "/sales".to_string(), true),
-        ("purchases", "/purchases".to_string(), true),
-        ("suppliers", "/suppliers".to_string(), false),
-        ("customers", "/customers".to_string(), true),
-        // The list/detail fragments the pages refresh over HTMX carry more
-        // targets (View buttons, inline line editors), so guard the seeded
-        // details too.
-        (
-            "sale detail fragment",
-            format!("/web/sales/{}", fixture.sale),
-            false,
-        ),
-        (
-            "purchase detail fragment",
-            format!("/web/purchases/{}", fixture.purchase),
-            false,
-        ),
-        (
-            "customer statement",
-            format!("/customers/{}", fixture.customer),
-            false,
-        ),
-    ];
-    for (label, path, typed_id_page) in pages {
-        let (status, html) = get(&app, &path).await;
-        assert_eq!(status, StatusCode::OK, "{label} {path}: {html:.400}");
-        assert_htmx_targets_are_wired(&probe_app, label, &html, typed_id_page)
-            .await
-            .unwrap_or_else(|err| panic!("{err}"));
-    }
+    assert_guarded_pages_are_wired(&app, &probe_app, &guarded_pages(&fixture))
+        .await
+        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -2097,15 +2410,15 @@ async fn check_refund_transaction(
 // fails loudly if the guard regresses to accepting it.
 // ---------------------------------------------------------------------------
 
-fn typed_shell_shape(html: &str) -> Result<(), String> {
+fn id_free_page_shape(html: &str) -> Result<(), String> {
     check_rendered_wiring_shape("mutation", html, true)
 }
 
-/// Blind spot 1: a hardcoded non-zero id on a typed-id shell used to pass
+/// Blind spot 1: a hardcoded non-zero id on an id-free page used to pass
 /// because only the literal `0` segment was rejected.
 #[test]
-fn wiring_guard_catches_hardcoded_numeric_id_on_typed_page() {
-    let err = typed_shell_shape(
+fn wiring_guard_catches_hardcoded_numeric_id_on_id_free_page() {
+    let err = id_free_page_shape(
         r#"<form hx-post="/web/sales/1/confirm"><input name="sale_id"></form>"#,
     )
     .unwrap_err();
@@ -2113,11 +2426,11 @@ fn wiring_guard_catches_hardcoded_numeric_id_on_typed_page() {
     assert!(err.contains("hardcodes a concrete id segment"), "{err}");
 
     // A final numeric segment is also a hardcoded id when the wiring is a form...
-    let err = typed_shell_shape(r#"<form hx-post="/web/sales/7"></form>"#).unwrap_err();
+    let err = id_free_page_shape(r#"<form hx-post="/web/sales/7"></form>"#).unwrap_err();
     assert!(err.contains("hardcodes a concrete id segment"), "{err}");
 
     // ...while a data-bound record link (bare button, final segment) is fine.
-    typed_shell_shape(r#"<button hx-get="/web/sales/7">View</button>"#).unwrap();
+    id_free_page_shape(r#"<button hx-get="/web/sales/7">View</button>"#).unwrap();
 
     // Record-bound detail fragments may target the record they render for.
     check_rendered_wiring_shape(
@@ -2128,15 +2441,269 @@ fn wiring_guard_catches_hardcoded_numeric_id_on_typed_page() {
     .unwrap();
 }
 
+/// The verifier's mutation, pinned: adding a form with a hardcoded id to the
+/// sales list must fail the guard. The only thing standing between that
+/// mutation and a green run is the rule the page list carries for "sales", and
+/// this test reads it from the same list the guard uses, so relaxing it again
+/// makes this test fail before the mutation can ship.
+#[tokio::test]
+async fn wiring_guard_rejects_a_hardcoded_id_form_added_to_the_sales_list() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+
+    let sales_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "sales")
+        .expect("the sales list must be declared in the guarded page list");
+    let (status, html) = get(&app, &sales_page.path).await;
+    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", sales_page.path);
+
+    // Exactly the verifier's mutation: one extra form with a concrete id.
+    let mutant = format!(
+        "{html}<form hx-post=\"/web/sales/1/lines\"><input name=\"qty\" value=\"1\" /></form>"
+    );
+    let err = check_rendered_wiring_shape(
+        "sales list (mutated)",
+        &mutant,
+        sales_page.concrete_ids_are_defects,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("hardcodes a concrete id segment"),
+        "the guard must reject a hardcoded id on the sales list: {err}"
+    );
+
+    // The mirror: on the record page a concrete id is legitimate — the URL
+    // carries the record id and the line ids are data-bound.
+    let record_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "sale record page")
+        .expect("the sale record page must be declared in the guarded page list");
+    assert!(
+        !record_page.concrete_ids_are_defects,
+        "the record page carries the ids it renders and must stay out of the rule"
+    );
+    let (status, record_html) = get(&app, &record_page.path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}: {record_html:.400}",
+        record_page.path
+    );
+    check_rendered_wiring_shape(
+        "sale record page",
+        &record_html,
+        record_page.concrete_ids_are_defects,
+    )
+    .unwrap_or_else(|err| panic!("concrete ids must stay legitimate on the record page: {err}"));
+}
+
+/// The mirror pin: adding a form with a hardcoded id to the purchases list must
+/// fail the guard. The list carries no legitimate concrete id, so its flag must
+/// stay true; the new record page carries the ids it renders, so its flag must
+/// stay false. Reading both from the same list the guard uses means a future flip
+/// fails here before the mutation can ship.
+#[tokio::test]
+async fn wiring_guard_rejects_a_hardcoded_id_form_added_to_the_purchases_list() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+
+    let purchases_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "purchases")
+        .expect("the purchases list must be declared in the guarded page list");
+    assert!(
+        purchases_page.concrete_ids_are_defects,
+        "the purchases list carries no legitimate concrete id and must stay under the rule"
+    );
+    let (status, html) = get(&app, &purchases_page.path).await;
+    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", purchases_page.path);
+
+    // Exactly the verifier's mutation: one extra form with a concrete id.
+    let mutant = format!(
+        "{html}<form hx-post=\"/web/purchases/1/lines\"><input name=\"qty\" value=\"1\" /></form>"
+    );
+    let err = check_rendered_wiring_shape(
+        "purchases list (mutated)",
+        &mutant,
+        purchases_page.concrete_ids_are_defects,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("hardcodes a concrete id segment"),
+        "the guard must reject a hardcoded id on the purchases list: {err}"
+    );
+
+    // The mirror: on the purchase record page a concrete id is legitimate — the URL
+    // carries the record id and the line ids are data-bound.
+    let record_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "purchase record page")
+        .expect("the purchase record page must be declared in the guarded page list");
+    assert!(
+        !record_page.concrete_ids_are_defects,
+        "the record page carries the ids it renders and must stay out of the rule"
+    );
+    let (status, record_html) = get(&app, &record_page.path).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}: {record_html:.400}",
+        record_page.path
+    );
+    check_rendered_wiring_shape(
+        "purchase record page",
+        &record_html,
+        record_page.concrete_ids_are_defects,
+    )
+    .unwrap_or_else(|err| {
+        panic!("concrete ids must stay legitimate on the purchase record page: {err}")
+    });
+}
+
+/// The dangling-selector shape, pinned. Route resolution cannot see a selector
+/// that matches no rendered element, so this rule closes that gap: a control
+/// aimed at the removed `#purchase-detail` panel must fail, and so must removing
+/// the panel an existing control targets. The message names the page and the
+/// missing selector.
+#[tokio::test]
+async fn wiring_guard_rejects_hx_target_selectors_that_no_element_matches() {
+    // The rule in isolation: a selector that resolves passes, one that does not
+    // fails and names both the page and the selector.
+    check_same_page_selectors(
+        "control",
+        r##"<div id="panel"></div><button hx-target="#panel"></button>"##,
+        &[],
+        &RenderedPages::new(),
+    )
+    .unwrap();
+    let err = check_same_page_selectors(
+        "control",
+        r##"<button hx-target="#purchase-detail"></button>"##,
+        &[],
+        &RenderedPages::new(),
+    )
+    .unwrap_err();
+    assert!(err.contains("control"), "{err}");
+    assert!(err.contains("#purchase-detail"), "{err}");
+
+    let (app, pool) = test_app().await;
+    let _fixture = seed_wiring_fixture(&app, &pool).await;
+
+    // Mutation A: the verifier's shape — a control aimed at the removed panel.
+    let (status, purchases) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK, "{purchases:.400}");
+    let dangling = format!("{purchases}<button hx-target=\"#purchase-detail\"></button>");
+    let err = check_same_page_selectors("purchases", &dangling, &[], &RenderedPages::new()).unwrap_err();
+    eprintln!("dangling selector rejected: {err}");
+    assert!(err.contains("purchases"), "{err}");
+    assert!(err.contains("#purchase-detail"), "{err}");
+
+    // Mutation B: remove the panel an existing control targets.
+    let (status, sales) = get(&app, "/sales").await;
+    assert_eq!(status, StatusCode::OK, "{sales:.400}");
+    let removed = sales.replacen("id=\"sale-debt\"", "", 1);
+    assert_ne!(removed, sales, "the mutation must remove the targeted panel");
+    let err = check_same_page_selectors("sales", &removed, &[], &RenderedPages::new()).unwrap_err();
+    eprintln!("removed panel rejected: {err}");
+    assert!(err.contains("sales"), "{err}");
+    assert!(err.contains("#sale-debt"), "{err}");
+}
+
+/// The page-external exemptions are load-bearing and real: each selector a
+/// fragment may reach is rendered by the host page it swaps into, and the
+/// fragment check fails without the declaration.
+#[tokio::test]
+async fn fragment_external_selectors_resolve_on_their_host_record_pages() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+
+    let (status, sale_page) = get(&app, &format!("/sales/{}", fixture.sale)).await;
+    assert_eq!(status, StatusCode::OK, "{sale_page:.400}");
+    for id in ["sale-record", "sale-record-money", "line-picker"] {
+        assert!(
+            sale_page.contains(&format!("id=\"{id}\"")),
+            "the sale host page must render #{id} for its fragments"
+        );
+    }
+
+    let (status, purchase_page) = get(&app, &format!("/purchases/{}", fixture.purchase)).await;
+    assert_eq!(status, StatusCode::OK, "{purchase_page:.400}");
+    for id in ["purchase-record", "purchase-record-money", "line-picker"] {
+        assert!(
+            purchase_page.contains(&format!("id=\"{id}\"")),
+            "the purchase host page must render #{id} for its fragments"
+        );
+    }
+
+    // The shared search fragment is guarded in its purchase context too: it adds
+    // against the purchase money region and shows the cost.
+    let (status, purchase_search) = get(
+        &app,
+        &format!(
+            "/web/product-search?q=GUARD-P&price=cost&line_action=/web/purchases/{}/lines&line_target=%23purchase-record-money",
+            fixture.purchase
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{purchase_search}");
+    assert!(
+        purchase_search.contains("hx-target=\"#purchase-record-money\""),
+        "the purchase results add against the purchase money region: {purchase_search}"
+    );
+    assert!(
+        purchase_search.contains("cost $10"),
+        "the purchase results show the cost: {purchase_search}"
+    );
+
+    // Without the declared exemption the fragment genuinely fails, so the
+    // exemption is not decorative.
+    let (_, fragment) = get(&app, &format!("/web/sales/{}", fixture.sale)).await;
+    let err = check_same_page_selectors("sale detail fragment", &fragment, &[], &RenderedPages::new()).unwrap_err();
+    assert!(err.contains("#sale-record"), "{err}");
+}
+
+/// A declaration must be a bound check, not a trust list: declaring a selector
+/// that no page renders must fail the guard, within the same run.
+#[tokio::test]
+async fn wiring_guard_rejects_an_external_selector_no_host_page_renders() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+    let (probe_app, probe_pool) = test_app().await;
+    let _probe_fixture = seed_wiring_fixture(&probe_app, &probe_pool).await;
+
+    // The healthy declarations resolve on their host pages.
+    let mut pages = guarded_pages(&fixture);
+    assert_guarded_pages_are_wired(&app, &probe_app, &pages)
+        .await
+        .unwrap_or_else(|err| panic!("the declared exemptions must resolve: {err}"));
+
+    // Mutation: declare a selector that exists nowhere, on a real page.
+    let fragment = pages
+        .iter_mut()
+        .find(|page| page.label == "sale detail fragment")
+        .expect("the sale detail fragment is guarded");
+    fragment.external_selectors.push(ExternalSelector {
+        selector: "#purchase-detail",
+        host: "sale record page",
+    });
+    let err = assert_guarded_pages_are_wired(&app, &probe_app, &pages)
+        .await
+        .unwrap_err();
+    eprintln!("bogus exemption rejected: {err}");
+    assert!(err.contains("sale detail fragment"), "{err}");
+    assert!(err.contains("#purchase-detail"), "{err}");
+}
+
 /// Blind spot 5: a colon in the query string is not a template placeholder.
 #[test]
 fn wiring_guard_allows_datetime_query_colons_but_rejects_path_colon() {
-    typed_shell_shape(
+    id_free_page_shape(
         r#"<input hx-get="/web/transactions?from=2024-05-01T00:00&to=2024-05-02T23:59" />"#,
     )
     .unwrap();
 
-    let err = typed_shell_shape(r#"<button hx-get="/web/sales/:id"></button>"#).unwrap_err();
+    let err = id_free_page_shape(r#"<button hx-get="/web/sales/:id"></button>"#).unwrap_err();
     eprintln!("path colon rejected: {err}");
     assert!(err.contains("placeholder marker"), "{err}");
 }
@@ -2153,6 +2720,21 @@ fn wiring_guard_catches_dead_native_form_action_rewrite() {
     .unwrap_err();
     eprintln!("mutation-4a rejected: {err}");
     assert!(err.contains("this.action"), "{err}");
+}
+
+/// `data-action` names the failed action for the `#notice` region. It is not a
+/// native form `action`, so the guard must not read it as one and probe
+/// "Create product" as a URL.
+#[test]
+fn wiring_guard_does_not_read_data_action_as_a_native_action() {
+    let html = r#"<form data-action="Create product" hx-post="/web/products"></form>"#;
+    let forms = extract_rendered_forms(html);
+    assert_eq!(forms.len(), 1);
+    assert_eq!(
+        forms[0].action, None,
+        "data-action is a notice label, not an action URL"
+    );
+    check_rendered_wiring_shape("notice", html, false).unwrap();
 }
 
 /// Blind spot 2: the dead target `/web/sales/does-not-exist` matches the
@@ -2634,4 +3216,1525 @@ async fn money_invariant_catches_orphan_document_movement() {
     let detail = sale_detail(&app, sale).await;
     assert_eq!(dec(&detail["paid"]), Decimal::ZERO, "the orphan paid nothing");
     assert_eq!(dec(&detail["due"]), dec(&detail["total"]));
+}
+
+// ---------------------------------------------------------------------------
+// Shell: sidebar, page header and non-blocking feedback (redesign-interface N1a)
+// ---------------------------------------------------------------------------
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// `alert(` as a call, not the `price_alert(` method name.
+fn contains_bare_alert(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(position) = rest.find("alert(") {
+        let preceded_by_identifier = rest[..position]
+            .chars()
+            .next_back()
+            .map(|c| c.is_alphanumeric() || c == '_')
+            .unwrap_or(false);
+        if !preceded_by_identifier {
+            return true;
+        }
+        rest = &rest[position + "alert(".len()..];
+    }
+    false
+}
+
+/// The opening tag of the sidebar entry the server marked active.
+fn active_nav_tag(html: &str) -> &str {
+    let marker = html
+        .find("aria-current=\"page\"")
+        .unwrap_or_else(|| panic!("no sidebar entry is marked active: {html:.600}"));
+    let start = html[..marker]
+        .rfind('<')
+        .expect("the active marker must sit inside a tag");
+    let end = marker
+        + html[marker..]
+            .find('>')
+            .expect("unterminated active nav tag");
+    &html[start..=end]
+}
+
+/// Value of `data-nav` on the active sidebar entry.
+fn active_nav_key(html: &str) -> String {
+    let tag = active_nav_tag(html);
+    let start = tag
+        .find("data-nav=\"")
+        .expect("the active entry must carry a data-nav key")
+        + "data-nav=\"".len();
+    let rest = &tag[start..];
+    let end = rest.find('"').expect("unterminated data-nav attribute");
+    rest[..end].to_string()
+}
+
+#[test]
+fn template_suite_never_calls_the_blocking_alert() {
+    fn collect(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("templates directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                collect(&path, offenders);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("html") {
+                let text = std::fs::read_to_string(&path).expect("read template");
+                if contains_bare_alert(&text) {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    collect(std::path::Path::new("templates"), &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "alert() is blocking and must be replaced by the #notice region: {offenders:?}"
+    );
+}
+
+#[tokio::test]
+async fn sidebar_marks_the_active_entry_from_the_server_on_every_page() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+    let pages = [
+        ("dashboard", "/".to_string(), "dashboard"),
+        ("products", "/products".to_string(), "products"),
+        ("sales", "/sales".to_string(), "sales"),
+        ("purchases", "/purchases".to_string(), "purchases"),
+        ("suppliers", "/suppliers".to_string(), "suppliers"),
+        ("customers", "/customers".to_string(), "customers"),
+        (
+            "account detail",
+            format!("/accounts/{}", fixture.account),
+            "accounts",
+        ),
+        (
+            "customer statement",
+            format!("/customers/{}", fixture.customer),
+            "customers",
+        ),
+        (
+            "sale record page",
+            format!("/sales/{}", fixture.sale),
+            "sales",
+        ),
+        (
+            "purchase record page",
+            format!("/purchases/{}", fixture.purchase),
+            "purchases",
+        ),
+    ];
+    for (label, path, expected) in pages {
+        let (status, html) = get(&app, &path).await;
+        assert_eq!(status, StatusCode::OK, "{label} {path}: {html:.400}");
+        assert_eq!(
+            count_occurrences(&html, "aria-current=\"page\""),
+            1,
+            "{label}: exactly one sidebar entry must be active"
+        );
+        let active = active_nav_tag(&html);
+        assert!(
+            active.contains("data-nav-active=\"true\""),
+            "{label}: the active entry needs a machine-checkable marker: {active}"
+        );
+        assert!(
+            active.contains("text-accent"),
+            "{label}: the active entry must be visually distinct: {active}"
+        );
+        assert_eq!(active_nav_key(&html), expected, "{label} {path}");
+    }
+}
+
+#[tokio::test]
+async fn sidebar_groups_navigation_into_operation_catalogue_and_cash() {
+    let (app, _pool) = test_app().await;
+    let (status, html) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Groups render in the documented order.
+    let mut cursor = 0;
+    for group in ["operation", "catalogue", "cash"] {
+        let needle = format!("data-nav-group=\"{group}\"");
+        let found = html[cursor..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("group {group} missing or out of order: {html:.600}"));
+        cursor += found + needle.len();
+    }
+
+    // Every destination renders exactly once.
+    for key in [
+        "dashboard",
+        "sales",
+        "purchases",
+        "products",
+        "suppliers",
+        "customers",
+        "accounts",
+    ] {
+        assert_eq!(
+            count_occurrences(&html, &format!("data-nav=\"{key}\"")),
+            1,
+            "nav key {key} must render exactly once"
+        );
+    }
+
+    // Secondary shell facts stay available but below navigation.
+    assert!(html.contains("local · SQLite"), "environment line missing");
+    assert!(
+        html.contains("href=\"/api/accounts\""),
+        "REST API link missing"
+    );
+    assert!(
+        html.contains("href=\"/#accounts\""),
+        "accounts has no page yet: the entry must point at the dashboard section"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_and_products_use_the_page_header_component() {
+    let (app, _pool) = test_app().await;
+    for (path, title, action) in [
+        ("/", "Dashboard", "#new-transaction"),
+        ("/products", "Products", "#new-product"),
+    ] {
+        let (status, html) = get(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            count_occurrences(&html, "data-page-header"),
+            1,
+            "{path}: exactly one page header"
+        );
+        assert!(
+            html.contains(&format!("data-page-title>{title}</h1>")),
+            "{path}: page title missing: {html:.400}"
+        );
+        assert_eq!(
+            count_occurrences(&html, "data-page-action"),
+            1,
+            "{path}: exactly one primary action"
+        );
+        assert!(
+            html.contains(&format!("href=\"{action}\"")),
+            "{path}: primary action must target {action}"
+        );
+        assert!(
+            html.contains(&format!("id=\"{}\"", &action[1..])),
+            "{path}: primary action target {action} must exist on the page"
+        );
+    }
+
+    // Products is a catalogue list: the optional breadcrumb is visible.
+    let (_, products) = get(&app, "/products").await;
+    assert!(
+        products.contains("data-page-breadcrumb"),
+        "products must show the Catalogue breadcrumb"
+    );
+    let (_, dashboard) = get(&app, "/").await;
+    assert!(
+        !dashboard.contains("data-page-breadcrumb"),
+        "dashboard is top level: no breadcrumb"
+    );
+}
+
+#[tokio::test]
+async fn converted_pages_expose_the_notice_region_and_named_actions() {
+    let (app, _pool) = test_app().await;
+
+    let (status, dashboard) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(dashboard.contains("id=\"notice\""), "notice region missing");
+    assert!(
+        dashboard.contains("data-action=\"Create account\""),
+        "the create-account form must name its action: {dashboard:.400}"
+    );
+    assert!(
+        dashboard.contains("data-action=\"Add transaction\""),
+        "the add-transaction form must name its action"
+    );
+
+    let (status, products) = get(&app, "/products").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(products.contains("id=\"notice\""), "notice region missing");
+    for action in ["Create category", "Create product", "Record movement"] {
+        assert!(
+            products.contains(&format!("data-action=\"{action}\"")),
+            "form action {action:?} must be named for the notice"
+        );
+    }
+
+    assert!(
+        !contains_bare_alert(&dashboard),
+        "the served shell must not call alert()"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// N4: the picker loads a sale from the keyboard and the scanner alone
+// ---------------------------------------------------------------------------
+
+/// The add-line response must bring the picker back out of band, empty and
+/// focused, so the next scan lands without a click.
+fn assert_oob_picker_is_empty_and_focused(html: &str) {
+    let oob_pos = html
+        .find("hx-swap-oob=\"true\"")
+        .unwrap_or_else(|| panic!("the picker must come back out of band: {html:.800}"));
+    let tag_start = html[..oob_pos].rfind('<').unwrap();
+    let tag_end = oob_pos + html[oob_pos..].find('>').unwrap();
+    let oob_tag = &html[tag_start..=tag_end];
+    assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
+    let oob = &html[tag_start..];
+    assert!(oob.contains("autofocus"), "the picker must come back focused: {oob:.400}");
+    let input_pos = oob
+        .find("id=\"product-picker\"")
+        .expect("the out-of-band picker renders its field");
+    let input_start = oob[..input_pos].rfind('<').unwrap();
+    let input_end = input_pos + oob[input_pos..].find('>').unwrap();
+    let input_tag = &oob[input_start..=input_end];
+    assert!(
+        !input_tag.contains("value="),
+        "the picker must come back empty: {input_tag}"
+    );
+}
+
+/// The whole loop over HTTP with the series of requests a USB reader produces:
+/// type (the debounced search) then Enter (the line form), with the response
+/// re-focusing an empty picker for the next scan. No request in the loop needs a
+/// click, name, SKU and barcode all find the product, an exact barcode adds in
+/// one step, removing a line updates the total, and an unknown value is a clear
+/// 400 that adds nothing.
+#[tokio::test]
+async fn line_picker_loads_a_sale_without_a_click() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "SCAN-P", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{product}/barcodes"),
+        json!({ "code": "7791234567890" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode: {body}");
+    let sale = create_sale_draft_via_web(&app, &pool, "ScanBuyer", "Cash", "").await;
+    let base = format!("/web/sales/{sale}");
+
+    // Typing a name, a SKU or a barcode each find the product, through the same
+    // search path the field uses.
+    let search = format!(
+        "/web/product-search?price=sale&line_action={base}/lines&line_target=%23sale-record-money"
+    );
+    for needle in ["scan", "SCAN-P", "7791234567890"] {
+        let (status, fragment) = get(&app, &format!("{search}&q={needle}")).await;
+        assert_eq!(status, StatusCode::OK, "{fragment}");
+        assert!(fragment.contains("product SCAN-P"), "{needle}: {fragment}");
+        assert!(fragment.contains("SCAN-P"), "{needle}: {fragment}");
+        assert!(fragment.contains("$25"), "{needle}: price travels: {fragment}");
+        assert!(fragment.contains("stock 20"), "{needle}: stock travels: {fragment}");
+        // A result is its own add action: it includes the picker form and carries
+        // its own product id.
+        assert!(
+            fragment.contains(&format!("hx-post=\"{base}/lines\"")),
+            "{fragment}"
+        );
+        assert!(fragment.contains("hx-include=\"#line-picker\""), "{fragment}");
+        assert!(
+            fragment.contains(&format!("hx-vals='{{\"product_id\": {product}}}'")),
+            "{fragment}"
+        );
+    }
+
+    // An empty query returns nothing, not the whole catalogue.
+    let (status, empty) = get(&app, "/web/product-search?q=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!empty.contains("SCAN-P"), "{empty}");
+
+    // The record page offers the field, its debounced search, the sibling results
+    // container and no catalogue select.
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !page.contains("<select name=\"product_id\""),
+        "the catalogue select must be gone: {page:.600}"
+    );
+    assert!(page.contains("hx-get=\"/web/product-search\""), "{page:.600}");
+    assert!(page.contains("id=\"product-search-results\""), "{page:.600}");
+    assert!(page.contains("delay:"), "the search must be debounced");
+    assert!(page.contains("Escape"), "Escape must clear the field");
+
+    // Scan 1: the reader types the barcode and presses Enter. The form carries the
+    // field and the quantity, never a product id.
+    let (status, added) = post_form(&app, &format!("{base}/lines"), "product=7791234567890&qty=2&unit_price=").await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("product SCAN-P"), "{added:.600}");
+    assert!(added.contains("$50"), "running total after the scan: {added:.800}");
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // Scan 2: the same series, and the picker comes back ready again.
+    let (status, added) = post_form(&app, &format!("{base}/lines"), "product=7791234567890&qty=1&unit_price=").await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("$75"), "running total: {added:.800}");
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // A clicked result is the same form plus its own product id; the quantity
+    // typed in the field still travels.
+    let (status, clicked) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        &format!("product=scan&qty=3&unit_price=&product_id={product}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{clicked}");
+    assert!(clicked.contains("$150"), "running total: {clicked:.800}");
+
+    // Removing a line updates the running total from the same response: 150 - 50.
+    let detail = sale_detail(&app, sale).await;
+    let line_id = detail["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["qty"] == json!("2"))
+        .and_then(|line| line["id"].as_i64())
+        .expect("the scanned line");
+    let (status, removed) = send(
+        &app,
+        "DELETE",
+        &format!("{base}/lines/{line_id}"),
+        None,
+        true,
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert!(removed.contains("$100"), "running total after removal: {removed:.800}");
+    assert!(
+        !removed.contains(&format!("id=\"sale-line-{line_id}\"")),
+        "the removed line is gone: {removed:.800}"
+    );
+
+    // An unknown value is a clear 400 naming the search count, and adds nothing.
+    let before = sale_detail(&app, sale).await;
+    let (status, err) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=does-not-exist&qty=1&unit_price=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err.contains("no exact match"), "{err}");
+    assert!(err.contains("0 matches"), "{err}");
+    let after = sale_detail(&app, sale).await;
+    assert_eq!(
+        after["lines"].as_array().unwrap().len(),
+        before["lines"].as_array().unwrap().len(),
+        "a failed resolution adds nothing"
+    );
+    assert_eq!(after["total"], before["total"]);
+}
+
+/// The same loop as the sale page, against the purchase record: the picker posts
+/// the typed value to the purchase line endpoint, the response carries the updated
+/// lines, the running total and the out-of-band picker, and the repeated-product
+/// rule surfaces as a clear 400 instead of a crash.
+#[tokio::test]
+async fn purchase_line_picker_adds_lines_without_a_click() {
+    let (app, pool) = test_app().await;
+    let product_a = create_product_via_web(&app, &pool, "PSCAN-A", "1", "50").await;
+    let product_b = create_product_via_web(&app, &pool, "PSCAN-B", "1", "50").await;
+    record_stock_via_web(&app, product_a, "20").await;
+    record_stock_via_web(&app, product_b, "5").await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{product_a}/barcodes"),
+        json!({ "code": "7791234567891" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode A: {body}");
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{product_b}/barcodes"),
+        json!({ "code": "7791234567892" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode B: {body}");
+    let supplier = create_supplier_via_web(&app, &pool, "ScanSupplier").await;
+
+    let (status, body) = post_form(
+        &app,
+        "/web/purchases",
+        &format!("supplier_id={supplier}&payment_type=Cash&purchase_date=2024-05-10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let purchase = find_only_purchase_id(&app).await;
+    let base = format!("/web/purchases/{purchase}");
+
+    // Typing a name, a SKU or a barcode each find the product through the same
+    // search path the field uses; the result is its own add action against the
+    // purchase line endpoint and carries the current stock.
+    let search = format!(
+        "/web/product-search?price=cost&line_action={base}/lines&line_target=%23purchase-record-money"
+    );
+    for needle in ["PSCAN-A", "7791234567891"] {
+        let (status, fragment) = get(&app, &format!("{search}&q={needle}")).await;
+        assert_eq!(status, StatusCode::OK, "{fragment}");
+        assert!(fragment.contains("product PSCAN-A"), "{needle}: {fragment}");
+        assert!(
+            fragment.contains("stock 20"),
+            "{needle}: stock travels: {fragment}"
+        );
+        assert!(
+            fragment.contains(&format!("hx-post=\"{base}/lines\"")),
+            "{needle}: {fragment}"
+        );
+        assert!(fragment.contains("hx-include=\"#line-picker\""), "{fragment}");
+        assert!(
+            fragment.contains(&format!("hx-vals='{{\"product_id\": {product_a}}}'")),
+            "{fragment}"
+        );
+        assert!(
+            fragment.contains("cost $10"),
+            "{needle}: the purchase picker must show the cost: {fragment}"
+        );
+        assert!(
+            !fragment.contains("$25"),
+            "{needle}: the purchase picker must not show the sale price: {fragment}"
+        );
+    }
+
+    // The record page offers the field, its debounced search and the sibling
+    // results container, and no catalogue select.
+    let (status, page) = get(&app, &format!("/purchases/{purchase}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        !page.contains("<select name=\"product_id\""),
+        "the catalogue select must be gone: {page:.600}"
+    );
+    assert!(
+        page.contains("hx-get=\"/web/product-search\""),
+        "{page:.600}"
+    );
+    assert!(
+        page.contains("id=\"purchase-record-money\""),
+        "{page:.600}"
+    );
+
+    // Scan 1: the reader types the barcode and presses Enter. The form carries the
+    // field and the quantity, never a product id. The empty cost falls back to the
+    // product cost price (10).
+    let (status, added) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567891&qty=2&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("product PSCAN-A"), "{added:.600}");
+    assert!(
+        added.contains("$20"),
+        "running total after the scan: {added:.800}"
+    );
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // Scan 2: a different product, and the picker comes back ready again.
+    let (status, added) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567892&qty=3&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("$50"), "running total: {added:.800}");
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // Removing a line updates the running total from the same response.
+    let detail = purchase_detail(&app, purchase).await;
+    let line_id = detail["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["qty"] == json!("2"))
+        .and_then(|line| line["id"].as_i64())
+        .expect("the scanned line");
+    let (status, removed) = send(
+        &app,
+        "DELETE",
+        &format!("{base}/lines/{line_id}"),
+        None,
+        true,
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert!(
+        removed.contains("$30"),
+        "running total after removal: {removed:.800}"
+    );
+    assert!(
+        !removed.contains(&format!("id=\"purchase-line-{line_id}\"")),
+        "the removed line is gone: {removed:.800}"
+    );
+
+    // The repeated-product rule surfaces as a clear 400 with the actionable
+    // message, and the picker form names its action so the notice region can say
+    // which action failed. Product B is still on the purchase after the removal.
+    let before = purchase_detail(&app, purchase).await;
+    let (status, repeated) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567892&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{repeated}");
+    assert!(repeated.contains("already has a line"), "{repeated}");
+    assert!(repeated.contains("separate purchase"), "{repeated}");
+    assert!(
+        repeated.contains("product PSCAN-B"),
+        "the rejection must name the product, not its id: {repeated}"
+    );
+    assert!(
+        !repeated.contains(&format!("product {product_b} already has a line")),
+        "the rejection must not leak the bare product id: {repeated}"
+    );
+    assert!(
+        page.contains("data-action=\"Add line\""),
+        "the notice must be able to name the failed action: {page:.600}"
+    );
+    let after = purchase_detail(&app, purchase).await;
+    assert_eq!(
+        after["lines"].as_array().unwrap().len(),
+        before["lines"].as_array().unwrap().len(),
+        "the repeated product adds nothing"
+    );
+    assert_eq!(after["total"], before["total"]);
+
+    // An unknown value is a clear 400 naming the search count, and adds nothing.
+    let (status, err) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=does-not-exist&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err.contains("no exact match"), "{err}");
+    assert!(err.contains("0 matches"), "{err}");
+    assert_eq!(
+        purchase_detail(&app, purchase).await["lines"]
+            .as_array()
+            .unwrap()
+            .len(),
+        after["lines"].as_array().unwrap().len(),
+        "a failed resolution adds nothing"
+    );
+}
+
+/// The shared results fragment shows the price the calling context works in:
+/// a sale line is sold at the sale price, a purchase line is bought at the
+/// cost. The endpoint takes the price kind from the picker, so the number can
+/// never be the other context's price.
+#[tokio::test]
+async fn product_search_shows_the_context_price() {
+    let (app, pool) = test_app().await;
+    create_product_via_web(&app, &pool, "PRICE-P", "1", "50").await;
+
+    let (status, sale) = get(
+        &app,
+        "/web/product-search?q=PRICE-P&price=sale&line_action=/web/sales/1/lines&line_target=%23sale-record-money",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sale}");
+    assert!(sale.contains("$25"), "a sale shows its sale price: {sale}");
+    assert!(!sale.contains("$10"), "a sale must not show the cost: {sale}");
+
+    let (status, purchase) = get(
+        &app,
+        "/web/product-search?q=PRICE-P&price=cost&line_action=/web/purchases/1/lines&line_target=%23purchase-record-money",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{purchase}");
+    assert!(
+        purchase.contains("cost $10"),
+        "a purchase shows the cost price: {purchase}"
+    );
+    assert!(
+        !purchase.contains("$25"),
+        "a purchase must not show the sale price: {purchase}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// N4 accessibility: named controls and a polite announcement for the picker
+// ---------------------------------------------------------------------------
+
+/// The opening tag that encloses byte `pos`, from its `<` to its `>`. The `<`
+/// itself may sit at `pos` (a control found by its `<input` marker), so the
+/// search includes that byte.
+fn enclosing_tag(html: &str, pos: usize) -> &str {
+    let start = html[..=pos]
+        .rfind('<')
+        .unwrap_or_else(|| panic!("no tag opens before byte {pos}"));
+    let end = pos + html[pos..]
+        .find('>')
+        .unwrap_or_else(|| panic!("unterminated tag at byte {pos}"));
+    &html[start..=end]
+}
+
+/// The full element carrying `id`, opening tag through closing tag, for the
+/// small elements this check inspects.
+fn element_with_id<'a>(html: &'a str, id: &str) -> &'a str {
+    let pos = html
+        .find(&format!("id=\"{id}\""))
+        .unwrap_or_else(|| panic!("no element renders id={id:?}"));
+    let start = html[..pos].rfind('<').expect("an id must sit inside a tag");
+    let name_start = start + 1;
+    let name_end = name_start
+        + html[name_start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .expect("unterminated opening tag");
+    let name = &html[name_start..name_end];
+    let close = format!("</{name}>");
+    let end = html[start..]
+        .find(&close)
+        .unwrap_or_else(|| panic!("no {close} for id={id:?}"));
+    &html[start..start + end + close.len()]
+}
+
+/// The earliest native form control in `body`, if any.
+fn first_control(body: &str) -> Option<usize> {
+    ["<input", "<select", "<textarea"]
+        .iter()
+        .filter_map(|tag| body.find(tag))
+        .min()
+}
+
+/// Native controls with no accessible name, resolved the way a screen reader
+/// resolves one for these forms: a `<label>` that wraps the control, or a label
+/// whose `for` matches the control's id. Hidden controls are ignored; buttons
+/// carry their own text and are not in scope.
+fn controls_without_accessible_name(html: &str) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut named_by_for: HashSet<String> = HashSet::new();
+    let mut wrapped: HashSet<usize> = HashSet::new();
+    let mut from = 0usize;
+    while let Some(rel) = html[from..].find("<label") {
+        let start = from + rel;
+        let open_end = start + html[start..].find('>').expect("unterminated <label>");
+        let label_tag = &html[start..=open_end];
+        if let Some(id) = attr_value(label_tag, "for") {
+            named_by_for.insert(id.to_string());
+        } else {
+            let content_start = open_end + 1;
+            if let Some(close_rel) = html[content_start..].find("</label>") {
+                let body = &html[content_start..content_start + close_rel];
+                if let Some(control_pos) = first_control(body) {
+                    wrapped.insert(content_start + control_pos);
+                }
+            }
+        }
+        from = open_end + 1;
+    }
+
+    let mut offenders = Vec::new();
+    for tag in ["<input", "<select", "<textarea"] {
+        let mut from = 0usize;
+        while let Some(rel) = html[from..].find(tag) {
+            let pos = from + rel;
+            from = pos + 1;
+            let opening = enclosing_tag(html, pos);
+            if attr_value(opening, "type") == Some("hidden") {
+                continue;
+            }
+            let named = wrapped.contains(&pos)
+                || attr_value(opening, "id")
+                    .map(|id| named_by_for.contains(id))
+                    .unwrap_or(false);
+            if named {
+                continue;
+            }
+            let name = attr_value(opening, "name").unwrap_or("?");
+            let id = attr_value(opening, "id").unwrap_or("none");
+            offenders.push(format!("{tag} name={name:?} id={id:?}"));
+        }
+    }
+    offenders
+}
+
+/// The resolver accepts both patterns a screen reader accepts, and still
+/// rejects a control whose label is only visual text.
+#[test]
+fn accessible_name_resolution_accepts_wrapping_and_for_labels() {
+    let named = r#"
+        <label>Wrapped <input type="number" name="wrapped" /></label>
+        <label for="picked">Picked</label><input type="range" name="picked" id="picked" />
+    "#;
+    assert_eq!(controls_without_accessible_name(named), Vec::<String>::new());
+
+    let offenders = controls_without_accessible_name(
+        r#"<label>Qty</label><input type="number" name="qty" id="qty" />"#,
+    );
+    assert_eq!(offenders.len(), 1, "{offenders:?}");
+    assert!(offenders[0].contains("qty"), "{offenders:?}");
+
+    // A hidden control is not announced, so it needs no name.
+    assert!(
+        controls_without_accessible_name(r#"<input type="hidden" name="id" />"#).is_empty()
+    );
+}
+
+/// Every control on the sale record page resolves an accessible name. The
+/// picker's Qty and Unit price fields were the verified defect; the same
+/// resolver covers the confirm, edit-header, discard, payment and cancel forms
+/// in both document states.
+#[tokio::test]
+async fn sale_record_controls_resolve_accessible_names() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "Caja", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "A11Y-L", "1", "50").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
+    add_sale_line_via_web(&app, sale, product, "1").await;
+
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    for id in ["line-qty", "line-unit-price"] {
+        assert!(
+            page.contains(&format!("for=\"{id}\"")),
+            "the {id} label must point at its input: {page:.600}"
+        );
+    }
+    let unnamed = controls_without_accessible_name(&page);
+    assert!(
+        unnamed.is_empty(),
+        "draft record page has unlabelled controls: {unnamed:?}"
+    );
+
+    confirm_sale_via_web(&app, sale, Some(account), Some(cash)).await;
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    let unnamed = controls_without_accessible_name(&page);
+    assert!(
+        unnamed.is_empty(),
+        "confirmed record page has unlabelled controls: {unnamed:?}"
+    );
+}
+
+/// The picker's results container is a polite live region the input is wired
+/// to, and only the match count is announced; the visual list is explicitly
+/// not live, so typing does not read the catalogue out loud on every keystroke.
+#[tokio::test]
+async fn product_search_results_announce_a_polite_match_count() {
+    let (app, pool) = test_app().await;
+    create_product_via_web(&app, &pool, "A11Y-P", "1", "50").await;
+    create_product_via_web(&app, &pool, "A11Y-Q", "1", "50").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
+    let base = format!("/web/sales/{sale}");
+
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+
+    let results_pos = page
+        .find("id=\"product-search-results\"")
+        .expect("the picker renders its results container");
+    let results = enclosing_tag(&page, results_pos);
+    assert!(
+        results.contains("aria-live=\"polite\""),
+        "the results container must be a polite live region: {results}"
+    );
+    assert!(results.contains("role=\"status\""), "{results}");
+    assert!(
+        results.contains("aria-atomic=\"false\""),
+        "the region must announce the count, not replace its whole content: {results}"
+    );
+
+    let input_pos = page
+        .find("id=\"product-picker\"")
+        .expect("the picker input");
+    let input = enclosing_tag(&page, input_pos);
+    assert!(
+        input.contains("aria-controls=\"product-search-results\""),
+        "the input must say what it controls: {input}"
+    );
+    assert!(
+        input.contains("aria-describedby=\"product-search-status\""),
+        "the input must point at the announced state: {input}"
+    );
+    assert!(
+        page.contains("id=\"product-search-status\""),
+        "the described status element must exist on the page"
+    );
+
+    let search = |query: &str| {
+        format!(
+            "/web/product-search?q={query}&line_action={base}/lines&line_target=%23sale-record-money"
+        )
+    };
+
+    // One match: the announced text is the count.
+    let (status, fragment) = get(&app, &search("A11Y-P")).await;
+    assert_eq!(status, StatusCode::OK, "{fragment}");
+    let status_text = element_with_id(&fragment, "product-search-status");
+    assert!(status_text.contains("1 match"), "{status_text}");
+    assert!(
+        fragment.contains("aria-live=\"off\""),
+        "the visual list must stay out of the live announcement: {fragment}"
+    );
+
+    // Two matches pluralize.
+    let (status, fragment) = get(&app, &search("A11Y")).await;
+    assert_eq!(status, StatusCode::OK, "{fragment}");
+    let status_text = element_with_id(&fragment, "product-search-status");
+    assert!(status_text.contains("2 matches"), "{status_text}");
+
+    // No matches is a state, not silence.
+    let (status, fragment) = get(&app, &search("does-not-exist")).await;
+    assert_eq!(status, StatusCode::OK, "{fragment}");
+    let status_text = element_with_id(&fragment, "product-search-status");
+    assert!(status_text.contains("No products match"), "{status_text}");
+}
+
+// ---------------------------------------------------------------------------
+// N5 — the referenced-id guard
+// ---------------------------------------------------------------------------
+
+/// The scan bites on every entity noun, and a document's own id stays exempt in
+/// both shapes the lists print.
+#[test]
+fn referenced_id_scan_bites_on_every_entity_noun() {
+    for noun in BARE_REFERENCED_ID_PREFIXES {
+        let mutant = format!("<div>{noun}3</div>");
+        let err = check_no_bare_referenced_ids("mutation", &mutant).unwrap_err();
+        assert!(err.contains(noun), "{err}");
+    }
+    check_no_bare_referenced_ids("mutation", "<div>draft #12</div>").unwrap();
+    check_no_bare_referenced_ids("mutation", "<div>2024-SALE-000012</div>").unwrap();
+    check_no_bare_referenced_ids("mutation", "<div>sale #12</div>").unwrap();
+}
+
+/// A guarded page that is clean passes, and the same page with a leaked referenced
+/// id is rejected by the exact check the guard runs over every seeded page.
+#[tokio::test]
+async fn referenced_id_guard_rejects_a_bare_id_added_to_a_guarded_page_copy() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+    let products_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "products")
+        .expect("the products page is guarded");
+    let (status, html) = get(&app, &products_page.path).await;
+    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", products_page.path);
+    check_no_bare_referenced_ids(products_page.label, &html)
+        .unwrap_or_else(|err| panic!("the guarded products page must be clean: {err}"));
+
+    let mutant = format!("{html}<div>product #3</div>");
+    let err = check_no_bare_referenced_ids(products_page.label, &mutant).unwrap_err();
+    assert!(err.contains("products"), "{err}");
+    assert!(err.contains("product #3"), "{err}");
+}
+
+/// The customer statement's receipt list shows the account and method names; the
+/// referenced-id rule covers the path now that the guard fixture collects a
+/// receipt, so this ordinary assertion replaces the old defect pin.
+#[tokio::test]
+async fn customer_statement_resolves_receipt_account_and_method_names() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "GapWallet", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "GAP-P", "1", "50").await;
+    record_stock_via_web(&app, product, "10").await;
+    let customer = seed_customer(&pool, "GapBuyer", None, None).await;
+    let sale = create_sale_draft_on_date(&app, customer, "Credit", "2024-05-02", "2024-06-01").await;
+    add_sale_line_via_web(&app, sale, product, "2").await;
+    confirm_sale_via_web(&app, sale, None, None).await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/customer-receipts",
+        &format!(
+            "customer_id={customer}&account_id={account}&method_id={cash}&amount=10&date=2024-05-10"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collect: {resp}");
+
+    let (status, page) = get(&app, &format!("/customers/{customer}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        bare_referenced_id(&page).is_none(),
+        "the receipt list must resolve account and method names: {page:.800}"
+    );
+    assert!(
+        page.contains("GapWallet • Cash"),
+        "the receipt shows the resolved account and method: {page:.800}"
+    );
+    assert!(
+        page.contains("Receipt #"),
+        "the receipt's own identifier stays visible: {page:.800}"
+    );
+
+    // The allocation names the sale the way the user does: its number, not its id.
+    let sale_number = sale_detail(&app, sale).await["sale"]["sale_number"]
+        .as_str()
+        .expect("the confirmed sale number")
+        .to_string();
+    assert!(
+        page.contains(&format!("{sale_number} •")),
+        "the receipt allocation shows the sale number: {page:.800}"
+    );
+    assert!(
+        !page.contains("sale #"),
+        "the receipt allocation must not print the sale's internal id: {page:.800}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// N5 — list filters, catalogue search and name resolution
+// ---------------------------------------------------------------------------
+
+/// The products list fragment as the browser's filter form fetches it.
+async fn product_list_html(app: &Router, query: &str) -> String {
+    let (status, html) = get(app, &format!("/web/products{query}")).await;
+    assert_eq!(status, StatusCode::OK, "/web/products{query}: {html}");
+    html
+}
+
+/// The sales list fragment as the browser's filter form fetches it.
+async fn sale_list_html(app: &Router, query: &str) -> String {
+    let (status, html) = get(app, &format!("/web/sales{query}")).await;
+    assert_eq!(status, StatusCode::OK, "/web/sales{query}: {html}");
+    html
+}
+
+/// The purchases list fragment as the browser's filter form fetches it.
+async fn purchase_list_html(app: &Router, query: &str) -> String {
+    let (status, html) = get(app, &format!("/web/purchases{query}")).await;
+    assert_eq!(status, StatusCode::OK, "/web/purchases{query}: {html}");
+    html
+}
+
+async fn category_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT id FROM categories WHERE name = ?")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+async fn create_category_via_web(app: &Router, pool: &SqlitePool, name: &str) -> i64 {
+    let (status, resp) = post_form(app, "/web/categories", &format!("name={name}")).await;
+    assert_eq!(status, StatusCode::OK, "create category {name}: {resp}");
+    category_id_by_name(pool, name).await
+}
+
+/// Create a product with an explicit display name and optional category, through
+/// the same web form the browser uses.
+async fn create_product_full_via_web(
+    app: &Router,
+    pool: &SqlitePool,
+    sku: &str,
+    name: &str,
+    category_id: Option<i64>,
+) -> i64 {
+    let encoded_name = name.replace(' ', "+");
+    let category = category_id.map(|c| c.to_string()).unwrap_or_default();
+    let body = format!(
+        "sku={sku}&name={encoded_name}&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&category_id={category}"
+    );
+    let (status, resp) = post_form(app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "create product {sku}: {resp}");
+    product_id_by_sku(pool, sku).await
+}
+
+/// Create a sale draft on an explicit date through the web form, and return its id.
+async fn create_sale_draft_on_date(
+    app: &Router,
+    customer_id: i64,
+    payment_type: &str,
+    sale_date: &str,
+    due_date: &str,
+) -> i64 {
+    let body = format!(
+        "customer_id={customer_id}&payment_type={payment_type}&sale_date={sale_date}&due_date={due_date}"
+    );
+    let (status, resp) = post_form(app, "/web/sales", &body).await;
+    assert_eq!(status, StatusCode::OK, "create sale: {resp}");
+    let (status, body) = get(app, "/api/sales").await;
+    assert_eq!(status, StatusCode::OK, "list sales: {body}");
+    let v = json_body(&body);
+    v["sales"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["sale"]["customer_id"] == json!(customer_id))
+        .last()
+        .and_then(|d| d["sale"]["id"].as_i64())
+        .unwrap_or_else(|| panic!("sale for customer {customer_id} not found: {v}"))
+}
+
+/// Create a purchase draft for an explicit supplier and date through the web form.
+async fn create_purchase_draft_on_date(app: &Router, supplier_id: i64, purchase_date: &str) -> i64 {
+    let body = format!(
+        "supplier_id={supplier_id}&payment_type=Credit&purchase_date={purchase_date}&due_date=2024-12-31"
+    );
+    let (status, resp) = post_form(app, "/web/purchases", &body).await;
+    assert_eq!(status, StatusCode::OK, "create purchase: {resp}");
+    let (status, body) = get(app, "/api/purchases").await;
+    assert_eq!(status, StatusCode::OK, "list purchases: {body}");
+    let v = json_body(&body);
+    v["purchases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["purchase"]["supplier_id"] == json!(supplier_id))
+        .last()
+        .and_then(|d| d["purchase"]["id"].as_i64())
+        .unwrap_or_else(|| panic!("purchase for supplier {supplier_id} not found: {v}"))
+}
+
+async fn add_purchase_line_via_web(app: &Router, purchase_id: i64, product_id: i64, qty: &str) {
+    let body = format!("purchase_id={purchase_id}&product_id={product_id}&qty={qty}");
+    let (status, resp) = post_form(app, "/web/purchases/lines", &body).await;
+    assert_eq!(status, StatusCode::OK, "add purchase line: {resp}");
+}
+
+async fn confirm_purchase_via_web(app: &Router, purchase_id: i64) {
+    let body = format!("purchase_id={purchase_id}");
+    let (status, resp) = post_form(app, "/web/purchases/confirm", &body).await;
+    assert_eq!(status, StatusCode::OK, "confirm purchase {purchase_id}: {resp}");
+}
+
+/// AC13: every sales filter works alone and combined; an empty filter is no
+/// constraint and a filter matching nothing is an empty list, never an error.
+#[tokio::test]
+async fn sales_list_filters_by_status_customer_number_and_date() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "FILT-S", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+
+    let ana = seed_customer(&pool, "FiltAna", None, None).await;
+    let beto = seed_customer(&pool, "FiltBeto", None, None).await;
+
+    let _draft = create_sale_draft_on_date(&app, ana, "Cash", "2024-05-02", "").await;
+    let ana_confirmed =
+        create_sale_draft_on_date(&app, ana, "Credit", "2024-05-02", "2024-06-01").await;
+    add_sale_line_via_web(&app, ana_confirmed, product, "1").await;
+    confirm_sale_via_web(&app, ana_confirmed, None, None).await;
+    let beto_confirmed =
+        create_sale_draft_on_date(&app, beto, "Credit", "2024-07-15", "2024-08-15").await;
+    add_sale_line_via_web(&app, beto_confirmed, product, "1").await;
+    confirm_sale_via_web(&app, beto_confirmed, None, None).await;
+
+    let ana_number = sale_detail(&app, ana_confirmed).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+    let beto_number = sale_detail(&app, beto_confirmed).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+
+    // No filter returns everything.
+    let all = sale_list_html(&app, "").await;
+    assert!(
+        all.contains("draft #"),
+        "the draft stays in the unfiltered list: {all}"
+    );
+    assert!(
+        all.contains(&ana_number) && all.contains(&beto_number),
+        "{all}"
+    );
+
+    // Status alone.
+    let confirmed = sale_list_html(&app, "?status=Confirmed").await;
+    assert!(confirmed.contains(&ana_number), "{confirmed}");
+    assert!(confirmed.contains(&beto_number), "{confirmed}");
+    assert!(!confirmed.contains("draft #"), "{confirmed}");
+
+    let drafts = sale_list_html(&app, "?status=Draft").await;
+    assert!(drafts.contains("draft #"), "{drafts}");
+    assert!(!drafts.contains(&ana_number), "{drafts}");
+
+    // Customer alone, case-insensitive over the name the list shows.
+    let ana_only = sale_list_html(&app, "?customer=filtana").await;
+    assert!(ana_only.contains("FiltAna"), "{ana_only}");
+    assert!(!ana_only.contains("FiltBeto"), "{ana_only}");
+
+    // Number matches partially: the user remembers a fragment, not the whole number.
+    let fragment = &ana_number[ana_number.len() - 6..];
+    let by_number = sale_list_html(&app, &format!("?number={fragment}")).await;
+    assert!(by_number.contains(&ana_number), "{by_number}");
+    assert!(!by_number.contains(&beto_number), "{by_number}");
+
+    // Date range is inclusive on sale_date.
+    let by_date = sale_list_html(&app, "?from=2024-07-01&to=2024-07-31").await;
+    assert!(by_date.contains(&beto_number), "{by_date}");
+    assert!(!by_date.contains(&ana_number), "{by_date}");
+    assert!(!by_date.contains("draft #"), "{by_date}");
+
+    // Combined filters narrow further.
+    let combined = sale_list_html(&app, "?status=Confirmed&customer=FiltBeto").await;
+    assert!(combined.contains(&beto_number), "{combined}");
+    assert!(!combined.contains(&ana_number), "{combined}");
+
+    // Empty values are no constraint, not an error.
+    let blank = sale_list_html(&app, "?status=&customer=&number=&from=&to=").await;
+    assert!(
+        blank.contains("draft #")
+            && blank.contains(&ana_number)
+            && blank.contains(&beto_number),
+        "{blank}"
+    );
+
+    // Matching nothing is an empty list, not an error.
+    let none = sale_list_html(&app, "?number=NOPE-0000").await;
+    assert!(none.contains("Nothing here yet."), "{none}");
+    assert!(!none.contains(&ana_number), "{none}");
+
+    // A status or date the picker never sends is treated as absent, not an error.
+    let lenient = sale_list_html(&app, "?status=bogus&from=not-a-date").await;
+    assert!(
+        lenient.contains("draft #")
+            && lenient.contains(&ana_number)
+            && lenient.contains(&beto_number),
+        "{lenient}"
+    );
+
+    // An inverted range matches nothing rather than failing.
+    let inverted = sale_list_html(&app, "?from=2024-07-01&to=2024-05-01").await;
+    assert!(inverted.contains("Nothing here yet."), "{inverted}");
+
+    // The full page is filtered too, so the filtered view is bookmarkable.
+    let (status, page) = get(&app, "/sales?status=Confirmed").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(&ana_number), "{page:.600}");
+    assert!(!page.contains("draft #"), "{page:.600}");
+
+    // The form reflects the URL, so a shared link re-opens with the same filters.
+    let (status, page) = get(
+        &app,
+        "/sales?status=Draft&customer=FiltAna&number=0000&from=2024-05-01&to=2024-05-31",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        page.contains("name=\"customer\" placeholder=\"Customer\" value=\"FiltAna\""),
+        "the form must reflect the bookmarkable URL: {page:.600}"
+    );
+    assert!(
+        page.contains("<option value=\"Draft\" selected>Draft</option>"),
+        "{page:.600}"
+    );
+    assert!(page.contains("name=\"from\" value=\"2024-05-01\""), "{page:.600}");
+}
+
+/// AC13: the purchases list carries the same filter shape.
+#[tokio::test]
+async fn purchases_list_filters_by_status_supplier_number_and_date() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "FILT-P2", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+
+    let sur = create_supplier_via_web(&app, &pool, "FiltSur").await;
+    let norte = create_supplier_via_web(&app, &pool, "FiltNorte").await;
+
+    let _draft = create_purchase_draft_on_date(&app, sur, "2024-05-02").await;
+    let sur_confirmed = create_purchase_draft_on_date(&app, sur, "2024-05-02").await;
+    add_purchase_line_via_web(&app, sur_confirmed, product, "1").await;
+    confirm_purchase_via_web(&app, sur_confirmed).await;
+    let norte_confirmed = create_purchase_draft_on_date(&app, norte, "2024-07-15").await;
+    add_purchase_line_via_web(&app, norte_confirmed, product, "1").await;
+    confirm_purchase_via_web(&app, norte_confirmed).await;
+
+    let sur_number = purchase_detail(&app, sur_confirmed).await["purchase"]["purchase_number"]
+        .as_str()
+        .expect("confirmed purchase number")
+        .to_string();
+    let norte_number = purchase_detail(&app, norte_confirmed).await["purchase"]
+        ["purchase_number"]
+        .as_str()
+        .expect("confirmed purchase number")
+        .to_string();
+
+    let all = purchase_list_html(&app, "").await;
+    assert!(all.contains("draft #"), "{all}");
+    assert!(
+        all.contains(&sur_number) && all.contains(&norte_number),
+        "{all}"
+    );
+
+    let confirmed = purchase_list_html(&app, "?status=Confirmed").await;
+    assert!(
+        confirmed.contains(&sur_number) && confirmed.contains(&norte_number),
+        "{confirmed}"
+    );
+    assert!(!confirmed.contains("draft #"), "{confirmed}");
+
+    let drafts = purchase_list_html(&app, "?status=Draft").await;
+    assert!(drafts.contains("draft #"), "{drafts}");
+    assert!(!drafts.contains(&sur_number), "{drafts}");
+
+    // Supplier alone, case-insensitive over the name the list shows.
+    let norte_only = purchase_list_html(&app, "?supplier=filtnorte").await;
+    assert!(norte_only.contains("FiltNorte"), "{norte_only}");
+    assert!(!norte_only.contains("FiltSur"), "{norte_only}");
+
+    let fragment = &sur_number[sur_number.len() - 6..];
+    let by_number = purchase_list_html(&app, &format!("?number={fragment}")).await;
+    assert!(by_number.contains(&sur_number), "{by_number}");
+    assert!(!by_number.contains(&norte_number), "{by_number}");
+
+    let by_date = purchase_list_html(&app, "?from=2024-07-01&to=2024-07-31").await;
+    assert!(by_date.contains(&norte_number), "{by_date}");
+    assert!(!by_date.contains(&sur_number), "{by_date}");
+
+    let combined = purchase_list_html(&app, "?status=Confirmed&supplier=FiltNorte").await;
+    assert!(combined.contains(&norte_number), "{combined}");
+    assert!(!combined.contains(&sur_number), "{combined}");
+
+    let blank = purchase_list_html(&app, "?status=&supplier=&number=&from=&to=").await;
+    assert!(
+        blank.contains("draft #")
+            && blank.contains(&sur_number)
+            && blank.contains(&norte_number),
+        "{blank}"
+    );
+
+    let none = purchase_list_html(&app, "?supplier=NoSuchSupplier").await;
+    assert!(none.contains("Nothing here yet."), "{none}");
+
+    let (status, page) = get(&app, "/purchases?status=Confirmed").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(&sur_number), "{page:.600}");
+    assert!(!page.contains("draft #"), "{page:.600}");
+
+    // The form reflects the URL, so a shared link re-opens with the same filters.
+    let (status, page) = get(
+        &app,
+        "/purchases?status=Draft&supplier=FiltSur&number=0000&from=2024-05-01&to=2024-05-31",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        page.contains("name=\"supplier\" placeholder=\"Supplier\" value=\"FiltSur\""),
+        "the form must reflect the bookmarkable URL: {page:.600}"
+    );
+    assert!(
+        page.contains("<option value=\"Draft\" selected>Draft</option>"),
+        "{page:.600}"
+    );
+}
+
+/// AC14: the products list matches name, SKU and barcode through the same search
+/// the picker uses, and combines with the existing category filter.
+#[tokio::test]
+async fn products_list_searches_name_sku_and_barcode_and_combines_with_category() {
+    let (app, pool) = test_app().await;
+    let yerba_cat = create_category_via_web(&app, &pool, "FiltBeverages").await;
+    let other_cat = create_category_via_web(&app, &pool, "FiltSnacks").await;
+
+    let yerba = create_product_full_via_web(
+        &app,
+        &pool,
+        "FILT-YERBA-500",
+        "Yerba Filt 500g",
+        Some(yerba_cat),
+    )
+    .await;
+    let gal = create_product_full_via_web(
+        &app,
+        &pool,
+        "FILT-GAL-100",
+        "Galletitas Filt",
+        Some(other_cat),
+    )
+    .await;
+    record_stock_via_web(&app, yerba, "10").await;
+    record_stock_via_web(&app, gal, "10").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{yerba}/barcodes"),
+        json!({ "code": "7791234567001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode: {body}");
+
+    // An empty query is not a search: it keeps the whole catalogue.
+    let all = product_list_html(&app, "?q=").await;
+    assert!(
+        all.contains("Yerba Filt 500g") && all.contains("Galletitas Filt"),
+        "{all}"
+    );
+
+    // By name, partial and case-insensitive.
+    let by_name = product_list_html(&app, "?q=yerba").await;
+    assert!(by_name.contains("Yerba Filt 500g"), "{by_name}");
+    assert!(!by_name.contains("Galletitas Filt"), "{by_name}");
+
+    // By SKU.
+    let by_sku = product_list_html(&app, "?q=FILT-GAL-100").await;
+    assert!(by_sku.contains("Galletitas Filt"), "{by_sku}");
+    assert!(!by_sku.contains("Yerba Filt 500g"), "{by_sku}");
+
+    // By barcode: the matching path the picker already uses.
+    let by_barcode = product_list_html(&app, "?q=7791234567001").await;
+    assert!(by_barcode.contains("Yerba Filt 500g"), "{by_barcode}");
+    assert!(!by_barcode.contains("Galletitas Filt"), "{by_barcode}");
+
+    // The existing category filter alone still works.
+    let by_category = product_list_html(&app, &format!("?category_id={yerba_cat}")).await;
+    assert!(by_category.contains("Yerba Filt 500g"), "{by_category}");
+    assert!(!by_category.contains("Galletitas Filt"), "{by_category}");
+
+    // Search and category combine.
+    let combined = product_list_html(&app, &format!("?q=Filt&category_id={other_cat}")).await;
+    assert!(combined.contains("Galletitas Filt"), "{combined}");
+    assert!(!combined.contains("Yerba Filt 500g"), "{combined}");
+
+    // A barcode that matches a product in another category combines to nothing.
+    let crossed = product_list_html(&app, &format!("?q=7791234567001&category_id={other_cat}")).await;
+    assert!(crossed.contains("No products yet"), "{crossed}");
+
+    // Matching nothing is an empty list, not an error.
+    let none = product_list_html(&app, "?q=does-not-exist").await;
+    assert!(none.contains("No products yet"), "{none}");
+
+    // The full page is filtered too, so the view is bookmarkable, and the form
+    // reflects the URL a shared link carries.
+    let (status, page) = get(&app, &format!("/products?q=yerba&category_id={yerba_cat}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains("Yerba Filt 500g"), "{page:.600}");
+    assert!(!page.contains("Galletitas Filt"), "{page:.600}");
+    assert!(
+        page.contains("name=\"q\" placeholder=\"Name, SKU or barcode\" value=\"yerba\""),
+        "the search box must reflect the bookmarkable URL: {page:.600}"
+    );
+    assert!(
+        page.contains(&format!("<option value=\"{yerba_cat}\" selected>")),
+        "the category select must reflect the bookmarkable URL: {page:.600}"
+    );
+}
+
+/// AC4/N5: each of the three lists resolves the referenced entity to a name and
+/// prints no internal id for it.
+#[tokio::test]
+async fn lists_resolve_referenced_names_and_print_no_internal_ids() {
+    let (app, pool) = test_app().await;
+    let product =
+        create_product_full_via_web(&app, &pool, "NAMES-P", "Named Widget", None).await;
+    let customer = seed_customer(&pool, "NamesBuyer", None, None).await;
+    let _sale = create_sale_draft_on_date(&app, customer, "Cash", "2024-05-02", "").await;
+    let supplier = create_supplier_via_web(&app, &pool, "NamesSupplier").await;
+    let _purchase = create_purchase_draft_on_date(&app, supplier, "2024-05-02").await;
+
+    let sales = sale_list_html(&app, "").await;
+    assert!(
+        sales.contains("NamesBuyer"),
+        "the sales list shows the customer name: {sales}"
+    );
+    assert!(!sales.contains("customer #"), "{sales}");
+
+    let purchases = purchase_list_html(&app, "").await;
+    assert!(
+        purchases.contains("NamesSupplier"),
+        "the purchases list shows the supplier name: {purchases}"
+    );
+    assert!(!purchases.contains("supplier #"), "{purchases}");
+
+    let products = product_list_html(&app, "").await;
+    assert!(
+        products.contains("Named Widget"),
+        "the products list shows the product name: {products}"
+    );
+    assert!(
+        !products.contains(&format!("#{product}")),
+        "the products list must not print the product's internal id: {products}"
+    );
+}
+
+
+/// The README must not describe the receipt-list referenced-id gap as open: the
+/// list resolves account and method names and the guard fixture now collects a
+/// receipt, so the old pin is gone.
+#[test]
+fn readme_does_not_describe_the_receipt_list_gap_as_open() {
+    let readme = std::fs::read_to_string("README.md").expect("README.md is readable");
+    assert!(
+        !readme.contains("A separate pin records the known"),
+        "the README still claims the receipt-list gap is pinned instead of fixed"
+    );
+    assert!(
+        readme.contains("receipt list resolves"),
+        "the README should state that the receipt list resolves names"
+    );
+}
+
+/// N6: the shared normalizer folds Unicode case and the Spanish diacritics.
+#[test]
+fn normalize_search_folds_case_and_spanish_diacritics() {
+    use crate::models::normalize_search;
+    for (raw, folded) in [
+        ("Pérez", "perez"),
+        ("pérez", "perez"),
+        ("PÉREZ", "perez"),
+        ("Perez", "perez"),
+        ("PEREZ", "perez"),
+        ("Ñandú", "nandu"),
+        ("ñandú", "nandu"),
+        ("ÑANDÚ", "nandu"),
+        ("Café", "cafe"),
+        ("CAFÉ", "cafe"),
+        ("ÀÉÎÕÜ", "aeiou"),
+    ] {
+        assert_eq!(normalize_search(raw), folded, "{raw:?}");
+    }
+}
+
+/// N6: search ignores accents and case on both sides, for parties and the
+/// catalogue. A phone keyboard capitalising the first letter, or a name typed
+/// without accents, must still find the record.
+#[tokio::test]
+async fn search_matches_ignore_accents_and_case() {
+    let (app, pool) = test_app().await;
+
+    // Sales: a customer named with accents, found from every typed form.
+    let perez = seed_customer(&pool, "Pérez", None, None).await;
+    let andu = seed_customer(&pool, "Ñandú", None, None).await;
+    create_sale_draft_for_customer(&app, perez, "Cash", "").await;
+    create_sale_draft_for_customer(&app, andu, "Cash", "").await;
+    for needle in ["Pérez", "pérez", "PÉREZ", "Perez", "PEREZ"] {
+        let html = sale_list_html(&app, &format!("?customer={needle}")).await;
+        assert!(html.contains("Pérez"), "{needle:?} must find Pérez: {html}");
+        assert!(!html.contains("Ñandú"), "{needle:?} must not match Ñandú: {html}");
+    }
+    for needle in ["Ñandú", "ñandú", "Nandu", "ÑANDÚ"] {
+        let html = sale_list_html(&app, &format!("?customer={needle}")).await;
+        assert!(html.contains("Ñandú"), "{needle:?} must find Ñandú: {html}");
+        assert!(!html.contains("Pérez"), "{needle:?} must not match Pérez: {html}");
+    }
+
+    // Purchases: a supplier named with accents, the same both ways.
+    let cafe_sup = create_supplier_via_web(&app, &pool, "Café").await;
+    let andu_sup = create_supplier_via_web(&app, &pool, "Ñandú").await;
+    create_purchase_draft_on_date(&app, cafe_sup, "2024-05-02").await;
+    create_purchase_draft_on_date(&app, andu_sup, "2024-05-02").await;
+    for needle in ["Nandu", "ÑANDÚ", "ñandú"] {
+        let html = purchase_list_html(&app, &format!("?supplier={needle}")).await;
+        assert!(html.contains("Ñandú"), "{needle:?} must find Ñandú: {html}");
+        assert!(!html.contains("Café"), "{needle:?} must not match Café: {html}");
+    }
+    for needle in ["CAFE", "café", "Café"] {
+        let html = purchase_list_html(&app, &format!("?supplier={needle}")).await;
+        assert!(html.contains("Café"), "{needle:?} must find Café: {html}");
+        assert!(!html.contains("Ñandú"), "{needle:?} must not match Ñandú: {html}");
+    }
+
+    // Catalogue: the picker and the list both fold accents and case.
+    create_product_full_via_web(&app, &pool, "CAFE-P", "Café", None).await;
+    let (status, search) = get(&app, "/web/product-search?q=CAFE").await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(search.contains("Café"), "the picker must find Café by CAFE: {search}");
+    let list = product_list_html(&app, "?q=cafe").await;
+    assert!(list.contains("Café"), "the catalogue must find Café by cafe: {list}");
+    let list = product_list_html(&app, "?q=CAFÉ").await;
+    assert!(list.contains("Café"), "the catalogue must find Café by CAFÉ: {list}");
 }

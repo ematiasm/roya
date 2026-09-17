@@ -1,59 +1,247 @@
-<div id="sale-detail-inner">
-  <div class="mb-2 flex flex-wrap items-center gap-2">
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if detail.sale.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if detail.sale.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ detail.sale.status }}</span>
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if detail.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ detail.payment_status }}</span>
-    <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ detail.sale.payment_type }}</span>
+{# Sale record body (redesign-interface N2; product picker N4).
+
+   Rendered both by `/sales/{id}` inside the shell and standalone by every
+   action response that swaps `#sale-record`, so the same context travels with
+   the fragment either way. The status gate below is presentation only: the
+   service stays the authority and refuses edits to a confirmed sale.
+
+   `record_money` wraps the running total and the lines so one response carries
+   both: adding a line swaps that region while the picker is replaced out of
+   band, empty and focused, ready for the next scan. #}
+{% import "partials/product_search_results.html" as picker %}
+{% macro record_money(record) %}
+<div id="sale-record-money">
+  <div class="my-2 text-2xl font-bold">${{ record.total }} <span class="text-[13px] text-muted">paid {{ record.paid }} • due {{ record.due }}</span></div>
+
+  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
+  {% if record.lines.is_empty() %}
+    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet{% if record.sale.status.to_string() == "Draft" %} — add one below.{% else %}.{% endif %}</div>
+  {% else %}
+    <div class="overflow-x-auto">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+            <th class="py-2 pr-3">Product</th>
+            <th class="py-2 pr-3 text-right">Qty</th>
+            <th class="py-2 pr-3 text-right">Unit price</th>
+            <th class="py-2 pr-3 text-right">Subtotal</th>
+            {% if record.sale.status.to_string() == "Draft" %}<th class="py-2"></th>{% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for line in record.lines %}
+          <tr class="border-b border-border/60" id="sale-line-{{ line.id }}">
+            <td class="py-2.5 pr-3">
+              <span class="font-semibold">{{ line.product_name }}</span>
+              <span class="text-[13px] text-muted"> · {{ line.product_sku }}</span>
+            </td>
+            <td class="py-2.5 pr-3 text-right tabular-nums">{{ line.qty }}</td>
+            <td class="py-2.5 pr-3 text-right tabular-nums">${{ line.unit_price }}</td>
+            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">${{ line.subtotal }}</td>
+            {% if record.sale.status.to_string() == "Draft" %}
+            <td class="py-2.5 text-right">
+              <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                      hx-delete="/web/sales/{{ record.sale.id }}/lines/{{ line.id }}"
+                      hx-target="#sale-record" hx-swap="innerHTML"
+                      aria-label="Remove line">✕</button>
+            </td>
+            {% endif %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</div>
+{% endmacro %}
+
+<div id="sale-record-inner" data-sale-record>
+  <div class="mb-3 flex flex-wrap items-center gap-2">
+    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.sale.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if record.sale.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.sale.status }}</span>
+    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.payment_status }}</span>
+    <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.sale.payment_type }}</span>
     <span class="text-base font-bold">
-      {% if let Some(n) = detail.sale.sale_number %}{{ n }}{% else %}Draft #{{ detail.sale.id }}{% endif %}
+      {% if let Some(n) = record.sale.sale_number %}{{ n }}{% else %}Draft sale{% endif %}
     </span>
   </div>
   <div class="mb-1 text-[13px] text-muted">
-    {% if detail.sale.customer_name.is_empty() %}Walk-in{% else %}{{ detail.sale.customer_name }}{% endif %}
-    • {{ detail.sale.sale_date }}{% if let Some(due) = detail.sale.due_date %} • due {{ due }}{% endif %}
+    {% if record.sale.customer_name.is_empty() %}Walk-in{% else %}{{ record.sale.customer_name }}{% endif %}
+    • {{ record.sale.sale_date }}{% if let Some(due) = record.sale.due_date %} • due {{ due }}{% endif %}
   </div>
-  {% if let Some(r) = detail.sale.receipt_no %}
+  {% if let Some(r) = record.sale.receipt_no %}
     <div class="text-[13px] text-muted">receipt {{ r }}</div>
   {% endif %}
-  {% if !detail.sale.notes.is_empty() %}
-    <div class="text-[13px] text-muted">{{ detail.sale.notes }}</div>
+  {% if !record.sale.notes.is_empty() %}
+    <div class="text-[13px] text-muted">{{ record.sale.notes }}</div>
   {% endif %}
-  {% if let Some(c) = detail.sale.cancel_reason %}
-    <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger">Cancelled: {{ c }}</div>
-  {% endif %}
-  <div class="my-2 text-2xl font-bold">${{ detail.total }} <span class="text-[13px] text-muted">paid {{ detail.paid }} • due {{ detail.due }}</span></div>
-
-  <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ detail.lines.len() }})</div>
-  {% if detail.lines.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet — add one from the form.</div>
-  {% else %}
-    {% for line in detail.lines %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-line-{{ line.id }}">
-      <div class="flex flex-col">
-        <span class="font-semibold">product #{{ line.product_id }}</span>
-        <span class="text-[13px] text-muted">{{ line.qty }} × ${{ line.unit_price }} = ${{ line.subtotal() }}</span>
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="font-bold tabular-nums text-income">{{ line.subtotal() }}</span>
-        {% if detail.sale.status.to_string() == "Draft" %}
-          <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-delete="/web/sales/{{ detail.sale.id }}/lines/{{ line.id }}" hx-target="#sale-detail" hx-swap="innerHTML">✕</button>
-        {% endif %}
-      </div>
-    </div>
-    {% endfor %}
+  {% if let Some(c) = record.sale.cancel_reason %}
+    <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-cancel-reason>Cancelled: {{ c }}</div>
   {% endif %}
 
-  <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ detail.payments.len() }})</div>
-  {% if detail.payments.is_empty() %}
+  {% call record_money(record) %}
+
+  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ record.payments.len() }})</div>
+  {% if record.payments.is_empty() %}
     <div class="text-[13px] text-muted">No payments recorded.</div>
   {% else %}
-    {% for pay in detail.payments %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-payment-{{ pay.id }}">
-      <div class="flex flex-col">
-        <span class="font-semibold">account #{{ pay.account_id }} • method #{{ pay.method_id }}</span>
-        <span class="text-[13px] text-muted">{{ pay.date }}</span>
-      </div>
-      <span class="font-bold tabular-nums text-income">{{ pay.amount }}</span>
+    <div class="overflow-x-auto">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+            <th class="py-2 pr-3">Date</th>
+            <th class="py-2 pr-3">Account</th>
+            <th class="py-2 pr-3">Method</th>
+            <th class="py-2 pr-3 text-right">Amount</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for pay in record.payments %}
+          <tr class="border-b border-border/60" id="sale-payment-{{ pay.id }}">
+            <td class="py-2.5 pr-3 tabular-nums">{{ pay.date }}</td>
+            <td class="py-2.5 pr-3">{{ pay.account_name }}</td>
+            <td class="py-2.5 pr-3">{{ pay.method_name }}</td>
+            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">${{ pay.amount }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
-    {% endfor %}
+  {% endif %}
+
+  {# Actions in context, gated by status. Destructive actions ask first. #}
+  {% if record.sale.status.to_string() == "Draft" %}
+  <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
+    <div class="rounded-2xl border border-border bg-card p-4" id="add-line">
+      <h2 class="mb-3 text-base font-semibold">Add line</h2>
+      {% call picker::line_picker(false, "sales", record.sale.id, "#sale-record-money", "line-unit-price", "unit_price", "Unit price (empty = list)", "list price", "sale") %}
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-4" id="confirm-sale">
+      <h2 class="mb-3 text-base font-semibold">Confirm sale</h2>
+      <form class="flex flex-col gap-2.5" data-action="Confirm sale"
+            hx-post="/web/sales/{{ record.sale.id }}/confirm"
+            hx-target="#sale-record" hx-swap="innerHTML">
+        <div>
+          <label for="confirm-account">Cash account (Cash only)</label>
+          <select id="confirm-account" name="account_id">
+            <option value="">— none (Credit) —</option>
+            {% for acc in accounts %}
+            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label for="confirm-method">Method (Cash only, must be allowed for account)</label>
+          <select id="confirm-method" name="method_id">
+            <option value="">— none (Credit) —</option>
+            {% for m in methods %}
+            <option value="{{ m.id }}">{{ m.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <button type="submit" class="bg-accent2 text-white">Confirm</button>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-4" id="edit-header">
+      <h2 class="mb-3 text-base font-semibold">Edit header</h2>
+      <form class="flex flex-col gap-2.5" data-action="Edit header"
+            hx-post="/web/sales/{{ record.sale.id }}/header"
+            hx-target="#sale-record" hx-swap="innerHTML">
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label for="header-sale-date">Sale date</label>
+            <input type="date" id="header-sale-date" name="sale_date" required value="{{ record.sale.sale_date }}" />
+          </div>
+          <div>
+            <label for="header-due-date">Due date (Credit only)</label>
+            <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.sale.due_date %}{{ due }}{% endif %}" />
+          </div>
+        </div>
+        <div>
+          <label for="header-receipt-no">Receipt no (optional)</label>
+          <input type="text" id="header-receipt-no" name="receipt_no" maxlength="64" value="{% if let Some(r) = record.sale.receipt_no %}{{ r }}{% endif %}" />
+        </div>
+        <div>
+          <label for="header-notes">Notes</label>
+          <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.sale.notes }}" />
+        </div>
+        <button type="submit">Save header</button>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-4" id="discard-sale">
+      <h2 class="mb-3 text-base font-semibold">Discard draft</h2>
+      <form class="flex flex-col gap-2.5" data-action="Discard draft"
+            hx-post="/web/sales/{{ record.sale.id }}/cancel"
+            hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
+            hx-target="#sale-record" hx-swap="innerHTML">
+        <div>
+          <label for="discard-reason">Reason (optional)</label>
+          <input type="text" id="discard-reason" name="reason" maxlength="256" />
+        </div>
+        <button type="submit" class="border border-border bg-transparent text-text">Discard draft</button>
+      </form>
+    </div>
+  </div>
+  {% else %}
+    {% if record.sale.status.to_string() == "Confirmed" %}
+    <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
+      {% if record.sale.payment_type.to_string() == "Credit" %}
+      <div class="rounded-2xl border border-border bg-card p-4" id="record-payment">
+        <h2 class="mb-3 text-base font-semibold">Record payment</h2>
+        <form class="flex flex-col gap-2.5" data-action="Record payment"
+              hx-post="/web/sales/{{ record.sale.id }}/payments"
+              hx-target="#sale-record" hx-swap="innerHTML">
+          <div>
+            <label for="payment-account">Account</label>
+            <select id="payment-account" name="account_id" required>
+              {% for acc in accounts %}
+              <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label for="payment-method">Method (must be allowed for account)</label>
+            <select id="payment-method" name="method_id" required>
+              {% for m in methods %}
+              <option value="{{ m.id }}">{{ m.name }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="flex gap-2.5 [&>*]:flex-1">
+            <div>
+              <label for="payment-amount">Amount</label>
+              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+            </div>
+            <div>
+              <label for="payment-date">Date</label>
+              <input type="date" id="payment-date" name="date" required value="{{ today }}" />
+            </div>
+          </div>
+          <button type="submit" class="bg-accent2 text-white">Record payment</button>
+        </form>
+      </div>
+      {% endif %}
+
+      <div class="rounded-2xl border border-border bg-card p-4" id="cancel-sale">
+        <h2 class="mb-3 text-base font-semibold">Cancel sale</h2>
+        <form class="flex flex-col gap-2.5" data-action="Cancel sale"
+              hx-post="/web/sales/{{ record.sale.id }}/cancel"
+              hx-confirm="Cancel this sale? Stock returns and recorded payments are refunded."
+              hx-target="#sale-record" hx-swap="innerHTML">
+          <div>
+            <label for="cancel-reason">Reason</label>
+            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="customer return…" />
+          </div>
+          <button type="submit" class="border border-border bg-transparent text-text">Cancel sale</button>
+        </form>
+      </div>
+    </div>
+    {% endif %}
   {% endif %}
 </div>
+
+{# The line response keeps the picker outside the swapped money region and swaps
+   it out of band with an empty, focused field, so the next scan lands there. #}
+{% if oob_picker %}{% call picker::line_picker(true, "sales", record.sale.id, "#sale-record-money", "line-unit-price", "unit_price", "Unit price (empty = list)", "list price", "sale") %}{% endif %}

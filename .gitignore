@@ -17,3 +17,28 @@ Thumbs.db
 
 # Local code graph index
 .codegraph/
+
+# Node artifacts must never enter this repo: there is no Node toolchain.
+# A stray package-lock.json from an npx invocation had to be removed once, so
+# every common package-manager artifact is ignored defensively, not just npm's.
+package-lock.json
+npm-shrinkwrap.json
+yarn.lock
+pnpm-lock.yaml
+node_modules/
+.npm/
+.yarn/
+.pnpm-store/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# E2E browser suite (Python + uv)
+e2e/.venv/
+e2e/.artifacts/
+e2e/**/__pycache__/
+e2e/.pytest_cache/
+e2e/.ruff_cache/
+e2e/.mypy_cache/
+e2e/test-results/
+

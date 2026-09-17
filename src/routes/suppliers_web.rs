@@ -45,6 +45,7 @@ struct SuppliersTemplate {
     suppliers: Vec<SupplierView>,
     products: Vec<Product>,
     today: String,
+    nav_key: &'static str,
 }
 
 #[derive(Template)]
@@ -151,6 +152,7 @@ async fn suppliers_page(State(state): State<AppState>) -> Result<Html<String>, A
         suppliers,
         products,
         today,
+        nav_key: "suppliers",
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,

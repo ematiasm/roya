@@ -29,6 +29,10 @@ struct ProductsTemplate {
     low_stock: Vec<ProductStock>,
     allow_negative_stock: bool,
     today: String,
+    nav_key: &'static str,
+    /// Current filter values, so the form reflects a bookmarkable `/products?q=…`.
+    filter_q: String,
+    filter_category: String,
 }
 
 #[derive(Template)]
@@ -43,6 +47,19 @@ struct StockListPartial {
     items: Vec<ProductStock>,
 }
 
+/// The picker results fragment. Generic on purpose: the record page supplies the
+/// line action and swap target, so the purchase record page reuses it unchanged.
+#[derive(Template)]
+#[template(path = "partials/product_search_results.html")]
+struct ProductSearchResultsPartial {
+    query: String,
+    matches: Vec<ProductStock>,
+    line_action: String,
+    line_target: String,
+    /// True when the calling context buys: show the cost, not the sale price.
+    show_cost: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -55,29 +72,22 @@ fn is_htmx(headers: &HeaderMap) -> bool {
 }
 
 async fn all_product_stocks(state: &AppState) -> AppResult<Vec<ProductStock>> {
-    let products = state.inventory_service.products.list().await?;
-    let mut out = Vec::with_capacity(products.len());
-    for p in products {
-        let stock = state.inventory_service.movements.stock_for_product(p.id).await?;
-        let suggested = match (p.min_stock, p.max_stock) {
-            (Some(min), Some(max)) if stock <= min => Some(max - stock),
-            _ => None,
-        };
-        out.push(ProductStock {
-            product: p,
-            stock,
-            suggested,
-        });
-    }
-    Ok(out)
+    state.inventory_service.filter_products("", None).await
 }
 
 // ---------------------------------------------------------------------------
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-async fn products_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let products = all_product_stocks(&state).await?;
+async fn products_page(
+    State(state): State<AppState>,
+    Query(q): Query<WebProductFilter>,
+) -> Result<Html<String>, AppError> {
+    let (query, category_id) = q.parsed();
+    let products = state
+        .inventory_service
+        .filter_products(&query, category_id)
+        .await?;
     let categories = state.inventory_service.categories.list().await?;
     let low_stock = state.inventory_service.low_stock().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -87,6 +97,9 @@ async fn products_page(State(state): State<AppState>) -> Result<Html<String>, Ap
         low_stock,
         allow_negative_stock: state.allow_negative_stock,
         today,
+        nav_key: "products",
+        filter_q: query,
+        filter_category: q.category_id.as_deref().unwrap_or("").trim().to_string(),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -95,30 +108,38 @@ async fn products_page(State(state): State<AppState>) -> Result<Html<String>, Ap
 
 #[derive(Debug, Deserialize, Default)]
 pub struct WebProductFilter {
+    #[serde(default)]
     pub category_id: Option<String>,
+    /// Text search over name, SKU and barcode, matched by the inventory service.
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+impl WebProductFilter {
+    /// The search text and the parsed category. An empty or unparseable value is
+    /// treated as "no constraint", matching the lenient parsing the list already
+    /// used, so a stray value never turns a bookmark into an error.
+    fn parsed(&self) -> (String, Option<i64>) {
+        let query = self.q.as_deref().unwrap_or("").trim().to_string();
+        let category = self
+            .category_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        (query, category)
+    }
 }
 
 async fn web_product_list(
     State(state): State<AppState>,
     Query(q): Query<WebProductFilter>,
 ) -> Result<Html<String>, AppError> {
-    // Empty string from <select> means "all".
-    let filter: Option<i64> = q.category_id.as_deref().and_then(|s| {
-        let t = s.trim();
-        if t.is_empty() {
-            None
-        } else {
-            t.parse().ok()
-        }
-    });
-    let stocks = all_product_stocks(&state).await?;
-    let products = match filter {
-        Some(cid) => stocks
-            .into_iter()
-            .filter(|ps| ps.product.category_id == Some(cid))
-            .collect(),
-        None => stocks,
-    };
+    let (query, category_id) = q.parsed();
+    let products = state
+        .inventory_service
+        .filter_products(&query, category_id)
+        .await?;
     let html = ProductListPartial { products }
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -165,6 +186,51 @@ async fn web_product_options(State(state): State<AppState>) -> Result<Html<Strin
             html_escape(&p.name)
         ));
     }
+    Ok(Html(html))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ProductSearchQuery {
+    /// Documented query name.
+    #[serde(default)]
+    pub q: String,
+    /// The picker input is named `product` because the same field feeds the line
+    /// form; both names reach the same search.
+    #[serde(default)]
+    pub product: String,
+    /// The record's line endpoint and swap target, supplied by the picker form so
+    /// the fragment stays generic (sales and purchases share it).
+    #[serde(default)]
+    pub line_action: String,
+    #[serde(default)]
+    pub line_target: String,
+    /// Which price the calling context works in: `cost` for a purchase line,
+    /// `sale` (the default) for a sale line. Only that number is shown.
+    #[serde(default)]
+    pub price: String,
+}
+
+/// `GET /web/product-search?q=`: the bounded picker read. Matching and stock
+/// derivation live in the inventory service; the route only renders.
+async fn web_product_search(
+    State(state): State<AppState>,
+    Query(params): Query<ProductSearchQuery>,
+) -> Result<Html<String>, AppError> {
+    let raw = if params.q.trim().is_empty() {
+        params.product
+    } else {
+        params.q
+    };
+    let matches = state.inventory_service.search_products(&raw).await?;
+    let html = ProductSearchResultsPartial {
+        query: raw.trim().to_string(),
+        matches,
+        line_action: params.line_action.trim().to_string(),
+        line_target: params.line_target.trim().to_string(),
+        show_cost: params.price.trim().eq_ignore_ascii_case("cost"),
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -392,6 +458,7 @@ pub fn router() -> Router<AppState> {
         .route("/web/categories", post(web_create_category))
         .route("/web/category-options", get(web_category_options))
         .route("/web/product-options", get(web_product_options))
+        .route("/web/product-search", get(web_product_search))
         .route("/web/stock-movements", post(web_create_movement))
         .route("/web/low-stock", get(web_low_stock))
         .route("/web/negative-stock", get(web_negative_stock))
@@ -480,5 +547,104 @@ mod tests {
         let (status, html) = get_html(app, "/web/products").await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("WEB-1"), "fragment should contain new sku: {html:.300}");
+    }
+
+    // -- N4: the picker search fragment ---------------------------------------
+
+    async fn seed_search_product(state: &AppState) -> crate::models::Product {
+        use crate::models::{NewProduct, ProductKind};
+        use rust_decimal::Decimal;
+
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "PICK-1".into(),
+                name: "Yerba Picker".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(10),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .inventory_service
+            .add_barcode(product.id, "7791234567890")
+            .await
+            .unwrap();
+        product
+    }
+
+    /// AC8: name, SKU and barcode all find the product in one fragment, and the
+    /// fragment carries price and current stock.
+    #[tokio::test]
+    async fn n4_product_search_matches_name_sku_and_barcode() {
+        let state = test_state().await;
+        seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        for needle in ["picker", "PICK-1", "7791234567890"] {
+            let (status, html) =
+                get_html(app.clone(), &format!("/web/product-search?q={needle}")).await;
+            assert_eq!(status, StatusCode::OK, "{needle}: {html}");
+            assert!(html.contains("Yerba Picker"), "{needle}: {html}");
+            assert!(html.contains("PICK-1"), "{needle}: {html}");
+            assert!(html.contains("$25"), "price rides along: {html}");
+            assert!(html.contains("stock 0"), "stock rides along: {html}");
+        }
+    }
+
+    /// AC8 (negative): an empty query returns no results, not the catalogue.
+    #[tokio::test]
+    async fn n4_product_search_empty_query_returns_no_results() {
+        let state = test_state().await;
+        seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/web/product-search?q=").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("Yerba Picker"),
+            "empty query must not dump the catalogue: {html}"
+        );
+    }
+
+    /// The fragment is generic: when the caller names the record's line action,
+    /// every match becomes its own add form that includes the picker form and
+    /// supplies its own product id. Without an action there are no dead controls.
+    #[tokio::test]
+    async fn n4_product_search_fragment_renders_one_add_action_per_match() {
+        let state = test_state().await;
+        let product = seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        let (status, plain) = get_html(app.clone(), "/web/product-search?q=picker").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !plain.contains("hx-post"),
+            "without an action the fragment must not render dead controls: {plain}"
+        );
+
+        let (status, html) = get_html(
+            app,
+            "/web/product-search?q=picker&line_action=/web/sales/7/lines&line_target=%23sale-record-money",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(html.matches("<form").count(), 1, "{html}");
+        assert!(html.contains("hx-post=\"/web/sales/7/lines\""), "{html}");
+        assert!(html.contains("hx-include=\"#line-picker\""), "{html}");
+        assert!(html.contains("hx-target=\"#sale-record-money\""), "{html}");
+        let vals = format!("hx-vals='{{\"product_id\": {}}}'", product.id);
+        assert!(
+            html.contains(&vals),
+            "result must supply its own product id: {html}"
+        );
     }
 }
