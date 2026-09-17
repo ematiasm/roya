@@ -1,4 +1,5 @@
 pub mod account;
+pub mod customer_receipts;
 pub mod customers;
 pub mod finance_methods;
 pub mod inventory;
@@ -8,6 +9,7 @@ pub mod suppliers;
 pub mod transaction;
 
 pub use account::AccountService;
+pub use customer_receipts::CustomerReceiptService;
 pub use customers::CustomerService;
 pub use finance_methods::PaymentMethodService;
 pub use inventory::InventoryService;

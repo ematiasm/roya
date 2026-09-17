@@ -489,6 +489,9 @@ pub struct SalePayment {
     pub transaction_id: Option<i64>,
     /// Refund transaction created when the sale was cancelled, if any.
     pub refund_transaction_id: Option<i64>,
+    /// Customer receipt that groups this payment, when a lump-sum collection
+    /// produced it; NULL for a direct payment on a single sale.
+    pub receipt_id: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -962,4 +965,63 @@ pub struct CustomerStatement {
     pub as_of: NaiveDate,
     pub ageing: Ageing,
     pub entries: Vec<StatementEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// M4 customers (Slice L). A customer receipt is the document a single handover
+// of money produces: it groups one `sale_payments` row per credit sale the
+// amount covered, applied oldest debt first. Each grouped payment still belongs
+// to its sale and keeps its own finance link, so traceability is untouched; the
+// receipt posts no movement of its own. There is NO stored total: the amount
+// handed over is derived as SUM(allocations), so an interrupted collection can
+// leave fewer payments but never a receipt claiming more than it applied.
+// Decimal-as-TEXT like the rest of the project.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomerReceipt {
+    pub id: i64,
+    pub customer_id: i64,
+    pub account_id: i64,
+    pub method_id: i64,
+    pub date: NaiveDate,
+    /// Optional free text (trimmed, <= 256 chars), NULL when empty.
+    pub notes: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// Service-level input for creating a receipt. There is no total field: the
+/// collected amount is a plan input, not a stored claim; what the document
+/// applied is derived from its payments.
+#[derive(Debug, Clone)]
+pub struct NewReceipt {
+    pub customer_id: i64,
+    pub account_id: i64,
+    pub method_id: i64,
+    pub date: NaiveDate,
+    pub notes: Option<String>,
+}
+
+/// One receipt with the payments it groups. `allocations` are the
+/// `sale_payments` rows carrying the receipt id, one per covered sale and each
+/// with its own `transaction_id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceiptDetail {
+    pub receipt: CustomerReceipt,
+    pub allocations: Vec<SalePayment>,
+    /// Derived, never stored: `SUM(allocations.amount)`, i.e. exactly what was
+    /// handed over and applied. A stored copy could disagree with the payments;
+    /// this one is computed from them.
+    pub total: Decimal,
+}
+
+impl ReceiptDetail {
+    pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>) -> Self {
+        let total = allocations.iter().map(|payment| payment.amount).sum();
+        Self {
+            receipt,
+            allocations,
+            total,
+        }
+    }
 }

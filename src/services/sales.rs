@@ -446,6 +446,29 @@ where
             .sum())
     }
 
+    /// The customer's outstanding debt sales, oldest first: `due_date`, then
+    /// `sale_date`, then id. This is the order `CustomerReceiptService` collects in,
+    /// so the oldest invoice is paid before the largest. Only Confirmed credit sales
+    /// with `due > 0` appear, which is why a walk-in sale can never be allocated to:
+    /// a confirmed credit sale always carries a due date (K2) and never belongs to
+    /// the walk-in.
+    pub async fn customer_debt_sales(&self, customer_id: i64) -> AppResult<Vec<SaleDetail>> {
+        let mut details: Vec<SaleDetail> = self
+            .customer_credit_details(customer_id)
+            .await?
+            .into_iter()
+            .filter(|detail| detail.due > Decimal::ZERO)
+            .collect();
+        details.sort_by(|a, b| {
+            a.sale
+                .due_date
+                .cmp(&b.sale.due_date)
+                .then_with(|| a.sale.sale_date.cmp(&b.sale.sale_date))
+                .then_with(|| a.sale.id.cmp(&b.sale.id))
+        });
+        Ok(details)
+    }
+
     /// Add one sale's outstanding `due` to the bucket its `due_date` falls into
     /// against `as_of`: due today, not yet due and no due date are current;
     /// 1..=30, 31..=60 and >60 days late fill the other three.
@@ -790,6 +813,7 @@ where
                     total,
                     sale.sale_date,
                     Some(income.id),
+                    None,
                 )
                 .await?;
         }
@@ -800,6 +824,8 @@ where
 
     // -- Pay (Credit) ------------------------------------------------------------
 
+    /// Record a payment on one sale, without a receipt: this is a direct payment
+    /// on a single sale and keeps working exactly as before.
     pub async fn record_payment(
         &self,
         sale_id: i64,
@@ -807,6 +833,23 @@ where
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
+    ) -> AppResult<SalePayment> {
+        self.record_payment_with_receipt(sale_id, account_id, method_id, amount, date, None)
+            .await
+    }
+
+    /// Record a payment on one sale. `receipt_id` groups the payment under the
+    /// customer receipt a collection produced; `None` is a direct payment on a
+    /// single sale. Either way the payment posts its own Income and keeps its
+    /// `transaction_id`; the receipt never posts a movement of its own.
+    pub async fn record_payment_with_receipt(
+        &self,
+        sale_id: i64,
+        account_id: i64,
+        method_id: i64,
+        amount: Decimal,
+        date: NaiveDate,
+        receipt_id: Option<i64>,
     ) -> AppResult<SalePayment> {
         let sale = self
             .sales
@@ -860,6 +903,7 @@ where
                 amount,
                 date,
                 Some(income.id),
+                receipt_id,
             )
             .await
     }

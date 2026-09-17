@@ -67,6 +67,7 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> SalePayment {
         date: row.get("date"),
         transaction_id: row.get("transaction_id"),
         refund_transaction_id: row.get("refund_transaction_id"),
+        receipt_id: row.get("receipt_id"),
         created_at: row.get("created_at"),
     }
 }
@@ -82,7 +83,7 @@ fn map_db_err(e: sqlx::Error) -> AppError {
             AppError::Conflict("sale already exists".into())
         }
     } else if s.contains("FOREIGN KEY constraint failed") {
-        AppError::NotFound("referenced sale/product/account not found".into())
+        AppError::NotFound("referenced sale/product/account/receipt not found".into())
     } else {
         AppError::Database(e)
     }
@@ -130,7 +131,9 @@ pub trait SaleRepository: Send + Sync {
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
     /// Create the payment row and link it to the finance transaction it produced
-    /// (`transaction_id`); NULL only for historical rows.
+    /// (`transaction_id`) and to the receipt that groups it (`receipt_id`); both
+    /// are NULL for a direct payment on a single sale. A receipt-grouped payment
+    /// still belongs to its sale and keeps its own transaction link.
     async fn create_payment(
         &self,
         sale_id: i64,
@@ -139,6 +142,7 @@ pub trait SaleRepository: Send + Sync {
         amount: Decimal,
         date: NaiveDate,
         transaction_id: Option<i64>,
+        receipt_id: Option<i64>,
     ) -> AppResult<SalePayment>;
     /// Link the refund transaction created by cancelling the sale to the payment
     /// row it refunds. The original `transaction_id` is left untouched.
@@ -148,6 +152,10 @@ pub trait SaleRepository: Send + Sync {
         refund_transaction_id: i64,
     ) -> AppResult<SalePayment>;
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>>;
+    /// The payments one customer receipt groups (its allocations), by id. The SQL
+    /// for `sale_payments` stays here, in the sales module that owns the table, so
+    /// the receipt repository can expose the read without querying a sales table.
+    async fn list_payments_by_receipt(&self, receipt_id: i64) -> AppResult<Vec<SalePayment>>;
 }
 
 #[derive(Clone)]
@@ -408,11 +416,12 @@ impl SaleRepository for SqliteSaleRepository {
         amount: Decimal,
         date: NaiveDate,
         transaction_id: Option<i64>,
+        receipt_id: Option<i64>,
     ) -> AppResult<SalePayment> {
         let row = sqlx::query(
-            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, transaction_id)
-               VALUES (?, ?, ?, ?, ?, ?)
-               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
+            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, transaction_id, receipt_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at"#,
         )
         .bind(sale_id)
         .bind(account_id)
@@ -420,6 +429,7 @@ impl SaleRepository for SqliteSaleRepository {
         .bind(amount.to_string())
         .bind(date)
         .bind(transaction_id)
+        .bind(receipt_id)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -433,7 +443,7 @@ impl SaleRepository for SqliteSaleRepository {
     ) -> AppResult<SalePayment> {
         let row = sqlx::query(
             r#"UPDATE sale_payments SET refund_transaction_id = ? WHERE id = ?
-               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at"#,
         )
         .bind(refund_transaction_id)
         .bind(payment_id)
@@ -445,10 +455,21 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>> {
         let rows = sqlx::query(
-            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at
                FROM sale_payments WHERE sale_id = ? ORDER BY id"#,
         )
         .bind(sale_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_payment).collect())
+    }
+
+    async fn list_payments_by_receipt(&self, receipt_id: i64) -> AppResult<Vec<SalePayment>> {
+        let rows = sqlx::query(
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at
+               FROM sale_payments WHERE receipt_id = ? ORDER BY id"#,
+        )
+        .bind(receipt_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_payment).collect())

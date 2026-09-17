@@ -1,6 +1,7 @@
 pub mod account_repo;
 pub mod barcode_repo;
 pub mod category_repo;
+pub mod customer_receipt_repo;
 pub mod customer_repo;
 pub mod doc_sequence_repo;
 pub mod payment_method_repo;
@@ -15,6 +16,7 @@ pub mod transaction_repo;
 pub use account_repo::{AccountRepository, SqliteAccountRepository};
 pub use barcode_repo::{BarcodeRepository, SqliteBarcodeRepository};
 pub use category_repo::{CategoryRepository, SqliteCategoryRepository};
+pub use customer_receipt_repo::{CustomerReceiptRepository, SqliteCustomerReceiptRepository};
 pub use customer_repo::{CustomerRepository, SqliteCustomerRepository};
 pub use doc_sequence_repo::{DocSequenceRepository, SqliteDocSequenceRepository};
 pub use payment_method_repo::{PaymentMethodRepository, SqlitePaymentMethodRepository};
