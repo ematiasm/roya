@@ -1764,6 +1764,33 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
             )?;
         }
     }
+
+    // Orphan movements: every transaction whose reference looks like a document
+    // number must be claimed by some payment, as original or refund. A failure
+    // between creating the movement and inserting the payment row leaves one of
+    // these (the project deliberately does not share transactions across
+    // modules), and nothing else would notice it. Manual transactions keep a
+    // NULL reference and stay exempt.
+    let orphans: Vec<(i64,)> = sqlx::query_as(
+        "SELECT t.id FROM transactions t \
+         WHERE t.reference IS NOT NULL \
+           AND (t.reference GLOB '[0-9][0-9][0-9][0-9]-SALE-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+             OR t.reference GLOB '[0-9][0-9][0-9][0-9]-PURCH-[0-9][0-9][0-9][0-9][0-9][0-9]') \
+           AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
+                           WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id) \
+           AND NOT EXISTS (SELECT 1 FROM purchase_payments pp \
+                           WHERE pp.transaction_id = t.id OR pp.refund_transaction_id = t.id) \
+         ORDER BY t.id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if !orphans.is_empty() {
+        let ids: Vec<i64> = orphans.into_iter().map(|(id,)| id).collect();
+        return Err(format!(
+            "transactions with a document reference are claimed by no payment: {ids:?} (every document movement must be linked as transaction_id or refund_transaction_id)"
+        ));
+    }
     Ok(())
 }
 
@@ -2379,4 +2406,66 @@ async fn money_invariant_catches_equal_amount_pointer_swaps() {
     let err = check_payment_links_are_traceable(&pool).await.unwrap_err();
     eprintln!("both-pointers swap rejected: {err}");
     assert!(err.contains("claimed by both"), "{err}");
+}
+
+/// The payment-traceability invariant must also see movements that no payment
+/// claims: a failure between creating the finance movement and inserting the
+/// payment leaves an orphan Income that inflates the account while the sale
+/// stays unpaid. The collection is deliberately not transactional across
+/// modules, so the invariant detects the residual instead.
+#[tokio::test]
+async fn money_invariant_catches_orphan_document_movement() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "OrphanInv", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "ORPHAN-INV", "1", "10").await;
+    record_stock_via_web(&app, product, "5").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "OrphanBuyer", "Credit", "2024-06-02").await;
+    add_sale_line_via_web(&app, sale, product, "1").await;
+    confirm_sale_via_web(&app, sale, None, None).await;
+    let sale_number = sale_detail(&app, sale).await["sale"]["sale_number"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Injected failure between the movement and the payment row.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER injected_payment_failure BEFORE INSERT ON sale_payments \
+         WHEN NEW.sale_id = {sale} BEGIN SELECT RAISE(ABORT, 'injected payment failure'); END"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "10").await;
+    assert!(status.is_server_error(), "{status} {body}");
+
+    let orphan: (i64,) = sqlx::query_as(
+        "SELECT t.id FROM transactions t WHERE t.reference = ? \
+         AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
+                         WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id)",
+    )
+    .bind(&sale_number)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let err = check_payment_links_are_traceable(&pool).await.unwrap_err();
+    eprintln!("orphan invariant error: {err}");
+    assert!(err.contains("claimed by no payment"), "{err}");
+    assert!(
+        err.contains(&orphan.0.to_string()),
+        "the invariant must report the orphan id: {err}"
+    );
+
+    // The orphan inflated the account while the sale stayed unpaid.
+    let tx: (String, String) = sqlx::query_as("SELECT kind, amount FROM transactions WHERE id = ?")
+        .bind(orphan.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tx.0, "Income");
+    assert_eq!(Decimal::from_str(&tx.1).unwrap(), Decimal::from_str("10").unwrap());
+    let detail = sale_detail(&app, sale).await;
+    assert_eq!(dec(&detail["paid"]), Decimal::ZERO, "the orphan paid nothing");
+    assert_eq!(dec(&detail["due"]), dec(&detail["total"]));
 }

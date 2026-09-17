@@ -504,11 +504,14 @@ mod tests {
     async fn ac16_add_sales_customer_backfills_walkin_and_preserves_rows() {
         let pool = memory_pool().await;
 
-        // Replay every migration except the K2 one so the legacy schema is real.
+        // Replay the pre-K2 migration range so the legacy schema is real. The
+        // later migrations depend on K2's `sales.customer_id` (migration 23's
+        // receipt triggers reference it), so they are applied after the rebuild
+        // below instead of against a schema their SQL cannot compile on.
         let migrator = sqlx::migrate!("./migrations");
         let mut applied: Vec<String> = Vec::new();
         for migration in migrator.iter() {
-            if migration.description.contains("add sales customer") {
+            if migration.version >= 20240101000021 {
                 continue;
             }
             sqlx::raw_sql(migration.sql.clone())
@@ -588,6 +591,19 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+
+        // K2 owns `sales.customer_id`; only now can the migrations that depend on
+        // it (customer receipts and the receipt-link triggers) be replayed.
+        for migration in migrator.iter() {
+            if migration.version <= 20240101000021 {
+                continue;
+            }
+            sqlx::raw_sql(migration.sql.clone())
+                .execute(&pool)
+                .await
+                .unwrap();
+            applied.push(migration.description.to_string());
+        }
 
         // Backfill: the legacy sale belongs to the walk-in and keeps its snapshot.
         let (customer_id, customer_name): (i64, String) =

@@ -741,7 +741,16 @@ router, form extraction and Askama rendering.
   cross-payment swaps fail even though every fact matches. That ownership rule
   is only reachable through direct database tampering: the application always
   creates a fresh refund per payment and no route accepts
-  `refund_transaction_id`).
+  `refund_transaction_id`). The invariant also rejects orphan document
+  movements: any transaction whose `reference` looks like `YYYY-SALE-NNNNNN`
+  or `YYYY-PURCH-NNNNNN` must be claimed by some payment as `transaction_id`
+  or `refund_transaction_id`, so a failure between creating the movement and
+  inserting the payment row cannot hide, and the offending ids are reported.
+- **Customer receipts (Slice L)**: a receipt's amount is derived from the
+  payments it groups, and database triggers refuse to group a payment under a
+  receipt of another customer on insert and on update alike, so no code path can
+  make a receipt claim money its own collection never applied. Ungrouped
+  payments and same-customer groupings are unaffected.
 - **Generic form-wiring guard**: for the seeded `/`, `/accounts/{id}`,
   `/products`, `/sales`, `/purchases` and `/suppliers` pages (plus the sale and
   purchase detail fragments) it extracts every `hx-get`, `hx-post`, `hx-put`,

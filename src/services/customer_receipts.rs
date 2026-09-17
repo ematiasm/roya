@@ -1311,4 +1311,146 @@ mod tests {
         s.delete_receipt(receipt_id.0).await.unwrap();
         assert!(s.receipts.find_by_id(receipt_id.0).await.unwrap().is_none());
     }
+
+    /// Finding 1: a payment may only be grouped under a receipt of its own
+    /// customer. The trigger fires on insert and on update, and only when a
+    /// receipt is set, so ungrouped payments and legitimate groupings are
+    /// untouched.
+    #[tokio::test]
+    async fn payment_cannot_be_grouped_under_another_customers_receipt() {
+        let (s, pool) = svc().await;
+        let product = seed_product(&s, "R-22", "10").await;
+        let ana = seed_customer(&s, "Ana").await;
+        let beto = seed_customer(&s, "Beto").await;
+        let account = seed_account(&s, "Caja").await;
+        let cash = method_id(&s, "Cash").await;
+        allow(&s, account, cash).await;
+        let ana_sale = credit_sale(&s, ana, product, "3", d(2024, 6, 1)).await;
+        let ana_sale_two = credit_sale(&s, ana, product, "2", d(2024, 6, 10)).await;
+        let beto_receipt = s
+            .receipts
+            .create(&NewReceipt {
+                customer_id: beto,
+                account_id: account,
+                method_id: cash,
+                date: d(2024, 6, 20),
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let ana_receipt = s
+            .receipts
+            .create(&NewReceipt {
+                customer_id: ana,
+                account_id: account,
+                method_id: cash,
+                date: d(2024, 6, 20),
+                notes: None,
+            })
+            .await
+            .unwrap();
+
+        // Direct SQL insert of a mismatched pair is aborted.
+        let err = sqlx::query(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
+             VALUES (?, ?, ?, '10', '2024-06-20', ?)",
+        )
+        .bind(ana_sale.sale.id)
+        .bind(account)
+        .bind(cash)
+        .bind(beto_receipt.id)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        eprintln!("mismatched insert error: {err}");
+        assert!(
+            err.to_string().contains("another customer's receipt"),
+            "got {err}"
+        );
+
+        // A matching pair is accepted, and a payment with a NULL receipt_id is
+        // unaffected.
+        sqlx::query(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
+             VALUES (?, ?, ?, '10', '2024-06-20', ?)",
+        )
+        .bind(ana_sale.sale.id)
+        .bind(account)
+        .bind(cash)
+        .bind(ana_receipt.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
+             VALUES (?, ?, ?, '5', '2024-06-20', NULL)",
+        )
+        .bind(ana_sale.sale.id)
+        .bind(account)
+        .bind(cash)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let free_payment: (i64,) = sqlx::query_as(
+            "SELECT id FROM sale_payments WHERE sale_id = ? AND receipt_id IS NULL",
+        )
+        .bind(ana_sale.sale.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // UPDATE onto another customer's receipt is aborted...
+        let err = sqlx::query("UPDATE sale_payments SET receipt_id = ? WHERE id = ?")
+            .bind(beto_receipt.id)
+            .bind(free_payment.0)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        eprintln!("mismatched update error: {err}");
+        assert!(
+            err.to_string().contains("another customer's receipt"),
+            "got {err}"
+        );
+
+        // ...while grouping it under a receipt of its own customer works, on a
+        // second sale of the same customer too.
+        sqlx::query("UPDATE sale_payments SET receipt_id = ? WHERE id = ?")
+            .bind(ana_receipt.id)
+            .bind(free_payment.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
+             VALUES (?, ?, ?, '7', '2024-06-20', ?)",
+        )
+        .bind(ana_sale_two.sale.id)
+        .bind(account)
+        .bind(cash)
+        .bind(ana_receipt.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            s.receipts.list_allocations(ana_receipt.id).await.unwrap().len(),
+            3,
+            "one receipt grouping several payments of its own customer"
+        );
+
+        // The service path still groups its own customer's payment.
+        let paid = s
+            .sales
+            .record_payment_with_receipt(
+                ana_sale.sale.id,
+                account,
+                cash,
+                dec("1"),
+                d(2024, 6, 21),
+                Some(ana_receipt.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(paid.receipt_id, Some(ana_receipt.id));
+    }
+
 }
