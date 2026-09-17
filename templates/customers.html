@@ -1,0 +1,230 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block content %}
+<div class="mb-4 flex items-center gap-2">
+  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/sales" class="text-[13px] text-muted">Sales</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">customers • derived balance and ageing</span>
+</div>
+<div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
+  <div class="flex flex-col gap-6">
+    {% if let Some(c) = selected %}
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Statement — {{ c.name }}</h2>
+        <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/customers">← All customers</a>
+      </div>
+      <div id="customer-statement"
+           hx-get="/web/customers/{{ c.id }}/statement"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/customer_statement.html" %}
+      </div>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Payment history</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/customers/{{ c.id }}/receipts" hx-target="#receipt-list" hx-swap="innerHTML">↻ Refresh</button>
+      </div>
+      <div id="receipt-list"
+           hx-get="/web/customers/{{ c.id }}/receipts"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/receipt_list.html" %}
+      </div>
+      <div class="mt-2 text-[13px] text-muted">Each receipt is one handover of money: its total is derived from the payments it groups, applied oldest debt first.</div>
+    </div>
+    {% else %}
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Customers</h2>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">↻ Refresh</button>
+      </div>
+      <div id="customer-list"
+           hx-get="/web/customers"
+           hx-trigger="refresh from:body, load"
+           hx-swap="innerHTML">
+        {% include "partials/customer_list.html" %}
+      </div>
+      <div class="mt-2 text-[13px] text-muted">Balance = confirmed credit sales − payments received. Ageing from due_date: current, 1–30, 31–60, 61+ days overdue.</div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="flex flex-col gap-6">
+    {% if let Some(c) = selected %}
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Collect payment</h2>
+      <form class="flex flex-col gap-2.5"
+            hx-post="/web/customer-receipts"
+            hx-target="#receipt-list"
+            hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#customer-statement','refresh'); }">
+        <input type="hidden" name="customer_id" value="{{ c.id }}" />
+        <div>
+          <label>Customer</label>
+          <div class="rounded-[10px] border border-border bg-bg px-3 py-2.5 text-sm">{{ c.name }}</div>
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Amount</label>
+            <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+          </div>
+          <div>
+            <label>Date</label>
+            <input type="date" name="date" required value="{{ today }}" />
+          </div>
+        </div>
+        <div>
+          <label>Account</label>
+          <select name="account_id" required>
+            {% for acc in accounts %}
+            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Method (required, must be allowed for account)</label>
+          <select name="method_id" required>
+            {% for m in methods %}
+            <option value="{{ m.id }}">{{ m.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div>
+          <label>Notes (optional)</label>
+          <input type="text" name="notes" placeholder="…" maxlength="256" />
+        </div>
+        <button type="submit" class="bg-accent2 text-white">Collect</button>
+        <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered sale grouped under the new receipt. More than the outstanding debt ⇒ 400; disallowed (account, method) ⇒ 400. Also at <code>POST /api/customer-receipts</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
+      <div class="text-[13px] leading-[1.7] text-muted">
+        <code>GET /api/customers/{{ c.id }}</code><br/>
+        <code>GET /api/customers/{{ c.id }}/statement</code><br/>
+        <code>GET /api/customer-receipts?customer_id={{ c.id }}</code><br/>
+        <code>POST /api/customer-receipts</code><br/>
+      </div>
+    </div>
+    {% else %}
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">New Customer</h2>
+      <form class="flex flex-col gap-2.5"
+            hx-post="/web/customers"
+            hx-target="#customer-list"
+            hx-swap="innerHTML"
+            hx-on::after-request="if(event.detail.successful) this.reset()">
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" required maxlength="128" placeholder="Ana Pérez…" />
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Phone (optional)</label>
+            <input type="text" name="phone" maxlength="32" placeholder="555-1234" />
+          </div>
+          <div>
+            <label>Tax ID (optional)</label>
+            <input type="text" name="tax_id" maxlength="32" />
+          </div>
+        </div>
+        <div>
+          <label>Address (optional)</label>
+          <input type="text" name="address" maxlength="256" />
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Credit limit (empty = no limit)</label>
+            <input type="number" name="credit_limit" step="0.01" min="0" placeholder="unlimited" />
+          </div>
+          <div>
+            <label>Payment days (empty = no term)</label>
+            <input type="number" name="payment_days" min="0" placeholder="30" />
+          </div>
+        </div>
+        <div>
+          <label>Notes (optional)</label>
+          <input type="text" name="notes" maxlength="512" />
+        </div>
+        <button type="submit">Create Customer</button>
+        <div class="text-[13px] text-muted">Duplicate names are allowed; the existing match is reported as a warning. Also at <code>POST /api/customers</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">Edit Customer</h2>
+      <form class="flex flex-col gap-2.5"
+            hx-post="/web/customers/edit"
+            hx-target="#customer-list"
+            hx-swap="innerHTML">
+        <div>
+          <label>Customer ID</label>
+          <input type="number" name="customer_id" required min="1" placeholder="1" />
+        </div>
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" required maxlength="128" placeholder="Name" />
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Phone (empty clears)</label>
+            <input type="text" name="phone" maxlength="32" />
+          </div>
+          <div>
+            <label>Tax ID (empty clears)</label>
+            <input type="text" name="tax_id" maxlength="32" />
+          </div>
+        </div>
+        <div>
+          <label>Address (empty clears)</label>
+          <input type="text" name="address" maxlength="256" />
+        </div>
+        <div class="flex gap-2.5 [&>*]:flex-1">
+          <div>
+            <label>Credit limit (empty = no limit)</label>
+            <input type="number" name="credit_limit" step="0.01" min="0" />
+          </div>
+          <div>
+            <label>Payment days (empty = no term)</label>
+            <input type="number" name="payment_days" min="0" />
+          </div>
+        </div>
+        <div>
+          <label>Notes (empty clears)</label>
+          <input type="text" name="notes" maxlength="512" />
+        </div>
+        <button type="submit">Save Customer</button>
+        <div class="text-[13px] text-muted">The submitted fields replace the current values; empty optional fields clear them. Also at <code>PUT /api/customers/:id</code></div>
+      </form>
+    </div>
+
+    <div class="rounded-2xl border border-border bg-card p-5">
+      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
+      <div class="text-[13px] leading-[1.7] text-muted">
+        <code>GET /api/customers</code><br/>
+        <code>POST /api/customers</code><br/>
+        <code>GET /api/customers/:id</code><br/>
+        <code>PUT /api/customers/:id</code><br/>
+        <code>POST /api/customers/:id/activate</code><br/>
+        <code>POST /api/customers/:id/deactivate</code><br/>
+        <code>DELETE /api/customers/:id</code><br/>
+        <code>GET /api/customers/:id/statement</code><br/>
+        <code>GET /api/customers/ageing</code><br/>
+        <code>GET /api/customer-receipts?customer_id=</code><br/>
+        <code>GET /api/customer-receipts/:id</code><br/>
+        <code>POST /api/customer-receipts</code><br/>
+      </div>
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+  document.body.addEventListener('customer-created', function(){ htmx.trigger('#customer-list','refresh'); });
+  document.body.addEventListener('customer-changed', function(){ htmx.trigger('#customer-list','refresh'); });
+</script>
+{% endblock %}

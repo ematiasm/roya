@@ -370,10 +370,14 @@ mod tests {
 
     /// Raw fixture: link a transaction to a synthetic sale payment. Finance
     /// tests stay domain-agnostic and never import sales/purchases types.
+    /// `customer_id` is NOT NULL by design and resolves the seeded walk-in
+    /// instead of hardcoding its id.
     async fn link_sale_payment(pool: &sqlx::SqlitePool, tx_id: i64, account_id: i64) {
         let sale_id: (i64,) = sqlx::query_as(
-            "INSERT INTO sales (status, payment_type, customer_name, sale_date) \
-             VALUES ('Confirmed', 'Cash', 'fixture', '2024-05-01') RETURNING id",
+            "INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date) \
+             VALUES ('Confirmed', 'Cash', \
+                     (SELECT id FROM customers WHERE is_walkin = 1), 'fixture', '2024-05-01') \
+             RETURNING id",
         )
         .fetch_one(pool)
         .await

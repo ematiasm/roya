@@ -11,6 +11,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
+use crate::error::{AppError, AppResult};
 use crate::models::{PaymentType, UpdateSaleDraft};
 use crate::routes::AppState;
 
@@ -21,7 +22,7 @@ use crate::routes::AppState;
 #[derive(Debug, Deserialize)]
 pub struct CreateSaleRequest {
     #[serde(default)]
-    pub customer_name: String,
+    pub customer_id: Option<i64>,
     pub payment_type: PaymentType,
     pub sale_date: NaiveDate,
     #[serde(default)]
@@ -34,8 +35,6 @@ pub struct CreateSaleRequest {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct UpdateSaleRequest {
-    #[serde(default)]
-    pub customer_name: Option<String>,
     #[serde(default)]
     pub sale_date: Option<NaiveDate>,
     #[serde(default)]
@@ -104,10 +103,13 @@ async fn create_sale(
     State(state): State<AppState>,
     Json(payload): Json<CreateSaleRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let customer_id = payload
+        .customer_id
+        .ok_or_else(|| AppError::Validation("customer_id is required".into()))?;
     let sale = state
         .sales_service
         .create_draft(crate::models::NewSale {
-            customer_name: payload.customer_name,
+            customer_id,
             payment_type: payload.payment_type,
             sale_date: payload.sale_date,
             due_date: payload.due_date,
@@ -137,7 +139,6 @@ async fn update_sale(
         .update_draft(
             id,
             UpdateSaleDraft {
-                customer_name: payload.customer_name,
                 sale_date: payload.sale_date,
                 due_date: payload.due_date,
                 receipt_no: payload.receipt_no,
@@ -378,16 +379,39 @@ mod tests {
         mid
     }
 
-    fn draft_body(customer: &str, payment_type: &str) -> serde_json::Value {
+    async fn seed_customer(
+        pool: &sqlx::SqlitePool,
+        name: &str,
+        limit: Option<&str>,
+        payment_days: Option<i64>,
+    ) -> i64 {
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO customers (name, credit_limit, payment_days) VALUES (?, ?, ?) RETURNING id",
+        )
+        .bind(name)
+        .bind(limit)
+        .bind(payment_days)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        row.0
+    }
+
+    async fn draft_body(
+        pool: &sqlx::SqlitePool,
+        customer: &str,
+        payment_type: &str,
+    ) -> serde_json::Value {
+        let customer_id = seed_customer(pool, customer, None, None).await;
         let (due_date, sale_date) = ("2024-06-01", "2024-05-02");
         if payment_type == "Credit" {
             serde_json::json!({
-                "customer_name": customer, "payment_type": payment_type,
+                "customer_id": customer_id, "payment_type": payment_type,
                 "sale_date": sale_date, "due_date": due_date
             })
         } else {
             serde_json::json!({
-                "customer_name": customer, "payment_type": payment_type,
+                "customer_id": customer_id, "payment_type": payment_type,
                 "sale_date": sale_date
             })
         }
@@ -405,7 +429,7 @@ mod tests {
         let cash = allow_cash(&pool, acc).await;
 
         // Draft has NULL sale_number.
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Ana", "Cash")).await;
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ana", "Cash").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let aid = v
             .get("sale")
@@ -442,7 +466,7 @@ mod tests {
         assert!(number_a.starts_with("2024-SALE-"), "got {number_a}");
 
         // Second confirm -> UNIQUE second number.
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Beto", "Cash")).await;
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Beto", "Cash").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft b: {v}");
         let bid = v
             .get("sale")
@@ -477,7 +501,7 @@ mod tests {
         let (st, _) = put_json(
             app.clone(),
             &format!("/api/sales/{aid}"),
-            serde_json::json!({ "customer_name": "Otro" }),
+            serde_json::json!({ "notes": "Otro" }),
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
@@ -492,7 +516,7 @@ mod tests {
         assert_eq!(still, number_a);
 
         // Draft -> Cancelled keeps NULL number (no-op).
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Ceci", "Cash")).await;
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ceci", "Cash").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft c: {v}");
         let cid = v
             .get("sale")
@@ -528,7 +552,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Serv", "Cash")).await;
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Serv", "Cash").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -573,7 +597,7 @@ mod tests {
         let acc = seed_account(&app, "caja10").await;
         let cash = allow_cash(&pool, acc).await;
 
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Ref", "Cash")).await;
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ref", "Cash").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -669,7 +693,7 @@ mod tests {
         let (st, v) = get_json(app.clone(), "/api/sales/debt").await;
         assert_eq!(st, StatusCode::OK, "empty debt: {v}");
 
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Deudor", "Credit")).await;
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Deudor", "Credit").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -757,7 +781,7 @@ mod tests {
         let acc = seed_account(&app, "m-rest").await;
         let cash = cash_method_id(&pool).await;
         // No allowlist row for (acc, Cash): confirm must be 400 with no side effects.
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body("Ana", "Cash")).await;
+        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ana", "Cash").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -788,5 +812,160 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tx_before.0, tx_after.0, "no finance touch on 400");
+    }
+
+    // -- K2: mandatory customer and credit limit over the wire ---------------
+
+    /// AC2: the REST DTO cannot create a sale without a customer; an unknown id is
+    /// a 404 and a known one is stored with the name snapshotted from the customer.
+    #[tokio::test]
+    async fn k2_rest_sale_requires_an_existing_customer() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+
+        // Missing customer_id => 400, nothing created.
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            serde_json::json!({ "payment_type": "Cash", "sale_date": "2024-05-02" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "missing customer: {v}");
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sales")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "a rejected create must not insert a sale");
+
+        // Unknown customer_id => 404.
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            serde_json::json!({
+                "customer_id": 99999, "payment_type": "Cash", "sale_date": "2024-05-02"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "unknown customer: {v}");
+
+        // Known walk-in customer => 201 with the snapshot.
+        let (walkin_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            serde_json::json!({
+                "customer_id": walkin_id, "payment_type": "Cash", "sale_date": "2024-05-02"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "walk-in cash sale: {v}");
+        assert_eq!(v["sale"]["customer_id"].as_i64(), Some(walkin_id));
+        assert_eq!(
+            v["sale"]["customer_name"].as_str(),
+            Some("Consumidor final")
+        );
+    }
+
+    /// AC4: the over-limit confirm is a 400 whose body carries the projected debt.
+    #[tokio::test]
+    async fn k2_rest_credit_limit_400_carries_projected_figure() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let pid = seed_product(&app, "K2-REST", "Product").await;
+        seed_stock(&app, pid, "10").await;
+        let customer_id = seed_customer(&pool, "REST Limit", Some("50"), None).await;
+
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            serde_json::json!({
+                "customer_id": customer_id, "payment_type": "Credit",
+                "sale_date": "2024-05-02", "due_date": "2024-06-01"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "draft: {v}");
+        let sale_id = v["sale"]["id"].as_i64().unwrap();
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/sales/{sale_id}/lines"),
+            serde_json::json!({ "product_id": pid, "qty": "6" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        let (st, v) = post_json(
+            app.clone(),
+            &format!("/api/sales/{sale_id}/confirm"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "over limit: {v}");
+        let msg = v["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("60"), "projected figure must be visible: {msg}");
+        assert!(msg.contains("50"), "limit must be visible: {msg}");
+    }
+
+    /// AC3: a credit sale for the walk-in is a 400 over REST too, and the draft
+    /// keeps its status and its NULL sale number.
+    #[tokio::test]
+    async fn k2_rest_credit_to_walkin_is_rejected() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let pid = seed_product(&app, "K2-WALKIN", "Product").await;
+        seed_stock(&app, pid, "10").await;
+        let (walkin_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            serde_json::json!({
+                "customer_id": walkin_id, "payment_type": "Credit",
+                "sale_date": "2024-05-02", "due_date": "2024-06-02"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "draft: {v}");
+        let sale_id = v["sale"]["id"].as_i64().unwrap();
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/sales/{sale_id}/lines"),
+            serde_json::json!({ "product_id": pid, "qty": "1" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        let (st, v) = post_json(
+            app.clone(),
+            &format!("/api/sales/{sale_id}/confirm"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "walk-in credit: {v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("walk-in"),
+            "actionable message: {v}"
+        );
+        let (st, v) = get_json(app, &format!("/api/sales/{sale_id}")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["sale"]["status"], "Draft");
+        assert!(
+            v["sale"]["sale_number"].is_null(),
+            "a blocked confirm assigns no number: {v}"
+        );
     }
 }

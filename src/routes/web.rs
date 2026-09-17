@@ -427,7 +427,9 @@ mod tests {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Same posture as db::create_pool: customer triggers fire under REPLACE.
+            .pragma("recursive_triggers", "1");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -527,12 +529,18 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED, "seed stock: {body}");
     }
 
-    async fn seed_credit_sale(app: &Router) -> i64 {
+    async fn seed_credit_sale(app: &Router, pool: &sqlx::SqlitePool) -> i64 {
+        let (customer_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO customers (name) VALUES ('Regression Buyer') RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
         let (status, body) = post_json(
             app,
             "/api/sales",
             serde_json::json!({
-                "customer_name": "Regression Buyer", "payment_type": "Credit",
+                "customer_id": customer_id, "payment_type": "Credit",
                 "sale_date": "2024-05-02", "due_date": "2024-06-01"
             }),
         )
@@ -576,7 +584,7 @@ mod tests {
 
         let pid = seed_product(&app, "REG-E2E").await;
         seed_stock(&app, pid).await;
-        let sale = seed_credit_sale(&app).await;
+        let sale = seed_credit_sale(&app, &pool).await;
         let (status, body) = post_json(
             &app,
             &format!("/api/sales/{sale}/lines"),
@@ -627,7 +635,7 @@ mod tests {
 
         let pid = seed_product(&app, "NO-ALLOW").await;
         seed_stock(&app, pid).await;
-        let sale = seed_credit_sale(&app).await;
+        let sale = seed_credit_sale(&app, &pool).await;
         let (status, body) = post_json(
             &app,
             &format!("/api/sales/{sale}/lines"),

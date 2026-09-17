@@ -7,6 +7,11 @@ pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> 
     let opts = SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .foreign_keys(true)
+        // Per-connection: SQLite fires BEFORE DELETE triggers during REPLACE
+        // conflict resolution (INSERT OR REPLACE, REPLACE INTO, UPDATE OR
+        // REPLACE) only when recursive triggers are on. The walk-in backstop
+        // triggers only RAISE(ABORT), so enabling this cannot recurse.
+        .pragma("recursive_triggers", "1")
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 

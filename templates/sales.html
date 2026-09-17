@@ -51,7 +51,11 @@
       <form class="flex flex-col gap-2.5" hx-post="/web/sales" hx-target="#sale-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#sale-debt','refresh'); }">
         <div>
           <label>Customer</label>
-          <input type="text" name="customer_name" placeholder="Walk-in…" maxlength="128" />
+          <select name="customer_id" required>
+            {% for c in customers %}
+            <option value="{{ c.id }}" {% if c.is_walkin %}selected{% endif %}>{{ c.name }}</option>
+            {% endfor %}
+          </select>
         </div>
         <div class="flex gap-2.5 [&>*]:flex-1">
           <div>

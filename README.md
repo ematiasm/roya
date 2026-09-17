@@ -23,9 +23,23 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
   there is no deterministic way to know which one a payment created), but they
   are still fully traceable through `reference`.
 - **Sales** — Draft → Confirmed → Cancelled orchestrator (Odoo-style):
+  - Every sale carries a mandatory `customer_id` (`NOT NULL`, indexed, RESTRICT).
+    Cash sales default to the seeded walk-in (`Consumidor final`) in the sale
+    form; `customer_name` is frozen as a snapshot of the customer's name at
+    creation time, so correcting a customer never rewrites history.
   - Draft creates lines with no stock/finance side effects.
   - Confirm assigns `YYYY-SALE-NNNNNN`, deducts stock (`Out`, reason `Sale`),
     Cash posts 1 Income with method, Credit opens a receivable (due = total).
+  - Credit rejects the walk-in customer (400): a receivable needs a real
+    customer. When the customer has a `credit_limit` and
+    `ENFORCE_CREDIT_LIMIT=true` (the default), confirming a credit sale whose
+    projected debt (`customer debt + total`) exceeds the limit returns 400 with
+    the projected figure; a null limit is never checked. The debt is derived
+    from confirmed credit sales minus their payments, so cancelled sales stop
+    counting.
+  - For a credit sale without `due_date`, the due date defaults to
+    `sale_date + customer.payment_days`; without a term on the customer it is
+    required (400). An explicit date always wins.
   - Payments carry `account_id + method_id` (N per sale, mixed accounts/methods,
     sum ≤ total); each posts 1 Income; overpay ⇒ 400; Paid when due = 0.
   - `account_payment_methods` allowlist enforced (400) before any stock/sequence/
@@ -35,6 +49,30 @@ Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + H
   - `sale_number` UNIQUE, immutable, NULL only in Draft/Cancelled-from-Draft.
   - Finance/stock rows are written only via services, reference = `sale_number`;
     each payment stores the id of the Income it created.
+- **Customers (M4)** — `customers(id, name, phone, address, tax_id, notes,
+  is_walkin, is_active, credit_limit NULL = no limit, payment_days NULL = no term,
+  created_at, updated_at)`, seeded with the walk-in `Consumidor final`
+  (`is_walkin = 1`, never deactivatable, never deletable, never duplicated). Names
+  are **not unique**: creating a duplicate is accepted and the existing matches are
+  returned so the interface warns without blocking. The receivable is derived from
+  sales, never stored: `balance = confirmed credit sales − their payments`,
+  `ageing` from `due_date` (current / 1-30 / 31-60 / 61+ days overdue) and
+  `over_limit` when a set limit is exceeded. REST: `GET/POST /api/customers`,
+  `GET/PUT/DELETE /api/customers/:id`,
+  `POST /api/customers/:id/activate|deactivate`,
+  `GET /api/customers/:id/statement`, `GET /api/customers/ageing`.
+- **Customer receipts (M4)** — `customer_receipts(id, customer_id, account_id,
+  method_id, date, notes, created_at)` groups the payments of one handover of
+  money. Collecting applies the amount to the customer's confirmed credit sales
+  oldest debt first, creates one receipt and one linked payment per covered sale,
+  and every grouped payment still posts its own Income with `reference =
+  sale_number`. The receipt stores no total: it is derived as `SUM(allocations)`,
+  so an interrupted collection can never claim more than it applied. More than the
+  outstanding debt ⇒ 400; a `(account, method)` pair outside the allowlist ⇒ 400;
+  both leave no side effect. No route accepts a receipt id: the same-customer rule
+  is enforced by construction in `collect`, and the database triggers stay the
+  backstop. REST: `GET/POST /api/customer-receipts`,
+  `GET /api/customer-receipts/:id` (list requires `?customer_id=`).
 - **Suppliers (M3)** — `suppliers(id, name UNIQUE, phone, notes, is_active)` plus the
   `product_supplier_costs` satellite holding the per-supplier price with its previous
   value and date. A new cost that differs shifts current → previous (value and date);
@@ -112,6 +150,7 @@ cp env.example .env
 # DATABASE_URL=sqlite://roya.db
 # ALLOW_NEGATIVE_BALANCE=false
 # ALLOW_NEGATIVE_STOCK=true
+# ENFORCE_CREDIT_LIMIT=true
 # RUST_LOG=info
 
 # 4. Run (migrations run automatically via sqlx::migrate! at startup)
@@ -172,6 +211,15 @@ Current migrations:
   (backfilled only from descriptions that exactly match the document number
   shape) plus `sale_payments` / `purchase_payments` `transaction_id` and
   `refund_transaction_id` FKs to `transactions(id)` RESTRICT
+- `20240101000020_create_customers.sql` — `customers` (indexes on `is_active` and
+  `is_walkin`, guarded walk-in seed, triggers protecting the walk-in)
+- `20240101000021_add_sales_customer.sql` — `sales.customer_id` NOT NULL (backfill
+  to the walk-in, table rebuild) + index; `customer_name` stays the frozen snapshot
+- `20240101000022_create_customer_receipts.sql` — `customer_receipts` (FKs RESTRICT,
+  indexes on `customer_id` and `date`)
+- `20240101000023_add_sale_payments_receipt.sql` — `sale_payments.receipt_id`
+  (RESTRICT, indexed) + triggers refusing a payment grouped under another
+  customer's receipt
 
 ## REST API
 
@@ -257,8 +305,10 @@ curl http://localhost:3000/api/negative-stock
 # Sales (Draft -> Confirmed -> Cancelled orchestrator)
 curl -X POST http://localhost:3000/api/sales \
   -H "Content-Type: application/json" \
-  -d '{"customer_name":"Ana","payment_type":"Cash","sale_date":"2024-05-02"}'
-# -> 201 sale detail (sale_number null while Draft; Credit needs due_date)
+  -d '{"customer_id":1,"payment_type":"Cash","sale_date":"2024-05-02"}'
+# -> 201 sale detail (customer_id required: unknown => 404; customer_name is
+#    snapshotted from the customer. sale_number null while Draft; for Credit
+#    due_date is optional when the customer has a payment term.)
 
 curl -X POST http://localhost:3000/api/sales/1/lines \
   -H "Content-Type: application/json" \
@@ -267,8 +317,9 @@ curl -X POST http://localhost:3000/api/sales/1/lines \
 
 curl -X PUT http://localhost:3000/api/sales/1 \
   -H "Content-Type: application/json" \
-  -d '{"customer_name":"Ana Gomez"}'
-# -> 200 detail (Draft only; edit Confirmed => 400)
+  -d '{"notes":"llamar antes de entregar"}'
+# -> 200 detail (Draft only; the customer and name snapshot are immutable;
+#    edit Confirmed => 400)
 
 curl -X POST http://localhost:3000/api/sales/1/confirm \
   -H "Content-Type: application/json" \
@@ -300,6 +351,47 @@ curl http://localhost:3000/api/sales
 # -> { sales: [detail with total/paid/due/payment_status] }
 curl http://localhost:3000/api/sales/debt
 # -> { debt: [Confirmed sales with due > 0] }
+```
+
+```bash
+# Customers (M4)
+curl -X POST http://localhost:3000/api/customers \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Ana Pérez","phone":"555-1234","credit_limit":"1000","payment_days":30}'
+# -> 201 { customer, name_matches:[...] }; the name is not unique, so an existing
+#    match is a warning, never a 409
+
+curl http://localhost:3000/api/customers
+# -> { customers: [{ customer, balance, over_limit }] }
+curl http://localhost:3000/api/customers/1
+curl -X PUT http://localhost:3000/api/customers/1 \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Ana P.","credit_limit":null,"payment_days":15}'
+# -> 200 { customer, balance, over_limit } (a null limit means no limit)
+curl -X POST http://localhost:3000/api/customers/1/deactivate
+curl -X POST http://localhost:3000/api/customers/1/activate
+curl -X DELETE http://localhost:3000/api/customers/1
+# -> 204 when unused; 400 when sales reference it or it is the walk-in (deactivate
+#    instead)
+
+curl "http://localhost:3000/api/customers/1/statement?as_of=2024-06-30"
+# -> { customer, statement: { balance, as_of, ageing: { current,
+#      overdue_1_30, overdue_31_60, overdue_61_plus }, entries: [chronological
+#      ledger of sale debits and payment credits with the running balance] } }
+curl "http://localhost:3000/api/customers/ageing?as_of=2024-06-30"
+# -> { ageing: [{ customer_id, name, balance, over_limit, ageing }] }: every
+#    customer with a non-zero balance
+
+# Customer receipts: collect an amount, oldest debt first
+curl -X POST http://localhost:3000/api/customer-receipts \
+  -H "Content-Type: application/json" \
+  -d '{"customer_id":1,"account_id":1,"method_id":1,"amount":"60","date":"2024-06-20","notes":"partial"}'
+# -> 201 receipt detail with the derived total and one allocation per covered
+#    sale, each keeping its own transaction_id; > outstanding => 400, disallowed
+#    (account,method) => 400, both with no side effect
+curl "http://localhost:3000/api/customer-receipts?customer_id=1"
+# -> { receipts: [receipt detail with allocations] }
+curl http://localhost:3000/api/customer-receipts/1
 ```
 
 ```bash
@@ -424,6 +516,28 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
   - Record payment: `POST /web/sales/:id/payments` (HTMX)
   - Cancel: `POST /web/sales/:id/cancel` (HTMX)
 
+`GET /customers` — customers (M4):
+
+- Customer list with the derived balance, the ageing buckets and the
+  active/inactive/walk-in/over-limit badges (HTMX `GET /web/customers`)
+- Forms:
+  - Create customer: `POST /web/customers` (HTMX; a duplicate name renders the
+    existing matches as a warning)
+  - Edit customer: `POST /web/customers/edit` (HTMX, id in the body; the fields
+    replace the current values and empty optional fields clear)
+  - Activate/deactivate: `POST /web/customers/activate|deactivate` (HTMX, id in body)
+  - Delete: `POST /web/customers/delete` (HTMX, id in body, RESTRICT-aware)
+
+`GET /customers/:id` — customer statement:
+
+- Ageing breakdown, receivable sales and the chronological ledger (HTMX
+  `GET /web/customers/:id/statement`)
+- Payment history: every receipt with its allocations (HTMX
+  `GET /web/customers/:id/receipts`)
+- Collect form: the customer, the amount, the account and the method; applies the
+  amount oldest debt first and creates one receipt grouping one payment per
+  covered sale (`POST /web/customer-receipts`, id in the body)
+
 `GET /purchases` — purchases (M3):
 
 - Purchase list with status + payable badges (HTMX `GET /web/purchases`, derived total/paid/due)
@@ -452,7 +566,7 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
-Navigation: the header links Dashboard, Products, Sales, Purchases and Suppliers; page-level links reach the detail/back views.
+Navigation: the header links Dashboard, Products, Sales, Customers, Purchases and Suppliers; page-level links reach the detail/back views.
 
 ## Styles & local assets
 
@@ -483,6 +597,7 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
 | `DATABASE_URL` | `sqlite://roya.db` | SQLite file (or `postgres://...`) |
 | `ALLOW_NEGATIVE_BALANCE` | `false` | If `false`, Expense that would make balance negative is rejected (also on edit/delete of Income) |
 | `ALLOW_NEGATIVE_STOCK` | `true` | If `false`, Out that would make stock negative is rejected (400, stock unchanged); if `true`, Out succeeds (201) and product appears in negative list |
+| `ENFORCE_CREDIT_LIMIT` | `true` | If `true`, confirming a credit sale whose projected debt exceeds the customer's `credit_limit` is rejected (400); a null limit is unlimited either way. If `false`, the sale is confirmed and the interface reports the customer as over limit |
 | `PORT` | `3000` | HTTP port |
 | `RUST_LOG` | `info` | tracing filter |
 
@@ -500,13 +615,21 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
   - `create Expense`: `projected = current_balance - amount` must be `>=0`.
   - `update`: recomputes `current - old_signed + new_signed`.
   - `delete Income`: `projected = current - amount` must be `>=0`.
-- `Sale` rules: Draft editable (lines/customer/dates); Confirmed/Cancelled immutable
-  except Cancel. `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
-  Draft/Cancelled-from-Draft. Credit requires `due_date >= sale_date`, Cash forbids it.
-  `qty > 0`, `unit_price >= 0`, payments carry `account_id + method_id` (N per sale,
+- `Sale` rules: Draft editable (lines/dates/notes); Confirmed/Cancelled immutable
+  except Cancel. The customer is fixed at creation: `customer_id` is mandatory
+  (`NOT NULL`, RESTRICT) and `customer_name` is the customer's name snapshotted
+  at creation, never rewritten by later corrections. Credit to the walk-in
+  returns 400; with `ENFORCE_CREDIT_LIMIT=true` and a customer limit, confirming
+  a credit sale whose projected debt (`confirmed credit sales − their payments`
+  plus this sale) exceeds the limit returns 400 with the projected figure; a
+  null limit is never checked and `ENFORCE_CREDIT_LIMIT=false` confirms the sale
+  (the customer reads as over limit). Credit without `due_date` defaults to
+  `sale_date + payment_days`, and without a term the due date is required.
+  `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
+  Draft/Cancelled-from-Draft. Cash forbids `due_date`. `qty > 0`,
+  `unit_price >= 0`, payments carry `account_id + method_id` (N per sale,
   mixed, sum ≤ total), reject overpay (`paid + amount <= total`) and disallowed
   `(account,method)` (400, no stock/sequence/finance touch).
-  No new env vars for sales (reuses `ALLOW_NEGATIVE_BALANCE` / `ALLOW_NEGATIVE_STOCK`).
 - `PaymentMethod` rules: `name` UNIQUE, `is_active` 0/1; allowlist
   `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id` RESTRICT
   NOT NULL; unknown method => 404, inactive/disallowed => 400.
@@ -529,6 +652,19 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
   satellite per line; cancelling a Confirmed purchase returns stock and refunds paid
   amounts as Income. No new env vars for purchases (reuses `ALLOW_NEGATIVE_BALANCE` /
   `ALLOW_NEGATIVE_STOCK`).
+- `Customer` rules: `name` trimmed, non-empty, ≤128 and **not unique**; `phone`/`tax_id`
+  ≤32, `address` ≤256, `notes` ≤512 (empty clears to NULL); `credit_limit ≥ 0` NULL =
+  no limit, `payment_days ≥ 0` NULL = no default term. The seeded walk-in cannot be
+  deleted or deactivated (service check plus database triggers), cannot be demoted and
+  cannot be created twice; deleting any customer with sales is refused (RESTRICT) while
+  deactivation keeps the history.
+- `CustomerReceipt` rules: the receipt is a grouping document with no stored total. Its
+  derived amount is `SUM(sale_payments.amount WHERE receipt_id = receipt)`. Collecting
+  validates the customer (404), a positive amount, the account and the `(account,
+  method)` allowlist (400) and `amount ≤ customer balance` (400) before any write, then
+  applies the amount oldest-first. A payment may only be grouped under a receipt of its
+  own customer (service guard + database trigger), and deleting a referenced receipt is
+  refused (RESTRICT). A payment without a receipt is still a direct payment on one sale.
 
 ## SQLite → Postgres Migration (without rewriting logic)
 
@@ -637,6 +773,9 @@ src/services/account.rs
 src/services/transaction.rs
 src/services/inventory.rs
 src/services/sales.rs      — Draft/Confirm/Pay/Cancel orchestrator (calls Inventory + Transaction services, never SQLs their tables)
+                           — also exposes the derived customer receivable (balance, statement, ageing)
+src/services/customers.rs  — customer CRUD, walk-in protection, duplicate-name warning
+src/services/customer_receipts.rs — collect oldest-first: one receipt grouping one payment per covered sale
 src/services/suppliers.rs  — supplier CRUD + product/supplier satellite cost rule
 src/services/purchases.rs  — Draft/Confirm/Pay/Cancel + suggestion builder (orchestrates stock, finance, satellite)
 src/repositories/account_repo.rs
@@ -646,6 +785,8 @@ src/repositories/product_repo.rs
 src/repositories/barcode_repo.rs
 src/repositories/stock_repo.rs
 src/repositories/sale_repo.rs          — Sale/SaleLine/SalePayment SQLite impl
+src/repositories/customer_repo.rs      — Customer SQLite impl (RESTRICT-aware delete)
+src/repositories/customer_receipt_repo.rs — receipt document + allocations read
 src/repositories/supplier_repo.rs      — Supplier SQLite impl (RESTRICT-aware delete)
 src/repositories/product_supplier_cost_repo.rs — satellite cost SQLite impl
 src/repositories/purchase_repo.rs      — Purchase/PurchaseLine/PurchasePayment SQLite impl
@@ -656,6 +797,8 @@ src/routes/inventory_api.rs
 src/routes/inventory_web.rs
 src/routes/sales_api.rs    — REST /api/sales, lines, payments, confirm/cancel, debt
 src/routes/sales_web.rs    — Web /sales Askama + HTMX
+src/routes/customers_api.rs — REST /api/customers, statement, ageing, /api/customer-receipts
+src/routes/customers_web.rs — Web /customers + statement Askama + HTMX
 src/routes/purchases_api.rs — REST /api/suppliers, /api/product-supplier-costs, /api/purchases
 src/routes/purchases_web.rs — Web /purchases Askama + HTMX (incl. Sugerido)
 src/routes/suppliers_web.rs — Web /suppliers Askama + HTMX
@@ -665,10 +808,12 @@ templates/dashboard.html
 templates/account_detail.html
 templates/products.html
 templates/sales.html
+templates/customers.html
 templates/purchases.html
 templates/suppliers.html
 templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_list.html,
-                             purchase_detail.html, supplier_list.html, suggestion_list.html
+                             purchase_detail.html, supplier_list.html, suggestion_list.html,
+                             customer_list.html, customer_statement.html, receipt_list.html
 migrations/*.sql
 assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/, @theme palette)
 static/tailwind.css        — compiled stylesheet (committed; rebuild via scripts/build-css.sh)
@@ -714,10 +859,28 @@ router, form extraction and Askama rendering.
   cross-payment swaps fail even though every fact matches. That ownership rule
   is only reachable through direct database tampering: the application always
   creates a fresh refund per payment and no route accepts
-  `refund_transaction_id`).
+  `refund_transaction_id`). The invariant also rejects orphan document
+  movements: any transaction whose `reference` looks like `YYYY-SALE-NNNNNN`
+  or `YYYY-PURCH-NNNNNN` must be claimed by some payment as `transaction_id`
+  or `refund_transaction_id`, so a failure between creating the movement and
+  inserting the payment row cannot hide, and the offending ids are reported.
+- **Customer receipts (Slice L)**: a receipt's amount is derived from the
+  payments it groups, and database triggers refuse to group a payment under a
+  receipt of another customer on insert and on update alike, so no code path can
+  make a receipt claim money its own collection never applied. A service-level
+  refusal maps that trigger abort to a clean 400, and no route accepts a receipt
+  id: the collect request carries only the customer, the amount, the account and
+  the method. Ungrouped payments and same-customer groupings are unaffected.
+- **Customers collection flow (Slice M)**: the suite creates a customer through
+  the web form, sells 3 × 25 on credit, collects 30 through
+  `POST /web/customer-receipts`, then asserts the derived balance (45), the
+  ageing bucket (`overdue_1_30 = 45` against `as_of=2024-06-20`), the
+  receivables view, the receipt's derived total equal to the sum of its
+  allocations, each grouped payment's `transaction_id`, and the
+  money-traceability invariant over the whole database the flow built.
 - **Generic form-wiring guard**: for the seeded `/`, `/accounts/{id}`,
-  `/products`, `/sales`, `/purchases` and `/suppliers` pages (plus the sale and
-  purchase detail fragments) it extracts every `hx-get`, `hx-post`, `hx-put`,
+  `/products`, `/sales`, `/purchases`, `/suppliers` and `/customers` pages (plus
+  the sale and purchase detail fragments and the `/customers/{id}` statement) it extracts every `hx-get`, `hx-post`, `hx-put`,
   `hx-patch` and `hx-delete` target with the HTTP verb htmx will send, the
   native `action`/`onsubmit` wiring of rendered forms, and the application URLs
   written inside `hx-on` bodies and inline scripts (verb from
@@ -735,11 +898,11 @@ router, form extraction and Askama rendering.
   `hx-post` target are caught. Handler-level 404s keep their own message, and
   the guard probes against its own freshly seeded app instance so the real
   handlers it may run cannot mutate the apps used by the flow assertions.
-- **Typed-id shells**: `/`, `/sales` and `/purchases` are the pages where the
-  user types the id into the form, so a concrete numeric path segment in a
-  form-bound target is rejected (`/web/sales/1/confirm`) while data-bound record
-  links such as the list View buttons stay valid. A `:` is a placeholder marker
-  only in the path, so `datetime` query values pass.
+- **Typed-id shells**: `/`, `/sales`, `/purchases` and `/customers` are the
+  pages where the user types the id into the form, so a concrete numeric path
+  segment in a form-bound target is rejected (`/web/sales/1/confirm`) while
+  data-bound record links such as the list View buttons stay valid. A `:` is a
+  placeholder marker only in the path, so `datetime` query values pass.
 - **Native forms**: a `this.action=` rewrite inside `onsubmit` fails the guard
   (htmx ignores the form action property), and native `action=` targets are
   probed with their form method like any other target.

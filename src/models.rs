@@ -442,6 +442,10 @@ pub struct Sale {
     pub sale_number: Option<String>,
     pub status: SaleStatus,
     pub payment_type: PaymentType,
+    /// The owning customer; the seeded walk-in for anonymous cash sales.
+    pub customer_id: i64,
+    /// Frozen snapshot of the customer's name at creation time, so correcting the
+    /// customer never rewrites history.
     pub customer_name: String,
     pub sale_date: NaiveDate,
     pub due_date: Option<NaiveDate>,
@@ -485,6 +489,9 @@ pub struct SalePayment {
     pub transaction_id: Option<i64>,
     /// Refund transaction created when the sale was cancelled, if any.
     pub refund_transaction_id: Option<i64>,
+    /// Customer receipt that groups this payment, when a lump-sum collection
+    /// produced it; NULL for a direct payment on a single sale.
+    pub receipt_id: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -514,10 +521,11 @@ pub struct DocSequence {
     pub last_number: i64,
 }
 
-/// Service-level input for sale creation (Draft).
+/// Service-level input for sale creation (Draft). The service resolves the
+/// customer through `CustomerService` and freezes `customer_name` from it.
 #[derive(Debug, Clone)]
 pub struct NewSale {
-    pub customer_name: String,
+    pub customer_id: i64,
     pub payment_type: PaymentType,
     pub sale_date: NaiveDate,
     pub due_date: Option<NaiveDate>,
@@ -525,10 +533,10 @@ pub struct NewSale {
     pub notes: Option<String>,
 }
 
-/// Service-level patch for Draft header edits.
+/// Service-level patch for Draft header edits. The customer (and therefore the
+/// name snapshot) is fixed at creation; only dates, receipt and notes are edited.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateSaleDraft {
-    pub customer_name: Option<String>,
     pub sale_date: Option<NaiveDate>,
     pub due_date: Option<Option<NaiveDate>>,
     pub receipt_no: Option<Option<String>>,
@@ -817,4 +825,203 @@ pub struct PurchaseSuggestionWithoutSupplier {
 pub struct PurchaseSuggestions {
     pub suggestions: Vec<PurchaseSuggestion>,
     pub without_supplier: Vec<PurchaseSuggestionWithoutSupplier>,
+}
+
+// ---------------------------------------------------------------------------
+// M4 customers (Slice K1). Customer CRUD only: the sales link and the derived
+// balance/ageing arrive in a later slice. Decimal-as-TEXT like the rest of the
+// project. A name is not unique on purpose; duplicates are reported as a
+// warning instead of blocking. is_walkin marks the single seeded cash default
+// ("Consumidor final"), which can never be deleted or deactivated.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Customer {
+    pub id: i64,
+    pub name: String,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub tax_id: Option<String>,
+    pub notes: Option<String>,
+    /// The seeded cash default. Exactly one row has this set.
+    pub is_walkin: bool,
+    pub is_active: bool,
+    /// Decimal >= 0 stored as TEXT; NULL means no limit.
+    pub credit_limit: Option<Decimal>,
+    /// Default credit term in days; NULL means no default term.
+    pub payment_days: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// Service-level input for customer creation. `is_walkin` is accepted only when
+/// no walk-in exists yet, which after the seed means never.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewCustomer {
+    pub name: String,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub tax_id: Option<String>,
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub is_walkin: bool,
+    /// None means no limit.
+    pub credit_limit: Option<Decimal>,
+    /// None means no default term.
+    pub payment_days: Option<i64>,
+}
+
+/// Service-level patch for customer edits. `Option<Option<T>>` distinguishes
+/// "leave unchanged" (`None`) from "clear" (`Some(None)`). `is_walkin` is not
+/// editable.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateCustomer {
+    pub name: Option<String>,
+    pub phone: Option<Option<String>>,
+    pub address: Option<Option<String>>,
+    pub tax_id: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
+    pub credit_limit: Option<Option<Decimal>>,
+    pub payment_days: Option<Option<i64>>,
+}
+
+/// Outcome of creating a customer: the new row plus any customers that already
+/// had that exact name, so the interface can warn without blocking (AC15).
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomerCreateResult {
+    pub customer: Customer,
+    pub name_matches: Vec<Customer>,
+}
+
+// ---------------------------------------------------------------------------
+// M4 customers (Slice K3). The receivable is derived from sales and payments,
+// so these reads live in `SalesService`: customers sits above sales, and the
+// reverse would be circular. Decimal-as-TEXT like the rest of the project, so
+// the buckets and the running balance are summed in Rust, never with SQL SUM.
+// ---------------------------------------------------------------------------
+
+/// Ageing of a derived receivable against an explicit `as_of` date. Each sale
+/// with `due > 0` falls in exactly one bucket by how many days late it is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Ageing {
+    /// Not yet due, due today, or no due date at all.
+    pub current: Decimal,
+    /// 1 to 30 days past the due date.
+    pub overdue_1_30: Decimal,
+    /// 31 to 60 days past the due date.
+    pub overdue_31_60: Decimal,
+    /// More than 60 days past the due date.
+    pub overdue_61_plus: Decimal,
+}
+
+impl Ageing {
+    /// Sum of the four buckets: the receivable they were computed from.
+    pub fn total(&self) -> Decimal {
+        self.current + self.overdue_1_30 + self.overdue_31_60 + self.overdue_61_plus
+    }
+}
+
+/// One row of the receivables view: a customer with a non-zero derived balance
+/// and the ageing of that balance as of the requested date. Names stay with
+/// `CustomerService`; routes compose the two reads.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CustomerAgeing {
+    pub customer_id: i64,
+    pub balance: Decimal,
+    pub ageing: Ageing,
+}
+
+/// What produced a statement entry: a confirmed credit sale (a debit) or a
+/// payment received on one of those sales (a credit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum StatementEntryKind {
+    Sale,
+    Payment,
+}
+
+/// One line of a customer statement. `balance` is the running balance after
+/// applying this entry, so the last entry always lands on the statement total.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StatementEntry {
+    pub date: NaiveDate,
+    pub kind: StatementEntryKind,
+    /// The document the entry belongs to (`YYYY-SALE-NNNNNN`). A payment carries
+    /// the sale it was applied to, which keeps tied dates orderable.
+    pub document_number: Option<String>,
+    pub description: String,
+    pub debit: Decimal,
+    pub credit: Decimal,
+    pub balance: Decimal,
+}
+
+/// Derived account statement of one customer: the full confirmed-credit ledger
+/// with its running balance, plus the ageing of the same receivable as of
+/// `as_of`. Cancelled sales contribute nothing to either side.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CustomerStatement {
+    pub customer_id: i64,
+    pub balance: Decimal,
+    pub as_of: NaiveDate,
+    pub ageing: Ageing,
+    pub entries: Vec<StatementEntry>,
+}
+
+// ---------------------------------------------------------------------------
+// M4 customers (Slice L). A customer receipt is the document a single handover
+// of money produces: it groups one `sale_payments` row per credit sale the
+// amount covered, applied oldest debt first. Each grouped payment still belongs
+// to its sale and keeps its own finance link, so traceability is untouched; the
+// receipt posts no movement of its own. There is NO stored total: the amount
+// handed over is derived as SUM(allocations), so an interrupted collection can
+// leave fewer payments but never a receipt claiming more than it applied.
+// Decimal-as-TEXT like the rest of the project.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomerReceipt {
+    pub id: i64,
+    pub customer_id: i64,
+    pub account_id: i64,
+    pub method_id: i64,
+    pub date: NaiveDate,
+    /// Optional free text (trimmed, <= 256 chars), NULL when empty.
+    pub notes: Option<String>,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// Service-level input for creating a receipt. There is no total field: the
+/// collected amount is a plan input, not a stored claim; what the document
+/// applied is derived from its payments.
+#[derive(Debug, Clone)]
+pub struct NewReceipt {
+    pub customer_id: i64,
+    pub account_id: i64,
+    pub method_id: i64,
+    pub date: NaiveDate,
+    pub notes: Option<String>,
+}
+
+/// One receipt with the payments it groups. `allocations` are the
+/// `sale_payments` rows carrying the receipt id, one per covered sale and each
+/// with its own `transaction_id`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceiptDetail {
+    pub receipt: CustomerReceipt,
+    pub allocations: Vec<SalePayment>,
+    /// Derived, never stored: `SUM(allocations.amount)`, i.e. exactly what was
+    /// handed over and applied. A stored copy could disagree with the payments;
+    /// this one is computed from them.
+    pub total: Decimal,
+}
+
+impl ReceiptDetail {
+    pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>) -> Self {
+        let total = allocations.iter().map(|payment| payment.amount).sum();
+        Self {
+            receipt,
+            allocations,
+            total,
+        }
+    }
 }

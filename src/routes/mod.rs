@@ -1,4 +1,6 @@
 pub mod api;
+pub mod customers_api;
+pub mod customers_web;
 pub mod inventory_api;
 pub mod inventory_web;
 pub mod purchases_api;
@@ -14,13 +16,14 @@ use tower_http::services::ServeDir;
 
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-    SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
+    SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
+    SqlitePaymentMethodRepository, SqliteProductRepository,
     SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteSaleRepository,
     SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTransactionRepository,
 };
 use crate::services::{
-    AccountService, InventoryService, PaymentMethodService, PurchasesService, SalesService,
-    SupplierService, TransactionService,
+    AccountService, CustomerReceiptService, CustomerService, InventoryService,
+    PaymentMethodService, PurchasesService, SalesService, SupplierService, TransactionService,
 };
 
 pub type InventorySvc = InventoryService<
@@ -40,6 +43,26 @@ pub type SalesSvc = SalesService<
     SqliteAccountRepository,
     SqliteTransactionRepository,
     SqlitePaymentMethodRepository,
+    SqliteCustomerRepository,
+>;
+
+pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
+
+/// Receipts: the grouped payments of one handover of money. It wraps the same
+/// sales service the routes use, so every grouped payment reaches sales and
+/// finance exactly like any other payment.
+pub type ReceiptSvc = CustomerReceiptService<
+    SqliteCustomerReceiptRepository,
+    SqliteSaleRepository,
+    SqliteDocSequenceRepository,
+    SqliteCategoryRepository,
+    SqliteProductRepository,
+    SqliteBarcodeRepository,
+    SqliteStockMovementRepository,
+    SqliteAccountRepository,
+    SqliteTransactionRepository,
+    SqlitePaymentMethodRepository,
+    SqliteCustomerRepository,
 >;
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
@@ -69,15 +92,31 @@ pub struct AppState {
         TransactionService<SqliteAccountRepository, SqliteTransactionRepository>,
     pub inventory_service: InventorySvc,
     pub sales_service: SalesSvc,
+    pub customer_service: CustomerSvc,
+    pub customer_receipt_service: ReceiptSvc,
     pub payment_method_service: MethodSvc,
     pub supplier_service: SupplierSvc,
     pub purchases_service: PurchasesSvc,
     pub allow_negative: bool,
     pub allow_negative_stock: bool,
+    /// `ENFORCE_CREDIT_LIMIT` (default true): the sales service rejects a credit
+    /// confirm whose projected debt exceeds the customer's limit.
+    pub enforce_credit_limit: bool,
 }
 
 impl AppState {
+    /// Compatibility constructor: credit-limit enforcement defaults to true,
+    /// exactly like `main` when the env var is absent.
     pub fn new(pool: SqlitePool, allow_negative: bool, allow_negative_stock: bool) -> Self {
+        Self::new_with_credit_limit(pool, allow_negative, allow_negative_stock, true)
+    }
+
+    pub fn new_with_credit_limit(
+        pool: SqlitePool,
+        allow_negative: bool,
+        allow_negative_stock: bool,
+        enforce_credit_limit: bool,
+    ) -> Self {
         let acc_repo = SqliteAccountRepository::new(pool.clone());
         let tx_repo = SqliteTransactionRepository::new(pool.clone());
         let account_service = AccountService::new(acc_repo.clone(), tx_repo.clone());
@@ -92,12 +131,24 @@ impl AppState {
         );
         let method_repo = SqlitePaymentMethodRepository::new(pool.clone());
         let payment_method_service = PaymentMethodService::new(method_repo.clone());
+        let customer_service =
+            CustomerService::new(SqliteCustomerRepository::new(pool.clone()));
         let sales_service = SalesService::new(
             SqliteSaleRepository::new(pool.clone()),
             SqliteDocSequenceRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
             method_repo.clone(),
+            customer_service.clone(),
+            enforce_credit_limit,
+        );
+        // M4: collections group the payments one handover of money produced; the
+        // receipt service composes the same sales service and the finance-owned
+        // (account, method) allowlist the rest of the app uses.
+        let customer_receipt_service = CustomerReceiptService::new(
+            SqliteCustomerReceiptRepository::new(pool.clone()),
+            sales_service.clone(),
+            payment_method_service.clone(),
         );
         // M3: suppliers + product/supplier cost satellite are consumed by the
         // purchases orchestrator; both share the same SQLite repos as the rest
@@ -120,11 +171,14 @@ impl AppState {
             transaction_service,
             inventory_service,
             sales_service,
+            customer_service,
+            customer_receipt_service,
             payment_method_service,
             supplier_service,
             purchases_service,
             allow_negative,
             allow_negative_stock,
+            enforce_credit_limit,
         }
     }
 }
@@ -133,6 +187,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(api::router())
         .merge(web::router())
+        .merge(customers_api::router())
+        .merge(customers_web::router())
         .merge(inventory_api::router())
         .merge(inventory_web::router())
         .merge(sales_api::router())

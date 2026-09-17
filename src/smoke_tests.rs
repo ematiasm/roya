@@ -52,7 +52,10 @@ async fn test_app() -> (Router, SqlitePool) {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        // Same posture as db::create_pool: the customer triggers fire under
+        // REPLACE conflict resolution too.
+        .pragma("recursive_triggers", "1");
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect_with(opts)
@@ -174,6 +177,15 @@ async fn supplier_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
     row.0
 }
 
+async fn customer_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT id FROM customers WHERE name = ?")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
 async fn create_account_via_web(
     app: &Router,
     pool: &SqlitePool,
@@ -225,7 +237,41 @@ async fn record_supplier_cost_via_web(app: &Router, product_id: i64, supplier_id
     assert_eq!(status, StatusCode::OK, "record supplier cost: {resp}");
 }
 
-async fn find_sale_id(app: &Router, customer: &str) -> i64 {
+async fn seed_customer(
+    pool: &SqlitePool,
+    name: &str,
+    credit_limit: Option<&str>,
+    payment_days: Option<i64>,
+) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "INSERT INTO customers (name, credit_limit, payment_days) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(name)
+    .bind(credit_limit)
+    .bind(payment_days)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
+/// Post to the sale form with an explicit customer id and return the created
+/// draft's id (the last sale for that customer in the list).
+async fn create_sale_draft_for_customer(
+    app: &Router,
+    customer_id: i64,
+    payment_type: &str,
+    due_date: &str,
+) -> i64 {
+    let body = format!(
+        "customer_id={customer_id}&payment_type={payment_type}&sale_date=2024-05-02&due_date={due_date}"
+    );
+    let (status, resp) = post_form(app, "/web/sales", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create sale for customer {customer_id}: {resp}"
+    );
     let (status, body) = get(app, "/api/sales").await;
     assert_eq!(status, StatusCode::OK, "list sales: {body}");
     let v = json_body(&body);
@@ -233,23 +279,21 @@ async fn find_sale_id(app: &Router, customer: &str) -> i64 {
         .as_array()
         .unwrap()
         .iter()
-        .find(|d| d["sale"]["customer_name"] == json!(customer))
+        .filter(|d| d["sale"]["customer_id"] == json!(customer_id))
+        .last()
         .and_then(|d| d["sale"]["id"].as_i64())
-        .unwrap_or_else(|| panic!("sale for {customer} not found: {v}"))
+        .unwrap_or_else(|| panic!("sale for customer {customer_id} not found: {v}"))
 }
 
 async fn create_sale_draft_via_web(
     app: &Router,
+    pool: &SqlitePool,
     customer: &str,
     payment_type: &str,
     due_date: &str,
 ) -> i64 {
-    let body = format!(
-        "customer_name={customer}&payment_type={payment_type}&sale_date=2024-05-02&due_date={due_date}"
-    );
-    let (status, resp) = post_form(app, "/web/sales", &body).await;
-    assert_eq!(status, StatusCode::OK, "create sale {customer}: {resp}");
-    find_sale_id(app, customer).await
+    let customer_id = seed_customer(pool, customer, None, None).await;
+    create_sale_draft_for_customer(app, customer_id, payment_type, due_date).await
 }
 
 async fn add_sale_line_via_web(app: &Router, sale_id: i64, product_id: i64, qty: &str) {
@@ -926,11 +970,13 @@ async fn unmatched_route_returns_recognisable_404_body() {
 // ---------------------------------------------------------------------------
 
 /// Minimal seeded world for the wiring guard: account + methods, product with
-/// stock, supplier with satellite cost, one draft sale and one purchase.
+/// stock, supplier with satellite cost, one draft sale, one purchase and one
+/// customer whose statement page the guard renders.
 struct WiringFixture {
     account: i64,
     sale: i64,
     purchase: i64,
+    customer: i64,
 }
 
 async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
@@ -952,7 +998,7 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
 
     // Draft rows make the rendered list partials exercise their id-bearing
     // View/delete/edit targets.
-    let sale = create_sale_draft_via_web(app, "GuardBuyer", "Credit", "2024-06-02").await;
+    let sale = create_sale_draft_via_web(app, &pool, "GuardBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(app, sale, product, "1").await;
 
     let (status, resp) = post_form(
@@ -964,10 +1010,20 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     assert_eq!(status, StatusCode::OK, "seed purchase: {resp}");
     let purchase = find_only_purchase_id(app).await;
 
+    let (status, resp) = post_form(
+        app,
+        "/web/customers",
+        "name=GuardCustomer&phone=555-0100&credit_limit=500&payment_days=30",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed customer: {resp}");
+    let customer = customer_id_by_name(pool, "GuardCustomer").await;
+
     WiringFixture {
         account,
         sale,
         purchase,
+        customer,
     }
 }
 
@@ -996,6 +1052,7 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
         ("sales", "/sales".to_string(), true),
         ("purchases", "/purchases".to_string(), true),
         ("suppliers", "/suppliers".to_string(), false),
+        ("customers", "/customers".to_string(), true),
         // The list/detail fragments the pages refresh over HTMX carry more
         // targets (View buttons, inline line editors), so guard the seeded
         // details too.
@@ -1007,6 +1064,11 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
         (
             "purchase detail fragment",
             format!("/web/purchases/{}", fixture.purchase),
+            false,
+        ),
+        (
+            "customer statement",
+            format!("/customers/{}", fixture.customer),
             false,
         ),
     ];
@@ -1083,7 +1145,7 @@ async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
     let product = create_product_via_web(&app, &pool, "CASH-P", "2", "50").await;
     record_stock_via_web(&app, product, "10").await;
 
-    let sale = create_sale_draft_via_web(&app, "CashBuyer", "Cash", "").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "CashBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, sale, product, "3").await;
     confirm_sale_via_web(&app, sale, Some(account), Some(cash)).await;
 
@@ -1134,7 +1196,7 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     let product = create_product_via_web(&app, &pool, "CREDIT-P", "2", "50").await;
     record_stock_via_web(&app, product, "10").await;
 
-    let sale = create_sale_draft_via_web(&app, "CreditBuyer", "Credit", "2024-06-02").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "CreditBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
     confirm_sale_via_web(&app, sale, None, None).await;
 
@@ -1220,6 +1282,241 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
         .expect("original row");
     assert_eq!(original["kind"], json!("Income"));
 }
+
+/// K2 over HTTP: every creation path carries a customer, the credit rules hold at
+/// the route boundary, and the due date default from the payment term is visible.
+#[tokio::test]
+async fn credit_rules_and_mandatory_customer_hold_over_http() {
+    let (app, pool) = test_app().await;
+
+    // AC2: a form post without a customer is a 400 and creates nothing.
+    let (status, body) = post_form(
+        &app,
+        "/web/sales",
+        "payment_type=Cash&sale_date=2024-05-02",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, list) = get(&app, "/api/sales").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert!(
+        json_body(&list)["sales"].as_array().unwrap().is_empty(),
+        "a rejected create must not insert a sale: {list}"
+    );
+
+    let product = create_product_via_web(&app, &pool, "K2-SMOKE", "1", "10").await;
+    record_stock_via_web(&app, product, "100").await;
+
+    // AC7: the due date defaults from the payment term (2024-05-02 + 30 days).
+    let term_id = seed_customer(&pool, "Smoke Term", Some("50"), Some(30)).await;
+    let sale = create_sale_draft_for_customer(&app, term_id, "Credit", "").await;
+    let detail = sale_detail(&app, sale).await;
+    assert_eq!(detail["sale"]["customer_id"].as_i64(), Some(term_id));
+    assert_eq!(detail["sale"]["customer_name"], json!("Smoke Term"));
+    assert_eq!(detail["sale"]["due_date"], json!("2024-06-01"), "{detail}");
+    add_sale_line_via_web(&app, sale, product, "1").await;
+    confirm_sale_via_web(&app, sale, None, None).await;
+    assert_eq!(
+        sale_detail(&app, sale).await["sale"]["status"],
+        json!("Confirmed")
+    );
+
+    // AC7: no term and no due date is a 400 at creation.
+    let no_term_id = seed_customer(&pool, "Smoke No Term", None, None).await;
+    let (status, body) = post_form(
+        &app,
+        "/web/sales",
+        &format!(
+            "customer_id={no_term_id}&payment_type=Credit&sale_date=2024-05-02&due_date="
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("due_date"), "actionable message: {body}");
+
+    // AC4: over the limit is a 400 with the projected debt and no side effect.
+    let over_id = seed_customer(&pool, "Smoke Over", Some("50"), Some(30)).await;
+    let over_sale = create_sale_draft_for_customer(&app, over_id, "Credit", "").await;
+    add_sale_line_via_web(&app, over_sale, product, "3").await;
+    let (status, body) = post_form(
+        &app,
+        "/web/sales/confirm",
+        &format!("sale_id={over_sale}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("75"), "projected debt in the message: {body}");
+    assert!(body.contains("50"), "limit in the message: {body}");
+    let over_detail = sale_detail(&app, over_sale).await;
+    assert_eq!(over_detail["sale"]["status"], json!("Draft"));
+    assert!(
+        over_detail["sale"]["sale_number"].is_null(),
+        "a blocked confirm assigns no number: {over_detail}"
+    );
+
+    // AC3: credit to the walk-in is rejected and leaves the draft untouched.
+    let (walkin_id,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let walkin_sale =
+        create_sale_draft_for_customer(&app, walkin_id, "Credit", "2024-06-02").await;
+    add_sale_line_via_web(&app, walkin_sale, product, "1").await;
+    let (status, body) = post_form(
+        &app,
+        "/web/sales/confirm",
+        &format!("sale_id={walkin_sale}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_lowercase().contains("walk-in"),
+        "actionable message: {body}"
+    );
+    assert_eq!(
+        sale_detail(&app, walkin_sale).await["sale"]["status"],
+        json!("Draft")
+    );
+}
+
+    /// M4 collection flow over HTTP: create a customer, sell on credit, collect
+    /// part of it through the form, then assert the derived balance, the ageing
+    /// buckets and that the receipt total equals the sum of its allocations
+    /// while every grouped payment keeps its own finance link.
+    #[tokio::test]
+    async fn collection_flow_derives_balance_ageing_and_receipt_total() {
+        let (app, pool) = test_app().await;
+        let cash = method_id(&pool, "Cash").await;
+        let account = create_account_via_web(&app, &pool, "CollectWallet", &[cash]).await;
+        let product = create_product_via_web(&app, &pool, "COLLECT-P", "1", "50").await;
+        record_stock_via_web(&app, product, "10").await;
+
+        // The customer is created through the same form the page renders.
+        let (status, resp) = post_form(
+            &app,
+            "/web/customers",
+            "name=Collect+Buyer&phone=555-0200&credit_limit=500&payment_days=30",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create customer: {resp}");
+        let customer = customer_id_by_name(&pool, "Collect Buyer").await;
+
+        // Credit sale of 3 x 25 = 75, due 2024-06-15.
+        let sale = create_sale_draft_for_customer(&app, customer, "Credit", "2024-06-15").await;
+        add_sale_line_via_web(&app, sale, product, "3").await;
+        confirm_sale_via_web(&app, sale, None, None).await;
+        let detail = sale_detail(&app, sale).await;
+        assert_eq!(dec(&detail["total"]), Decimal::from(75));
+        assert_eq!(dec(&detail["due"]), Decimal::from(75));
+
+        // Collect 30 through the collect form (the id travels in the body).
+        let (status, resp) = post_form(
+            &app,
+            "/web/customer-receipts",
+            &format!(
+                "customer_id={customer}&account_id={account}&method_id={cash}&amount=30&date=2024-06-20&notes=part"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "collect: {resp}");
+
+        // Derived balance and over-limit flag through the composed read.
+        let (status, body) = get(&app, &format!("/api/customers/{customer}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        assert_eq!(dec(&v["balance"]), Decimal::from(45));
+        assert_eq!(v["over_limit"], json!(false));
+        assert_eq!(v["customer"]["name"], json!("Collect Buyer"));
+
+        // Statement: one sale debit, one payment credit, balance 45, and the
+        // whole balance 5 days overdue falls in 1-30.
+        let (status, body) = get(
+            &app,
+            &format!("/api/customers/{customer}/statement?as_of=2024-06-20"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        let statement = &v["statement"];
+        assert_eq!(dec(&statement["balance"]), Decimal::from(45));
+        assert_eq!(dec(&statement["ageing"]["overdue_1_30"]), Decimal::from(45));
+        assert_eq!(dec(&statement["ageing"]["current"]), Decimal::ZERO);
+        let entries = statement["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "sale debit + payment credit: {entries:?}");
+        assert!(entries
+            .iter()
+            .any(|e| e["kind"] == json!("Sale") && dec(&e["debit"]) == Decimal::from(75)));
+        assert!(entries.iter().any(|e| e["kind"] == json!("Payment")
+            && dec(&e["credit"]) == Decimal::from(30)));
+
+        // The receivables view ages the same balance.
+        let (status, body) = get(&app, "/api/customers/ageing?as_of=2024-06-20").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        let row = v["ageing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["customer_id"] == json!(customer))
+            .unwrap_or_else(|| panic!("customer {customer} missing from ageing: {v}"));
+        assert_eq!(dec(&row["balance"]), Decimal::from(45));
+        assert_eq!(dec(&row["ageing"]["overdue_1_30"]), Decimal::from(45));
+        assert_eq!(row["name"], json!("Collect Buyer"));
+
+        // Receipt total is derived from its allocations, never stored.
+        let (status, body) = get(
+            &app,
+            &format!("/api/customer-receipts?customer_id={customer}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v = json_body(&body);
+        let receipts = v["receipts"].as_array().unwrap();
+        assert_eq!(receipts.len(), 1, "{v}");
+        let receipt = &receipts[0];
+        let receipt_id = receipt["receipt"]["id"].as_i64().unwrap();
+        assert_eq!(dec(&receipt["total"]), Decimal::from(30));
+        let allocations = receipt["allocations"].as_array().unwrap();
+        assert_eq!(allocations.len(), 1);
+        let summed: Decimal = allocations.iter().map(|a| dec(&a["amount"])).sum();
+        assert_eq!(summed, dec(&receipt["total"]));
+        for allocation in allocations {
+            assert_eq!(allocation["receipt_id"].as_i64(), Some(receipt_id));
+            assert_eq!(allocation["sale_id"].as_i64(), Some(sale));
+            assert!(
+                allocation["transaction_id"].as_i64().is_some(),
+                "the grouped payment keeps its finance link: {allocation}"
+            );
+        }
+        let raw: Vec<(String,)> =
+            sqlx::query_as("SELECT amount FROM sale_payments WHERE receipt_id = ?")
+                .bind(receipt_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let raw_sum: Decimal = raw
+            .iter()
+            .map(|(amount,)| Decimal::from_str(amount).unwrap())
+            .sum();
+        assert_eq!(raw_sum, dec(&receipt["total"]));
+
+        // The sale still shows the receipt-linked payment, and the money
+        // invariant holds for the whole database built by the flow.
+        let detail = sale_detail(&app, sale).await;
+        assert_eq!(detail["payments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            detail["payments"][0]["receipt_id"].as_i64(),
+            Some(receipt_id)
+        );
+        assert_eq!(dec(&detail["due"]), Decimal::from(45));
+        assert_payment_links_are_traceable(&pool).await;
+
+        // The statement page renders the collected customer and the new balance.
+        let (status, html) = get(&app, &format!("/customers/{customer}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Collect Buyer"), "{html:.400}");
+        assert!(html.contains("45"), "the page shows the derived balance: {html:.400}");
+    }
 
 #[tokio::test]
 async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
@@ -1347,7 +1644,7 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
 
     let product = create_product_via_web(&app, &pool, "GUARDFLOW-P", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
-    let sale = create_sale_draft_via_web(&app, "GuardFlowBuyer", "Credit", "2024-06-02").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "GuardFlowBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
     confirm_sale_via_web(&app, sale, None, None).await;
 
@@ -1398,12 +1695,12 @@ async fn money_invariants_hold_for_balances_and_payment_links() {
     let account_a = create_account_via_web(&app, &pool, "InvA", &[cash]).await;
     let product_a = create_product_via_web(&app, &pool, "INV-A", "1", "50").await;
     record_stock_via_web(&app, product_a, "10").await;
-    let cash_sale = create_sale_draft_via_web(&app, "InvCashBuyer", "Cash", "").await;
+    let cash_sale = create_sale_draft_via_web(&app, &pool, "InvCashBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, cash_sale, product_a, "1").await;
     confirm_sale_via_web(&app, cash_sale, Some(account_a), Some(cash)).await;
 
     let credit_sale =
-        create_sale_draft_via_web(&app, "InvCreditBuyer", "Credit", "2024-06-02").await;
+        create_sale_draft_via_web(&app, &pool, "InvCreditBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, credit_sale, product_a, "1").await;
     confirm_sale_via_web(&app, credit_sale, None, None).await;
     let (status, body) = pay_sale_via_web(&app, credit_sale, account_a, cash, "25").await;
@@ -1632,6 +1929,33 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
                 format!("purchase payment {payment_id} refund_transaction_id"),
             )?;
         }
+    }
+
+    // Orphan movements: every transaction whose reference looks like a document
+    // number must be claimed by some payment, as original or refund. A failure
+    // between creating the movement and inserting the payment row leaves one of
+    // these (the project deliberately does not share transactions across
+    // modules), and nothing else would notice it. Manual transactions keep a
+    // NULL reference and stay exempt.
+    let orphans: Vec<(i64,)> = sqlx::query_as(
+        "SELECT t.id FROM transactions t \
+         WHERE t.reference IS NOT NULL \
+           AND (t.reference GLOB '[0-9][0-9][0-9][0-9]-SALE-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+             OR t.reference GLOB '[0-9][0-9][0-9][0-9]-PURCH-[0-9][0-9][0-9][0-9][0-9][0-9]') \
+           AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
+                           WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id) \
+           AND NOT EXISTS (SELECT 1 FROM purchase_payments pp \
+                           WHERE pp.transaction_id = t.id OR pp.refund_transaction_id = t.id) \
+         ORDER BY t.id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    if !orphans.is_empty() {
+        let ids: Vec<i64> = orphans.into_iter().map(|(id,)| id).collect();
+        return Err(format!(
+            "transactions with a document reference are claimed by no payment: {ids:?} (every document movement must be linked as transaction_id or refund_transaction_id)"
+        ));
     }
     Ok(())
 }
@@ -1904,7 +2228,7 @@ async fn money_invariant_catches_broken_refund_link() {
     let account = create_account_via_web(&app, &pool, "RefundInv", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "REFUND-INV", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
-    let sale = create_sale_draft_via_web(&app, "RefundInvBuyer", "Cash", "").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "RefundInvBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
     confirm_sale_via_web(&app, sale, Some(account), Some(cash)).await;
     let (status, body) = post_form(
@@ -2062,7 +2386,7 @@ async fn money_invariant_catches_cross_payment_refund_swap() {
     let account = create_account_via_web(&app, &pool, "SwapInv", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "SWAP-INV", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
-    let sale = create_sale_draft_via_web(&app, "SwapInvBuyer", "Credit", "2024-06-02").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "SwapInvBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
     confirm_sale_via_web(&app, sale, None, None).await;
     let (status, body) = pay_sale_via_web(&app, sale, account, cash, "30").await;
@@ -2200,7 +2524,7 @@ async fn money_invariant_catches_equal_amount_pointer_swaps() {
     let account = create_account_via_web(&app, &pool, "EqualInv", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "EQUAL-INV", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
-    let sale = create_sale_draft_via_web(&app, "EqualInvBuyer", "Credit", "2024-06-02").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "EqualInvBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
     confirm_sale_via_web(&app, sale, None, None).await;
     let (status, body) = pay_sale_via_web(&app, sale, account, cash, "25").await;
@@ -2248,4 +2572,66 @@ async fn money_invariant_catches_equal_amount_pointer_swaps() {
     let err = check_payment_links_are_traceable(&pool).await.unwrap_err();
     eprintln!("both-pointers swap rejected: {err}");
     assert!(err.contains("claimed by both"), "{err}");
+}
+
+/// The payment-traceability invariant must also see movements that no payment
+/// claims: a failure between creating the finance movement and inserting the
+/// payment leaves an orphan Income that inflates the account while the sale
+/// stays unpaid. The collection is deliberately not transactional across
+/// modules, so the invariant detects the residual instead.
+#[tokio::test]
+async fn money_invariant_catches_orphan_document_movement() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "OrphanInv", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "ORPHAN-INV", "1", "10").await;
+    record_stock_via_web(&app, product, "5").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "OrphanBuyer", "Credit", "2024-06-02").await;
+    add_sale_line_via_web(&app, sale, product, "1").await;
+    confirm_sale_via_web(&app, sale, None, None).await;
+    let sale_number = sale_detail(&app, sale).await["sale"]["sale_number"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Injected failure between the movement and the payment row.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE TRIGGER injected_payment_failure BEFORE INSERT ON sale_payments \
+         WHEN NEW.sale_id = {sale} BEGIN SELECT RAISE(ABORT, 'injected payment failure'); END"
+    )))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "10").await;
+    assert!(status.is_server_error(), "{status} {body}");
+
+    let orphan: (i64,) = sqlx::query_as(
+        "SELECT t.id FROM transactions t WHERE t.reference = ? \
+         AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
+                         WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id)",
+    )
+    .bind(&sale_number)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let err = check_payment_links_are_traceable(&pool).await.unwrap_err();
+    eprintln!("orphan invariant error: {err}");
+    assert!(err.contains("claimed by no payment"), "{err}");
+    assert!(
+        err.contains(&orphan.0.to_string()),
+        "the invariant must report the orphan id: {err}"
+    );
+
+    // The orphan inflated the account while the sale stayed unpaid.
+    let tx: (String, String) = sqlx::query_as("SELECT kind, amount FROM transactions WHERE id = ?")
+        .bind(orphan.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tx.0, "Income");
+    assert_eq!(Decimal::from_str(&tx.1).unwrap(), Decimal::from_str("10").unwrap());
+    let detail = sale_detail(&app, sale).await;
+    assert_eq!(dec(&detail["paid"]), Decimal::ZERO, "the orphan paid nothing");
+    assert_eq!(dec(&detail["due"]), dec(&detail["total"]));
 }

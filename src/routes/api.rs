@@ -540,9 +540,13 @@ mod tests {
         let tx_id = v["id"].as_i64().unwrap();
 
         // Synthetic sale payment pointing at the money row (RESTRICT).
+        // `customer_id` is NOT NULL by design: resolve the seeded walk-in
+        // instead of hardcoding its id.
         let sale_id: (i64,) = sqlx::query_as(
-            "INSERT INTO sales (status, payment_type, customer_name, sale_date) \
-             VALUES ('Confirmed', 'Cash', 'fixture', '2024-01-15') RETURNING id",
+            "INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date) \
+             VALUES ('Confirmed', 'Cash', \
+                     (SELECT id FROM customers WHERE is_walkin = 1), 'fixture', '2024-01-15') \
+             RETURNING id",
         )
         .fetch_one(&pool)
         .await
