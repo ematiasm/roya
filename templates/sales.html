@@ -17,12 +17,18 @@
       </div>
       {# Server-side filters: the form GETs `/web/sales` and swaps only the list, so a
          filtered view is bookmarkable (`/sales?status=…`) and testable. Clear goes
-         to the unfiltered page. #}
+         to the unfiltered page.
+
+         `hx-push-url` makes a filter change addressable: htmx would push the fragment
+         path (`/web/sales?…`), which cannot be reloaded as a page, so base.html
+         rewrites the pending history entry to the page URL (`/sales?…`). Empty fields
+         are dropped before the request, so clearing a filter returns to the bare URL. #}
       <form id="sale-filters"
             class="mb-3 flex flex-wrap gap-2"
             hx-get="/web/sales"
             hx-target="#sale-list"
             hx-swap="innerHTML"
+            hx-push-url="true"
             hx-trigger="change, keyup changed delay:300ms">
         <select class="min-w-[110px] flex-1" name="status">
           <option value="">All statuses</option>
@@ -36,7 +42,11 @@
         <input class="min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
         <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/sales">Clear</a>
       </form>
+      {# `hx-history-elt` snapshots only the list on a history push, so Back restores the
+         previous list instead of re-fetching it from a filter form that already holds
+         the newer value. base.html syncs the form to the restored URL. #}
       <div id="sale-list"
+           hx-history-elt
            hx-get="/web/sales"
            hx-trigger="refresh from:body, load"
            hx-include="#sale-filters"

@@ -97,6 +97,165 @@
         if (form) notice('success', form.getAttribute('data-action') + ' saved');
       });
 
+      // List filters are addressable pages (slice E3). The filter forms fetch a
+      // fragment from /web/<list> but the page a person can reload, bookmark or share
+      // is /<list>. htmx would push the fragment path, so rewrite the pending history
+      // entry to the page URL; empty fields are dropped first so clearing a filter
+      // returns to the bare URL. On Back, htmx restores the snapshotted list (each
+      // list marks itself `hx-history-elt`) and this syncs the form to the URL, so the
+      // controls agree with the restored view.
+      function isFilterForm(elt) {
+        return elt && elt.matches && elt.matches('form[id$="-filters"]');
+      }
+      function syncFilterFormsFromUrl() {
+        var params = new URLSearchParams(location.search);
+        var forms = document.querySelectorAll('form[id$="-filters"]');
+        for (var f = 0; f < forms.length; f++) {
+          var controls = forms[f].querySelectorAll('input[name], select[name]');
+          for (var c = 0; c < controls.length; c++) {
+            controls[c].value = params.get(controls[c].name) || '';
+          }
+        }
+      }
+      document.body.addEventListener('htmx:configRequest', function (evt) {
+        if (!isFilterForm(evt.detail.elt)) return;
+        var params = evt.detail.parameters || {};
+        for (var key in params) {
+          if (params.hasOwnProperty(key) && (params[key] === '' || params[key] === null)) {
+            delete params[key];
+          }
+        }
+      });
+      document.body.addEventListener('htmx:beforeHistoryUpdate', function (evt) {
+        var history = evt.detail && evt.detail.history;
+        if (!history || !history.path) return;
+        if (/^\/web\/(sales|products|purchases)(?=\?|$)/.test(history.path)) {
+          history.path = history.path.replace(/^\/web/, '');
+        }
+      });
+      document.body.addEventListener('htmx:historyRestore', syncFilterFormsFromUrl);
+
+      // Product picker keyboard traversal (slice E3). The results are real buttons, so
+      // moving real focus is what makes Enter activate a result on its own and what a
+      // screen reader follows; there is no separate highlight to keep in sync.
+      // ArrowDown enters the results from the field and walks down them, ArrowUp walks
+      // back up to the field, and Escape returns to the field and clears it.
+      //
+      // A scan is different: the reader types into whatever has focus and ends with
+      // Enter, so a scan character arriving while a result is focused must pull focus
+      // back to the field. The field is cleared first, so the first character starts a
+      // fresh value instead of appending to the operator's query ("Harness" + a
+      // scanned barcode would not resolve). Enter, Space and the arrow keys are left
+      // untouched, so activating the focused result still works.
+      document.addEventListener('keydown', function (evt) {
+        var picker = document.getElementById('product-picker');
+        if (!picker) return;
+        var container = document.getElementById('product-search-results');
+        var buttons = container
+          ? Array.prototype.slice.call(container.querySelectorAll('button'))
+          : [];
+        var active = document.activeElement;
+        var index = buttons.indexOf(active);
+        if (evt.key === 'ArrowDown') {
+          if (active === picker && buttons.length > 0) {
+            evt.preventDefault();
+            buttons[0].focus();
+          } else if (index >= 0) {
+            evt.preventDefault();
+            if (index + 1 < buttons.length) buttons[index + 1].focus();
+          }
+        } else if (evt.key === 'ArrowUp') {
+          if (index > 0) {
+            evt.preventDefault();
+            buttons[index - 1].focus();
+          } else if (index === 0) {
+            evt.preventDefault();
+            picker.focus();
+          }
+        } else if (evt.key === 'Escape' && (index >= 0 || active === picker)) {
+          evt.preventDefault();
+          picker.value = '';
+          picker.focus();
+          // The field's own `hx-on:keyup` clears it when Escape is pressed there;
+          // setting the value programmatically does not fire `input`, so tell the
+          // debounced search that the field changed. Without this the field would be
+          // empty while the results still showed the previous matches.
+          picker.dispatchEvent(new Event('input', { bubbles: true }));
+        } else if (
+          index >= 0 &&
+          evt.key.length === 1 &&
+          evt.key !== ' ' &&
+          !evt.ctrlKey &&
+          !evt.metaKey &&
+          !evt.altKey
+        ) {
+          // Not prevented: the character still has to land in the field, and the
+          // browser inserts it into whatever holds focus when this handler returns.
+          // Space is deliberately excluded: a scanner never sends it, and on a
+          // focused button it is the keyboard convention for "activate", which a
+          // screen reader user relies on. Enter and Space both keep activating the
+          // focused result; only the characters a scan is made of are redirected.
+          picker.value = '';
+          picker.focus();
+        }
+      });
+
+      // Running the search must not drop focus. The swap replaces the focused result
+      // button, and htmx's own restore only knows elements with an id; the buttons
+      // have none, so focus fell to `document.body` and the next key went nowhere.
+      // Focus is on a *product*, not a row position, so the product id is the
+      // correspondence: the same product keeps focus while it is still a match, and
+      // when it is gone focus returns to the field, where the operator is typing.
+      // The capture runs before the swap, while the old buttons still exist.
+      var pendingResultFocus = null;
+      document.body.addEventListener('htmx:beforeSwap', function (evt) {
+        var target = evt.detail && evt.detail.target;
+        if (!target || target.id !== 'product-search-results') return;
+        var active = document.activeElement;
+        pendingResultFocus =
+          active && active.dataset ? active.dataset.productId || null : null;
+      });
+      document.body.addEventListener('htmx:afterSwap', function (evt) {
+        var target = evt.detail && evt.detail.target;
+        if (!target || target.id !== 'product-search-results') return;
+        var key = pendingResultFocus;
+        pendingResultFocus = null;
+        if (!key) return;
+        var again = target.querySelector('[data-product-id="' + key + '"]');
+        if (again) {
+          again.focus();
+          return;
+        }
+        var picker = document.getElementById('product-picker');
+        if (picker) picker.focus();
+      });
+
+      // One polite live region owns the search state. While the request is in flight
+      // the region says so, so a screen reader is never left with the previous count
+      // that is about to change; the count arrives with the swapped results, which
+      // replace this text. The visible busy cue is aria-hidden and does not announce.
+      document.body.addEventListener('htmx:beforeRequest', function (evt) {
+        var elt = evt.detail && evt.detail.elt;
+        if (!elt || elt.id !== 'product-picker') return;
+        var status = document.getElementById('product-search-status');
+        if (status) status.textContent = 'Searching…';
+      });
+
+      // A failed search has no swapped results to replace "Searching…", so without
+      // this the region would say the search is still running forever. Only real
+      // failures reset it: `htmx:sendAbort` is deliberately not handled, because a
+      // newer keystroke superseding an old request must not announce a failure.
+      function searchFailed(evt) {
+        var cfg = evt.detail && evt.detail.requestConfig;
+        var elt = cfg && cfg.elt;
+        if (!elt || elt.id !== 'product-picker') return;
+        var status = document.getElementById('product-search-status');
+        if (status) status.textContent = 'Search failed.';
+      }
+      document.body.addEventListener('htmx:responseError', searchFailed);
+      document.body.addEventListener('htmx:sendError', searchFailed);
+      document.body.addEventListener('htmx:timeout', searchFailed);
+
       // Existing cross-region refreshes.
       document.body.addEventListener('transaction-created', function(){ htmx.trigger('#account-list','refresh'); });
       document.body.addEventListener('transaction-deleted', function(){ htmx.trigger('#account-list','refresh'); });

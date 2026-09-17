@@ -90,9 +90,41 @@ Slice E2 is the critical flows:
   first; dismissing leaves the record untouched (asserted on the page and through
   the API), accepting performs the cancellation.
 
-Slice E3 adds the tests for the three defects that motivated the suite: the URL
-not carrying the filter, the results not traversable with the arrow keys, and a
-search in flight looking like an empty result.
+Slice E3 is the three defects that motivated the suite, in `tests/test_search_ux.py`:
+
+- the filter URL — filtering sales, purchases and products pushes the page URL
+  (`/sales?status=…`), reloading that URL reproduces the filtered view, clearing the
+  filters returns to the bare URL, and Back restores the previous view with the form
+  agreeing with the restored URL;
+- keyboard traversal — the arrow keys move **real focus** into and through the result
+  buttons (so Enter activates the focused result on its own and a screen reader
+  follows), ArrowUp walks back to the field, and Escape returns to the field and clears
+  it while the announced match count keeps working;
+- the busy state — a search in flight shows the `#product-search-busy` status instead
+  of an empty area. The test holds the response with Playwright route interception so
+  the transient state can be observed, then releases it; it does not sleep.
+
+The picker macro deliberately exposes `#product-search-busy` as the busy hook that
+htmx's `hx-indicator` toggles; the stylesheet hides it with `display:none` until the
+request is in flight. It is only the visual cue (`aria-hidden`): the announced state
+lives in `#product-search-status`, the text of the single polite region
+`#product-search-results`, which says "Searching…" in flight and the count when the
+results land.
+
+A follow-up round closed three more defects in that keyboard flow, also in
+`tests/test_search_ux.py`:
+
+- a scan is never swallowed — a character a scanner sends arriving while a result
+  has focus pulls focus back to the field (and clears it) so the reader's
+  characters land, while Enter and Space still activate the focused result (Space
+  is excluded from the redirect because activating a focused control is a keyboard
+  convention a screen reader user relies on);
+- a running search keeps focus — the swap replaces the focused result button, so
+  focus follows the same product id when it is still a match and returns to the
+  field when it is gone, instead of falling to `document.body`;
+- the announced state is honest — one polite region describes one state at a time,
+  so the previous match count is never announced beside "Searching…", and a failed
+  search resets that region to say so instead of leaving "Searching…" forever.
 
 It deliberately does **not** verify business rules: balances, stock deduction,
 payment traceability, numbering and the rest stay in the Rust suite, which is

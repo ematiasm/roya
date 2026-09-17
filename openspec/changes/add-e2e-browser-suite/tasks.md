@@ -40,19 +40,19 @@
 - [x] T11: the results announce the match count to assistive technology (AC9)
 
 ## Slice E3 — the three defects, closed
-- [ ] T12: write the test that fails because filtering does not update the URL, show it failing, then fix
+- [x] T12: write the test that fails because filtering does not update the URL, show it failing, then fix
       the templates so a filtered view can be reloaded and shared (AC5)
-- [ ] T13: write the test that fails because the results cannot be traversed with the arrow keys, show it
+- [x] T13: write the test that fails because the results cannot be traversed with the arrow keys, show it
       failing, then implement it (AC6)
-- [ ] T14: write the test that fails because a search in flight looks like an empty result, show it
+- [x] T14: write the test that fails because a search in flight looks like an empty result, show it
       failing, then add the busy state (AC7)
-- [ ] T15: re-run the whole suite and the Rust suite
+- [x] T15: re-run the whole suite and the Rust suite
 
 ## Verify
-- [ ] AC1, AC2, AC10, AC11, AC12 checked: one command, the development database untouched and the port
+- [x] AC1, AC2, AC10, AC11, AC12 checked: one command, the development database untouched and the port
       released, a deliberately failing test producing an openable trace, no fixed sleeps, and `cargo test`
       unaffected
-- [ ] Confirm the suite leaves no artifact behind on a green run
+- [x] Confirm the suite leaves no artifact behind on a green run
 
 ## Archiving
 - [ ] On merge: add a presentation section to the canonical specs describing the browser suite's boundary

@@ -17,12 +17,16 @@
       </div>
       {# Catalogue filter: the text field matches name, SKU and barcode through the
          same inventory search the picker uses, and combines with the category. A
-         bookmarkable `/products?q=…&category_id=…` re-renders this state. #}
+         bookmarkable `/products?q=…&category_id=…` re-renders this state.
+
+         `hx-push-url` makes the filter addressable; base.html rewrites the fragment
+         path to the page URL and drops empty fields. #}
       <form id="product-filters"
             class="mb-3 flex flex-wrap gap-2"
             hx-get="/web/products"
             hx-target="#product-list"
             hx-swap="innerHTML"
+            hx-push-url="true"
             hx-trigger="change, keyup changed delay:300ms">
         <input class="min-w-[160px] flex-1" type="text" name="q" placeholder="Name, SKU or barcode" value="{{ filter_q }}" />
         <select class="min-w-[120px] flex-1" id="filter-category" name="category_id">
@@ -33,7 +37,11 @@
         </select>
         <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/products">Clear</a>
       </form>
+      {# `hx-history-elt` snapshots only the list on a history push, so Back restores the
+         previous list instead of re-fetching it from a filter form that already holds
+         the newer value. base.html syncs the form to the restored URL. #}
       <div id="product-list"
+           hx-history-elt
            hx-get="/web/products"
            hx-trigger="refresh from:body, load"
            hx-include="#product-filters"
