@@ -11,6 +11,10 @@ pub trait ProductRepository: Send + Sync {
     async fn create(&self, input: &NewProduct) -> AppResult<Product>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Product>>;
     async fn find_by_sku(&self, sku: &str) -> AppResult<Option<Product>>;
+    /// Exact SKU regardless of case, used by the scanner/SKU resolution path.
+    async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>>;
+    /// Bounded picker read over name, SKU and barcode aliases in one query.
+    async fn search(&self, query: &str, limit: i64) -> AppResult<Vec<Product>>;
     async fn list(&self) -> AppResult<Vec<Product>>;
     async fn list_by_category(&self, category_id: i64) -> AppResult<Vec<Product>>;
     async fn count_by_category(&self, category_id: i64) -> AppResult<i64>;
@@ -32,6 +36,13 @@ fn kind_from_str(s: &str) -> ProductKind {
         "Service" => ProductKind::Service,
         _ => ProductKind::Product,
     }
+}
+
+/// Escape the LIKE wildcards in a user-typed value so `%` and `_` stay literal.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Product {
@@ -133,6 +144,41 @@ impl ProductRepository for SqliteProductRepository {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(row_to_product))
+    }
+
+    async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>> {
+        let row = sqlx::query(
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at FROM products WHERE sku = ? COLLATE NOCASE ORDER BY id LIMIT 1"#,
+        )
+        .bind(sku)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_product))
+    }
+
+    async fn search(&self, query: &str, limit: i64) -> AppResult<Vec<Product>> {
+        // One query path: name, SKU and barcode aliases. LIKE is case-insensitive
+        // for ASCII in SQLite, and `%`/`_` typed by the user stay literal text.
+        let pattern = format!("%{}%", escape_like(query));
+        let rows = sqlx::query(
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at
+               FROM products p
+               WHERE p.name LIKE ? ESCAPE '\'
+                  OR p.sku LIKE ? ESCAPE '\'
+                  OR EXISTS (
+                       SELECT 1 FROM product_barcodes b
+                       WHERE b.product_id = p.id AND b.code LIKE ? ESCAPE '\'
+                     )
+               ORDER BY p.name, p.id
+               LIMIT ?"#,
+        )
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_product).collect())
     }
 
     async fn list(&self) -> AppResult<Vec<Product>> {

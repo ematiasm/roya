@@ -18,7 +18,6 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{PaymentType, SaleDetail, SaleRecord, SaleStatus, UpdateSaleDraft};
-use crate::repositories::ProductRepository;
 use crate::routes::AppState;
 
 // ---------------------------------------------------------------------------
@@ -51,7 +50,7 @@ struct SalePageTemplate {
     page_action_href: String,
     page_action_label: String,
     record: SaleRecord,
-    products: Vec<crate::models::Product>,
+    oob_picker: bool,
     accounts: Vec<crate::models::AccountWithBalance>,
     methods: Vec<crate::models::PaymentMethod>,
     today: String,
@@ -71,7 +70,7 @@ struct SaleListPartial {
 #[template(path = "partials/sale_detail.html")]
 struct SaleDetailPartial {
     record: SaleRecord,
-    products: Vec<crate::models::Product>,
+    oob_picker: bool,
     accounts: Vec<crate::models::AccountWithBalance>,
     methods: Vec<crate::models::PaymentMethod>,
     today: String,
@@ -145,11 +144,10 @@ fn render_list(sales: Vec<SaleDetail>, title: &str) -> AppResult<Html<String>> {
 }
 
 /// Everything the record body renders: the resolved record plus the option
-/// lists its action forms need (the product picker stays a plain selector until
-/// slice N3).
+/// lists its action forms need. The product picker searches
+/// `/web/product-search` instead of carrying the whole catalogue.
 struct SaleRecordContext {
     record: SaleRecord,
-    products: Vec<crate::models::Product>,
     accounts: Vec<crate::models::AccountWithBalance>,
     methods: Vec<crate::models::PaymentMethod>,
     today: String,
@@ -157,23 +155,21 @@ struct SaleRecordContext {
 
 async fn record_context(state: &AppState, sale_id: i64) -> AppResult<SaleRecordContext> {
     let record = state.sales_service.get_record(sale_id).await?;
-    let products = state.inventory_service.products.list().await?;
     let accounts = state.account_service.list_with_balances().await?;
     let methods = state.payment_method_service.list().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     Ok(SaleRecordContext {
         record,
-        products,
         accounts,
         methods,
         today,
     })
 }
 
-fn render_record(context: SaleRecordContext) -> AppResult<Html<String>> {
+fn render_record(context: SaleRecordContext, oob_picker: bool) -> AppResult<Html<String>> {
     let html = SaleDetailPartial {
         record: context.record,
-        products: context.products,
+        oob_picker,
         accounts: context.accounts,
         methods: context.methods,
         today: context.today,
@@ -186,7 +182,17 @@ fn render_record(context: SaleRecordContext) -> AppResult<Html<String>> {
 /// Record-body response that keeps the cross-region `sale-changed` refresh
 /// event, so subscribed list and debt regions update after an action.
 async fn changed(state: &AppState, sale_id: i64) -> AppResult<Response> {
-    let html = render_record(record_context(state, sale_id).await?)?.0;
+    changed_with_picker(state, sale_id, false).await
+}
+
+/// Line-add response: the same body plus the out-of-band picker, empty and
+/// focused, so the scanner can feed the next line without a click.
+async fn changed_with_picker(
+    state: &AppState,
+    sale_id: i64,
+    oob_picker: bool,
+) -> AppResult<Response> {
+    let html = render_record(record_context(state, sale_id).await?, oob_picker)?.0;
     let mut resp = Html(html).into_response();
     resp.headers_mut()
         .insert("HX-Trigger", "sale-changed".parse().unwrap());
@@ -254,7 +260,7 @@ async fn sale_record_page(
         page_action_href: action_href,
         page_action_label: action_label,
         record: context.record,
-        products: context.products,
+        oob_picker: false,
         accounts: context.accounts,
         methods: context.methods,
         today: context.today,
@@ -269,7 +275,7 @@ async fn web_sale_detail(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
-    render_record(record_context(&state, id).await?)
+    render_record(record_context(&state, id).await?, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +302,13 @@ pub struct CreateSaleForm {
 pub struct AddLineForm {
     #[serde(default)]
     pub sale_id: i64,
-    pub product_id: i64,
+    /// An explicit id arrives from a clicked result; a scan arrives as `product`.
+    #[serde(default)]
+    pub product_id: Option<i64>,
+    /// The typed or scanned value. The inventory service resolves it: exact
+    /// barcode, then exact SKU (case-insensitive), then a numeric id.
+    #[serde(default)]
+    pub product: String,
     #[serde(default)]
     pub qty: String,
     #[serde(default)]
@@ -410,12 +422,22 @@ async fn web_add_line(
 ) -> Result<axum::response::Response, AppError> {
     let qty = parse_required_decimal(&form.qty, "qty")?;
     let unit_price = parse_opt_decimal(&form.unit_price, "unit_price")?;
+    // An explicit product id (a clicked result) wins over the typed text; a scan
+    // or an Enter carries only the value and resolves through inventory.
+    let product_id = match form.product_id.filter(|id| *id > 0) {
+        Some(id) => id,
+        None => state
+            .inventory_service
+            .resolve_product_ref(&form.product)
+            .await?
+            .id,
+    };
     state
         .sales_service
-        .add_line(id, form.product_id, qty, unit_price)
+        .add_line(id, product_id, qty, unit_price)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed_with_picker(&state, id, true).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -709,6 +731,7 @@ mod tests {
     struct RecordFixture {
         sale_id: i64,
         line_id: i64,
+        product_id: i64,
         product_name: String,
         product_sku: String,
         account_id: i64,
@@ -783,6 +806,7 @@ mod tests {
         RecordFixture {
             sale_id: sale.id,
             line_id: line.id,
+            product_id: product.id,
             product_name: product.name,
             product_sku: product.sku,
             account_id: account.id,
@@ -1427,5 +1451,198 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.to_lowercase().contains("customer"), "{body}");
+    }
+
+    // -- N4: the product picker on the record page ----------------------------
+
+    /// Cuts the `<form>...</form>` region that contains `needle`, for structural
+    /// assertions such as "the results container is not inside the picker form".
+    fn enclosing_form<'a>(html: &'a str, needle: &str) -> &'a str {
+        let pos = html
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} not rendered: {html:.600}"));
+        let start = html[..pos].rfind("<form").expect("needle must sit in a form");
+        let end = html[pos..].find("</form>").expect("form must close");
+        &html[start..pos + end + "</form>".len()]
+    }
+
+    /// The catalogue `<select>` is replaced by one field that searches with a
+    /// debounce, submits on Enter and clears on Escape; the results container is a
+    /// sibling of the form, and every result is its own add action.
+    #[tokio::test]
+    async fn n4_sale_record_offers_the_picker_instead_of_the_catalogue_select() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("<select name=\"product_id\""),
+            "the whole-catalogue select must be gone: {html:.800}"
+        );
+
+        let picker = enclosing_form(&html, "id=\"product-picker\"");
+        assert!(
+            picker.contains(&format!("hx-post=\"/web/sales/{}/lines\"", fixture.sale_id)),
+            "{picker}"
+        );
+        assert!(picker.contains("hx-get=\"/web/product-search\""), "{picker}");
+        assert!(
+            picker.contains("delay:"),
+            "the search must be debounced: {picker}"
+        );
+        assert!(
+            picker.contains("hx-target=\"#product-search-results\""),
+            "{picker}"
+        );
+        assert!(
+            picker.contains("hx-on:keyup")
+                && picker.contains("Escape")
+                && picker.contains("this.value"),
+            "Escape must clear the field declaratively: {picker}"
+        );
+        assert!(
+            picker.contains("name=\"qty\"") && picker.contains("value=\"1\""),
+            "a scan and a click must both carry the default quantity: {picker}"
+        );
+        assert!(
+            !picker.contains("id=\"product-search-results\""),
+            "the results container must be a sibling of the picker form, never inside it: {picker}"
+        );
+        assert!(
+            html.contains("id=\"product-search-results\""),
+            "the page must render the sibling results container: {html:.600}"
+        );
+        assert!(
+            html.contains("id=\"sale-record-money\""),
+            "adding a line swaps the money region, which carries the total and the lines"
+        );
+    }
+
+    /// AC9 + AC10: an exact barcode submits the line in one step, and the same
+    /// response carries the updated lines, the running total and an out-of-band
+    /// picker that is empty and focused.
+    #[tokio::test]
+    async fn n4_sale_line_scan_adds_in_one_step_and_resets_the_picker() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .inventory_service
+            .add_barcode(fixture.product_id, "7791234567890")
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // Exactly what the picker form posts on Enter: the typed value and the
+        // quantity, no product id and no click.
+        let (status, added) = post_form(
+            app,
+            &format!("/web/sales/{}/lines", fixture.sale_id),
+            "product=7791234567890&qty=2&unit_price=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+
+        let detail = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        assert_eq!(detail.lines.len(), 2, "the scan adds its own line");
+        let scanned = detail
+            .lines
+            .iter()
+            .find(|line| line.qty == Decimal::from(2))
+            .expect("the scanned line");
+        assert_eq!(scanned.product_id, fixture.product_id);
+
+        // One response carries the lines, the running total and the OOB picker, so
+        // lines and total can never drift.
+        assert!(added.contains(&fixture.product_name), "{added:.600}");
+        assert!(
+            added.contains("$50"),
+            "the running total travels with the lines: {added:.800}"
+        );
+        let oob_pos = added
+            .find("hx-swap-oob=\"true\"")
+            .expect("the picker must come back out of band");
+        let tag_start = added[..oob_pos].rfind('<').unwrap();
+        let tag_end = oob_pos + added[oob_pos..].find('>').unwrap();
+        let oob_tag = &added[tag_start..=tag_end];
+        assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
+        let oob = &added[tag_start..];
+        assert!(
+            oob.contains("autofocus"),
+            "the picker must come back focused: {oob:.400}"
+        );
+        let input_pos = oob.find("id=\"product-picker\"").unwrap();
+        let input_start = oob[..input_pos].rfind('<').unwrap();
+        let input_end = input_pos + oob[input_pos..].find('>').unwrap();
+        let input_tag = &oob[input_start..=input_end];
+        assert!(
+            !input_tag.contains("value="),
+            "the picker must come back empty: {input_tag}"
+        );
+    }
+
+    /// AC10 (clicked result): a result is its own add action; the request includes
+    /// the picker form, so the quantity travels, and supplies the product id
+    /// itself. The typed text is not an exact match on purpose.
+    #[tokio::test]
+    async fn n4_sale_line_clicked_result_uses_the_picker_quantity() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = post_form(
+            app,
+            &format!("/web/sales/{}/lines", fixture.sale_id),
+            &format!(
+                "product=record&qty=3&unit_price=&product_id={}",
+                fixture.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let detail = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        let clicked = detail
+            .lines
+            .iter()
+            .find(|line| line.qty == Decimal::from(3))
+            .expect("the clicked line");
+        assert_eq!(clicked.product_id, fixture.product_id);
+        assert_eq!(detail.total, Decimal::from(125));
+    }
+
+    /// AC12: an unresolvable value is a clear 400 that names the number of partial
+    /// matches the search found, and it adds nothing.
+    #[tokio::test]
+    async fn n4_sale_line_unknown_value_is_400_and_adds_nothing() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let before = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+
+        let (status, body) = post_form(
+            app,
+            &format!("/web/sales/{}/lines", fixture.sale_id),
+            "product=record&qty=1&unit_price=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("no exact match"), "{body}");
+        assert!(
+            body.contains("1 match"),
+            "the message must name the search count: {body}"
+        );
+
+        let after = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        assert_eq!(
+            after.lines.len(),
+            before.lines.len(),
+            "a failed resolution adds no line"
+        );
+        assert_eq!(after.total, before.total);
     }
 }

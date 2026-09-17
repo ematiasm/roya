@@ -44,6 +44,17 @@ struct StockListPartial {
     items: Vec<ProductStock>,
 }
 
+/// The picker results fragment. Generic on purpose: the record page supplies the
+/// line action and swap target, so the purchase record page reuses it unchanged.
+#[derive(Template)]
+#[template(path = "partials/product_search_results.html")]
+struct ProductSearchResultsPartial {
+    query: String,
+    matches: Vec<ProductStock>,
+    line_action: String,
+    line_target: String,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -167,6 +178,46 @@ async fn web_product_options(State(state): State<AppState>) -> Result<Html<Strin
             html_escape(&p.name)
         ));
     }
+    Ok(Html(html))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ProductSearchQuery {
+    /// Documented query name.
+    #[serde(default)]
+    pub q: String,
+    /// The picker input is named `product` because the same field feeds the line
+    /// form; both names reach the same search.
+    #[serde(default)]
+    pub product: String,
+    /// The record's line endpoint and swap target, supplied by the picker form so
+    /// the fragment stays generic (sales today, purchases next).
+    #[serde(default)]
+    pub line_action: String,
+    #[serde(default)]
+    pub line_target: String,
+}
+
+/// `GET /web/product-search?q=`: the bounded picker read. Matching and stock
+/// derivation live in the inventory service; the route only renders.
+async fn web_product_search(
+    State(state): State<AppState>,
+    Query(params): Query<ProductSearchQuery>,
+) -> Result<Html<String>, AppError> {
+    let raw = if params.q.trim().is_empty() {
+        params.product
+    } else {
+        params.q
+    };
+    let matches = state.inventory_service.search_products(&raw).await?;
+    let html = ProductSearchResultsPartial {
+        query: raw.trim().to_string(),
+        matches,
+        line_action: params.line_action.trim().to_string(),
+        line_target: params.line_target.trim().to_string(),
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -394,6 +445,7 @@ pub fn router() -> Router<AppState> {
         .route("/web/categories", post(web_create_category))
         .route("/web/category-options", get(web_category_options))
         .route("/web/product-options", get(web_product_options))
+        .route("/web/product-search", get(web_product_search))
         .route("/web/stock-movements", post(web_create_movement))
         .route("/web/low-stock", get(web_low_stock))
         .route("/web/negative-stock", get(web_negative_stock))
@@ -482,5 +534,104 @@ mod tests {
         let (status, html) = get_html(app, "/web/products").await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("WEB-1"), "fragment should contain new sku: {html:.300}");
+    }
+
+    // -- N4: the picker search fragment ---------------------------------------
+
+    async fn seed_search_product(state: &AppState) -> crate::models::Product {
+        use crate::models::{NewProduct, ProductKind};
+        use rust_decimal::Decimal;
+
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "PICK-1".into(),
+                name: "Yerba Picker".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(10),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .inventory_service
+            .add_barcode(product.id, "7791234567890")
+            .await
+            .unwrap();
+        product
+    }
+
+    /// AC8: name, SKU and barcode all find the product in one fragment, and the
+    /// fragment carries price and current stock.
+    #[tokio::test]
+    async fn n4_product_search_matches_name_sku_and_barcode() {
+        let state = test_state().await;
+        seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        for needle in ["picker", "PICK-1", "7791234567890"] {
+            let (status, html) =
+                get_html(app.clone(), &format!("/web/product-search?q={needle}")).await;
+            assert_eq!(status, StatusCode::OK, "{needle}: {html}");
+            assert!(html.contains("Yerba Picker"), "{needle}: {html}");
+            assert!(html.contains("PICK-1"), "{needle}: {html}");
+            assert!(html.contains("$25"), "price rides along: {html}");
+            assert!(html.contains("stock 0"), "stock rides along: {html}");
+        }
+    }
+
+    /// AC8 (negative): an empty query returns no results, not the catalogue.
+    #[tokio::test]
+    async fn n4_product_search_empty_query_returns_no_results() {
+        let state = test_state().await;
+        seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/web/product-search?q=").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("Yerba Picker"),
+            "empty query must not dump the catalogue: {html}"
+        );
+    }
+
+    /// The fragment is generic: when the caller names the record's line action,
+    /// every match becomes its own add form that includes the picker form and
+    /// supplies its own product id. Without an action there are no dead controls.
+    #[tokio::test]
+    async fn n4_product_search_fragment_renders_one_add_action_per_match() {
+        let state = test_state().await;
+        let product = seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        let (status, plain) = get_html(app.clone(), "/web/product-search?q=picker").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !plain.contains("hx-post"),
+            "without an action the fragment must not render dead controls: {plain}"
+        );
+
+        let (status, html) = get_html(
+            app,
+            "/web/product-search?q=picker&line_action=/web/sales/7/lines&line_target=%23sale-record-money",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(html.matches("<form").count(), 1, "{html}");
+        assert!(html.contains("hx-post=\"/web/sales/7/lines\""), "{html}");
+        assert!(html.contains("hx-include=\"#line-picker\""), "{html}");
+        assert!(html.contains("hx-target=\"#sale-record-money\""), "{html}");
+        let vals = format!("hx-vals='{{\"product_id\": {}}}'", product.id);
+        assert!(
+            html.contains(&vals),
+            "result must supply its own product id: {html}"
+        );
     }
 }

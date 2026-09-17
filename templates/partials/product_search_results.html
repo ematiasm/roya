@@ -1,0 +1,52 @@
+{# Product search results (redesign-interface N4).
+
+   Generic picker fragment: it answers `GET /web/product-search?q=` with name,
+   SKU, price and current stock. When the caller supplies the record's line
+   action and swap target, every match becomes its own add form: the request
+   includes `#line-picker` (so the quantity travels) and supplies its own
+   product_id through `hx-vals`. The results container is a sibling of the
+   picker form because a form inside a form is invalid HTML.
+
+   Accessibility: `#product-search-results` is the polite live region (set in
+   the record template). Only this hidden count is announced; the visual list
+   sits under `aria-live="off"`, so typing does not read the catalogue out loud
+   on every keystroke. The picker input describes itself with this status
+   through `aria-describedby`. #}
+<p id="product-search-status" class="sr-only">
+  {% if matches.is_empty() %}
+    {% if query.is_empty() %}Type a name, SKU or barcode.{% else %}No products match "{{ query }}".{% endif %}
+  {% else %}
+    {{ matches.len() }} match{% if matches.len() != 1 %}es{% endif %}.
+  {% endif %}
+</p>
+<div aria-live="off">
+{% if matches.is_empty() %}
+  {% if query.is_empty() %}
+    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">Type a name, SKU or barcode.</div>
+  {% else %}
+    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">No products match "{{ query }}".</div>
+  {% endif %}
+{% else %}
+  <div class="flex flex-col gap-1.5">
+    {% for ps in matches %}
+      {% if !line_action.is_empty() && !line_target.is_empty() %}
+      <form data-action="Add line"
+            hx-post="{{ line_action }}" hx-include="#line-picker"
+            hx-vals='{"product_id": {{ ps.product.id }}}'
+            hx-target="{{ line_target }}" hx-swap="outerHTML" hx-select="{{ line_target }}">
+        <button type="submit"
+                class="flex w-full items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-left text-sm text-text">
+          <span class="min-w-0 truncate font-semibold">{{ ps.product.name }}</span>
+          <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • ${{ ps.product.sale_price }} • stock {{ ps.stock }}</span>
+        </button>
+      </form>
+      {% else %}
+      <div class="flex items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-sm">
+        <span class="min-w-0 truncate font-semibold">{{ ps.product.name }}</span>
+        <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • ${{ ps.product.sale_price }} • stock {{ ps.stock }}</span>
+      </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+{% endif %}
+</div>

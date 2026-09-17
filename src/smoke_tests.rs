@@ -1083,6 +1083,14 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<(&'static str, String, bool)> {
             false,
         ),
         (
+            "product search fragment",
+            format!(
+                "/web/product-search?q=GUARD-P&line_action=/web/sales/{}/lines&line_target=%23sale-record-money",
+                fixture.sale
+            ),
+            false,
+        ),
+        (
             "purchase detail fragment",
             format!("/web/purchases/{}", fixture.purchase),
             false,
@@ -2974,5 +2982,398 @@ async fn converted_pages_expose_the_notice_region_and_named_actions() {
         !contains_bare_alert(&dashboard),
         "the served shell must not call alert()"
     );
+}
+
+// ---------------------------------------------------------------------------
+// N4: the picker loads a sale from the keyboard and the scanner alone
+// ---------------------------------------------------------------------------
+
+/// The add-line response must bring the picker back out of band, empty and
+/// focused, so the next scan lands without a click.
+fn assert_oob_picker_is_empty_and_focused(html: &str) {
+    let oob_pos = html
+        .find("hx-swap-oob=\"true\"")
+        .unwrap_or_else(|| panic!("the picker must come back out of band: {html:.800}"));
+    let tag_start = html[..oob_pos].rfind('<').unwrap();
+    let tag_end = oob_pos + html[oob_pos..].find('>').unwrap();
+    let oob_tag = &html[tag_start..=tag_end];
+    assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
+    let oob = &html[tag_start..];
+    assert!(oob.contains("autofocus"), "the picker must come back focused: {oob:.400}");
+    let input_pos = oob
+        .find("id=\"product-picker\"")
+        .expect("the out-of-band picker renders its field");
+    let input_start = oob[..input_pos].rfind('<').unwrap();
+    let input_end = input_pos + oob[input_pos..].find('>').unwrap();
+    let input_tag = &oob[input_start..=input_end];
+    assert!(
+        !input_tag.contains("value="),
+        "the picker must come back empty: {input_tag}"
+    );
+}
+
+/// The whole loop over HTTP with the series of requests a USB reader produces:
+/// type (the debounced search) then Enter (the line form), with the response
+/// re-focusing an empty picker for the next scan. No request in the loop needs a
+/// click, name, SKU and barcode all find the product, an exact barcode adds in
+/// one step, removing a line updates the total, and an unknown value is a clear
+/// 400 that adds nothing.
+#[tokio::test]
+async fn line_picker_loads_a_sale_without_a_click() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "SCAN-P", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{product}/barcodes"),
+        json!({ "code": "7791234567890" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode: {body}");
+    let sale = create_sale_draft_via_web(&app, &pool, "ScanBuyer", "Cash", "").await;
+    let base = format!("/web/sales/{sale}");
+
+    // Typing a name, a SKU or a barcode each find the product, through the same
+    // search path the field uses.
+    let search = format!(
+        "/web/product-search?line_action={base}/lines&line_target=%23sale-record-money"
+    );
+    for needle in ["scan", "SCAN-P", "7791234567890"] {
+        let (status, fragment) = get(&app, &format!("{search}&q={needle}")).await;
+        assert_eq!(status, StatusCode::OK, "{fragment}");
+        assert!(fragment.contains("product SCAN-P"), "{needle}: {fragment}");
+        assert!(fragment.contains("SCAN-P"), "{needle}: {fragment}");
+        assert!(fragment.contains("$25"), "{needle}: price travels: {fragment}");
+        assert!(fragment.contains("stock 20"), "{needle}: stock travels: {fragment}");
+        // A result is its own add action: it includes the picker form and carries
+        // its own product id.
+        assert!(
+            fragment.contains(&format!("hx-post=\"{base}/lines\"")),
+            "{fragment}"
+        );
+        assert!(fragment.contains("hx-include=\"#line-picker\""), "{fragment}");
+        assert!(
+            fragment.contains(&format!("hx-vals='{{\"product_id\": {product}}}'")),
+            "{fragment}"
+        );
+    }
+
+    // An empty query returns nothing, not the whole catalogue.
+    let (status, empty) = get(&app, "/web/product-search?q=").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!empty.contains("SCAN-P"), "{empty}");
+
+    // The record page offers the field, its debounced search, the sibling results
+    // container and no catalogue select.
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !page.contains("<select name=\"product_id\""),
+        "the catalogue select must be gone: {page:.600}"
+    );
+    assert!(page.contains("hx-get=\"/web/product-search\""), "{page:.600}");
+    assert!(page.contains("id=\"product-search-results\""), "{page:.600}");
+    assert!(page.contains("delay:"), "the search must be debounced");
+    assert!(page.contains("Escape"), "Escape must clear the field");
+
+    // Scan 1: the reader types the barcode and presses Enter. The form carries the
+    // field and the quantity, never a product id.
+    let (status, added) = post_form(&app, &format!("{base}/lines"), "product=7791234567890&qty=2&unit_price=").await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("product SCAN-P"), "{added:.600}");
+    assert!(added.contains("$50"), "running total after the scan: {added:.800}");
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // Scan 2: the same series, and the picker comes back ready again.
+    let (status, added) = post_form(&app, &format!("{base}/lines"), "product=7791234567890&qty=1&unit_price=").await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(added.contains("$75"), "running total: {added:.800}");
+    assert_oob_picker_is_empty_and_focused(&added);
+
+    // A clicked result is the same form plus its own product id; the quantity
+    // typed in the field still travels.
+    let (status, clicked) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        &format!("product=scan&qty=3&unit_price=&product_id={product}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{clicked}");
+    assert!(clicked.contains("$150"), "running total: {clicked:.800}");
+
+    // Removing a line updates the running total from the same response: 150 - 50.
+    let detail = sale_detail(&app, sale).await;
+    let line_id = detail["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["qty"] == json!("2"))
+        .and_then(|line| line["id"].as_i64())
+        .expect("the scanned line");
+    let (status, removed) = send(
+        &app,
+        "DELETE",
+        &format!("{base}/lines/{line_id}"),
+        None,
+        true,
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    assert!(removed.contains("$100"), "running total after removal: {removed:.800}");
+    assert!(
+        !removed.contains(&format!("id=\"sale-line-{line_id}\"")),
+        "the removed line is gone: {removed:.800}"
+    );
+
+    // An unknown value is a clear 400 naming the search count, and adds nothing.
+    let before = sale_detail(&app, sale).await;
+    let (status, err) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=does-not-exist&qty=1&unit_price=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert!(err.contains("no exact match"), "{err}");
+    assert!(err.contains("0 matches"), "{err}");
+    let after = sale_detail(&app, sale).await;
+    assert_eq!(
+        after["lines"].as_array().unwrap().len(),
+        before["lines"].as_array().unwrap().len(),
+        "a failed resolution adds nothing"
+    );
+    assert_eq!(after["total"], before["total"]);
+}
+
+// ---------------------------------------------------------------------------
+// N4 accessibility: named controls and a polite announcement for the picker
+// ---------------------------------------------------------------------------
+
+/// The opening tag that encloses byte `pos`, from its `<` to its `>`. The `<`
+/// itself may sit at `pos` (a control found by its `<input` marker), so the
+/// search includes that byte.
+fn enclosing_tag(html: &str, pos: usize) -> &str {
+    let start = html[..=pos]
+        .rfind('<')
+        .unwrap_or_else(|| panic!("no tag opens before byte {pos}"));
+    let end = pos + html[pos..]
+        .find('>')
+        .unwrap_or_else(|| panic!("unterminated tag at byte {pos}"));
+    &html[start..=end]
+}
+
+/// The full element carrying `id`, opening tag through closing tag, for the
+/// small elements this check inspects.
+fn element_with_id<'a>(html: &'a str, id: &str) -> &'a str {
+    let pos = html
+        .find(&format!("id=\"{id}\""))
+        .unwrap_or_else(|| panic!("no element renders id={id:?}"));
+    let start = html[..pos].rfind('<').expect("an id must sit inside a tag");
+    let name_start = start + 1;
+    let name_end = name_start
+        + html[name_start..]
+            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
+            .expect("unterminated opening tag");
+    let name = &html[name_start..name_end];
+    let close = format!("</{name}>");
+    let end = html[start..]
+        .find(&close)
+        .unwrap_or_else(|| panic!("no {close} for id={id:?}"));
+    &html[start..start + end + close.len()]
+}
+
+/// The earliest native form control in `body`, if any.
+fn first_control(body: &str) -> Option<usize> {
+    ["<input", "<select", "<textarea"]
+        .iter()
+        .filter_map(|tag| body.find(tag))
+        .min()
+}
+
+/// Native controls with no accessible name, resolved the way a screen reader
+/// resolves one for these forms: a `<label>` that wraps the control, or a label
+/// whose `for` matches the control's id. Hidden controls are ignored; buttons
+/// carry their own text and are not in scope.
+fn controls_without_accessible_name(html: &str) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut named_by_for: HashSet<String> = HashSet::new();
+    let mut wrapped: HashSet<usize> = HashSet::new();
+    let mut from = 0usize;
+    while let Some(rel) = html[from..].find("<label") {
+        let start = from + rel;
+        let open_end = start + html[start..].find('>').expect("unterminated <label>");
+        let label_tag = &html[start..=open_end];
+        if let Some(id) = attr_value(label_tag, "for") {
+            named_by_for.insert(id.to_string());
+        } else {
+            let content_start = open_end + 1;
+            if let Some(close_rel) = html[content_start..].find("</label>") {
+                let body = &html[content_start..content_start + close_rel];
+                if let Some(control_pos) = first_control(body) {
+                    wrapped.insert(content_start + control_pos);
+                }
+            }
+        }
+        from = open_end + 1;
+    }
+
+    let mut offenders = Vec::new();
+    for tag in ["<input", "<select", "<textarea"] {
+        let mut from = 0usize;
+        while let Some(rel) = html[from..].find(tag) {
+            let pos = from + rel;
+            from = pos + 1;
+            let opening = enclosing_tag(html, pos);
+            if attr_value(opening, "type") == Some("hidden") {
+                continue;
+            }
+            let named = wrapped.contains(&pos)
+                || attr_value(opening, "id")
+                    .map(|id| named_by_for.contains(id))
+                    .unwrap_or(false);
+            if named {
+                continue;
+            }
+            let name = attr_value(opening, "name").unwrap_or("?");
+            let id = attr_value(opening, "id").unwrap_or("none");
+            offenders.push(format!("{tag} name={name:?} id={id:?}"));
+        }
+    }
+    offenders
+}
+
+/// The resolver accepts both patterns a screen reader accepts, and still
+/// rejects a control whose label is only visual text.
+#[test]
+fn accessible_name_resolution_accepts_wrapping_and_for_labels() {
+    let named = r#"
+        <label>Wrapped <input type="number" name="wrapped" /></label>
+        <label for="picked">Picked</label><input type="range" name="picked" id="picked" />
+    "#;
+    assert_eq!(controls_without_accessible_name(named), Vec::<String>::new());
+
+    let offenders = controls_without_accessible_name(
+        r#"<label>Qty</label><input type="number" name="qty" id="qty" />"#,
+    );
+    assert_eq!(offenders.len(), 1, "{offenders:?}");
+    assert!(offenders[0].contains("qty"), "{offenders:?}");
+
+    // A hidden control is not announced, so it needs no name.
+    assert!(
+        controls_without_accessible_name(r#"<input type="hidden" name="id" />"#).is_empty()
+    );
+}
+
+/// Every control on the sale record page resolves an accessible name. The
+/// picker's Qty and Unit price fields were the verified defect; the same
+/// resolver covers the confirm, edit-header, discard, payment and cancel forms
+/// in both document states.
+#[tokio::test]
+async fn sale_record_controls_resolve_accessible_names() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "Caja", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "A11Y-L", "1", "50").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
+    add_sale_line_via_web(&app, sale, product, "1").await;
+
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    for id in ["line-qty", "line-unit-price"] {
+        assert!(
+            page.contains(&format!("for=\"{id}\"")),
+            "the {id} label must point at its input: {page:.600}"
+        );
+    }
+    let unnamed = controls_without_accessible_name(&page);
+    assert!(
+        unnamed.is_empty(),
+        "draft record page has unlabelled controls: {unnamed:?}"
+    );
+
+    confirm_sale_via_web(&app, sale, Some(account), Some(cash)).await;
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    let unnamed = controls_without_accessible_name(&page);
+    assert!(
+        unnamed.is_empty(),
+        "confirmed record page has unlabelled controls: {unnamed:?}"
+    );
+}
+
+/// The picker's results container is a polite live region the input is wired
+/// to, and only the match count is announced; the visual list is explicitly
+/// not live, so typing does not read the catalogue out loud on every keystroke.
+#[tokio::test]
+async fn product_search_results_announce_a_polite_match_count() {
+    let (app, pool) = test_app().await;
+    create_product_via_web(&app, &pool, "A11Y-P", "1", "50").await;
+    create_product_via_web(&app, &pool, "A11Y-Q", "1", "50").await;
+    let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
+    let base = format!("/web/sales/{sale}");
+
+    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+
+    let results_pos = page
+        .find("id=\"product-search-results\"")
+        .expect("the picker renders its results container");
+    let results = enclosing_tag(&page, results_pos);
+    assert!(
+        results.contains("aria-live=\"polite\""),
+        "the results container must be a polite live region: {results}"
+    );
+    assert!(results.contains("role=\"status\""), "{results}");
+    assert!(
+        results.contains("aria-atomic=\"false\""),
+        "the region must announce the count, not replace its whole content: {results}"
+    );
+
+    let input_pos = page
+        .find("id=\"product-picker\"")
+        .expect("the picker input");
+    let input = enclosing_tag(&page, input_pos);
+    assert!(
+        input.contains("aria-controls=\"product-search-results\""),
+        "the input must say what it controls: {input}"
+    );
+    assert!(
+        input.contains("aria-describedby=\"product-search-status\""),
+        "the input must point at the announced state: {input}"
+    );
+    assert!(
+        page.contains("id=\"product-search-status\""),
+        "the described status element must exist on the page"
+    );
+
+    let search = |query: &str| {
+        format!(
+            "/web/product-search?q={query}&line_action={base}/lines&line_target=%23sale-record-money"
+        )
+    };
+
+    // One match: the announced text is the count.
+    let (status, fragment) = get(&app, &search("A11Y-P")).await;
+    assert_eq!(status, StatusCode::OK, "{fragment}");
+    let status_text = element_with_id(&fragment, "product-search-status");
+    assert!(status_text.contains("1 match"), "{status_text}");
+    assert!(
+        fragment.contains("aria-live=\"off\""),
+        "the visual list must stay out of the live announcement: {fragment}"
+    );
+
+    // Two matches pluralize.
+    let (status, fragment) = get(&app, &search("A11Y")).await;
+    assert_eq!(status, StatusCode::OK, "{fragment}");
+    let status_text = element_with_id(&fragment, "product-search-status");
+    assert!(status_text.contains("2 matches"), "{status_text}");
+
+    // No matches is a state, not silence.
+    let (status, fragment) = get(&app, &search("does-not-exist")).await;
+    assert_eq!(status, StatusCode::OK, "{fragment}");
+    let status_text = element_with_id(&fragment, "product-search-status");
+    assert!(status_text.contains("No products match"), "{status_text}");
 }
 
