@@ -14,6 +14,7 @@ never a proposal.
 | [sales](sales/spec.md) | M2 | Sales, lines, payments, document numbering, cash and credit, cancellation |
 | [purchases](purchases/spec.md) | M3 | Suppliers, per-supplier cost history, purchases, purchase orders from the reorder suggestion, cancellation |
 | [customers](customers/spec.md) | M4 | Customers, the protected walk-in, credit rules, derived receivables and ageing, receipts that group a handover across sales |
+| [verification](verification/spec.md) | — | The two test layers, the boundary between them, the browser harness contract, and the rule that makes a green suite mean something |
 
 ## Architecture invariants
 
@@ -53,6 +54,11 @@ These hold across every capability and are the rules a new module must respect.
     transaction between modules. Every expected rejection is validated before any write, and the residual
     is detected rather than hidden: a movement whose `reference` looks like a document number must be
     claimed by a payment as its `transaction_id` or `refund_transaction_id`.
+11. **Verification has two layers and a boundary.** The Rust suite covers the server; the browser suite
+    covers interaction, focus, navigation, dialogs and the URL. A behaviour only a browser can see belongs
+    in the browser suite and may not be approximated by a Rust test that checks an attribute. And a
+    regression test is validated by reintroducing the bug and watching it fail: three times here a test
+    that looked like a guard was decoration.
 
 ## Verification
 

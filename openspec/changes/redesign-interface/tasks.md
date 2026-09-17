@@ -71,3 +71,10 @@ behind the others.
 - [ ] On merge: fold the interface requirements into the canonical specs as a presentation section, note
       the record-page routes in the `sales` and `purchases` capabilities, and move this change to
       `openspec/changes/archive/`.
+
+## Status after the interface work merged
+Slices N1a, N2, N3, N4 and N5 are merged, together with the browser suite that verified them. This change
+stays in `changes/` rather than being archived, because **N6 is still open**: converting the remaining
+templates to the page-header pattern is cosmetic and was deliberately deferred behind the flows the user
+actually felt, and the four collection endpoints that the record pages made redundant still need a
+decision. An unarchived change is the honest signal that work is in flight.
