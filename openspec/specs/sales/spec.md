@@ -12,12 +12,14 @@ Sales consume `('SALE', year)`.
 
 ### sales
 `id`, `sale_number` (UNIQUE, nullable), `status` (`Draft` | `Confirmed` | `Cancelled`),
-`payment_type` (`Cash` | `Credit`), `customer_name` (free text, ≤ 128), `sale_date`,
+`payment_type` (`Cash` | `Credit`), `customer_id` NOT NULL → customers ON DELETE RESTRICT,
+`customer_name` (a frozen snapshot of the customer's name at creation, ≤ 128), `sale_date`,
 `due_date` (nullable, required for credit), `receipt_no` (nullable, UNIQUE), `notes`,
 `cancel_reason`, `created_at`, `updated_at`, `confirmed_at`, `cancelled_at`.
 
 A sale carries no account: accounts live on each payment, because a credit sale may be paid into
-different accounts over time.
+different accounts over time. The customer, the credit rules and the receivable reads belong to the
+`customers` capability.
 
 ### sale_lines
 `id`, `sale_id` → sales ON DELETE CASCADE, `product_id` → products ON DELETE RESTRICT, `qty` (> 0),
@@ -26,7 +28,8 @@ different accounts over time.
 ### sale_payments
 `id`, `sale_id` → sales ON DELETE CASCADE, `account_id` → accounts ON DELETE RESTRICT,
 `method_id` → payment_methods ON DELETE RESTRICT, `amount` (> 0), `date`, `created_at`,
-`transaction_id` → transactions ON DELETE RESTRICT, `refund_transaction_id` → transactions ON DELETE RESTRICT.
+`transaction_id` → transactions ON DELETE RESTRICT, `refund_transaction_id` → transactions ON DELETE RESTRICT,
+`receipt_id` nullable → customer_receipts ON DELETE RESTRICT.
 
 ## Rules
 - **A draft touches nothing:** no stock movement, no finance entry, no document number.
@@ -48,6 +51,13 @@ different accounts over time.
 - The same product may appear on several lines of one sale, which is legitimate when some units carry
   a different price. A purchase does not allow it, for the reason stated in that capability's spec.
 
+- **Credit sale with no customer term:** a credit sale without a due date defaults to
+  `sale_date + payment_days`; with no term and no due date it returns 400. Credit to the walk-in is
+  refused. See the `customers` capability for the walk-in, the credit limit and the receivables.
+- **A payment may be grouped under a receipt**, which is how one handover of money is recorded across
+  several sales. A payment without a receipt is a direct payment on one sale and stays valid. See the
+  `customers` capability for the collection flow.
+
 ## Interface
 - REST: `GET/POST /api/sales`, `GET /api/sales/debt`, `GET/PUT /api/sales/{id}`,
   `POST /api/sales/{id}/lines`, `PUT/DELETE /api/sales/lines/{line_id}`,
@@ -57,10 +67,6 @@ different accounts over time.
   the body, because htmx uses the literal `hx-post` value and ignores a form's `action`.
 - No configuration of its own; it inherits `ALLOW_NEGATIVE_STOCK` from inventory and
   `ALLOW_NEGATIVE_BALANCE` from finance.
-
-## Known gap, addressed by the customers change
-`customer_name` is free text. There is no customer entity, no per-customer balance, no credit limit and
-no receivable ageing. See `changes/add-customers-module` when it exists.
 
 ## Verification
 `src/services/sales.rs` (AC1–AC7 plus triangulation), `src/routes/sales_api.rs`,
