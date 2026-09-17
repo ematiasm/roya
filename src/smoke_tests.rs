@@ -1139,6 +1139,22 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     assert_eq!(status, StatusCode::OK, "seed customer: {resp}");
     let customer = customer_id_by_name(pool, "GuardCustomer").await;
 
+    // A confirmed credit sale collected into a receipt, so the customer statement
+    // renders the receipt list and the referenced-id rule covers that path too.
+    let guard_sale =
+        create_sale_draft_for_customer(app, customer, "Credit", "2024-06-02").await;
+    add_sale_line_via_web(app, guard_sale, product, "1").await;
+    confirm_sale_via_web(app, guard_sale, None, None).await;
+    let (status, resp) = post_form(
+        app,
+        "/web/customer-receipts",
+        &format!(
+            "customer_id={customer}&account_id={account}&method_id={cash}&amount=10&date=2024-05-10"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed receipt: {resp}");
+
     WiringFixture {
         account,
         sale,
@@ -1287,6 +1303,52 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
     ]
 }
 
+/// Referenced entities the interface always shows by name: a product, account,
+/// payment method, customer or supplier. A document's own id is exempt, so the
+/// scan requires the entity noun before the digit, which keeps the legitimate
+/// `draft #12` and `2024-SALE-000012` allowed.
+const BARE_REFERENCED_ID_PREFIXES: [&str; 5] = [
+    "product #",
+    "account #",
+    "method #",
+    "customer #",
+    "supplier #",
+];
+
+/// The first `<entity noun> #<digits>` in a rendered page, case-insensitive, or
+/// `None`. Pure, so the mutation pin can prove the scan bites on a page copy
+/// without rendering one.
+fn bare_referenced_id(html: &str) -> Option<String> {
+    let lowered = html.to_ascii_lowercase();
+    for prefix in BARE_REFERENCED_ID_PREFIXES {
+        let mut from = 0;
+        while let Some(offset) = lowered[from..].find(prefix) {
+            let at = from + offset;
+            let digits: String = lowered[at + prefix.len()..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !digits.is_empty() {
+                return Some(format!("{prefix}{digits}"));
+            }
+            from = at + prefix.len();
+        }
+    }
+    None
+}
+
+/// Fail when a rendered page prints a referenced entity's internal id instead of
+/// its name. The entity nouns are explicit so a document id (`draft #12`) never
+/// fails, and the message names both the page and the offending fragment.
+fn check_no_bare_referenced_ids(page: &str, html: &str) -> Result<(), String> {
+    match bare_referenced_id(html) {
+        Some(matched) => Err(format!(
+            "{page}: renders a bare referenced-entity id {matched:?}; show the entity's name instead"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Render every guarded page, then apply both rules to the same run: route
 /// resolution per page, and selector declarations bound to the host page the run
 /// rendered. A declaration cannot pass by membership alone.
@@ -1301,6 +1363,8 @@ async fn assert_guarded_pages_are_wired(
         if status != StatusCode::OK {
             return Err(format!("{} {}: {html:.400}", page.label, page.path));
         }
+        check_no_bare_referenced_ids(page.label, &html)
+            .map_err(|err| format!("{} {}: {err}", page.label, page.path))?;
         assert_htmx_targets_are_wired(probe_app, page.label, &html, page.concrete_ids_are_defects)
             .await?;
         rendered.insert(page.label, html);
@@ -4028,3 +4092,649 @@ async fn product_search_results_announce_a_polite_match_count() {
     assert!(status_text.contains("No products match"), "{status_text}");
 }
 
+// ---------------------------------------------------------------------------
+// N5 — the referenced-id guard
+// ---------------------------------------------------------------------------
+
+/// The scan bites on every entity noun, and a document's own id stays exempt in
+/// both shapes the lists print.
+#[test]
+fn referenced_id_scan_bites_on_every_entity_noun() {
+    for noun in BARE_REFERENCED_ID_PREFIXES {
+        let mutant = format!("<div>{noun}3</div>");
+        let err = check_no_bare_referenced_ids("mutation", &mutant).unwrap_err();
+        assert!(err.contains(noun), "{err}");
+    }
+    check_no_bare_referenced_ids("mutation", "<div>draft #12</div>").unwrap();
+    check_no_bare_referenced_ids("mutation", "<div>2024-SALE-000012</div>").unwrap();
+    check_no_bare_referenced_ids("mutation", "<div>sale #12</div>").unwrap();
+}
+
+/// A guarded page that is clean passes, and the same page with a leaked referenced
+/// id is rejected by the exact check the guard runs over every seeded page.
+#[tokio::test]
+async fn referenced_id_guard_rejects_a_bare_id_added_to_a_guarded_page_copy() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+    let products_page = guarded_pages(&fixture)
+        .into_iter()
+        .find(|page| page.label == "products")
+        .expect("the products page is guarded");
+    let (status, html) = get(&app, &products_page.path).await;
+    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", products_page.path);
+    check_no_bare_referenced_ids(products_page.label, &html)
+        .unwrap_or_else(|err| panic!("the guarded products page must be clean: {err}"));
+
+    let mutant = format!("{html}<div>product #3</div>");
+    let err = check_no_bare_referenced_ids(products_page.label, &mutant).unwrap_err();
+    assert!(err.contains("products"), "{err}");
+    assert!(err.contains("product #3"), "{err}");
+}
+
+/// The customer statement's receipt list shows the account and method names; the
+/// referenced-id rule covers the path now that the guard fixture collects a
+/// receipt, so this ordinary assertion replaces the old defect pin.
+#[tokio::test]
+async fn customer_statement_resolves_receipt_account_and_method_names() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "GapWallet", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "GAP-P", "1", "50").await;
+    record_stock_via_web(&app, product, "10").await;
+    let customer = seed_customer(&pool, "GapBuyer", None, None).await;
+    let sale = create_sale_draft_on_date(&app, customer, "Credit", "2024-05-02", "2024-06-01").await;
+    add_sale_line_via_web(&app, sale, product, "2").await;
+    confirm_sale_via_web(&app, sale, None, None).await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/customer-receipts",
+        &format!(
+            "customer_id={customer}&account_id={account}&method_id={cash}&amount=10&date=2024-05-10"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collect: {resp}");
+
+    let (status, page) = get(&app, &format!("/customers/{customer}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        bare_referenced_id(&page).is_none(),
+        "the receipt list must resolve account and method names: {page:.800}"
+    );
+    assert!(
+        page.contains("GapWallet • Cash"),
+        "the receipt shows the resolved account and method: {page:.800}"
+    );
+    assert!(
+        page.contains("Receipt #"),
+        "the receipt's own identifier stays visible: {page:.800}"
+    );
+
+    // The allocation names the sale the way the user does: its number, not its id.
+    let sale_number = sale_detail(&app, sale).await["sale"]["sale_number"]
+        .as_str()
+        .expect("the confirmed sale number")
+        .to_string();
+    assert!(
+        page.contains(&format!("{sale_number} •")),
+        "the receipt allocation shows the sale number: {page:.800}"
+    );
+    assert!(
+        !page.contains("sale #"),
+        "the receipt allocation must not print the sale's internal id: {page:.800}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// N5 — list filters, catalogue search and name resolution
+// ---------------------------------------------------------------------------
+
+/// The products list fragment as the browser's filter form fetches it.
+async fn product_list_html(app: &Router, query: &str) -> String {
+    let (status, html) = get(app, &format!("/web/products{query}")).await;
+    assert_eq!(status, StatusCode::OK, "/web/products{query}: {html}");
+    html
+}
+
+/// The sales list fragment as the browser's filter form fetches it.
+async fn sale_list_html(app: &Router, query: &str) -> String {
+    let (status, html) = get(app, &format!("/web/sales{query}")).await;
+    assert_eq!(status, StatusCode::OK, "/web/sales{query}: {html}");
+    html
+}
+
+/// The purchases list fragment as the browser's filter form fetches it.
+async fn purchase_list_html(app: &Router, query: &str) -> String {
+    let (status, html) = get(app, &format!("/web/purchases{query}")).await;
+    assert_eq!(status, StatusCode::OK, "/web/purchases{query}: {html}");
+    html
+}
+
+async fn category_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as("SELECT id FROM categories WHERE name = ?")
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.0
+}
+
+async fn create_category_via_web(app: &Router, pool: &SqlitePool, name: &str) -> i64 {
+    let (status, resp) = post_form(app, "/web/categories", &format!("name={name}")).await;
+    assert_eq!(status, StatusCode::OK, "create category {name}: {resp}");
+    category_id_by_name(pool, name).await
+}
+
+/// Create a product with an explicit display name and optional category, through
+/// the same web form the browser uses.
+async fn create_product_full_via_web(
+    app: &Router,
+    pool: &SqlitePool,
+    sku: &str,
+    name: &str,
+    category_id: Option<i64>,
+) -> i64 {
+    let encoded_name = name.replace(' ', "+");
+    let category = category_id.map(|c| c.to_string()).unwrap_or_default();
+    let body = format!(
+        "sku={sku}&name={encoded_name}&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&category_id={category}"
+    );
+    let (status, resp) = post_form(app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "create product {sku}: {resp}");
+    product_id_by_sku(pool, sku).await
+}
+
+/// Create a sale draft on an explicit date through the web form, and return its id.
+async fn create_sale_draft_on_date(
+    app: &Router,
+    customer_id: i64,
+    payment_type: &str,
+    sale_date: &str,
+    due_date: &str,
+) -> i64 {
+    let body = format!(
+        "customer_id={customer_id}&payment_type={payment_type}&sale_date={sale_date}&due_date={due_date}"
+    );
+    let (status, resp) = post_form(app, "/web/sales", &body).await;
+    assert_eq!(status, StatusCode::OK, "create sale: {resp}");
+    let (status, body) = get(app, "/api/sales").await;
+    assert_eq!(status, StatusCode::OK, "list sales: {body}");
+    let v = json_body(&body);
+    v["sales"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["sale"]["customer_id"] == json!(customer_id))
+        .last()
+        .and_then(|d| d["sale"]["id"].as_i64())
+        .unwrap_or_else(|| panic!("sale for customer {customer_id} not found: {v}"))
+}
+
+/// Create a purchase draft for an explicit supplier and date through the web form.
+async fn create_purchase_draft_on_date(app: &Router, supplier_id: i64, purchase_date: &str) -> i64 {
+    let body = format!(
+        "supplier_id={supplier_id}&payment_type=Credit&purchase_date={purchase_date}&due_date=2024-12-31"
+    );
+    let (status, resp) = post_form(app, "/web/purchases", &body).await;
+    assert_eq!(status, StatusCode::OK, "create purchase: {resp}");
+    let (status, body) = get(app, "/api/purchases").await;
+    assert_eq!(status, StatusCode::OK, "list purchases: {body}");
+    let v = json_body(&body);
+    v["purchases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["purchase"]["supplier_id"] == json!(supplier_id))
+        .last()
+        .and_then(|d| d["purchase"]["id"].as_i64())
+        .unwrap_or_else(|| panic!("purchase for supplier {supplier_id} not found: {v}"))
+}
+
+async fn add_purchase_line_via_web(app: &Router, purchase_id: i64, product_id: i64, qty: &str) {
+    let body = format!("purchase_id={purchase_id}&product_id={product_id}&qty={qty}");
+    let (status, resp) = post_form(app, "/web/purchases/lines", &body).await;
+    assert_eq!(status, StatusCode::OK, "add purchase line: {resp}");
+}
+
+async fn confirm_purchase_via_web(app: &Router, purchase_id: i64) {
+    let body = format!("purchase_id={purchase_id}");
+    let (status, resp) = post_form(app, "/web/purchases/confirm", &body).await;
+    assert_eq!(status, StatusCode::OK, "confirm purchase {purchase_id}: {resp}");
+}
+
+/// AC13: every sales filter works alone and combined; an empty filter is no
+/// constraint and a filter matching nothing is an empty list, never an error.
+#[tokio::test]
+async fn sales_list_filters_by_status_customer_number_and_date() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "FILT-S", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+
+    let ana = seed_customer(&pool, "FiltAna", None, None).await;
+    let beto = seed_customer(&pool, "FiltBeto", None, None).await;
+
+    let _draft = create_sale_draft_on_date(&app, ana, "Cash", "2024-05-02", "").await;
+    let ana_confirmed =
+        create_sale_draft_on_date(&app, ana, "Credit", "2024-05-02", "2024-06-01").await;
+    add_sale_line_via_web(&app, ana_confirmed, product, "1").await;
+    confirm_sale_via_web(&app, ana_confirmed, None, None).await;
+    let beto_confirmed =
+        create_sale_draft_on_date(&app, beto, "Credit", "2024-07-15", "2024-08-15").await;
+    add_sale_line_via_web(&app, beto_confirmed, product, "1").await;
+    confirm_sale_via_web(&app, beto_confirmed, None, None).await;
+
+    let ana_number = sale_detail(&app, ana_confirmed).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+    let beto_number = sale_detail(&app, beto_confirmed).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+
+    // No filter returns everything.
+    let all = sale_list_html(&app, "").await;
+    assert!(
+        all.contains("draft #"),
+        "the draft stays in the unfiltered list: {all}"
+    );
+    assert!(
+        all.contains(&ana_number) && all.contains(&beto_number),
+        "{all}"
+    );
+
+    // Status alone.
+    let confirmed = sale_list_html(&app, "?status=Confirmed").await;
+    assert!(confirmed.contains(&ana_number), "{confirmed}");
+    assert!(confirmed.contains(&beto_number), "{confirmed}");
+    assert!(!confirmed.contains("draft #"), "{confirmed}");
+
+    let drafts = sale_list_html(&app, "?status=Draft").await;
+    assert!(drafts.contains("draft #"), "{drafts}");
+    assert!(!drafts.contains(&ana_number), "{drafts}");
+
+    // Customer alone, case-insensitive over the name the list shows.
+    let ana_only = sale_list_html(&app, "?customer=filtana").await;
+    assert!(ana_only.contains("FiltAna"), "{ana_only}");
+    assert!(!ana_only.contains("FiltBeto"), "{ana_only}");
+
+    // Number matches partially: the user remembers a fragment, not the whole number.
+    let fragment = &ana_number[ana_number.len() - 6..];
+    let by_number = sale_list_html(&app, &format!("?number={fragment}")).await;
+    assert!(by_number.contains(&ana_number), "{by_number}");
+    assert!(!by_number.contains(&beto_number), "{by_number}");
+
+    // Date range is inclusive on sale_date.
+    let by_date = sale_list_html(&app, "?from=2024-07-01&to=2024-07-31").await;
+    assert!(by_date.contains(&beto_number), "{by_date}");
+    assert!(!by_date.contains(&ana_number), "{by_date}");
+    assert!(!by_date.contains("draft #"), "{by_date}");
+
+    // Combined filters narrow further.
+    let combined = sale_list_html(&app, "?status=Confirmed&customer=FiltBeto").await;
+    assert!(combined.contains(&beto_number), "{combined}");
+    assert!(!combined.contains(&ana_number), "{combined}");
+
+    // Empty values are no constraint, not an error.
+    let blank = sale_list_html(&app, "?status=&customer=&number=&from=&to=").await;
+    assert!(
+        blank.contains("draft #")
+            && blank.contains(&ana_number)
+            && blank.contains(&beto_number),
+        "{blank}"
+    );
+
+    // Matching nothing is an empty list, not an error.
+    let none = sale_list_html(&app, "?number=NOPE-0000").await;
+    assert!(none.contains("Nothing here yet."), "{none}");
+    assert!(!none.contains(&ana_number), "{none}");
+
+    // A status or date the picker never sends is treated as absent, not an error.
+    let lenient = sale_list_html(&app, "?status=bogus&from=not-a-date").await;
+    assert!(
+        lenient.contains("draft #")
+            && lenient.contains(&ana_number)
+            && lenient.contains(&beto_number),
+        "{lenient}"
+    );
+
+    // An inverted range matches nothing rather than failing.
+    let inverted = sale_list_html(&app, "?from=2024-07-01&to=2024-05-01").await;
+    assert!(inverted.contains("Nothing here yet."), "{inverted}");
+
+    // The full page is filtered too, so the filtered view is bookmarkable.
+    let (status, page) = get(&app, "/sales?status=Confirmed").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(&ana_number), "{page:.600}");
+    assert!(!page.contains("draft #"), "{page:.600}");
+
+    // The form reflects the URL, so a shared link re-opens with the same filters.
+    let (status, page) = get(
+        &app,
+        "/sales?status=Draft&customer=FiltAna&number=0000&from=2024-05-01&to=2024-05-31",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        page.contains("name=\"customer\" placeholder=\"Customer\" value=\"FiltAna\""),
+        "the form must reflect the bookmarkable URL: {page:.600}"
+    );
+    assert!(
+        page.contains("<option value=\"Draft\" selected>Draft</option>"),
+        "{page:.600}"
+    );
+    assert!(page.contains("name=\"from\" value=\"2024-05-01\""), "{page:.600}");
+}
+
+/// AC13: the purchases list carries the same filter shape.
+#[tokio::test]
+async fn purchases_list_filters_by_status_supplier_number_and_date() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "FILT-P2", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+
+    let sur = create_supplier_via_web(&app, &pool, "FiltSur").await;
+    let norte = create_supplier_via_web(&app, &pool, "FiltNorte").await;
+
+    let _draft = create_purchase_draft_on_date(&app, sur, "2024-05-02").await;
+    let sur_confirmed = create_purchase_draft_on_date(&app, sur, "2024-05-02").await;
+    add_purchase_line_via_web(&app, sur_confirmed, product, "1").await;
+    confirm_purchase_via_web(&app, sur_confirmed).await;
+    let norte_confirmed = create_purchase_draft_on_date(&app, norte, "2024-07-15").await;
+    add_purchase_line_via_web(&app, norte_confirmed, product, "1").await;
+    confirm_purchase_via_web(&app, norte_confirmed).await;
+
+    let sur_number = purchase_detail(&app, sur_confirmed).await["purchase"]["purchase_number"]
+        .as_str()
+        .expect("confirmed purchase number")
+        .to_string();
+    let norte_number = purchase_detail(&app, norte_confirmed).await["purchase"]
+        ["purchase_number"]
+        .as_str()
+        .expect("confirmed purchase number")
+        .to_string();
+
+    let all = purchase_list_html(&app, "").await;
+    assert!(all.contains("draft #"), "{all}");
+    assert!(
+        all.contains(&sur_number) && all.contains(&norte_number),
+        "{all}"
+    );
+
+    let confirmed = purchase_list_html(&app, "?status=Confirmed").await;
+    assert!(
+        confirmed.contains(&sur_number) && confirmed.contains(&norte_number),
+        "{confirmed}"
+    );
+    assert!(!confirmed.contains("draft #"), "{confirmed}");
+
+    let drafts = purchase_list_html(&app, "?status=Draft").await;
+    assert!(drafts.contains("draft #"), "{drafts}");
+    assert!(!drafts.contains(&sur_number), "{drafts}");
+
+    // Supplier alone, case-insensitive over the name the list shows.
+    let norte_only = purchase_list_html(&app, "?supplier=filtnorte").await;
+    assert!(norte_only.contains("FiltNorte"), "{norte_only}");
+    assert!(!norte_only.contains("FiltSur"), "{norte_only}");
+
+    let fragment = &sur_number[sur_number.len() - 6..];
+    let by_number = purchase_list_html(&app, &format!("?number={fragment}")).await;
+    assert!(by_number.contains(&sur_number), "{by_number}");
+    assert!(!by_number.contains(&norte_number), "{by_number}");
+
+    let by_date = purchase_list_html(&app, "?from=2024-07-01&to=2024-07-31").await;
+    assert!(by_date.contains(&norte_number), "{by_date}");
+    assert!(!by_date.contains(&sur_number), "{by_date}");
+
+    let combined = purchase_list_html(&app, "?status=Confirmed&supplier=FiltNorte").await;
+    assert!(combined.contains(&norte_number), "{combined}");
+    assert!(!combined.contains(&sur_number), "{combined}");
+
+    let blank = purchase_list_html(&app, "?status=&supplier=&number=&from=&to=").await;
+    assert!(
+        blank.contains("draft #")
+            && blank.contains(&sur_number)
+            && blank.contains(&norte_number),
+        "{blank}"
+    );
+
+    let none = purchase_list_html(&app, "?supplier=NoSuchSupplier").await;
+    assert!(none.contains("Nothing here yet."), "{none}");
+
+    let (status, page) = get(&app, "/purchases?status=Confirmed").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(&sur_number), "{page:.600}");
+    assert!(!page.contains("draft #"), "{page:.600}");
+
+    // The form reflects the URL, so a shared link re-opens with the same filters.
+    let (status, page) = get(
+        &app,
+        "/purchases?status=Draft&supplier=FiltSur&number=0000&from=2024-05-01&to=2024-05-31",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        page.contains("name=\"supplier\" placeholder=\"Supplier\" value=\"FiltSur\""),
+        "the form must reflect the bookmarkable URL: {page:.600}"
+    );
+    assert!(
+        page.contains("<option value=\"Draft\" selected>Draft</option>"),
+        "{page:.600}"
+    );
+}
+
+/// AC14: the products list matches name, SKU and barcode through the same search
+/// the picker uses, and combines with the existing category filter.
+#[tokio::test]
+async fn products_list_searches_name_sku_and_barcode_and_combines_with_category() {
+    let (app, pool) = test_app().await;
+    let yerba_cat = create_category_via_web(&app, &pool, "FiltBeverages").await;
+    let other_cat = create_category_via_web(&app, &pool, "FiltSnacks").await;
+
+    let yerba = create_product_full_via_web(
+        &app,
+        &pool,
+        "FILT-YERBA-500",
+        "Yerba Filt 500g",
+        Some(yerba_cat),
+    )
+    .await;
+    let gal = create_product_full_via_web(
+        &app,
+        &pool,
+        "FILT-GAL-100",
+        "Galletitas Filt",
+        Some(other_cat),
+    )
+    .await;
+    record_stock_via_web(&app, yerba, "10").await;
+    record_stock_via_web(&app, gal, "10").await;
+
+    let (status, body) = post_json(
+        &app,
+        &format!("/api/products/{yerba}/barcodes"),
+        json!({ "code": "7791234567001" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "seed barcode: {body}");
+
+    // An empty query is not a search: it keeps the whole catalogue.
+    let all = product_list_html(&app, "?q=").await;
+    assert!(
+        all.contains("Yerba Filt 500g") && all.contains("Galletitas Filt"),
+        "{all}"
+    );
+
+    // By name, partial and case-insensitive.
+    let by_name = product_list_html(&app, "?q=yerba").await;
+    assert!(by_name.contains("Yerba Filt 500g"), "{by_name}");
+    assert!(!by_name.contains("Galletitas Filt"), "{by_name}");
+
+    // By SKU.
+    let by_sku = product_list_html(&app, "?q=FILT-GAL-100").await;
+    assert!(by_sku.contains("Galletitas Filt"), "{by_sku}");
+    assert!(!by_sku.contains("Yerba Filt 500g"), "{by_sku}");
+
+    // By barcode: the matching path the picker already uses.
+    let by_barcode = product_list_html(&app, "?q=7791234567001").await;
+    assert!(by_barcode.contains("Yerba Filt 500g"), "{by_barcode}");
+    assert!(!by_barcode.contains("Galletitas Filt"), "{by_barcode}");
+
+    // The existing category filter alone still works.
+    let by_category = product_list_html(&app, &format!("?category_id={yerba_cat}")).await;
+    assert!(by_category.contains("Yerba Filt 500g"), "{by_category}");
+    assert!(!by_category.contains("Galletitas Filt"), "{by_category}");
+
+    // Search and category combine.
+    let combined = product_list_html(&app, &format!("?q=Filt&category_id={other_cat}")).await;
+    assert!(combined.contains("Galletitas Filt"), "{combined}");
+    assert!(!combined.contains("Yerba Filt 500g"), "{combined}");
+
+    // A barcode that matches a product in another category combines to nothing.
+    let crossed = product_list_html(&app, &format!("?q=7791234567001&category_id={other_cat}")).await;
+    assert!(crossed.contains("No products yet"), "{crossed}");
+
+    // Matching nothing is an empty list, not an error.
+    let none = product_list_html(&app, "?q=does-not-exist").await;
+    assert!(none.contains("No products yet"), "{none}");
+
+    // The full page is filtered too, so the view is bookmarkable, and the form
+    // reflects the URL a shared link carries.
+    let (status, page) = get(&app, &format!("/products?q=yerba&category_id={yerba_cat}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains("Yerba Filt 500g"), "{page:.600}");
+    assert!(!page.contains("Galletitas Filt"), "{page:.600}");
+    assert!(
+        page.contains("name=\"q\" placeholder=\"Name, SKU or barcode\" value=\"yerba\""),
+        "the search box must reflect the bookmarkable URL: {page:.600}"
+    );
+    assert!(
+        page.contains(&format!("<option value=\"{yerba_cat}\" selected>")),
+        "the category select must reflect the bookmarkable URL: {page:.600}"
+    );
+}
+
+/// AC4/N5: each of the three lists resolves the referenced entity to a name and
+/// prints no internal id for it.
+#[tokio::test]
+async fn lists_resolve_referenced_names_and_print_no_internal_ids() {
+    let (app, pool) = test_app().await;
+    let product =
+        create_product_full_via_web(&app, &pool, "NAMES-P", "Named Widget", None).await;
+    let customer = seed_customer(&pool, "NamesBuyer", None, None).await;
+    let _sale = create_sale_draft_on_date(&app, customer, "Cash", "2024-05-02", "").await;
+    let supplier = create_supplier_via_web(&app, &pool, "NamesSupplier").await;
+    let _purchase = create_purchase_draft_on_date(&app, supplier, "2024-05-02").await;
+
+    let sales = sale_list_html(&app, "").await;
+    assert!(
+        sales.contains("NamesBuyer"),
+        "the sales list shows the customer name: {sales}"
+    );
+    assert!(!sales.contains("customer #"), "{sales}");
+
+    let purchases = purchase_list_html(&app, "").await;
+    assert!(
+        purchases.contains("NamesSupplier"),
+        "the purchases list shows the supplier name: {purchases}"
+    );
+    assert!(!purchases.contains("supplier #"), "{purchases}");
+
+    let products = product_list_html(&app, "").await;
+    assert!(
+        products.contains("Named Widget"),
+        "the products list shows the product name: {products}"
+    );
+    assert!(
+        !products.contains(&format!("#{product}")),
+        "the products list must not print the product's internal id: {products}"
+    );
+}
+
+
+/// The README must not describe the receipt-list referenced-id gap as open: the
+/// list resolves account and method names and the guard fixture now collects a
+/// receipt, so the old pin is gone.
+#[test]
+fn readme_does_not_describe_the_receipt_list_gap_as_open() {
+    let readme = std::fs::read_to_string("README.md").expect("README.md is readable");
+    assert!(
+        !readme.contains("A separate pin records the known"),
+        "the README still claims the receipt-list gap is pinned instead of fixed"
+    );
+    assert!(
+        readme.contains("receipt list resolves"),
+        "the README should state that the receipt list resolves names"
+    );
+}
+
+/// N6: the shared normalizer folds Unicode case and the Spanish diacritics.
+#[test]
+fn normalize_search_folds_case_and_spanish_diacritics() {
+    use crate::models::normalize_search;
+    for (raw, folded) in [
+        ("Pérez", "perez"),
+        ("pérez", "perez"),
+        ("PÉREZ", "perez"),
+        ("Perez", "perez"),
+        ("PEREZ", "perez"),
+        ("Ñandú", "nandu"),
+        ("ñandú", "nandu"),
+        ("ÑANDÚ", "nandu"),
+        ("Café", "cafe"),
+        ("CAFÉ", "cafe"),
+        ("ÀÉÎÕÜ", "aeiou"),
+    ] {
+        assert_eq!(normalize_search(raw), folded, "{raw:?}");
+    }
+}
+
+/// N6: search ignores accents and case on both sides, for parties and the
+/// catalogue. A phone keyboard capitalising the first letter, or a name typed
+/// without accents, must still find the record.
+#[tokio::test]
+async fn search_matches_ignore_accents_and_case() {
+    let (app, pool) = test_app().await;
+
+    // Sales: a customer named with accents, found from every typed form.
+    let perez = seed_customer(&pool, "Pérez", None, None).await;
+    let andu = seed_customer(&pool, "Ñandú", None, None).await;
+    create_sale_draft_for_customer(&app, perez, "Cash", "").await;
+    create_sale_draft_for_customer(&app, andu, "Cash", "").await;
+    for needle in ["Pérez", "pérez", "PÉREZ", "Perez", "PEREZ"] {
+        let html = sale_list_html(&app, &format!("?customer={needle}")).await;
+        assert!(html.contains("Pérez"), "{needle:?} must find Pérez: {html}");
+        assert!(!html.contains("Ñandú"), "{needle:?} must not match Ñandú: {html}");
+    }
+    for needle in ["Ñandú", "ñandú", "Nandu", "ÑANDÚ"] {
+        let html = sale_list_html(&app, &format!("?customer={needle}")).await;
+        assert!(html.contains("Ñandú"), "{needle:?} must find Ñandú: {html}");
+        assert!(!html.contains("Pérez"), "{needle:?} must not match Pérez: {html}");
+    }
+
+    // Purchases: a supplier named with accents, the same both ways.
+    let cafe_sup = create_supplier_via_web(&app, &pool, "Café").await;
+    let andu_sup = create_supplier_via_web(&app, &pool, "Ñandú").await;
+    create_purchase_draft_on_date(&app, cafe_sup, "2024-05-02").await;
+    create_purchase_draft_on_date(&app, andu_sup, "2024-05-02").await;
+    for needle in ["Nandu", "ÑANDÚ", "ñandú"] {
+        let html = purchase_list_html(&app, &format!("?supplier={needle}")).await;
+        assert!(html.contains("Ñandú"), "{needle:?} must find Ñandú: {html}");
+        assert!(!html.contains("Café"), "{needle:?} must not match Café: {html}");
+    }
+    for needle in ["CAFE", "café", "Café"] {
+        let html = purchase_list_html(&app, &format!("?supplier={needle}")).await;
+        assert!(html.contains("Café"), "{needle:?} must find Café: {html}");
+        assert!(!html.contains("Ñandú"), "{needle:?} must not match Ñandú: {html}");
+    }
+
+    // Catalogue: the picker and the list both fold accents and case.
+    create_product_full_via_web(&app, &pool, "CAFE-P", "Café", None).await;
+    let (status, search) = get(&app, "/web/product-search?q=CAFE").await;
+    assert_eq!(status, StatusCode::OK, "{search}");
+    assert!(search.contains("Café"), "the picker must find Café by CAFE: {search}");
+    let list = product_list_html(&app, "?q=cafe").await;
+    assert!(list.contains("Café"), "the catalogue must find Café by cafe: {list}");
+    let list = product_list_html(&app, "?q=CAFÉ").await;
+    assert!(list.contains("Café"), "the catalogue must find Café by CAFÉ: {list}");
+}

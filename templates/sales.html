@@ -13,11 +13,33 @@
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Sales</h2>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/sales" hx-target="#sale-list" hx-swap="innerHTML">↻ Refresh</button>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/sales" hx-include="#sale-filters" hx-target="#sale-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
+      {# Server-side filters: the form GETs `/web/sales` and swaps only the list, so a
+         filtered view is bookmarkable (`/sales?status=…`) and testable. Clear goes
+         to the unfiltered page. #}
+      <form id="sale-filters"
+            class="mb-3 flex flex-wrap gap-2"
+            hx-get="/web/sales"
+            hx-target="#sale-list"
+            hx-swap="innerHTML"
+            hx-trigger="change, keyup changed delay:300ms">
+        <select class="min-w-[110px] flex-1" name="status">
+          <option value="">All statuses</option>
+          <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>Draft</option>
+          <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>Confirmed</option>
+          <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>Cancelled</option>
+        </select>
+        <input class="min-w-[120px] flex-1" type="text" name="customer" placeholder="Customer" value="{{ filter_customer }}" />
+        <input class="min-w-[120px] flex-1" type="text" name="number" placeholder="Sale number" value="{{ filter_number }}" />
+        <input class="min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
+        <input class="min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+        <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/sales">Clear</a>
+      </form>
       <div id="sale-list"
            hx-get="/web/sales"
            hx-trigger="refresh from:body, load"
+           hx-include="#sale-filters"
            hx-swap="innerHTML">
         {% include "partials/sale_list.html" %}
       </div>
@@ -32,7 +54,7 @@
            hx-get="/web/sales/debt"
            hx-trigger="refresh from:body, load"
            hx-swap="innerHTML">
-        <div class="text-[13px] text-muted">Loading…</div>
+        {% include "partials/sale_debt.html" %}
       </div>
       <div class="mt-2 text-[13px] text-muted">Confirmed sales with due &gt; 0 (total − paid). Open a record to record its payment.</div>
     </div>

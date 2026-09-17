@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, HashSet};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     format_purchase_number, MovementReason, MovementType, NewMovement, NewPurchase,
-    PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchasePayment,
-    PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
+    PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter,
+    PurchasePayment, PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
     PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, UpdatePurchaseDraft,
 };
 
@@ -460,6 +460,42 @@ where
             out.push(self.detail_for(purchase).await?);
         }
         Ok(out)
+    }
+
+    /// The same derived list narrowed by the server-side list filter. The party
+    /// name is resolved against the suppliers table (normalized) into ids, and the
+    /// repository narrows the document query by those ids, so only matching
+    /// documents have their lines and payments loaded.
+    pub async fn list_details_filtered(
+        &self,
+        filter: &PurchaseListFilter,
+    ) -> AppResult<Vec<PurchaseDetail>> {
+        let mut repo_filter = filter.clone();
+        if let Some(name) = &filter.supplier {
+            repo_filter.supplier_ids = Some(self.matching_supplier_ids(name).await?);
+        }
+        let purchases = self.purchases.list_purchases_filtered(&repo_filter).await?;
+        let mut out = Vec::with_capacity(purchases.len());
+        for purchase in purchases {
+            out.push(self.detail_for(purchase).await?);
+        }
+        Ok(out)
+    }
+
+    /// Supplier ids whose current name matches `needle` after normalization. The
+    /// suppliers table is small by nature, so the match runs in Rust over the whole
+    /// set and the document query stays bounded to the matching ids. If the party
+    /// catalogue ever stops being small, this needs a normalized index instead.
+    async fn matching_supplier_ids(&self, needle: &str) -> AppResult<Vec<i64>> {
+        let needle = crate::models::normalize_search(needle);
+        Ok(self
+            .suppliers
+            .list_suppliers()
+            .await?
+            .into_iter()
+            .filter(|supplier| crate::models::normalize_search(&supplier.name).contains(&needle))
+            .map(|supplier| supplier.id)
+            .collect())
     }
 
     /// Outstanding payables: Confirmed purchases with due > 0.
@@ -2468,5 +2504,54 @@ mod tests {
         assert_eq!(refund.kind, TransactionKind::Income);
         assert_eq!(refund.amount, dec("15"));
         assert_eq!(refund.reference.as_deref(), Some(number.as_str()));
+    }
+
+    /// N5 follow-up: the purchase filters run in the repository too, so the details
+    /// loaded scale with the matching documents. The repository's test-only read
+    /// counter makes the before/after difference deterministic.
+    #[tokio::test]
+    async fn list_details_filtered_reads_only_the_result_set() {
+        let (s, _pool) = svc().await;
+        let match_supplier = seed_supplier(&s, "PerfMatch").await;
+        let other_supplier = seed_supplier(&s, "PerfOther").await;
+        let mut matching = 0;
+        for i in 0..20 {
+            let supplier_id = if i == 3 {
+                match_supplier.id
+            } else {
+                other_supplier.id
+            };
+            let purchase = s
+                .create_draft(NewPurchase {
+                    supplier_id,
+                    payment_type: PaymentType::Cash,
+                    purchase_date: purchase_date(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                })
+                .await
+                .unwrap();
+            if i == 3 {
+                matching = purchase.id;
+            }
+        }
+
+        s.purchases.reset_reads();
+        let details = s
+            .list_details_filtered(&crate::models::PurchaseListFilter {
+                supplier: Some("PerfMatch".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let reads = s.purchases.read_count();
+
+        assert_eq!(details.len(), 1, "the supplier filter narrows to its purchase");
+        assert_eq!(details[0].purchase.id, matching);
+        assert_eq!(
+            reads, 3,
+            "one filtered query plus the matching document's lines and payments only, got {reads} reads for 20 purchases"
+        );
     }
 }

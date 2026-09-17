@@ -49,11 +49,11 @@ behind the others.
 - [ ] T26: regenerate the stylesheet
 
 ## Slice N5 — remaining names, filters and search
-- [ ] T27: resolve names in the fragments not covered by the record pages: lists, statements, receipts
-- [ ] T28: filters for sales and purchases: status, party, number, date
-- [ ] T29: product filters for name, SKU and barcode, keeping the category filter
-- [ ] T30: tests for AC13 and AC14, plus a guard assertion that no rendered page shows a bare entity id
-- [ ] T31: README updated for the record pages, the picker and the filters
+- [x] T27: resolve names in the fragments not covered by the record pages: lists, statements, receipts
+- [x] T28: filters for sales and purchases: status, party, number, date
+- [x] T29: product filters for name, SKU and barcode, keeping the category filter
+- [x] T30: tests for AC13 and AC14, plus a guard assertion that no rendered page shows a bare entity id
+- [x] T31: README updated for the record pages, the picker and the filters
 
 ## Slice N6 — finish the shell conversion (cosmetic, last)
 - [ ] T32: convert the remaining templates to the page-header pattern

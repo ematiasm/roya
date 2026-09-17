@@ -5,7 +5,7 @@
 // form body) stay registered for existing callers.
 use askama::Template;
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -17,8 +17,11 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{PaymentType, SaleDetail, SaleRecord, SaleStatus, UpdateSaleDraft};
+use crate::models::{
+    DebtSummary, PaymentType, SaleDetail, SaleListFilter, SaleRecord, SaleStatus, UpdateSaleDraft,
+};
 use crate::routes::AppState;
+use crate::services::sales::DEBT_BANNER_LIMIT;
 
 // ---------------------------------------------------------------------------
 // Askama templates
@@ -29,12 +32,19 @@ use crate::routes::AppState;
 struct SalesTemplate {
     title: String,
     sales: Vec<SaleDetail>,
-    debt: Vec<SaleDetail>,
+    debt: DebtSummary,
     customers: Vec<crate::models::Customer>,
     allow_negative: bool,
     allow_negative_stock: bool,
     today: String,
     nav_key: &'static str,
+    /// Current filter values, so a bookmarkable `/sales?status=…` re-renders with
+    /// the same form state the server used for the list.
+    filter_status: String,
+    filter_customer: String,
+    filter_number: String,
+    filter_from: String,
+    filter_to: String,
 }
 
 /// The `/sales/{id}` record page. The page-header values are struct fields, so
@@ -62,6 +72,14 @@ struct SalePageTemplate {
 struct SaleListPartial {
     title: String,
     sales: Vec<SaleDetail>,
+}
+
+/// The debt banner: total owed, unpaid count and the oldest few. A summary, so
+/// the always-rendered panel never loads the whole receivable history.
+#[derive(Template)]
+#[template(path = "partials/sale_debt.html")]
+struct SaleDebtPartial {
+    debt: DebtSummary,
 }
 
 /// The record body, shared by the page and by every action response that swaps
@@ -143,6 +161,13 @@ fn render_list(sales: Vec<SaleDetail>, title: &str) -> AppResult<Html<String>> {
     Ok(Html(html))
 }
 
+fn render_debt(debt: DebtSummary) -> AppResult<Html<String>> {
+    let html = SaleDebtPartial { debt }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Html(html))
+}
+
 /// Everything the record body renders: the resolved record plus the option
 /// lists its action forms need. The product picker searches
 /// `/web/product-search` instead of carrying the whole catalogue.
@@ -203,9 +228,15 @@ async fn changed_with_picker(
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let sales = state.sales_service.list_details().await?;
-    let debt = state.sales_service.outstanding_debt().await?;
+async fn sales_page(
+    State(state): State<AppState>,
+    Query(query): Query<SaleListQuery>,
+) -> Result<Html<String>, AppError> {
+    let sales = state
+        .sales_service
+        .list_details_filtered(&query.to_filter())
+        .await?;
+    let debt = state.sales_service.debt_summary(DEBT_BANNER_LIMIT).await?;
     let customers = state.customer_service.list_customers(true).await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = SalesTemplate {
@@ -217,20 +248,87 @@ async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppEr
         allow_negative_stock: state.allow_negative_stock,
         today,
         nav_key: "sales",
+        filter_status: query.status.trim().to_string(),
+        filter_customer: query.customer.trim().to_string(),
+        filter_number: query.number.trim().to_string(),
+        filter_from: query.from.trim().to_string(),
+        filter_to: query.to.trim().to_string(),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
-async fn web_sale_list(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let sales = state.sales_service.list_details().await?;
+/// Query parameters for the sales list filter. Every field is optional and an
+/// empty or unparseable value is treated as absent, so a filterless or partial URL
+/// is never an error. The document number matches partially, because a user
+/// remembers a fragment of it.
+#[derive(Debug, Deserialize, Default)]
+pub struct SaleListQuery {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub customer: String,
+    #[serde(default)]
+    pub number: String,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+}
+
+impl SaleListQuery {
+    fn to_filter(&self) -> SaleListFilter {
+        SaleListFilter {
+            status: parse_optional_status(&self.status),
+            customer: clean_filter_text(&self.customer),
+            customer_ids: None,
+            number: clean_filter_text(&self.number),
+            from: parse_optional_date(&self.from),
+            to: parse_optional_date(&self.to),
+        }
+    }
+}
+
+fn clean_filter_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_optional_status(raw: &str) -> Option<SaleStatus> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+fn parse_optional_date(raw: &str) -> Option<NaiveDate> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+async fn web_sale_list(
+    State(state): State<AppState>,
+    Query(query): Query<SaleListQuery>,
+) -> Result<Html<String>, AppError> {
+    let sales = state
+        .sales_service
+        .list_details_filtered(&query.to_filter())
+        .await?;
     render_list(sales, "All sales")
 }
 
 async fn web_sale_debt(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let debt = state.sales_service.outstanding_debt().await?;
-    render_list(debt, "Outstanding debt")
+    let debt = state.sales_service.debt_summary(DEBT_BANNER_LIMIT).await?;
+    render_debt(debt)
 }
 
 /// `/sales/{id}`: a real page inside the shell. The label is the sale number or

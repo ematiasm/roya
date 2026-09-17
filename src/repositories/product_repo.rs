@@ -4,7 +4,7 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewProduct, Product, ProductKind};
+use crate::models::{NewProduct, Product, ProductBarcode, ProductKind};
 
 #[async_trait]
 pub trait ProductRepository: Send + Sync {
@@ -13,8 +13,10 @@ pub trait ProductRepository: Send + Sync {
     async fn find_by_sku(&self, sku: &str) -> AppResult<Option<Product>>;
     /// Exact SKU regardless of case, used by the scanner/SKU resolution path.
     async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>>;
-    /// Bounded picker read over name, SKU and barcode aliases in one query.
-    async fn search(&self, query: &str, limit: i64) -> AppResult<Vec<Product>>;
+    /// Every barcode alias. The normalized catalogue search matches the whole
+    /// (small) set in Rust, so name/SKU/barcode share one matching definition; this
+    /// read owns the `product_barcodes` SQL the retired picker query used to hold.
+    async fn list_barcodes(&self) -> AppResult<Vec<ProductBarcode>>;
     async fn list(&self) -> AppResult<Vec<Product>>;
     async fn list_by_category(&self, category_id: i64) -> AppResult<Vec<Product>>;
     async fn count_by_category(&self, category_id: i64) -> AppResult<i64>;
@@ -39,12 +41,6 @@ fn kind_from_str(s: &str) -> ProductKind {
 }
 
 /// Escape the LIKE wildcards in a user-typed value so `%` and `_` stay literal.
-fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Product {
     let sale_str: String = row.get("sale_price");
     let cost_str: String = row.get("cost_price");
@@ -156,29 +152,21 @@ impl ProductRepository for SqliteProductRepository {
         Ok(row.map(row_to_product))
     }
 
-    async fn search(&self, query: &str, limit: i64) -> AppResult<Vec<Product>> {
-        // One query path: name, SKU and barcode aliases. LIKE is case-insensitive
-        // for ASCII in SQLite, and `%`/`_` typed by the user stay literal text.
-        let pattern = format!("%{}%", escape_like(query));
+    async fn list_barcodes(&self) -> AppResult<Vec<ProductBarcode>> {
         let rows = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at
-               FROM products p
-               WHERE p.name LIKE ? ESCAPE '\'
-                  OR p.sku LIKE ? ESCAPE '\'
-                  OR EXISTS (
-                       SELECT 1 FROM product_barcodes b
-                       WHERE b.product_id = p.id AND b.code LIKE ? ESCAPE '\'
-                     )
-               ORDER BY p.name, p.id
-               LIMIT ?"#,
+            "SELECT id, product_id, code, created_at FROM product_barcodes ORDER BY product_id, id",
         )
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(&pattern)
-        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(row_to_product).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| ProductBarcode {
+                id: row.get("id"),
+                product_id: row.get("product_id"),
+                code: row.get("code"),
+                created_at: row.get("created_at"),
+            })
+            .collect())
     }
 
     async fn list(&self) -> AppResult<Vec<Product>> {

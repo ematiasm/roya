@@ -6,7 +6,7 @@
 // callers.
 use askama::Template;
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -19,7 +19,8 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewPurchase, PaymentType, PurchaseDetail, PurchaseRecord, PurchaseStatus, PurchaseSuggestions,
+    NewPurchase, PaymentType, PurchaseDetail, PurchaseListFilter, PurchaseRecord, PurchaseStatus,
+    PurchaseSuggestions,
 };
 use crate::routes::AppState;
 
@@ -46,6 +47,13 @@ struct PurchasesTemplate {
     allow_negative_stock: bool,
     today: String,
     nav_key: &'static str,
+    /// Current filter values, so a bookmarkable `/purchases?supplier=…`
+    /// re-renders with the same form state the server used for the list.
+    filter_status: String,
+    filter_supplier: String,
+    filter_number: String,
+    filter_from: String,
+    filter_to: String,
 }
 
 /// The `/purchases/{id}` record page. The page-header values are struct fields,
@@ -158,8 +166,14 @@ fn clean_opt(s: &str) -> Option<String> {
     }
 }
 
-async fn purchase_views(state: &AppState) -> AppResult<Vec<PurchaseView>> {
-    let details = state.purchases_service.list_details().await?;
+async fn purchase_views(
+    state: &AppState,
+    filter: &PurchaseListFilter,
+) -> AppResult<Vec<PurchaseView>> {
+    let details = state
+        .purchases_service
+        .list_details_filtered(filter)
+        .await?;
     let mut out = Vec::with_capacity(details.len());
     for detail in details {
         let supplier = state
@@ -244,8 +258,11 @@ async fn changed_with_picker(
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-async fn purchases_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let purchases = purchase_views(&state).await?;
+async fn purchases_page(
+    State(state): State<AppState>,
+    Query(query): Query<PurchaseListQuery>,
+) -> Result<Html<String>, AppError> {
+    let purchases = purchase_views(&state, &query.to_filter()).await?;
     let suggestions = state.purchases_service.suggestions().await?;
     let has_suggestions =
         !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
@@ -261,10 +278,70 @@ async fn purchases_page(State(state): State<AppState>) -> Result<Html<String>, A
         allow_negative_stock: state.allow_negative_stock,
         today,
         nav_key: "purchases",
+        filter_status: query.status.trim().to_string(),
+        filter_supplier: query.supplier.trim().to_string(),
+        filter_number: query.number.trim().to_string(),
+        filter_from: query.from.trim().to_string(),
+        filter_to: query.to.trim().to_string(),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
     ))
+}
+
+/// Query parameters for the purchases list filter, the same shape as
+/// [`SaleListQuery`](crate::routes::sales_web::SaleListQuery). The document number
+/// matches partially, because a user remembers a fragment of it.
+#[derive(Debug, Deserialize, Default)]
+pub struct PurchaseListQuery {
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub supplier: String,
+    #[serde(default)]
+    pub number: String,
+    #[serde(default)]
+    pub from: String,
+    #[serde(default)]
+    pub to: String,
+}
+
+impl PurchaseListQuery {
+    fn to_filter(&self) -> PurchaseListFilter {
+        PurchaseListFilter {
+            status: parse_optional_status(&self.status),
+            supplier: clean_filter_text(&self.supplier),
+            supplier_ids: None,
+            number: clean_filter_text(&self.number),
+            from: parse_optional_date_filter(&self.from),
+            to: parse_optional_date_filter(&self.to),
+        }
+    }
+}
+
+fn clean_filter_text(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn parse_optional_status(raw: &str) -> Option<PurchaseStatus> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse().ok()
+}
+
+fn parse_optional_date_filter(raw: &str) -> Option<NaiveDate> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse().ok()
 }
 
 /// `/purchases/{id}`: a real page inside the shell. The label is the purchase
@@ -306,8 +383,11 @@ async fn purchase_record_page(
     ))
 }
 
-async fn web_purchase_list(State(state): State<AppState>) -> AppResult<Response> {
-    let view = purchase_views(&state).await?;
+async fn web_purchase_list(
+    State(state): State<AppState>,
+    Query(query): Query<PurchaseListQuery>,
+) -> AppResult<Response> {
+    let view = purchase_views(&state, &query.to_filter()).await?;
     Ok(render_list(view, "All purchases")?.into_response())
 }
 

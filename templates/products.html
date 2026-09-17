@@ -15,17 +15,28 @@
         <h2 class="text-lg font-semibold">Products</h2>
         <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/products" hx-target="#product-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
-      <div class="mb-3 flex flex-wrap gap-2">
-        <select class="min-w-[120px] flex-1" id="filter-category" name="category_id" hx-get="/web/products" hx-target="#product-list" hx-trigger="change">
+      {# Catalogue filter: the text field matches name, SKU and barcode through the
+         same inventory search the picker uses, and combines with the category. A
+         bookmarkable `/products?q=…&category_id=…` re-renders this state. #}
+      <form id="product-filters"
+            class="mb-3 flex flex-wrap gap-2"
+            hx-get="/web/products"
+            hx-target="#product-list"
+            hx-swap="innerHTML"
+            hx-trigger="change, keyup changed delay:300ms">
+        <input class="min-w-[160px] flex-1" type="text" name="q" placeholder="Name, SKU or barcode" value="{{ filter_q }}" />
+        <select class="min-w-[120px] flex-1" id="filter-category" name="category_id">
           <option value="">All categories</option>
           {% for cat in categories %}
-          <option value="{{ cat.id }}">{{ cat.name }}</option>
+          <option value="{{ cat.id }}" {% if filter_category == cat.id.to_string() %}selected{% endif %}>{{ cat.name }}</option>
           {% endfor %}
         </select>
-      </div>
+        <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/products">Clear</a>
+      </form>
       <div id="product-list"
            hx-get="/web/products"
            hx-trigger="refresh from:body, load"
+           hx-include="#product-filters"
            hx-swap="innerHTML">
         {% include "partials/product_list.html" %}
       </div>

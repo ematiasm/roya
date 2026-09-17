@@ -30,6 +30,9 @@ struct ProductsTemplate {
     allow_negative_stock: bool,
     today: String,
     nav_key: &'static str,
+    /// Current filter values, so the form reflects a bookmarkable `/products?q=…`.
+    filter_q: String,
+    filter_category: String,
 }
 
 #[derive(Template)]
@@ -69,29 +72,22 @@ fn is_htmx(headers: &HeaderMap) -> bool {
 }
 
 async fn all_product_stocks(state: &AppState) -> AppResult<Vec<ProductStock>> {
-    let products = state.inventory_service.products.list().await?;
-    let mut out = Vec::with_capacity(products.len());
-    for p in products {
-        let stock = state.inventory_service.movements.stock_for_product(p.id).await?;
-        let suggested = match (p.min_stock, p.max_stock) {
-            (Some(min), Some(max)) if stock <= min => Some(max - stock),
-            _ => None,
-        };
-        out.push(ProductStock {
-            product: p,
-            stock,
-            suggested,
-        });
-    }
-    Ok(out)
+    state.inventory_service.filter_products("", None).await
 }
 
 // ---------------------------------------------------------------------------
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-async fn products_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
-    let products = all_product_stocks(&state).await?;
+async fn products_page(
+    State(state): State<AppState>,
+    Query(q): Query<WebProductFilter>,
+) -> Result<Html<String>, AppError> {
+    let (query, category_id) = q.parsed();
+    let products = state
+        .inventory_service
+        .filter_products(&query, category_id)
+        .await?;
     let categories = state.inventory_service.categories.list().await?;
     let low_stock = state.inventory_service.low_stock().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -102,6 +98,8 @@ async fn products_page(State(state): State<AppState>) -> Result<Html<String>, Ap
         allow_negative_stock: state.allow_negative_stock,
         today,
         nav_key: "products",
+        filter_q: query,
+        filter_category: q.category_id.as_deref().unwrap_or("").trim().to_string(),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -110,30 +108,38 @@ async fn products_page(State(state): State<AppState>) -> Result<Html<String>, Ap
 
 #[derive(Debug, Deserialize, Default)]
 pub struct WebProductFilter {
+    #[serde(default)]
     pub category_id: Option<String>,
+    /// Text search over name, SKU and barcode, matched by the inventory service.
+    #[serde(default)]
+    pub q: Option<String>,
+}
+
+impl WebProductFilter {
+    /// The search text and the parsed category. An empty or unparseable value is
+    /// treated as "no constraint", matching the lenient parsing the list already
+    /// used, so a stray value never turns a bookmark into an error.
+    fn parsed(&self) -> (String, Option<i64>) {
+        let query = self.q.as_deref().unwrap_or("").trim().to_string();
+        let category = self
+            .category_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse().ok());
+        (query, category)
+    }
 }
 
 async fn web_product_list(
     State(state): State<AppState>,
     Query(q): Query<WebProductFilter>,
 ) -> Result<Html<String>, AppError> {
-    // Empty string from <select> means "all".
-    let filter: Option<i64> = q.category_id.as_deref().and_then(|s| {
-        let t = s.trim();
-        if t.is_empty() {
-            None
-        } else {
-            t.parse().ok()
-        }
-    });
-    let stocks = all_product_stocks(&state).await?;
-    let products = match filter {
-        Some(cid) => stocks
-            .into_iter()
-            .filter(|ps| ps.product.category_id == Some(cid))
-            .collect(),
-        None => stocks,
-    };
+    let (query, category_id) = q.parsed();
+    let products = state
+        .inventory_service
+        .filter_products(&query, category_id)
+        .await?;
     let html = ProductListPartial { products }
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;

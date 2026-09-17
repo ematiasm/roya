@@ -1,17 +1,34 @@
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewPurchase, PaymentType, Purchase, PurchaseLine, PurchasePayment, PurchaseStatus,
-    UpdatePurchaseDraft,
+    NewPurchase, PaymentType, Purchase, PurchaseLine, PurchaseListFilter, PurchasePayment,
+    PurchaseStatus, UpdatePurchaseDraft,
 };
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
+}
+
+/// A `%…%` LIKE needle whose literal `%`, `_` and `\` are escaped, so the SQL
+/// matches the same partial substring the retired in-memory filter did. Callers
+/// compare it to `LOWER(column) ... ESCAPE '\'`; case folding is ASCII, like
+/// SQLite's `LOWER`, because the engine ships no Unicode collation.
+fn like_needle(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('%');
+    for ch in raw.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
 }
 
 fn status_from_str(s: &str) -> PurchaseStatus {
@@ -92,6 +109,13 @@ pub trait PurchaseRepository: Send + Sync {
     async fn find_purchase(&self, id: i64) -> AppResult<Option<Purchase>>;
     async fn find_purchase_by_number(&self, number: &str) -> AppResult<Option<Purchase>>;
     async fn list_purchases(&self) -> AppResult<Vec<Purchase>>;
+    /// The same rows narrowed by the list filter, inside the repository query so
+    /// only matching documents have their lines and payments loaded. The supplier
+    /// filter joins the suppliers table for the name the list shows.
+    async fn list_purchases_filtered(
+        &self,
+        filter: &PurchaseListFilter,
+    ) -> AppResult<Vec<Purchase>>;
     /// Update Draft header fields (service guarantees Draft status).
     async fn update_draft(&self, id: i64, patch: &UpdatePurchaseDraft) -> AppResult<Purchase>;
     /// Transition Draft -> Confirmed with assigned number.
@@ -136,11 +160,37 @@ pub trait PurchaseRepository: Send + Sync {
 #[derive(Clone)]
 pub struct SqlitePurchaseRepository {
     pub pool: SqlitePool,
+    /// Test-only read counter: proves the filtered list reads scale with the
+    /// result set, not the shop's history. Absent from production builds.
+    #[cfg(test)]
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SqlitePurchaseRepository {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Count one repository read (test builds only).
+    #[cfg(test)]
+    fn tick(&self) {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Reset and read the test-only read counter.
+    #[cfg(test)]
+    pub(crate) fn reset_reads(&self) {
+        self.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_count(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -195,11 +245,63 @@ impl PurchaseRepository for SqlitePurchaseRepository {
     }
 
     async fn list_purchases(&self) -> AppResult<Vec<Purchase>> {
+        #[cfg(test)]
+        self.tick();
         let rows = sqlx::query(
             r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM purchases ORDER BY id"#,
         )
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows.into_iter().map(row_to_purchase).collect())
+    }
+
+    async fn list_purchases_filtered(
+        &self,
+        filter: &PurchaseListFilter,
+    ) -> AppResult<Vec<Purchase>> {
+        #[cfg(test)]
+        self.tick();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT p.id, p.purchase_number, p.supplier_id, p.status, p.payment_type, p.purchase_date, p.due_date, p.supplier_invoice_no, p.notes, p.cancel_reason, p.created_at, p.updated_at, p.confirmed_at, p.cancelled_at FROM purchases p",
+        );
+        let has_filter = filter.status.is_some()
+            || filter.supplier_ids.is_some()
+            || filter.number.is_some()
+            || filter.from.is_some()
+            || filter.to.is_some();
+        if has_filter {
+            qb.push(" WHERE 1 = 1");
+        }
+        if let Some(status) = filter.status {
+            qb.push(" AND p.status = ").push_bind(status.to_string());
+        }
+        if let Some(ids) = &filter.supplier_ids {
+            if ids.is_empty() {
+                // The party filter matched no supplier, so no document can match.
+                return Ok(Vec::new());
+            }
+            qb.push(" AND p.supplier_id IN (");
+            {
+                let mut separated = qb.separated(", ");
+                for id in ids {
+                    separated.push_bind(*id);
+                }
+                separated.push_unseparated(")");
+            }
+        }
+        if let Some(number) = &filter.number {
+            qb.push(" AND p.purchase_number IS NOT NULL AND LOWER(p.purchase_number) LIKE LOWER(")
+                .push_bind(like_needle(number))
+                .push(") ESCAPE '\\'");
+        }
+        if let Some(from) = filter.from {
+            qb.push(" AND p.purchase_date >= ").push_bind(from);
+        }
+        if let Some(to) = filter.to {
+            qb.push(" AND p.purchase_date <= ").push_bind(to);
+        }
+        qb.push(" ORDER BY p.id");
+        let rows = qb.build().fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_purchase).collect())
     }
 
@@ -323,6 +425,8 @@ impl PurchaseRepository for SqlitePurchaseRepository {
     }
 
     async fn list_lines(&self, purchase_id: i64) -> AppResult<Vec<PurchaseLine>> {
+        #[cfg(test)]
+        self.tick();
         let rows = sqlx::query(
             r#"SELECT id, purchase_id, product_id, qty, unit_cost, created_at
                FROM purchase_lines WHERE purchase_id = ? ORDER BY id"#,
@@ -404,6 +508,8 @@ impl PurchaseRepository for SqlitePurchaseRepository {
     }
 
     async fn list_payments(&self, purchase_id: i64) -> AppResult<Vec<PurchasePayment>> {
+        #[cfg(test)]
+        self.tick();
         let rows = sqlx::query(
             r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at
                FROM purchase_payments WHERE purchase_id = ? ORDER BY id"#,

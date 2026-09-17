@@ -353,18 +353,88 @@ where
     /// whole catalogue into a fragment.
     pub const PRODUCT_SEARCH_LIMIT: i64 = 10;
 
-    /// Bounded read behind `GET /web/product-search`: name, SKU and barcode in
-    /// one query path over the repository, with derived stock. The empty query is
-    /// not a search and never returns the catalogue.
+    /// Bounded read behind `GET /web/product-search`: normalized name, SKU and
+    /// barcode matching over the small catalogue, with derived stock. The empty
+    /// query is not a search and never returns the catalogue.
     pub async fn search_products(&self, query: &str) -> AppResult<Vec<ProductStock>> {
         let value = query.trim();
         if value.is_empty() {
             return Ok(Vec::new());
         }
         let products = self
-            .products
-            .search(value, Self::PRODUCT_SEARCH_LIMIT)
+            .match_catalogue(value, Some(Self::PRODUCT_SEARCH_LIMIT as usize))
             .await?;
+        self.with_stock(products).await
+    }
+
+    /// Catalogue filter behind the products list (N5): the same normalized
+    /// name/SKU/barcode matching the picker uses, without its row bound, combined
+    /// with the existing category filter. An empty query contributes no constraint,
+    /// so the list stays whole.
+    pub async fn filter_products(
+        &self,
+        query: &str,
+        category_id: Option<i64>,
+    ) -> AppResult<Vec<ProductStock>> {
+        let value = query.trim();
+        let products = if value.is_empty() {
+            self.products.list().await?
+        } else {
+            self.match_catalogue(value, None).await?
+        };
+        let products = match category_id {
+            Some(cid) => products
+                .into_iter()
+                .filter(|product| product.category_id == Some(cid))
+                .collect(),
+            None => products,
+        };
+        self.with_stock(products).await
+    }
+
+    /// The one matching definition for the party and catalogue searches: fold both
+    /// sides with `normalize_search` so case and Spanish diacritics do not matter,
+    /// over the whole (small) catalogue fetched once. `limit` bounds the picker; the
+    /// catalogue list passes `None`. If the catalogue ever stops being small, this
+    /// needs a normalized index instead.
+    async fn match_catalogue(&self, query: &str, limit: Option<usize>) -> AppResult<Vec<Product>> {
+        let needle = crate::models::normalize_search(query);
+        let products = self.products.list().await?;
+        let by_id: std::collections::BTreeMap<i64, usize> = products
+            .iter()
+            .enumerate()
+            .map(|(index, product)| (product.id, index))
+            .collect();
+        let mut matched: std::collections::BTreeSet<usize> = products
+            .iter()
+            .enumerate()
+            .filter(|(_, product)| {
+                crate::models::normalize_search(&product.name).contains(&needle)
+                    || crate::models::normalize_search(&product.sku).contains(&needle)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        for barcode in self.products.list_barcodes().await? {
+            if crate::models::normalize_search(&barcode.code).contains(&needle) {
+                if let Some(index) = by_id.get(&barcode.product_id) {
+                    matched.insert(*index);
+                }
+            }
+        }
+        let mut out: Vec<Product> = matched
+            .into_iter()
+            .map(|index| products[index].clone())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        if let Some(limit) = limit {
+            out.truncate(limit);
+        }
+        Ok(out)
+    }
+
+    /// Derive stock and the reorder suggestion for a product list. Shared by the
+    /// picker search and the catalogue filter so both read stock the same way.
+    async fn with_stock(&self, products: Vec<Product>) -> AppResult<Vec<ProductStock>> {
         let mut out = Vec::with_capacity(products.len());
         for product in products {
             let stock = self.movements.stock_for_product(product.id).await?;

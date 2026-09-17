@@ -492,6 +492,9 @@ pub struct SalePayment {
     /// Customer receipt that groups this payment, when a lump-sum collection
     /// produced it; NULL for a direct payment on a single sale.
     pub receipt_id: Option<i64>,
+    /// The owning sale's document number, resolved by the receipt-allocation read
+    /// so a receipt names the sale the way the user does; `None` in other reads.
+    pub sale_number: Option<String>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -573,6 +576,55 @@ pub fn format_sale_number(year: i32, seq: i64) -> String {
     format!("{year}-SALE-{seq:06}")
 }
 
+
+/// Fold a search string to its comparable ASCII form: Unicode lowercase plus the
+/// Spanish and Latin-1 diacritics mapped to their base letters. Both sides of every
+/// party and catalogue match go through this one function, so `Perez` finds
+/// `Pérez`, `CAFE` finds `Café` and `Ñandú` finds `ñandú`.
+pub fn normalize_search(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        match ch {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' => out.push('a'),
+            'æ' => out.push_str("ae"),
+            'ç' | 'ć' | 'č' => out.push('c'),
+            'è' | 'é' | 'ê' | 'ë' | 'ē' => out.push('e'),
+            'ì' | 'í' | 'î' | 'ï' | 'ī' => out.push('i'),
+            'ð' => out.push('d'),
+            'ñ' | 'ń' => out.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' => out.push('o'),
+            'œ' => out.push_str("oe"),
+            'ù' | 'ú' | 'û' | 'ü' | 'ū' => out.push('u'),
+            'ý' | 'ÿ' => out.push('y'),
+            'þ' => out.push_str("th"),
+            'ß' => out.push_str("ss"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Server-side filter for the sales list (redesign-interface N5). Every field is
+/// optional and an absent field adds no constraint, so an empty filter returns the
+/// whole list and a filter matching nothing returns an empty list rather than an
+/// error. `customer` is the typed party name; the service resolves it against the
+/// customers table (normalized) into `customer_ids`, and the repository narrows the
+/// document query by those ids. `number` matches the document number partially.
+#[derive(Debug, Clone, Default)]
+pub struct SaleListFilter {
+    pub status: Option<SaleStatus>,
+    /// The typed party name, resolved by the service into `customer_ids`.
+    pub customer: Option<String>,
+    /// Matching customer ids, set by the service; `Some(empty)` matches nothing.
+    pub customer_ids: Option<Vec<i64>>,
+    pub number: Option<String>,
+    /// Inclusive lower bound on `sale_date`.
+    pub from: Option<NaiveDate>,
+    /// Inclusive upper bound on `sale_date`.
+    pub to: Option<NaiveDate>,
+}
+
+
 // ---------------------------------------------------------------------------
 // Sale record page (redesign-interface N2)
 //
@@ -614,6 +666,17 @@ pub struct SaleRecord {
     pub paid: Decimal,
     pub due: Decimal,
     pub payment_status: PaymentStatus,
+}
+
+/// The sales page's debt banner: a summary, not the full receivable. `total` and
+/// `count` are exact (decimal sums in Rust) and `oldest` is the first few unpaid
+/// documents by due date, so the banner renders a bounded number of rows. The full
+/// receivable list stays a filtered read, never an always-rendered panel.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DebtSummary {
+    pub total: Decimal,
+    pub count: usize,
+    pub oldest: Vec<SaleDetail>,
 }
 
 // ---------------------------------------------------------------------------
@@ -880,6 +943,25 @@ pub fn format_purchase_number(year: i32, seq: i64) -> String {
     format!("{year}-PURCH-{seq:06}")
 }
 
+/// Server-side filter for the purchases list (redesign-interface N5). The same
+/// shape as `SaleListFilter`; `supplier` is the typed party name, resolved by the
+/// service against the suppliers table (normalized) into `supplier_ids`, and the
+/// repository narrows the document query by those ids. `number` matches partially.
+#[derive(Debug, Clone, Default)]
+pub struct PurchaseListFilter {
+    pub status: Option<PurchaseStatus>,
+    /// The typed party name, resolved by the service into `supplier_ids`.
+    pub supplier: Option<String>,
+    /// Matching supplier ids, set by the service; `Some(empty)` matches nothing.
+    pub supplier_ids: Option<Vec<i64>>,
+    pub number: Option<String>,
+    /// Inclusive lower bound on `purchase_date`.
+    pub from: Option<NaiveDate>,
+    /// Inclusive upper bound on `purchase_date`.
+    pub to: Option<NaiveDate>,
+}
+
+
 /// One low-stock product with a chosen supplier from the cost satellite.
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseSuggestion {
@@ -1094,6 +1176,10 @@ pub struct ReceiptDetail {
     /// handed over and applied. A stored copy could disagree with the payments;
     /// this one is computed from them.
     pub total: Decimal,
+    /// Account name resolved for display through the account read path.
+    pub account_name: String,
+    /// Payment-method name resolved for display through the finance read path.
+    pub method_name: String,
 }
 
 impl ReceiptDetail {
@@ -1103,6 +1189,16 @@ impl ReceiptDetail {
             receipt,
             allocations,
             total,
+            account_name: String::new(),
+            method_name: String::new(),
         }
+    }
+
+    /// Attach the display names the receipt list shows, so the template never
+    /// prints the internal account/method keys.
+    pub fn with_names(mut self, account_name: String, method_name: String) -> Self {
+        self.account_name = account_name;
+        self.method_name = method_name;
+        self
     }
 }

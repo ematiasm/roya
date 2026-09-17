@@ -203,7 +203,25 @@ where
 
     async fn receipt_detail(&self, receipt: CustomerReceipt) -> AppResult<ReceiptDetail> {
         let allocations = self.receipts.list_allocations(receipt.id).await?;
-        Ok(ReceiptDetail::new(receipt, allocations))
+        let detail = ReceiptDetail::new(receipt, allocations);
+        // Resolve the display names through the same read paths the rest of the
+        // interface uses, so the receipt list never prints an internal key.
+        let account_name = self
+            .sales
+            .transactions
+            .accounts
+            .find_by_id(detail.receipt.account_id)
+            .await?
+            .map(|account| account.name)
+            .unwrap_or_else(|| "Unknown account".to_string());
+        let method_name = self
+            .payment_methods
+            .methods
+            .find_method(detail.receipt.method_id)
+            .await?
+            .map(|method| method.name)
+            .unwrap_or_else(|| "Unknown method".to_string());
+        Ok(detail.with_names(account_name, method_name))
     }
 
     // -- Planning and guards ----------------------------------------------------

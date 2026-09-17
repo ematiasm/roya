@@ -13,11 +13,32 @@
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Purchases</h2>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/purchases" hx-target="#purchase-list" hx-swap="innerHTML">↻ Refresh</button>
+        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/purchases" hx-include="#purchase-filters" hx-target="#purchase-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
+      {# Server-side filters, the same shape as the sales list: the form GETs
+         `/web/purchases` and swaps only the list. #}
+      <form id="purchase-filters"
+            class="mb-3 flex flex-wrap gap-2"
+            hx-get="/web/purchases"
+            hx-target="#purchase-list"
+            hx-swap="innerHTML"
+            hx-trigger="change, keyup changed delay:300ms">
+        <select class="min-w-[110px] flex-1" name="status">
+          <option value="">All statuses</option>
+          <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>Draft</option>
+          <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>Confirmed</option>
+          <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>Cancelled</option>
+        </select>
+        <input class="min-w-[120px] flex-1" type="text" name="supplier" placeholder="Supplier" value="{{ filter_supplier }}" />
+        <input class="min-w-[120px] flex-1" type="text" name="number" placeholder="Purchase number" value="{{ filter_number }}" />
+        <input class="min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
+        <input class="min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+        <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/purchases">Clear</a>
+      </form>
       <div id="purchase-list"
            hx-get="/web/purchases"
            hx-trigger="refresh from:body, load"
+           hx-include="#purchase-filters"
            hx-swap="innerHTML">
         {% include "partials/purchase_list.html" %}
       </div>

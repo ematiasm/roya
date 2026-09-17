@@ -918,6 +918,13 @@ router, form extraction and Askama rendering.
 - **Native forms**: a `this.action=` rewrite inside `onsubmit` fails the guard
   (htmx ignores the form action property), and native `action=` targets are
   probed with their form method like any other target.
+- **Referenced-id guard**: every seeded page is scanned for `product #`,
+  `account #`, `method #`, `customer #` and `supplier #` followed by digits, so a
+  list or fragment can never leak the internal id of a referenced entity. A
+  document's own id stays allowed (`draft #12`, `2024-SALE-000012`), and the scan
+  is pinned by a page-copy mutation test. The receipt list resolves account and
+  method names through the finance read paths, and the guard fixture collects a
+  receipt so the customer statement renders that list and the rule covers it.
 
 ## License
 

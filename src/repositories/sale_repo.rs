@@ -1,16 +1,34 @@
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewSale, PaymentType, Sale, SaleLine, SalePayment, SaleStatus, UpdateSaleDraft,
+    NewSale, PaymentType, Sale, SaleLine, SaleListFilter, SalePayment, SaleStatus,
+    UpdateSaleDraft,
 };
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
+}
+
+/// A `%…%` LIKE needle whose literal `%`, `_` and `\` are escaped, so the SQL
+/// matches the same partial substring the retired in-memory filter did. Callers
+/// compare it to `LOWER(column) ... ESCAPE '\'`; case folding is ASCII, like
+/// SQLite's `LOWER`, because the engine ships no Unicode collation.
+fn like_needle(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('%');
+    for ch in raw.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
 }
 
 fn status_from_str(s: &str) -> SaleStatus {
@@ -68,6 +86,9 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> SalePayment {
         transaction_id: row.get("transaction_id"),
         refund_transaction_id: row.get("refund_transaction_id"),
         receipt_id: row.get("receipt_id"),
+        // Only the receipt-allocation query selects `sale_number`; every other
+        // payment read leaves it `None`.
+        sale_number: row.try_get::<Option<String>, _>("sale_number").unwrap_or(None),
         created_at: row.get("created_at"),
     }
 }
@@ -97,6 +118,10 @@ pub trait SaleRepository: Send + Sync {
     async fn find_sale(&self, id: i64) -> AppResult<Option<Sale>>;
     async fn find_sale_by_number(&self, number: &str) -> AppResult<Option<Sale>>;
     async fn list_sales(&self) -> AppResult<Vec<Sale>>;
+    /// The same rows narrowed by the list filter, inside the repository query so
+    /// only matching documents have their lines and payments loaded. Party
+    /// matching uses the frozen `customer_name` snapshot the list already shows.
+    async fn list_sales_filtered(&self, filter: &SaleListFilter) -> AppResult<Vec<Sale>>;
     /// Confirmed credit sales of one customer, oldest first. Feeds the derived
     /// receivable used by the credit-limit check; cancelled sales never count.
     async fn list_confirmed_credit_sales(&self, customer_id: i64) -> AppResult<Vec<Sale>>;
@@ -109,6 +134,12 @@ pub trait SaleRepository: Send + Sync {
     async fn list_customer_credit_ledger(
         &self,
         customer_id: i64,
+    ) -> AppResult<Vec<(Sale, Vec<SaleLine>, Vec<SalePayment>)>>;
+    /// Every customer's confirmed credit ledger in three batched reads, oldest due
+    /// first. The debt banner uses this so its query count stays constant as the
+    /// shop's history grows; the service derives each total in Rust.
+    async fn list_confirmed_credit_ledger_all(
+        &self,
     ) -> AppResult<Vec<(Sale, Vec<SaleLine>, Vec<SalePayment>)>>;
     /// Update Draft header fields (service guarantees Draft status).
     async fn update_draft(&self, id: i64, patch: &UpdateSaleDraft) -> AppResult<Sale>;
@@ -161,11 +192,37 @@ pub trait SaleRepository: Send + Sync {
 #[derive(Clone)]
 pub struct SqliteSaleRepository {
     pub pool: SqlitePool,
+    /// Test-only read counter: proves the filtered list reads scale with the
+    /// result set, not the shop's history. Absent from production builds.
+    #[cfg(test)]
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SqliteSaleRepository {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Count one repository read (test builds only).
+    #[cfg(test)]
+    fn tick(&self) {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Reset and read the test-only read counter.
+    #[cfg(test)]
+    pub(crate) fn reset_reads(&self) {
+        self.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_count(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -221,11 +278,60 @@ impl SaleRepository for SqliteSaleRepository {
     }
 
     async fn list_sales(&self) -> AppResult<Vec<Sale>> {
+        #[cfg(test)]
+        self.tick();
         let rows = sqlx::query(
             r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales ORDER BY id"#,
         )
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows.into_iter().map(row_to_sale).collect())
+    }
+
+    async fn list_sales_filtered(&self, filter: &SaleListFilter) -> AppResult<Vec<Sale>> {
+        #[cfg(test)]
+        self.tick();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales",
+        );
+        let has_filter = filter.status.is_some()
+            || filter.customer_ids.is_some()
+            || filter.number.is_some()
+            || filter.from.is_some()
+            || filter.to.is_some();
+        if has_filter {
+            qb.push(" WHERE 1 = 1");
+        }
+        if let Some(status) = filter.status {
+            qb.push(" AND status = ").push_bind(status.to_string());
+        }
+        if let Some(ids) = &filter.customer_ids {
+            if ids.is_empty() {
+                // The party filter matched no customer, so no document can match.
+                return Ok(Vec::new());
+            }
+            qb.push(" AND customer_id IN (");
+            {
+                let mut separated = qb.separated(", ");
+                for id in ids {
+                    separated.push_bind(*id);
+                }
+                separated.push_unseparated(")");
+            }
+        }
+        if let Some(number) = &filter.number {
+            qb.push(" AND sale_number IS NOT NULL AND LOWER(sale_number) LIKE LOWER(")
+                .push_bind(like_needle(number))
+                .push(") ESCAPE '\\'");
+        }
+        if let Some(from) = filter.from {
+            qb.push(" AND sale_date >= ").push_bind(from);
+        }
+        if let Some(to) = filter.to {
+            qb.push(" AND sale_date <= ").push_bind(to);
+        }
+        qb.push(" ORDER BY id");
+        let rows = qb.build().fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_sale).collect())
     }
 
@@ -254,6 +360,80 @@ impl SaleRepository for SqliteSaleRepository {
             out.push((sale, lines, payments));
         }
         Ok(out)
+    }
+
+    async fn list_confirmed_credit_ledger_all(
+        &self,
+    ) -> AppResult<Vec<(Sale, Vec<SaleLine>, Vec<SalePayment>)>> {
+        let rows = sqlx::query(
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at
+               FROM sales
+               WHERE status = 'Confirmed' AND payment_type = 'Credit'
+               ORDER BY due_date, sale_date, id"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        #[cfg(test)]
+        self.tick();
+        let sales: Vec<Sale> = rows.into_iter().map(row_to_sale).collect();
+        if sales.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<i64> = sales.iter().map(|sale| sale.id).collect();
+
+        let mut lines_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, sale_id, product_id, qty, unit_price, created_at FROM sale_lines WHERE sale_id IN (",
+        );
+        {
+            let mut separated = lines_qb.separated(", ");
+            for id in &ids {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(") ORDER BY id");
+        }
+        let line_rows = lines_qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+
+        let mut payments_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at FROM sale_payments WHERE sale_id IN (",
+        );
+        {
+            let mut separated = payments_qb.separated(", ");
+            for id in &ids {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(") ORDER BY id");
+        }
+        let payment_rows = payments_qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+
+        let mut lines_by_sale: std::collections::BTreeMap<i64, Vec<SaleLine>> =
+            std::collections::BTreeMap::new();
+        for row in line_rows {
+            let line = row_to_line(row);
+            lines_by_sale.entry(line.sale_id).or_default().push(line);
+        }
+        let mut payments_by_sale: std::collections::BTreeMap<i64, Vec<SalePayment>> =
+            std::collections::BTreeMap::new();
+        for row in payment_rows {
+            let payment = row_to_payment(row);
+            payments_by_sale
+                .entry(payment.sale_id)
+                .or_default()
+                .push(payment);
+        }
+
+        Ok(sales
+            .into_iter()
+            .map(|sale| {
+                let lines = lines_by_sale.remove(&sale.id).unwrap_or_default();
+                let payments = payments_by_sale.remove(&sale.id).unwrap_or_default();
+                (sale, lines, payments)
+            })
+            .collect())
     }
 
     async fn update_draft(&self, id: i64, patch: &UpdateSaleDraft) -> AppResult<Sale> {
@@ -371,6 +551,8 @@ impl SaleRepository for SqliteSaleRepository {
     }
 
     async fn list_lines(&self, sale_id: i64) -> AppResult<Vec<SaleLine>> {
+        #[cfg(test)]
+        self.tick();
         let rows = sqlx::query(
             r#"SELECT id, sale_id, product_id, qty, unit_price, created_at
                FROM sale_lines WHERE sale_id = ? ORDER BY id"#,
@@ -454,6 +636,8 @@ impl SaleRepository for SqliteSaleRepository {
     }
 
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>> {
+        #[cfg(test)]
+        self.tick();
         let rows = sqlx::query(
             r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at
                FROM sale_payments WHERE sale_id = ? ORDER BY id"#,
@@ -466,8 +650,10 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn list_payments_by_receipt(&self, receipt_id: i64) -> AppResult<Vec<SalePayment>> {
         let rows = sqlx::query(
-            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at
-               FROM sale_payments WHERE receipt_id = ? ORDER BY id"#,
+            r#"SELECT sp.id, sp.sale_id, sp.account_id, sp.method_id, sp.amount, sp.date, sp.transaction_id, sp.refund_transaction_id, sp.receipt_id, sp.created_at, s.sale_number
+               FROM sale_payments sp
+               JOIN sales s ON s.id = sp.sale_id
+               WHERE sp.receipt_id = ? ORDER BY sp.id"#,
         )
         .bind(receipt_id)
         .fetch_all(&self.pool)
