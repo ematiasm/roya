@@ -1,0 +1,20 @@
+[project]
+name = "roya-e2e"
+version = "0.1.0"
+description = "Browser end-to-end suite for roya: Playwright drives the real binary against throwaway data"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-playwright>=0.9.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# conftest.py and helpers.py live at the suite root, not inside tests/, so the
+# suite root is importable without turning tests/ into a package.
+pythonpath = ["."]
+addopts = "-ra"

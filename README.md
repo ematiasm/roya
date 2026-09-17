@@ -926,6 +926,26 @@ router, form extraction and Askama rendering.
   method names through the finance read paths, and the guard fixture collects a
   receipt so the customer statement renders that list and the rule covers it.
 
+## Tests (browser suite)
+
+A second toolchain lives in `e2e/`: a Playwright browser suite that drives the
+real interface, because interaction, focus, navigation and dialogs are only
+honest in a browser. One command runs it, it never touches `roya.db`, and it
+needs nothing installed or managed for Node (Playwright's Python driver bundles
+its own Node runtime inside the suite's virtual environment):
+
+```bash
+scripts/e2e.sh          # headless; see e2e/README.md for setup and options
+```
+
+The suite builds the binary once, spawns it against a throwaway SQLite file on a
+free port whose isolation it proves from the server's own log, seeds data through
+the HTTP API reading each step's effect back, and writes a Playwright trace,
+screenshot and server log only when a test fails. `cargo test` stays independent
+of it and keeps its current speed; business rules remain in the Rust suite. The
+one-time Chromium download, the covered flows and the deliberate boundary are
+documented in [`e2e/README.md`](e2e/README.md).
+
 ## License
 
 MIT
