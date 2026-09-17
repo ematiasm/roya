@@ -13,6 +13,7 @@ never a proposal.
 | [inventory](inventory/spec.md) | M1 | Categories, products and services, barcodes, stock movements, derived stock and reorder suggestion |
 | [sales](sales/spec.md) | M2 | Sales, lines, payments, document numbering, cash and credit, cancellation |
 | [purchases](purchases/spec.md) | M3 | Suppliers, per-supplier cost history, purchases, purchase orders from the reorder suggestion, cancellation |
+| [customers](customers/spec.md) | M4 | Customers, the protected walk-in, credit rules, derived receivables and ageing, receipts that group a handover across sales |
 
 ## Architecture invariants
 
@@ -25,8 +26,10 @@ These hold across every capability and are the rules a new module must respect.
    Concretely: a foreign key from a payment to the transaction it produced is allowed; the reverse
    is not, and finance receives a document number only as an opaque `reference` string.
 3. **Derived state is never stored as truth.** Account balance, product stock, sale total, sale debt,
-   customer balance and reorder suggestion are all computed. A cached column may exist for
-   convenience but is never used to answer a read.
+   customer balance, receivable ageing, reorder suggestion and the total of a receipt are all computed.
+   A cached column may exist for convenience but is never used to answer a read. Where a stored value
+   could contradict its own parts, it must not be stored: a receipt's stored total was removed for exactly
+   that reason after a partial failure was shown to leave it claiming more than it had applied.
 4. **Money and quantities are `Decimal`, stored as `TEXT` in SQLite.** `NUMERIC` affinity would cast
    to `REAL` and silently lose digits, so sums are performed in Rust.
 5. **Every money movement caused by a document is traceable in both directions.** The movement knows
@@ -39,6 +42,17 @@ These hold across every capability and are the rules a new module must respect.
 8. **Document numbering is universal.** `doc_sequences(doc_type, year, last_number)` issues
    `YYYY-TYPE-NNNNNN` numbers on confirmation, never on draft. New document types are a row, not a
    schema change.
+9. **What code cannot be trusted with belongs in the database.** Cross-row invariants are enforced with
+   CHECK constraints, partial unique indexes and triggers, not only in the service layer: the walk-in is
+   permanent, a payment cannot be grouped under another customer's receipt. Where a trigger is used,
+   remember that SQLite does not fire `BEFORE DELETE` triggers for rows removed by REPLACE conflict
+   resolution unless `PRAGMA recursive_triggers` is enabled on the connection, which this project does.
+   The guarantee covers accidental and programmatic writes; it does not cover an actor deliberately
+   dropping the triggers or altering the schema.
+10. **Multi-step operations across modules are not atomic.** The project deliberately does not share a
+    transaction between modules. Every expected rejection is validated before any write, and the residual
+    is detected rather than hidden: a movement whose `reference` looks like a document number must be
+    claimed by a payment as its `transaction_id` or `refund_transaction_id`.
 
 ## Verification
 
