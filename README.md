@@ -1,8 +1,10 @@
-# Roya — Local Personal Finance Tracker
+# Roya — Local Business Manager
 
-Local CRUD for personal finances: 2–3 accounts/wallets, income/expense transactions, derived balances, REST API + HTMX web UI. 100% local, ready to scale.
+Local business manager for a polirrubro (goods and services): sales of products and services, stock, purchases from suppliers with per-supplier cost history, customers with credit and receivable ageing, and the money behind all of it. One SQLite file, a REST API and an HTMX web interface, no cloud and no internet required.
 
-Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + HTMX + rust_decimal + chrono**.
+Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + HTMX 1.9.12 + Tailwind CSS 4.3.3 + rust_decimal + chrono**.
+
+The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CSS 4.3.3** stylesheet are vendored under `static/` and served by Axum, so there is no CDN, no npm and no runtime network dependency. See [Styles & local assets](#styles--local-assets).
 
 ## Features
 
@@ -570,9 +572,9 @@ Navigation: the header links Dashboard, Products, Sales, Customers, Purchases an
 
 ## Styles & local assets
 
-The UI is styled with Tailwind CSS v4 utilities. The source of truth is `assets/tailwind.css`; the compiled stylesheet is committed at `static/tailwind.css`. Both files under `static/` are served by Axum at `/static/*` (`tower-http` `ServeDir` nested in `routes::router`), so the app has no CDN dependencies:
+The UI is styled with **Tailwind CSS 4.3.3** utilities (Tailwind v4 syntax: CSS-first configuration, no `tailwind.config.js`). The source of truth is `assets/tailwind.css`; the compiled stylesheet is committed at `static/tailwind.css`. Both files under `static/` are served by Axum at `/static/*` (`tower-http` `ServeDir` nested in `routes::router`), so the app has no CDN dependencies:
 
-- `static/tailwind.css` — compiled Tailwind stylesheet
+- `static/tailwind.css` — compiled Tailwind 4.3.3 stylesheet (~13 KB, only the classes in use)
 - `static/htmx.min.js` — HTMX 1.9.12
 
 Rebuild the CSS after changing templates or the entrypoint. The standalone Tailwind CLI is a dev-time tool only; it is not a Rust dependency and is not committed:
