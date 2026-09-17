@@ -70,11 +70,29 @@ itself always runs headless; nothing in the repository depends on `--headed`.
 
 ## What it covers
 
-Slice E1 is the harness. `tests/test_harness.py` proves the application starts,
-the dashboard renders, and a barcode scan adds a line to a draft sale with the
-picker coming back empty and focused. Slices E2 and E3 add the picker, filter
-and confirmation flows, and the tests for the three defects that motivated the
-suite.
+Slice E1 is the harness: `tests/test_harness.py` proves the isolated server starts
+and releases its port, a failure leaves openable evidence, and the seed helpers
+refuse a silent no-op.
+
+Slice E2 is the critical flows:
+
+- `tests/test_picker.py` — a barcode scan adds a line in one interaction and the
+  field comes back empty and focused; choosing a result adds the product with the
+  quantity already typed, on both the sale and the purchase record; a value with no
+  exact match is refused with a non-blocking message and no line added; the results
+  announce their match count in a live region; a search is not announced as an added
+  line.
+- `tests/test_filters.py` — each sales-list criterion (status, party, document
+  number, date range) narrows the list on its own, two together narrow it further,
+  and a filter that matches nothing shows the empty state. The URL a filter should
+  carry is deliberately not asserted here: it is slice E3's subject.
+- `tests/test_confirmation.py` — cancelling a sale and discarding a draft ask
+  first; dismissing leaves the record untouched (asserted on the page and through
+  the API), accepting performs the cancellation.
+
+Slice E3 adds the tests for the three defects that motivated the suite: the URL
+not carrying the filter, the results not traversable with the arrow keys, and a
+search in flight looking like an empty result.
 
 It deliberately does **not** verify business rules: balances, stock deduction,
 payment traceability, numbering and the rest stay in the Rust suite, which is

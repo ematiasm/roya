@@ -33,11 +33,11 @@
 - [x] T7: the root README gains a short section on the browser suite and the toolchain it brings
 
 ## Slice E2 — the critical flows
-- [ ] T8: picker tests: scanning adds in one interaction and the field returns empty and focused
+- [x] T8: picker tests: scanning adds in one interaction and the field returns empty and focused
       (AC3); choosing from the results carries the typed quantity (AC4)
-- [ ] T9: filter tests: each criterion narrows the list, and a filter combined with another still narrows
-- [ ] T10: confirmation tests: dismissing the dialog leaves the sale untouched, accepting cancels it (AC8)
-- [ ] T11: the results announce the match count to assistive technology (AC9)
+- [x] T9: filter tests: each criterion narrows the list, and a filter combined with another still narrows
+- [x] T10: confirmation tests: dismissing the dialog leaves the sale untouched, accepting cancels it (AC8)
+- [x] T11: the results announce the match count to assistive technology (AC9)
 
 ## Slice E3 — the three defects, closed
 - [ ] T12: write the test that fails because filtering does not update the URL, show it failing, then fix

@@ -23,9 +23,28 @@
    every keystroke. The picker input describes itself with this status through
    `aria-describedby`. #}
 {% macro line_picker(oob, resource, id, money_target, price_field_id, price_field_name, price_label, price_placeholder, price_kind) %}
+{# Inheritance audit (htmx 1.9.12). htmx resolves most `hx-*` attributes by walking
+   up from the element, so this form's attributes leak into every control inside it.
+   What inherits (`getClosestAttributeValue`): hx-target, hx-swap, hx-select,
+   hx-select-oob, hx-confirm, hx-prompt, hx-encoding, hx-params, hx-push-url,
+   hx-replace-url, hx-sync, hx-boost; list values hx-include, hx-indicator,
+   hx-disabled-elt; merged values hx-vals, hx-vars, hx-headers. What does not:
+   the verb (hx-get/post/put/patch/delete), hx-trigger and hx-on are own-only.
+
+   Here that meant `#product-picker` inherited hx-select="{{ money_target }}" and its
+   own search GET was filtered to an element the search fragment does not contain, so
+   the results container stayed permanently empty in a browser (no HTTP test can see
+   that). `#line-qty` and the price input inherited hx-target/hx-swap/hx-select the
+   same way; they are inert today only because a verb and hx-trigger are not
+   inherited, so the next `hx-get`/`hx-trigger` added there would silently borrow the
+   add-line request. The fix is therefore class-level, not instance-level: the form
+   states which of its request attributes children must not inherit.
+   `#product-picker` keeps its own hx-target/hx-swap, and the qty and price inputs
+   inherit nothing at all. #}
 <div id="line-picker"{% if oob %} hx-swap-oob="true"{% endif %}>
   <form class="flex flex-col gap-2.5" data-action="Add line"
         hx-post="/web/{{ resource }}/{{ id }}/lines"
+        hx-disinherit="hx-select hx-target hx-swap"
         hx-target="{{ money_target }}" hx-swap="outerHTML" hx-select="{{ money_target }}">
     <div>
       <label for="product-picker">Product</label>

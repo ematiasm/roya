@@ -68,8 +68,20 @@
         var button = evt.target.closest ? evt.target.closest('[data-notice-dismiss]') : null;
         if (button) button.closest('[data-notice]').remove();
       });
+      // The notice names the action that actually completed.
+      // Two traps here, both found by driving the picker in a browser:
+      //   1. `detail.elt` is not reliable. When a request swaps the element it came
+      //      from, htmx re-dispatches `htmx:afterRequest` on a surviving ancestor
+      //      (the picker is replaced out of band after a line is added), so the form
+      //      is lost. `requestConfig.elt` is captured before the request and survives.
+      //   2. `closest('form[data-action]')` is too broad. The picker's debounced
+      //      search is issued by an input *inside* the add-line form, so closest()
+      //      made every search announce "Add line saved". Only a form's own submit
+      //      carries its action.
       function actionForm(evt) {
-        return evt.detail.elt && evt.detail.elt.closest ? evt.detail.elt.closest('form[data-action]') : null;
+        var detail = evt.detail || {};
+        var elt = (detail.requestConfig && detail.requestConfig.elt) || detail.elt;
+        return elt && elt.matches && elt.matches('form[data-action]') ? elt : null;
       }
       document.body.addEventListener('htmx:responseError', function (evt) {
         var message = evt.detail.xhr.responseText;

@@ -1,9 +1,10 @@
 """Slice E1: the harness itself, proven end to end.
 
-This module keeps only what proves the harness works: the application starts,
-the dashboard renders, and a barcode scan adds a line to a draft sale with the
-picker coming back empty and focused. The exhaustive picker, filter and
-confirmation flows belong to slices E2 and E3.
+This module keeps only what proves the harness works: the application starts, the
+dashboard and a record page render, the isolated server stops and releases its
+port, a failure writes openable evidence, and the seed helpers refuse a silent
+no-op. The picker, filter and confirmation flows are user behaviour and live in
+their own modules (slices E2 and E3), so this file stays about the harness.
 """
 
 from __future__ import annotations
@@ -32,8 +33,13 @@ from helpers import (
 )
 
 
-def test_dashboard_renders_and_a_scan_adds_a_line(page: Page, api: ApiClient) -> None:
-    """The application boots, renders the dashboard, and a scan adds a line."""
+def test_dashboard_and_record_page_render(page: Page, api: ApiClient) -> None:
+    """The seeded shop boots, renders the dashboard and opens a draft's page.
+
+    This is the harness's own smoke test: it proves the seeded data reaches the
+    interface and the record page renders its picker. The picker's behaviour is
+    asserted where it belongs, in ``test_picker.py``.
+    """
     data = seed_harness_data(api)
 
     page.goto(f"{api.base_url}/")
@@ -41,27 +47,14 @@ def test_dashboard_renders_and_a_scan_adds_a_line(page: Page, api: ApiClient) ->
     expect(page.locator("#total-balance")).to_be_visible()
 
     page.goto(f"{api.base_url}/sales/{data.sale_id}")
-    picker = page.locator("#product-picker")
-    expect(picker).to_be_visible()
-
-    # One interaction: the scanner types the barcode and presses Enter. Nothing
-    # is clicked, and no fixed wait stands in for the line appearing.
-    picker.fill(data.barcode)
-    picker.press("Enter")
-
-    expect(page.locator("#sale-record-money")).to_contain_text(data.product_name)
-    expect(picker).to_have_value("")
-    expect(picker).to_be_focused()
-
-    # The browser and the API agree: the scanned line is persisted, on top of
-    # the line the seed already put on the draft.
+    expect(page.locator("#product-picker")).to_be_visible()
+    # The seed's draft line really renders, so a later "the interaction added a
+    # line" assertion cannot pass on an empty record.
+    expect(page.locator("#sale-record-money table tbody tr")).to_have_count(1)
     detail = api.get_json(f"/api/sales/{data.sale_id}")
-    lines = detail["lines"]
-    assert len(lines) == 2, lines
-    assert {line["product_id"] for line in lines} == {
-        data.sale_line_product_id,
-        data.product_id,
-    }
+    assert [line["product_id"] for line in detail["lines"]] == [
+        data.sale_line_product_id
+    ], detail["lines"]
 
 
 def test_server_stops_and_releases_the_port(live_server) -> None:

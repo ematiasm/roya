@@ -150,6 +150,21 @@ def create_account_with_methods(
     return account_id
 
 
+def payment_method_id(api: ApiClient, account_id: int, name: str = "Cash") -> int:
+    """The catalog id of one payment method, so a seed can confirm a cash sale.
+
+    The id lives in the catalog the account endpoints expose; the allowlist only
+    stores ids, so it cannot be used to resolve a name.
+    """
+    catalog = api.get_json(f"/api/accounts/{account_id}/payment-methods")["methods"]
+    for method in catalog:
+        if method["name"] == name:
+            return int(method["id"])
+    raise SeedError(
+        f"payment method {name!r} is not in the catalog for account {account_id}: {catalog}"
+    )
+
+
 def create_product(
     api: ApiClient,
     *,
@@ -307,6 +322,31 @@ def add_sale_line(
         )
 
 
+def confirm_sale(
+    api: ApiClient, sale_id: int, *, account_id: int, method_id: int
+) -> None:
+    """Confirm a cash draft sale and read the effect back.
+
+    A confirmed sale carries its assigned number and drives the filter and
+    confirmation slices, so a silent transition failure must fail the seed here.
+    """
+    api.post_json(
+        f"/api/sales/{sale_id}/confirm",
+        {"account_id": account_id, "method_id": method_id},
+    )
+    status = api.get_json(f"/api/sales/{sale_id}")["sale"]["status"]
+    if status != "Confirmed":
+        raise SeedError(f"sale {sale_id} status is {status!r}, expected 'Confirmed'")
+
+
+def cancel_sale(api: ApiClient, sale_id: int, *, reason: str | None = None) -> None:
+    """Cancel a draft or confirmed sale and read the effect back."""
+    api.post_json(f"/api/sales/{sale_id}/cancel", {"reason": reason})
+    status = api.get_json(f"/api/sales/{sale_id}")["sale"]["status"]
+    if status != "Cancelled":
+        raise SeedError(f"sale {sale_id} status is {status!r}, expected 'Cancelled'")
+
+
 def create_purchase_draft(
     api: ApiClient,
     supplier_id: int,
@@ -408,4 +448,60 @@ def seed_harness_data(api: ApiClient) -> HarnessData:
         sale_id=sale_id,
         sale_line_product_id=spare_id,
         purchase_id=purchase_id,
+    )
+
+
+@dataclass(frozen=True)
+class FilterDataset:
+    """Three sales that make each list criterion discriminate on its own.
+
+    One draft for ``Filter Alpha``, one confirmed sale for the same customer, and
+    one cancelled sale for ``Filter Beta``; the dates are separate months so the
+    range filter can isolate one of them.
+    """
+
+    draft_id: int
+    confirmed_id: int
+    cancelled_id: int
+    confirmed_number: str
+
+
+def seed_filter_data(api: ApiClient) -> FilterDataset:
+    """Seed the small sales set the filter tests narrow."""
+    account_id = create_account_with_methods(api, "Filter Caja", ("Cash",))
+    method_id = payment_method_id(api, account_id, "Cash")
+    product = create_product(
+        api,
+        sku="FILTER-WIDGET",
+        name="Filter Widget",
+        sale_price="10.00",
+        cost_price="4.00",
+        stock="20",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+
+    alpha_id = create_customer(api, "Filter Alpha")
+    beta_id = create_customer(api, "Filter Beta")
+
+    draft_id = create_sale_draft(api, alpha_id, sale_date="2024-05-01")
+    add_sale_line(api, draft_id, product_id, qty="1")
+
+    confirmed_id = create_sale_draft(api, alpha_id, sale_date="2024-06-01")
+    add_sale_line(api, confirmed_id, product_id, qty="1")
+    confirm_sale(api, confirmed_id, account_id=account_id, method_id=method_id)
+    confirmed_number = str(
+        api.get_json(f"/api/sales/{confirmed_id}")["sale"]["sale_number"]
+    )
+
+    cancelled_id = create_sale_draft(api, beta_id, sale_date="2024-07-01")
+    add_sale_line(api, cancelled_id, product_id, qty="1")
+    cancel_sale(api, cancelled_id, reason="seeded cancellation")
+
+    return FilterDataset(
+        draft_id=draft_id,
+        confirmed_id=confirmed_id,
+        cancelled_id=cancelled_id,
+        confirmed_number=confirmed_number,
     )
