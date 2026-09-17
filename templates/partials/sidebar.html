@@ -1,0 +1,66 @@
+{# Sidebar navigation.
+
+   The active entry is decided on the server: the page's rendering struct carries
+   `nav_key` and this partial compares it, so the state is correct without
+   JavaScript and a test can assert it. Askama cannot read the request path.
+
+   Responsive: full at `lg`, icons only at `md`, drawer below `md` (toggled by
+   `#drawer-toggle` in `base.html`). Every entry keeps `title` so the icon-only
+   layout stays usable. #}
+
+{% macro nav_item(key, href, label, icon_d) %}
+<a href="{{ href }}"
+   data-nav="{{ key }}"
+   {% if nav_key == key %}aria-current="page" data-nav-active="true"{% endif %}
+   title="{{ label }}"
+   class="flex items-center gap-3 rounded-[10px] px-3 py-2 text-sm no-underline hover:no-underline md:justify-center lg:justify-start {% if nav_key == key %}bg-accent/10 font-semibold text-accent{% else %}text-muted hover:bg-card hover:text-text{% endif %}">
+  <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="{{ icon_d }}"/></svg>
+  <span class="truncate md:hidden lg:inline">{{ label }}</span>
+</a>
+{% endmacro %}
+
+<aside id="sidebar" data-sidebar
+       class="fixed top-0 bottom-0 left-0 z-40 flex w-64 -translate-x-full flex-col border-r border-border bg-surface transition-transform duration-200 md:sticky md:bottom-auto md:h-screen md:w-16 md:translate-x-0 lg:w-64">
+  <div class="flex h-14 shrink-0 items-center border-b border-border px-4 md:justify-center md:px-2 lg:justify-start lg:px-4">
+    <a href="/" class="text-lg font-bold tracking-[-0.02em] text-text no-underline hover:no-underline">
+      <span class="md:hidden lg:inline">roya </span><span class="text-accent">◆</span>
+    </a>
+  </div>
+
+  <nav class="flex flex-1 flex-col gap-5 overflow-y-auto px-2 py-4" aria-label="Main navigation">
+    <div data-nav-group="operation">
+      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Operation</div>
+      <div class="flex flex-col gap-0.5">
+        {% call nav_item("dashboard", "/", "Dashboard", "M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75") %}
+        {% call nav_item("sales", "/sales", "Sales", "M2.25 3h1.386c.51 0 .955.343 1.087.835l.383 1.437M7.5 14.25a3 3 0 00-3 3h15.75m-12.75-3h11.218c1.121-2.3 2.1-4.684 2.924-7.138a60.114 60.114 0 00-16.536-1.84M7.5 14.25L5.106 5.272M6 20.25a.75.75 0 11-1.5 0 .75.75 0 011.5 0zm12.75 0a.75.75 0 11-1.5 0 .75.75 0 011.5 0z") %}
+        {% call nav_item("purchases", "/purchases", "Purchases", "M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.129-.504 1.09-1.124a17.902 17.902 0 00-3.213-9.193 2.056 2.056 0 00-1.58-.86H14.25M16.5 18.75h-2.25m0-11.177v-.958c0-.568-.422-1.048-.987-1.106a48.554 48.554 0 00-10.026 0 1.106 1.106 0 00-.987 1.106v7.635m12-6.677v6.677m0 4.5v-4.5m0 0h-12") %}
+      </div>
+    </div>
+
+    <div data-nav-group="catalogue">
+      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Catalogue</div>
+      <div class="flex flex-col gap-0.5">
+        {% call nav_item("products", "/products", "Products", "M21 7.5l-9-5.25L3 7.5m18 0l-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9") %}
+        {% call nav_item("suppliers", "/suppliers", "Suppliers", "M13.5 21v-7.5a.75.75 0 01.75-.75h3a.75.75 0 01.75.75V21m-4.5 0H2.36m11.14 0H18m0 0h3.64m-1.39 0V9.349m-16.5 11.65V9.35m0 0a3.001 3.001 0 003.75-.615A2.993 2.993 0 009.75 9.75c.896 0 1.7-.393 2.25-1.016a2.993 2.993 0 002.25 1.016c.896 0 1.7-.393 2.25-1.016a3.001 3.001 0 003.75.614m-16.5 0a3.004 3.004 0 01-.621-4.72L4.318 3.44A1.5 1.5 0 015.378 3h13.243a1.5 1.5 0 011.06.44l1.19 1.189a3 3 0 01-.621 4.72m-13.5 8.65h3.75a.75.75 0 00.75-.75V13.5a.75.75 0 00-.75-.75H6.75a.75.75 0 00-.75.75v3.75c0 .415.336.75.75.75z") %}
+        {% call nav_item("customers", "/customers", "Customers", "M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z") %}
+      </div>
+    </div>
+
+    <div data-nav-group="cash">
+      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Cash</div>
+      <div class="flex flex-col gap-0.5">
+        {# No accounts page exists yet; the entry points at the dashboard section. #}
+        {% call nav_item("accounts", "/#accounts", "Accounts", "M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5v-.75A.75.75 0 003 15h-.75M15 10.5a3 3 0 11-6 0 3 3 0 016 0zm3 0h.008v.008H18V10.5zm-12 0h.008v.008H6V10.5z") %}
+      </div>
+    </div>
+  </nav>
+
+  {# Secondary shell facts: below navigation, muted, never competing. #}
+  <div class="shrink-0 border-t border-border px-3 py-3 text-[12px] text-muted md:text-center lg:text-left">
+    <div class="truncate md:hidden lg:block">local · SQLite</div>
+    <a href="/api/accounts" target="_blank" rel="noreferrer"
+       class="mt-1 inline-block text-[12px] font-normal text-muted no-underline hover:text-text hover:underline">
+      <span class="md:hidden lg:inline">REST API ↗</span><span class="hidden md:inline lg:hidden">API</span>
+    </a>
+  </div>
+</aside>

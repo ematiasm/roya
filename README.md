@@ -568,7 +568,7 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
-Navigation: the header links Dashboard, Products, Sales, Customers, Purchases and Suppliers; page-level links reach the detail/back views.
+Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases), Catalogue (Products, Suppliers, Customers) and Cash (Accounts, currently the dashboard section). Each page's rendering struct carries a nav key and the server marks the active entry, so the state is correct without JavaScript. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path.
 
 ## Styles & local assets
 

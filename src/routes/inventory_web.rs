@@ -29,6 +29,7 @@ struct ProductsTemplate {
     low_stock: Vec<ProductStock>,
     allow_negative_stock: bool,
     today: String,
+    nav_key: &'static str,
 }
 
 #[derive(Template)]
@@ -87,6 +88,7 @@ async fn products_page(State(state): State<AppState>) -> Result<Html<String>, Ap
         low_stock,
         allow_negative_stock: state.allow_negative_stock,
         today,
+        nav_key: "products",
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,

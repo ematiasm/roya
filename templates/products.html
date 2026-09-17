@@ -1,10 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Roya — Products{% endblock %}
 {% block content %}
-<div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
-  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">inventory • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %}</span>
-</div>
+{% let page_title = "Products" %}
+{% let page_breadcrumb_label = "Catalogue" %}
+{% let page_breadcrumb_href = "" %}
+{% let page_action_href = "#new-product" %}
+{% let page_action_label = "New product" %}
+{% include "partials/page_header.html" %}
+<div class="mb-4 text-[13px] text-muted">inventory • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %}</div>
 <div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
   <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
@@ -46,7 +49,7 @@
   <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
       <h2 class="mb-3 text-lg font-semibold">New Category</h2>
-      <form class="flex flex-col gap-2.5" hx-post="/web/categories" hx-swap="none" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#product-list','refresh'); htmx.ajax('GET','/web/category-options','#filter-category'); }">
+      <form class="flex flex-col gap-2.5" data-action="Create category" hx-post="/web/categories" hx-swap="none" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#product-list','refresh'); htmx.ajax('GET','/web/category-options','#filter-category'); }">
         <div>
           <label>Name</label>
           <input type="text" name="name" placeholder="Beverages, Services…" required maxlength="128" />
@@ -60,9 +63,9 @@
       </form>
     </div>
 
-    <div class="rounded-2xl border border-border bg-card p-5">
+    <div class="rounded-2xl border border-border bg-card p-5" id="new-product">
       <h2 class="mb-3 text-lg font-semibold">New Product</h2>
-      <form class="flex flex-col gap-2.5" hx-post="/web/products" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
+      <form class="flex flex-col gap-2.5" data-action="Create product" hx-post="/web/products" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
         <div>
           <label>SKU</label>
           <input type="text" name="sku" placeholder="YERBA-500" required maxlength="64" />
@@ -118,7 +121,7 @@
 
     <div class="rounded-2xl border border-border bg-card p-5">
       <h2 class="mb-3 text-lg font-semibold">Stock Movement</h2>
-      <form class="flex flex-col gap-2.5" hx-post="/web/stock-movements" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
+      <form class="flex flex-col gap-2.5" data-action="Record movement" hx-post="/web/stock-movements" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
         <div>
           <label>Product ID</label>
           <input type="number" name="product_id" required min="1" placeholder="1" />

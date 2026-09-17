@@ -39,6 +39,7 @@ struct SalesTemplate {
     allow_negative: bool,
     allow_negative_stock: bool,
     today: String,
+    nav_key: &'static str,
 }
 
 #[derive(Template)]
@@ -147,6 +148,7 @@ async fn sales_page(State(state): State<AppState>) -> Result<Html<String>, AppEr
         allow_negative: state.allow_negative,
         allow_negative_stock: state.allow_negative_stock,
         today,
+        nav_key: "sales",
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,

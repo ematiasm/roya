@@ -438,13 +438,27 @@ fn form_regions(html: &str) -> Vec<&str> {
     out
 }
 
-/// Value of a double-quoted attribute inside an HTML tag.
+/// Value of a double-quoted attribute inside an HTML tag. The attribute name must
+/// start at the tag or after whitespace, so `data-action` is not read as
+/// `action` and `hx-method` is not read as `method`.
 fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
     let needle = format!("{name}=\"");
-    let start = tag.find(&needle)?;
-    let after = &tag[start + needle.len()..];
-    let end = after.find('"')?;
-    Some(&after[..end])
+    let mut offset = 0;
+    while let Some(found) = tag[offset..].find(&needle) {
+        let start = offset + found;
+        let at_boundary = tag[..start]
+            .chars()
+            .next_back()
+            .map(|c| c.is_ascii_whitespace())
+            .unwrap_or(true);
+        if at_boundary {
+            let after = &tag[start + needle.len()..];
+            let end = after.find('"')?;
+            return Some(&after[..end]);
+        }
+        offset = start + needle.len();
+    }
+    None
 }
 
 fn htmx_targets_in(html: &str) -> Vec<(String, String, String)> {
@@ -2155,6 +2169,21 @@ fn wiring_guard_catches_dead_native_form_action_rewrite() {
     assert!(err.contains("this.action"), "{err}");
 }
 
+/// `data-action` names the failed action for the `#notice` region. It is not a
+/// native form `action`, so the guard must not read it as one and probe
+/// "Create product" as a URL.
+#[test]
+fn wiring_guard_does_not_read_data_action_as_a_native_action() {
+    let html = r#"<form data-action="Create product" hx-post="/web/products"></form>"#;
+    let forms = extract_rendered_forms(html);
+    assert_eq!(forms.len(), 1);
+    assert_eq!(
+        forms[0].action, None,
+        "data-action is a notice label, not an action URL"
+    );
+    check_rendered_wiring_shape("notice", html, false).unwrap();
+}
+
 /// Blind spot 2: the dead target `/web/sales/does-not-exist` matches the
 /// path-param route `GET /web/sales/{id}`, so an OPTIONS probe saw 405 and the
 /// guard called it wired. Probing the real POST verb sees 405 too, which fails.
@@ -2635,3 +2664,245 @@ async fn money_invariant_catches_orphan_document_movement() {
     assert_eq!(dec(&detail["paid"]), Decimal::ZERO, "the orphan paid nothing");
     assert_eq!(dec(&detail["due"]), dec(&detail["total"]));
 }
+
+// ---------------------------------------------------------------------------
+// Shell: sidebar, page header and non-blocking feedback (redesign-interface N1a)
+// ---------------------------------------------------------------------------
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// `alert(` as a call, not the `price_alert(` method name.
+fn contains_bare_alert(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(position) = rest.find("alert(") {
+        let preceded_by_identifier = rest[..position]
+            .chars()
+            .next_back()
+            .map(|c| c.is_alphanumeric() || c == '_')
+            .unwrap_or(false);
+        if !preceded_by_identifier {
+            return true;
+        }
+        rest = &rest[position + "alert(".len()..];
+    }
+    false
+}
+
+/// The opening tag of the sidebar entry the server marked active.
+fn active_nav_tag(html: &str) -> &str {
+    let marker = html
+        .find("aria-current=\"page\"")
+        .unwrap_or_else(|| panic!("no sidebar entry is marked active: {html:.600}"));
+    let start = html[..marker]
+        .rfind('<')
+        .expect("the active marker must sit inside a tag");
+    let end = marker
+        + html[marker..]
+            .find('>')
+            .expect("unterminated active nav tag");
+    &html[start..=end]
+}
+
+/// Value of `data-nav` on the active sidebar entry.
+fn active_nav_key(html: &str) -> String {
+    let tag = active_nav_tag(html);
+    let start = tag
+        .find("data-nav=\"")
+        .expect("the active entry must carry a data-nav key")
+        + "data-nav=\"".len();
+    let rest = &tag[start..];
+    let end = rest.find('"').expect("unterminated data-nav attribute");
+    rest[..end].to_string()
+}
+
+#[test]
+fn template_suite_never_calls_the_blocking_alert() {
+    fn collect(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("templates directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                collect(&path, offenders);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("html") {
+                let text = std::fs::read_to_string(&path).expect("read template");
+                if contains_bare_alert(&text) {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    collect(std::path::Path::new("templates"), &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "alert() is blocking and must be replaced by the #notice region: {offenders:?}"
+    );
+}
+
+#[tokio::test]
+async fn sidebar_marks_the_active_entry_from_the_server_on_every_page() {
+    let (app, pool) = test_app().await;
+    let fixture = seed_wiring_fixture(&app, &pool).await;
+    let pages = [
+        ("dashboard", "/".to_string(), "dashboard"),
+        ("products", "/products".to_string(), "products"),
+        ("sales", "/sales".to_string(), "sales"),
+        ("purchases", "/purchases".to_string(), "purchases"),
+        ("suppliers", "/suppliers".to_string(), "suppliers"),
+        ("customers", "/customers".to_string(), "customers"),
+        (
+            "account detail",
+            format!("/accounts/{}", fixture.account),
+            "accounts",
+        ),
+        (
+            "customer statement",
+            format!("/customers/{}", fixture.customer),
+            "customers",
+        ),
+    ];
+    for (label, path, expected) in pages {
+        let (status, html) = get(&app, &path).await;
+        assert_eq!(status, StatusCode::OK, "{label} {path}: {html:.400}");
+        assert_eq!(
+            count_occurrences(&html, "aria-current=\"page\""),
+            1,
+            "{label}: exactly one sidebar entry must be active"
+        );
+        let active = active_nav_tag(&html);
+        assert!(
+            active.contains("data-nav-active=\"true\""),
+            "{label}: the active entry needs a machine-checkable marker: {active}"
+        );
+        assert!(
+            active.contains("text-accent"),
+            "{label}: the active entry must be visually distinct: {active}"
+        );
+        assert_eq!(active_nav_key(&html), expected, "{label} {path}");
+    }
+}
+
+#[tokio::test]
+async fn sidebar_groups_navigation_into_operation_catalogue_and_cash() {
+    let (app, _pool) = test_app().await;
+    let (status, html) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Groups render in the documented order.
+    let mut cursor = 0;
+    for group in ["operation", "catalogue", "cash"] {
+        let needle = format!("data-nav-group=\"{group}\"");
+        let found = html[cursor..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("group {group} missing or out of order: {html:.600}"));
+        cursor += found + needle.len();
+    }
+
+    // Every destination renders exactly once.
+    for key in [
+        "dashboard",
+        "sales",
+        "purchases",
+        "products",
+        "suppliers",
+        "customers",
+        "accounts",
+    ] {
+        assert_eq!(
+            count_occurrences(&html, &format!("data-nav=\"{key}\"")),
+            1,
+            "nav key {key} must render exactly once"
+        );
+    }
+
+    // Secondary shell facts stay available but below navigation.
+    assert!(html.contains("local · SQLite"), "environment line missing");
+    assert!(
+        html.contains("href=\"/api/accounts\""),
+        "REST API link missing"
+    );
+    assert!(
+        html.contains("href=\"/#accounts\""),
+        "accounts has no page yet: the entry must point at the dashboard section"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_and_products_use_the_page_header_component() {
+    let (app, _pool) = test_app().await;
+    for (path, title, action) in [
+        ("/", "Dashboard", "#new-transaction"),
+        ("/products", "Products", "#new-product"),
+    ] {
+        let (status, html) = get(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            count_occurrences(&html, "data-page-header"),
+            1,
+            "{path}: exactly one page header"
+        );
+        assert!(
+            html.contains(&format!("data-page-title>{title}</h1>")),
+            "{path}: page title missing: {html:.400}"
+        );
+        assert_eq!(
+            count_occurrences(&html, "data-page-action"),
+            1,
+            "{path}: exactly one primary action"
+        );
+        assert!(
+            html.contains(&format!("href=\"{action}\"")),
+            "{path}: primary action must target {action}"
+        );
+        assert!(
+            html.contains(&format!("id=\"{}\"", &action[1..])),
+            "{path}: primary action target {action} must exist on the page"
+        );
+    }
+
+    // Products is a catalogue list: the optional breadcrumb is visible.
+    let (_, products) = get(&app, "/products").await;
+    assert!(
+        products.contains("data-page-breadcrumb"),
+        "products must show the Catalogue breadcrumb"
+    );
+    let (_, dashboard) = get(&app, "/").await;
+    assert!(
+        !dashboard.contains("data-page-breadcrumb"),
+        "dashboard is top level: no breadcrumb"
+    );
+}
+
+#[tokio::test]
+async fn converted_pages_expose_the_notice_region_and_named_actions() {
+    let (app, _pool) = test_app().await;
+
+    let (status, dashboard) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(dashboard.contains("id=\"notice\""), "notice region missing");
+    assert!(
+        dashboard.contains("data-action=\"Create account\""),
+        "the create-account form must name its action: {dashboard:.400}"
+    );
+    assert!(
+        dashboard.contains("data-action=\"Add transaction\""),
+        "the add-transaction form must name its action"
+    );
+
+    let (status, products) = get(&app, "/products").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(products.contains("id=\"notice\""), "notice region missing");
+    for action in ["Create category", "Create product", "Record movement"] {
+        assert!(
+            products.contains(&format!("data-action=\"{action}\"")),
+            "form action {action:?} must be named for the notice"
+        );
+    }
+
+    assert!(
+        !contains_bare_alert(&dashboard),
+        "the served shell must not call alert()"
+    );
+}
+

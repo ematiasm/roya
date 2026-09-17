@@ -29,6 +29,7 @@ struct DashboardTemplate {
     today: String,
     methods: Vec<PaymentMethod>,
     accounts_without_methods: AccountsWithoutMethods,
+    nav_key: &'static str,
 }
 
 #[derive(Template)]
@@ -39,6 +40,7 @@ struct AccountDetailTemplate {
     allow_negative: bool,
     methods: Vec<PaymentMethodOption>,
     has_methods: bool,
+    nav_key: &'static str,
 }
 
 #[derive(Template)]
@@ -120,6 +122,7 @@ async fn dashboard(
         today,
         methods,
         accounts_without_methods,
+        nav_key: "dashboard",
     };
     Ok(Html(tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?))
 }
@@ -140,6 +143,7 @@ async fn account_detail(
         allow_negative: state.allow_negative,
         methods,
         has_methods,
+        nav_key: "accounts",
     };
     let html = tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?;
 

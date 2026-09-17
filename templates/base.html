@@ -3,34 +3,92 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>{% block title %}Roya — Personal Finance{% endblock %}</title>
+  <title>{% block title %}Roya{% endblock %}</title>
   <link rel="stylesheet" href="/static/tailwind.css" />
   <script src="/static/htmx.min.js"></script>
   {% block head %}{% endblock %}
 </head>
 <body class="bg-bg font-sans text-text">
-  <div class="mx-auto max-w-[1080px] px-6 py-6">
-    <header class="mb-6 flex flex-wrap items-center justify-between gap-3">
-      <h1 class="m-0 text-[28px] font-bold tracking-[-0.02em]"><a href="/" class="text-inherit no-underline hover:no-underline">roya <span class="text-accent">◆</span></a></h1>
-      <nav class="flex flex-wrap items-center gap-2">
-        <a class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted" href="/">Dashboard</a>
-        <a class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted" href="/products">Products</a>
-        <a class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted" href="/sales">Sales</a>
-            <a class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted" href="/customers">Customers</a>
-        <a class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted" href="/purchases">Purchases</a>
-        <a class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted" href="/suppliers">Suppliers</a>
-        <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">local • SQLite • HTMX</span>
-        <a class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted" href="/api/accounts" target="_blank">REST API</a>
-      </nav>
-    </header>
-    {% block content %}{% endblock %}
+  <div class="flex min-h-screen">
+    {% include "partials/sidebar.html" %}
+
+    <div class="flex min-w-0 flex-1 flex-col">
+      <!-- Mobile header: the drawer toggle lives here, below md only. -->
+      <header class="sticky top-0 z-30 flex items-center gap-3 border-b border-border bg-bg px-4 py-3 md:hidden">
+        <button id="drawer-toggle" type="button" data-drawer-toggle
+                class="rounded-[10px] border border-border bg-card p-2 text-text"
+                aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">
+          <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h16.5"/></svg>
+        </button>
+        <a href="/" class="text-lg font-bold tracking-[-0.02em] text-text no-underline hover:no-underline">roya <span class="text-accent">◆</span></a>
+      </header>
+
+      <main class="mx-auto w-full max-w-[1080px] flex-1 px-4 py-6 lg:px-8">
+        <div id="notice" data-notice-region aria-live="polite"></div>
+        {% block content %}{% endblock %}
+      </main>
+    </div>
   </div>
+
   <script>
-    document.body.addEventListener('htmx:responseError', function(evt){
-      try { let r=JSON.parse(evt.detail.xhr.responseText); alert(r.error||evt.detail.xhr.responseText);} catch(e){ alert(evt.detail.xhr.responseText); }
-    });
-    document.body.addEventListener('transaction-created', function(){ htmx.trigger('#account-list','refresh'); });
-    document.body.addEventListener('transaction-deleted', function(){ htmx.trigger('#account-list','refresh'); });
+    (function () {
+      // Drawer: the sidebar is off-canvas below md; the toggle and Escape close it.
+      var sidebar = document.getElementById('sidebar');
+      var toggle = document.getElementById('drawer-toggle');
+      function drawer(open) {
+        if (!sidebar || !toggle) return;
+        sidebar.classList.toggle('-translate-x-full', !open);
+        toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      }
+      if (toggle) toggle.addEventListener('click', function () { drawer(sidebar.classList.contains('-translate-x-full')); });
+      document.addEventListener('keydown', function (evt) { if (evt.key === 'Escape') drawer(false); });
+      if (sidebar) sidebar.addEventListener('click', function (evt) { if (evt.target.closest && evt.target.closest('a')) drawer(false); });
+
+      function el(tag, attrs, text) {
+        var node = document.createElement(tag);
+        for (var key in attrs) node.setAttribute(key, attrs[key]);
+        node.textContent = text;
+        return node;
+      }
+      // Notice: non-blocking feedback region; replaces the old blocking browser dialog.
+      function notice(kind, text) {
+        var region = document.getElementById('notice');
+        if (!region) return;
+        var box = document.createElement('div');
+        box.className = kind === 'error'
+          ? 'mb-4 flex items-start justify-between gap-3 rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger'
+          : 'mb-4 flex items-start justify-between gap-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3 text-sm text-accent';
+        box.setAttribute('data-notice', kind);
+        box.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+        box.appendChild(el('div', { class: 'min-w-0 flex-1 break-words' }, text));
+        box.appendChild(el('button', { type: 'button', class: 'shrink-0 rounded border border-current px-2 py-0.5 text-xs', 'data-notice-dismiss': 'true', 'aria-label': 'Dismiss' }, '✕'));
+        region.replaceChildren(box);
+      }
+      document.addEventListener('click', function (evt) {
+        var button = evt.target.closest ? evt.target.closest('[data-notice-dismiss]') : null;
+        if (button) button.closest('[data-notice]').remove();
+      });
+      function actionForm(evt) {
+        return evt.detail.elt && evt.detail.elt.closest ? evt.detail.elt.closest('form[data-action]') : null;
+      }
+      document.body.addEventListener('htmx:responseError', function (evt) {
+        var message = evt.detail.xhr.responseText;
+        try { message = JSON.parse(message).error || message; } catch (e) { /* keep the raw body */ }
+        var form = actionForm(evt);
+        var action = form ? form.getAttribute('data-action')
+          : (evt.detail.pathInfo && evt.detail.pathInfo.requestPath) || 'The request';
+        notice('error', action + ' failed — ' + message);
+      });
+      document.body.addEventListener('htmx:afterRequest', function (evt) {
+        if (!evt.detail.successful) return;
+        var form = actionForm(evt);
+        if (form) notice('success', form.getAttribute('data-action') + ' saved');
+      });
+
+      // Existing cross-region refreshes.
+      document.body.addEventListener('transaction-created', function(){ htmx.trigger('#account-list','refresh'); });
+      document.body.addEventListener('transaction-deleted', function(){ htmx.trigger('#account-list','refresh'); });
+    })();
   </script>
 </body>
 </html>
