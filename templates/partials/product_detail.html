@@ -27,20 +27,23 @@
     <div class="text-[13px] text-muted">stock {{ stock }}{% if let Some(min) = product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = product.max_stock %} • max {{ max }}{% endif %}</div>
 
     {# Lifecycle actions live beside the header like the customers drawer: hidden
-       id, POST, list swap, drawer closes only when the request succeeded. #}
+       id, POST, list swap, drawer closes only when the request succeeded. The
+       three forms carry the catalogue filter (`hx-include` merges
+       `#product-filters` into the body): the answer renders the list, so it
+       must render the list the operator is looking at (issue #33). #}
     <div class="mt-4 flex items-center gap-2">
       {% if product.is_active %}
-      <form hx-post="/web/products/deactivate" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+      <form hx-post="/web/products/deactivate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
         <input type="hidden" name="product_id" value="{{ product.id }}" />
         <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Deactivate</button>
       </form>
       {% else %}
-      <form hx-post="/web/products/activate" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+      <form hx-post="/web/products/activate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
         <input type="hidden" name="product_id" value="{{ product.id }}" />
         <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Activate</button>
       </form>
       {% endif %}
-      <form hx-post="/web/products/delete" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+      <form hx-post="/web/products/delete" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
         <input type="hidden" name="product_id" value="{{ product.id }}" />
         <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Delete</button>
       </form>

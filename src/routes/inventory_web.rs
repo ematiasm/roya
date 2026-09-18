@@ -428,10 +428,18 @@ pub struct PreferredCostForm {
 }
 
 /// Shared hidden-id form for the drawer lifecycle actions (activate/deactivate/
-/// delete). Never a concrete id in the path, like the customers drawer.
+/// delete). Never a concrete id in the path, like the customers drawer. The
+/// catalogue filter rides along via `hx-include="#product-filters"`: the
+/// answer renders the list, so it must render the list the operator is looking
+/// at (issue #33). The form owns only `product_id`, so the filter keys cannot
+/// collide with it.
 #[derive(Debug, Deserialize)]
 pub struct ProductIdForm {
     pub product_id: i64,
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub category_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -616,10 +624,12 @@ async fn web_create_movement(
 
 /// Drawer edit: build a full patch from the form (it always sends every
 /// field), then answer per caller — the drawer target gets the fresh
-/// fragment, other HTMX callers get the list, a plain browser the redirect.
+/// fragment, other HTMX callers get the list the caller is looking at, a
+/// plain browser the redirect.
 async fn web_edit_product(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(filter): Query<WebProductFilter>,
     Form(form): Form<EditProductForm>,
 ) -> Result<axum::response::Response, AppError> {
     let kind: ProductKind = if form.kind.trim().is_empty() {
@@ -693,7 +703,16 @@ async fn web_edit_product(
                 "product-saved",
             ));
         }
-        let products = all_product_stocks(&state).await?;
+        // The non-drawer branch takes the catalogue filter from the query
+        // string, not the body: the form body already carries the product's
+        // own `category_id`, so a body-borne filter would collide with that
+        // key, and this branch has no in-repo caller today (issue #33 keeps it
+        // filter-honest anyway).
+        let (query, category_id) = filter.parsed();
+        let products = state
+            .inventory_service
+            .filter_products(&query, category_id)
+            .await?;
         let html = ProductListPartial { products }
             .render()
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -785,7 +804,7 @@ async fn web_activate_product(
         .inventory_service
         .set_product_active(form.product_id, true)
         .await?;
-    product_lifecycle_response(&state, &headers).await
+    product_lifecycle_response(&state, &headers, &form).await
 }
 
 async fn web_deactivate_product(
@@ -797,7 +816,7 @@ async fn web_deactivate_product(
         .inventory_service
         .set_product_active(form.product_id, false)
         .await?;
-    product_lifecycle_response(&state, &headers).await
+    product_lifecycle_response(&state, &headers, &form).await
 }
 
 async fn web_delete_product(
@@ -806,17 +825,31 @@ async fn web_delete_product(
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
     state.inventory_service.delete_product(form.product_id).await?;
-    product_lifecycle_response(&state, &headers).await
+    product_lifecycle_response(&state, &headers, &form).await
 }
 
 /// The shared answer for the lifecycle actions: list fragment + trigger for
-/// HTMX callers, redirect for plain browsers.
+/// HTMX callers, redirect for plain browsers. The fragment honours the
+/// catalogue filter the caller is looking at — the forms carry
+/// `#product-filters`, and an unfiltered answer here is one dropped trigger
+/// away from a list that disagrees with its own filter controls (issue #33).
 async fn product_lifecycle_response(
     state: &AppState,
     headers: &HeaderMap,
+    form: &ProductIdForm,
 ) -> Result<axum::response::Response, AppError> {
     if is_htmx(headers) {
-        let products = all_product_stocks(state).await?;
+        // The same lenient parsing as the page: empty strings mean "no
+        // constraint", so a filterless caller keeps the whole catalogue.
+        let filter = WebProductFilter {
+            q: Some(form.q.clone()),
+            category_id: Some(form.category_id.clone()),
+        };
+        let (query, category_id) = filter.parsed();
+        let products = state
+            .inventory_service
+            .filter_products(&query, category_id)
+            .await?;
         let html = ProductListPartial { products }
             .render()
             .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -1187,7 +1220,7 @@ mod tests {
     async fn web_edit_product_from_drawer_answers_fragment_and_trigger() {
         let state = test_state().await;
         let product = seed_tracked_product(&state, "EDIT-WEB").await;
-        let app = crate::routes::router(state);
+        let app = crate::routes::router(state.clone());
 
         let body = format!(
             "id={}&sku=EDIT-WEB-2&name=Edited+via+drawer&kind=Product&unit=kg&sale_price=20.50&cost_price=8&category_id=&track_stock=1&min_stock=2&max_stock=80&location=shelf+3&notes=edited",
@@ -1241,6 +1274,78 @@ mod tests {
         assert!(
             !trigger.contains("product-saved"),
             "non-drawer save must not fire product-saved, got {trigger:?}"
+        );
+
+        // Issue #33: the non-drawer branch must honour the catalogue filter too.
+        // The filter rides the query string, not the body: the form body already
+        // carries the product's own `category_id`, so the keys would collide.
+        let cat_a = state
+            .inventory_service
+            .create_category("Edit Cat A", None)
+            .await
+            .unwrap();
+        let cat_b = state
+            .inventory_service
+            .create_category("Edit Cat B", None)
+            .await
+            .unwrap();
+        let _other = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "EDIT-OTHER".into(),
+                name: "other EDIT-OTHER".into(),
+                kind: ProductKind::Product,
+                category_id: Some(cat_b.id),
+                unit: "un".into(),
+                sale_price: Decimal::from(10),
+                cost_price: Decimal::from(2),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        // The body keeps the product in cat_a so the query filter can select it.
+        let filtered_body = format!(
+            "id={}&sku=EDIT-WEB-2&name=Edited+via+drawer&kind=Product&unit=kg&sale_price=20.50&cost_price=8&category_id={}&track_stock=1&min_stock=2&max_stock=80&location=shelf+3&notes=edited",
+            product.id, cat_a.id
+        );
+        let (status, headers, html) = post_form_full(
+            app.clone(),
+            &format!("/web/products/edit?category_id={}", cat_a.id),
+            &filtered_body,
+            &[("HX-Target", "product-list")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("EDIT-WEB-2"),
+            "filtered non-drawer answer must hold the edited row: {html:.400}"
+        );
+        assert!(
+            !html.contains("EDIT-OTHER"),
+            "filtered non-drawer answer must not hold the other category's row: {html:.400}"
+        );
+        assert!(
+            hx_trigger(&headers).contains("product-changed"),
+            "filtered non-drawer answer must fire product-changed, got {:?}",
+            hx_trigger(&headers)
+        );
+
+        // Without the query the non-drawer answer is still the full catalogue.
+        let (status, _, html) = post_form_full(
+            app.clone(),
+            "/web/products/edit",
+            &filtered_body,
+            &[("HX-Target", "product-list")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("EDIT-WEB-2") && html.contains("EDIT-OTHER"),
+            "unfiltered non-drawer answer must cover the whole catalogue: {html:.400}"
         );
 
         // A plain browser post is a redirect to the page.
@@ -1516,18 +1621,67 @@ mod tests {
 
     /// Activate/deactivate/delete post with a hidden product_id and answer the
     /// list fragment with `product-changed`; delete of a product with movements
-    /// stays a 400 and the row survives.
+    /// stays a 400 and the row survives. The fragment must be the list the
+    /// caller is looking at (issue #33): a filter riding the body narrows the
+    /// answer to that category, and without one the whole catalogue comes back.
     #[tokio::test]
     async fn web_product_lifecycle_actions() {
         let state = test_state().await;
-        let product = seed_tracked_product(&state, "LIFE-WEB").await;
+        let cat_a = state
+            .inventory_service
+            .create_category("Life Cat A", None)
+            .await
+            .unwrap();
+        let cat_b = state
+            .inventory_service
+            .create_category("Life Cat B", None)
+            .await
+            .unwrap();
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "LIFE-WEB".into(),
+                name: "prod LIFE-WEB".into(),
+                kind: ProductKind::Product,
+                category_id: Some(cat_a.id),
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::from(2)),
+                max_stock: Some(Decimal::from(50)),
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let other = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "LIFE-OTHER".into(),
+                name: "prod LIFE-OTHER".into(),
+                kind: ProductKind::Product,
+                category_id: Some(cat_b.id),
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::from(2)),
+                max_stock: Some(Decimal::from(50)),
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
         let app = crate::routes::router(state.clone());
 
-        // Deactivate: the flag flips and the list fragment comes back.
+        // Deactivate with the catalogue filter in the body: the flag flips and
+        // the answer is the filtered list fragment, still firing the trigger.
+        let body = format!("product_id={}&category_id={}", product.id, cat_a.id);
         let (status, headers, html) = post_form_full(
             app.clone(),
             "/web/products/deactivate",
-            &format!("product_id={}", product.id),
+            &body,
             &[("HX-Target", "product-list")],
         )
         .await;
@@ -1537,6 +1691,14 @@ mod tests {
             "must answer the list fragment: {html:.400}"
         );
         assert!(
+            html.contains("LIFE-WEB"),
+            "filtered answer must hold the product's row: {html:.400}"
+        );
+        assert!(
+            !html.contains("LIFE-OTHER"),
+            "filtered answer must not hold the other category's row: {html:.400}"
+        );
+        assert!(
             hx_trigger(&headers).contains("product-changed"),
             "must fire product-changed, got {:?}",
             hx_trigger(&headers)
@@ -1544,8 +1706,8 @@ mod tests {
         let after = state.inventory_service.get_product(product.id).await.unwrap();
         assert!(!after.is_active, "deactivate must flip is_active");
 
-        // Activate flips it back.
-        let (status, _, _) = post_form_full(
+        // Activate without a filter: the answer is still the whole catalogue.
+        let (status, _, html) = post_form_full(
             app.clone(),
             "/web/products/activate",
             &format!("product_id={}", product.id),
@@ -1553,20 +1715,24 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("LIFE-WEB") && html.contains("LIFE-OTHER"),
+            "unfiltered answer must cover the whole catalogue: {html:.400}"
+        );
         let after = state.inventory_service.get_product(product.id).await.unwrap();
         assert!(after.is_active, "activate must flip is_active back");
 
         // Delete without movements: gone.
-        let plain = seed_tracked_product(&state, "LIFE-DEL").await;
+        let plain_id = other.id;
         let (status, _, _) = post_form_full(
             app.clone(),
             "/web/products/delete",
-            &format!("product_id={}", plain.id),
+            &format!("product_id={}", plain_id),
             &[],
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = get_html(app.clone(), &format!("/web/products/detail/{}", plain.id)).await;
+        let (status, _) = get_html(app.clone(), &format!("/web/products/detail/{}", plain_id)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Delete with movements: 400, row survives.
