@@ -236,16 +236,36 @@ ser byte a byte idéntico (PR #32). Regla para el futuro: no usar palabras suelt
 que sean utilidades de Tailwind en la prosa de los templates.
 
 ## Follow-ups abiertos
-- Tres respuestas HTMX listan el catálogo completo e ignoran el filtro activo: la
-  rama no-drawer de `POST /web/products/edit` y `product_lifecycle_response`
-  (activate/deactivate/delete). Verificado en el navegador: el swap sin filtro es
-  transitorio porque el trigger `product-changed` re-consulta con el filtro y gana,
-  así que hoy no es visible para el usuario; queda como trampa latente y como
-  request redundante. Issue #33.
+- Cuatro respuestas HTMX más siguen listando el catálogo completo e ignorando el
+  filtro activo: `web_create_product`, `web_create_movement`,
+  `web_record_product_cost` y `web_set_preferred_cost` (todas verificadas por el
+  verificador independiente que revisó el fix de #33). Cada una queda enmascarada
+  por su trigger (`product-created`, `movement-created`,
+  `product-cost-recorded`), así que es latente, no visible. El caso de
+  `web_create_product` además tiene una decisión de producto pendiente: si el
+  filtro activo no matchea el producto recién creado, la lista correcta no lo
+  muestra y el operador puede creer que el alta falló. Issue de seguimiento
+  abierta al cerrar #33.
 - Los 4 hallazgos informativos del review nativo (ver la entrega), sin
   descripción recuperable.
 - Ejemplo `curl` del `PUT /api/products/{id}` en el README: hecho en el PR de docs
   de este mismo cierre.
+
+## Fix #33 (2026-09-18, post-entrega)
+Las dos respuestas que la issue #33 delimitó (la rama no-drawer de
+`POST /web/products/edit` y `product_lifecycle_response`) ahora honran el filtro
+que el caller está mirando: las formas de ciclo de vida del drawer mandan
+`hx-include="#product-filters"` (htmx lo mergea en el body del POST, y
+`ProductIdForm` gana `q` + `category_id` con `serde(default)`, sin colisión
+porque el form solo tiene `product_id`), y la rama no-drawer del edit lo lee del
+query string (el body ya lleva el `category_id` del producto, así que no puede
+viajar ahí). El parseo lenient de `WebProductFilter::parsed` mantiene el
+contrato: sin filtro, catálogo completo.
+
+No-vacuidad verificada rompiendo el filtrado a propósito: el test Rust de
+ciclo de vida y el e2e nuevo fallan los dos. Verificación independiente final:
+`cargo test` 350, `cargo check --all-targets` 0 errores, `scripts/e2e.sh` 54
+passed / 4 skipped.
 
 ## Next step
 - Nada pendiente de este feature. Los follow-ups de arriba viven en sus issues.

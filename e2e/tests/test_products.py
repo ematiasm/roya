@@ -477,6 +477,117 @@ def test_refresh_button_respects_the_active_catalogue_filter(
     expect(page.locator('#product-filters input[name="q"]')).to_have_value("Refresh")
 
 
+def test_drawer_deactivate_under_a_category_filter_keeps_the_filtered_list(
+    page: Page, api: ApiClient
+) -> None:
+    """Deactivating from the drawer must answer the list the operator is looking at.
+
+    Issue #33: the drawer's lifecycle posts rendered the whole catalogue back
+    into ``#product-list``; the ``product-changed`` trigger then re-fetched with
+    the filter and masked the wrong render, so the operator never saw it — but
+    the wasted unfiltered render was one dropped trigger away from a list that
+    silently disagrees with its own filter controls, the exact defect the
+    Refresh button already had. The drawer forms carry ``#product-filters`` and
+    the lifecycle answer honours it: the drawer closes, the list still holds
+    exactly the filtered row, and every ``/web/products`` GET issued during the
+    flow carries the active filter (collected with ``page.on("request")``).
+
+    Seeding goes through the real JSON API because the shared helper pins
+    ``category_id`` to ``None``; two categories make the filter unambiguous.
+    """
+    cat_alpha = api.post_json("/api/categories", {"name": "Drawer Cat Alpha", "parent_id": None})
+    cat_beta = api.post_json("/api/categories", {"name": "Drawer Cat Beta", "parent_id": None})
+    product = api.post_json(
+        "/api/products",
+        {
+            "sku": "DEACT-SKU-15",
+            "name": "Deactivate Widget",
+            "kind": "Product",
+            "category_id": cat_alpha["id"],
+            "unit": "un",
+            "sale_price": "25.00",
+            "cost_price": "10.00",
+            "track_stock": True,
+            "min_stock": "1",
+            "max_stock": "100",
+            "location": None,
+            "notes": None,
+        },
+    )
+    api.post_json(
+        "/api/products",
+        {
+            "sku": "DEACT-OTHER-16",
+            "name": "Deactivate Other Widget",
+            "kind": "Product",
+            "category_id": cat_beta["id"],
+            "unit": "un",
+            "sale_price": "25.00",
+            "cost_price": "10.00",
+            "track_stock": True,
+            "min_stock": "1",
+            "max_stock": "100",
+            "location": None,
+            "notes": None,
+        },
+    )
+    product_id = int(product["id"])
+    category_id = int(cat_alpha["id"])
+    _open_products_list(page, api, name="Deactivate Widget")
+
+    # Collect every /web/products GET from the moment the filter goes active, so
+    # the flow's requests are the filtered ones and any unfiltered one fails.
+    product_list_gets: list[str] = []
+
+    def _record_list_get(request) -> None:
+        parsed = urlparse(request.url)
+        if parsed.path == _PRODUCTS_LIST and request.method == "GET":
+            product_list_gets.append(request.url)
+
+    page.on("request", _record_list_get)
+    with page.expect_response(_response_for(_PRODUCTS_LIST)):
+        page.locator("#filter-category").select_option(str(category_id))
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Deactivate Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text(
+        "Deactivate Other Widget"
+    )
+
+    # Deactivate the product from its drawer; the drawer closes on success. The
+    # POST answer is what the browser swaps into #product-list, so its body must
+    # already be the filtered fragment — the trigger re-fetch cannot be relied on
+    # to mask an unfiltered render, and a settled-DOM check alone cannot tell the
+    # swapped fragment from the re-fetch that follows it.
+    _open_product_drawer(page, product_id)
+    deactivate_form = page.locator(
+        '#product-detail-inner form[hx-post="/web/products/deactivate"]'
+    )
+    with page.expect_response(_response_for("/web/products/deactivate", "POST")) as deactivated:
+        deactivate_form.get_by_role("button", name="Deactivate").click()
+    swapped = deactivated.value.text()
+    assert "Deactivate Widget" in swapped, f"swapped answer must hold the row: {swapped:.400}"
+    assert (
+        "Deactivate Other Widget" not in swapped
+    ), f"swapped answer must not hold the other category's row: {swapped:.400}"
+
+    expect(page.locator("#product-drawer")).not_to_be_visible()
+    expect(page.locator("#product-drawer-body")).to_have_text("")
+
+    # The filtered list must still hold exactly the (now inactive) row.
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Deactivate Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text(
+        "Deactivate Other Widget"
+    )
+    expect(page.locator(f"#{_PRODUCTS_INNER} > div[id^='product-']")).to_have_count(1)
+
+    # Every /web/products GET the flow issued carried the active filter; an
+    # unfiltered one means some caller rendered (or re-fetched) the catalogue.
+    assert product_list_gets, "the flow must issue /web/products GETs"
+    unfiltered = [
+        url for url in product_list_gets if f"category_id={category_id}" not in url
+    ]
+    assert not unfiltered, f"unfiltered /web/products GETs during the flow: {unfiltered}"
+
+
 def test_recording_a_supplier_cost_and_setting_preferred_from_the_drawer(
     page: Page, api: ApiClient
 ) -> None:
