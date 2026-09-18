@@ -20,12 +20,12 @@ Hold the money: where it is, how much there is, and which document caused each m
 an opaque string: it knows a movement came from *something* and never what.
 
 ### payment_methods
-`id`, `name` (UNIQUE), `is_active`. Seeded with `Cash`, `Transfer`, `Debit`, `CreditCard`, `QR`.
-There is deliberately no catch-all `Other`, so every payment names an explicit medium.
-
-### account_payment_methods
-`(account_id, method_id)` primary key, both ON DELETE RESTRICT. The allowlist that decides which
-mediums an account may accept, so cash cannot be booked into a bank account.
+`id`, `name`, `account_id` (nullable, → accounts ON DELETE RESTRICT), `is_active`. Seeded with
+`Cash`, `Transfer`, `Debit`, `CreditCard`, `QR`, unassigned until an account owns them. There is
+deliberately no catch-all `Other`, so every payment names an explicit medium. Each method belongs
+to at most one account (`UNIQUE(account_id, name)` lets two accounts each own a same-named method
+as separate rows); `NULL` means unassigned and unusable for payments. The owning account is derived
+from the method at pay/collect time, so an invalid combination is impossible by construction.
 
 ## Rules
 - `amount > 0`; the account must exist; `description` ≤ 256 characters.
@@ -34,19 +34,25 @@ mediums an account may accept, so cash cannot be booked into a bank account.
 - **Negative guard:** with `ALLOW_NEGATIVE_BALANCE=false` (the default), an `Expense` that would push
   the balance below zero is rejected with 400. This applies to creation, to edits, and to deleting an
   `Income`. With the flag set to true, overdraft is permitted.
-- A payment pair `(account_id, method_id)` outside the allowlist is rejected with 400 and produces no
-  side effect. Account creation requires at least one allowed method; accounts without configured
-  methods are visibly flagged in the interface.
+- A payment naming an unknown method returns 404; an inactive or unassigned method is rejected with
+  400 and an actionable message, and produces no side effect. Accounts without owned methods are
+  visibly flagged in the interface.
 - `PUT /api/accounts/{id}/payment-methods` **replaces** the set rather than merging it. Unknown method
-  ids return 404 and an empty list returns 400; both leave the existing set untouched.
+  ids return 404 and methods owned by another account return 400 (never stolen silently); both leave
+  the existing set untouched. An empty list unassigns everything. Assigning the well-known defaults
+  (`Caja→Cash`, `Banco→Transfer,Debit,CreditCard`, `MP→QR,Transfer`) reuses free rows and duplicates
+  owned names instead of stealing them.
 - Deleting a transaction that a payment references is refused with 409 and an actionable message: the
   money entry belongs to a document, so the document must be cancelled instead.
 
 ## Interface
-- REST: `GET/POST /api/accounts`, `GET /api/accounts/{id}`, `GET/POST /api/transactions`,
-  `PUT/DELETE /api/transactions/{id}`, `GET/PUT /api/accounts/{id}/payment-methods`.
+- REST: `GET/POST /api/accounts`, `GET /api/accounts/{id}`, `GET /api/payment-methods`,
+  `GET/POST /api/transactions`, `PUT/DELETE /api/transactions/{id}`,
+  `GET/PUT /api/accounts/{id}/payment-methods`.
 - Web: `/` dashboard with total and per-account balances, `/accounts/{id}` detail with the
-  payment-method matrix.
+  assign/unassign method editor.
+- Breaking change (migration 24): payment endpoints no longer accept `account_id`; every form is a
+  single method select rendered `"Name — AccountName"`.
 - Configuration: `ALLOW_NEGATIVE_BALANCE` (default `false`), `DATABASE_URL`, `PORT`, `RUST_LOG`.
 
 ## Verification

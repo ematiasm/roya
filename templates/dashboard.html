@@ -68,7 +68,7 @@
             </label>
             {% endfor %}
           </div>
-          <div class="mt-2 text-[13px] text-muted">Select at least one. An account with no methods cannot record payments.</div>
+          <div class="mt-2 text-[13px] text-muted">Ticked methods join the new account (unassigned ones are assigned; ones owned elsewhere are duplicated). An account with no methods cannot record payments.</div>
         </fieldset>
         <button type="submit">Create Account</button>
         <div class="text-[13px] text-muted">HTMX — no page reload. Also available at <code>POST /api/accounts</code> + <code>PUT /api/accounts/:id/payment-methods</code></div>

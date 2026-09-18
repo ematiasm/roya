@@ -61,7 +61,6 @@ pub struct UpdateLineRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct RecordPaymentRequest {
-    pub account_id: i64,
     pub method_id: i64,
     pub amount: Decimal,
     pub date: NaiveDate,
@@ -69,8 +68,6 @@ pub struct RecordPaymentRequest {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfirmSaleRequest {
-    #[serde(default)]
-    pub account_id: Option<i64>,
     #[serde(default)]
     pub method_id: Option<i64>,
 }
@@ -189,13 +186,7 @@ async fn record_payment(
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let payment = state
         .sales_service
-        .record_payment(
-            id,
-            payload.account_id,
-            payload.method_id,
-            payload.amount,
-            payload.date,
-        )
+        .record_payment(id, payload.method_id, payload.amount, payload.date)
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(payment))))
 }
@@ -205,10 +196,7 @@ async fn confirm_sale(
     Path(id): Path<i64>,
     Json(payload): Json<ConfirmSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let detail = state
-        .sales_service
-        .confirm(id, payload.account_id, payload.method_id)
-        .await?;
+    let detail = state.sales_service.confirm(id, payload.method_id).await?;
     Ok(Json(serde_json::json!(detail)))
 }
 
@@ -370,13 +358,28 @@ mod tests {
 
     async fn allow_cash(pool: &sqlx::SqlitePool, account_id: i64) -> i64 {
         let mid = cash_method_id(pool).await;
-        sqlx::query("INSERT OR IGNORE INTO account_payment_methods (account_id, method_id) VALUES (?, ?)")
+        // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
+        // the name when it is already owned elsewhere in this pool.
+        let assigned = sqlx::query("UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL")
             .bind(account_id)
             .bind(mid)
             .execute(pool)
             .await
-            .unwrap();
-        mid
+            .unwrap()
+            .rows_affected();
+        if assigned == 1 {
+            return mid;
+        }
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO payment_methods (name, account_id, is_active) \
+             SELECT name, ?, is_active FROM payment_methods WHERE id = ? RETURNING id",
+        )
+        .bind(account_id)
+        .bind(mid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        row.0
     }
 
     async fn seed_customer(
@@ -452,7 +455,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{aid}/confirm"),
-            serde_json::json!({ "account_id": acc, "method_id": cash }),
+            serde_json::json!({ "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm: {v}");
@@ -484,7 +487,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{bid}/confirm"),
-            serde_json::json!({ "account_id": acc, "method_id": cash }),
+            serde_json::json!({ "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm b: {v}");
@@ -570,7 +573,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/confirm"),
-            serde_json::json!({ "account_id": acc, "method_id": cash }),
+            serde_json::json!({ "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm service sale: {v}");
@@ -615,7 +618,7 @@ mod tests {
         let (st, v) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/confirm"),
-            serde_json::json!({ "account_id": acc, "method_id": cash }),
+            serde_json::json!({ "method_id": cash }),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "confirm: {v}");
@@ -724,7 +727,7 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/payments"),
-            serde_json::json!({ "account_id": acc, "method_id": cash, "amount": "5", "date": "2024-05-10" }),
+            serde_json::json!({ "method_id": cash, "amount": "5", "date": "2024-05-10" }),
         )
         .await;
         assert_eq!(st, StatusCode::CREATED);
@@ -734,7 +737,7 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/payments"),
-            serde_json::json!({ "account_id": acc, "method_id": cash, "amount": "15", "date": "2024-05-11" }),
+            serde_json::json!({ "method_id": cash, "amount": "15", "date": "2024-05-11" }),
         )
         .await;
         assert_eq!(st, StatusCode::CREATED);
@@ -746,7 +749,7 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/payments"),
-            serde_json::json!({ "account_id": acc, "method_id": cash, "amount": "1", "date": "2024-05-12" }),
+            serde_json::json!({ "method_id": cash, "amount": "1", "date": "2024-05-12" }),
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "overpay must be 400");
@@ -772,15 +775,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn method_allowlist_enforced_via_rest() {
+    async fn unassigned_method_rejected_via_rest() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let pid = seed_product(&app, "M-REST", "Product").await;
         seed_stock(&app, pid, "10").await;
-        let acc = seed_account(&app, "m-rest").await;
+        let _acc = seed_account(&app, "m-rest").await;
         let cash = cash_method_id(&pool).await;
-        // No allowlist row for (acc, Cash): confirm must be 400 with no side effects.
+        // Cash belongs to no account: confirming with it must be 400 with no
+        // side effects.
         let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ana", "Cash").await).await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
@@ -803,10 +807,10 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/sales/{id}/confirm"),
-            serde_json::json!({ "account_id": acc, "method_id": cash }),
+            serde_json::json!({ "method_id": cash }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "disallowed pair must be 400");
+        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned method must be 400");
         let tx_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
             .fetch_one(&pool)
             .await

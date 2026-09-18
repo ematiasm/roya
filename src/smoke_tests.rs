@@ -150,6 +150,19 @@ async fn method_id(pool: &SqlitePool, name: &str) -> i64 {
     row.0
 }
 
+/// The method row one account owns (same names repeat across accounts).
+async fn account_method_id(pool: &SqlitePool, account_id: i64, name: &str) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT id FROM payment_methods WHERE account_id = ? AND name = ?",
+    )
+    .bind(account_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}
+
 async fn account_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
     let row: (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = ?")
         .bind(name)
@@ -305,13 +318,9 @@ async fn add_sale_line_via_web(app: &Router, sale_id: i64, product_id: i64, qty:
 async fn confirm_sale_via_web(
     app: &Router,
     sale_id: i64,
-    account_id: Option<i64>,
     method_id: Option<i64>,
 ) {
     let mut body = format!("sale_id={sale_id}");
-    if let Some(account) = account_id {
-        body.push_str(&format!("&account_id={account}"));
-    }
     if let Some(method) = method_id {
         body.push_str(&format!("&method_id={method}"));
     }
@@ -322,12 +331,11 @@ async fn confirm_sale_via_web(
 async fn pay_sale_via_web(
     app: &Router,
     sale_id: i64,
-    account_id: i64,
     method_id: i64,
     amount: &str,
 ) -> (StatusCode, String) {
     let body = format!(
-        "sale_id={sale_id}&account_id={account_id}&method_id={method_id}&amount={amount}&date=2024-05-10"
+        "sale_id={sale_id}&method_id={method_id}&amount={amount}&date=2024-05-10"
     );
     post_form(app, "/web/sales/payments", &body).await
 }
@@ -1144,12 +1152,12 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     let guard_sale =
         create_sale_draft_for_customer(app, customer, "Credit", "2024-06-02").await;
     add_sale_line_via_web(app, guard_sale, product, "1").await;
-    confirm_sale_via_web(app, guard_sale, None, None).await;
+    confirm_sale_via_web(app, guard_sale, None).await;
     let (status, resp) = post_form(
         app,
         "/web/customer-receipts",
         &format!(
-            "customer_id={customer}&account_id={account}&method_id={cash}&amount=10&date=2024-05-10"
+            "customer_id={customer}&method_id={cash}&amount=10&date=2024-05-10"
         ),
     )
     .await;
@@ -1409,7 +1417,7 @@ async fn web_setup_flow_persists_account_methods_product_and_supplier_cost() {
     let account = create_account_via_web(&app, &pool, "SetupWallet", &[cash]).await;
     let catalog = payment_methods_catalog(&app, account).await;
     assert!(
-        catalog["allowed_method_ids"]
+        catalog["method_ids"]
             .as_array()
             .unwrap()
             .contains(&json!(cash)),
@@ -1460,7 +1468,7 @@ async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
 
     let sale = create_sale_draft_via_web(&app, &pool, "CashBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, sale, product, "3").await;
-    confirm_sale_via_web(&app, sale, Some(account), Some(cash)).await;
+    confirm_sale_via_web(&app, sale, Some(cash)).await;
 
     let detail = sale_detail(&app, sale).await;
     assert_eq!(detail["sale"]["status"], json!("Confirmed"));
@@ -1511,7 +1519,7 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
 
     let sale = create_sale_draft_via_web(&app, &pool, "CreditBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
-    confirm_sale_via_web(&app, sale, None, None).await;
+    confirm_sale_via_web(&app, sale, None).await;
 
     let detail = sale_detail(&app, sale).await;
     let sale_number = detail["sale"]["sale_number"]
@@ -1530,7 +1538,7 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     assert_eq!(stock_of(&app, product).await, Decimal::from(8));
 
     // Partial payment: one Income linked from the payment.
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "30").await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "30").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let detail = sale_detail(&app, sale).await;
     assert_eq!(detail["payments"].as_array().unwrap().len(), 1);
@@ -1544,7 +1552,7 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     assert_eq!(txs[0]["reference"].as_str(), Some(sale_number.as_str()));
 
     // Overpaying is rejected without touching finance.
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "30").await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "30").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("overpay rejected"), "{body}");
     assert_eq!(transactions_for(&app, account).await.len(), 1);
@@ -1628,7 +1636,7 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
     assert_eq!(detail["sale"]["customer_name"], json!("Smoke Term"));
     assert_eq!(detail["sale"]["due_date"], json!("2024-06-01"), "{detail}");
     add_sale_line_via_web(&app, sale, product, "1").await;
-    confirm_sale_via_web(&app, sale, None, None).await;
+    confirm_sale_via_web(&app, sale, None).await;
     assert_eq!(
         sale_detail(&app, sale).await["sale"]["status"],
         json!("Confirmed")
@@ -1700,7 +1708,7 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
     async fn collection_flow_derives_balance_ageing_and_receipt_total() {
         let (app, pool) = test_app().await;
         let cash = method_id(&pool, "Cash").await;
-        let account = create_account_via_web(&app, &pool, "CollectWallet", &[cash]).await;
+        let _account = create_account_via_web(&app, &pool, "CollectWallet", &[cash]).await;
         let product = create_product_via_web(&app, &pool, "COLLECT-P", "1", "50").await;
         record_stock_via_web(&app, product, "10").await;
 
@@ -1717,7 +1725,7 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
         // Credit sale of 3 x 25 = 75, due 2024-06-15.
         let sale = create_sale_draft_for_customer(&app, customer, "Credit", "2024-06-15").await;
         add_sale_line_via_web(&app, sale, product, "3").await;
-        confirm_sale_via_web(&app, sale, None, None).await;
+        confirm_sale_via_web(&app, sale, None).await;
         let detail = sale_detail(&app, sale).await;
         assert_eq!(dec(&detail["total"]), Decimal::from(75));
         assert_eq!(dec(&detail["due"]), Decimal::from(75));
@@ -1727,7 +1735,7 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
             &app,
             "/web/customer-receipts",
             &format!(
-                "customer_id={customer}&account_id={account}&method_id={cash}&amount=30&date=2024-06-20&notes=part"
+                "customer_id={customer}&method_id={cash}&amount=30&date=2024-06-20&notes=part"
             ),
         )
         .await;
@@ -1870,7 +1878,7 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
     let (status, body) = post_form(
         &app,
         "/web/purchases/confirm",
-        &format!("purchase_id={purchase}&account_id={account}&method_id={cash}"),
+        &format!("purchase_id={purchase}&method_id={cash}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1935,20 +1943,21 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
     assert_eq!(refund["reference"].as_str(), Some(purchase_number.as_str()));
 }
 
-/// An account with no allowlist rejects the payment with the actionable message;
-/// configuring the methods afterwards makes the same payment succeed.
+/// A method with no owning account rejects the payment with the actionable
+/// message; assigning it to the account afterwards makes the same payment
+/// succeed.
 #[tokio::test]
 async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
     let (app, pool) = test_app().await;
     let cash = method_id(&pool, "Cash").await;
 
-    // REST-created accounts start with no allowlist, and the web form refuses to
-    // create one, so this is the realistic broken state.
+    // REST-created accounts own nothing and Cash is unassigned: no account can
+    // be derived, the realistic broken state.
     let (status, body) = post_json(&app, "/api/accounts", json!({ "name": "GuardAccount" })).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let account = json_body(&body)["id"].as_i64().unwrap();
     assert!(
-        payment_methods_catalog(&app, account).await["allowed_method_ids"]
+        payment_methods_catalog(&app, account).await["method_ids"]
             .as_array()
             .unwrap()
             .is_empty(),
@@ -1959,12 +1968,12 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
     record_stock_via_web(&app, product, "5").await;
     let sale = create_sale_draft_via_web(&app, &pool, "GuardFlowBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
-    confirm_sale_via_web(&app, sale, None, None).await;
+    confirm_sale_via_web(&app, sale, None).await;
 
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "25").await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        body.contains("configure the account's payment methods"),
+        body.contains("not assigned to any account"),
         "message must tell the user what to do: {body}"
     );
     assert!(
@@ -1988,7 +1997,7 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
 
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "25").await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
     assert_eq!(status, StatusCode::OK, "payment after configuration: {body}");
     assert_eq!(sale_detail(&app, sale).await["payments"].as_array().unwrap().len(), 1);
     let txs = transactions_for(&app, account).await;
@@ -2005,18 +2014,18 @@ async fn money_invariants_hold_for_balances_and_payment_links() {
     let cash = method_id(&pool, "Cash").await;
 
     // Account A: cash sale posts Income; credit sale posts Income then a refund.
-    let account_a = create_account_via_web(&app, &pool, "InvA", &[cash]).await;
+    let _account_a = create_account_via_web(&app, &pool, "InvA", &[cash]).await;
     let product_a = create_product_via_web(&app, &pool, "INV-A", "1", "50").await;
     record_stock_via_web(&app, product_a, "10").await;
     let cash_sale = create_sale_draft_via_web(&app, &pool, "InvCashBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, cash_sale, product_a, "1").await;
-    confirm_sale_via_web(&app, cash_sale, Some(account_a), Some(cash)).await;
+    confirm_sale_via_web(&app, cash_sale, Some(cash)).await;
 
     let credit_sale =
         create_sale_draft_via_web(&app, &pool, "InvCreditBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, credit_sale, product_a, "1").await;
-    confirm_sale_via_web(&app, credit_sale, None, None).await;
-    let (status, body) = pay_sale_via_web(&app, credit_sale, account_a, cash, "25").await;
+    confirm_sale_via_web(&app, credit_sale, None).await;
+    let (status, body) = pay_sale_via_web(&app, credit_sale, cash, "25").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = post_form(
         &app,
@@ -2027,7 +2036,10 @@ async fn money_invariants_hold_for_balances_and_payment_links() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // Account B: funded manually, purchase posts Expense, cancel refunds it.
+    // InvB owns its own Cash duplicate (same name, different row), so the
+    // purchase must name that row: the method id decides the account.
     let account_b = create_account_via_web(&app, &pool, "InvB", &[cash]).await;
+    let cash_b = account_method_id(&pool, account_b, "Cash").await;
     let (status, body) = post_form(
         &app,
         "/web/transactions",
@@ -2050,7 +2062,7 @@ async fn money_invariants_hold_for_balances_and_payment_links() {
     let (status, body) = post_form(
         &app,
         "/web/purchases/confirm",
-        &format!("purchase_id={purchase}&account_id={account_b}&method_id={cash}"),
+        &format!("purchase_id={purchase}&method_id={cash_b}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2812,7 +2824,7 @@ async fn money_invariant_catches_broken_refund_link() {
     record_stock_via_web(&app, product, "5").await;
     let sale = create_sale_draft_via_web(&app, &pool, "RefundInvBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
-    confirm_sale_via_web(&app, sale, Some(account), Some(cash)).await;
+    confirm_sale_via_web(&app, sale, Some(cash)).await;
     let (status, body) = post_form(
         &app,
         "/web/sales/cancel",
@@ -2965,15 +2977,15 @@ async fn seeded_pages_expose_their_js_handler_urls_to_the_guard() {
 async fn money_invariant_catches_cross_payment_refund_swap() {
     let (app, pool) = test_app().await;
     let cash = method_id(&pool, "Cash").await;
-    let account = create_account_via_web(&app, &pool, "SwapInv", &[cash]).await;
+    let _account = create_account_via_web(&app, &pool, "SwapInv", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "SWAP-INV", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
     let sale = create_sale_draft_via_web(&app, &pool, "SwapInvBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
-    confirm_sale_via_web(&app, sale, None, None).await;
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "30").await;
+    confirm_sale_via_web(&app, sale, None).await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "30").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "20").await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "20").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = post_form(
         &app,
@@ -3103,15 +3115,15 @@ async fn wiring_guard_probes_js_url_styles() {
 async fn money_invariant_catches_equal_amount_pointer_swaps() {
     let (app, pool) = test_app().await;
     let cash = method_id(&pool, "Cash").await;
-    let account = create_account_via_web(&app, &pool, "EqualInv", &[cash]).await;
+    let _account = create_account_via_web(&app, &pool, "EqualInv", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "EQUAL-INV", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
     let sale = create_sale_draft_via_web(&app, &pool, "EqualInvBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
-    confirm_sale_via_web(&app, sale, None, None).await;
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "25").await;
+    confirm_sale_via_web(&app, sale, None).await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "25").await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = post_form(
         &app,
@@ -3165,12 +3177,12 @@ async fn money_invariant_catches_equal_amount_pointer_swaps() {
 async fn money_invariant_catches_orphan_document_movement() {
     let (app, pool) = test_app().await;
     let cash = method_id(&pool, "Cash").await;
-    let account = create_account_via_web(&app, &pool, "OrphanInv", &[cash]).await;
+    let _account = create_account_via_web(&app, &pool, "OrphanInv", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "ORPHAN-INV", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
     let sale = create_sale_draft_via_web(&app, &pool, "OrphanBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
-    confirm_sale_via_web(&app, sale, None, None).await;
+    confirm_sale_via_web(&app, sale, None).await;
     let sale_number = sale_detail(&app, sale).await["sale"]["sale_number"]
         .as_str()
         .unwrap()
@@ -3184,7 +3196,7 @@ async fn money_invariant_catches_orphan_document_movement() {
     .execute(&pool)
     .await
     .unwrap();
-    let (status, body) = pay_sale_via_web(&app, sale, account, cash, "10").await;
+    let (status, body) = pay_sale_via_web(&app, sale, cash, "10").await;
     assert!(status.is_server_error(), "{status} {body}");
 
     let orphan: (i64,) = sqlx::query_as(
@@ -3989,7 +4001,7 @@ fn accessible_name_resolution_accepts_wrapping_and_for_labels() {
 async fn sale_record_controls_resolve_accessible_names() {
     let (app, pool) = test_app().await;
     let cash = method_id(&pool, "Cash").await;
-    let account = create_account_via_web(&app, &pool, "Caja", &[cash]).await;
+    let _account = create_account_via_web(&app, &pool, "Caja", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "A11Y-L", "1", "50").await;
     let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
@@ -4008,7 +4020,7 @@ async fn sale_record_controls_resolve_accessible_names() {
         "draft record page has unlabelled controls: {unnamed:?}"
     );
 
-    confirm_sale_via_web(&app, sale, Some(account), Some(cash)).await;
+    confirm_sale_via_web(&app, sale, Some(cash)).await;
     let (status, page) = get(&app, &format!("/sales/{sale}")).await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     let unnamed = controls_without_accessible_name(&page);
@@ -4138,18 +4150,18 @@ async fn referenced_id_guard_rejects_a_bare_id_added_to_a_guarded_page_copy() {
 async fn customer_statement_resolves_receipt_account_and_method_names() {
     let (app, pool) = test_app().await;
     let cash = method_id(&pool, "Cash").await;
-    let account = create_account_via_web(&app, &pool, "GapWallet", &[cash]).await;
+    let _account = create_account_via_web(&app, &pool, "GapWallet", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "GAP-P", "1", "50").await;
     record_stock_via_web(&app, product, "10").await;
     let customer = seed_customer(&pool, "GapBuyer", None, None).await;
     let sale = create_sale_draft_on_date(&app, customer, "Credit", "2024-05-02", "2024-06-01").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
-    confirm_sale_via_web(&app, sale, None, None).await;
+    confirm_sale_via_web(&app, sale, None).await;
     let (status, resp) = post_form(
         &app,
         "/web/customer-receipts",
         &format!(
-            "customer_id={customer}&account_id={account}&method_id={cash}&amount=10&date=2024-05-10"
+            "customer_id={customer}&method_id={cash}&amount=10&date=2024-05-10"
         ),
     )
     .await;
@@ -4317,11 +4329,11 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     let ana_confirmed =
         create_sale_draft_on_date(&app, ana, "Credit", "2024-05-02", "2024-06-01").await;
     add_sale_line_via_web(&app, ana_confirmed, product, "1").await;
-    confirm_sale_via_web(&app, ana_confirmed, None, None).await;
+    confirm_sale_via_web(&app, ana_confirmed, None).await;
     let beto_confirmed =
         create_sale_draft_on_date(&app, beto, "Credit", "2024-07-15", "2024-08-15").await;
     add_sale_line_via_web(&app, beto_confirmed, product, "1").await;
-    confirm_sale_via_web(&app, beto_confirmed, None, None).await;
+    confirm_sale_via_web(&app, beto_confirmed, None).await;
 
     let ana_number = sale_detail(&app, ana_confirmed).await["sale"]["sale_number"]
         .as_str()

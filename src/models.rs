@@ -499,22 +499,45 @@ pub struct SalePayment {
 }
 
 // ---------------------------------------------------------------------------
-// M0 payment methods (finance-owned allowlist). Seeded Cash/Transfer/Debit/
-// CreditCard/QR, no Other. account_payment_methods PK(both) RESTRICT both.
+// M0 payment methods (finance-owned, account-owned 1:N). Seeded Cash/Transfer/
+// Debit/CreditCard/QR, no Other. Each method belongs to at most one account
+// (`account_id`, NULL = unassigned and unusable); UNIQUE(account_id, name) lets
+// two accounts each own a same-named method as separate rows.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentMethod {
     pub id: i64,
     pub name: String,
+    /// The owning account; NULL means unassigned and unusable for payments.
+    pub account_id: Option<i64>,
     pub is_active: bool,
     pub created_at: chrono::NaiveDateTime,
 }
 
+/// One method with its owning account resolved for display, so method-only
+/// selects render `"Name — AccountName"` without SQL in a route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AccountPaymentMethod {
-    pub account_id: i64,
-    pub method_id: i64,
+pub struct PaymentMethodWithAccount {
+    pub id: i64,
+    pub name: String,
+    pub account_id: Option<i64>,
+    pub account_name: Option<String>,
+    pub is_active: bool,
+}
+
+impl PaymentMethodWithAccount {
+    /// Owning account name, or `unassigned` for methods no account owns yet.
+    pub fn account_label(&self) -> String {
+        self.account_name
+            .clone()
+            .unwrap_or_else(|| "unassigned".to_string())
+    }
+
+    /// Select label: `"Transfer — Bank"`.
+    pub fn label(&self) -> String {
+        format!("{} — {}", self.name, self.account_label())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1155,7 +1178,8 @@ pub struct CustomerReceipt {
 
 /// Service-level input for creating a receipt. There is no total field: the
 /// collected amount is a plan input, not a stored claim; what the document
-/// applied is derived from its payments.
+/// applied is derived from its payments. There is no account field either: the
+/// account is derived from the method, which belongs to exactly one account.
 #[derive(Debug, Clone)]
 pub struct NewReceipt {
     pub customer_id: i64,

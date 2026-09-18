@@ -56,8 +56,8 @@ direct payment on a single sale and remains fully valid.
   depend on sort stability.
 - **Collecting:** the plan fills the customer's oldest debt first, ordered by due date, then sale date,
   then id, with a partial on the last covered sale. It creates one payment per covered sale, grouped by a
-  new receipt. An amount above the outstanding debt, or zero or less, returns 400; a disallowed
-  `(account, method)` pair returns 400. Both are validated before any write.
+  new receipt. An amount above the outstanding debt, or zero or less, returns 400; an inactive or
+  unassigned method returns 400 (no account can be derived from it). Both are validated before any write.
 - **A payment can never be grouped under another customer's receipt.** Two database triggers compare the
   receipt's customer against the sale's customer on insert and on update of `sale_payments`. No route
   accepts a caller-supplied receipt id, so the mismatch is unreachable from the interface by construction.

@@ -4,9 +4,9 @@
 // receipt can only ever cover sales of its own customer, and every payment it
 // creates still belongs to its sale and posts its own finance movement through
 // `SalesService`. This file runs no SQL: receipts are stored through
-// `CustomerReceiptRepository`, payments through `SalesService`, and the
-// (account, method) allowlist is validated by `PaymentMethodService` before any
-// write. The receipt stores no total: its amount is the derived SUM of the payments
+// `CustomerReceiptRepository`, payments through `SalesService`, and the method's
+// owning account is derived by `PaymentMethodService` before any write. The
+// receipt stores no total: its amount is the derived SUM of the payments
 // it groups, so an interrupted collection can leave fewer payments but never a
 // document claiming more than it applied.
 use chrono::NaiveDate;
@@ -87,7 +87,6 @@ where
     pub async fn collect(
         &self,
         customer_id: i64,
-        account_id: i64,
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
@@ -98,15 +97,9 @@ where
         if amount <= Decimal::ZERO {
             return Err(AppError::Validation("amount must be > 0".into()));
         }
-        if !self.sales.transactions.accounts.exists(account_id).await? {
-            return Err(AppError::NotFound(format!(
-                "account {account_id} not found"
-            )));
-        }
-        // Finance allowlist validated before any write (400, no side effect).
-        self.payment_methods
-            .require_allowed(account_id, method_id)
-            .await?;
+        // The account is derived from the method's owner before any write
+        // (400 inactive/unassigned, no side effect).
+        let account_id = self.payment_methods.resolve_account(method_id).await?;
         let notes = Self::clean_notes(notes)?;
 
         // The receivable: a collection never exceeds what the customer owes, and the
@@ -150,7 +143,6 @@ where
             self.sales
                 .record_payment_with_receipt(
                     allocation.sale_id,
-                    account_id,
                     method_id,
                     allocation.amount,
                     date,
@@ -455,7 +447,7 @@ mod tests {
     async fn allow(s: &ReceiptSvc, account_id: i64, method_id: i64) {
         s.sales
             .payment_methods
-            .allow(account_id, method_id)
+            .set_method_account(method_id, Some(account_id))
             .await
             .unwrap();
     }
@@ -496,7 +488,7 @@ mod tests {
             .add_line(sale.id, product_id, dec(qty), None)
             .await
             .unwrap();
-        s.sales.confirm(sale.id, None, None).await.unwrap()
+        s.sales.confirm(sale.id, None).await.unwrap()
     }
 
     async fn receipt_count(pool: &SqlitePool) -> i64 {
@@ -551,12 +543,22 @@ mod tests {
         let debts = three_debts(&s, customer, product).await;
 
         let detail = s
-            .collect(customer, account, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
         assert_eq!(detail.total, dec("80"));
         assert_eq!(detail.allocations.len(), 3, "one payment per covered sale");
+
+        // Method-only collection: the account is derived from the method's
+        // owner and lands on the receipt, every grouped payment and every
+        // finance movement.
+        assert_eq!(detail.receipt.account_id, account);
+        assert_eq!(detail.receipt.method_id, cash);
+        assert!(
+            detail.allocations.iter().all(|p| p.account_id == account && p.method_id == cash),
+            "every grouped payment carries the derived account"
+        );
 
         let sale_ids: Vec<i64> = detail.allocations.iter().map(|p| p.sale_id).collect();
         assert_eq!(
@@ -631,7 +633,7 @@ mod tests {
         three_debts(&s, customer, product).await;
 
         let detail = s
-            .collect(customer, account, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -676,7 +678,7 @@ mod tests {
         credit_sale(&s, beto, product, "4", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(ana, account, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(ana, cash, dec("30"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -736,7 +738,6 @@ mod tests {
             .sales
             .record_payment_with_receipt(
                 sale.sale.id,
-                account,
                 cash,
                 dec("40"),
                 d(2024, 6, 20),
@@ -765,7 +766,7 @@ mod tests {
 
         let payment = s
             .sales
-            .record_payment(sale.sale.id, account, cash, dec("15"), d(2024, 6, 20))
+            .record_payment(sale.sale.id, cash, dec("15"), d(2024, 6, 20))
             .await
             .unwrap();
 
@@ -791,7 +792,7 @@ mod tests {
         allow(&s, account, cash).await;
         let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
         let detail = s
-            .collect(customer, account, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("30"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -837,7 +838,7 @@ mod tests {
         let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(customer, account, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("30"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -859,7 +860,7 @@ mod tests {
         allow(&s, account, cash).await;
         let debts = three_debts(&s, customer, product).await;
 
-        s.collect(customer, account, cash, dec("80"), d(2024, 6, 20), None)
+        s.collect(customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -880,7 +881,7 @@ mod tests {
         let largest = credit_sale(&s, customer, product, "10", d(2024, 6, 15)).await; // 100
 
         let detail = s
-            .collect(customer, account, cash, dec("40"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("40"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -911,7 +912,7 @@ mod tests {
         let same_date = credit_sale_on(&s, customer, product, "3", d(2024, 5, 1), due).await;
 
         let detail = s
-            .collect(customer, account, cash, dec("90"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("90"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -935,11 +936,11 @@ mod tests {
 
         // A direct payment reduces the debt the receipt can allocate over.
         s.sales
-            .record_payment(sale.sale.id, account, cash, dec("10"), d(2024, 6, 10))
+            .record_payment(sale.sale.id, cash, dec("10"), d(2024, 6, 10))
             .await
             .unwrap();
         let detail = s
-            .collect(customer, account, cash, dec("20"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("20"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -997,7 +998,7 @@ mod tests {
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
-            .collect(customer, account, cash, dec("31"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("31"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1010,22 +1011,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disallowed_account_and_method_pair_is_rejected_without_side_effects() {
+    async fn unassigned_method_is_rejected_without_side_effects() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-13", "10").await;
         let customer = seed_customer(&s, "Ana").await;
+        // Cash belongs to no account: no account can be derived for it.
         let cash = method_id(&s, "Cash").await;
-        let bare_account = seed_account(&s, "Banco").await; // no allowlist rows
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
-            .collect(customer, bare_account, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("10"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert!(err
-            .to_string()
-            .contains("configure the account's payment methods"));
+        assert!(err.to_string().contains("not assigned to any account"));
         assert_eq!(receipt_count(&pool).await, 0);
         assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(tx_count(&pool).await, 0);
@@ -1045,7 +1044,7 @@ mod tests {
 
         for amount in [dec("0"), dec("-5")] {
             let err = s
-                .collect(customer, account, cash, amount, d(2024, 6, 20), None)
+                .collect(customer, cash, amount, d(2024, 6, 20), None)
                 .await
                 .unwrap_err();
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1060,7 +1059,7 @@ mod tests {
         let cash = method_id(&s, "Cash").await;
 
         let err = s
-            .collect(999_999, 999_999, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(999_999, cash, dec("10"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
 
@@ -1096,7 +1095,7 @@ mod tests {
             .unwrap()
             .is_empty());
         let err = s
-            .collect(walkin, account, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(walkin, cash, dec("10"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1119,7 +1118,6 @@ mod tests {
         let detail = s
             .collect(
                 customer,
-                account,
                 cash,
                 dec("10"),
                 d(2024, 6, 20),
@@ -1132,7 +1130,6 @@ mod tests {
         let err = s
             .collect(
                 customer,
-                account,
                 cash,
                 dec("10"),
                 d(2024, 6, 20),
@@ -1155,7 +1152,7 @@ mod tests {
         allow(&s, account, cash).await;
         three_debts(&s, customer, product).await;
         let detail = s
-            .collect(customer, account, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -1200,7 +1197,7 @@ mod tests {
         .unwrap();
 
         let err = s
-            .collect(customer, account, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         eprintln!("injected mid-loop failure: {err}");
@@ -1306,7 +1303,7 @@ mod tests {
         .unwrap();
 
         let err = s
-            .collect(customer, account, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         eprintln!("injected first-payment failure: {err}");
@@ -1460,7 +1457,6 @@ mod tests {
             .sales
             .record_payment_with_receipt(
                 ana_sale.sale.id,
-                account,
                 cash,
                 dec("1"),
                 d(2024, 6, 21),
@@ -1502,7 +1498,6 @@ mod tests {
             .sales
             .record_payment_with_receipt(
                 ana_sale.sale.id,
-                account,
                 cash,
                 dec("10"),
                 d(2024, 6, 20),
@@ -1542,7 +1537,6 @@ mod tests {
             .sales
             .record_payment_with_receipt(
                 ana_sale.sale.id,
-                account,
                 cash,
                 dec("10"),
                 d(2024, 6, 20),

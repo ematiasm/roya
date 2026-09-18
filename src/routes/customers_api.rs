@@ -55,7 +55,6 @@ pub struct ReceiptListQuery {
 #[derive(Debug, Deserialize)]
 pub struct CreateReceiptRequest {
     pub customer_id: i64,
-    pub account_id: i64,
     pub method_id: i64,
     pub amount: Decimal,
     pub date: NaiveDate,
@@ -316,7 +315,6 @@ async fn collect_receipt(
         .customer_receipt_service
         .collect(
             payload.customer_id,
-            payload.account_id,
             payload.method_id,
             payload.amount,
             payload.date,
@@ -462,15 +460,30 @@ mod tests {
                 .fetch_one(pool)
                 .await
                 .unwrap();
-        sqlx::query(
-            "INSERT OR IGNORE INTO account_payment_methods (account_id, method_id) VALUES (?, ?)",
+        // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
+        // the name when it is already owned elsewhere in this pool.
+        let assigned = sqlx::query(
+            "UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL",
         )
         .bind(account_id)
         .bind(cash)
         .execute(pool)
         .await
+        .unwrap()
+        .rows_affected();
+        if assigned == 1 {
+            return cash;
+        }
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO payment_methods (name, account_id, is_active) \
+             SELECT name, ?, is_active FROM payment_methods WHERE id = ? RETURNING id",
+        )
+        .bind(account_id)
+        .bind(cash)
+        .fetch_one(pool)
+        .await
         .unwrap();
-        cash
+        row.0
     }
 
     async fn seed_customer(
@@ -764,7 +777,7 @@ mod tests {
             &app,
             "/api/customer-receipts",
             json!({
-                "customer_id": customer, "account_id": account, "method_id": cash,
+                "customer_id": customer, "method_id": cash,
                 "amount": "60", "date": "2024-06-20", "notes": "  partial  "
             }),
         )
@@ -849,7 +862,7 @@ mod tests {
             &app,
             "/api/customer-receipts",
             json!({
-                "customer_id": customer, "account_id": account, "method_id": cash,
+                "customer_id": customer, "method_id": cash,
                 "amount": "31", "date": "2024-06-20"
             }),
         )
@@ -861,26 +874,34 @@ mod tests {
         );
         assert_eq!(receipt_count(&pool).await, 0);
 
-        // Disallowed (account, method) pair.
-        let bare = seed_account(&app, "Sin métodos").await;
+        // Unassigned method: no account can be derived, so it is a 400.
+        sqlx::query("UPDATE payment_methods SET account_id = NULL WHERE id = ?")
+            .bind(cash)
+            .execute(&pool)
+            .await
+            .unwrap();
         let (st, v) = post(
             &app,
             "/api/customer-receipts",
             json!({
-                "customer_id": customer, "account_id": bare, "method_id": cash,
+                "customer_id": customer, "method_id": cash,
                 "amount": "10", "date": "2024-06-20"
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "disallowed pair: {v}");
+        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned method: {v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("not assigned"),
+            "the message must name the fix: {v}"
+        );
         assert_eq!(receipt_count(&pool).await, 0);
 
-        // Unknown customer is a 404 before any write; unknown account too.
+        // Unknown customer is a 404 before any write; unknown method too.
         let (st, _) = post(
             &app,
             "/api/customer-receipts",
             json!({
-                "customer_id": 999999, "account_id": account, "method_id": cash,
+                "customer_id": 999999, "method_id": cash,
                 "amount": "10", "date": "2024-06-20"
             }),
         )
@@ -890,7 +911,7 @@ mod tests {
             &app,
             "/api/customer-receipts",
             json!({
-                "customer_id": customer, "account_id": 999999, "method_id": cash,
+                "customer_id": customer, "method_id": 999999,
                 "amount": "10", "date": "2024-06-20"
             }),
         )
@@ -932,7 +953,7 @@ mod tests {
             &app,
             "/api/customer-receipts",
             json!({
-                "customer_id": beto, "account_id": account, "method_id": cash,
+                "customer_id": beto, "method_id": cash,
                 "amount": "10", "date": "2024-06-20"
             }),
         )
@@ -947,7 +968,7 @@ mod tests {
             &app,
             &format!("/api/sales/{ana_sale}/payments"),
             json!({
-                "account_id": account, "method_id": cash,
+                "method_id": cash,
                 "amount": "10", "date": "2024-06-20",
                 "receipt_id": beto_receipt
             }),
