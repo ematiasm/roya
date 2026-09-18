@@ -48,6 +48,52 @@ pub struct CreateProductRequest {
     pub notes: Option<String>,
 }
 
+/// Patch-style PUT body for product edits, mirroring `UpdateSupplierRequest`:
+/// an absent field leaves the stored value unchanged, and where clearing
+/// matters the field is `Option<Option<T>>` so `null` means "clear".
+/// Distinguishes an absent JSON key from an explicit `null` on a clearable field.
+///
+/// serde's derived `Option<Option<T>>` collapses both into the outer `None`, so
+/// `null` could never mean "clear" and the patch contract would be a lie on the
+/// wire. This visitor keeps the three states apart: missing key => `None` (leave
+/// unchanged, supplied by `#[serde(default)]`), `null` => `Some(None)` (clear),
+/// value => `Some(Some(v))` (set).
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateProductRequest {
+    #[serde(default)]
+    pub sku: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kind: Option<ProductKind>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub category_id: Option<Option<i64>>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default)]
+    pub sale_price: Option<Decimal>,
+    #[serde(default)]
+    pub cost_price: Option<Decimal>,
+    #[serde(default)]
+    pub track_stock: Option<bool>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub min_stock: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub max_stock: Option<Option<Decimal>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub location: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub notes: Option<Option<String>>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateMovementRequest {
     pub product_id: i64,
@@ -175,6 +221,34 @@ async fn get_product(
     Ok(Json(serde_json::json!(product)))
 }
 
+async fn update_product(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<UpdateProductRequest>,
+) -> crate::error::AppResult<Json<serde_json::Value>> {
+    let product = state
+        .inventory_service
+        .update_product(
+            id,
+            crate::models::UpdateProduct {
+                sku: payload.sku,
+                name: payload.name,
+                kind: payload.kind,
+                category_id: payload.category_id,
+                unit: payload.unit,
+                sale_price: payload.sale_price,
+                cost_price: payload.cost_price,
+                track_stock: payload.track_stock,
+                min_stock: payload.min_stock,
+                max_stock: payload.max_stock,
+                location: payload.location,
+                notes: payload.notes,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!(product)))
+}
+
 async fn delete_product(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -271,7 +345,10 @@ pub fn router() -> Router<AppState> {
             get(get_category).put(update_category).delete(delete_category),
         )
         .route("/api/products", get(list_products).post(create_product))
-        .route("/api/products/{id}", get(get_product).delete(delete_product))
+        .route(
+            "/api/products/{id}",
+            get(get_product).put(update_product).delete(delete_product),
+        )
         .route("/api/products/{id}/stock", get(get_stock))
         .route(
             "/api/products/{id}/barcodes",
@@ -330,6 +407,25 @@ mod tests {
             .method("GET")
             .uri(uri)
             .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    async fn put_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
@@ -490,5 +586,124 @@ mod tests {
             items.iter().any(|x| x.get("product").and_then(|p| p.get("id")).and_then(|i| i.as_i64()) == Some(pid)),
             "product {pid} should be in negative-stock: {v}"
         );
+    }
+
+    // -- T1 redesign-products: PUT /api/products/{id} --------------------------
+
+    /// A partial body changes only the named field: every other stored field
+    /// survives the merge, so the patch is additive by construction.
+    #[tokio::test]
+    async fn put_partial_body_updates_only_that_field() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let (_, v) = post_json(app.clone(), "/api/products", product_body("PUT-PARTIAL")).await;
+        let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
+        let (st, v) = put_json(
+            app.clone(),
+            &format!("/api/products/{pid}"),
+            serde_json::json!({ "name": "Renamed via PUT" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "update: {v}");
+        assert_eq!(v.get("name").and_then(|x| x.as_str()).unwrap(), "Renamed via PUT");
+        // Every other field survives.
+        assert_eq!(v.get("sku").and_then(|x| x.as_str()).unwrap(), "PUT-PARTIAL");
+        assert_eq!(v.get("sale_price").and_then(|x| x.as_str()).unwrap(), "10");
+        assert_eq!(v.get("cost_price").and_then(|x| x.as_str()).unwrap(), "5");
+        assert_eq!(v.get("track_stock").and_then(|x| x.as_bool()).unwrap(), true);
+        assert_eq!(v.get("min_stock").and_then(|x| x.as_str()).unwrap(), "5");
+        assert_eq!(v.get("max_stock").and_then(|x| x.as_str()).unwrap(), "50");
+    }
+
+    /// An explicit `null` clears a clearable field while an absent key leaves
+    /// the stored value unchanged. The two semantics must stay distinguishable:
+    /// flattening `Option<Option<T>>` to `Option<T>` would either make an
+    /// omitted key wipe stored data or make it impossible for a JSON client to
+    /// blank a field without rewriting the whole record.
+    #[tokio::test]
+    async fn put_null_clears_location_and_notes_but_absent_keys_survive() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state.clone());
+        let body = serde_json::json!({
+            "sku": "PUT-NULL", "name": "prod PUT-NULL", "kind": "Product",
+            "unit": "un", "sale_price": "10", "cost_price": "5",
+            "track_stock": true, "min_stock": "5", "max_stock": "50",
+            "location": "shelf A", "notes": "fragile"
+        });
+        let (st, v) = post_json(app.clone(), "/api/products", body).await;
+        assert_eq!(st, StatusCode::CREATED, "create: {v}");
+        let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
+
+        // Absent keys leave the stored values unchanged.
+        let (st, v) = put_json(
+            app.clone(),
+            &format!("/api/products/{pid}"),
+            serde_json::json!({ "name": "Renamed, nothing cleared" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "absent-key put: {v}");
+        assert_eq!(v.get("location").and_then(|x| x.as_str()), Some("shelf A"));
+        assert_eq!(v.get("notes").and_then(|x| x.as_str()), Some("fragile"));
+
+        // Explicit `null` clears, only for the named fields; everything else
+        // (including the name renamed above) survives the merge.
+        let (st, v) = put_json(
+            app.clone(),
+            &format!("/api/products/{pid}"),
+            serde_json::json!({ "location": null, "notes": null }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "null put: {v}");
+        assert!(
+            v.get("location").map(serde_json::Value::is_null).unwrap_or(false),
+            "explicit null must clear location: {v}"
+        );
+        assert!(
+            v.get("notes").map(serde_json::Value::is_null).unwrap_or(false),
+            "explicit null must clear notes: {v}"
+        );
+        assert_eq!(v.get("sku").and_then(|x| x.as_str()).unwrap(), "PUT-NULL");
+        assert_eq!(
+            v.get("name").and_then(|x| x.as_str()).unwrap(),
+            "Renamed, nothing cleared"
+        );
+        assert_eq!(v.get("sale_price").and_then(|x| x.as_str()).unwrap(), "10");
+        assert_eq!(v.get("track_stock").and_then(|x| x.as_bool()).unwrap(), true);
+        assert_eq!(v.get("min_stock").and_then(|x| x.as_str()).unwrap(), "5");
+        assert_eq!(v.get("max_stock").and_then(|x| x.as_str()).unwrap(), "50");
+    }
+
+    #[tokio::test]
+    async fn put_unknown_product_is_not_found() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let (st, _) = put_json(
+            app,
+            "/api/products/99999",
+            serde_json::json!({ "name": "x" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// A body the JSON layer cannot bind (a non-numeric sale_price) is rejected
+    /// by axum's extractor before the handler runs. Axum maps a serde
+    /// deserialization failure to 422 Unprocessable Entity (a syntactically
+    /// broken JSON body would be 400), so this status is axum's own rejection,
+    /// not the AppError JSON envelope; the envelope guarantee applies to
+    /// AppError responses and an extractor rejection is by design not one.
+    #[tokio::test]
+    async fn put_unbindable_body_is_rejected_before_the_handler() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let (_, v) = post_json(app.clone(), "/api/products", product_body("PUT-BAD")).await;
+        let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
+        let (st, _) = put_json(
+            app,
+            &format!("/api/products/{pid}"),
+            serde_json::json!({ "sale_price": "not-a-number" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
     }
 }
