@@ -313,6 +313,11 @@ curl -X POST http://localhost:3000/api/products \
 # -> 201 product; duplicate sku => 409
 
 curl http://localhost:3000/api/products/1
+curl -X PUT http://localhost:3000/api/products/1 \
+  -H "Content-Type: application/json" \
+  -d '{"sale_price":"1300.00","location":null}'
+# -> 200 product; omitted keys keep their value, an explicit null clears a field
+
 curl http://localhost:3000/api/products/1/stock
 # -> { product, stock:"10", suggested:"40" } (suggested = max - stock when stock <= min)
 

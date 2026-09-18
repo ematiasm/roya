@@ -204,6 +204,49 @@ contrato de headers en `src/routes/inventory_web.rs`.
   (el contrato `hx-history-elt` + sync de `base.html` está cubierto por el test
   de `/sales`).
 
+## Entrega (2026-09-18)
+- PRs encadenados mergeados a `main`: #28 (`feat/products-edit-path`, issue #25),
+  #29 (`feat/products-redesign`, issue #26) y #30 (`test/products-e2e`, issue #27);
+  cada issue quedó cerrada por su PR. Follow-up #32 (`chore/stylesheet-in-sync`,
+  issue #31). Ramas locales y remotas borradas.
+- Review nativo (RDD encendido): lineage `review-03e09a59ab713e55`, tier medio,
+  lente `review-reliability`, 3319 líneas cambiadas → **approved** con 4 hallazgos
+  **no bloqueantes**: `R3-001` WARNING informativo en
+  `src/routes/inventory_web.rs:696-700`; `R3-002` y `R3-003` SUGGESTION en
+  `templates/partials/product_detail.html:33-43` y `49-54`; `R3-004` SUGGESTION en
+  `templates/partials/list_filters_close.html:7`. El envelope de cierre no trae las
+  descripciones y el store local queda vacío tras el acknowledge, así que no son
+  recuperables.
+- Slicing: **no hubo corte cohesivo por debajo del budget de 400 líneas**. Las
+  rutas del drawer no compilan sin el partial (Askama resuelve el template en
+  compile time) y los dos fixes de filtros viven en los mismos archivos que el
+  rediseño que los expuso; separarlos habría publicado un estado intermedio nunca
+  probado. Corte por capa (backend / interfaz / e2e) y `size:exception` en cada PR
+  con la justificación en su cuerpo.
+- Verificación por slice en worktree aislado del commit: backend 342 tests,
+  interfaz 350, e2e 53 passed / 4 skipped. `main` final: 350 tests,
+  `cargo check --all-targets` sin errores, e2e verde.
+
+## Desviación: la prosa de los comentarios genera utilidades de Tailwind
+Tailwind v4 escanea `templates/` y **también lee los comentarios**: las palabras
+sueltas "blur" e "inline" en dos comentarios nuevos produjeron reglas
+`.blur`/`.inline` que nadie usa, así que regenerar el stylesheet dejó de coincidir
+con el commiteado. Reescritos esos dos comentarios, `scripts/build-css.sh` vuelve a
+ser byte a byte idéntico (PR #32). Regla para el futuro: no usar palabras sueltas
+que sean utilidades de Tailwind en la prosa de los templates.
+
+## Follow-ups abiertos
+- Tres respuestas HTMX listan el catálogo completo e ignoran el filtro activo: la
+  rama no-drawer de `POST /web/products/edit` y `product_lifecycle_response`
+  (activate/deactivate/delete). Verificado en el navegador: el swap sin filtro es
+  transitorio porque el trigger `product-changed` re-consulta con el filtro y gana,
+  así que hoy no es visible para el usuario; queda como trampa latente y como
+  request redundante. Issue #33.
+- Los 4 hallazgos informativos del review nativo (ver la entrega), sin
+  descripción recuperable.
+- Ejemplo `curl` del `PUT /api/products/{id}` en el README: hecho en el PR de docs
+  de este mismo cierre.
+
 ## Next step
-- Decidir rama/commit/PR encadenado (el diff es grande: ~2k líneas entre 11
-  archivos). Nada commiteado todavía; hoy vive en el working tree de `main`.
+- Nada pendiente de este feature. Los follow-ups de arriba viven en sus issues.
+  El repo quedó en `main` con los tres PRs mergeados.
