@@ -42,7 +42,10 @@ mantener el filtro sin avisar (no resuelve la queja de fondo).
   alta, rename del select de categoría propia, listener del aviso.
 - `templates/partials/product_detail.html`: `hx-include` en los forms de
   movimiento, costo y preferido.
-- `templates/base.html`: `notice()` acepta un link de acción opcional.
+- `templates/base.html`: guard de precedencia en el handler genérico
+  `htmx:afterRequest`, comentario cruzado con el box del servidor.
+- `templates/partials/notice.html` (nuevo): el box, en `templates/` para que
+  Tailwind lo escanee.
 - `src/smoke_tests.rs`: el helper `create_product_full_via_web` por el rename.
 - `e2e/tests/test_products.py`: el flujo real en navegador.
 - Fuera de alcance: `web_edit_product` (cerrado en #33), los follow-ups
@@ -65,10 +68,23 @@ mantener el filtro sin avisar (no resuelve la queja de fondo).
   (que es la autoridad sobre el matching de nombre/SKU/barcode), no una
   comparación paralela escrita a mano ni el cliente.
 - El aviso tiene que pisar el genérico "Create product saved" que ya emite
-  `base.html` en `htmx:afterRequest`, así que viaja por
-  `HX-Trigger-After-Settle` (el mismo razonamiento que `product-saved`): el
-  after-settle es estrictamente posterior al swap y al afterRequest. El
-  `HX-Trigger: product-created` actual no se toca.
+  `base.html` en `htmx:afterRequest`. **Premisa inicial refutada con evidencia**
+  (ver T2): htmx 1.9.12 corre la fase de swap (`beforeSwap` → `afterSwap`)
+  **antes** de `htmx:afterRequest`, así que un aviso renderizado en el body se
+  swappea primero y el genérico lo pisa después — al revés de lo supuesto. La
+  solución no es mandarlo por header (`HX-Trigger-After-Settle`), porque el
+  nombre del producto es UTF-8 arbitrario y `HeaderValue` es ASCII-estricto: un
+  producto "Yerba Ñandú" convertiría un alta exitosa en 500, y escaparlo a mano
+  rompe con caracteres no-BMP. Se resuelve con un guard de precedencia en el
+  handler genérico existente: saltea el aviso genérico cuando el body de la
+  respuesta trae el box (`data-notice-server`). Es independiente del orden —la
+  decisión sale del cuerpo de la respuesta, no del DOM post-swap— y falla seguro
+  en las dos direcciones. El `HX-Trigger: product-created` actual no se toca.
+- El markup del aviso vive en `templates/partials/notice.html`, no en un string
+  de Rust: Tailwind v4 escanea **solo** `templates/` (`@source "../templates"`
+  en `assets/tailwind.css`), así que una clase agregada a markup armado en Rust
+  renderiza sin estilo con todos los tests en verde. El precedente de
+  `web_category_options` no cubre el caso: arma `<option>` **sin clases**.
 - Los cuatro tests nuevos tienen que ser no-vacuosos: fallan si se saca el
   filtrado, mismo estándar que #33.
 - Tailwind: nada de palabras sueltas que sean utilidades (`blur`, `inline`) en
@@ -98,8 +114,9 @@ unidad de trabajo; push y PR son decisión del usuario.
 - [x] T1 — Los cuatro handlers filter-honest: structs + ramas no-drawer por
       `filter_products`, rename del campo propio del modal, `hx-include` en los
       forms, helper de smoke. Con sus tests Rust. → `bc53a08`
-- [ ] T2 — Aviso create-bajo-filtro: derivación server-side, trigger payload,
-      link de acción en `notice()`, listener. Con tests Rust y e2e.
+- [x] T2 — Aviso create-bajo-filtro: derivación server-side, transporte por
+      body (swap OOB hacia `#notice`), guard de precedencia en `base.html`,
+      markup en `templates/`. Con tests Rust y e2e. → `fed9bfc`
 - [ ] T3 — Verificación completa (cargo test, check, e2e) + docs + cierre.
 
 ## Progress
@@ -109,6 +126,10 @@ unidad de trabajo; push y PR son decisión del usuario.
 - 2026-09-18: T1 completo en `bc53a08`. `all_product_stocks` reemplazado por
   `filtered_list_html(state, q, category_id)`; los cuatro handlers leen el
   filtro del body; el campo propio del modal pasó a `product_category_id`.
+- 2026-09-18: T2 completo en `fed9bfc`. El aviso viaja en el body como swap OOB
+  hacia `#notice`; el guard de precedencia descarta el aviso genérico cuando el
+  servidor ya renderizó el suyo. La premisa de orden del diseño inicial
+  (`HX-Trigger-After-Settle`) quedó refutada por medición y se reemplazó.
 
 ## Verification evidence
 
@@ -146,7 +167,77 @@ unidad de trabajo; push y PR son decisión del usuario.
 - No verificable en T1 (fuera de autorización): comportamiento en navegador
   real — lo cubre T2/T3 con la suite e2e.
 
-### Hallazgos del verificador, diferidos a follow-up (pre-existentes, fuera de alcance)
+### T2 (`fed9bfc`)
+- Writer: `cargo test` 359 passed / 0 failed (354 antes de T2, +5);
+  `cargo check --all-targets` 0 errores, 51 warnings pre-existentes;
+  `scripts/e2e.sh -k products` 13 passed / 1 skipped;
+  `scripts/build-css.sh` reproducible (`static/tailwind.css` md5
+  `e562f79b00c7906faec139cf33d40132` sin cambios).
+- **Premisa del diseño refutada, con evidencia, antes de escribir el código
+  equivocado.** El brief afirmaba que el swap OOB landa después de
+  `htmx:afterRequest`. El writer decodificó `static/htmx.min.js` y midió en
+  Chromium real con Playwright: `["beforeSwap","afterSwap",
+  "afterRequest:successful=true","notice-js"]` — el swap va **primero**
+  (`b.onload` ejecuta `M(n,I)` y recién después `ce(n,"htmx:afterRequest",I)`),
+  así que el aviso genérico "Create product saved" pisaba el box del servidor.
+  Implementado tal cual el brief, el test e2e habría fallado. Se aprobó la
+  opción A (guard de precedencia con marcador `data-notice-server`) y se
+  descartó el header payload por el límite ASCII de `HeaderValue`.
+- Verificación independiente (read-only, otro agente): **PASS WITH FINDINGS**,
+  sin defecto de correctitud. Re-derivó la no-vacuidad con **cuatro** probes:
+  con `hidden` forzado a `false` fallan 3 tests (y el negativo queda verde, que
+  es lo correcto); con el chequeo de pertenencia sacado fallan los dos tests
+  negativos, o sea las aserciones atan en las dos direcciones; con el guard
+  borrado **el test e2e falla en navegador real** con
+  `Actual value: Create product saved`; restauración probada por md5 de los
+  cuatro archivos y por `git diff --stat` idéntico.
+- Verificado que el aviso se ve: los **30 tokens de clase** del markup existen
+  en el `static/tailwind.css` commiteado (parseo estricto de selectores, no
+  substring). Sin esto un aviso sin estilo pasaría todos los tests, que afirman
+  texto y estructura, no apariencia.
+- Verificado el «radio de explosión» del guard: 21 forms con `data-action`
+  enumerados; el único emisor del marcador es `web_create_product`. La rama de
+  error (`htmx:responseError`) no tiene una sola línea cambiada, y el guard
+  corre después de `if (!evt.detail.successful) return`, así que nunca se aplica
+  a un error.
+- Verificado que el sniff de substring es independiente del orden: la decisión
+  sale de `evt.detail.xhr.responseText`, nunca del DOM post-swap. Si una versión
+  futura de htmx invirtiera las fases, el guard seguiría sólo suprimiendo y el
+  swap OOB dejaría el box igual.
+- Verificado que el test e2e es sensible a los cuatro modos de falla relevantes
+  (guard borrado, marcador ausente, `hidden` forzado, transporte por header):
+  ninguno escapa.
+- Fuerza del `HX-Trigger: product-created` y del redirect no-HTMX: byte-idénticos
+  a `HEAD`.
+
+### T2 — hallazgos de la verificación
+- **F1 (cerrado en T2)** — Tailwind v4 escanea solo `templates/`, así que las
+  clases del aviso armadas en Rust nunca se escanean: hoy están en el CSS de
+  prestado. Latente (un aviso sin estilo con todos los tests verdes) y lo
+  introducía el diseño. Cerrado moviendo el markup a
+  `templates/partials/notice.html`.
+- **F2 (cerrado en T2)** — el propio documento de tarea describía el diseño
+  viejo (`notice()` con link de acción, `HX-Trigger-After-Settle`). Corregido.
+- **F3 (aceptado, direccionalmente seguro)** — el guard usa
+  `responseText.includes('data-notice-server')` sobre el body entero: un
+  producto o categoría llamado literalmente así saltearía el aviso genérico de
+  esa request. Sin crash ni dato incorrecto, y el único emisor del marcador es
+  un handler. Se acepta con el contrato escrito en el comentario.
+- **F4 (aceptado)** — `render_product_list(&[ProductStock])` clona con
+  `to_vec()`; ambos call sites tienen la `Vec` propia y podrían moverla. El
+  verificador lo juzgó no valioso (app local, catálogo chico, un clone por
+  request). Se deja.
+- **F5 (informativo)** — `body_filter_is_active` re-deriva la regla lenient de
+  `WebProductFilter::parsed()`. Verificado token-consistente; queda como
+  defensa.
+- **No verificado** — el escapado adversarial ahora sí tiene test
+  (`create_notice_escapes_html_specials_in_the_product_name`), pero **no hay
+  cobertura e2e de nombres no-ASCII** (el test es a nivel Rust), y **ningún test
+  afirma la lista de clases**: los dos mirrors (template Askama y string JS en
+  `base.html`) siguen siendo un contrato textual con comentario cruzado en las
+  dos puntas.
+
+### Hallazgos del verificador de T1, diferidos a follow-up (pre-existentes, fuera de alcance)
 - **F1** — `web_edit_product` (rama no-drawer) sigue tomando el filtro del
   query string, no del body: es el arreglo de #33 y hoy no tiene caller
   in-repo. La asimetría con el body queda documentada en el código. Pre-existente.
