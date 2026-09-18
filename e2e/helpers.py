@@ -167,6 +167,48 @@ def payment_method_id(api: ApiClient, name: str = "Cash") -> int:
     raise SeedError(f"payment method {name!r} is not in the catalog: {catalog}")
 
 
+def account_method_id(api: ApiClient, account_id: int, name: str = "Cash") -> int:
+    """The id of one method the account owns.
+
+    The same name can exist on several accounts (one row per owner), so a seed
+    that must pay through THIS account reads its own catalog instead of the
+    global one. An unassigned method is rejected here because the pay/collect
+    forms disable it: a test that selected one would fail on a rule, not a bug.
+    """
+    owned = api.get_json(f"/api/accounts/{account_id}/payment-methods")["methods"]
+    for method in owned:
+        if method["name"] == name:
+            return int(method["id"])
+    raise SeedError(f"account {account_id} owns no method named {name!r}: {owned}")
+
+
+def fund_account(
+    api: ApiClient, account_id: int, amount: str, *, date: str = "2024-05-01"
+) -> None:
+    """Post an Income the account needs before it can pay anyone.
+
+    Paying a supplier posts an Expense, and overdraft is blocked by default, so
+    an unfunded account would fail the handover on a rule unrelated to the test.
+    The read-back asserts the balance really moved, not merely that the POST 2xx'd.
+    """
+    api.post_json(
+        "/api/transactions",
+        {
+            "account_id": account_id,
+            "type": "Income",
+            "amount": amount,
+            "description": "seed funding",
+            "reference": None,
+            "date": date,
+        },
+    )
+    balance = Decimal(str(api.get_json(f"/api/accounts/{account_id}")["balance"]))
+    if balance < Decimal(amount):
+        raise SeedError(
+            f"account {account_id} balance is {balance} after funding {amount}"
+        )
+
+
 def create_product(
     api: ApiClient,
     *,
@@ -231,17 +273,20 @@ def create_customer(
     api: ApiClient,
     name: str,
     *,
+    phone: str | None = None,
     credit_limit: str | None = None,
     payment_days: int | None = None,
+    address: str | None = None,
+    notes: str | None = None,
 ) -> int:
     created = api.post_json(
         "/api/customers",
         {
             "name": name,
-            "phone": None,
-            "address": None,
+            "phone": phone,
+            "address": address,
             "tax_id": None,
-            "notes": None,
+            "notes": notes,
             "credit_limit": credit_limit,
             "payment_days": payment_days,
         },
@@ -251,8 +296,12 @@ def create_customer(
     return int(created["customer"]["id"])
 
 
-def create_supplier(api: ApiClient, name: str, *, phone: str = "555-0100") -> int:
-    supplier = api.post_json("/api/suppliers", {"name": name, "phone": phone, "notes": None})
+def create_supplier(
+    api: ApiClient, name: str, *, phone: str = "555-0100", notes: str | None = None
+) -> int:
+    supplier = api.post_json(
+        "/api/suppliers", {"name": name, "phone": phone, "notes": notes}
+    )
     return int(supplier["id"])
 
 
@@ -286,6 +335,7 @@ def create_sale_draft(
     *,
     payment_type: str = "Cash",
     sale_date: str = "2024-05-02",
+    due_date: str | None = None,
 ) -> int:
     detail = api.post_json(
         "/api/sales",
@@ -293,7 +343,7 @@ def create_sale_draft(
             "customer_id": customer_id,
             "payment_type": payment_type,
             "sale_date": sale_date,
-            "due_date": None,
+            "due_date": due_date,
             "receipt_no": None,
             "notes": None,
         },
@@ -325,13 +375,14 @@ def add_sale_line(
 
 
 def confirm_sale(
-    api: ApiClient, sale_id: int, *, method_id: int
+    api: ApiClient, sale_id: int, *, method_id: int | None = None
 ) -> None:
-    """Confirm a cash draft sale and read the effect back.
+    """Confirm a draft sale and read the effect back.
 
     A confirmed sale carries its assigned number and drives the filter and
     confirmation slices, so a silent transition failure must fail the seed here.
-    The account is derived from the method.
+    A cash sale names the method; a credit sale omits it (the account is derived
+    from the method, and a credit sale must not carry one).
     """
     api.post_json(
         f"/api/sales/{sale_id}/confirm",
@@ -340,6 +391,33 @@ def confirm_sale(
     status = api.get_json(f"/api/sales/{sale_id}")["sale"]["status"]
     if status != "Confirmed":
         raise SeedError(f"sale {sale_id} status is {status!r}, expected 'Confirmed'")
+
+
+def create_confirmed_credit_sale(
+    api: ApiClient,
+    customer_id: int,
+    product_id: int,
+    *,
+    qty: str = "1",
+    unit_price: str = "10.00",
+    sale_date: str = "2024-05-02",
+    due_date: str = "2024-06-01",
+) -> int:
+    """A Confirmed credit sale with one line, so a customer drawer has a document.
+
+    Credit needs a due date (the customer may have no term), and confirming
+    assigns the sale number the drawer renders.
+    """
+    sale_id = create_sale_draft(
+        api,
+        customer_id,
+        payment_type="Credit",
+        sale_date=sale_date,
+        due_date=due_date,
+    )
+    add_sale_line(api, sale_id, product_id, qty=qty, unit_price=unit_price)
+    confirm_sale(api, sale_id)
+    return sale_id
 
 
 def cancel_sale(api: ApiClient, sale_id: int, *, reason: str | None = None) -> None:
@@ -356,6 +434,7 @@ def create_purchase_draft(
     *,
     payment_type: str = "Cash",
     purchase_date: str = "2024-05-02",
+    due_date: str | None = None,
 ) -> int:
     detail = api.post_json(
         "/api/purchases",
@@ -363,7 +442,7 @@ def create_purchase_draft(
             "supplier_id": supplier_id,
             "payment_type": payment_type,
             "purchase_date": purchase_date,
-            "due_date": None,
+            "due_date": due_date,
             "supplier_invoice_no": None,
             "notes": None,
         },
@@ -392,6 +471,53 @@ def add_purchase_line(
         raise SeedError(
             f"purchase {purchase_id} has no line for product {product_id} with qty {qty}"
         )
+
+
+def confirm_purchase(
+    api: ApiClient, purchase_id: int, *, method_id: int | None = None
+) -> None:
+    """Confirm a draft purchase and read the effect back.
+
+    A cash purchase names the method; a credit purchase omits it. The read-back
+    catches a 2xx that left the status behind, which is exactly the silent no-op
+    the drawer's outstanding balance would hide.
+    """
+    api.post_json(
+        f"/api/purchases/{purchase_id}/confirm",
+        {"method_id": method_id},
+    )
+    status = api.get_json(f"/api/purchases/{purchase_id}")["purchase"]["status"]
+    if status != "Confirmed":
+        raise SeedError(
+            f"purchase {purchase_id} status is {status!r}, expected 'Confirmed'"
+        )
+
+
+def create_confirmed_credit_purchase(
+    api: ApiClient,
+    supplier_id: int,
+    product_id: int,
+    *,
+    qty: str = "3",
+    unit_cost: str = "10.00",
+    purchase_date: str = "2024-05-02",
+    due_date: str = "2024-06-01",
+) -> int:
+    """A Confirmed credit purchase with one line, so a supplier has a payable.
+
+    Credit needs a due date, and confirming receives the stock; the drawer sums
+    the line's due into the outstanding balance the supplier test reads.
+    """
+    purchase_id = create_purchase_draft(
+        api,
+        supplier_id,
+        payment_type="Credit",
+        purchase_date=purchase_date,
+        due_date=due_date,
+    )
+    add_purchase_line(api, purchase_id, product_id, qty=qty, unit_cost=unit_cost)
+    confirm_purchase(api, purchase_id)
+    return purchase_id
 
 
 # ---------------------------------------------------------------------------

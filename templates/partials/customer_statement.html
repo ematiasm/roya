@@ -17,6 +17,9 @@
   {% if let Some(tax_id) = c.tax_id %}
   <div class="text-[13px] text-muted">tax id {{ tax_id }}</div>
   {% endif %}
+  {% if let Some(notes) = c.notes %}
+  <div class="text-[13px] text-muted">{{ notes }}</div>
+  {% endif %}
   {% endif %}
 
   {% if let Some(st) = statement %}
@@ -42,46 +45,5 @@
     </div>
   </div>
 
-  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Receivable sales ({{ debt_sales.len() }})</div>
-  {% if debt_sales.is_empty() %}
-    <div class="text-[13px] text-muted">No outstanding credit sales.</div>
-  {% else %}
-    {% for d in debt_sales %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3">
-      <div class="flex flex-col">
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">{{ d.payment_status }}</span>
-          <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}sale #{{ d.sale.id }}{% endif %}</span>
-        </div>
-        <span class="text-[13px] text-muted">{{ d.sale.sale_date }}{% if let Some(due) = d.sale.due_date %} • due {{ due }}{% endif %} • total {{ d.total }} • paid {{ d.paid }}</span>
-      </div>
-      <span class="font-bold tabular-nums text-expense">{{ d.due }}</span>
-    </div>
-    {% endfor %}
-  {% endif %}
-
-  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Statement ledger ({{ st.entries.len() }})</div>
-  {% if st.entries.is_empty() %}
-    <div class="text-[13px] text-muted">No confirmed credit sales yet.</div>
-  {% else %}
-    {% for e in st.entries %}
-    <div class="mb-1.5 flex items-center justify-between rounded-[10px] border border-border bg-card px-3 py-2">
-      <div class="flex flex-col">
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if e.debit.is_sign_positive() %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{{ e.description }}</span>
-          {% if let Some(n) = e.document_number %}
-          <span class="text-xs text-muted">{{ n }}</span>
-          {% endif %}
-        </div>
-        <span class="text-[13px] text-muted">{{ e.date }}</span>
-      </div>
-      <div class="flex items-center gap-2">
-        <span class="text-[13px] tabular-nums text-expense">+{{ e.debit }}</span>
-        <span class="text-[13px] tabular-nums text-income">−{{ e.credit }}</span>
-        <span class="font-bold tabular-nums">{{ e.balance }}</span>
-      </div>
-    </div>
-    {% endfor %}
-  {% endif %}
   {% endif %}
 </div>

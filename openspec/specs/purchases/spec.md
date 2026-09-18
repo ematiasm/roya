@@ -54,15 +54,23 @@ Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount
 - **Cancelling** a confirmed purchase returns the goods to the supplier (`Out`, reason
   `Purchase-return`) and refunds the money paid as an `Income` per payment. Unlike the sales refund,
   this is money *entering* the account, so it cannot overdraft and needs no balance guard.
+- **Supplier payment.** One handover of money is allocated oldest debt first (`due_date`, then
+  `purchase_date`, then id) across the supplier's Confirmed credit purchases, one payment per covered
+  purchase, each still posting its own `Expense` with `reference = purchase_number`. Suppliers have no
+  grouping receipt document (unlike customer receipts), so there is no receipt id and no total to
+  derive: the result is the created payments. More than the outstanding debt ⇒ 400 naming both
+  figures; an unassigned/inactive method ⇒ 400; both are raised before any write.
 - Deleting a supplier or product with history is refused (RESTRICT); deactivate instead.
 
 ## Interface
 - REST: `GET/POST /api/suppliers`, `GET/PUT /api/suppliers/{id}`, cost endpoints,
   `GET/POST /api/purchases`, `GET/PUT /api/purchases/{id}`, lines, payments, `confirm`,
-  `cancel`, and `GET /api/purchases/suggestions`.
+  `cancel`, `GET /api/purchases/suggestions`, and `POST /api/supplier-payments` (supplier-level
+  payment, oldest-first, no receipt document).
 - Web: `/purchases` with the purchase list, the "Sugerido" panel that seeds a draft, the draft line
   editor and the confirm, pay and cancel forms; `/suppliers` with the cost satellite and its
-  raise/lower badge.
+  raise/lower badge, and the drawer detail with the pay-supplier form (`POST /web/supplier-payments`)
+  and the record-cost form.
 
 ## Verification
 `src/services/purchases.rs` and `src/services/suppliers.rs` (AC1–AC14 and the cost-rule cases),

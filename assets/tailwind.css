@@ -50,6 +50,16 @@
   button {
     @apply cursor-pointer rounded-[10px] border-0 bg-accent px-3.5 py-2.5 font-bold text-[#0a0f0d] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
   }
+
+  /* Tailwind's preflight resets `* { margin: 0 }`, which wins over the UA
+     stylesheet's `dialog { margin: auto }`. A modal dialog therefore pins to the
+     top-left corner over the sidebar instead of centring — the backdrop still
+     paints, so it reads as a broken layout rather than an unstyled one. The
+     height bound keeps a tall form usable on a short viewport by scrolling
+     inside the dialog instead of overflowing the screen. */
+  dialog {
+    @apply m-auto max-h-[90vh] overflow-y-auto;
+  }
 }
 
 /* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The

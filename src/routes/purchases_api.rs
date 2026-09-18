@@ -103,6 +103,16 @@ pub struct RecordPaymentRequest {
     pub date: NaiveDate,
 }
 
+/// Supplier-level payment: no receipt id, because suppliers have no grouping
+/// document — the service derives the covered purchases from the supplier.
+#[derive(Debug, Deserialize)]
+pub struct PaySupplierRequest {
+    pub supplier_id: i64,
+    pub method_id: i64,
+    pub amount: Decimal,
+    pub date: NaiveDate,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfirmPurchaseRequest {
     #[serde(default)]
@@ -356,6 +366,31 @@ async fn record_payment(
     Ok((StatusCode::CREATED, Json(serde_json::json!(payment))))
 }
 
+/// Pay a supplier across their Confirmed purchases, oldest debt first. There is
+/// no grouping receipt document here (suppliers have none): the response is the
+/// payments the handover produced, one per covered purchase. The amount is
+/// validated against the supplier's outstanding debt (400 naming both figures)
+/// and the account is derived from the method (400 when unassigned/inactive),
+/// both before any write.
+async fn pay_supplier(
+    State(state): State<AppState>,
+    Json(payload): Json<PaySupplierRequest>,
+) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let payments = state
+        .purchases_service
+        .pay_supplier(
+            payload.supplier_id,
+            payload.method_id,
+            payload.amount,
+            payload.date,
+        )
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "payments": payments })),
+    ))
+}
+
 async fn confirm_purchase(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -393,6 +428,7 @@ pub fn router() -> Router<AppState> {
             put(update_line).delete(remove_line),
         )
         .route("/api/purchases/{id}/payments", post(record_payment))
+        .route("/api/supplier-payments", post(pay_supplier))
         .route("/api/purchases/{id}/confirm", post(confirm_purchase))
         .route("/api/purchases/{id}/cancel", post(cancel_purchase))
 }
@@ -1012,5 +1048,75 @@ mod tests {
             delete_req(app.clone(), &format!("/api/suppliers/{temp}")).await,
             StatusCode::NO_CONTENT
         );
+    }
+
+    // -- T5: supplier-level payment across purchases, no receipt -------------
+    #[tokio::test]
+    async fn rest_pay_supplier_allocates_oldest_first_without_a_receipt() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let pid = seed_product(&app, "PAY-SUP", "Product").await;
+        seed_stock(&app, pid, "10").await;
+        let sup = seed_supplier(&app, "PAY SUP").await;
+        let acc = seed_account(&app, "caja-pay").await;
+        fund_account(&app, acc, "1000").await;
+        let cash = allow_cash(&pool, acc).await;
+
+        // One Confirmed Credit purchase: 2 × 5 = 10 due.
+        let id = create_draft(&app, sup, "Credit").await;
+        add_line(&app, id, pid, "2").await;
+        let (st, v) = post_json(
+            app.clone(),
+            &format!("/api/purchases/{id}/confirm"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "confirm: {v}");
+
+        // Pay 4 of the 10 outstanding: one payment for the covered purchase.
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/supplier-payments",
+            serde_json::json!({
+                "supplier_id": sup, "method_id": cash, "amount": "4", "date": "2024-06-20"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "pay supplier: {v}");
+        let payments = v["payments"].as_array().unwrap();
+        assert_eq!(payments.len(), 1, "one payment per covered purchase: {v}");
+        assert_eq!(payments[0]["purchase_id"].as_i64(), Some(id));
+        assert_eq!(payments[0]["amount"].as_str().unwrap(), "4");
+
+        let (st, v) = get_json(app.clone(), &format!("/api/purchases/{id}")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["paid"].as_str().unwrap(), "4");
+        assert_eq!(v["due"].as_str().unwrap(), "6");
+
+        // More than the outstanding debt ⇒ 400, no further payment.
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/supplier-payments",
+            serde_json::json!({
+                "supplier_id": sup, "method_id": cash, "amount": "1000", "date": "2024-06-20"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "overpay must be 400");
+        let (st, v) = get_json(app.clone(), &format!("/api/purchases/{id}")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["due"].as_str().unwrap(), "6", "overpay left no side effect");
+
+        // Unknown supplier ⇒ 404, like the service.
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/supplier-payments",
+            serde_json::json!({
+                "supplier_id": 999999, "method_id": cash, "amount": "1", "date": "2024-06-20"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
     }
 }
