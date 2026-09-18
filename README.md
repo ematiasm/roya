@@ -535,7 +535,18 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /products` — inventory:
 
-- Product list with derived stock + low/negative badges (HTMX `GET /web/products`, filter by `category_id`)
+- Product list with derived stock + low/negative badges (HTMX `GET /web/products`)
+- Filter bar (`#product-filters`): text search over name, SKU and barcode (`q`) plus
+  `category_id`; the filter is addressable (`/products?q=…&category_id=…`) and Back restores
+  the list it was applied to
+- Every product mutation answer renders the list the caller is looking at, never the whole
+  catalogue: the mutation forms carry `hx-include="#product-filters"`, so the handler reads `q`
+  and `category_id` straight from the body. The New product modal's own category select is
+  `product_category_id`, because the filter already owns `category_id` and htmx resolves a
+  name collision in favour of the form's own field
+- Creating a product that the active filter hides answers with a notice naming the product,
+  stating that the filter is keeping it out of the list, and offering `Clear filter`; the
+  filter itself is left alone
 - Low-stock list with reorder suggestion (HTMX `GET /web/low-stock`, also `GET /web/negative-stock`)
 - Forms:
   - Create category: `POST /web/categories` (HTMX)
@@ -623,7 +634,7 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
-Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases), Catalogue (Products, Suppliers, Customers) and Cash (Accounts, currently the dashboard section). Each page's rendering struct carries a nav key and the server marks the active entry, so the state is correct without JavaScript. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path.
+Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases), Catalogue (Products, Suppliers, Customers) and Cash (Accounts, currently the dashboard section). Each page's rendering struct carries a nav key and the server marks the active entry, so the state is correct without JavaScript. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path. A response that carries its own server-rendered notice wins over the generic `<action> saved` text: the create-under-filter answer swaps its notice out of band into `#notice` (`templates/partials/notice.html`) and marks it `data-notice-server`, which `base.html` reads to skip the generic one. The name travels in the body rather than an `HX-Trigger` payload because header values are ASCII-only and product names are arbitrary UTF-8.
 
 ## Styles & local assets
 
