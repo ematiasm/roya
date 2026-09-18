@@ -32,7 +32,7 @@
      modifier compares the form's own `.value`, which is undefined, against that
      same undefined value, so it swallows every keystroke (htmx 1.9.12). `input`
      fires while typing (and on paste and select changes) and `delay:300ms`
-     debounces the burst; `change` stays as the blur backstop.
+     debounces the burst; `change` stays as the commit-on-leave backstop.
    - The Refresh button lives inside the form, next to Clear, and carries an
      explicit `hx-include="#<module>-filters"` even though htmx would include the
      enclosing form by itself: a copy-pasted button placed outside the form
