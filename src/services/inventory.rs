@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     Category, MovementReason, MovementType, NewMovement, NewProduct, Product, ProductBarcode,
-    ProductKind, ProductStock, StockMovement,
+    ProductKind, ProductStock, StockMovement, UpdateProduct,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
@@ -318,6 +318,38 @@ where
             return Err(AppError::Conflict("sku already exists".into()));
         }
         self.products.create(&clean).await
+    }
+
+    /// Patch edit over the current row. The patch merges onto the loaded product
+    /// (`None` = leave unchanged; `Some(None)` clears), then the merged row runs
+    /// the same `validate_product` rules as create, so an edit can never bypass a
+    /// business rule. The only edit-specific check is the duplicate SKU, done
+    /// against other rows only so re-sending the same SKU is not a conflict.
+    pub async fn update_product(&self, id: i64, patch: UpdateProduct) -> AppResult<Product> {
+        let current = self.get_product(id).await?;
+        let merged = NewProduct {
+            sku: patch.sku.unwrap_or_else(|| current.sku.clone()),
+            name: patch.name.unwrap_or_else(|| current.name.clone()),
+            kind: patch.kind.unwrap_or(current.kind),
+            category_id: patch.category_id.unwrap_or(current.category_id),
+            unit: patch.unit.unwrap_or_else(|| current.unit.clone()),
+            sale_price: patch.sale_price.unwrap_or(current.sale_price),
+            cost_price: patch.cost_price.unwrap_or(current.cost_price),
+            track_stock: patch.track_stock.unwrap_or(current.track_stock),
+            min_stock: patch.min_stock.unwrap_or(current.min_stock),
+            max_stock: patch.max_stock.unwrap_or(current.max_stock),
+            location: patch.location.unwrap_or_else(|| current.location.clone()),
+            notes: patch.notes.unwrap_or_else(|| current.notes.clone()),
+        };
+        let clean = self.validate_product(merged).await?;
+        if clean.sku != current.sku {
+            if let Some(other) = self.products.find_by_sku(&clean.sku).await? {
+                if other.id != id {
+                    return Err(AppError::Conflict("sku already exists".into()));
+                }
+            }
+        }
+        self.products.update(id, &clean).await
     }
 
     pub async fn set_product_active(&self, id: i64, active: bool) -> AppResult<Product> {
@@ -634,6 +666,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::UpdateProduct;
     use crate::repositories::{
         SqliteBarcodeRepository, SqliteCategoryRepository, SqliteProductRepository,
         SqliteStockMovementRepository,
@@ -1147,4 +1180,205 @@ mod tests {
         let err = s.resolve_product_ref("").await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "{err:?}");
     }
+
+        // -- T1 redesign-products: the product edit path -------------------------
+
+        /// A full patch changes every editable field, keeps id/is_active, and the
+        /// returned row is what the service persisted.
+        #[tokio::test]
+        async fn update_product_full_edit_changes_every_field() {
+            let s = svc(true).await;
+            let cat = s.create_category("edit-cat", None).await.unwrap();
+            let p = s.create_product(product_input("EDIT-1")).await.unwrap();
+            let patch = UpdateProduct {
+                sku: Some("EDIT-2".into()),
+                name: Some("Edited product".into()),
+                kind: Some(ProductKind::Product),
+                category_id: Some(Some(cat.id)),
+                unit: Some("kg".into()),
+                sale_price: Some(dec("20.50")),
+                cost_price: Some(dec("8.25")),
+                track_stock: Some(true),
+                min_stock: Some(Some(dec("2"))),
+                max_stock: Some(Some(dec("80"))),
+                location: Some(Some("shelf 3".into())),
+                notes: Some(Some("edited".into())),
+            };
+            let updated = s.update_product(p.id, patch).await.unwrap();
+            assert_eq!(updated.id, p.id);
+            assert_eq!(updated.sku, "EDIT-2");
+            assert_eq!(updated.name, "Edited product");
+            assert_eq!(updated.kind, ProductKind::Product);
+            assert_eq!(updated.category_id, Some(cat.id));
+            assert_eq!(updated.unit, "kg");
+            assert_eq!(updated.sale_price, dec("20.50"));
+            assert_eq!(updated.cost_price, dec("8.25"));
+            assert!(updated.track_stock);
+            assert_eq!(updated.min_stock, Some(dec("2")));
+            assert_eq!(updated.max_stock, Some(dec("80")));
+            assert_eq!(updated.location.as_deref(), Some("shelf 3"));
+            assert_eq!(updated.notes.as_deref(), Some("edited"));
+            assert!(updated.is_active, "edit must not flip is_active");
+        }
+
+        /// The empty patch is a no-op: every stored field survives untouched.
+        #[tokio::test]
+        async fn update_product_default_patch_leaves_product_untouched() {
+            let s = svc(true).await;
+            let p = s.create_product(product_input("NOPATCH")).await.unwrap();
+            let before = s.get_product(p.id).await.unwrap();
+            let updated = s
+                .update_product(p.id, UpdateProduct::default())
+                .await
+                .unwrap();
+            for field in [
+                updated.sku == before.sku,
+                updated.name == before.name,
+                updated.kind == before.kind,
+                updated.category_id == before.category_id,
+                updated.unit == before.unit,
+                updated.sale_price == before.sale_price,
+                updated.cost_price == before.cost_price,
+                updated.track_stock == before.track_stock,
+                updated.min_stock == before.min_stock,
+                updated.max_stock == before.max_stock,
+                updated.location == before.location,
+                updated.notes == before.notes,
+                updated.is_active == before.is_active,
+            ] {
+                assert!(
+                    field,
+                    "an empty patch must change nothing: {before:?} -> {updated:?}"
+                );
+            }
+        }
+
+        /// Some(None) clears a nullable field; untracking then clearing min/max
+        /// must satisfy (not violate) the tracked-products rule.
+        #[tokio::test]
+        async fn update_product_clears_min_max_when_untracked() {
+            let s = svc(true).await;
+            let p = s.create_product(product_input("CLR")).await.unwrap();
+            let updated = s
+                .update_product(
+                    p.id,
+                    UpdateProduct {
+                        track_stock: Some(false),
+                        min_stock: Some(None),
+                        max_stock: Some(None),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!updated.track_stock);
+            assert_eq!(updated.min_stock, None);
+            assert_eq!(updated.max_stock, None);
+        }
+
+        /// The cleaned SKU of another product is a Conflict; the same product's own
+        /// SKU (even re-sent) is accepted.
+        #[tokio::test]
+        async fn update_product_sku_conflict_only_against_other_rows() {
+            let s = svc(true).await;
+            let a = s.create_product(product_input("UPD-A")).await.unwrap();
+            let b = s.create_product(product_input("UPD-B")).await.unwrap();
+
+            let err = s
+                .update_product(
+                    a.id,
+                    UpdateProduct {
+                        sku: Some("UPD-B".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
+
+            // Same product re-sending its own SKU while changing the name.
+            let ok = s
+                .update_product(
+                    b.id,
+                    UpdateProduct {
+                        sku: Some("UPD-B".into()),
+                        name: Some("Renamed B".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(ok.name, "Renamed B");
+        }
+
+        /// Every create rule still holds on edit: a service cannot track stock,
+        /// max must be >= min, and a product needs sale_price > 0. A rejected
+        /// patch leaves no partial write behind.
+        #[tokio::test]
+        async fn update_product_invalid_patch_is_validation() {
+            let s = svc(true).await;
+            let p = s.create_product(product_input("INV-P")).await.unwrap();
+
+            // Service that tracks stock.
+            let err = s
+                .update_product(
+                    p.id,
+                    UpdateProduct {
+                        kind: Some(ProductKind::Service),
+                        track_stock: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+            // max < min (merged with the current min).
+            let err = s
+                .update_product(
+                    p.id,
+                    UpdateProduct {
+                        max_stock: Some(Some(dec("1"))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+            // sale_price 0 for a product.
+            let err = s
+                .update_product(
+                    p.id,
+                    UpdateProduct {
+                        sale_price: Some(Decimal::ZERO),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+            // No failed patch left a partial write behind.
+            let after = s.get_product(p.id).await.unwrap();
+            assert_eq!(after.sku, "INV-P");
+            assert_eq!(after.sale_price, dec("10"));
+        }
+
+        /// An unknown id is NotFound before any merge or write happens.
+        #[tokio::test]
+        async fn update_product_unknown_id_is_not_found() {
+            let s = svc(true).await;
+            let err = s
+                .update_product(
+                    99999,
+                    UpdateProduct {
+                        sku: Some("GHOST".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+        }
 }

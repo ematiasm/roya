@@ -284,6 +284,16 @@ pub struct Product {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+impl Product {
+    /// Template helper for the drawer's category select: `true` when this product
+    /// belongs to the given category. Askama binds `Some`/match arms by reference
+    /// and cannot deref or build `Some(...)` in expressions, so the comparison
+    /// lives here instead of in the template.
+    pub fn category_is(&self, id: &i64) -> bool {
+        self.category_id == Some(*id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductBarcode {
     pub id: i64,
@@ -331,6 +341,26 @@ pub struct NewProduct {
     pub max_stock: Option<Decimal>,
     pub location: Option<String>,
     pub notes: Option<String>,
+}
+
+/// Service-level patch for product edits. `None` means "leave unchanged"; the web
+/// form always sends every field, so it builds a full patch from the form.
+/// `Option<Option<T>>` fields distinguish "leave unchanged" (`None`) from
+/// "clear" (`Some(None)`), like `UpdateSupplier` / `UpdateCustomer`.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateProduct {
+    pub sku: Option<String>,
+    pub name: Option<String>,
+    pub kind: Option<ProductKind>,
+    pub category_id: Option<Option<i64>>,
+    pub unit: Option<String>,
+    pub sale_price: Option<Decimal>,
+    pub cost_price: Option<Decimal>,
+    pub track_stock: Option<bool>,
+    pub min_stock: Option<Option<Decimal>>,
+    pub max_stock: Option<Option<Decimal>>,
+    pub location: Option<Option<String>>,
+    pub notes: Option<Option<String>>,
 }
 
 /// Service-level input for stock movements.

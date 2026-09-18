@@ -21,6 +21,11 @@ pub trait ProductRepository: Send + Sync {
     async fn list_by_category(&self, category_id: i64) -> AppResult<Vec<Product>>;
     async fn count_by_category(&self, category_id: i64) -> AppResult<i64>;
     async fn set_active(&self, id: i64, active: bool) -> AppResult<Product>;
+    /// Persist a full merged row for an existing product. The service merges the
+    /// patch over the current row and validates it, so the repository stays
+    /// patch-agnostic: one UPDATE rewrites every editable column and returns the
+    /// re-read row.
+    async fn update(&self, id: i64, input: &NewProduct) -> AppResult<Product>;
     async fn delete(&self, id: i64) -> AppResult<bool>;
     async fn exists(&self, id: i64) -> AppResult<bool>;
 }
@@ -209,6 +214,38 @@ impl ProductRepository for SqliteProductRepository {
         Ok(row_to_product(row))
     }
 
+    async fn update(&self, id: i64, input: &NewProduct) -> AppResult<Product> {
+        let row = sqlx::query(
+            r#"UPDATE products
+               SET sku = ?, name = ?, kind = ?, category_id = ?, unit = ?,
+                   sale_price = ?, cost_price = ?, track_stock = ?, min_stock = ?,
+                   max_stock = ?, location = ?, notes = ?,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ?
+               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at"#,
+        )
+        .bind(&input.sku)
+        .bind(&input.name)
+        .bind(input.kind.to_string())
+        .bind(input.category_id)
+        .bind(&input.unit)
+        .bind(input.sale_price.to_string())
+        .bind(input.cost_price.to_string())
+        .bind(if input.track_stock { 1i64 } else { 0i64 })
+        .bind(input.min_stock.map(|d| d.to_string()))
+        .bind(input.max_stock.map(|d| d.to_string()))
+        .bind(input.location.clone())
+        .bind(input.notes.clone())
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        // Zero rows affected means the id does not exist: surface the same 404
+        // the reads do, so an edit can never silently no-op.
+        row.map(row_to_product)
+            .ok_or_else(|| AppError::NotFound(format!("product {id} not found")))
+    }
+
     async fn delete(&self, id: i64) -> AppResult<bool> {
         let res = sqlx::query(r#"DELETE FROM products WHERE id = ?"#)
             .bind(id)
@@ -233,5 +270,95 @@ impl ProductRepository for SqliteProductRepository {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.0 > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ProductKind;
+    use rust_decimal::Decimal;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    async fn test_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn repo() -> SqliteProductRepository {
+        SqliteProductRepository::new(test_pool().await)
+    }
+
+    fn product_input(sku: &str) -> NewProduct {
+        NewProduct {
+            sku: sku.to_string(),
+            name: format!("prod {sku}"),
+            kind: ProductKind::Product,
+            category_id: None,
+            unit: "un".to_string(),
+            sale_price: Decimal::from_str("10").unwrap(),
+            cost_price: Decimal::from_str("5").unwrap(),
+            track_stock: true,
+            min_stock: Some(Decimal::from_str("5").unwrap()),
+            max_stock: Some(Decimal::from_str("50").unwrap()),
+            location: None,
+            notes: None,
+        }
+    }
+
+    /// T1: `update` persists the full merged row in one UPDATE and returns the
+    /// re-read row, so the service merge is the only place patch semantics live.
+    #[tokio::test]
+    async fn update_persists_the_full_row_and_returns_it() {
+        let r = repo().await;
+        let created = r.create(&product_input("REPO-U1")).await.unwrap();
+        let input = NewProduct {
+            sku: "REPO-U2".to_string(),
+            name: "renamed".to_string(),
+            kind: ProductKind::Product,
+            category_id: None,
+            unit: "kg".to_string(),
+            sale_price: Decimal::from_str("20.5").unwrap(),
+            cost_price: Decimal::from_str("8").unwrap(),
+            track_stock: false,
+            min_stock: None,
+            max_stock: None,
+            location: Some("shelf 9".to_string()),
+            notes: Some("repo note".to_string()),
+        };
+        let updated = r.update(created.id, &input).await.unwrap();
+        assert_eq!(updated.id, created.id);
+        assert_eq!(updated.sku, "REPO-U2");
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.unit, "kg");
+        assert_eq!(updated.sale_price, Decimal::from_str("20.5").unwrap());
+        assert_eq!(updated.cost_price, Decimal::from_str("8").unwrap());
+        assert!(!updated.track_stock);
+        assert_eq!(updated.min_stock, None);
+        assert_eq!(updated.max_stock, None);
+        assert_eq!(updated.location.as_deref(), Some("shelf 9"));
+        assert_eq!(updated.notes.as_deref(), Some("repo note"));
+        // The row really changed in the table, not only in the return value.
+        let reread = r.find_by_id(created.id).await.unwrap().unwrap();
+        assert_eq!(reread.sku, "REPO-U2");
+        assert_eq!(reread.name, "renamed");
+    }
+
+    /// T1: zero rows affected maps to NotFound, matching the service's 404.
+    #[tokio::test]
+    async fn update_unknown_id_is_not_found() {
+        let r = repo().await;
+        let err = r.update(99999, &product_input("REPO-GHOST")).await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 }
