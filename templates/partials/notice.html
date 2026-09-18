@@ -1,0 +1,27 @@
+{# The server-rendered success notice for the create-under-filter case (issue
+   #37). The create answer swaps this wrapper out of band into the page's
+   `#notice` region with hx-swap-oob="innerHTML:#notice": htmx removes the
+   wrapper from the main swap and replaces the region's content with this
+   element's children. Rendered by `HiddenByFilterNotice` in
+   `src/routes/inventory_web.rs`, which names this file in its own comment.
+
+   The box markup mirrors `base.html`'s `notice()` JS success box byte for
+   byte — same classes, `data-notice="success"`, `role="status"` and the same
+   dismiss button — and `base.html` cross-references this file. The classes
+   are deliberately duplicated between an Askama template and a JS string:
+   this copy lives in `templates/` because that is the only tree Tailwind
+   scans (`@source "../templates"` in `assets/tailwind.css`), so the box keeps
+   its styling without any template ever rendering it statically; the JS copy
+   lives in `base.html` because every page's client-side notices are built
+   there. Change the two together, never one without the other.
+
+   Askama escapes `{{ product_name }}` on output, so a name made of markup
+   characters (`<`, `>`, `&`, `"`) reaches the operator as text, not HTML. #}
+<div hx-swap-oob="innerHTML:#notice">
+  <div class="mb-4 flex items-start justify-between gap-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3 text-sm text-accent" data-notice="success" data-notice-server="true" role="status">
+    <div class="min-w-0 flex-1 break-words">{{ product_name }} created — the active catalogue filter is keeping it out of the list.
+      <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/products">Clear filter</a>
+    </div>
+    <button type="button" class="shrink-0 rounded border border-current px-2 py-0.5 text-xs" data-notice-dismiss="true" aria-label="Dismiss">✕</button>
+  </div>
+</div>

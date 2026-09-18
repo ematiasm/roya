@@ -51,6 +51,16 @@
         return node;
       }
       // Notice: non-blocking feedback region; replaces the old blocking browser dialog.
+      // The server can also render this success box itself for the
+      // create-under-filter case (issue #37): the create answer swaps it out
+      // of band into this region with hx-swap-oob="innerHTML:#notice", marked
+      // data-notice-server="true". That box is an Askama template,
+      // templates/partials/notice.html, whose markup mirrors the markup below
+      // byte for byte. The classes are deliberately duplicated between a JS
+      // string and an Askama template: the server box must live in `templates/`
+      // because that is the only tree Tailwind scans, while this builder stays
+      // in base.html because every page's client-side notices are built here.
+      // Change the two together, never one without the other.
       function notice(kind, text) {
         var region = document.getElementById('notice');
         if (!region) return;
@@ -94,7 +104,20 @@
       document.body.addEventListener('htmx:afterRequest', function (evt) {
         if (!evt.detail.successful) return;
         var form = actionForm(evt);
-        if (form) notice('success', form.getAttribute('data-action') + ' saved');
+        if (!form) return;
+        // A server-rendered notice for this same request must win over the
+        // generic text: htmx runs the swap phase (beforeSwap → afterSwap)
+        // BEFORE this event — measured against the vendored htmx 1.9.12 in a
+        // real browser — so the out-of-band create-under-filter box (marked
+        // data-notice-server="true", emitted in inventory_web.rs) is already
+        // sitting in the region, and notice() below would replace it with
+        // "Create product saved". The response body is the tiebreak, the same
+        // read the responseError branch does for error text. Fail-safe in
+        // both directions: an ordinary create carries no marker and keeps the
+        // generic notice, and if the server ever stops rendering the box the
+        // generic notice comes back on its own.
+        if (evt.detail.xhr && evt.detail.xhr.responseText.includes('data-notice-server')) return;
+        notice('success', form.getAttribute('data-action') + ' saved');
       });
 
       // List filters are addressable pages (slice E3). The filter forms fetch a

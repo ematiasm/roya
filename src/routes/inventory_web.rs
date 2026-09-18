@@ -43,6 +43,21 @@ struct ProductListPartial {
     products: Vec<ProductStock>,
 }
 
+/// The server-rendered create-under-filter notice (issue #37). The box lives
+/// in `templates/partials/notice.html`, whose comment carries the full
+/// transport and mirroring contract; the important placement fact: the class
+/// tokens must stay scanned, and Tailwind scans only `templates/`, so this
+/// markup cannot live in a Rust string like `web_category_options`' option
+/// list (that builder writes classless `<option>` elements, so it never
+/// needed the scan). Askama escapes `{{ product_name }}` on output — the same
+/// escaping guarantee the hand `html_escape` gave, plus `'` — so a name made
+/// of markup characters reaches the operator as text, not HTML.
+#[derive(Template)]
+#[template(path = "partials/notice.html")]
+struct HiddenByFilterNotice {
+    product_name: String,
+}
+
 #[derive(Template)]
 #[template(path = "partials/stock_list.html")]
 struct StockListPartial {
@@ -95,25 +110,71 @@ fn is_htmx(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// The catalogue list fragment for a body-borne filter. The mutation forms
-/// carry `hx-include="#product-filters"` — the mechanism issue #33 established
-/// for the lifecycle forms — so the answer renders the list the operator is
+/// The catalogue rows for a body-borne filter. The mutation forms carry
+/// `hx-include="#product-filters"` — the mechanism issue #33 established for
+/// the lifecycle forms — so the answer is built from the list the operator is
 /// actually looking at instead of the whole catalogue. Empty strings mean "no
 /// constraint", the same lenient parsing the list page uses, so a filterless
-/// caller keeps the whole catalogue.
-async fn filtered_list_html(state: &AppState, q: &str, category_id: &str) -> AppResult<String> {
+/// caller keeps the whole catalogue. One helper so the lenient parsing stays
+/// written once: the create answer reuses these rows for both the fragment and
+/// the create-under-filter derivation (issue #37).
+async fn filtered_products(
+    state: &AppState,
+    q: &str,
+    category_id: &str,
+) -> AppResult<Vec<ProductStock>> {
     let filter = WebProductFilter {
         q: Some(q.to_string()),
         category_id: Some(category_id.to_string()),
     };
     let (query, category) = filter.parsed();
-    let products = state
+    state
         .inventory_service
         .filter_products(&query, category)
-        .await?;
-    ProductListPartial { products }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))
+        .await
+}
+
+async fn filtered_list_html(state: &AppState, q: &str, category_id: &str) -> AppResult<String> {
+    let products = filtered_products(state, q, category_id).await?;
+    render_product_list(&products)
+}
+
+fn render_product_list(products: &[ProductStock]) -> AppResult<String> {
+    ProductListPartial {
+        products: products.to_vec(),
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+/// Whether the body-borne catalogue filter actually constrains the list: a
+/// non-empty search text or a category that parses. Unparseable values stay
+/// inert — the lenient rule `WebProductFilter::parsed()` applies — so a stray
+/// `category_id=abc` must not be treated as an active filter.
+fn body_filter_is_active(q: &str, category_id: &str) -> bool {
+    !q.trim().is_empty()
+        || (!category_id.trim().is_empty() && category_id.trim().parse::<i64>().is_ok())
+}
+
+/// Render the create-under-filter notice for one product name. One place by
+/// construction: the markup and its contract live in
+/// `templates/partials/notice.html`, which cross-references this struct and
+/// `base.html`'s `notice()` box it mirrors; edit the two together.
+///
+/// `data-notice-server="true"` on the box marks it for base.html's generic
+/// `htmx:afterRequest` notice: htmx runs the swap phase (beforeSwap →
+/// afterSwap) BEFORE afterRequest — measured against the vendored 1.9.12 in a
+/// real browser — so the generic "Create product saved" would otherwise land
+/// last and replace this box. The guard skips that generic notice when the
+/// response body itself carries this marker, and both directions fail safe:
+/// an ordinary create (no marker) keeps the generic notice, and if the server
+/// ever stops rendering this box the generic notice comes back untouched.
+fn hidden_by_filter_notice_html(product_name: &str) -> AppResult<String> {
+    HiddenByFilterNotice {
+        product_name: product_name.to_string(),
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 fn triggered(html: String, event: &str) -> axum::response::Response {
@@ -600,13 +661,32 @@ async fn web_create_product(
             Some(form.notes)
         },
     };
-    state.inventory_service.create_product(input).await?;
+    let created = state.inventory_service.create_product(input).await?;
     if is_htmx(&headers) {
         // The answer is the list the caller is looking at: the filter rides the
         // body via `hx-include="#product-filters"` (issue #37), so an active
         // filter narrows this fragment and `product-created` still refreshes it.
-        let mut resp =
-            Html(filtered_list_html(&state, &form.q, &form.category_id).await?).into_response();
+        // ONE filtered query serves both the fragment and the under-filter
+        // check: membership is read off the very rows the answer renders, so a
+        // second query run can never disagree with the list actually shown.
+        let products = filtered_products(&state, &form.q, &form.category_id).await?;
+        // Create-under-filter: the correctly filtered list does not hold the
+        // fresh product, and the operator could read that as a failed create.
+        // Product decision (issue #37): keep the filter and say what happened,
+        // with a one-click way out. Membership is derived in the server from
+        // the service's own matching, never from a parallel comparison written
+        // against the form values, and only when the filter actually filters.
+        let hidden = body_filter_is_active(&form.q, &form.category_id)
+            && !products.iter().any(|p| p.product.id == created.id);
+        let mut html = render_product_list(&products)?;
+        if hidden {
+            // Prepended so the out-of-band notice opens the answer body; htmx
+            // removes the wrapper from the main swap either way. The
+            // transport (body, not header), the template home and the marker
+            // are documented on `hidden_by_filter_notice_html`.
+            html = hidden_by_filter_notice_html(&created.name)? + &html;
+        }
+        let mut resp = Html(html).into_response();
         resp.headers_mut()
             .insert("HX-Trigger", "product-created".parse().unwrap());
         return Ok(resp);

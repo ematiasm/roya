@@ -4762,6 +4762,207 @@ async fn product_create_answer_honours_the_active_filter() {
     );
 }
 
+// Issue #37 T2, create-under-filter: when the active filter keeps the fresh
+// product out of the correctly filtered list, the answer must say so — a
+// server-rendered notice that names the product, swapped out of band into the
+// page's `#notice` region, with a Clear filter way out. Everything below rides
+// the shape the browser's create form sends: `HX-Request` plus the filter the
+// modal merges from `#product-filters`.
+/// The notice IS present, naming the product and marked for the client-side
+/// precedence guard, when an active filter excludes the created product. The
+/// list fragment itself must stay the filtered rows the caller is looking at.
+#[tokio::test]
+async fn create_hidden_by_filter_answers_the_named_product_notice() {
+    let (app, pool) = test_app().await;
+    let alpha_cat = create_category_via_web(&app, &pool, "NoticeCat Alpha").await;
+    create_product_full_via_web(&app, &pool, "NTC-A", "Alpha Widget", Some(alpha_cat)).await;
+
+    // The filter (q=Alpha, matching only the seeded row) excludes the product
+    // being created, exactly what the merged body looks like in the browser.
+    let body = "sku=NTC-B&name=Beta+Widget&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&product_category_id=&category_id=&q=Alpha";
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("hx-swap-oob=\"innerHTML:#notice\""),
+        "the notice must travel out of band into #notice: {html:.400}"
+    );
+    assert!(
+        html.contains("data-notice-server=\"true\""),
+        "the server box must carry the precedence-guard marker: {html:.400}"
+    );
+    assert!(
+        html.contains("Beta Widget created"),
+        "the notice must name the created product: {html:.400}"
+    );
+    assert!(
+        html.contains("the active catalogue filter is keeping it out of the list"),
+        "the notice must say why the row is not there: {html:.400}"
+    );
+    assert!(
+        html.contains(">Clear filter</a>"),
+        "the notice must offer the one-click way out: {html:.400}"
+    );
+    assert!(
+        html.contains("data-notice=\"success\"") && html.contains("role=\"status\""),
+        "the box must mirror base.html notice()'s success markup: {html:.400}"
+    );
+    assert!(
+        html.contains("data-notice-dismiss=\"true\"") && html.contains("aria-label=\"Dismiss\""),
+        "the global dismiss handler must be able to remove the box: {html:.400}"
+    );
+    // The list fragment is still the filtered view: the seeded matching row is
+    // there, the created product's row is not (the notice names the product —
+    // that mention is the only occurrence — and rows carry the SKU, which the
+    // notice does not).
+    assert!(
+        html.contains("Alpha Widget") && html.contains("NTC-A"),
+        "the filtered answer must keep the matching seeded row: {html:.400}"
+    );
+    assert_eq!(
+        html.matches("Beta Widget").count(),
+        1,
+        "the created product must appear only in the notice, not as a row: {html:.400}"
+    );
+    assert!(
+        !html.contains("NTC-B"),
+        "the created row must not render in the filtered answer: {html:.400}"
+    );
+}
+
+/// The marker rides the response body exactly when the notice does: base.html
+/// skips the generic notice on this marker alone, so the guard and the box
+/// must not drift apart.
+#[tokio::test]
+async fn create_notice_marker_appears_exactly_when_the_notice_does() {
+    let (app, pool) = test_app().await;
+    let alpha_cat = create_category_via_web(&app, &pool, "MarkCat Alpha").await;
+    create_product_full_via_web(&app, &pool, "MRK-A", "Alpha Widget", Some(alpha_cat)).await;
+
+    // Hidden case: the marker rides along with the notice.
+    let body = "sku=MRK-B&name=Beta+Widget&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&q=Alpha";
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("data-notice-server=\"true\"") && html.contains("hx-swap-oob"),
+        "the marker must be present when the notice is: {html:.400}"
+    );
+
+    // Matching filter: the created product is IN the answer, so no notice and
+    // no marker — out loud, no false alarm.
+    let body = "sku=MRK-C&name=Alpha+Junior&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&q=Alpha";
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        !html.contains("data-notice-server") && !html.contains("hx-swap-oob"),
+        "a matching filter must not raise the notice: {html:.400}"
+    );
+
+    // No filter: the lenient empty path must not trip the notice either.
+    let body = "sku=MRK-D&name=Delta+Widget&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50";
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        !html.contains("data-notice-server") && !html.contains("hx-swap-oob"),
+        "an unfiltered create must stay silent beyond the generic notice: {html:.400}"
+    );
+    // (The two negative cases above also pin the empty-string filter keys:
+    // `q=` and `category_id=` must parse as inactive, not as constraints.)
+    let body = "sku=MRK-E&name=Echo+Widget&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&q=&category_id=";
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        !html.contains("data-notice-server") && !html.contains("hx-swap-oob"),
+        "empty filter keys must parse as no filter: {html:.400}"
+    );
+}
+
+/// A matching filter keeps the answer notice-free: the generic "Create product
+/// saved" notice is already honest when the row lands in the list.
+#[tokio::test]
+async fn create_matching_filter_answer_holds_the_new_row_without_a_notice() {
+    let (app, pool) = test_app().await;
+    let alpha_cat = create_category_via_web(&app, &pool, "MatchCat Alpha").await;
+    create_product_full_via_web(&app, &pool, "MTC-A", "Alpha Widget", Some(alpha_cat)).await;
+
+    let body = "sku=MTC-B&name=Alpha+Junior&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&q=Alpha";
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Junior"),
+        "the created row must be in the filtered answer: {html:.400}"
+    );
+    assert!(
+        !html.contains("data-notice-server") && !html.contains("hx-swap-oob"),
+        "a matching filter must not raise the notice: {html:.400}"
+    );
+}
+
+/// Regression for the header trap the body transport exists to avoid: a
+/// product name with non-ASCII characters (and one with an emoji, outside the
+/// BMP) must create successfully under a filter that hides it — no panic, no
+/// 5xx — and the notice must name it, because the body is UTF-8 while an
+/// `HX-Trigger` payload would have died in `HeaderValue`'s ASCII parser.
+#[tokio::test]
+async fn create_non_ascii_names_under_filter_stay_2xx_with_the_notice() {
+    let (app, pool) = test_app().await;
+    create_product_full_via_web(&app, &pool, "UTF-A", "Alpha Widget", None).await;
+
+    // "Yerba Ñandú" and "Yerba 🧉 Mate" URL-encoded, exactly what a browser
+    // form sends for those names.
+    for (sku, encoded, decoded) in [
+        ("UTF-B", "Yerba+%C3%91and%C3%BA", "Yerba Ñandú"),
+        ("UTF-C", "Yerba+%F0%9F%A7%89+Mate", "Yerba 🧉 Mate"),
+    ] {
+        let body = format!(
+            "sku={sku}&name={encoded}&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&q=Alpha"
+        );
+        let (status, html) = post_form(&app, "/web/products", &body).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a non-ASCII name must not turn a create into a 5xx: {html:.400}"
+        );
+        // html_escape leaves non-ASCII untouched, so the raw name must appear
+        // verbatim in the notice.
+        assert!(
+            html.contains(&format!("{decoded} created")),
+            "the notice must name the created product verbatim: {html:.400}"
+        );
+    }
+}
+
+/// The notice renders the product name through Askama's HTML escaping: a name
+/// made of markup characters must reach the operator as text, not HTML. This
+/// pins the escaping guarantee the template took over from the hand
+/// `html_escape` call when the box moved into `templates/partials/notice.html`.
+#[tokio::test]
+async fn create_notice_escapes_html_specials_in_the_product_name() {
+    let (app, pool) = test_app().await;
+    create_product_full_via_web(&app, &pool, "ESC-A", "Alpha Widget", None).await;
+
+    // "Agua <500ml> & \"especial\"" URL-encoded, exactly what a browser form
+    // sends for that name, under a filter that hides the created product.
+    let body = "sku=ESC-B&name=Agua+%3C500ml%3E+%26+%22especial%22&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&q=Alpha";
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a markup-laden name must not turn a create into a 5xx: {html:.400}"
+    );
+    assert!(
+        html.contains("data-notice-server=\"true\""),
+        "the notice must be present for the escaped-name case: {html:.400}"
+    );
+    assert!(
+        html.contains("Agua &lt;500ml&gt; &amp; &quot;especial&quot; created"),
+        "the notice must carry the escaped name: {html:.400}"
+    );
+    assert!(
+        !html.contains("<500ml>"),
+        "the raw markup must never reach the notice: {html:.400}"
+    );
+}
+
 #[tokio::test]
 async fn product_movement_answer_honours_the_active_filter() {
     let (app, pool) = test_app().await;
