@@ -1,0 +1,679 @@
+"""The redesigned products screen: header buttons, modals and the product drawer.
+
+The redesign moved creation into two modal dialogs (category and product), removed
+the four permanent right-rail cards (New Category, New Product, Stock Movement,
+REST API), and turned each row name into a slide-over drawer carrying the inline
+edit form, the per-supplier cost satellite and the stock movement form. These
+tests drive that screen in a real browser and assert what the browser actually
+rendered: the page holds the list and nothing the drawer owns, the modals create
+through the real endpoints and their refreshes land, and the drawer opens, saves,
+records costs and movements in place.
+
+They deliberately do not re-check business rules -- the Rust suite owns validation,
+cost shifting and stock arithmetic. What is asserted here is UX wiring and
+rendering: the fragment arrives, the drawer opens, the swap lands, the value
+shows. The regression tests in the drawer section cover the three user-reported
+filter/drawer defects: a catalogue filter that only applied on blur, a Refresh
+button that ignored the active filter, and a save that left the drawer open and
+(under a matching filter) hid the edited row.
+
+Unlike the party lists, product rows carry a per-record id (`#product-{id}`), so a
+row control is scoped by that id and additionally proven bound to the record by
+the endpoint its name button calls.
+
+The opt-in probe at the bottom writes full-page screenshots of the redesigned
+states for a human to look at; it is skipped unless
+``ROYA_E2E_PRODUCTS_SCREENSHOT_PROBE=1``.
+"""
+
+from __future__ import annotations
+
+import os
+from urllib.parse import urlparse
+
+import pytest
+from playwright.sync_api import Page, expect
+
+from conftest import ARTIFACTS_ROOT
+from helpers import ApiClient, create_product, create_supplier, record_supplier_cost
+
+# The env gate for the design-screenshot probe, the same one-shot shape as the
+# parties probe: opt-in, skipped by default, no effect on a normal run.
+SCREENSHOT_PROBE_ENV = "ROYA_E2E_PRODUCTS_SCREENSHOT_PROBE"
+
+_PRODUCTS_PAGE = "/products"
+_PRODUCTS_LIST = "/web/products"
+_PRODUCTS_INNER = "product-list-inner"
+
+
+# ---------------------------------------------------------------------------
+# Small navigation helpers
+# ---------------------------------------------------------------------------
+
+
+def _response_for(path: str, method: str = "GET"):
+    """Predicate matching one request path and method, query string ignored."""
+
+    def matches(response) -> bool:
+        return urlparse(response.url).path == path and response.request.method == method
+
+    return matches
+
+
+def _drawer_trigger(page: Page, product_id: int):
+    """The row name wired to one product, addressed by its ``hx-get``.
+
+    The redesigned rows carry a per-record id (`#product-{id}`), so the row id
+    scopes the lookup and the detail endpoint in the ``hx-get`` both finds the
+    right button and proves the row is bound to the record under test.
+    """
+    return page.locator(
+        f'#product-{product_id} button[hx-get="/web/products/detail/{product_id}"]'
+    )
+
+
+def _edit_form(page: Page):
+    """The drawer's inline Save product form, inside the swapped fragment."""
+    return page.locator('#product-detail-inner form[hx-post="/web/products/edit"]')
+
+
+def _open_products_list(page: Page, api: ApiClient, *, name: str) -> None:
+    """Open the products page and wait out the re-fetch its ``load`` trigger fires.
+
+    The server renders the list and htmx immediately asks for it again; acting
+    before that second response lands risks the swap replacing the row mid-click.
+    """
+    with page.expect_response(_response_for(_PRODUCTS_LIST)):
+        page.goto(f"{api.base_url}{_PRODUCTS_PAGE}")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text(name)
+
+
+def _open_product_drawer(page: Page, product_id: int) -> None:
+    """Click a row name and wait for its detail fragment before asserting.
+
+    The name's ``hx-get`` and the fragment path are the same, so one argument
+    both finds the control and synchronizes on its response.
+    """
+    with page.expect_response(_response_for(f"/web/products/detail/{product_id}")):
+        _drawer_trigger(page, product_id).click()
+
+
+# ---------------------------------------------------------------------------
+# Page structure
+# ---------------------------------------------------------------------------
+
+
+def test_products_page_keeps_the_list_and_drops_the_old_cards(
+    page: Page, api: ApiClient
+) -> None:
+    """The page is the list plus the two modal buttons and the empty drawer shell.
+
+    Seeded with one product so a clickable row name must exist. The sharpest
+    assertions are the absences: the old right rail's New Product, Stock Movement
+    and REST API cards must not render anywhere (the shared sidebar still carries
+    a ``REST API ↗`` link, so only the cards' own ids and exact headings count).
+    """
+    product = create_product(
+        api,
+        sku="PAGE-SKU-01",
+        name="Page Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+
+    _open_products_list(page, api, name="Page Widget")
+
+    # The list filter bar owns the refresh control, shared with the Clear
+    # anchor inside #product-filters; the Low Stock card carries its own
+    # identically labelled refresh button by design, so scoping to the filter
+    # form is what keeps the lookup unambiguous.
+    filter_bar = page.locator("#product-filters")
+    expect(filter_bar.get_by_role("button", name="↻ Refresh")).to_be_visible()
+    expect(filter_bar.get_by_text("Clear", exact=True)).to_be_visible()
+    # Title row: the two modal openers stayed behind while the refresh moved
+    # into the filter bar.
+    title_row = page.get_by_role("heading", name="Products", exact=True).locator("xpath=..")
+    expect(title_row.get_by_role("button", name="New category")).to_be_visible()
+    expect(title_row.get_by_role("button", name="New product")).to_be_visible()
+
+    # The two dialog shells exist but stay closed until a header button opens them.
+    for dialog_id in ("#new-category-dialog", "#new-product-dialog"):
+        expect(page.locator(dialog_id)).to_have_count(1)
+        expect(page.locator(dialog_id)).not_to_be_visible()
+
+    # The drawer shell is present, closed, and holds nothing yet.
+    expect(page.locator("#product-drawer")).to_have_count(1)
+    expect(page.locator("#product-drawer")).not_to_be_visible()
+    expect(page.locator("#product-drawer-body")).to_have_text("")
+
+    # The list and the Low Stock card remain, and the seeded row's name is the
+    # drawer trigger the drawer tests click.
+    expect(page.locator("#product-list")).to_be_visible()
+    expect(page.locator("#low-stock-section")).to_be_visible()
+    expect(_drawer_trigger(page, product_id)).to_be_visible()
+
+    # The old permanent cards are gone. Exact text: the sidebar still renders a
+    # "REST API ↗" link, and the new UI legitimately says "New product" and
+    # "Stock movement" in other casings, so only the old cards' exact spellings
+    # and ids must be absent.
+    expect(page.locator("#new-product")).to_have_count(0)
+    expect(page.get_by_text("New Product", exact=True)).to_have_count(0)
+    expect(page.get_by_text("Stock Movement", exact=True)).to_have_count(0)
+    expect(page.get_by_text("REST API", exact=True)).to_have_count(0)
+
+
+# ---------------------------------------------------------------------------
+# Creation modals
+# ---------------------------------------------------------------------------
+
+
+def test_new_product_modal_creates_and_refreshes_the_list(
+    page: Page, api: ApiClient
+) -> None:
+    """The New product button opens the modal; submitting creates the record.
+
+    The created product must land in the list next to the existing one, proving
+    the create POST answered with the refreshed list and the ``product-created``
+    event closed the modal.
+    """
+    create_product(
+        api,
+        sku="EXIST-SKU-02",
+        name="Existing Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    _open_products_list(page, api, name="Existing Widget")
+
+    page.get_by_role("button", name="New product").click()
+    dialog = page.locator("#new-product-dialog")
+    expect(dialog).to_be_visible()
+    dialog.locator('input[name="sku"]').fill("MODAL-SKU-02")
+    dialog.locator('input[name="name"]').fill("Modal Widget")
+    dialog.locator('input[name="sale_price"]').fill("12.50")
+    with page.expect_response(_response_for("/web/products", "POST")):
+        dialog.get_by_role("button", name="Create product").click()
+
+    listing = page.locator(f"#{_PRODUCTS_INNER}")
+    expect(listing).to_contain_text("Modal Widget")
+    expect(listing).to_contain_text("Existing Widget")
+    expect(dialog).not_to_be_visible()
+
+
+def test_new_category_modal_creates_and_fills_both_category_selects(
+    page: Page, api: ApiClient
+) -> None:
+    """The New category button opens the modal; the fresh category is selectable.
+
+    Submitting creates through the real endpoint, resets the form, and refetches
+    both category selects off ``/web/category-options``. The sharp assertions are
+    the two option lists: a category that only reached the database but not the
+    filter or the product modal's select would break a user's next action, and the
+    modal must keep an empty-value option so "no category" stays selectable.
+    """
+    create_product(
+        api,
+        sku="CAT-SKU-03",
+        name="Category Widget",
+        stock="1",
+        min_stock="1",
+        max_stock="10",
+    )
+    _open_products_list(page, api, name="Category Widget")
+
+    page.get_by_role("button", name="New category").click()
+    dialog = page.locator("#new-category-dialog")
+    expect(dialog).to_be_visible()
+    dialog.locator('input[name="name"]').fill("Modal Beverages")
+    with page.expect_response(_response_for("/web/categories", "POST")):
+        dialog.get_by_role("button", name="Create category").click()
+
+    # The form reset itself (the category dialog stays open by design).
+    expect(dialog.locator('input[name="name"]')).to_have_value("")
+
+    # The fresh category is selectable in the filter select…
+    expect(
+        page.locator("#filter-category option").filter(has_text="Modal Beverages")
+    ).to_have_count(1)
+    # …and in the product modal's category select…
+    expect(
+        page.locator("#new-product-category option").filter(has_text="Modal Beverages")
+    ).to_have_count(1)
+    # …which still offers an empty value for "no category".
+    expect(page.locator('#new-product-category option[value=""]')).to_have_count(1)
+
+
+# ---------------------------------------------------------------------------
+# Drawer
+# ---------------------------------------------------------------------------
+
+
+def test_clicking_a_product_name_opens_the_drawer_with_the_edit_form(
+    page: Page, api: ApiClient
+) -> None:
+    """The name opens the drawer landing the editable fragment, prefilled.
+
+    Asserts the drawer rendered content, not that a request fired: the fragment
+    root, the product name and the derived stock line must be there, and the Save
+    product form must carry the stored SKU — prefill is the point, because an
+    empty form would silently wipe the product's fields on the next save.
+    """
+    product = create_product(
+        api,
+        sku="DRAW-SKU-04",
+        name="Drawer Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Drawer Widget")
+    _open_product_drawer(page, product_id)
+
+    expect(page.locator("#product-drawer")).to_be_visible()
+    body = page.locator("#product-detail-inner")
+    expect(body).to_contain_text("Drawer Widget")
+    expect(body).to_contain_text("stock 10")
+
+    form = body.locator('form[hx-post="/web/products/edit"]')
+    expect(form.locator('input[name="sku"]')).to_have_value("DRAW-SKU-04")
+    expect(form.locator('input[name="name"]')).to_have_value("Drawer Widget")
+
+
+def test_editing_a_product_in_the_drawer_updates_drawer_and_list(
+    page: Page, api: ApiClient
+) -> None:
+    """Saving the drawer's edit form closes the drawer and refreshes the list.
+
+    A successful save closes the drawer (the user asked for it: Save is the end of
+    the edit flow); the ``product-changed`` trigger must refresh the list behind
+    it with the new values, still bound to the same product id. Asserting both the
+    closed drawer and the updated row catches a save that only did one of the two.
+    """
+    product = create_product(
+        api,
+        sku="EDIT-SKU-05",
+        name="Edit Me Widget",
+        sale_price="25.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Edit Me Widget")
+    _open_product_drawer(page, product_id)
+
+    form = _edit_form(page)
+    form.locator('input[name="name"]').fill("Edited Widget")
+    form.locator('input[name="sale_price"]').fill("29.50")
+    with page.expect_response(_response_for("/web/products/edit", "POST")):
+        with page.expect_response(_response_for(_PRODUCTS_LIST)):
+            form.get_by_role("button", name="Save product").click()
+
+    # The drawer read the swapped fragment before closing: the new values were in
+    # it (proven by the list below rendering them), and the drawer itself is now
+    # hidden with its body emptied by closeProductDrawer().
+    expect(page.locator("#product-drawer")).not_to_be_visible()
+    expect(page.locator("#product-drawer-body")).to_have_text("")
+
+    # The list row behind the drawer was refreshed by the trigger too, still bound
+    # to the same product id.
+    row = page.locator(f"#product-{product_id}")
+    expect(row).to_contain_text("Edited Widget")
+    expect(row).to_contain_text("$29.50")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Edit Me Widget")
+
+
+def test_editing_a_product_while_a_matching_filter_is_active_keeps_the_row_visible(
+    page: Page, api: ApiClient
+) -> None:
+    """The reported symptom: an edit under a matching filter must not hide the row.
+
+    The reported sequence was: filter (which only landed on blur), open a product,
+    edit its cost price, save — and the product vanished from the list until a
+    refresh, because the post-save list refresh silently re-applied the filter the
+    user never saw being applied. With the filter matching the edited product, a
+    successful save must leave that product's row visible in the list and close
+    the drawer.
+    """
+    product = create_product(
+        api,
+        sku="FILTER-SKU-09",
+        name="Filter Widget",
+        cost_price="10.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    create_product(
+        api,
+        sku="OTHER-SKU-10",
+        name="Other Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Filter Widget")
+
+    # The filter matches exactly one product, and it is applied without blurring:
+    # type the term and wait for the debounced fragment response.
+    with page.expect_response(_response_for(_PRODUCTS_LIST)):
+        page.locator('#product-filters input[name="q"]').press_sequentially("Filter")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Filter Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Other Widget")
+    expect(page.locator('#product-filters input[name="q"]')).to_have_value("Filter")
+
+    # Edit the cost price in the drawer and save; the drawer closes on success.
+    _open_product_drawer(page, product_id)
+    form = _edit_form(page)
+    form.locator('input[name="cost_price"]').fill("18.25")
+    with page.expect_response(_response_for("/web/products/edit", "POST")):
+        with page.expect_response(_response_for(_PRODUCTS_LIST)):
+            form.get_by_role("button", name="Save product").click()
+
+    expect(page.locator("#product-drawer")).not_to_be_visible()
+    # The filtered list must still hold the edited product's row — this is the
+    # exact step that used to make the product "disappear".
+    row = page.locator(f"#product-{product_id}")
+    expect(row).to_be_visible()
+    expect(row).to_contain_text("Filter Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Other Widget")
+
+
+def test_catalogue_filter_applies_while_typing_without_blurring(
+    page: Page, api: ApiClient
+) -> None:
+    """The catalogue filter narrows the list as the term is typed, no blur needed.
+
+    The filter form used `keyup changed delay:300ms`; htmx 1.9.12 initialises the
+    `changed` modifier's lastValue from the element carrying the trigger — the
+    ``<form>``, whose ``.value`` is undefined — and compares against that same
+    undefined value, so the debounced keystroke branch never fired and the filter
+    only applied on blur. Typing a term that matches exactly one seeded product
+    must narrow the list on its own, and the field must keep the typed value.
+    """
+    create_product(
+        api,
+        sku="LIVE-SKU-11",
+        name="Live Filter Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    create_product(
+        api,
+        sku="UNRELATED-SKU-12",
+        name="Unrelated Goods",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    _open_products_list(page, api, name="Live Filter Widget")
+
+    field = page.locator('#product-filters input[name="q"]')
+    field.click()
+    # Keystrokes only: no fill + Tab, no blur. The debounced response lands about
+    # 300ms after the last keystroke, so the request is awaited, not assumed.
+    with page.expect_response(_response_for(_PRODUCTS_LIST)):
+        page.keyboard.type("Live")
+
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Live Filter Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Unrelated Goods")
+    expect(page.locator(f"#{_PRODUCTS_INNER} > div[id^='product-']")).to_have_count(1)
+    # The field kept what the user typed: the filter the list shows is the filter
+    # the field holds.
+    expect(field).to_have_value("Live")
+
+
+def test_refresh_button_respects_the_active_catalogue_filter(
+    page: Page, api: ApiClient
+) -> None:
+    """The list card's Refresh button re-fetches with the active filter applied.
+
+    The button fetched `/web/products` without including ``#product-filters``, so
+    it rendered the unfiltered catalogue while the filter controls and the URL
+    still showed the filter — the list and its controls disagreed. Refresh must
+    carry the filter like the sales and purchases Refresh buttons do, and must not
+    rewrite the URL the filter already set.
+    """
+    create_product(
+        api,
+        sku="REFRESH-SKU-13",
+        name="Refresh Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    create_product(
+        api,
+        sku="STOCK-SKU-14",
+        name="Stocked Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    _open_products_list(page, api, name="Refresh Widget")
+
+    with page.expect_response(_response_for(_PRODUCTS_LIST)):
+        page.locator('#product-filters input[name="q"]').press_sequentially("Refresh")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Refresh Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Stocked Widget")
+
+    # The Refresh button inside the filter bar (the Low Stock card owns a
+    # second, identically labelled button by design).
+    filter_bar = page.locator("#product-filters")
+    with page.expect_response(_response_for(_PRODUCTS_LIST)):
+        filter_bar.get_by_role("button", name="↻ Refresh").click()
+
+    # The list stayed filtered: one row, the matching one, and the field keeps the
+    # term so the controls agree with what the list shows.
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Refresh Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Stocked Widget")
+    expect(page.locator(f"#{_PRODUCTS_INNER} > div[id^='product-']")).to_have_count(1)
+    expect(page.locator('#product-filters input[name="q"]')).to_have_value("Refresh")
+
+
+def test_recording_a_supplier_cost_and_setting_preferred_from_the_drawer(
+    page: Page, api: ApiClient
+) -> None:
+    """The drawer records a supplier cost and can mark its supplier preferred.
+
+    Two suppliers are seeded so the preferred marker is unambiguous: only the row
+    whose Set preferred was clicked may carry the badge, and the other supplier's
+    row must keep its button. The cost must list with the supplier's name and the
+    recorded amount, not a bare id or the product's fallback cost.
+    """
+    product = create_product(
+        api,
+        sku="COST-SKU-06",
+        name="Cost Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    supplier_a = create_supplier(api, "Cost Supplier Alpha")
+    supplier_b = create_supplier(api, "Cost Supplier Beta")
+    record_supplier_cost(api, product_id, supplier_b, cost="8.00")
+
+    _open_products_list(page, api, name="Cost Widget")
+    _open_product_drawer(page, product_id)
+
+    # The seeded cost renders from the product side before anything is recorded.
+    rows = page.locator("#product-detail-inner div.mb-2.justify-between")
+    expect(rows).to_have_count(1)
+    expect(rows.filter(has_text="Cost Supplier Beta")).to_contain_text("$8.00")
+
+    # Record a cost for the other supplier through the drawer's own form. The
+    # drawer stays OPEN by design (so the recorded value is visible) — only the
+    # Save product form closes it.
+    cost_form = page.locator('#product-detail-inner form[hx-post="/web/product-costs"]')
+    cost_form.locator('select[name="supplier_id"]').select_option(str(supplier_a))
+    cost_form.locator('input[name="cost"]').fill("9.75")
+    with page.expect_response(_response_for("/web/product-costs", "POST")):
+        cost_form.get_by_role("button", name="Record cost").click()
+
+    # The drawer was swapped in place and must still be open: both cost rows now
+    # list with names and amounts.
+    expect(page.locator("#product-drawer")).to_be_visible()
+    rows = page.locator("#product-detail-inner div.mb-2.justify-between")
+    expect(rows).to_have_count(2)
+    expect(rows.filter(has_text="Cost Supplier Alpha")).to_contain_text("$9.75")
+
+    # Mark the freshly recorded supplier preferred; the swap re-renders the rows.
+    preferred_form_a = rows.filter(
+        has_text="Cost Supplier Alpha"
+    ).locator('form[hx-post="/web/product-costs/preferred"]')
+    with page.expect_response(_response_for("/web/product-costs/preferred", "POST")):
+        preferred_form_a.get_by_role("button", name="Set preferred").click()
+
+    rows = page.locator("#product-detail-inner div.mb-2.justify-between")
+    expect(rows).to_have_count(2)
+    row_a = rows.filter(has_text="Cost Supplier Alpha")
+    expect(row_a.get_by_text("preferred", exact=True)).to_have_count(1)
+    # The other supplier keeps its button and must not inherit the marker.
+    row_b = rows.filter(has_text="Cost Supplier Beta")
+    expect(row_b.get_by_text("preferred", exact=True)).to_have_count(0)
+    expect(row_b.locator('form[hx-post="/web/product-costs/preferred"]')).to_have_count(1)
+
+
+def test_recording_a_stock_movement_from_the_drawer_updates_both_surfaces(
+    page: Page, api: ApiClient
+) -> None:
+    """The drawer's movement form updates the derived stock in drawer and list.
+
+    The browser proves the wiring: recording an ``In`` from the product's own
+    drawer must swap the fragment with the new derived stock and refresh the list
+    row behind it via ``movement-created``. The arithmetic itself is the Rust
+    suite's; what would break here is a movement that lands in neither surface.
+    """
+    product = create_product(
+        api,
+        sku="MOVE-SKU-07",
+        name="Movement Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Movement Widget")
+    _open_product_drawer(page, product_id)
+    expect(page.locator("#product-detail-inner")).to_contain_text("stock 10")
+
+    movement_form = page.locator(
+        '#product-detail-inner form[hx-post="/web/stock-movements"]'
+    )
+    movement_form.locator('select[name="type"]').select_option("In")
+    movement_form.locator('input[name="qty"]').fill("5")
+    with page.expect_response(_response_for("/web/stock-movements", "POST")):
+        with page.expect_response(_response_for(_PRODUCTS_LIST)):
+            movement_form.get_by_role("button", name="Record movement").click()
+
+    # The drawer was swapped with the fresh derived stock and must still be
+    # open: only the Save product form closes it.
+    expect(page.locator("#product-drawer")).to_be_visible()
+    drawer = page.locator("#product-detail-inner")
+    expect(drawer).to_contain_text("stock 15")
+    expect(drawer).not_to_contain_text("stock 10")
+
+    # The list row behind the drawer was refreshed by the trigger too.
+    row = page.locator(f"#product-{product_id}")
+    expect(row).to_contain_text("stock 15")
+    expect(row).not_to_contain_text("stock 10")
+
+
+# ---------------------------------------------------------------------------
+# Visual evidence (opt-in)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    os.environ.get(SCREENSHOT_PROBE_ENV) != "1",
+    reason=(
+        "opt-in probe: set "
+        f"{SCREENSHOT_PROBE_ENV}=1 to write the design screenshots"
+    ),
+)
+def test_design_screenshots_probe(page: Page, api: ApiClient) -> None:
+    """Write full-page screenshots of the redesigned products states for a human.
+
+    Skipped by default, like the harness artifact probe. It seeds a tracked
+    product with stock and a supplier with a recorded cost so the drawer shows
+    real content, then walks the states and writes one PNG per state under
+    ``e2e/.artifacts/design/`` (git-ignored), numbering after the parties probe.
+    """
+    product = create_product(
+        api,
+        sku="SHOT-SKU-08",
+        name="Screenshot Widget",
+        sale_price="25.00",
+        cost_price="10.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    supplier_id = create_supplier(
+        api,
+        "Distribuidora Sur",
+        phone="11 5555-5555",
+        notes="Entregas los martes",
+    )
+    record_supplier_cost(api, product_id, supplier_id, cost="9.50")
+
+    directory = ARTIFACTS_ROOT / "design"
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+
+    def shot(name: str) -> None:
+        path = directory / name
+        page.screenshot(path=str(path), full_page=True)
+        written.append(str(path.resolve()))
+
+    # 1. Products list
+    _open_products_list(page, api, name="Screenshot Widget")
+    shot("07-products-list.png")
+
+    # 2. New category modal open
+    page.get_by_role("button", name="New category").click()
+    expect(page.locator("#new-category-dialog")).to_be_visible()
+    shot("08-products-category-modal.png")
+    page.locator('#new-category-dialog button[type="button"]').first.click()
+    expect(page.locator("#new-category-dialog")).not_to_be_visible()
+
+    # 3. New product modal open
+    page.get_by_role("button", name="New product").click()
+    expect(page.locator("#new-product-dialog")).to_be_visible()
+    shot("09-products-product-modal.png")
+    page.locator('#new-product-dialog button[type="button"]').first.click()
+    expect(page.locator("#new-product-dialog")).not_to_be_visible()
+
+    # 4. Drawer open: edit form prefilled and the supplier-costs card with the
+    #    recorded row.
+    _open_product_drawer(page, product_id)
+    expect(page.locator("#product-drawer")).to_be_visible()
+    expect(page.locator("#product-detail-inner")).to_contain_text("Screenshot Widget")
+    expect(page.locator("#product-detail-inner")).to_contain_text("Distribuidora Sur")
+    shot("10-products-drawer.png")
+
+    # 5. Drawer after recording a movement through the form, so the movement card
+    #    is shown with a real interaction behind it.
+    movement_form = page.locator(
+        '#product-detail-inner form[hx-post="/web/stock-movements"]'
+    )
+    movement_form.locator('select[name="type"]').select_option("In")
+    movement_form.locator('input[name="qty"]').fill("5")
+    with page.expect_response(_response_for("/web/stock-movements", "POST")):
+        movement_form.get_by_role("button", name="Record movement").click()
+    expect(page.locator("#product-detail-inner")).to_contain_text("stock 15")
+    # The drawer body scrolls internally (the slide-over is fixed), so bring the
+    # movement card into view before capturing it.
+    page.locator("#product-drawer-body").evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    shot("11-products-drawer-movement.png")
+
+    for path in written:
+        print(f"screenshot: {path}")
