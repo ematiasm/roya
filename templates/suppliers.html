@@ -24,40 +24,6 @@
 </div>
 
 <div class="mt-6 rounded-2xl border border-border bg-card p-5">
-  <h2 class="mb-3 text-lg font-semibold">Record Product Cost</h2>
-  <form class="flex flex-col gap-2.5" hx-post="/web/supplier-costs" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
-    <div>
-      <label>Supplier</label>
-      <select name="supplier_id" required>
-        {% for s in suppliers %}
-        <option value="{{ s.supplier.id }}">{{ s.supplier.name }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div>
-      <label>Product</label>
-      <select name="product_id" required>
-        {% for p in products %}
-        <option value="{{ p.id }}">{{ p.sku }} — {{ p.name }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="flex gap-2.5 [&>*]:flex-1">
-      <div>
-        <label>Cost</label>
-        <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" />
-      </div>
-      <div>
-        <label>Date</label>
-        <input type="date" name="date" value="{{ today }}" />
-      </div>
-    </div>
-    <button type="submit">Record Cost</button>
-    <div class="text-[13px] text-muted">Unknown product/supplier ⇒ 400; a date older than the current cost date ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
-  </form>
-</div>
-
-<div class="mt-6 rounded-2xl border border-border bg-card p-5">
   <h2 class="mb-3 text-lg font-semibold">REST API</h2>
   <div class="text-[13px] leading-[1.7] text-muted">
     <code>GET /api/suppliers</code><br/>
@@ -143,5 +109,6 @@
   document.body.addEventListener('supplier-changed', function () { htmx.trigger('#supplier-list', 'refresh'); });
   document.body.addEventListener('supplier-deleted', function () { htmx.trigger('#supplier-list', 'refresh'); });
   document.body.addEventListener('supplier-cost-recorded', function () { htmx.trigger('#supplier-list', 'refresh'); });
+  document.body.addEventListener('supplier-paid', function () { htmx.trigger('#supplier-list', 'refresh'); });
 </script>
 {% endblock %}

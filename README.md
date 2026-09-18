@@ -93,6 +93,13 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
   - Credit payments each post 1 Expense (`reference = purchase_number`) and the
     payment stores the Expense id; N per purchase,
     mixed methods, sum ≤ total; Paid when due = 0; overpay ⇒ 400.
+  - Supplier-level payment: one handover of money allocated oldest debt first
+    (`due_date`, then `purchase_date`, then id) across the supplier's Confirmed
+    credit purchases, one payment per covered purchase, each posting its own
+    Expense. Suppliers have no grouping receipt document, so there is no receipt
+    id: the result is the created payments. More than the outstanding debt ⇒ 400
+    naming both figures; an unassigned/inactive method ⇒ 400; both leave no side
+    effect. Web form in the supplier drawer; REST: `POST /api/supplier-payments`.
   - Cancel of Confirmed returns stock (`Out`, reason `Purchase-return`, the M1 CHECK
     expansion) and posts Income refunds per payment; a refund is money entering, so the
     balance guard never blocks it. Draft cancel is a discard with no side effects.

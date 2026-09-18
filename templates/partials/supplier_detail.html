@@ -24,6 +24,68 @@
   </section>
 
   <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="mb-1.5 font-bold text-[13px] text-muted">Pay supplier</div>
+    <form class="flex flex-col gap-2.5"
+          hx-post="/web/supplier-payments"
+          hx-target="#supplier-drawer-body"
+          hx-swap="innerHTML"
+          hx-on::after-request="if(event.detail.successful) this.reset()">
+      <input type="hidden" name="supplier_id" value="{{ supplier.id }}" />
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Amount</label>
+          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+        </div>
+        <div>
+          <label>Date</label>
+          <input type="date" name="date" required value="{{ today }}" />
+        </div>
+      </div>
+      <div>
+        <label>Method (the account is derived from it)</label>
+        <select name="method_id" required>
+          {% for m in method_options %}
+          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button type="submit" class="bg-accent2 text-white">Pay supplier</button>
+      <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered purchase. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account.</div>
+    </form>
+  </section>
+
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="mb-1.5 font-bold text-[13px] text-muted">Record Product Cost</div>
+    <form class="flex flex-col gap-2.5"
+          hx-post="/web/supplier-costs"
+          hx-target="#supplier-drawer-body"
+          hx-swap="innerHTML"
+          hx-on::after-request="if(event.detail.successful) this.reset()">
+      <input type="hidden" name="supplier_id" value="{{ supplier.id }}" />
+      <div>
+        <label>Product</label>
+        <select name="product_id" required>
+          {% for p in products %}
+          <option value="{{ p.id }}">{{ p.sku }} — {{ p.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Cost</label>
+          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" />
+        </div>
+        <div>
+          <label>Date</label>
+          <input type="date" name="date" value="{{ today }}" />
+        </div>
+      </div>
+      <button type="submit">Record Cost</button>
+      <div class="text-[13px] text-muted">Unknown product ⇒ 400; a date older than the current cost date ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
+    </form>
+  </section>
+
+  <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1.5 font-bold text-[13px] text-muted">Purchases ({{ purchases.len() }})</div>
     {% if purchases.is_empty() %}
       <div class="text-[13px] text-muted">No purchases from this supplier yet.</div>
