@@ -95,9 +95,9 @@ unidad de trabajo; push y PR son decisión del usuario.
 - No-vacuidad probada rompiendo el filtrado a propósito
 
 ## Tasks
-- [ ] T1 — Los cuatro handlers filter-honest: structs + ramas no-drawer por
+- [x] T1 — Los cuatro handlers filter-honest: structs + ramas no-drawer por
       `filter_products`, rename del campo propio del modal, `hx-include` en los
-      forms, helper de smoke. Con sus tests Rust.
+      forms, helper de smoke. Con sus tests Rust. → `bc53a08`
 - [ ] T2 — Aviso create-bajo-filtro: derivación server-side, trigger payload,
       link de acción en `notice()`, listener. Con tests Rust y e2e.
 - [ ] T3 — Verificación completa (cargo test, check, e2e) + docs + cierre.
@@ -106,9 +106,56 @@ unidad de trabajo; push y PR son decisión del usuario.
 - 2026-09-18: documento creado, rama `fix/filter-honest-product-mutations`
   (desde `main` limpio en `6b5f025`). Baseline verificado: `cargo test` 350
   passed, árbol limpio, sincronizado con `origin/main`.
+- 2026-09-18: T1 completo en `bc53a08`. `all_product_stocks` reemplazado por
+  `filtered_list_html(state, q, category_id)`; los cuatro handlers leen el
+  filtro del body; el campo propio del modal pasó a `product_category_id`.
 
 ## Verification evidence
-- (pendiente)
+
+### T1 (`bc53a08`)
+- Writer: `cargo test` 354 passed / 0 failed (baseline 350, +4 nuevos);
+  `cargo check --all-targets` 0 errores, 51 warnings, ninguno atribuible a las
+  líneas nuevas.
+- Verificación independiente (read-only, otro agente): **PASS WITH FINDINGS**,
+  ningún hallazgo bloqueante ni causado por el cambio. Re-derivó la
+  no-vacuidad por su cuenta con **dos** probes: rompiendo el filtrado
+  (`filter_products("", None)`) los 4 tests fallan por la aserción esperada, y
+  con un filtro que no matchea nada (`"__matches_nothing__"`) los 4 vuelven a
+  fallar por la aserción opuesta. O sea las aserciones atan en las dos
+  direcciones y ningún test pasa sobre una lista vacía. Restauración probada
+  por `md5sum` del archivo y del diff completo (idéntico antes y después).
+- Inventario repo-wide de posters a los cuatro endpoints (incluido `e2e/`,
+  `README.md`, `openspec/`): sólo el modal, los tres forms del drawer y el
+  helper de smoke tocaban el endpoint de alta; el rename no rompe ninguno. Los
+  `curl` del README apuntan a `/api/*`, no al form web. Los e2e llenan el modal
+  por `name="sku"/"name"/"sale_price"` y eligen la categoría por **id**
+  (`#new-product-category`), así que el rename no los toca.
+- El choque de clave se comprobó decodificando `static/htmx.min.js` (1.9.12):
+  en `getInputValues` los campos del form que dispara se copian **sobre** los
+  del `hx-include` (`n = le(n, i)`), así que un nombre repetido hace ganar al
+  form propio y **descarta en silencio** el valor incluido. Con el nombre viejo
+  el filtro habría perdido su `category_id` y sólo habría viajado `q`. Esto es
+  lo que convierte el rename en arreglo semántico, no en cosmética.
+- Limpieza confirmada: `grep all_product_stocks` → 0 matches; los cuatro
+  renders de `ProductListPartial` existentes pasan por un filtro
+  (`filtered_list_html`, `web_product_list`, `web_edit_product`,
+  `product_lifecycle_response`).
+- Sin caminos stale: `hx-include` lee el DOM en el momento del request, y
+  `base.html` re-sincroniza los filter forms contra `location.search` en
+  `htmx:historyRestore`, así que el render inicial y el Back coinciden.
+- No verificable en T1 (fuera de autorización): comportamiento en navegador
+  real — lo cubre T2/T3 con la suite e2e.
+
+### Hallazgos del verificador, diferidos a follow-up (pre-existentes, fuera de alcance)
+- **F1** — `web_edit_product` (rama no-drawer) sigue tomando el filtro del
+  query string, no del body: es el arreglo de #33 y hoy no tiene caller
+  in-repo. La asimetría con el body queda documentada en el código. Pre-existente.
+- **F2** — El wiring guard (`guarded_pages()` en `src/smoke_tests.rs`) no cubre
+  el fragmento del drawer de producto (`/web/products/detail/{id}`), así que los
+  `hx-include` nuevos de `product_detail.html` no están validados por
+  `seeded_pages_render_only_wired_htmx_targets`. El selector es correcto
+  (`#product-filters` existe en la página que aloja el drawer) y el hueco ya
+  existía para los forms de ciclo de vida de #33.
 
 ## Next step
 - T1: delegar el writer con las superficies de edición exactas.
