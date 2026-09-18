@@ -93,6 +93,13 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
   - Credit payments each post 1 Expense (`reference = purchase_number`) and the
     payment stores the Expense id; N per purchase,
     mixed methods, sum ≤ total; Paid when due = 0; overpay ⇒ 400.
+  - Supplier-level payment: one handover of money allocated oldest debt first
+    (`due_date`, then `purchase_date`, then id) across the supplier's Confirmed
+    credit purchases, one payment per covered purchase, each posting its own
+    Expense. Suppliers have no grouping receipt document, so there is no receipt
+    id: the result is the created payments. More than the outstanding debt ⇒ 400
+    naming both figures; an unassigned/inactive method ⇒ 400; both leave no side
+    effect. Web form in the supplier drawer; REST: `POST /api/supplier-payments`.
   - Cancel of Confirmed returns stock (`Out`, reason `Purchase-return`, the M1 CHECK
     expansion) and posts Income refunds per payment; a refund is money entering, so the
     balance guard never blocks it. Draft cancel is a discard with no side effects.
@@ -548,20 +555,23 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /customers` — customers (M4):
 
-- Customer list with the derived balance, the ageing buckets and the
-  active/inactive/walk-in/over-limit badges (HTMX `GET /web/customers`)
-- Forms:
-  - Create customer: `POST /web/customers` (HTMX; a duplicate name renders the
-    existing matches as a warning)
-  - Edit customer: `POST /web/customers/edit` (HTMX, id in the body; the fields
-    replace the current values and empty optional fields clear)
-  - Activate/deactivate: `POST /web/customers/activate|deactivate` (HTMX, id in body)
-  - Delete: `POST /web/customers/delete` (HTMX, id in body, RESTRICT-aware)
+- Names-only customer list; an inactive name renders muted (HTMX `GET /web/customers`)
+- New customer button opens a `<dialog>` modal with the create form
+  (`POST /web/customers`, HTMX; a duplicate name renders the existing matches
+  as a warning)
+- Selecting a name opens the right slide-over drawer with the customer detail
+  (HTMX `GET /web/customers/detail/:id`); no edit card is shown (the
+  `POST /web/customers/edit` endpoint stays available)
+- Forms (id in the body):
+  - Edit customer: `POST /web/customers/edit` (HTMX; the fields replace the
+    current values and empty optional fields clear)
+  - Activate/deactivate: `POST /web/customers/activate|deactivate` (HTMX)
+  - Delete: `POST /web/customers/delete` (HTMX, RESTRICT-aware)
 
-`GET /customers/:id` — customer statement:
+`GET /customers/:id` — customer statement (same list, drawer open):
 
 - Ageing breakdown, receivable sales and the chronological ledger (HTMX
-  `GET /web/customers/:id/statement`)
+  `GET /web/customers/detail/:id`)
 - Payment history: every receipt with its allocations (HTMX
   `GET /web/customers/:id/receipts`)
 - Collect form: the customer, the amount, the account and the method; applies the
@@ -591,8 +601,14 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /suppliers` — suppliers + cost satellite (M3):
 
-- Supplier list with active/inactive badge and every satellite cost row (derived
-  raised/lowered alert, preferred marker) (HTMX `GET /web/suppliers`)
+- Names-only supplier list; an inactive name renders muted (HTMX `GET /web/suppliers`)
+- New supplier button opens a `<dialog>` modal with the create form
+  (`POST /web/suppliers`, HTMX); no edit card is shown (the
+  `POST /web/suppliers/edit` endpoint stays available)
+- Selecting a name opens the right slide-over drawer with the supplier header,
+  the outstanding balance (sum of `due` over Confirmed purchases) and that
+  supplier's purchases linking to their records (HTMX
+  `GET /web/suppliers/:id/detail`)
 - Forms:
   - Create supplier: `POST /web/suppliers` (HTMX)
   - Edit supplier: `POST /web/suppliers/edit` (HTMX)

@@ -786,6 +786,86 @@ where
             .await
     }
 
+    /// Pay a supplier across their outstanding Confirmed purchases, oldest debt
+    /// first (mirror of `CustomerReceiptService::collect` without the receipt
+    /// grouping document: suppliers have none). The supplier must exist (404)
+    /// and the amount must be positive; the account is derived from the
+    /// method's owner before any write (400 inactive/unassigned, no side
+    /// effect). A payment over the supplier's outstanding debt is a 400 naming
+    /// both figures. Returns one payment per covered purchase.
+    pub async fn pay_supplier(
+        &self,
+        supplier_id: i64,
+        method_id: i64,
+        amount: Decimal,
+        date: NaiveDate,
+    ) -> AppResult<Vec<PurchasePayment>> {
+        let supplier = self.suppliers.get_supplier(supplier_id).await?;
+        if amount <= Decimal::ZERO {
+            return Err(AppError::Validation("amount must be > 0".into()));
+        }
+        // The account is derived from the method's owner before any write
+        // (400 inactive/unassigned, no side effect).
+        self.payment_methods.resolve_account(method_id).await?;
+
+        // The payable: a payment never exceeds what the supplier is owed, and
+        // the outstanding figure is what the allocation is checked against.
+        // Oldest first: `due_date`, then `purchase_date`, then id — the same
+        // ordering rule `collect` plans with.
+        let mut debts: Vec<PurchaseDetail> = self
+            .outstanding_payables()
+            .await?
+            .into_iter()
+            .filter(|detail| detail.purchase.supplier_id == supplier_id)
+            .collect();
+        debts.sort_by(|a, b| {
+            a.purchase
+                .due_date
+                .cmp(&b.purchase.due_date)
+                .then_with(|| a.purchase.purchase_date.cmp(&b.purchase.purchase_date))
+                .then_with(|| a.purchase.id.cmp(&b.purchase.id))
+        });
+        let outstanding: Decimal = debts.iter().map(|detail| detail.due).sum();
+        if amount > outstanding {
+            return Err(AppError::Validation(format!(
+                "amount {amount} exceeds the outstanding debt {outstanding} of supplier {} ({supplier_id})",
+                supplier.name
+            )));
+        }
+
+        let mut remaining = amount;
+        let mut plan = Vec::new();
+        for detail in &debts {
+            if remaining <= Decimal::ZERO {
+                break;
+            }
+            if detail.due <= Decimal::ZERO {
+                continue;
+            }
+            let take = detail.due.min(remaining);
+            plan.push((detail.purchase.id, take));
+            remaining -= take;
+        }
+        let planned: Decimal = plan.iter().map(|(_, take)| *take).sum();
+        if planned != amount {
+            return Err(AppError::Internal(format!(
+                "payment plan {planned} does not consume the paid amount {amount}"
+            )));
+        }
+
+        // One payment per covered purchase. `record_payment` revalidates the
+        // overpay per document, and no allocation exceeds its due by
+        // construction.
+        let mut payments = Vec::with_capacity(plan.len());
+        for (purchase_id, take) in plan {
+            payments.push(
+                self.record_payment(purchase_id, method_id, take, date)
+                    .await?,
+            );
+        }
+        Ok(payments)
+    }
+
     // -- Cancel / purchase return --------------------------------------------------
 
     pub async fn cancel(
@@ -1362,6 +1442,148 @@ mod tests {
             .unwrap();
         assert!(rows.iter().all(|t| t.kind == TransactionKind::Expense));
         assert!(rows.iter().all(|t| t.description == number));
+    }
+
+    // -- T5: pay_supplier (oldest-first across purchases, no receipt) --------
+
+    async fn draft_credit_due(s: &Svc, supplier_id: i64, due: NaiveDate) -> Purchase {
+        s.create_draft(NewPurchase {
+            supplier_id,
+            payment_type: PaymentType::Credit,
+            purchase_date: purchase_date(),
+            due_date: Some(due),
+            supplier_invoice_no: None,
+            notes: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn t5_pay_supplier_covers_oldest_first_with_exact_dues() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T5-P", "20").await;
+        seed_stock(&s, prod.id, "20").await;
+        let sup = seed_supplier(&s, "T5 SUP").await;
+        let acc = seed_account(&s, "caja-t5").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        // Two Confirmed credit purchases: A due 2024-06-01 (2 × 20 = 40),
+        // B due 2024-07-01 (3 × 10 = 30).
+        let a = draft_credit_due(&s, sup.id, d(2024, 6, 1)).await;
+        s.add_line(a.id, prod.id, dec("2"), Some(dec("20")))
+            .await
+            .unwrap();
+        s.confirm(a.id, None).await.unwrap();
+        let b = draft_credit_due(&s, sup.id, d(2024, 7, 1)).await;
+        s.add_line(b.id, prod.id, dec("3"), Some(dec("10")))
+            .await
+            .unwrap();
+        s.confirm(b.id, None).await.unwrap();
+
+        // Pay 55: A covered exactly, B partial — one payment per purchase.
+        let payments = s
+            .pay_supplier(sup.id, cash, dec("55"), d(2024, 6, 20))
+            .await
+            .unwrap();
+        assert_eq!(payments.len(), 2);
+        assert_eq!(payments[0].purchase_id, a.id);
+        assert_eq!(payments[0].amount, dec("40"));
+        assert_eq!(payments[1].purchase_id, b.id);
+        assert_eq!(payments[1].amount, dec("15"));
+
+        let da = s.get_detail(a.id).await.unwrap();
+        assert_eq!(da.due, Decimal::ZERO);
+        assert_eq!(da.payment_status, crate::models::PaymentStatus::Paid);
+        let db = s.get_detail(b.id).await.unwrap();
+        assert_eq!(db.paid, dec("15"));
+        assert_eq!(db.due, dec("15"));
+        assert_eq!(tx_count(&pool).await, 2);
+
+        // Pay the exact remainder: B closes, nothing more is planned.
+        let rest = s
+            .pay_supplier(sup.id, cash, dec("15"), d(2024, 6, 21))
+            .await
+            .unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].purchase_id, b.id);
+        assert_eq!(rest[0].amount, dec("15"));
+        let db = s.get_detail(b.id).await.unwrap();
+        assert_eq!(db.due, Decimal::ZERO);
+        assert_eq!(db.payment_status, crate::models::PaymentStatus::Paid);
+    }
+
+    #[tokio::test]
+    async fn t5_pay_supplier_overpay_rejected_with_no_side_effect() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T5-OV", "20").await;
+        seed_stock(&s, prod.id, "20").await;
+        let sup = seed_supplier(&s, "T5 OV SUP").await;
+        let acc = seed_account(&s, "caja-t5ov").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        let a = draft_credit_due(&s, sup.id, d(2024, 6, 1)).await;
+        s.add_line(a.id, prod.id, dec("2"), Some(dec("20")))
+            .await
+            .unwrap();
+        s.confirm(a.id, None).await.unwrap();
+        let b = draft_credit_due(&s, sup.id, d(2024, 7, 1)).await;
+        s.add_line(b.id, prod.id, dec("3"), Some(dec("10")))
+            .await
+            .unwrap();
+        s.confirm(b.id, None).await.unwrap();
+
+        // Outstanding is 70: paying 71 is a 400 naming both figures.
+        let err = s
+            .pay_supplier(sup.id, cash, dec("71"), d(2024, 6, 20))
+            .await
+            .unwrap_err();
+        match &err {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("71"), "amount must be named: {msg}");
+                assert!(msg.contains("70"), "outstanding must be named: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(tx_count(&pool).await, 0, "no finance may be posted");
+        let db = s.get_detail(b.id).await.unwrap();
+        assert_eq!(db.paid, Decimal::ZERO);
+        assert_eq!(db.due, dec("30"), "second purchase untouched");
+    }
+
+    #[tokio::test]
+    async fn t5_pay_supplier_unknown_supplier_is_404() {
+        let (s, _) = svc().await;
+        let err = s
+            .pay_supplier(999_999, 1, dec("10"), purchase_date())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn t5_pay_supplier_unassigned_method_is_400() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T5-UM", "10").await;
+        seed_stock(&s, prod.id, "5").await;
+        let sup = seed_supplier(&s, "T5 UM SUP").await;
+        // Cash stays unassigned: no account may derive from it.
+        let cash = cash_method(&s).await;
+
+        let a = draft_credit(&s, sup.id).await;
+        s.add_line(a.id, prod.id, dec("1"), None).await.unwrap();
+        s.confirm(a.id, None).await.unwrap();
+
+        let err = s
+            .pay_supplier(sup.id, cash, dec("5"), purchase_date())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert_eq!(tx_count(&pool).await, 0, "no finance may be posted");
+        let da = s.get_detail(a.id).await.unwrap();
+        assert_eq!(da.paid, Decimal::ZERO);
     }
 
     // -- AC5: unknown refs + bad values ------------------------------------------
