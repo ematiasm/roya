@@ -126,6 +126,27 @@ A follow-up round closed three more defects in that keyboard flow, also in
   so the previous match count is never announced beside "Searching…", and a failed
   search resets that region to say so instead of leaving "Searching…" forever.
 
+Slice E4 is the redesigned parties screens, in `tests/test_parties.py`:
+
+- the customers and suppliers lists are names-only — the drawer owns the
+  badges, ageing, limits, phone and costs — verified with seeded phone, limit
+  and cost data that would surface if any of it leaked back into a row;
+- clicking a name opens the slide-over drawer, and the test asserts the rendered
+  content: the header, the balance line and the seeded Confirmed credit sale for
+  the customer; the outstanding balance and the Confirmed purchase for the
+  supplier;
+- the New customer/New supplier buttons open the create modal, and submitting
+  lands the created name in the refreshed list; each row's edit control opens a
+  prefilled modal whose saved change lands in the row;
+- paying a supplier from the drawer swaps the outstanding balance in place. The
+  browser proves the value is displayed, not the arithmetic.
+
+The design screenshots are an opt-in probe, shaped like the harness artifact
+probe: `ROYA_E2E_PARTIES_SCREENSHOT_PROBE=1` writes full-page PNGs of the six
+screens (customers list, customer drawer, customer create modal, suppliers list,
+supplier drawer, supplier edit modal) under `e2e/.artifacts/design/`
+(git-ignored) for a human to open.
+
 It deliberately does **not** verify business rules: balances, stock deduction,
 payment traceability, numbering and the rest stay in the Rust suite, which is
 faster and already thorough. Keeping that boundary sharp is what stops the
