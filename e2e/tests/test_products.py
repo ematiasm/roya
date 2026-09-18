@@ -203,6 +203,81 @@ def test_new_product_modal_creates_and_refreshes_the_list(
     expect(dialog).not_to_be_visible()
 
 
+def test_creating_a_product_hidden_by_the_active_filter_says_so_and_offers_the_way_out(
+    page: Page, api: ApiClient
+) -> None:
+    """A create under an active filter that excludes the new row must say so.
+
+    The decided behaviour (issue #37): the filter stays and the server answers
+    with its own notice — naming the created product, saying the active filter
+    is keeping it out of the list, with a `Clear filter` way out — swapped out
+    of band into the page's `#notice` region.
+
+    The sharp assertion is what the notice region ends up holding: exactly one
+    box, the server's, not the generic "Create product saved". A broken version
+    would look like either failure mode this design guards against — the
+    generic `htmx:afterRequest` notice landing after the out-of-band swap and
+    replacing the server box (the htmx swap phase runs before afterRequest, so
+    without the base.html precedence guard that is exactly what happens), or
+    the notice never arriving because the server skipped the under-filter
+    check. A broken membership derivation shows up as the notice while the row
+    is actually visible, or the row absent from the list with no notice.
+    """
+    product = create_product(
+        api,
+        sku="HIDE-SKU-13",
+        name="Visible Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    _open_products_list(page, api, name="Visible Widget")
+
+    # Activate a filter that will exclude the product about to be created: type
+    # the term and wait for the debounced fragment response.
+    with page.expect_response(_response_for(_PRODUCTS_LIST)):
+        page.locator('#product-filters input[name="q"]').press_sequentially("Visible")
+    listing = page.locator(f"#{_PRODUCTS_INNER}")
+    expect(listing).to_contain_text("Visible Widget")
+
+    page.get_by_role("button", name="New product").click()
+    dialog = page.locator("#new-product-dialog")
+    expect(dialog).to_be_visible()
+    dialog.locator('input[name="sku"]').fill("HIDDEN-SKU-14")
+    dialog.locator('input[name="name"]').fill("Hidden Widget")
+    dialog.locator('input[name="sale_price"]').fill("12.50")
+    with page.expect_response(_response_for("/web/products", "POST")):
+        dialog.get_by_role("button", name="Create product").click()
+
+    # The server's notice, not the generic "Create product saved": exactly one
+    # box in the region, naming the product and saying why it is not in the
+    # list. This is the assertion that pins the precedence guard and the
+    # out-of-band transport in a real browser.
+    region = page.locator("#notice")
+    boxes = region.locator("[data-notice]")
+    expect(boxes).to_have_count(1)
+    box = boxes.first
+    expect(box).to_be_visible()
+    expect(box).to_contain_text("Hidden Widget created")
+    expect(box).to_contain_text("the active catalogue filter is keeping it out of the list")
+    expect(box).not_to_contain_text("Create product saved")
+
+    # The filtered list still shows only the matching rows.
+    expect(listing).to_contain_text("Visible Widget")
+    expect(listing).not_to_contain_text("Hidden Widget")
+    # The filter controls still hold the active filter.
+    expect(page.locator('#product-filters input[name="q"]')).to_have_value("Visible")
+
+    # The notice offers the way out: following Clear filter reloads the page
+    # without the query, and the new row appears.
+    with page.expect_navigation():
+        box.get_by_text("Clear filter").click()
+    expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Hidden Widget")
+    expect(
+        page.locator(f"#product-{int(product['id'])}")
+    ).to_contain_text("Visible Widget")
+
+
 def test_new_category_modal_creates_and_fills_both_category_selects(
     page: Page, api: ApiClient
 ) -> None:
