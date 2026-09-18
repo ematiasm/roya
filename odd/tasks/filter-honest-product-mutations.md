@@ -319,9 +319,46 @@ unidad de trabajo; push y PR son decisión del usuario.
   `cargo test` 354 passed, e2e completa 54 passed / 4 skipped. PR1 = T1 (bajo el
   umbral de ~400), PR2 = T2 (apenas por encima). Decisión del usuario.
 
+## Entrega (2026-09-18)
+- Dos PRs **apilados**, ambos mergeados a `main`:
+  - PR #38 (`fix/filter-honest-mutation-answers`, `type:bug`) → merge `7e4c55b`.
+    Slice T1: los cuatro handlers de mutación filter-honest.
+  - PR #39 (`fix/filter-honest-product-mutations`, `type:feature`) → merge
+    `49d5fa2`. Slice T2: el aviso create-bajo-filtro. Cerró la issue #37, que
+    pasó a CLOSED/COMPLETED.
+  - #38 dice "Part of #37" y #39 lo cierra: el criterio de aceptación del
+    create-bajo-filtro recién se cumple en T2, así que cerrarlo en #38 habría
+    sido mentira de bookkeeping.
+- Slicing: 937+/29- totales. Sin el doc de tarea, la superficie revisable era
+  **291** líneas (T1) y **461** (T2). Una sola pasada honesta de corte; T2 queda
+  sobre el budget de 400 y por eso lleva `size:exception`, aceptado por el
+  usuario al mergear. No hay corte mejor: el aviso, el guard y el test de
+  navegador son un solo comportamiento, y separar el test de lo que verifica
+  publicaría un estado intermedio sin probar.
+- Gate post-merge (verificación independiente sobre `main` ya mergeado):
+  `main^{tree} == e333b42^{tree}` (`f204282c…`), o sea **los dos merges no
+  perdieron ni inventaron un hunk**; `cargo test` 359 passed; `cargo check
+  --all-targets` 0 errores y 51 warnings (el baseline exacto, ninguno sobre una
+  línea tocada); `scripts/e2e.sh` completo 55 passed / 4 skipped;
+  `scripts/build-css.sh` reproducible. Entre `6b5f025` y `main` entraron
+  exactamente los 9 archivos del cambio, ninguno de más.
+- **Error de proceso, registrado porque es reutilizable**: `gh pr merge 38
+  --delete-branch` **cerró** #39 en vez de retargetearlo — GitHub cierra un PR
+  cuando desaparece su base y no lo retargetea sólo. Recuperado recreando la rama
+  padre en `ba3999e`, reabriendo #39, retargeteando a `main` y confirmando que el
+  diff siguiera siendo el slice de T2 (7 archivos, +621/-26) antes de mergear.
+  Regla para la próxima: en un stack, la rama padre no se borra hasta que mergea
+  el hijo.
+- Ramas locales y remotas borradas; `main` local y remoto en el mismo commit
+  (`49d5fa2`), árbol limpio, una sola rama en ambos.
+
 ## Next step
-- Nada pendiente de esta feature. Push y PR son decisión del usuario (ver
-  "Carga de revisión" para el corte sugerido en dos PRs).
-- Follow-ups abiertos, fuera de alcance: issue #37 cerrada por esta rama;
-  F1/F2 de T1 (asimetría de `web_edit_product`, wiring guard sin cubrir el
-  drawer de producto) y los `Option<Option<T>>` de suppliers/categories.
+- Nada pendiente de esta feature: #37 cerrada y los dos PRs mergeados con el
+  gate post-merge en verde.
+- Follow-ups abiertos, fuera de alcance (detalle en las secciones de arriba):
+  asimetría de `web_edit_product` (toma el filtro del query string, sin caller
+  in-repo), el wiring guard que no cubre el fragmento del drawer de producto, y
+  los `Option<Option<T>>` sin `double_option` de suppliers/categories.
+- Preexistente y ajeno a esta feature: 79 sesiones rancias "activas" de `roya`
+  en Engram (por eso fallan cerrado los writes sin session id explícito) y el
+  error `sync_target_closed_space` (43 mutaciones sin ack).
