@@ -14,7 +14,6 @@ use crate::error::{AppError, AppResult};
 use crate::models::{PaymentMethod, TransactionKind};
 use crate::repositories::AccountRepository;
 use crate::routes::AppState;
-use crate::services::finance_methods::PaymentMethodOption;
 
 // ---------------------------------------------------------------------------
 // Askama templates
@@ -38,7 +37,8 @@ struct AccountDetailTemplate {
     account: crate::models::AccountWithBalance,
     transactions: Vec<crate::models::Transaction>,
     allow_negative: bool,
-    methods: Vec<PaymentMethodOption>,
+    methods: Vec<PaymentMethod>,
+    unassigned: Vec<PaymentMethod>,
     has_methods: bool,
     nav_key: &'static str,
 }
@@ -136,12 +136,14 @@ async fn account_detail(
     // find_with_balance for header
     let acc_with_balance = state.accounts_with_balance_lookup(id).await?;
     let methods = state.payment_method_service.catalog_for_account(id).await?;
-    let has_methods = methods.iter().any(|m| m.allowed);
+    let unassigned = state.payment_method_service.unassigned().await?;
+    let has_methods = !methods.is_empty();
     let tmpl = AccountDetailTemplate {
         account: acc_with_balance,
         transactions: detail.transactions.clone(),
         allow_negative: state.allow_negative,
         methods,
+        unassigned,
         has_methods,
         nav_key: "accounts",
     };
@@ -238,17 +240,16 @@ async fn web_create_account(
     headers: HeaderMap,
     Form(form): Form<CreateAccountForm>,
 ) -> Result<axum::response::Response, AppError> {
-    // Explicit configuration: validate the allowlist before creating the
-    // account so a rejected form never leaves a half-configured account behind.
-    let method_ids = state
-        .payment_method_service
-        .validated_method_ids(&form.method_ids)
-        .await?;
+    // Ticked methods join the new account: unassigned ones are assigned, ones
+    // owned elsewhere are duplicated by name (never stolen). No ticks means a
+    // method-less account, which the list flags with a warning.
     let acc = state.account_service.create(&form.name).await?;
-    state
-        .payment_method_service
-        .replace_allowed(acc.id, &method_ids)
-        .await?;
+    for method_id in &form.method_ids {
+        state
+            .payment_method_service
+            .assign_or_duplicate(acc.id, *method_id)
+            .await?;
+    }
     // If HTMX, return updated fragments
     if is_htmx(&headers) {
         let accounts = state.account_service.list_with_balances().await?;
@@ -281,7 +282,7 @@ async fn web_update_payment_methods(
     state.account_service.require_exists(id).await?;
     state
         .payment_method_service
-        .replace_allowed(id, &form.method_ids)
+        .replace_account_methods(id, &form.method_ids)
         .await?;
     Ok(Redirect::to(&format!("/accounts/{id}")).into_response())
 }
@@ -558,7 +559,6 @@ mod tests {
     async fn pay(
         app: &Router,
         sale_id: i64,
-        account: i64,
         method: i64,
         amount: &str,
     ) -> (StatusCode, String) {
@@ -566,7 +566,7 @@ mod tests {
             app,
             &format!("/api/sales/{sale_id}/payments"),
             serde_json::json!({
-                "account_id": account, "method_id": method,
+                "method_id": method,
                 "amount": amount, "date": "2024-05-10"
             }),
         )
@@ -580,11 +580,10 @@ mod tests {
         let app = crate::routes::router(state);
 
         let cash = method_id(&pool, "Cash").await;
-        // Original bug: the web form created accounts with an empty
-        // account_payment_methods allowlist, so every payment was rejected.
+        // The web form attaches the ticked methods to the new account, so a
+        // payment with one of them is accepted.
         let (status, body) = web_create_account(&app, "Wallet", &[cash]).await;
         assert_eq!(status, StatusCode::SEE_OTHER, "web create: {status} {body}");
-        let acc = account_id(&pool, "Wallet").await;
 
         let pid = seed_product(&app, "REG-E2E").await;
         seed_stock(&app, pid).await;
@@ -604,11 +603,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "confirm: {body}");
 
-        let (status, body) = pay(&app, sale, acc, cash, "10").await;
+        let (status, body) = pay(&app, sale, cash, "10").await;
         assert_eq!(
             status,
             StatusCode::CREATED,
-            "payment must be accepted after web creation with the allowlist: {body}"
+            "payment must be accepted after web creation with the method: {body}"
         );
         let payments: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
             .bind(sale)
@@ -619,12 +618,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payment_rejected_with_actionable_message_when_account_has_no_methods() {
+    async fn payment_rejected_with_actionable_message_when_method_unassigned() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
 
-        // REST-created accounts start with no allowlist (web form requires a tick).
+        // REST-created accounts own nothing; Cash is unassigned too.
         let (status, body) = post_json(
             &app,
             "/api/accounts",
@@ -632,9 +631,6 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "create account: {body}");
-        let acc: i64 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
-            .as_i64()
-            .unwrap();
         let cash = method_id(&pool, "Cash").await;
 
         let pid = seed_product(&app, "NO-ALLOW").await;
@@ -655,7 +651,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "confirm: {body}");
 
-        let (status, body) = pay(&app, sale, acc, cash, "10").await;
+        let (status, body) = pay(&app, sale, cash, "10").await;
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
@@ -664,7 +660,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let msg = v["error"].as_str().unwrap_or_default();
         assert!(
-            msg.contains("configure the account's payment methods"),
+            msg.contains("not assigned to any account"),
             "message must tell the user what to do, got {msg}"
         );
         let payments: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
@@ -676,20 +672,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_create_account_without_ticked_methods_is_rejected() {
+    async fn web_create_account_without_ticked_methods_creates_flagged_account() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
 
+        // No ticks is allowed: the account is created method-less and the list
+        // flags it with the actionable warning.
         let (status, body) = web_create_account(&app, "NoMethods", &[]).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("at least one"), "clear message: {body}");
+        assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM accounts WHERE name = 'NoMethods'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(count.0, 0, "no account may be created without methods");
+        assert_eq!(count.0, 1, "the account is created without methods");
+        let (status, list) = send(app.clone(), "GET", "/web/accounts", None, String::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            list.contains("No payment methods configured"),
+            "the method-less account must be flagged: {list}"
+        );
     }
 
     #[tokio::test]
@@ -724,14 +727,13 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let allowed: Vec<&str> = v["methods"]
+        let owned: Vec<&str> = v["methods"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| m["allowed"] == true)
             .map(|m| m["name"].as_str().unwrap())
             .collect();
-        assert_eq!(allowed, vec!["Transfer"], "Cash must be removed: {body}");
+        assert_eq!(owned, vec!["Transfer"], "Cash must be unassigned: {body}");
 
         // The detail page reflects the new set and clears the warning.
         let (status, page) = send(
@@ -746,6 +748,12 @@ mod tests {
         assert!(
             page.contains(&format!("value=\"{transfer}\" checked")),
             "Transfer must render checked"
+        );
+        // Cash is now unassigned, so it renders in the unassigned section,
+        // unchecked.
+        assert!(
+            page.contains(&format!("value=\"{cash}\"")),
+            "Cash must still be offered as unassigned"
         );
         assert!(
             !page.contains(&format!("value=\"{cash}\" checked")),

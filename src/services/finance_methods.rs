@@ -1,22 +1,15 @@
-// M0 payment-method allowlist service (finance-owned).
-// Methods seeded Cash/Transfer/Debit/CreditCard/QR (no Other) via migration.
-// account_payment_methods PK(both) RESTRICT both. Sensible defaults:
-// Caja->[Cash], Banco->[Transfer,Debit,CreditCard], MP->[QR,Transfer].
+// M0 account-owned payment methods (finance-owned).
+// Methods seeded Cash/Transfer/Debit/CreditCard/QR (no Other), unassigned until
+// an account owns them. Each method belongs to at most one account:
+// UNIQUE(account_id, name) lets two accounts each own a same-named method as
+// separate rows. Sensible defaults: Caja->[Cash],
+// Banco->[Transfer,Debit,CreditCard], MP->[QR,Transfer] (Transfer duplicates by
+// design). Payments name only the method; the account is derived from ownership,
+// so an invalid combination is impossible by construction.
 use crate::error::{AppError, AppResult};
-use crate::models::PaymentMethod;
+use crate::models::{PaymentMethod, PaymentMethodWithAccount};
 use crate::repositories::PaymentMethodRepository;
-use serde::Serialize;
 use std::collections::HashSet;
-
-/// A catalog entry plus whether the account currently accepts it. Serialized by
-/// `GET /api/accounts/{id}/payment-methods` and rendered by the web matrix.
-#[derive(Debug, Clone, Serialize)]
-pub struct PaymentMethodOption {
-    pub id: i64,
-    pub name: String,
-    pub is_active: bool,
-    pub allowed: bool,
-}
 
 #[derive(Clone)]
 pub struct PaymentMethodService<PM>
@@ -38,6 +31,12 @@ where
         self.methods.list_methods().await
     }
 
+    /// Every method with its owning account resolved, for method-only selects
+    /// (`"Name — AccountName"`).
+    pub async fn methods_with_accounts(&self) -> AppResult<Vec<PaymentMethodWithAccount>> {
+        self.methods.list_with_accounts().await
+    }
+
     /// Canonical method names in seed order.
     pub fn seeded_names() -> Vec<&'static str> {
         vec!["Cash", "Transfer", "Debit", "CreditCard", "QR"]
@@ -54,54 +53,75 @@ where
         }
     }
 
-    /// Insert allowlist rows for the well-known defaults (idempotent).
+    /// Give a well-known account its defaults (idempotent). An unassigned
+    /// same-named method is assigned; when the name only exists on another
+    /// account a duplicate row is created (UNIQUE(account_id, name) permits
+    /// it); a missing name is created fresh. Never steals: no existing
+    /// ownership is ever changed.
     pub async fn ensure_defaults_for_account(
         &self,
         account_id: i64,
         account_name: &str,
     ) -> AppResult<()> {
         for method_name in Self::default_method_names_for_account_name(account_name) {
-            if let Some(m) = self.methods.find_method_by_name(method_name).await? {
-                self.methods.allow(account_id, m.id).await?;
+            if self
+                .methods
+                .find_method_in_account(account_id, method_name)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            if let Some(unassigned) =
+                self.methods.find_unassigned_by_name(method_name).await?
+            {
+                self.methods
+                    .set_method_account(unassigned.id, Some(account_id))
+                    .await?;
+            } else {
+                self.methods.create_in_account(method_name, account_id).await?;
             }
         }
         Ok(())
     }
 
-    /// Full catalog for one account with an `allowed` flag per method.
+    /// The account's own methods (ownership implies usability; there is no
+    /// separate allowlist anymore).
     pub async fn catalog_for_account(
         &self,
         account_id: i64,
-    ) -> AppResult<Vec<PaymentMethodOption>> {
-        let methods = self.methods.list_methods().await?;
-        let allowed = self.methods.list_allowed(account_id).await?;
-        let allowed_ids: HashSet<i64> = allowed.into_iter().map(|m| m.id).collect();
-        Ok(methods
-            .into_iter()
-            .map(|m| PaymentMethodOption {
-                id: m.id,
-                name: m.name,
-                is_active: m.is_active,
-                allowed: allowed_ids.contains(&m.id),
-            })
-            .collect())
+    ) -> AppResult<Vec<PaymentMethod>> {
+        self.methods.list_by_account(account_id).await
     }
 
-    /// Account ids whose allowlist is empty; drives the self-diagnosing warning.
+    /// Methods no account owns yet: assignable, but unusable for payments.
+    pub async fn unassigned(&self) -> AppResult<Vec<PaymentMethod>> {
+        self.methods.list_unassigned().await
+    }
+
+    /// Account ids with no owned methods; drives the self-diagnosing warning.
     pub async fn accounts_without_methods(&self) -> AppResult<Vec<i64>> {
         self.methods.list_accounts_without_methods().await
     }
 
-    /// Validate a requested allowlist: non-empty, deduped, every id exists.
-    /// An empty list is a 400: removing every method leaves the account unable
-    /// to record any payment, which is the bug this configuration surface fixes.
-    pub async fn validated_method_ids(&self, method_ids: &[i64]) -> AppResult<Vec<i64>> {
-        if method_ids.is_empty() {
-            return Err(AppError::Validation(
-                "at least one payment method is required; an empty allowlist rejects every payment"
-                    .into(),
-            ));
-        }
+    /// Derive the owning account of a method for payments: 404 unknown method,
+    /// 400 inactive or unassigned (with an actionable message naming the fix).
+    /// No stock/finance side effects.
+    pub async fn resolve_account(&self, method_id: i64) -> AppResult<i64> {
+        resolve_account_for(&self.methods, method_id).await
+    }
+
+    /// Set the account's method set to exactly `method_ids` (no merge).
+    /// Unknown ids 404 before any write, so a rejected request never clears the
+    /// existing set. Methods assigned to ANOTHER account are a 400 (never
+    /// stolen silently); unassign those here first or duplicate the name.
+    /// An empty list unassigns everything (the UI warns on method-less
+    /// accounts). Returns the updated catalog.
+    pub async fn replace_account_methods(
+        &self,
+        account_id: i64,
+        method_ids: &[i64],
+    ) -> AppResult<Vec<PaymentMethod>> {
         let mut seen = HashSet::new();
         let mut unique = Vec::with_capacity(method_ids.len());
         for id in method_ids {
@@ -109,30 +129,41 @@ where
                 unique.push(*id);
             }
         }
+        let mut to_assign = Vec::with_capacity(unique.len());
         for id in &unique {
-            if self.methods.find_method(*id).await?.is_none() {
-                return Err(AppError::NotFound(format!("method {id} not found")));
+            let method = self
+                .methods
+                .find_method(*id)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("method {id} not found")))?;
+            match method.account_id {
+                Some(owner) if owner != account_id => {
+                    return Err(AppError::Validation(format!(
+                        "method {} belongs to account {owner}; unassign it there first or create a {} method in this account instead of reusing it",
+                        method.name, method.name
+                    )));
+                }
+                None => to_assign.push(*id),
+                Some(_) => {}
             }
         }
-        Ok(unique)
-    }
-
-    /// Replace the account's allowlist with `method_ids` (no merge). Unknown ids
-    /// 404 and empty lists 400 before any write, so a rejected request never
-    /// clears the existing set. Returns the updated catalog.
-    pub async fn replace_allowed(
-        &self,
-        account_id: i64,
-        method_ids: &[i64],
-    ) -> AppResult<Vec<PaymentMethodOption>> {
-        let unique = self.validated_method_ids(method_ids).await?;
-        self.methods.replace_allowed(account_id, &unique).await?;
+        let current = self.methods.list_by_account(account_id).await?;
+        for owned in &current {
+            if !seen.contains(&owned.id) {
+                self.methods.set_method_account(owned.id, None).await?;
+            }
+        }
+        for id in to_assign {
+            self.methods.set_method_account(id, Some(account_id)).await?;
+        }
         self.catalog_for_account(account_id).await
     }
 
-    /// Validate (account, method) pair for sales: 404 unknown method,
-    /// 400 inactive or not allowlisted. No stock/finance side effects.
-    pub async fn require_allowed(
+    /// Attach one existing method to a new account at creation time: an
+    /// unassigned method is assigned, a method owned elsewhere is duplicated by
+    /// name (deduped: an existing same-named row in this account wins), a row
+    /// already here is kept. Unknown ids 404.
+    pub async fn assign_or_duplicate(
         &self,
         account_id: i64,
         method_id: i64,
@@ -142,20 +173,61 @@ where
             .find_method(method_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("method {method_id} not found")))?;
-        if !method.is_active {
-            return Err(AppError::Validation(format!(
-                "method {} is inactive",
-                method.name
-            )));
+        match method.account_id {
+            Some(owner) if owner == account_id => Ok(method),
+            Some(_) => {
+                if let Some(existing) = self
+                    .methods
+                    .find_method_in_account(account_id, &method.name)
+                    .await?
+                {
+                    Ok(existing)
+                } else {
+                    self.methods.create_in_account(&method.name, account_id).await
+                }
+            }
+            None => {
+                if let Some(existing) = self
+                    .methods
+                    .find_method_in_account(account_id, &method.name)
+                    .await?
+                {
+                    self.methods.set_method_account(method.id, None).await?;
+                    Ok(existing)
+                } else {
+                    self.methods.set_method_account(method.id, Some(account_id)).await?;
+                    self.methods
+                        .find_method(method.id)
+                        .await?
+                        .ok_or_else(|| AppError::Internal("method vanished after assign".into()))
+                }
+            }
         }
-        if !self.methods.is_allowed(account_id, method_id).await? {
-            return Err(AppError::Validation(format!(
-                "method {} is not allowed for account {account_id}; configure the account's payment methods and try again",
-                method.name
-            )));
-        }
-        Ok(method)
     }
+}
+
+/// Shared ownership resolution for services that hold the repository directly
+/// (e.g. `SalesService`) instead of a `PaymentMethodService`.
+pub async fn resolve_account_for<PM>(repo: &PM, method_id: i64) -> AppResult<i64>
+where
+    PM: PaymentMethodRepository,
+{
+    let method = repo
+        .find_method(method_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("method {method_id} not found")))?;
+    if !method.is_active {
+        return Err(AppError::Validation(format!(
+            "method {} is inactive",
+            method.name
+        )));
+    }
+    method.account_id.ok_or_else(|| {
+        AppError::Validation(format!(
+            "method {} is not assigned to any account; assign it to an account before collecting or paying with it",
+            method.name
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -179,95 +251,8 @@ mod tests {
         pool
     }
 
-    #[tokio::test]
-    async fn seeded_methods_without_other() {
-        let pool = test_pool().await;
-        let repo = SqlitePaymentMethodRepository::new(pool);
-        let svc = PaymentMethodService::new(repo);
-        let methods = svc.list().await.unwrap();
-        let names: Vec<String> = methods.into_iter().map(|m| m.name).collect();
-        assert_eq!(names, vec!["Cash", "Transfer", "Debit", "CreditCard", "QR"]);
-        assert!(!names.iter().any(|n| n == "Other"));
-    }
-
-    #[tokio::test]
-    async fn sensible_defaults_for_caja_banco_mp() {
-        let pool = test_pool().await;
-        let repo = SqlitePaymentMethodRepository::new(pool.clone());
-        let svc = PaymentMethodService::new(repo);
-        async fn acc_id(pool: &sqlx::SqlitePool, name: &str) -> i64 {
-            sqlx::query("INSERT OR IGNORE INTO accounts (name) VALUES (?)")
-                .bind(name)
-                .execute(pool)
-                .await
-                .unwrap();
-            let row: (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = ?")
-                .bind(name)
-                .fetch_one(pool)
-                .await
-                .unwrap();
-            row.0
-        }
-        async fn method_names(pool: &sqlx::SqlitePool, acc: i64) -> Vec<String> {
-            let rows: Vec<(String,)> = sqlx::query_as(
-                "SELECT m.name FROM payment_methods m JOIN account_payment_methods a ON a.method_id = m.id WHERE a.account_id = ? ORDER BY m.name",
-            )
-            .bind(acc)
-            .fetch_all(pool)
-            .await
-            .unwrap();
-            rows.into_iter().map(|r| r.0).collect()
-        }
-        for name in ["Caja", "Banco", "MP"] {
-            let id = acc_id(&pool, name).await;
-            svc.ensure_defaults_for_account(id, name).await.unwrap();
-        }
-        assert_eq!(method_names(&pool, acc_id(&pool, "Caja").await).await, vec!["Cash"]);
-        assert_eq!(
-            method_names(&pool, acc_id(&pool, "Banco").await).await,
-            vec!["CreditCard", "Debit", "Transfer"]
-        );
-        assert_eq!(
-            method_names(&pool, acc_id(&pool, "MP").await).await,
-            vec!["QR", "Transfer"]
-        );
-    }
-
-    #[tokio::test]
-    async fn require_allowed_rejects_unknown_pair() {
-        let pool = test_pool().await;
-        let repo = SqlitePaymentMethodRepository::new(pool.clone());
-        let svc = PaymentMethodService::new(repo);
-        sqlx::query("INSERT OR IGNORE INTO accounts (name) VALUES ('Banco')")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let acc: (i64,) =
-            sqlx::query_as("SELECT id FROM accounts WHERE name = 'Banco'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        svc.ensure_defaults_for_account(acc.0, "Banco").await.unwrap();
-        let cash = svc
-            .methods
-            .find_method_by_name("Cash")
-            .await
-            .unwrap()
-            .unwrap();
-        // Banco allows Transfer/Debit/CreditCard, not Cash.
-        let err = svc.require_allowed(acc.0, cash.id).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-    }
-
-    // -- explicit allowlist configuration (bug: accounts created in-app had no methods) --
-
     async fn seed_account(pool: &sqlx::SqlitePool, name: &str) -> i64 {
-        sqlx::query("INSERT OR IGNORE INTO accounts (name) VALUES (?)")
-            .bind(name)
-            .execute(pool)
-            .await
-            .unwrap();
-        let row: (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = ?")
+        let row: (i64,) = sqlx::query_as("INSERT INTO accounts (name) VALUES (?) RETURNING id")
             .bind(name)
             .fetch_one(pool)
             .await
@@ -287,117 +272,225 @@ mod tests {
             .id
     }
 
-    fn allowed_names(catalog: &[PaymentMethodOption]) -> Vec<String> {
-        catalog
-            .iter()
-            .filter(|m| m.allowed)
-            .map(|m| m.name.clone())
-            .collect()
+    fn catalog_names(catalog: &[PaymentMethod]) -> Vec<String> {
+        let mut names: Vec<String> = catalog.iter().map(|m| m.name.clone()).collect();
+        names.sort();
+        names
     }
 
     #[tokio::test]
-    async fn catalog_marks_allowed_methods() {
+    async fn seeded_methods_start_unassigned_without_other() {
         let pool = test_pool().await;
-        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
-        let acc = seed_account(&pool, "Catalog").await;
-        let cash = method_id(&svc, "Cash").await;
-
-        let empty = svc.catalog_for_account(acc).await.unwrap();
-        assert_eq!(empty.len(), 5, "full catalog is returned");
-        assert!(allowed_names(&empty).is_empty(), "nothing allowed yet");
-
-        svc.replace_allowed(acc, &[cash]).await.unwrap();
-        let catalog = svc.catalog_for_account(acc).await.unwrap();
-        assert_eq!(allowed_names(&catalog), vec!["Cash"]);
-        assert_eq!(catalog.iter().filter(|m| m.allowed).count(), 1);
-        assert!(catalog.iter().any(|m| m.name == "QR" && !m.allowed));
+        let repo = SqlitePaymentMethodRepository::new(pool);
+        let svc = PaymentMethodService::new(repo);
+        let methods = svc.list().await.unwrap();
+        let names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
+        let seeded: Vec<String> = PaymentMethodService::<SqlitePaymentMethodRepository>::seeded_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(names, seeded, "seed order is the canonical order");
+        assert!(!names.iter().any(|n| n == "Other"));
+        assert!(methods.iter().all(|m| m.account_id.is_none()));
     }
 
     #[tokio::test]
-    async fn replace_allowed_replaces_previous_set() {
+    async fn sensible_defaults_for_caja_banco_mp() {
         let pool = test_pool().await;
-        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
-        let acc = seed_account(&pool, "Replace").await;
-        let cash = method_id(&svc, "Cash").await;
-        let transfer = method_id(&svc, "Transfer").await;
-
-        svc.replace_allowed(acc, &[cash]).await.unwrap();
-        assert_eq!(
-            allowed_names(&svc.catalog_for_account(acc).await.unwrap()),
-            vec!["Cash"]
-        );
-
-        svc.replace_allowed(acc, &[transfer]).await.unwrap();
-        assert_eq!(
-            allowed_names(&svc.catalog_for_account(acc).await.unwrap()),
-            vec!["Transfer"],
-            "replace must remove Cash, not merge"
-        );
-        let rows = svc.methods.list_allowed(acc).await.unwrap();
-        assert!(rows.iter().all(|m| m.id != cash), "Cash row must be gone");
-    }
-
-    #[tokio::test]
-    async fn replace_allowed_rejects_empty_list_with_clear_message() {
-        let pool = test_pool().await;
-        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
-        let acc = seed_account(&pool, "Empty").await;
-
-        let err = svc.replace_allowed(acc, &[]).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        let msg = err.to_string();
-        assert!(msg.contains("at least one"), "got {msg}");
-        assert!(svc.methods.list_allowed(acc).await.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn replace_allowed_rejects_unknown_method_id_without_clearing_existing_set() {
-        let pool = test_pool().await;
-        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
-        let acc = seed_account(&pool, "Unknown").await;
-        let cash = method_id(&svc, "Cash").await;
-        let transfer = method_id(&svc, "Transfer").await;
-
-        svc.replace_allowed(acc, &[cash]).await.unwrap();
-        let err = svc
-            .replace_allowed(acc, &[transfer, 999_999])
+        let repo = SqlitePaymentMethodRepository::new(pool.clone());
+        let svc = PaymentMethodService::new(repo);
+        for name in ["Caja", "Banco", "MP"] {
+            let id = seed_account(&pool, name).await;
+            svc.ensure_defaults_for_account(id, name).await.unwrap();
+        }
+        async fn names(pool: &sqlx::SqlitePool, acc: i64) -> Vec<String> {
+            let rows = SqlitePaymentMethodRepository::new(pool.clone())
+                .list_by_account(acc)
+                .await
+                .unwrap();
+            catalog_names(&rows)
+        }
+        let caja_id: (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = 'Caja'")
+            .fetch_one(&pool)
             .await
-            .unwrap_err();
+            .unwrap();
+        let banco_id: (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = 'Banco'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mp_id: (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = 'MP'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(names(&pool, caja_id.0).await, vec!["Cash"]);
+        assert_eq!(names(&pool, banco_id.0).await, vec!["CreditCard", "Debit", "Transfer"]);
+        assert_eq!(names(&pool, mp_id.0).await, vec!["QR", "Transfer"]);
+    }
+
+    #[tokio::test]
+    async fn shared_default_name_duplicates_instead_of_being_stolen() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let banco = seed_account(&pool, "Banco").await;
+        let mp = seed_account(&pool, "MP").await;
+        svc.ensure_defaults_for_account(banco, "Banco").await.unwrap();
+        svc.ensure_defaults_for_account(mp, "MP").await.unwrap();
+
+        let transfers: Vec<(i64, Option<i64>)> = sqlx::query_as(
+            "SELECT id, account_id FROM payment_methods WHERE name = 'Transfer' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(transfers.len(), 2, "Transfer duplicates across accounts: {transfers:?}");
+        assert_eq!(transfers[0].1, Some(banco));
+        assert_eq!(transfers[1].1, Some(mp));
+        assert_ne!(transfers[0].0, transfers[1].0);
+
+        // Idempotent: a second run assigns nothing new.
+        svc.ensure_defaults_for_account(banco, "Banco").await.unwrap();
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM payment_methods")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 5 + 1, "only the one Transfer duplicate exists");
+    }
+
+    #[tokio::test]
+    async fn resolve_account_derives_the_owner() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let acc = seed_account(&pool, "Caja").await;
+        svc.ensure_defaults_for_account(acc, "Caja").await.unwrap();
+        let cash = method_id(&svc, "Cash").await;
+        assert_eq!(svc.resolve_account(cash).await.unwrap(), acc);
+    }
+
+    #[tokio::test]
+    async fn resolve_account_rejects_unknown_inactive_and_unassigned() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let err = svc.resolve_account(999_999).await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+
+        // Unassigned is a 400 naming the fix.
+        let cash = method_id(&svc, "Cash").await;
+        let err = svc.resolve_account(cash).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("not assigned to any account"), "got {err}");
+
+        // Inactive is a 400 too.
+        let acc = seed_account(&pool, "Caja").await;
+        svc.methods.set_method_account(cash, Some(acc)).await.unwrap();
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
+            .bind(cash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let err = svc.resolve_account(cash).await.unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("inactive"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn replace_account_methods_assigns_and_unassigns() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let acc = seed_account(&pool, "A").await;
+        let cash = method_id(&svc, "Cash").await;
+        let transfer = method_id(&svc, "Transfer").await;
+
+        let catalog = svc.replace_account_methods(acc, &[cash]).await.unwrap();
+        assert_eq!(catalog_names(&catalog), vec!["Cash"]);
+
+        let catalog = svc.replace_account_methods(acc, &[transfer]).await.unwrap();
+        assert_eq!(catalog_names(&catalog), vec!["Transfer"], "replace removes Cash");
+        assert_eq!(
+            svc.methods.find_method(cash).await.unwrap().unwrap().account_id,
+            None,
+            "removed methods are unassigned, not deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_account_methods_rejects_unknown_without_clearing() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let acc = seed_account(&pool, "A").await;
+        let cash = method_id(&svc, "Cash").await;
+        svc.replace_account_methods(acc, &[cash]).await.unwrap();
+
+        let err = svc.replace_account_methods(acc, &[cash, 999_999]).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
         assert_eq!(
-            allowed_names(&svc.catalog_for_account(acc).await.unwrap()),
+            catalog_names(&svc.catalog_for_account(acc).await.unwrap()),
             vec!["Cash"],
-            "a rejected replacement must not clear the existing allowlist"
+            "a rejected replacement must not clear the existing set"
         );
     }
 
     #[tokio::test]
-    async fn accounts_without_methods_lists_only_unconfigured_accounts() {
+    async fn replace_account_methods_never_steals_from_another_account() {
         let pool = test_pool().await;
         let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
-        let bare = seed_account(&pool, "Bare").await;
-        let configured = seed_account(&pool, "Configured").await;
+        let a = seed_account(&pool, "A").await;
+        let b = seed_account(&pool, "B").await;
         let cash = method_id(&svc, "Cash").await;
-        svc.replace_allowed(configured, &[cash]).await.unwrap();
+        svc.replace_account_methods(a, &[cash]).await.unwrap();
 
-        let missing = svc.accounts_without_methods().await.unwrap();
-        assert!(missing.contains(&bare), "unconfigured account must be listed");
-        assert!(!missing.contains(&configured), "configured account is not listed");
-    }
-
-    #[tokio::test]
-    async fn require_allowed_message_tells_user_to_configure_methods() {
-        let pool = test_pool().await;
-        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
-        let acc = seed_account(&pool, "NoMethods").await;
-        let cash = method_id(&svc, "Cash").await;
-
-        let err = svc.require_allowed(acc, cash).await.unwrap_err();
+        let err = svc.replace_account_methods(b, &[cash]).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("configure the account's payment methods"),
-            "message must tell the user what to do, got {msg}"
-        );
+        assert!(err.to_string().contains("belongs to account"), "got {err}");
+        assert_eq!(svc.resolve_account(cash).await.unwrap(), a, "ownership unchanged");
+    }
+
+    #[tokio::test]
+    async fn replace_account_methods_accepts_empty_and_warns() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let acc = seed_account(&pool, "A").await;
+        let cash = method_id(&svc, "Cash").await;
+        svc.replace_account_methods(acc, &[cash]).await.unwrap();
+
+        let catalog = svc.replace_account_methods(acc, &[]).await.unwrap();
+        assert!(catalog.is_empty());
+        assert_eq!(svc.accounts_without_methods().await.unwrap(), vec![acc]);
+    }
+
+    #[tokio::test]
+    async fn assign_or_duplicate_assigns_free_and_clones_owned() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let a = seed_account(&pool, "A").await;
+        let b = seed_account(&pool, "B").await;
+        let cash = method_id(&svc, "Cash").await;
+
+        // Free method is assigned.
+        let owned = svc.assign_or_duplicate(a, cash).await.unwrap();
+        assert_eq!(owned.account_id, Some(a));
+
+        // Owned elsewhere: B gets a duplicate, A keeps its row.
+        let dup = svc.assign_or_duplicate(b, cash).await.unwrap();
+        assert_eq!(dup.account_id, Some(b));
+        assert_ne!(dup.id, cash);
+        assert_eq!(dup.name, "Cash");
+        assert_eq!(svc.resolve_account(cash).await.unwrap(), a);
+    }
+
+    #[tokio::test]
+    async fn methods_with_accounts_renders_owner_labels() {
+        let pool = test_pool().await;
+        let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
+        let acc = seed_account(&pool, "Caja").await;
+        svc.ensure_defaults_for_account(acc, "Caja").await.unwrap();
+
+        let options = svc.methods_with_accounts().await.unwrap();
+        assert_eq!(options.len(), 5);
+        let cash = options.iter().find(|m| m.name == "Cash").unwrap();
+        assert_eq!(cash.account_id, Some(acc));
+        assert_eq!(cash.account_name.as_deref(), Some("Caja"));
+        let qr = options.iter().find(|m| m.name == "QR").unwrap();
+        assert_eq!(qr.account_id, None);
+        assert_eq!(qr.account_name, None);
     }
 }

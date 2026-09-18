@@ -19,15 +19,27 @@
   </div>
   {% endif %}
   <form method="post" action="/accounts/{{ account.id }}/payment-methods" class="flex flex-col gap-2.5">
+    <div class="text-[13px] font-bold text-muted">This account's methods (untick to unassign)</div>
     <div class="flex flex-wrap gap-x-5 gap-y-2">
       {% for m in methods %}
       <label class="flex items-center gap-2 text-[13px]">
-        <input type="checkbox" name="method_ids" value="{{ m.id }}" {% if m.allowed %}checked{% endif %} />
+        <input type="checkbox" name="method_ids" value="{{ m.id }}" checked />
         {{ m.name }}{% if !m.is_active %} <span class="text-muted">(inactive)</span>{% endif %}
       </label>
       {% endfor %}
     </div>
-    <div class="text-[13px] text-muted">Saving replaces this account's allowlist. At least one method is required.</div>
+    {% if !unassigned.is_empty() %}
+    <div class="text-[13px] font-bold text-muted">Unassigned methods (tick to assign to this account)</div>
+    <div class="flex flex-wrap gap-x-5 gap-y-2">
+      {% for m in unassigned %}
+      <label class="flex items-center gap-2 text-[13px]">
+        <input type="checkbox" name="method_ids" value="{{ m.id }}" />
+        {{ m.name }}{% if !m.is_active %} <span class="text-muted">(inactive)</span>{% endif %}
+      </label>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <div class="text-[13px] text-muted">Saving replaces this account's method set. Methods owned by another account never appear here: unassign them there first. An account with no methods cannot record payments.</div>
     <button type="submit" class="self-start">Save payment methods</button>
   </form>
 </div>

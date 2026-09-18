@@ -200,13 +200,16 @@ def test_seed_helpers_reject_a_2xx_that_moved_nothing() -> None:
     with _stubbed_api(
         {
             ("POST", "/api/accounts"): {"id": 7},
+            ("GET", "/api/payment-methods"): {
+                "methods": [{"name": "Cash", "id": 1, "account_id": None}],
+            },
             ("GET", "/api/accounts/7/payment-methods"): {
-                "methods": [{"name": "Cash", "id": 1}],
-                "allowed_method_ids": [],
+                "methods": [],
+                "method_ids": [],
             },
         }
     ) as api:
-        with pytest.raises(SeedError, match="allowlist"):
+        with pytest.raises(SeedError, match="methods are"):
             create_account_with_methods(api, "Caja", ("Cash",))
 
     with _stubbed_api(

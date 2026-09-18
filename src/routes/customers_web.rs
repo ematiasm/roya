@@ -26,8 +26,8 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AccountWithBalance, Ageing, Customer, CustomerStatement, NewCustomer, PaymentMethod,
-    ReceiptDetail, SaleDetail, UpdateCustomer,
+    Ageing, Customer, CustomerStatement, NewCustomer, PaymentMethodWithAccount, ReceiptDetail,
+    SaleDetail, UpdateCustomer,
 };
 use crate::routes::AppState;
 
@@ -53,8 +53,7 @@ struct CustomersTemplate {
     selected: Option<Customer>,
     receipts: Vec<ReceiptDetail>,
     debt_sales: Vec<SaleDetail>,
-    accounts: Vec<AccountWithBalance>,
-    methods: Vec<PaymentMethod>,
+    method_options: Vec<PaymentMethodWithAccount>,
     today: String,
     warning: Option<String>,
     nav_key: &'static str,
@@ -201,8 +200,7 @@ async fn list_response(state: &AppState, warning: Option<String>) -> AppResult<R
 
 async fn customers_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let customers = customer_rows(&state).await?;
-    let accounts = state.account_service.list_with_balances().await?;
-    let methods = state.payment_method_service.list().await?;
+    let method_options = state.payment_method_service.methods_with_accounts().await?;
     let tmpl = CustomersTemplate {
         title: "Roya — Customers".to_string(),
         customers,
@@ -210,8 +208,7 @@ async fn customers_page(State(state): State<AppState>) -> Result<Html<String>, A
         selected: None,
         receipts: vec![],
         debt_sales: vec![],
-        accounts,
-        methods,
+        method_options,
         today: today().to_string(),
         warning: None,
         nav_key: "customers",
@@ -229,8 +226,7 @@ async fn customer_statement_page(
     let statement = state.sales_service.customer_statement(id, today()).await?;
     let debt_sales = state.sales_service.customer_debt_sales(id).await?;
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
-    let accounts = state.account_service.list_with_balances().await?;
-    let methods = state.payment_method_service.list().await?;
+    let method_options = state.payment_method_service.methods_with_accounts().await?;
     let tmpl = CustomersTemplate {
         title: format!("Roya — Statement: {}", customer.name),
         customers: vec![],
@@ -238,8 +234,7 @@ async fn customer_statement_page(
         selected: Some(customer),
         receipts,
         debt_sales,
-        accounts,
-        methods,
+        method_options,
         today: today().to_string(),
         warning: None,
         nav_key: "customers",
@@ -333,8 +328,6 @@ pub struct CustomerIdForm {
 pub struct CollectForm {
     #[serde(default)]
     pub customer_id: i64,
-    #[serde(default)]
-    pub account_id: i64,
     #[serde(default)]
     pub method_id: i64,
     #[serde(default)]
@@ -487,7 +480,6 @@ async fn web_collect_receipt(
         .customer_receipt_service
         .collect(
             form.customer_id,
-            form.account_id,
             form.method_id,
             amount,
             date,
@@ -676,7 +668,7 @@ mod tests {
             .unwrap();
         state
             .sales_service
-            .confirm(sale.id, None, None)
+            .confirm(sale.id, None)
             .await
             .unwrap();
         WebFixture {
@@ -841,8 +833,9 @@ mod tests {
         let fixture = seed_fixture(&state).await;
         let app = crate::routes::router(state.clone());
 
-        // The rendered collect form carries the customer, amount, account and
-        // method, and posts to the collection endpoint with the id in the body.
+        // The rendered collect form carries the customer, amount and method
+        // (the account is derived from the method), and posts to the
+        // collection endpoint with the id in the body.
         let (status, html) = get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         let form_start = html
@@ -852,19 +845,22 @@ mod tests {
         for field in [
             "name=\"customer_id\"",
             "name=\"amount\"",
-            "name=\"account_id\"",
             "name=\"method_id\"",
         ] {
             assert!(form.contains(field), "collect form must carry {field}: {form:.600}");
         }
+        assert!(
+            !form.contains("name=\"account_id\""),
+            "the collect form must not ask for an account: {form:.600}"
+        );
 
         // Collect 30 of the 75 debt.
         let (status, html) = post_form(
             app.clone(),
             "/web/customer-receipts",
             &format!(
-                "customer_id={}&account_id={}&method_id={}&amount=30&date=2024-06-20&notes=part",
-                fixture.customer, fixture.account, fixture.cash
+                "customer_id={}&method_id={}&amount=30&date=2024-06-20&notes=part",
+                fixture.customer, fixture.cash
             ),
         )
         .await;
@@ -890,8 +886,8 @@ mod tests {
             app.clone(),
             "/web/customer-receipts",
             &format!(
-                "customer_id={}&account_id={}&method_id={}&amount=1000&date=2024-06-20",
-                fixture.customer, fixture.account, fixture.cash
+                "customer_id={}&method_id={}&amount=1000&date=2024-06-20",
+                fixture.customer, fixture.cash
             ),
         )
         .await;

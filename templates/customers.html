@@ -77,18 +77,10 @@
           </div>
         </div>
         <div>
-          <label>Account</label>
-          <select name="account_id" required>
-            {% for acc in accounts %}
-            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <div>
-          <label>Method (required, must be allowed for account)</label>
+          <label>Method (the account is derived from it)</label>
           <select name="method_id" required>
-            {% for m in methods %}
-            <option value="{{ m.id }}">{{ m.name }}</option>
+            {% for m in method_options %}
+            <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
             {% endfor %}
           </select>
         </div>
@@ -97,7 +89,7 @@
           <input type="text" name="notes" placeholder="…" maxlength="256" />
         </div>
         <button type="submit" class="bg-accent2 text-white">Collect</button>
-        <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered sale grouped under the new receipt. More than the outstanding debt ⇒ 400; disallowed (account, method) ⇒ 400. Also at <code>POST /api/customer-receipts</code></div>
+        <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered sale grouped under the new receipt. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account. Also at <code>POST /api/customer-receipts</code></div>
       </form>
     </div>
 
