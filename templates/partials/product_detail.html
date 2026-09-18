@@ -1,0 +1,251 @@
+{# The product slide-over drawer body (redesign-products T2). Everything is a
+   form POST with a hidden id: concrete ids never appear in an action path, so
+   the smoke-test wiring guard stays intact. Mutations inside the drawer answer
+   this fragment back into `#product-drawer-body` (no URL rebuild needed), fire
+   `product-changed` / `product-cost-recorded` / `movement-created`, and the page
+   listener refreshes `#product-list`; a successful save also fires
+   `product-saved`, which closes the drawer. Lifecycle actions swap
+   `#product-list` themselves and close the drawer on success via
+   `closeProductDrawer()`. #}
+<div id="product-detail-inner" class="flex flex-col gap-4">
+  {# Card A: header, derived stock and the inline edit form. Every field is
+     prefilled from the stored row; optional numbers/text render empty values,
+     never `0`, so a save cannot silently turn "no value" into a zero. #}
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-lg font-semibold">{{ product.name }}</span>
+      <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if product.kind.to_string() == "Service" %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{{ product.kind }}</span>
+      <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if product.is_active %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{% if product.is_active %}active{% else %}inactive{% endif %}</span>
+      {% if let Some(sug) = suggested %}
+      <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">low • suggest {{ sug }}</span>
+      {% endif %}
+      {% if stock.is_sign_negative() %}
+      <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">negative</span>
+      {% endif %}
+    </div>
+    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • ${{ product.sale_price }}</div>
+    <div class="text-[13px] text-muted">stock {{ stock }}{% if let Some(min) = product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = product.max_stock %} • max {{ max }}{% endif %}</div>
+
+    {# Lifecycle actions live beside the header like the customers drawer: hidden
+       id, POST, list swap, drawer closes only when the request succeeded. #}
+    <div class="mt-4 flex items-center gap-2">
+      {% if product.is_active %}
+      <form hx-post="/web/products/deactivate" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+        <input type="hidden" name="product_id" value="{{ product.id }}" />
+        <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Deactivate</button>
+      </form>
+      {% else %}
+      <form hx-post="/web/products/activate" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+        <input type="hidden" name="product_id" value="{{ product.id }}" />
+        <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Activate</button>
+      </form>
+      {% endif %}
+      <form hx-post="/web/products/delete" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+        <input type="hidden" name="product_id" value="{{ product.id }}" />
+        <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Delete</button>
+      </form>
+    </div>
+
+    {# Closure is trigger-driven: htmx removes this form's listeners when the
+       swap detaches it, so the form cannot own its own close; the save answer
+       instead carries `product-saved` (after-settle, so it lands after the
+       `htmx:afterSwap` open), which the page listener maps to
+       `closeProductDrawer()`. A failed save swaps nothing and keeps the drawer
+       open. #}
+    <form class="mt-4 flex flex-col gap-2.5"
+          data-action="Save product"
+          hx-post="/web/products/edit"
+          hx-target="#product-drawer-body"
+          hx-swap="innerHTML">
+      <input type="hidden" name="id" value="{{ product.id }}" />
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>SKU</label>
+          <input type="text" name="sku" required maxlength="64" value="{{ product.sku }}" />
+        </div>
+        <div>
+          <label>Name</label>
+          <input type="text" name="name" required maxlength="128" value="{{ product.name }}" />
+        </div>
+      </div>
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Kind</label>
+          <select name="kind">
+            <option value="Product" {% if product.kind.to_string() == "Product" %}selected{% endif %}>Product</option>
+            <option value="Service" {% if product.kind.to_string() == "Service" %}selected{% endif %}>Service</option>
+          </select>
+        </div>
+        <div>
+          <label>Unit</label>
+          <input type="text" name="unit" required maxlength="16" value="{{ product.unit }}" />
+        </div>
+      </div>
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Sale price</label>
+          <input type="number" name="sale_price" step="0.01" required value="{{ product.sale_price }}" />
+        </div>
+        <div>
+          <label>Cost price</label>
+          <input type="number" name="cost_price" step="0.01" value="{{ product.cost_price }}" />
+        </div>
+      </div>
+      <div>
+        <label>Category</label>
+        <select name="category_id">
+          {# An empty value means "clear": the edit handler sends Some(None) so an
+             untied category is a real edit, not "leave unchanged". #}
+          <option value="">No category</option>
+          {% for c in categories %}
+          <option value="{{ c.id }}" {% if product.category_is(c.id) %}selected{% endif %}>{{ c.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        {# One label wraps the box and the text, and the box keeps w-auto: the global
+           input width would otherwise stretch the control and push the text out. #}
+        <label class="flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" class="w-auto" {% if product.track_stock %}checked{% endif %} /> Track stock</label>
+      </div>
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Min stock</label>
+          <input type="number" name="min_stock" step="0.01" {% if let Some(v) = product.min_stock %}value="{{ v }}"{% endif %} />
+        </div>
+        <div>
+          <label>Max stock</label>
+          <input type="number" name="max_stock" step="0.01" {% if let Some(v) = product.max_stock %}value="{{ v }}"{% endif %} />
+        </div>
+      </div>
+      <div>
+        <label>Location</label>
+        <input type="text" name="location" maxlength="64" {% if let Some(v) = product.location %}value="{{ v }}"{% endif %} />
+      </div>
+      <div>
+        <label>Notes</label>
+        <input type="text" name="notes" maxlength="1024" {% if let Some(v) = product.notes %}value="{{ v }}"{% endif %} />
+      </div>
+      <button type="submit" class="bg-accent2 text-white">Save product</button>
+      <div class="text-[13px] text-muted">The same rules as creation apply: services cannot track stock, tracked products need min and max, and the SKU cannot collide with another product (⇒ 400/409).</div>
+    </form>
+  </section>
+
+  {# Card B: the per-supplier cost satellite, read from the product side. The
+     alert is derived (previous vs current), never stored; `products.cost_price`
+     is only the fallback when this list is empty. #}
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="mb-1.5 font-bold text-[13px] text-muted">Supplier costs ({{ supplier_costs.len() }})</div>
+    {% if supplier_costs.is_empty() %}
+      <div class="mb-3 text-[13px] text-muted">No supplier rows yet — the reference cost falls back to the product's cost price until one is recorded here.</div>
+    {% else %}
+      {% for cost in supplier_costs %}
+      <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3">
+        <div class="flex flex-col">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="font-semibold">{{ cost.supplier_name }}</span>
+            {% if cost.cost.previous_cost.is_some() %}
+            <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if cost.cost.price_alert().to_string() == "Raised" %}border-expense/30 bg-expense/12 text-expense{% else if cost.cost.price_alert().to_string() == "Lowered" %}border-income/30 bg-income/15 text-income{% else %}border-border bg-card text-muted{% endif %}">{{ cost.cost.price_alert() }}</span>
+            {% endif %}
+          </div>
+          <span class="text-[13px] text-muted">${{ cost.cost.current_cost }}{% if let Some(prev) = cost.cost.previous_cost %} • previous {{ prev }}{% endif %} • since {{ cost.cost.current_cost_updated_at }}</span>
+        </div>
+        <div>
+          {% if cost.cost.is_preferred %}
+          <span class="rounded-full border border-income/30 bg-income/15 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-income">preferred</span>
+          {% else %}
+          <form hx-post="/web/product-costs/preferred" hx-target="#product-drawer-body" hx-swap="innerHTML">
+            <input type="hidden" name="product_id" value="{{ product.id }}" />
+            <input type="hidden" name="supplier_id" value="{{ cost.cost.supplier_id }}" />
+            <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Set preferred</button>
+          </form>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    {% endif %}
+
+    <form class="mt-4 flex flex-col gap-2.5"
+          data-action="Record product cost"
+          hx-post="/web/product-costs"
+          hx-target="#product-drawer-body"
+          hx-swap="innerHTML"
+          hx-on::after-request="if(event.detail.successful) this.reset()">
+      <input type="hidden" name="product_id" value="{{ product.id }}" />
+      <div>
+        <label>Supplier</label>
+        <select name="supplier_id" required>
+          {% for s in suppliers %}
+          <option value="{{ s.id }}">{{ s.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Cost</label>
+          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" />
+        </div>
+        <div>
+          <label>Date</label>
+          <input type="date" name="date" value="{{ today }}" />
+        </div>
+      </div>
+      <button type="submit">Record cost</button>
+      <div class="text-[13px] text-muted">First call creates the row; a different cost shifts the current one into previous; the same cost only refreshes the date; a date older than the current one ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
+    </form>
+  </section>
+
+  {# Card C: the movement form moved here from the page. The service rejects
+     movements for services and untracked products, so the card only renders
+     where a movement is possible; otherwise show the derived stock and why. #}
+  <section class="rounded-2xl border border-border bg-card p-5">
+    {% if product.track_stock && product.kind.to_string() == "Product" %}
+    <div class="mb-1.5 font-bold text-[13px] text-muted">Stock movement</div>
+    <form class="flex flex-col gap-2.5"
+          data-action="Record movement"
+          hx-post="/web/stock-movements"
+          hx-target="#product-drawer-body"
+          hx-swap="innerHTML"
+          hx-on::after-request="if(event.detail.successful) this.reset()">
+      <input type="hidden" name="product_id" value="{{ product.id }}" />
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Type</label>
+          <select name="type">
+            <option value="In">In</option>
+            <option value="Out">Out</option>
+            <option value="Adjust">Adjust</option>
+          </select>
+        </div>
+        <div>
+          <label>Qty</label>
+          <input type="number" name="qty" step="0.01" required placeholder="10.00" />
+        </div>
+      </div>
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label>Reason</label>
+          <select name="reason">
+            <option value="Initial">Initial</option>
+            <option value="Purchase">Purchase</option>
+            <option value="Sale">Sale</option>
+            <option value="Loss">Loss</option>
+            <option value="Adjust">Adjust</option>
+          </select>
+        </div>
+        <div>
+          <label>Date</label>
+          <input type="date" name="date" value="{{ today }}" />
+        </div>
+      </div>
+      <div>
+        <label>Reference (optional)</label>
+        <input type="text" name="reference" maxlength="256" />
+      </div>
+      <button type="submit">Record movement</button>
+      <div class="text-[13px] text-muted">In=+qty, Out=−qty, Adjust=signed delta.</div>
+    </form>
+    {% else %}
+    <div class="text-[13px] text-muted">Stock movement is not available for services and untracked products. Derived stock: {{ stock }}</div>
+    {% endif %}
+  </section>
+</div>

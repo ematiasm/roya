@@ -1,6 +1,6 @@
 use askama::Template;
 use axum::{
-    extract::{Form, Query, State},
+    extract::{Form, Path, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Redirect},
     routing::{get, post},
@@ -11,9 +11,13 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{MovementReason, MovementType, NewMovement, NewProduct, ProductKind, ProductStock};
+use crate::models::{
+    MovementReason, MovementType, NewMovement, NewProduct, Product, ProductKind,
+    ProductStock, ProductSupplierCost, UpdateProduct,
+};
 use crate::repositories::{
-    BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
+    BarcodeRepository, CategoryRepository, ProductRepository, ProductSupplierCostRepository,
+    StockMovementRepository,
 };
 use crate::routes::AppState;
 
@@ -26,9 +30,7 @@ use crate::routes::AppState;
 struct ProductsTemplate {
     products: Vec<ProductStock>,
     categories: Vec<crate::models::Category>,
-    low_stock: Vec<ProductStock>,
     allow_negative_stock: bool,
-    today: String,
     nav_key: &'static str,
     /// Current filter values, so the form reflects a bookmarkable `/products?q=…`.
     filter_q: String,
@@ -60,6 +62,28 @@ struct ProductSearchResultsPartial {
     show_cost: bool,
 }
 
+/// One satellite cost row with the supplier fields the drawer needs to render it.
+#[derive(Clone)]
+pub struct ProductCostView {
+    pub cost: ProductSupplierCost,
+    pub supplier_name: String,
+}
+
+/// The product slide-over drawer body: the header with derived stock and the
+/// inline edit form, the per-supplier cost satellite (record/switch preferred)
+/// and the stock movement form. Field names are the template task's contract.
+#[derive(Template)]
+#[template(path = "partials/product_detail.html")]
+struct ProductDetailPartial {
+    product: Product,
+    stock: Decimal,
+    suggested: Option<Decimal>,
+    categories: Vec<crate::models::Category>,
+    supplier_costs: Vec<ProductCostView>,
+    suppliers: Vec<crate::models::Supplier>,
+    today: String,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -73,6 +97,24 @@ fn is_htmx(headers: &HeaderMap) -> bool {
 
 async fn all_product_stocks(state: &AppState) -> AppResult<Vec<ProductStock>> {
     state.inventory_service.filter_products("", None).await
+}
+
+fn triggered(html: String, event: &str) -> axum::response::Response {
+    let mut resp = Html(html).into_response();
+    resp.headers_mut()
+        .insert("HX-Trigger", event.parse().unwrap());
+    resp
+}
+
+/// Adds a second trigger header to an already-built response. Plain `HX-Trigger`
+/// events fire before htmx performs the swap, so a trigger that must land after
+/// the swap (the drawer close) rides `HX-Trigger-After-Settle`: htmx dispatches
+/// it on the body once settling completes, after any `htmx:afterSwap` open.
+fn triggered_after_settle(resp: axum::response::Response, event: &str) -> axum::response::Response {
+    let mut resp = resp;
+    resp.headers_mut()
+        .insert("HX-Trigger-After-Settle", event.parse().unwrap());
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -89,14 +131,10 @@ async fn products_page(
         .filter_products(&query, category_id)
         .await?;
     let categories = state.inventory_service.categories.list().await?;
-    let low_stock = state.inventory_service.low_stock().await?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = ProductsTemplate {
         products,
         categories,
-        low_stock,
         allow_negative_stock: state.allow_negative_stock,
-        today,
         nav_key: "products",
         filter_q: query,
         filter_category: q.category_id.as_deref().unwrap_or("").trim().to_string(),
@@ -162,9 +200,26 @@ async fn web_negative_stock(State(state): State<AppState>) -> Result<Html<String
     Ok(Html(html))
 }
 
-async fn web_category_options(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+/// The empty option's label is caller-owned: the catalogue filter says "All
+/// categories", but the product form's empty choice means "no category".
+#[derive(Debug, Deserialize, Default)]
+pub struct CategoryOptionsQuery {
+    #[serde(default)]
+    pub empty: Option<String>,
+}
+
+async fn web_category_options(
+    State(state): State<AppState>,
+    Query(q): Query<CategoryOptionsQuery>,
+) -> Result<Html<String>, AppError> {
     let cats = state.inventory_service.categories.list().await?;
-    let mut html = String::from("<option value=\"\">All categories</option>");
+    let empty_label = q
+        .empty
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .unwrap_or("All categories");
+    let mut html = format!("<option value=\"\">{}</option>", html_escape(empty_label));
     for c in cats {
         html.push_str(&format!(
             "<option value=\"{}\">{}</option>",
@@ -234,6 +289,49 @@ async fn web_product_search(
     Ok(Html(html))
 }
 
+/// `GET /web/products/detail/{id}`: the drawer fragment. Concrete ids sit last in
+/// the path, matching the wiring guard the smoke suite enforces.
+async fn web_product_detail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    product_detail_html(&state, id).await
+}
+
+/// The drawer body with fresh derived data. The detail read and every mutating
+/// drawer action answer it, so saving/costs/movements refresh the drawer in
+/// place without the client rebuilding a URL.
+async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
+    let ps = state.inventory_service.product_stock(id).await?;
+    let categories = state.inventory_service.categories.list().await?;
+    let suppliers = state.supplier_service.list_suppliers().await?;
+    let costs = state.supplier_service.costs.list_by_product(id).await?;
+    let supplier_costs = costs
+        .into_iter()
+        .map(|cost| {
+            let supplier_name = suppliers
+                .iter()
+                .find(|s| s.id == cost.supplier_id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| format!("supplier #{}", cost.supplier_id));
+            ProductCostView { cost, supplier_name }
+        })
+        .collect();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let html = ProductDetailPartial {
+        product: ps.product,
+        stock: ps.stock,
+        suggested: ps.suggested,
+        categories,
+        supplier_costs,
+        suppliers,
+        today,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Html(html))
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -279,6 +377,61 @@ pub struct CreateProductForm {
     pub location: String,
     #[serde(default)]
     pub notes: String,
+}
+
+/// The drawer's inline edit form always sends every field, so each field is
+/// wrapped in `Some(...)` and empty optional values arrive as an explicit
+/// `Some(None)` (clear), never as "leave unchanged".
+#[derive(Debug, Deserialize)]
+pub struct EditProductForm {
+    pub id: i64,
+    #[serde(default)]
+    pub sku: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub category_id: String,
+    #[serde(default)]
+    pub unit: String,
+    #[serde(default)]
+    pub sale_price: String,
+    #[serde(default)]
+    pub cost_price: String,
+    #[serde(default)]
+    pub track_stock: Option<String>,
+    #[serde(default)]
+    pub min_stock: String,
+    #[serde(default)]
+    pub max_stock: String,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RecordProductCostForm {
+    pub product_id: i64,
+    pub supplier_id: i64,
+    #[serde(default)]
+    pub cost: String,
+    #[serde(default)]
+    pub date: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PreferredCostForm {
+    pub product_id: i64,
+    pub supplier_id: i64,
+}
+
+/// Shared hidden-id form for the drawer lifecycle actions (activate/deactivate/
+/// delete). Never a concrete id in the path, like the customers drawer.
+#[derive(Debug, Deserialize)]
+pub struct ProductIdForm {
+    pub product_id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -436,6 +589,19 @@ async fn web_create_movement(
     };
     state.inventory_service.record_movement(input).await?;
     if is_htmx(&headers) {
+        // Drawer submissions target `#product-drawer-body`: answer the fresh
+        // detail fragment (stock and header reloaded) and keep the existing
+        // `movement-created` trigger so the page listener refreshes the list.
+        // Any other HTMX caller keeps the historical list-fragment answer.
+        let from_drawer = headers
+            .get("HX-Target")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("product-drawer-body"))
+            .unwrap_or(false);
+        if from_drawer {
+            let html = product_detail_html(&state, form.product_id).await?;
+            return Ok(triggered(html.0, "movement-created"));
+        }
         let products = all_product_stocks(&state).await?;
         let html = ProductListPartial { products }
             .render()
@@ -444,6 +610,217 @@ async fn web_create_movement(
         resp.headers_mut()
             .insert("HX-Trigger", "movement-created".parse().unwrap());
         return Ok(resp);
+    }
+    Ok(Redirect::to("/products").into_response())
+}
+
+/// Drawer edit: build a full patch from the form (it always sends every
+/// field), then answer per caller — the drawer target gets the fresh
+/// fragment, other HTMX callers get the list, a plain browser the redirect.
+async fn web_edit_product(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<EditProductForm>,
+) -> Result<axum::response::Response, AppError> {
+    let kind: ProductKind = if form.kind.trim().is_empty() {
+        ProductKind::Product
+    } else {
+        form.kind.parse().map_err(AppError::Validation)?
+    };
+    let sale_price = if form.sale_price.trim().is_empty() {
+        return Err(AppError::Validation("sale_price is required".into()));
+    } else {
+        Decimal::from_str(form.sale_price.trim())
+            .map_err(|_| AppError::Validation("invalid sale_price".into()))?
+    };
+    let cost_price = if form.cost_price.trim().is_empty() {
+        Decimal::ZERO
+    } else {
+        Decimal::from_str(form.cost_price.trim())
+            .map_err(|_| AppError::Validation("invalid cost_price".into()))?
+    };
+    // Checkbox: present means checked; absent means false, like creation.
+    let track_stock = match form.track_stock.as_deref() {
+        None => false,
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"),
+    };
+    let patch = UpdateProduct {
+        sku: Some(form.sku),
+        name: Some(form.name),
+        kind: Some(kind),
+        // Empty optional values are an explicit clear, not "leave unchanged".
+        category_id: Some(parse_opt_i64(&form.category_id)?),
+        unit: Some(if form.unit.trim().is_empty() {
+            "un".to_string()
+        } else {
+            form.unit
+        }),
+        sale_price: Some(sale_price),
+        cost_price: Some(cost_price),
+        track_stock: Some(track_stock),
+        min_stock: Some(parse_opt_decimal(&form.min_stock)?),
+        max_stock: Some(parse_opt_decimal(&form.max_stock)?),
+        location: Some(
+            if form.location.trim().is_empty() {
+                None
+            } else {
+                Some(form.location)
+            },
+        ),
+        notes: Some(
+            if form.notes.trim().is_empty() {
+                None
+            } else {
+                Some(form.notes)
+            },
+        ),
+    };
+    state.inventory_service.update_product(form.id, patch).await?;
+    if is_htmx(&headers) {
+        let from_drawer = headers
+            .get("HX-Target")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("product-drawer-body"))
+            .unwrap_or(false);
+        if from_drawer {
+            let html = product_detail_html(&state, form.id).await?;
+            // Two events with distinct jobs: `product-changed` (pre-swap)
+            // refreshes the lists, `product-saved` closes the drawer. The close
+            // must fire after the swap so the `htmx:afterSwap` open cannot
+            // resurrect the panel, hence the after-settle header.
+            return Ok(triggered_after_settle(
+                triggered(html.0, "product-changed"),
+                "product-saved",
+            ));
+        }
+        let products = all_product_stocks(&state).await?;
+        let html = ProductListPartial { products }
+            .render()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(triggered(html, "product-changed"));
+    }
+    Ok(Redirect::to("/products").into_response())
+}
+
+/// Record (or shift) a per-supplier cost from the drawer, with the same parsing
+/// rules as the supplier-side form: a required cost and a date that defaults to
+/// today; the satellite's newer-date rule rejects older ones with 400.
+async fn web_record_product_cost(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RecordProductCostForm>,
+) -> Result<axum::response::Response, AppError> {
+    let cost = Decimal::from_str(form.cost.trim())
+        .map_err(|_| AppError::Validation("invalid cost".into()))?;
+    let date = if form.date.trim().is_empty() {
+        chrono::Local::now().date_naive()
+    } else {
+        form.date
+            .trim()
+            .parse()
+            .map_err(|_| AppError::Validation("invalid date (YYYY-MM-DD)".into()))?
+    };
+    state
+        .supplier_service
+        .record_cost(form.product_id, form.supplier_id, cost, date)
+        .await?;
+    if is_htmx(&headers) {
+        let from_drawer = headers
+            .get("HX-Target")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("product-drawer-body"))
+            .unwrap_or(false);
+        if from_drawer {
+            let html = product_detail_html(&state, form.product_id).await?;
+            return Ok(triggered(html.0, "product-cost-recorded"));
+        }
+        let products = all_product_stocks(&state).await?;
+        let html = ProductListPartial { products }
+            .render()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(triggered(html, "product-cost-recorded"));
+    }
+    Ok(Redirect::to("/products").into_response())
+}
+
+/// Move the preferred marker to one supplier for this product; the service
+/// clears the previous preferred row and rejects unknown cost pairs (404).
+async fn web_set_preferred_cost(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PreferredCostForm>,
+) -> Result<axum::response::Response, AppError> {
+    state
+        .supplier_service
+        .set_preferred(form.product_id, form.supplier_id)
+        .await?;
+    if is_htmx(&headers) {
+        let from_drawer = headers
+            .get("HX-Target")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("product-drawer-body"))
+            .unwrap_or(false);
+        if from_drawer {
+            let html = product_detail_html(&state, form.product_id).await?;
+            return Ok(triggered(html.0, "product-cost-recorded"));
+        }
+        let products = all_product_stocks(&state).await?;
+        let html = ProductListPartial { products }
+            .render()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(triggered(html, "product-cost-recorded"));
+    }
+    Ok(Redirect::to("/products").into_response())
+}
+
+/// Lifecycle actions share one three-way answer: HTMX gets the fresh list
+/// fragment with `product-changed` (the drawer closes itself on success via
+/// its `hx-on::after-request`), a plain browser gets the redirect.
+async fn web_activate_product(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProductIdForm>,
+) -> Result<axum::response::Response, AppError> {
+    state
+        .inventory_service
+        .set_product_active(form.product_id, true)
+        .await?;
+    product_lifecycle_response(&state, &headers).await
+}
+
+async fn web_deactivate_product(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProductIdForm>,
+) -> Result<axum::response::Response, AppError> {
+    state
+        .inventory_service
+        .set_product_active(form.product_id, false)
+        .await?;
+    product_lifecycle_response(&state, &headers).await
+}
+
+async fn web_delete_product(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProductIdForm>,
+) -> Result<axum::response::Response, AppError> {
+    state.inventory_service.delete_product(form.product_id).await?;
+    product_lifecycle_response(&state, &headers).await
+}
+
+/// The shared answer for the lifecycle actions: list fragment + trigger for
+/// HTMX callers, redirect for plain browsers.
+async fn product_lifecycle_response(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<axum::response::Response, AppError> {
+    if is_htmx(headers) {
+        let products = all_product_stocks(state).await?;
+        let html = ProductListPartial { products }
+            .render()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        return Ok(triggered(html, "product-changed"));
     }
     Ok(Redirect::to("/products").into_response())
 }
@@ -459,6 +836,13 @@ pub fn router() -> Router<AppState> {
         .route("/web/category-options", get(web_category_options))
         .route("/web/product-options", get(web_product_options))
         .route("/web/product-search", get(web_product_search))
+        .route("/web/products/detail/{id}", get(web_product_detail))
+        .route("/web/products/edit", post(web_edit_product))
+        .route("/web/products/activate", post(web_activate_product))
+        .route("/web/products/deactivate", post(web_deactivate_product))
+        .route("/web/products/delete", post(web_delete_product))
+        .route("/web/product-costs", post(web_record_product_cost))
+        .route("/web/product-costs/preferred", post(web_set_preferred_cost))
         .route("/web/stock-movements", post(web_create_movement))
         .route("/web/low-stock", get(web_low_stock))
         .route("/web/negative-stock", get(web_negative_stock))
@@ -646,5 +1030,567 @@ mod tests {
             html.contains(&vals),
             "result must supply its own product id: {html}"
         );
+    }
+
+    // -- T2 redesign-products: the product drawer routes -----------------------
+
+    use crate::models::{NewProduct, NewSupplier, ProductKind};
+    use rust_decimal::Decimal;
+
+    async fn post_form_full(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true");
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).to_string(),
+        )
+    }
+
+    async fn seed_tracked_product(state: &AppState, sku: &str) -> crate::models::Product {
+        state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: sku.into(),
+                name: format!("prod {sku}"),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::from(2)),
+                max_stock: Some(Decimal::from(50)),
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    fn hx_trigger(headers: &axum::http::HeaderMap) -> String {
+        header_value(headers, "HX-Trigger")
+    }
+
+    fn header_value(headers: &axum::http::HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// The drawer fragment renders the header with the derived stock and one row
+    /// per supplier cost (supplier name, current cost, preferred marker); an
+    /// unknown id is a 404 like the suppliers drawer.
+    #[tokio::test]
+    async fn web_product_detail_renders_costs_and_unknown_is_404() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "DETAIL-1").await;
+        state
+            .inventory_service
+            .record_movement(crate::models::NewMovement {
+                product_id: product.id,
+                qty: Decimal::from(5),
+                movement_type: crate::models::MovementType::In,
+                reason: crate::models::MovementReason::Initial,
+                reference: String::new(),
+                date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            })
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Detail Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .supplier_service
+            .record_cost(
+                product.id,
+                supplier.id,
+                Decimal::from_str("12.50").unwrap(),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .supplier_service
+            .set_preferred(product.id, supplier.id)
+            .await
+            .unwrap();
+
+        let app = crate::routes::router(state);
+        let (status, html) =
+            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        for expected in [
+            "product-detail-inner",
+            "prod DETAIL-1",
+            "stock 5",
+            "Detail Sup",
+            "12.50",
+            "preferred",
+        ] {
+            assert!(html.contains(expected), "drawer must show {expected}: {html:.900}");
+        }
+
+        // The global notice region labels its success/error messages with the
+        // submitting form's `data-action`, so renaming one of these labels is a
+        // silent UX regression: every HTTP-status test still sees 200 and only
+        // the toast text degrades. Pin the exact three labels and forbid any
+        // other `data-action` in the fragment.
+        for label in ["Save product", "Record product cost", "Record movement"] {
+            let attr = format!("data-action=\"{label}\"");
+            assert_eq!(
+                html.matches(&attr).count(),
+                1,
+                "exactly one data-action '{label}' in the drawer fragment: {html:.900}"
+            );
+        }
+        assert_eq!(
+            html.matches("data-action=").count(),
+            3,
+            "no other data-action labels may appear in the drawer fragment: {html:.900}"
+        );
+
+        let app = crate::routes::router(test_state().await);
+        let (status, _) = get_html(app, "/web/products/detail/99999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// Drawer submissions get the fresh detail fragment plus two triggers:
+    /// pre-swap `HX-Trigger` `product-changed` refreshes the lists, and
+    /// after-settle `HX-Trigger-After-Settle` `product-saved` closes the
+    /// drawer; a plain browser gets the redirect.
+    #[tokio::test]
+    async fn web_edit_product_from_drawer_answers_fragment_and_trigger() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "EDIT-WEB").await;
+        let app = crate::routes::router(state);
+
+        let body = format!(
+            "id={}&sku=EDIT-WEB-2&name=Edited+via+drawer&kind=Product&unit=kg&sale_price=20.50&cost_price=8&category_id=&track_stock=1&min_stock=2&max_stock=80&location=shelf+3&notes=edited",
+            product.id
+        );
+        let (status, headers, html) = post_form_full(
+            app.clone(),
+            "/web/products/edit",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        for expected in ["product-detail-inner", "Edited via drawer", "EDIT-WEB-2"] {
+            assert!(
+                html.contains(expected),
+                "drawer answer must show {expected}: {html:.600}"
+            );
+        }
+        // Two trigger headers, one distinct job each: `product-changed`
+        // (pre-swap `HX-Trigger`) refreshes the product/low-stock lists;
+        // `product-saved` (after-settle) is the drawer's own close signal for a
+        // successful save. The close must ride the after-settle header because
+        // the drawer's `htmx:afterSwap` open fires after the swap and would
+        // otherwise reopen the panel the plain header just closed. A failed
+        // save swaps nothing and fires neither.
+        assert_eq!(
+            hx_trigger(&headers),
+            "product-changed",
+            "drawer answer must fire product-changed pre-swap"
+        );
+        assert_eq!(
+            header_value(&headers, "HX-Trigger-After-Settle"),
+            "product-saved",
+            "drawer answer must fire product-saved after settle (closes the drawer)"
+        );
+
+        // The non-drawer HTMX branch (e.g. the standalone list edit form) keeps
+        // the single-event answer: `product-changed` only, never `product-saved`,
+        // so no save outside the drawer can close the panel.
+        let (status, headers, _) = post_form_full(
+            app.clone(),
+            "/web/products/edit",
+            &body,
+            &[("HX-Target", "product-list")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let trigger = hx_trigger(&headers);
+        assert!(trigger.contains("product-changed"));
+        assert!(
+            !trigger.contains("product-saved"),
+            "non-drawer save must not fire product-saved, got {trigger:?}"
+        );
+
+        // A plain browser post is a redirect to the page.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/products/edit")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get("Location").and_then(|v| v.to_str().ok()),
+            Some("/products")
+        );
+    }
+
+    /// Emptying an optional field through the drawer form is an explicit
+    /// clear, not "leave unchanged": the create and update paths share
+    /// validation, so a regression that silently kept the stale optional
+    /// value would corrupt the product on save. The unticked `track_stock`
+    /// checkbox sends nothing, which must also mean `false`.
+    #[tokio::test]
+    async fn web_edit_product_clears_emptied_optional_fields() {
+        let state = test_state().await;
+        let category = state
+            .inventory_service
+            .create_category("Clear Cat", None)
+            .await
+            .unwrap();
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "CLEAR-1".into(),
+                name: "clearable prod".into(),
+                kind: ProductKind::Product,
+                category_id: Some(category.id),
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::from(2)),
+                max_stock: Some(Decimal::from(50)),
+                location: Some("shelf 3".into()),
+                notes: Some("fragile".into()),
+            })
+            .await
+            .unwrap();
+
+        // Every optional field is sent empty and the `track_stock` key is
+        // absent (the unticked checkbox posts nothing at all).
+        let body = format!(
+            "id={}&sku=CLEAR-1&name=clearable+prod&kind=Product&unit=un&sale_price=25&cost_price=5&category_id=&min_stock=&max_stock=&location=&notes=",
+            product.id
+        );
+        let app = crate::routes::router(state.clone());
+        let (status, _, html) = post_form_full(
+            app,
+            "/web/products/edit",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains("product-detail-inner"),
+            "drawer edit must answer the detail fragment: {html:.600}"
+        );
+
+        let after = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
+        assert!(!after.track_stock, "absent checkbox must mean false");
+        assert_eq!(after.min_stock, None, "empty min_stock must clear");
+        assert_eq!(after.max_stock, None, "empty max_stock must clear");
+        assert_eq!(after.location, None, "empty location must clear");
+        assert_eq!(after.notes, None, "empty notes must clear");
+        assert_eq!(after.category_id, None, "empty category_id must clear");
+        // Fields the form did send survive untouched.
+        assert_eq!(after.sku, "CLEAR-1");
+        assert_eq!(after.name, "clearable prod");
+        assert_eq!(after.sale_price, Decimal::from(25));
+        assert_eq!(after.cost_price, Decimal::from(5));
+    }
+
+    /// Recording a cost creates/updates the satellite row and fires
+    /// `product-cost-recorded`; a date older than the current one is 400.
+    #[tokio::test]
+    async fn web_record_product_cost_creates_row_and_fires_trigger() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "COST-WEB").await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Cost Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let body = format!(
+            "product_id={}&supplier_id={}&cost=12.50&date=2024-05-01",
+            product.id, supplier.id
+        );
+        let (status, headers, html) = post_form_full(
+            app.clone(),
+            "/web/product-costs",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("product-detail-inner") && html.contains("Cost Sup"),
+            "drawer answer must be the fresh detail: {html:.600}"
+        );
+        assert!(
+            hx_trigger(&headers).contains("product-cost-recorded"),
+            "must fire product-cost-recorded, got {:?}",
+            hx_trigger(&headers)
+        );
+
+        let costs = state
+            .supplier_service
+            .list_costs_for_product(product.id)
+            .await
+            .unwrap();
+        assert_eq!(costs.len(), 1, "one satellite row after the web post");
+        assert_eq!(costs[0].current_cost, Decimal::from_str("12.50").unwrap());
+
+        // A date older than the current cost date is rejected by the service.
+        let body = format!(
+            "product_id={}&supplier_id={}&cost=13&date=2024-04-01",
+            product.id, supplier.id
+        );
+        let (status, _, _) = post_form_full(
+            app,
+            "/web/product-costs",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Marking a preferred supplier moves the marker: after switching, exactly
+    /// one row for the product is preferred and it is the newest choice.
+    #[tokio::test]
+    async fn web_set_preferred_cost_switches_preferred() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "PREF-WEB").await;
+        let a = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Pref A".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let b = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Pref B".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        for (sid, cost) in [(a.id, "9"), (b.id, "8")] {
+            state
+                .supplier_service
+                .record_cost(
+                    product.id,
+                    sid,
+                    Decimal::from_str(cost).unwrap(),
+                    chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        let app = crate::routes::router(state.clone());
+
+        for (target, expected_preferred) in [(a.id, a.id), (b.id, b.id)] {
+            let (status, _, _) = post_form_full(
+                app.clone(),
+                "/web/product-costs/preferred",
+                &format!("product_id={}&supplier_id={}", product.id, target),
+                &[("HX-Target", "product-drawer-body")],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "set preferred {target}");
+
+            let costs = state
+                .supplier_service
+                .list_costs_for_product(product.id)
+                .await
+                .unwrap();
+            let preferred: Vec<_> = costs.iter().filter(|c| c.is_preferred).collect();
+            assert_eq!(
+                preferred.len(),
+                1,
+                "exactly one preferred row after choosing supplier {target}"
+            );
+            assert_eq!(preferred[0].supplier_id, expected_preferred);
+        }
+    }
+
+    /// The movement form lives in the drawer: a drawer submission answers the
+    /// fresh fragment and keeps firing `movement-created`; a movement for a
+    /// service still surfaces the service error (400).
+    #[tokio::test]
+    async fn web_stock_movement_from_drawer_answers_fragment_and_keeps_trigger() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "MOVE-WEB").await;
+        let service = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "SRV-WEB".into(),
+                name: "service SRV-WEB".into(),
+                kind: ProductKind::Service,
+                category_id: None,
+                unit: "hr".into(),
+                sale_price: Decimal::from(30),
+                cost_price: Decimal::ZERO,
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let body = format!(
+            "product_id={}&type=In&qty=5&reason=Initial&date=2024-05-01",
+            product.id
+        );
+        let (status, headers, html) = post_form_full(
+            app.clone(),
+            "/web/stock-movements",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("product-detail-inner") && html.contains("stock 5"),
+            "drawer answer must be the fresh detail with derived stock: {html:.600}"
+        );
+        assert!(
+            hx_trigger(&headers).contains("movement-created"),
+            "drawer answer must keep movement-created, got {:?}",
+            hx_trigger(&headers)
+        );
+
+        // Service product => the service error (400), not a fragment.
+        let body = format!("product_id={}&type=In&qty=1&reason=Purchase", service.id);
+        let (status, _, _) = post_form_full(
+            app,
+            "/web/stock-movements",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Activate/deactivate/delete post with a hidden product_id and answer the
+    /// list fragment with `product-changed`; delete of a product with movements
+    /// stays a 400 and the row survives.
+    #[tokio::test]
+    async fn web_product_lifecycle_actions() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "LIFE-WEB").await;
+        let app = crate::routes::router(state.clone());
+
+        // Deactivate: the flag flips and the list fragment comes back.
+        let (status, headers, html) = post_form_full(
+            app.clone(),
+            "/web/products/deactivate",
+            &format!("product_id={}", product.id),
+            &[("HX-Target", "product-list")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("product-list-inner"),
+            "must answer the list fragment: {html:.400}"
+        );
+        assert!(
+            hx_trigger(&headers).contains("product-changed"),
+            "must fire product-changed, got {:?}",
+            hx_trigger(&headers)
+        );
+        let after = state.inventory_service.get_product(product.id).await.unwrap();
+        assert!(!after.is_active, "deactivate must flip is_active");
+
+        // Activate flips it back.
+        let (status, _, _) = post_form_full(
+            app.clone(),
+            "/web/products/activate",
+            &format!("product_id={}", product.id),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let after = state.inventory_service.get_product(product.id).await.unwrap();
+        assert!(after.is_active, "activate must flip is_active back");
+
+        // Delete without movements: gone.
+        let plain = seed_tracked_product(&state, "LIFE-DEL").await;
+        let (status, _, _) = post_form_full(
+            app.clone(),
+            "/web/products/delete",
+            &format!("product_id={}", plain.id),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get_html(app.clone(), &format!("/web/products/detail/{}", plain.id)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // Delete with movements: 400, row survives.
+        state
+            .inventory_service
+            .record_movement(crate::models::NewMovement {
+                product_id: product.id,
+                qty: Decimal::from(3),
+                movement_type: crate::models::MovementType::In,
+                reason: crate::models::MovementReason::Initial,
+                reference: String::new(),
+                date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            })
+            .await
+            .unwrap();
+        let (status, _, _) = post_form_full(
+            app.clone(),
+            "/web/products/delete",
+            &format!("product_id={}", product.id),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "a product with movements survives delete");
     }
 }

@@ -1,14 +1,20 @@
 <div id="product-list-inner">
   <div class="mb-2.5 text-[13px] text-muted">{{ products.len() }} products • stock derived from movements</div>
   {% if products.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No products yet — create one on the right.</div>
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No products yet — use the New product button.</div>
   {% else %}
     {% for ps in products %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="product-{{ ps.product.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
           <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if ps.product.kind.to_string() == "Service" %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{{ ps.product.kind }}</span>
-          <span class="font-semibold">{{ ps.product.name }}</span>
+          {# The name is the drawer trigger: the same button-as-row pattern as the
+             party lists, fetching the detail fragment into the drawer body. #}
+          <button type="button"
+                  class="bg-transparent p-0 text-left font-semibold {% if ps.product.is_active %}text-text{% else %}text-muted{% endif %}"
+                  hx-get="/web/products/detail/{{ ps.product.id }}"
+                  hx-target="#product-drawer-body"
+                  hx-swap="innerHTML">{{ ps.product.name }}</button>
           <span class="text-xs text-muted">{{ ps.product.sku }} • {{ ps.product.unit }} • ${{ ps.product.sale_price }}</span>
           {% if !ps.product.track_stock %}
             <span class="text-xs text-muted">untracked</span>
