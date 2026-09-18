@@ -3403,13 +3403,15 @@ async fn sidebar_groups_navigation_into_operation_catalogue_and_cash() {
     );
 }
 
+/// The dashboard is the last page still on the one-action page_header component.
+/// Products left it: the redesign needs two modal buttons in the header slot,
+/// which the single-action header cannot host, so it moved to the parties-style
+/// title row (covered by the products redesign test below).
 #[tokio::test]
-async fn dashboard_and_products_use_the_page_header_component() {
+async fn dashboard_uses_the_page_header_component() {
     let (app, _pool) = test_app().await;
-    for (path, title, action) in [
-        ("/", "Dashboard", "#new-transaction"),
-        ("/products", "Products", "#new-product"),
-    ] {
+    let (path, title, action) = ("/", "Dashboard", "#new-transaction");
+    {
         let (status, html) = get(&app, path).await;
         assert_eq!(status, StatusCode::OK, "{path}");
         assert_eq!(
@@ -3436,16 +3438,86 @@ async fn dashboard_and_products_use_the_page_header_component() {
         );
     }
 
-    // Products is a catalogue list: the optional breadcrumb is visible.
-    let (_, products) = get(&app, "/products").await;
+    // The dashboard is top level: no breadcrumb.
     assert!(
-        products.contains("data-page-breadcrumb"),
-        "products must show the Catalogue breadcrumb"
-    );
-    let (_, dashboard) = get(&app, "/").await;
-    assert!(
-        !dashboard.contains("data-page-breadcrumb"),
+        !get(&app, "/").await.1.contains("data-page-breadcrumb"),
         "dashboard is top level: no breadcrumb"
+    );
+}
+
+/// The products redesign (odd/tasks/redesign-products.md T3): the permanent
+/// New Category / New Product cards became `<dialog>` modals opened by header
+/// buttons, the Stock Movement and REST API cards left the page, and a
+/// right-hand drawer opens on click. This test pins the page-level contract of
+/// that redesign; the e2e browser suite exercises the interactions.
+#[tokio::test]
+async fn products_page_uses_modals_drawer_and_clickable_rows() {
+    let (app, pool) = test_app().await;
+    let _a = create_product_full_via_web(&app, &pool, "REDESIGN-A", "Widget A", None).await;
+    let _b = create_product_full_via_web(&app, &pool, "REDESIGN-B", "Widget B", None).await;
+
+    let (status, products) = get(&app, "/products").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The creation flows are modals now: both dialog elements exist and exactly
+    // the two header buttons open them with showModal().
+    assert!(
+        products.contains("id=\"new-category-dialog\""),
+        "the New category dialog must be rendered"
+    );
+    assert!(
+        products.contains("id=\"new-product-dialog\""),
+        "the New product dialog must be rendered"
+    );
+    assert_eq!(
+        count_occurrences(&products, ".showModal()"),
+        2,
+        "exactly two buttons may open modals"
+    );
+    assert!(
+        products.contains("document.getElementById('new-category-dialog').showModal()"),
+        "the New category button must open its dialog"
+    );
+    assert!(
+        products.contains("document.getElementById('new-product-dialog').showModal()"),
+        "the New product button must open its dialog"
+    );
+
+    // The right-hand drawer shell is always present but empty on load: detail
+    // content is fetched on click, never pre-rendered.
+    assert!(
+        products.contains("id=\"product-drawer\""),
+        "the product drawer must be rendered"
+    );
+    assert!(
+        products.contains("id=\"product-drawer-body\""),
+        "the product drawer body must be rendered"
+    );
+    assert!(
+        products.contains("function closeProductDrawer()"),
+        "the page must define closeProductDrawer"
+    );
+
+    // The permanent New Product card is gone. `id="new-product"` with the
+    // closing quote cannot match `id="new-product-dialog"`, so this stays exact.
+    assert!(
+        !products.contains("id=\"new-product\""),
+        "the permanent New Product card must not exist"
+    );
+
+    // The REST API card is gone: the endpoints stay, the page no longer
+    // advertises them. The sidebar's `/api` link renders the same phrase on every
+    // page, so the pin is the card heading, not the phrase anywhere in the shell.
+    assert!(
+        !products.contains(">REST API</h2>"),
+        "the REST API card must not be rendered"
+    );
+
+    // Every row binds its name to the drawer: one detail link per seeded row.
+    assert_eq!(
+        count_occurrences(&products, "/web/products/detail/"),
+        2,
+        "each product row must open the drawer once"
     );
 }
 
@@ -3468,7 +3540,10 @@ async fn converted_pages_expose_the_notice_region_and_named_actions() {
     let (status, products) = get(&app, "/products").await;
     assert_eq!(status, StatusCode::OK);
     assert!(products.contains("id=\"notice\""), "notice region missing");
-    for action in ["Create category", "Create product", "Record movement"] {
+    // `Record movement` no longer renders on the page: the redesign moved that
+    // form into the product drawer, which is fetched on click and therefore not
+    // present in the served shell.
+    for action in ["Create category", "Create product"] {
         assert!(
             products.contains(&format!("data-action=\"{action}\"")),
             "form action {action:?} must be named for the notice"

@@ -1,0 +1,42 @@
+{# Shared list-filter bar for the products, sales and purchases pages — opening
+   half (the `<form>` shell). The closing half, `partials/list_filters_close.html`,
+   owns the shared Clear anchor and Refresh control.
+
+   The including page declares two locals before the include (the same shape as
+   `partials/page_header.html`):
+
+     {% let filter_module = "product" %}   {# singular: the form id and list target prefix #}
+     {% let filter_list = "products" %}    {# plural: the endpoint path segment and the Clear href #}
+     {% include "partials/list_filters_open.html" %}
+       ...the page's own filter fields...
+     {% include "partials/list_filters_close.html" %}
+
+   Why the shell is split in two: Askama compiles every branch of an included
+   template against every including page's context struct, and the three filter
+   field sets are disjoint (`filter_q`/`filter_category` vs `filter_status`/
+   `filter_customer` vs `filter_status`/`filter_supplier`), so a single-file
+   branching partial cannot compile. Splitting keeps the drift-prone parts — the
+   form attributes, the debounced trigger, the Clear anchor, and the Refresh
+   control with its explicit `hx-include` and `type="button"` — written once,
+   while each page keeps the data bindings it actually owns.
+
+   Contract, written once here because every page kept drifting its own copy:
+   - `form[id$="-filters"]` is what `base.html` syncs against the URL when a
+     history entry is restored, so the form id must stay `<module>-filters`.
+   - `hx-push-url` makes a filter change addressable: htmx would push the fragment
+     path (`/web/<list>?…`), which cannot be reloaded as a page, so base.html
+     rewrites the pending history entry to the page URL (`/<list>?…`). Empty
+     fields are dropped before the request, so clearing a filter returns to the
+     bare URL.
+   - The trigger cannot use htmx's `changed` modifier: on a form element the
+     modifier compares the form's own `.value`, which is undefined, against that
+     same undefined value, so it swallows every keystroke (htmx 1.9.12). `input`
+     fires while typing (and on paste and select changes) and `delay:300ms`
+     debounces the burst; `change` stays as the blur backstop.
+   - The Refresh button lives inside the form, next to Clear, and carries an
+     explicit `hx-include="#<module>-filters"` even though htmx would include the
+     enclosing form by itself: a copy-pasted button placed outside the form
+     without the include re-fetched the unfiltered list — exactly the drift this
+     shared shell prevents. `type="button"` keeps the control from submitting
+     the form natively. #}
+<form id="{{ filter_module }}-filters" class="mb-3 flex flex-wrap gap-2" hx-get="/web/{{ filter_list }}" hx-target="#{{ filter_module }}-list" hx-swap="innerHTML" hx-push-url="true" hx-trigger="input delay:300ms, change">

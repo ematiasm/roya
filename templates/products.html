@@ -1,210 +1,229 @@
 {% extends "base.html" %}
 {% block title %}Roya — Products{% endblock %}
 {% block content %}
-{% let page_title = "Products" %}
-{% let page_breadcrumb_label = "Catalogue" %}
-{% let page_breadcrumb_href = "" %}
-{% let page_action_href = "#new-product" %}
-{% let page_action_label = "New product" %}
-{% include "partials/page_header.html" %}
-<div class="mb-4 text-[13px] text-muted">inventory • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %}</div>
-<div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
-  <div class="flex flex-col gap-6">
-    <div class="rounded-2xl border border-border bg-card p-5">
-      <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Products</h2>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/products" hx-target="#product-list" hx-swap="innerHTML">↻ Refresh</button>
-      </div>
-      {# Catalogue filter: the text field matches name, SKU and barcode through the
-         same inventory search the picker uses, and combines with the category. A
-         bookmarkable `/products?q=…&category_id=…` re-renders this state.
-
-         `hx-push-url` makes the filter addressable; base.html rewrites the fragment
-         path to the page URL and drops empty fields. #}
-      <form id="product-filters"
-            class="mb-3 flex flex-wrap gap-2"
-            hx-get="/web/products"
-            hx-target="#product-list"
-            hx-swap="innerHTML"
-            hx-push-url="true"
-            hx-trigger="change, keyup changed delay:300ms">
-        <input class="min-w-[160px] flex-1" type="text" name="q" placeholder="Name, SKU or barcode" value="{{ filter_q }}" />
-        <select class="min-w-[120px] flex-1" id="filter-category" name="category_id">
-          <option value="">All categories</option>
-          {% for cat in categories %}
-          <option value="{{ cat.id }}" {% if filter_category == cat.id.to_string() %}selected{% endif %}>{{ cat.name }}</option>
-          {% endfor %}
-        </select>
-        <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/products">Clear</a>
-      </form>
-      {# `hx-history-elt` snapshots only the list on a history push, so Back restores the
-         previous list instead of re-fetching it from a filter form that already holds
-         the newer value. base.html syncs the form to the restored URL. #}
-      <div id="product-list"
-           hx-history-elt
-           hx-get="/web/products"
-           hx-trigger="refresh from:body, load"
-           hx-include="#product-filters"
-           hx-swap="innerHTML">
-        {% include "partials/product_list.html" %}
-      </div>
-    </div>
-
-    <div class="rounded-2xl border border-border bg-card p-5" id="low-stock-section">
-      <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Low Stock</h2>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/low-stock" hx-target="#low-stock-list" hx-swap="innerHTML">↻ Refresh</button>
-      </div>
-      <div id="low-stock-list"
-           hx-get="/web/low-stock"
-           hx-trigger="refresh from:body, load"
-           hx-swap="innerHTML">
-        <div class="text-[13px] text-muted">Loading…</div>
-      </div>
-      <div class="mt-2 text-[13px] text-muted">Suggested reorder = max − stock when stock ≤ min.</div>
-    </div>
-  </div>
-
-  <div class="flex flex-col gap-6">
-    <div class="rounded-2xl border border-border bg-card p-5">
-      <h2 class="mb-3 text-lg font-semibold">New Category</h2>
-      <form class="flex flex-col gap-2.5" data-action="Create category" hx-post="/web/categories" hx-swap="none" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#product-list','refresh'); htmx.ajax('GET','/web/category-options','#filter-category'); }">
-        <div>
-          <label>Name</label>
-          <input type="text" name="name" placeholder="Beverages, Services…" required maxlength="128" />
-        </div>
-        <div>
-          <label>Parent ID (optional)</label>
-          <input type="number" name="parent_id" placeholder="empty = root" min="1" />
-        </div>
-        <button type="submit">Create Category</button>
-        <div class="text-[13px] text-muted">Also available at <code>POST /api/categories</code></div>
-      </form>
-    </div>
-
-    <div class="rounded-2xl border border-border bg-card p-5" id="new-product">
-      <h2 class="mb-3 text-lg font-semibold">New Product</h2>
-      <form class="flex flex-col gap-2.5" data-action="Create product" hx-post="/web/products" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
-        <div>
-          <label>SKU</label>
-          <input type="text" name="sku" placeholder="YERBA-500" required maxlength="64" />
-        </div>
-        <div>
-          <label>Name</label>
-          <input type="text" name="name" placeholder="Yerba 500g" required maxlength="128" />
-        </div>
-        <div class="flex gap-2.5 [&>*]:flex-1">
-          <div>
-            <label>Kind</label>
-            <select name="kind" required>
-              <option value="Product">Product</option>
-              <option value="Service">Service</option>
-            </select>
-          </div>
-          <div>
-            <label>Unit</label>
-            <input type="text" name="unit" placeholder="un, kg, lt…" required maxlength="16" value="un" />
-          </div>
-        </div>
-        <div class="flex gap-2.5 [&>*]:flex-1">
-          <div>
-            <label>Sale price</label>
-            <input type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required />
-          </div>
-          <div>
-            <label>Cost price</label>
-            <input type="number" name="cost_price" step="0.01" min="0" placeholder="0" value="0" />
-          </div>
-        </div>
-        <div>
-          <label>Category ID (optional)</label>
-          <input type="number" name="category_id" placeholder="empty = none" min="1" />
-        </div>
-        <div>
-          <label class="flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" checked class="w-auto" /> Track stock</label>
-        </div>
-        <div class="flex gap-2.5 [&>*]:flex-1">
-          <div>
-            <label>Min stock</label>
-            <input type="number" name="min_stock" step="0.01" min="0" placeholder="5" value="5" />
-          </div>
-          <div>
-            <label>Max stock</label>
-            <input type="number" name="max_stock" step="0.01" min="0" placeholder="50" value="50" />
-          </div>
-        </div>
-        <button type="submit">Create Product</button>
-        <div class="text-[13px] text-muted">Services: untick stock + empty min/max. Also at <code>POST /api/products</code></div>
-      </form>
-    </div>
-
-    <div class="rounded-2xl border border-border bg-card p-5">
-      <h2 class="mb-3 text-lg font-semibold">Stock Movement</h2>
-      <form class="flex flex-col gap-2.5" data-action="Record movement" hx-post="/web/stock-movements" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#low-stock-list','refresh'); }">
-        <div>
-          <label>Product ID</label>
-          <input type="number" name="product_id" required min="1" placeholder="1" />
-        </div>
-        <div class="flex gap-2.5 [&>*]:flex-1">
-          <div>
-            <label>Type</label>
-            <select name="type" required>
-              <option value="In">In</option>
-              <option value="Out">Out</option>
-              <option value="Adjust">Adjust</option>
-            </select>
-          </div>
-          <div>
-            <label>Qty</label>
-            <input type="number" name="qty" step="0.01" required placeholder="1" />
-          </div>
-        </div>
-        <div class="flex gap-2.5 [&>*]:flex-1">
-          <div>
-            <label>Reason</label>
-            <select name="reason" required>
-              <option value="Initial">Initial</option>
-              <option value="Purchase">Purchase</option>
-              <option value="Sale">Sale</option>
-              <option value="Loss">Loss</option>
-              <option value="Adjust">Adjust</option>
-            </select>
-          </div>
-          <div>
-            <label>Date</label>
-            <input type="date" name="date" required value="{{ today }}" />
-          </div>
-        </div>
-        <div>
-          <label>Reference (optional)</label>
-          <input type="text" name="reference" placeholder="remito-123" maxlength="256" />
-        </div>
-        <button type="submit" class="bg-accent2 text-white">Record Movement</button>
-        <div class="text-[13px] text-muted">In=+qty, Out=−qty, Adjust=signed delta. Also at <code>POST /api/stock-movements</code></div>
-      </form>
-    </div>
-
-    <div class="rounded-2xl border border-border bg-card p-5">
-      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
-      <div class="text-[13px] leading-[1.7] text-muted">
-        <code>GET /api/categories</code><br/>
-        <code>POST /api/categories</code><br/>
-        <code>GET /api/products</code><br/>
-        <code>POST /api/products</code><br/>
-        <code>GET /api/products/:id/stock</code><br/>
-        <code>POST /api/products/:id/barcodes</code><br/>
-        <code>GET /api/stock-movements?product_id=</code><br/>
-        <code>POST /api/stock-movements</code><br/>
-        <code>GET /api/low-stock</code><br/>
-        <code>GET /api/negative-stock</code><br/>
-      </div>
-    </div>
+{# The one-action page_header cannot host two modal buttons, so the page uses the
+   parties-style header instead: back link + context pill, then a title row whose
+   right side carries the two New buttons (the list's Refresh control lives in
+   the shared filter bar below). #}
+<div class="mb-4 flex items-center gap-2">
+  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">products • inventory • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %}</span>
+</div>
+<div class="mb-4 flex items-center justify-between gap-2">
+  <h2 class="text-lg font-semibold">Products</h2>
+  <div class="flex items-center gap-2">
+    <button type="button" onclick="document.getElementById('new-category-dialog').showModal()">New category</button>
+    <button type="button" onclick="document.getElementById('new-product-dialog').showModal()">New product</button>
   </div>
 </div>
 
+{# Single content column: the old right rail (New Category, New Product, Stock
+   Movement, API-info cards) is gone. Stock movement lives in the product drawer
+   now, and the REST endpoints keep working without being advertised here. #}
+<div class="grid grid-cols-1 gap-6">
+  <div class="rounded-2xl border border-border bg-card p-5">
+    {# The shared list-filter bar: `filter_module` is the singular form-id and
+       list-target prefix, `filter_list` the plural endpoint path segment and
+       Clear href. The two partials own the form shell, the Clear anchor and the
+       Refresh control; this page keeps only its own field block between them. #}
+    {% let filter_module = "product" %}
+    {% let filter_list = "products" %}
+    {% include "partials/list_filters_open.html" %}
+      <input class="min-w-[160px] flex-1" type="text" name="q" placeholder="Name, SKU or barcode" value="{{ filter_q }}" />
+      <select class="min-w-[120px] flex-1" id="filter-category" name="category_id">
+        <option value="">All categories</option>
+        {% for cat in categories %}
+        <option value="{{ cat.id }}" {% if filter_category == cat.id.to_string() %}selected{% endif %}>{{ cat.name }}</option>
+        {% endfor %}
+      </select>
+    {% include "partials/list_filters_close.html" %}
+    {# `hx-history-elt` snapshots only the list on a history push, so Back restores the
+       previous list instead of re-fetching it from a filter form that already holds
+       the newer value. base.html syncs the form to the restored URL. #}
+    <div id="product-list"
+         hx-history-elt
+         hx-get="/web/products"
+         hx-trigger="refresh from:body, load"
+         hx-include="#product-filters"
+         hx-swap="innerHTML">
+      {% include "partials/product_list.html" %}
+    </div>
+  </div>
+
+  <div class="rounded-2xl border border-border bg-card p-5" id="low-stock-section">
+    <div class="mb-3 flex items-center justify-between">
+      <h2 class="text-lg font-semibold">Low Stock</h2>
+      <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/low-stock" hx-target="#low-stock-list" hx-swap="innerHTML">↻ Refresh</button>
+    </div>
+    <div id="low-stock-list"
+         hx-get="/web/low-stock"
+         hx-trigger="refresh from:body, load"
+         hx-swap="innerHTML">
+      <div class="text-[13px] text-muted">Loading…</div>
+    </div>
+    <div class="mt-2 text-[13px] text-muted">Suggested reorder = max − stock when stock ≤ min.</div>
+  </div>
+</div>
+
+{# New category modal. On success the form resets, the list refreshes and BOTH
+   category selects are refetched from `/web/category-options`, so a fresh
+   category is immediately selectable in the filter and in the product modal. #}
+<dialog id="new-category-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
+  <div class="mb-3 flex items-center justify-between gap-6">
+    <h2 class="text-lg font-semibold">New category</h2>
+    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-category-dialog').close()">✕</button>
+  </div>
+  <form class="flex flex-col gap-2.5"
+        data-action="Create category"
+        hx-post="/web/categories"
+        hx-swap="none"
+        hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#product-list','refresh'); htmx.ajax('GET','/web/category-options','#filter-category'); htmx.ajax('GET','/web/category-options?empty=No%20category','#new-product-category'); }">
+    <div>
+      <label>Name</label>
+      <input type="text" name="name" placeholder="Beverages, Services…" required maxlength="128" />
+    </div>
+    <div>
+      <label>Parent ID (optional)</label>
+      <input type="number" name="parent_id" placeholder="empty = root" min="1" />
+    </div>
+    <button type="submit">Create category</button>
+  </form>
+</dialog>
+
+{# New product modal. The category is a select (not a typed id), and on success
+   the dialog closes itself, resets, and the body listeners refresh the list and
+   the Low Stock card off `product-created`. #}
+<dialog id="new-product-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
+  <div class="mb-3 flex items-center justify-between gap-6">
+    <h2 class="text-lg font-semibold">New product</h2>
+    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-product-dialog').close()">✕</button>
+  </div>
+  <form class="flex flex-col gap-2.5"
+        data-action="Create product"
+        hx-post="/web/products"
+        hx-target="#product-list"
+        hx-swap="innerHTML"
+        hx-on::after-request="if(event.detail.successful) { document.getElementById('new-product-dialog').close(); this.reset(); }">
+    <div>
+      <label>SKU</label>
+      <input type="text" name="sku" placeholder="YERBA-500" required maxlength="64" />
+    </div>
+    <div>
+      <label>Name</label>
+      <input type="text" name="name" placeholder="Yerba 500g" required maxlength="128" />
+    </div>
+    <div class="flex gap-2.5 [&>*]:flex-1">
+      <div>
+        <label>Kind</label>
+        <select name="kind" required>
+          <option value="Product">Product</option>
+          <option value="Service">Service</option>
+        </select>
+      </div>
+      <div>
+        <label>Unit</label>
+        <input type="text" name="unit" placeholder="un, kg, lt…" required maxlength="16" value="un" />
+      </div>
+    </div>
+    <div class="flex gap-2.5 [&>*]:flex-1">
+      <div>
+        <label>Sale price</label>
+        <input type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required />
+      </div>
+      <div>
+        <label>Cost price</label>
+        <input type="number" name="cost_price" step="0.01" min="0" placeholder="0" value="0" />
+      </div>
+    </div>
+    <div>
+      <label>Category (optional)</label>
+      <select id="new-product-category" name="category_id">
+        <option value="">No category</option>
+        {% for cat in categories %}
+        <option value="{{ cat.id }}">{{ cat.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" checked class="w-auto" /> Track stock</label>
+    </div>
+    <div class="flex gap-2.5 [&>*]:flex-1">
+      <div>
+        <label>Min stock</label>
+        <input type="number" name="min_stock" step="0.01" min="0" placeholder="5" value="5" />
+      </div>
+      <div>
+        <label>Max stock</label>
+        <input type="number" name="max_stock" step="0.01" min="0" placeholder="50" value="50" />
+      </div>
+    </div>
+    <div>
+      <label>Location (optional)</label>
+      <input type="text" name="location" maxlength="64" />
+    </div>
+    <div>
+      <label>Notes (optional)</label>
+      <input type="text" name="notes" maxlength="1024" />
+    </div>
+    <button type="submit">Create product</button>
+    <div class="text-[13px] text-muted">Services: untick stock + empty min/max.</div>
+  </form>
+</dialog>
+
+{# The product slide-over. Empty on load: the row buttons fetch the detail
+   fragment into `#product-drawer-body` and `htmx:afterSwap` opens the drawer; the
+   save form's close rides the `product-saved` after-settle trigger. #}
+<div id="product-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md hidden flex-col border-l border-border bg-card shadow-xl">
+  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+    <span class="text-sm font-semibold">Product detail</span>
+    <div class="flex items-center gap-2">
+      <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/products">All products</a>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closeProductDrawer()" aria-label="Close detail">✕</button>
+    </div>
+  </div>
+  <div id="product-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
+</div>
+
 <script>
+  function openProductDrawer() {
+    var drawer = document.getElementById('product-drawer');
+    if (drawer) {
+      drawer.classList.remove('hidden');
+      drawer.classList.add('flex');
+    }
+  }
+  function closeProductDrawer() {
+    var drawer = document.getElementById('product-drawer');
+    if (drawer) {
+      drawer.classList.add('hidden');
+      drawer.classList.remove('flex');
+    }
+    var body = document.getElementById('product-drawer-body');
+    if (body) body.innerHTML = '';
+  }
+  document.addEventListener('keydown', function (evt) {
+    if (evt.key !== 'Escape') return;
+    // An open dialog owns Escape; only close the drawer when both are closed.
+    var catDlg = document.getElementById('new-category-dialog');
+    if (catDlg && catDlg.open) return;
+    var prodDlg = document.getElementById('new-product-dialog');
+    if (prodDlg && prodDlg.open) return;
+    closeProductDrawer();
+  });
+  document.body.addEventListener('htmx:afterSwap', function (evt) {
+    if (evt.detail.target && evt.detail.target.id === 'product-drawer-body') openProductDrawer();
+  });
+  // A successful drawer save answers the POST with the fresh detail fragment
+  // plus two trigger events: `product-changed` (pre-swap) refreshes the lists,
+  // and `product-saved` — delivered after the swap settles, because the plain
+  // header fires before it and the `htmx:afterSwap` open below would reopen
+  // the panel — is what closes the drawer here. A failed save swaps nothing
+  // and fires no trigger, so the drawer stays open with the operator's values.
+  document.body.addEventListener('product-saved', closeProductDrawer);
   document.body.addEventListener('product-created', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
-  document.body.addEventListener('movement-created', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
+  document.body.addEventListener('product-changed', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
   document.body.addEventListener('category-created', function(){ htmx.trigger('#product-list','refresh'); });
+  document.body.addEventListener('product-cost-recorded', function(){ htmx.trigger('#product-list','refresh'); });
+  document.body.addEventListener('movement-created', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
 </script>
 {% endblock %}
