@@ -95,8 +95,25 @@ fn is_htmx(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-async fn all_product_stocks(state: &AppState) -> AppResult<Vec<ProductStock>> {
-    state.inventory_service.filter_products("", None).await
+/// The catalogue list fragment for a body-borne filter. The mutation forms
+/// carry `hx-include="#product-filters"` — the mechanism issue #33 established
+/// for the lifecycle forms — so the answer renders the list the operator is
+/// actually looking at instead of the whole catalogue. Empty strings mean "no
+/// constraint", the same lenient parsing the list page uses, so a filterless
+/// caller keeps the whole catalogue.
+async fn filtered_list_html(state: &AppState, q: &str, category_id: &str) -> AppResult<String> {
+    let filter = WebProductFilter {
+        q: Some(q.to_string()),
+        category_id: Some(category_id.to_string()),
+    };
+    let (query, category) = filter.parsed();
+    let products = state
+        .inventory_service
+        .filter_products(&query, category)
+        .await?;
+    ProductListPartial { products }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 fn triggered(html: String, event: &str) -> axum::response::Response {
@@ -359,8 +376,19 @@ pub struct CreateProductForm {
     pub name: String,
     #[serde(default)]
     pub kind: String,
+    // `category_id` here is the catalogue FILTER's key, not the product's own
+    // category: `hx-include="#product-filters"` merges the live filter form
+    // into this body (issue #37), so the answer is the list the operator is
+    // looking at.
+    #[serde(default)]
+    pub q: String,
     #[serde(default)]
     pub category_id: String,
+    // The rename was forced, not stylistic: the modal's own category select
+    // used to ride `category_id`, but that key now belongs to the filter and
+    // one body cannot carry two values under the same key.
+    #[serde(default)]
+    pub product_category_id: String,
     #[serde(default)]
     pub unit: String,
     #[serde(default)]
@@ -415,6 +443,14 @@ pub struct EditProductForm {
 pub struct RecordProductCostForm {
     pub product_id: i64,
     pub supplier_id: i64,
+    // The catalogue filter rides the body via `hx-include="#product-filters"`
+    // (issue #37): the non-drawer answer renders the list, so it must render
+    // the list the operator is looking at. The drawer edit form keeps its own
+    // `category_id` unchanged because it carries no `hx-include`.
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub category_id: String,
     #[serde(default)]
     pub cost: String,
     #[serde(default)]
@@ -425,6 +461,12 @@ pub struct RecordProductCostForm {
 pub struct PreferredCostForm {
     pub product_id: i64,
     pub supplier_id: i64,
+    // Same body-borne filter as the other product mutations (issue #37); the
+    // drawer branch ignores these keys — it answers the detail fragment.
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub category_id: String,
 }
 
 /// Shared hidden-id form for the drawer lifecycle actions (activate/deactivate/
@@ -455,6 +497,12 @@ pub struct CreateMovementForm {
     pub reference: String,
     #[serde(default)]
     pub date: String,
+    // Same body-borne filter as the other product mutations (issue #37); the
+    // drawer branch ignores these keys — it answers the detail fragment.
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub category_id: String,
 }
 
 fn parse_opt_decimal(s: &str) -> AppResult<Option<Decimal>> {
@@ -530,7 +578,7 @@ async fn web_create_product(
         sku: form.sku,
         name: form.name,
         kind,
-        category_id: parse_opt_i64(&form.category_id)?,
+        category_id: parse_opt_i64(&form.product_category_id)?,
         unit: if form.unit.trim().is_empty() {
             "un".to_string()
         } else {
@@ -554,11 +602,11 @@ async fn web_create_product(
     };
     state.inventory_service.create_product(input).await?;
     if is_htmx(&headers) {
-        let products = all_product_stocks(&state).await?;
-        let html = ProductListPartial { products }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let mut resp = Html(html).into_response();
+        // The answer is the list the caller is looking at: the filter rides the
+        // body via `hx-include="#product-filters"` (issue #37), so an active
+        // filter narrows this fragment and `product-created` still refreshes it.
+        let mut resp =
+            Html(filtered_list_html(&state, &form.q, &form.category_id).await?).into_response();
         resp.headers_mut()
             .insert("HX-Trigger", "product-created".parse().unwrap());
         return Ok(resp);
@@ -610,11 +658,10 @@ async fn web_create_movement(
             let html = product_detail_html(&state, form.product_id).await?;
             return Ok(triggered(html.0, "movement-created"));
         }
-        let products = all_product_stocks(&state).await?;
-        let html = ProductListPartial { products }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let mut resp = Html(html).into_response();
+        // Non-drawer callers get the list they are looking at (issue #37): the
+        // filter rides the body via `hx-include="#product-filters"`.
+        let mut resp =
+            Html(filtered_list_html(&state, &form.q, &form.category_id).await?).into_response();
         resp.headers_mut()
             .insert("HX-Trigger", "movement-created".parse().unwrap());
         return Ok(resp);
@@ -753,10 +800,9 @@ async fn web_record_product_cost(
             let html = product_detail_html(&state, form.product_id).await?;
             return Ok(triggered(html.0, "product-cost-recorded"));
         }
-        let products = all_product_stocks(&state).await?;
-        let html = ProductListPartial { products }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        // Non-drawer callers get the list they are looking at (issue #37): the
+        // filter rides the body via `hx-include="#product-filters"`.
+        let html = filtered_list_html(&state, &form.q, &form.category_id).await?;
         return Ok(triggered(html, "product-cost-recorded"));
     }
     Ok(Redirect::to("/products").into_response())
@@ -783,10 +829,9 @@ async fn web_set_preferred_cost(
             let html = product_detail_html(&state, form.product_id).await?;
             return Ok(triggered(html.0, "product-cost-recorded"));
         }
-        let products = all_product_stocks(&state).await?;
-        let html = ProductListPartial { products }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        // Non-drawer callers get the list they are looking at (issue #37): the
+        // filter rides the body via `hx-include="#product-filters"`.
+        let html = filtered_list_html(&state, &form.q, &form.category_id).await?;
         return Ok(triggered(html, "product-cost-recorded"));
     }
     Ok(Redirect::to("/products").into_response())
