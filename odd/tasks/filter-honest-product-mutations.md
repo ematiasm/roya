@@ -72,10 +72,13 @@ mantener el filtro sin avisar (no resuelve la queja de fondo).
   (ver T2): htmx 1.9.12 corre la fase de swap (`beforeSwap` → `afterSwap`)
   **antes** de `htmx:afterRequest`, así que un aviso renderizado en el body se
   swappea primero y el genérico lo pisa después — al revés de lo supuesto. La
-  solución no es mandarlo por header (`HX-Trigger-After-Settle`), porque el
-  nombre del producto es UTF-8 arbitrario y `HeaderValue` es ASCII-estricto: un
-  producto "Yerba Ñandú" convertiría un alta exitosa en 500, y escaparlo a mano
-  rompe con caracteres no-BMP. Se resuelve con un guard de precedencia en el
+  solución no es mandarlo por header (`HX-Trigger-After-Settle`): el nombre del
+  producto es UTF-8 arbitrario, y aunque `HeaderValue` **sí** acepta bytes ≥ 0x80
+  (`is_valid`, http 1.5.0: `b >= 32 && b != 127 || b == b'\t'`), un header
+  no-ASCII llega al cliente como mojibake porque XHR decodifica los bytes de
+  header como ISO-8859-1; y re-escapar el nombre a ASCII a mano rompe con
+  caracteres no-BMP (`serde_json` deja el UTF-8 crudo y `\uXXXX` necesita
+  surrogates). Se resuelve con un guard de precedencia en el
   handler genérico existente: saltea el aviso genérico cuando el body de la
   respuesta trae el box (`data-notice-server`). Es independiente del orden —la
   decisión sale del cuerpo de la respuesta, no del DOM post-swap— y falla seguro
@@ -117,7 +120,7 @@ unidad de trabajo; push y PR son decisión del usuario.
 - [x] T2 — Aviso create-bajo-filtro: derivación server-side, transporte por
       body (swap OOB hacia `#notice`), guard de precedencia en `base.html`,
       markup en `templates/`. Con tests Rust y e2e. → `fed9bfc`
-- [ ] T3 — Verificación completa (cargo test, check, e2e) + docs + cierre.
+- [x] T3 — Verificación completa (cargo test, check, e2e) + docs + cierre. → `1622bdc` + commit de corrección
 
 ## Progress
 - 2026-09-18: documento creado, rama `fix/filter-honest-product-mutations`
@@ -182,7 +185,9 @@ unidad de trabajo; push y PR son decisión del usuario.
   así que el aviso genérico "Create product saved" pisaba el box del servidor.
   Implementado tal cual el brief, el test e2e habría fallado. Se aprobó la
   opción A (guard de precedencia con marcador `data-notice-server`) y se
-  descartó el header payload por el límite ASCII de `HeaderValue`.
+  descartó el header payload por el mojibake del header no-ASCII (ver la
+  corrección de cierre: `HeaderValue` no era el límite, lo es el decodificado
+  del cliente).
 - Verificación independiente (read-only, otro agente): **PASS WITH FINDINGS**,
   sin defecto de correctitud. Re-derivó la no-vacuidad con **cuatro** probes:
   con `hidden` forzado a `false` fallan 3 tests (y el negativo queda verde, que
@@ -248,5 +253,75 @@ unidad de trabajo; push y PR son decisión del usuario.
   (`#product-filters` existe en la página que aloja el drawer) y el hueco ya
   existía para los forms de ciclo de vida de #33.
 
+## Cierre (T3)
+
+### Verificación completa de la rama (`1622bdc`)
+- Verificación independiente (read-only, otro agente) sobre el commit, árbol
+  limpio: **PASS WITH FINDINGS**, rama apta para revisión. Los **5 criterios de
+  aceptación cumplidos con evidencia re-derivada**, no heredada.
+- Suites: `cargo test` **359 passed / 0 failed**; `cargo check --all-targets`
+  **0 errores**, sin un solo warning atribuible a líneas tocadas;
+  `scripts/e2e.sh` **completa**: 55 passed / 4 skipped / 0 failed (los 4 skipped
+  son probes opt-in); `scripts/build-css.sh` reproducible.
+- No-vacuidad re-derivada de cero con tres probes: filtrado neutralizado →
+  **8 tests fallan**; chequeo de pertenencia sacado → fallan los 2 negativos;
+  guard borrado → el test e2e **falla en navegador real** con
+  `Actual value: Create product saved`. Todo revertido y probado por md5.
+- Interacción T1×T2 probada en Chromium real por caminos: alta filtrada (el OOB
+  **no** se filtra al swap principal, `#notice` tiene 1 box del servidor,
+  `#low-stock-list` refresca coherente), alta sin filtro (aviso genérico, sin
+  marcador), error a mitad (4xx, cero OOB en `#product-list`, un aviso de
+  error), y POST de browser común (303 sin marcador en el body). Prueba a nivel
+  bundle de que no puede filtrarse: `swapResponse` llama `handleOutOfBandSwaps`
+  antes del swap principal y `oobSwap` remueve el elemento OOB de las dos ramas.
+- Los 21 forms con `data-action` enumerados: el único emisor del marcador es el
+  camino de alta filtrada, y la rama de error no tiene una línea cambiada.
+- Sin restos: 0 referencias a `all_product_stocks`, sin TODO/FIXME nuevos, sin
+  imports muertos, los 4 renders de `ProductListPartial` pasan por un filtro.
+
+### Correcciones de exactitud (F1/F2/F3 de la verificación de cierre)
+- **F1 (README, overstated)** — decía "every product mutation answer … the
+  mutation forms carry `hx-include`": es falso para `POST /web/products/edit`,
+  cuya rama no-drawer toma el filtro del query string. Corregido: la excepción
+  queda nombrada y se aclara que ninguna página alcanza esa rama.
+- **F2 (rationale falso, el más importante)** — sostuve que `HeaderValue` es
+  ASCII-estricto y que un nombre con acento habría dado 500. **Es falso**: en
+  `http 1.5.0`, `is_valid(b) = b >= 32 && b != 127 || b == b'\t'` acepta bytes
+  ≥ 0x80, así que el header se construye sin problema. El modo de falla real es
+  **mojibake**: XHR decodifica los bytes del header como ISO-8859-1. La decisión
+  de transporte (body) **no cambia y sigue siendo la correcta** —evita el
+  mojibake y el re-escape manual a ASCII, que rompe con no-BMP—, pero la razón
+  escrita estaba mal. Corregido en `README.md`, en el comentario de
+  `create_non_ascii_names_under_filter_stay_2xx_with_the_notice` y en este
+  documento. El mensaje del commit `fed9bfc` conserva la afirmación vieja: se
+  deja como está a propósito, porque el commit de corrección la nombra y
+  reescribir historia invalidaría las hashes que la verificación usó como
+  evidencia.
+- **F3 (“byte for byte”, literalmente falso)** — los dos mirrors difieren en
+  orden de atributos, whitespace, el marcador y el `<a>` del filtro. Corregido a
+  "mismas clases, mismos `data-notice`/`role` y mismo botón de descarte", con
+  los divergentes nombrados.
+- **F4 (aceptado, dependiente de datos)** — el guard escanea el body entero: un
+  producto llamado literalmente `data-notice-server` haría perder el aviso
+  genérico de otra request. Sin crash ni dato incorrecto; direccionalmente
+  seguro y documentado.
+- **No verificado, sigue abierto** — sin cobertura e2e de nombres no-ASCII
+  (solo Rust); ningún test afirma la lista de clases de los dos mirrors; el
+  Back del filtro de `/products` se apoya en el test de `/sales` (mecanismo
+  compartido, sin test propio).
+
+### Carga de revisión
+- Rama: 937+/29- en 9 archivos. Por categoría: código 167, templates 73, tests
+  459, docs 267. Sin el documento de tarea, la superficie revisable son **291**
+  líneas para T1 y **434** para T2.
+- Corte en dos PRs posible **sin publicar un estado intermedio sin probar**: el
+  verificador corrió el árbol de T1 (`bc53a08`) en un worktree aislado →
+  `cargo test` 354 passed, e2e completa 54 passed / 4 skipped. PR1 = T1 (bajo el
+  umbral de ~400), PR2 = T2 (apenas por encima). Decisión del usuario.
+
 ## Next step
-- T1: delegar el writer con las superficies de edición exactas.
+- Nada pendiente de esta feature. Push y PR son decisión del usuario (ver
+  "Carga de revisión" para el corte sugerido en dos PRs).
+- Follow-ups abiertos, fuera de alcance: issue #37 cerrada por esta rama;
+  F1/F2 de T1 (asimetría de `web_edit_product`, wiring guard sin cubrir el
+  drawer de producto) y los `Option<Option<T>>` de suppliers/categories.

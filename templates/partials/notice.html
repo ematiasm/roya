@@ -5,9 +5,12 @@
    element's children. Rendered by `HiddenByFilterNotice` in
    `src/routes/inventory_web.rs`, which names this file in its own comment.
 
-   The box markup mirrors `base.html`'s `notice()` JS success box byte for
-   byte — same classes, `data-notice="success"`, `role="status"` and the same
-   dismiss button — and `base.html` cross-references this file. The classes
+   The box markup carries the same classes, `data-notice="success"`,
+   `role="status"` and the same dismiss button as `base.html`'s `notice()` JS
+   success box, plus the `data-notice-server` marker and the action link this
+   case needs. Attribute order and whitespace differ from the JS box and do not
+   matter; the class list is what has to stay in step. `base.html`
+   cross-references this file. The classes
    are deliberately duplicated between an Askama template and a JS string:
    this copy lives in `templates/` because that is the only tree Tailwind
    scans (`@source "../templates"` in `assets/tailwind.css`), so the box keeps

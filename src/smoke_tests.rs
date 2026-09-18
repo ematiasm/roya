@@ -4897,11 +4897,15 @@ async fn create_matching_filter_answer_holds_the_new_row_without_a_notice() {
     );
 }
 
-/// Regression for the header trap the body transport exists to avoid: a
-/// product name with non-ASCII characters (and one with an emoji, outside the
-/// BMP) must create successfully under a filter that hides it — no panic, no
-/// 5xx — and the notice must name it, because the body is UTF-8 while an
-/// `HX-Trigger` payload would have died in `HeaderValue`'s ASCII parser.
+/// Regression for the trap the body transport exists to avoid: a product name
+/// with non-ASCII characters (and one with an emoji, outside the BMP) must
+/// create successfully under a filter that hides it — no panic, no 5xx — and
+/// the notice must name it verbatim. The body is UTF-8 and Askama escapes it;
+/// a header payload would have needed the name re-encoded by hand, and a raw
+/// non-ASCII header value reaches the client as mojibake, because XHR decodes
+/// header bytes as ISO-8859-1. `http`'s `HeaderValue` is NOT the blocker:
+/// `is_valid` (http 1.5.0) accepts any byte >= 32 except 127, so non-ASCII
+/// passes validation and the damage happens on the wire instead.
 #[tokio::test]
 async fn create_non_ascii_names_under_filter_stay_2xx_with_the_notice() {
     let (app, pool) = test_app().await;
