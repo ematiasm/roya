@@ -61,8 +61,7 @@ struct SalePageTemplate {
     page_action_label: String,
     record: SaleRecord,
     oob_picker: bool,
-    accounts: Vec<crate::models::AccountWithBalance>,
-    methods: Vec<crate::models::PaymentMethod>,
+    method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
     nav_key: &'static str,
 }
@@ -89,8 +88,7 @@ struct SaleDebtPartial {
 struct SaleDetailPartial {
     record: SaleRecord,
     oob_picker: bool,
-    accounts: Vec<crate::models::AccountWithBalance>,
-    methods: Vec<crate::models::PaymentMethod>,
+    method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
 }
 
@@ -168,25 +166,22 @@ fn render_debt(debt: DebtSummary) -> AppResult<Html<String>> {
     Ok(Html(html))
 }
 
-/// Everything the record body renders: the resolved record plus the option
-/// lists its action forms need. The product picker searches
-/// `/web/product-search` instead of carrying the whole catalogue.
+/// Everything the record body renders: the resolved record plus the
+/// method-with-account options its action forms need. The product picker
+/// searches `/web/product-search` instead of carrying the whole catalogue.
 struct SaleRecordContext {
     record: SaleRecord,
-    accounts: Vec<crate::models::AccountWithBalance>,
-    methods: Vec<crate::models::PaymentMethod>,
+    method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
 }
 
 async fn record_context(state: &AppState, sale_id: i64) -> AppResult<SaleRecordContext> {
     let record = state.sales_service.get_record(sale_id).await?;
-    let accounts = state.account_service.list_with_balances().await?;
-    let methods = state.payment_method_service.list().await?;
+    let method_options = state.payment_method_service.methods_with_accounts().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     Ok(SaleRecordContext {
         record,
-        accounts,
-        methods,
+        method_options,
         today,
     })
 }
@@ -195,8 +190,7 @@ fn render_record(context: SaleRecordContext, oob_picker: bool) -> AppResult<Html
     let html = SaleDetailPartial {
         record: context.record,
         oob_picker,
-        accounts: context.accounts,
-        methods: context.methods,
+        method_options: context.method_options,
         today: context.today,
     }
     .render()
@@ -359,8 +353,7 @@ async fn sale_record_page(
         page_action_label: action_label,
         record: context.record,
         oob_picker: false,
-        accounts: context.accounts,
-        methods: context.methods,
+        method_options: context.method_options,
         today: context.today,
         nav_key: "sales",
     };
@@ -426,8 +419,6 @@ pub struct ConfirmSaleForm {
     #[serde(default)]
     pub sale_id: i64,
     #[serde(default)]
-    pub account_id: String,
-    #[serde(default)]
     pub method_id: String,
 }
 
@@ -435,7 +426,6 @@ pub struct ConfirmSaleForm {
 pub struct RecordPaymentForm {
     #[serde(default)]
     pub sale_id: i64,
-    pub account_id: i64,
     pub method_id: i64,
     #[serde(default)]
     pub amount: String,
@@ -572,12 +562,8 @@ async fn web_confirm_sale(
     Path(id): Path<i64>,
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    let account_id = parse_opt_i64(&form.account_id, "account_id")?;
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
-    state
-        .sales_service
-        .confirm(id, account_id, method_id)
-        .await?;
+    state.sales_service.confirm(id, method_id).await?;
     if is_htmx(&headers) {
         return changed(&state, id).await;
     }
@@ -594,7 +580,7 @@ async fn web_record_payment(
     let date = parse_date_or_today(&form.date)?;
     state
         .sales_service
-        .record_payment(id, form.account_id, form.method_id, amount, date)
+        .record_payment(id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
         return changed(&state, id).await;
@@ -1010,14 +996,13 @@ mod tests {
         let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
         state
             .sales_service
-            .confirm(fixture.sale_id, None, None)
+            .confirm(fixture.sale_id, None)
             .await
             .unwrap();
         state
             .sales_service
             .record_payment(
                 fixture.sale_id,
-                fixture.account_id,
                 fixture.method_id,
                 Decimal::from(10),
                 chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
@@ -1089,7 +1074,7 @@ mod tests {
 
         state
             .sales_service
-            .confirm(fixture.sale_id, None, None)
+            .confirm(fixture.sale_id, None)
             .await
             .unwrap();
         let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
@@ -1143,7 +1128,6 @@ mod tests {
             .sales_service
             .confirm(
                 fixture.sale_id,
-                Some(fixture.account_id),
                 Some(fixture.method_id),
             )
             .await
@@ -1191,7 +1175,7 @@ mod tests {
 
         state
             .sales_service
-            .confirm(fixture.sale_id, None, None)
+            .confirm(fixture.sale_id, None)
             .await
             .unwrap();
         let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
@@ -1314,7 +1298,7 @@ mod tests {
                 .unwrap();
             state
                 .sales_service
-                .confirm(sale.id, None, None)
+                .confirm(sale.id, None)
                 .await
                 .unwrap();
             sale_ids.push(sale.id);

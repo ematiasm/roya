@@ -9,7 +9,6 @@ use serde::Deserialize;
 use crate::error::AppResult;
 use crate::models::{CreateAccountRequest, CreateTransactionRequest, TransactionFilter, UpdateTransactionRequest};
 use crate::routes::AppState;
-use crate::services::finance_methods::PaymentMethodOption;
 
 async fn list_accounts(State(state): State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let accounts = state.account_service.list_with_balances().await?;
@@ -33,25 +32,36 @@ async fn get_account(
     Ok(Json(serde_json::json!(detail)))
 }
 
+/// Every payment method with its owning account, so clients can resolve a name
+/// to the row one account owns without going through an account's catalog.
+async fn list_payment_methods(
+    State(state): State<AppState>,
+) -> AppResult<Json<serde_json::Value>> {
+    let methods = state.payment_method_service.list().await?;
+    Ok(Json(serde_json::json!({ "methods": methods })))
+}
+
 /// Body for `PUT /api/accounts/{id}/payment-methods`. The list replaces the
-/// account's allowlist; it must be explicit and non-empty (no silent defaults).
+/// account's method set: ids owned by another account are a 400 (never stolen);
+/// an empty list unassigns everything (the UI warns on method-less accounts).
 #[derive(Debug, Deserialize)]
 struct UpdateAccountPaymentMethodsRequest {
+    #[serde(default)]
     method_ids: Vec<i64>,
 }
 
-/// Full method catalog for an account plus an `allowed` flag per method.
+/// The account's own methods (ownership implies usability).
 async fn get_account_payment_methods(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<serde_json::Value>> {
     state.account_service.require_exists(id).await?;
     let methods = state.payment_method_service.catalog_for_account(id).await?;
-    Ok(Json(catalog_json(id, methods)))
+    Ok(Json(methods_json(id, methods)))
 }
 
-/// Replace the account's allowlist with `method_ids` (unknown ids => 404,
-/// empty list => 400). Returns the updated catalog.
+/// Replace the account's method set with `method_ids` (unknown ids => 404,
+/// foreign-owned ids => 400). Returns the updated set.
 async fn put_account_payment_methods(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -60,22 +70,20 @@ async fn put_account_payment_methods(
     state.account_service.require_exists(id).await?;
     let methods = state
         .payment_method_service
-        .replace_allowed(id, &payload.method_ids)
+        .replace_account_methods(id, &payload.method_ids)
         .await?;
-    Ok(Json(catalog_json(id, methods)))
+    Ok(Json(methods_json(id, methods)))
 }
 
-/// Shape shared by GET and PUT: the allowed ids plus the full catalog with an
-/// `allowed` flag per method.
-fn catalog_json(account_id: i64, methods: Vec<PaymentMethodOption>) -> serde_json::Value {
-    let allowed_method_ids: Vec<i64> = methods
-        .iter()
-        .filter(|m| m.allowed)
-        .map(|m| m.id)
-        .collect();
+/// Shape shared by GET and PUT: the account plus its owned methods.
+fn methods_json(
+    account_id: i64,
+    methods: Vec<crate::models::PaymentMethod>,
+) -> serde_json::Value {
+    let method_ids: Vec<i64> = methods.iter().map(|m| m.id).collect();
     serde_json::json!({
         "account_id": account_id,
-        "allowed_method_ids": allowed_method_ids,
+        "method_ids": method_ids,
         "methods": methods,
     })
 }
@@ -130,6 +138,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/accounts", get(list_accounts).post(create_account))
         .route("/api/accounts/{id}", get(get_account))
+        .route("/api/payment-methods", get(list_payment_methods))
         .route(
             "/api/accounts/{id}/payment-methods",
             get(get_account_payment_methods).put(put_account_payment_methods),
@@ -235,48 +244,49 @@ mod tests {
         .await
     }
 
-    fn allowed_names(v: &serde_json::Value) -> Vec<String> {
-        v["methods"]
+    fn owned_names(v: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = v["methods"]
             .as_array()
             .unwrap()
             .iter()
-            .filter(|m| m["allowed"].as_bool().unwrap_or(false))
             .map(|m| m["name"].as_str().unwrap().to_string())
-            .collect()
+            .collect();
+        names.sort();
+        names
     }
 
     #[tokio::test]
-    async fn get_account_payment_methods_lists_catalog_with_allowed_flags() {
+    async fn get_account_payment_methods_lists_owned_methods() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let acc = create_account(&app, "ApiCatalog").await;
         let cash = method_id(&pool, "Cash").await;
 
+        // A fresh account owns nothing (ownership, not a full catalog).
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let methods = v["methods"].as_array().unwrap();
-        assert_eq!(methods.len(), 5, "full catalog expected: {v}");
-        assert!(allowed_names(&v).is_empty(), "nothing allowed yet: {v}");
-        assert!(methods.iter().all(|m| {
+        assert!(v["methods"].as_array().unwrap().is_empty(), "{v}");
+        assert!(v["method_ids"].as_array().unwrap().is_empty(), "{v}");
+        assert!(v["methods"].as_array().unwrap().iter().all(|m| {
             m.get("id").is_some()
                 && m.get("name").is_some()
                 && m.get("is_active").is_some()
-                && m.get("allowed").is_some()
+                && m.get("account_id").is_some()
         }));
 
         let (status, v) = put_methods(&app, acc, &[cash]).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!(allowed_names(&v), vec!["Cash"]);
+        assert_eq!(owned_names(&v), vec!["Cash"]);
         assert_eq!(
-            v["allowed_method_ids"].as_array().unwrap(),
+            v["method_ids"].as_array().unwrap(),
             &vec![serde_json::json!(cash)],
-            "allowed ids are exposed explicitly: {v}"
+            "owned ids are exposed explicitly: {v}"
         );
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!(allowed_names(&v), vec!["Cash"]);
+        assert_eq!(owned_names(&v), vec!["Cash"]);
 
         let (status, _) = get_methods(&app, 999_999).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "unknown account must 404");
@@ -293,19 +303,19 @@ mod tests {
 
         let (status, v) = put_methods(&app, acc, &[cash, transfer]).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!(allowed_names(&v), vec!["Cash", "Transfer"]);
+        assert_eq!(owned_names(&v), vec!["Cash", "Transfer"]);
 
         let (status, v) = put_methods(&app, acc, &[transfer]).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(
-            allowed_names(&v),
+            owned_names(&v),
             vec!["Transfer"],
-            "Cash must be removed, not kept: {v}"
+            "Cash must be unassigned, not kept: {v}"
         );
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!(allowed_names(&v), vec!["Transfer"]);
+        assert_eq!(owned_names(&v), vec!["Transfer"]);
     }
 
     #[tokio::test]
@@ -325,29 +335,55 @@ mod tests {
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            allowed_names(&v),
+            owned_names(&v),
             vec!["Cash"],
             "a rejected PUT must not mutate the set: {v}"
         );
     }
 
     #[tokio::test]
-    async fn put_account_payment_methods_rejects_empty_list() {
+    async fn put_account_payment_methods_rejects_foreign_owned_method_id() {
         let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let a = create_account(&app, "ApiOwner").await;
+        let b = create_account(&app, "ApiThief").await;
+        let cash = method_id(&pool, "Cash").await;
+        let (status, _) = put_methods(&app, a, &[cash]).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Stealing is a 400 and changes nothing on either side.
+        let (status, v) = put_methods(&app, b, &[cash]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "foreign method must 400: {v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("belongs to account"),
+            "actionable message: {v}"
+        );
+        let (status, v) = get_methods(&app, a).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(owned_names(&v), vec!["Cash"]);
+        let (status, v) = get_methods(&app, b).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(owned_names(&v).is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_account_payment_methods_accepts_empty_list_and_unassigns() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let acc = create_account(&app, "ApiEmpty").await;
+        let cash = method_id(&pool, "Cash").await;
+        let (status, _) = put_methods(&app, acc, &[cash]).await;
+        assert_eq!(status, StatusCode::OK);
 
         let (status, v) = put_methods(&app, acc, &[]).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
-        let msg = v["error"].as_str().unwrap_or_default();
-        assert!(
-            msg.contains("at least one"),
-            "empty list needs a clear message, got {msg}"
-        );
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(owned_names(&v).is_empty(), "empty unassigns everything: {v}");
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(allowed_names(&v).is_empty());
+        assert!(owned_names(&v).is_empty());
     }
 
     // -- transaction reference (money traceability) -----------------------------

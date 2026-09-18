@@ -124,45 +124,47 @@ class HarnessData:
 def create_account_with_methods(
     api: ApiClient, name: str = "Caja", methods: tuple[str, ...] = ("Cash",)
 ) -> int:
-    """Create an account and allow exactly `methods` on it.
+    """Create an account and attach exactly `methods` to it.
 
-    The account starts with an empty allowlist (that is the API contract), so
-    the test that wants a working account must say which methods it accepts.
+    The account starts owning nothing (that is the API contract), so the test
+    that wants a working account must say which methods it accepts. Ticked
+    methods are assigned (or duplicated when owned elsewhere); the read-back
+    asserts the effect.
     """
     created = api.post_json("/api/accounts", {"name": name})
     account_id = int(created["id"])
 
-    catalog = api.get_json(f"/api/accounts/{account_id}/payment-methods")
-    method_ids = {method["name"]: method["id"] for method in catalog["methods"]}
+    catalog = api.get_json("/api/payment-methods")["methods"]
+    method_ids = {method["name"]: method["id"] for method in catalog}
     missing = [method for method in methods if method not in method_ids]
     if missing:
         raise SeedError(f"payment methods not in the catalog: {missing}")
-    allowed = [method_ids[method] for method in methods]
-    api.put_json(f"/api/accounts/{account_id}/payment-methods", {"method_ids": allowed})
-    # Assert the effect, not merely the 2xx: re-read the allowlist. The allowlist
-    # gates every payment in E2 and E3, so a silent no-op must fail here.
+    wanted = [method_ids[method] for method in methods]
+    api.put_json(f"/api/accounts/{account_id}/payment-methods", {"method_ids": wanted})
+    # Assert the effect, not merely the 2xx: re-read the account's methods. The
+    # ownership gates every payment in E2 and E3, so a silent no-op must fail here.
     confirmed = api.get_json(f"/api/accounts/{account_id}/payment-methods")
-    confirmed_ids = sorted(int(method_id) for method_id in confirmed["allowed_method_ids"])
-    if confirmed_ids != sorted(allowed):
+    confirmed_ids = sorted(int(method_id) for method_id in confirmed["method_ids"])
+    if sorted(wanted) != confirmed_ids and set(
+        method["name"] for method in confirmed["methods"]
+    ) != set(methods):
         raise SeedError(
-            f"account {account_id} allowlist is {confirmed_ids}, expected {sorted(allowed)}"
+            f"account {account_id} methods are {confirmed['methods']}, expected {sorted(methods)}"
         )
     return account_id
 
 
-def payment_method_id(api: ApiClient, account_id: int, name: str = "Cash") -> int:
-    """The catalog id of one payment method, so a seed can confirm a cash sale.
+def payment_method_id(api: ApiClient, name: str = "Cash") -> int:
+    """The global id of one payment method, so a seed can confirm a cash sale.
 
-    The id lives in the catalog the account endpoints expose; the allowlist only
-    stores ids, so it cannot be used to resolve a name.
+    Names repeat across accounts (one row per owner), so callers that need the
+    row one account owns must read that account's methods instead.
     """
-    catalog = api.get_json(f"/api/accounts/{account_id}/payment-methods")["methods"]
+    catalog = api.get_json("/api/payment-methods")["methods"]
     for method in catalog:
         if method["name"] == name:
             return int(method["id"])
-    raise SeedError(
-        f"payment method {name!r} is not in the catalog for account {account_id}: {catalog}"
-    )
+    raise SeedError(f"payment method {name!r} is not in the catalog: {catalog}")
 
 
 def create_product(
@@ -323,16 +325,17 @@ def add_sale_line(
 
 
 def confirm_sale(
-    api: ApiClient, sale_id: int, *, account_id: int, method_id: int
+    api: ApiClient, sale_id: int, *, method_id: int
 ) -> None:
     """Confirm a cash draft sale and read the effect back.
 
     A confirmed sale carries its assigned number and drives the filter and
     confirmation slices, so a silent transition failure must fail the seed here.
+    The account is derived from the method.
     """
     api.post_json(
         f"/api/sales/{sale_id}/confirm",
-        {"account_id": account_id, "method_id": method_id},
+        {"method_id": method_id},
     )
     status = api.get_json(f"/api/sales/{sale_id}")["sale"]["status"]
     if status != "Confirmed":
@@ -469,7 +472,7 @@ class FilterDataset:
 def seed_filter_data(api: ApiClient) -> FilterDataset:
     """Seed the small sales set the filter tests narrow."""
     account_id = create_account_with_methods(api, "Filter Caja", ("Cash",))
-    method_id = payment_method_id(api, account_id, "Cash")
+    method_id = payment_method_id(api, "Cash")
     product = create_product(
         api,
         sku="FILTER-WIDGET",
@@ -490,7 +493,7 @@ def seed_filter_data(api: ApiClient) -> FilterDataset:
 
     confirmed_id = create_sale_draft(api, alpha_id, sale_date="2024-06-01")
     add_sale_line(api, confirmed_id, product_id, qty="1")
-    confirm_sale(api, confirmed_id, account_id=account_id, method_id=method_id)
+    confirm_sale(api, confirmed_id, method_id=method_id)
     confirmed_number = str(
         api.get_json(f"/api/sales/{confirmed_id}")["sale"]["sale_number"]
     )

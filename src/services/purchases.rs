@@ -4,7 +4,9 @@
 // confirm and stock Out (reason Purchase-return) on cancel, TransactionService
 // for the Cash Expense / payment Expenses / cancel Income refunds with
 // reference = purchase_number, SupplierService for the satellite cost update on
-// confirm, and PaymentMethodService for the (account, method) allowlist check.
+// confirm, and PaymentMethodService for the method-ownership check (the cash
+// account is derived from the method, so an invalid combination is impossible
+// by construction).
 // It never SQLs `transactions`, `stock_movements`, `accounts` or
 // `payment_methods` for writes.
 //
@@ -512,7 +514,6 @@ where
     pub async fn confirm(
         &self,
         purchase_id: i64,
-        cash_account_id: Option<i64>,
         cash_method_id: Option<i64>,
     ) -> AppResult<PurchaseDetail> {
         let purchase = self
@@ -599,26 +600,32 @@ where
             &self.purchases.list_payments(purchase_id).await?,
         );
 
-        match purchase.payment_type {
+        // The cash account is derived from the method, which belongs to exactly
+        // one account: an invalid combination is impossible by construction.
+        let cash_account_id: Option<i64> = match purchase.payment_type {
             PaymentType::Cash => {
-                let account_id = cash_account_id.ok_or_else(|| {
-                    AppError::Validation("cash purchase requires account and method".into())
-                })?;
                 let method_id = cash_method_id.ok_or_else(|| {
-                    AppError::Validation("cash purchase requires account and method".into())
+                    AppError::Validation("cash purchase requires a payment method".into())
                 })?;
                 if purchase.due_date.is_some() {
                     return Err(AppError::Validation("due_date must be NULL for Cash".into()));
                 }
-                if !self.transactions.accounts.exists(account_id).await? {
-                    return Err(AppError::NotFound(format!(
-                        "account {account_id} not found"
-                    )));
+                // Ownership resolved before any stock/sequence/finance touch.
+                Some(self.payment_methods.resolve_account(method_id).await?)
+            }
+            PaymentType::Credit => {
+                if cash_method_id.is_some() {
+                    return Err(AppError::Validation(
+                        "credit purchase must not include a payment method".into(),
+                    ));
                 }
-                // Allowlist validated before any stock/sequence/finance touch.
-                self.payment_methods
-                    .require_allowed(account_id, method_id)
-                    .await?;
+                None
+            }
+        };
+
+        match purchase.payment_type {
+            PaymentType::Cash => {
+                let account_id = cash_account_id.expect("resolved above");
                 // The Cash Expense leaves the account: keep the M0 overdraft
                 // guard from failing after stock/finance already applied.
                 if !self.transactions.allow_negative && total > Decimal::ZERO {
@@ -636,11 +643,8 @@ where
                 }
             }
             PaymentType::Credit => {
-                if cash_account_id.is_some() || cash_method_id.is_some() {
-                    return Err(AppError::Validation(
-                        "credit purchase must not include cash account".into(),
-                    ));
-                }
+                // A method here was already rejected above; the account is
+                // derived from it, so there is nothing else to refuse.
                 if purchase.due_date.is_none() {
                     return Err(AppError::Validation(
                         "due_date is required for Credit".into(),
@@ -724,7 +728,6 @@ where
     pub async fn record_payment(
         &self,
         purchase_id: i64,
-        account_id: i64,
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
@@ -742,15 +745,8 @@ where
         if amount <= Decimal::ZERO {
             return Err(AppError::Validation("amount must be > 0".into()));
         }
-        if !self.transactions.accounts.exists(account_id).await? {
-            return Err(AppError::NotFound(format!(
-                "account {account_id} not found"
-            )));
-        }
-        // Allowlist validated before any finance touch (no stock here either).
-        self.payment_methods
-            .require_allowed(account_id, method_id)
-            .await?;
+        // The account is derived from the method's owner (no finance touch yet).
+        let account_id = self.payment_methods.resolve_account(method_id).await?;
         let lines = self.purchases.list_lines(purchase_id).await?;
         let payments = self.purchases.list_payments(purchase_id).await?;
         let (total, paid, _) = Self::totals(&lines, &payments);
@@ -1138,7 +1134,7 @@ mod tests {
     }
 
     async fn allow(s: &Svc, account_id: i64, method_id: i64) {
-        s.payment_methods.methods.allow(account_id, method_id).await.unwrap()
+        s.payment_methods.methods.set_method_account(method_id, Some(account_id)).await.unwrap()
     }
 
     async fn tx_count(pool: &sqlx::SqlitePool) -> i64 {
@@ -1245,7 +1241,7 @@ mod tests {
             .unwrap(); // total 12
 
         let detail = s
-            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .confirm(purchase.id, Some(cash))
             .await
             .unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
@@ -1301,7 +1297,7 @@ mod tests {
             .await
             .unwrap(); // total 24
 
-        let detail = s.confirm(purchase.id, None, None).await.unwrap();
+        let detail = s.confirm(purchase.id, None).await.unwrap();
         assert!(detail.purchase.purchase_number.is_some());
         assert_eq!(detail.total, dec("24"));
         assert_eq!(detail.paid, Decimal::ZERO);
@@ -1329,10 +1325,10 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("2"), Some(dec("20")))
             .await
             .unwrap(); // total 40
-        let detail = s.confirm(purchase.id, None, None).await.unwrap();
+        let detail = s.confirm(purchase.id, None).await.unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
 
-        s.record_payment(purchase.id, acc.id, cash, dec("15"), d(2024, 5, 10))
+        s.record_payment(purchase.id, cash, dec("15"), d(2024, 5, 10))
             .await
             .unwrap();
         let d1 = s.get_detail(purchase.id).await.unwrap();
@@ -1343,14 +1339,14 @@ mod tests {
 
         // Overpay rejected with no extra finance row.
         let err = s
-            .record_payment(purchase.id, acc.id, cash, dec("30"), d(2024, 5, 11))
+            .record_payment(purchase.id, cash, dec("30"), d(2024, 5, 11))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert_eq!(tx_count(&pool).await, 1);
 
         // Paying the remainder closes the payable.
-        s.record_payment(purchase.id, acc.id, cash, dec("25"), d(2024, 5, 12))
+        s.record_payment(purchase.id, cash, dec("25"), d(2024, 5, 12))
             .await
             .unwrap();
         let d2 = s.get_detail(purchase.id).await.unwrap();
@@ -1437,19 +1433,19 @@ mod tests {
         let err = s.update_line(zero.id, dec("1"), dec("-1")).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
-        // Unknown account on Cash confirm => 404.
+        // Unknown method on Cash confirm => 404.
         let err = s
-            .confirm(purchase.id, Some(999_999), Some(cash))
+            .confirm(purchase.id, Some(999_999))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
 
-        // Unknown account on payment => 404.
+        // Unknown method on payment => 404.
         let cp = draft_credit(&s, sup.id).await;
         s.add_line(cp.id, prod.id, dec("1"), None).await.unwrap();
-        s.confirm(cp.id, None, None).await.unwrap();
+        s.confirm(cp.id, None).await.unwrap();
         let err = s
-            .record_payment(cp.id, 999_999, cash, dec("5"), purchase_date())
+            .record_payment(cp.id, 999_999, dec("5"), purchase_date())
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
@@ -1471,12 +1467,12 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("1"), Some(dec("10")))
             .await
             .unwrap();
-        s.confirm(purchase.id, Some(acc.id), Some(cash))
+        s.confirm(purchase.id, Some(cash))
             .await
             .unwrap();
 
         let err = s
-            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .confirm(purchase.id, Some(cash))
             .await
             .unwrap_err();
         assert!(
@@ -1538,7 +1534,7 @@ mod tests {
             .await
             .unwrap(); // total 40
         let detail = s
-            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .confirm(purchase.id, Some(cash))
             .await
             .unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
@@ -1628,7 +1624,7 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("2"), Some(dec("12")))
             .await
             .unwrap();
-        s.confirm(purchase.id, None, None).await.unwrap();
+        s.confirm(purchase.id, None).await.unwrap();
 
         let row = s.suppliers.find_cost(prod.id, sup.id).await.unwrap().unwrap();
         assert_eq!(row.current_cost, dec("12"));
@@ -1668,7 +1664,7 @@ mod tests {
 
         let moves_before = movement_count(&pool).await;
         let err = s
-            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .confirm(purchase.id, Some(cash))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1703,7 +1699,7 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("1"), Some(dec("12")))
             .await
             .unwrap();
-        s.confirm(purchase.id, None, None).await.unwrap();
+        s.confirm(purchase.id, None).await.unwrap();
 
         let stored = s.inventory.get_product(prod.id).await.unwrap();
         assert_eq!(stored.cost_price, dec("5"), "cost_price must stay untouched");
@@ -1727,7 +1723,7 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("2"), Some(dec("6")))
             .await
             .unwrap();
-        let detail = s.confirm(purchase.id, None, None).await.unwrap();
+        let detail = s.confirm(purchase.id, None).await.unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
 
         let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
@@ -1740,7 +1736,7 @@ mod tests {
         let acc = seed_account(&s, "caja11").await;
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
-        s.record_payment(purchase.id, acc.id, cash, dec("5"), d(2024, 5, 20))
+        s.record_payment(purchase.id, cash, dec("5"), d(2024, 5, 20))
             .await
             .unwrap();
         let rows = s
@@ -1830,26 +1826,26 @@ mod tests {
         assert!(!out.suggestions.iter().any(|x| x.product.id == svc_prod.id));
     }
 
-    // -- AC14: allowlist rejection without side effects ----------------------------
+    // -- AC14: unassigned-method rejection without side effects ------------------
 
     #[tokio::test]
-    async fn ac14_disallowed_pair_rejected_without_side_effects() {
+    async fn ac14_unassigned_method_rejected_without_side_effects() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "AC14", "10").await;
         let sup = seed_supplier(&s, "AC14 SUP").await;
         let acc = seed_account(&s, "caja14").await;
         let cash = cash_method(&s).await;
         let qr = method_by_name(&s, "QR").await;
-        allow(&s, acc.id, cash).await; // QR intentionally not allowed
+        allow(&s, acc.id, cash).await; // QR intentionally unassigned
 
-        // Cash confirm with a disallowed pair => 400, nothing applied.
+        // Cash confirm with an unassigned method => 400, nothing applied.
         let purchase = draft_cash(&s, sup.id).await;
         s.add_line(purchase.id, prod.id, dec("2"), Some(dec("10")))
             .await
             .unwrap();
         let moves_before = movement_count(&pool).await;
         let err = s
-            .confirm(purchase.id, Some(acc.id), Some(qr))
+            .confirm(purchase.id, Some(qr))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1859,15 +1855,15 @@ mod tests {
         assert!(detail.purchase.purchase_number.is_none());
         assert_eq!(detail.purchase.status, PurchaseStatus::Draft);
 
-        // Payment with a disallowed pair => 400, no finance row.
+        // Payment with an unassigned method => 400, no finance row.
         let credit = draft_credit(&s, sup.id).await;
         s.add_line(credit.id, prod.id, dec("2"), Some(dec("10")))
             .await
             .unwrap();
-        s.confirm(credit.id, None, None).await.unwrap();
+        s.confirm(credit.id, None).await.unwrap();
         let tx_before = tx_count(&pool).await;
         let err = s
-            .record_payment(credit.id, acc.id, qr, dec("5"), purchase_date())
+            .record_payment(credit.id, qr, dec("5"), purchase_date())
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1894,7 +1890,7 @@ mod tests {
             .unwrap();
         let before = movement_count(&pool).await;
         let detail = s
-            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .confirm(purchase.id, Some(cash))
             .await
             .unwrap();
         assert_eq!(detail.total, dec("60"));
@@ -1940,8 +1936,8 @@ mod tests {
         s.add_line(a.id, prod.id, dec("1"), Some(dec("5"))).await.unwrap();
         let b = draft_credit(&s, sup.id).await;
         s.add_line(b.id, prod.id, dec("1"), Some(dec("5"))).await.unwrap();
-        let da = s.confirm(a.id, None, None).await.unwrap();
-        let db = s.confirm(b.id, None, None).await.unwrap();
+        let da = s.confirm(a.id, None).await.unwrap();
+        let db = s.confirm(b.id, None).await.unwrap();
         let na = da.purchase.purchase_number.clone().unwrap();
         let nb = db.purchase.purchase_number.clone().unwrap();
         assert_ne!(na, nb);
@@ -1968,7 +1964,7 @@ mod tests {
             .unwrap(); // total 20, account has 0
         let moves_before = movement_count(&pool).await;
         let err = s
-            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .confirm(purchase.id, Some(cash))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1995,12 +1991,12 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("2"), Some(dec("20")))
             .await
             .unwrap(); // total 40
-        let detail = s.confirm(purchase.id, None, None).await.unwrap();
+        let detail = s.confirm(purchase.id, None).await.unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
-        s.record_payment(purchase.id, acc_a.id, cash, dec("15"), d(2024, 5, 10))
+        s.record_payment(purchase.id, cash, dec("15"), d(2024, 5, 10))
             .await
             .unwrap();
-        s.record_payment(purchase.id, acc_b.id, transfer, dec("25"), d(2024, 5, 11))
+        s.record_payment(purchase.id, transfer, dec("25"), d(2024, 5, 11))
             .await
             .unwrap();
 
@@ -2043,11 +2039,11 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("1"), Some(dec("5")))
             .await
             .unwrap();
-        s.confirm(purchase.id, None, None).await.unwrap();
+        s.confirm(purchase.id, None).await.unwrap();
         s.cancel(purchase.id, None).await.unwrap();
         let tx_before = tx_count(&pool).await;
         let err = s
-            .record_payment(purchase.id, acc.id, cash, dec("5"), purchase_date())
+            .record_payment(purchase.id, cash, dec("5"), purchase_date())
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -2240,7 +2236,7 @@ mod tests {
 
         // Defensive: add_line/update_line already reject duplicates, but a
         // confirm must never accept a repeated product either.
-        let err = s.confirm(purchase.id, None, None).await.unwrap_err();
+        let err = s.confirm(purchase.id, None).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         let after = s.get_detail(purchase.id).await.unwrap();
@@ -2267,13 +2263,13 @@ mod tests {
         s.add_line(first.id, prod.id, dec("1"), Some(dec("4")))
             .await
             .unwrap();
-        s.confirm(first.id, None, None).await.unwrap();
+        s.confirm(first.id, None).await.unwrap();
 
         let second = draft_credit(&s, sup.id).await;
         s.add_line(second.id, prod.id, dec("2"), Some(dec("6")))
             .await
             .unwrap();
-        let detail = s.confirm(second.id, None, None).await.unwrap();
+        let detail = s.confirm(second.id, None).await.unwrap();
 
         assert_eq!(detail.total, dec("12"));
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("3"));
@@ -2318,7 +2314,7 @@ mod tests {
         )
         .await
         .unwrap();
-        s.confirm(purchase.id, None, None).await.unwrap();
+        s.confirm(purchase.id, None).await.unwrap();
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("20"));
 
         let after = s.suggestions().await.unwrap();
@@ -2421,7 +2417,7 @@ mod tests {
             .unwrap(); // total 20
 
         let detail = s
-            .confirm(purchase.id, Some(acc.id), Some(cash))
+            .confirm(purchase.id, Some(cash))
             .await
             .unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
@@ -2459,11 +2455,11 @@ mod tests {
         s.add_line(purchase.id, prod.id, dec("2"), Some(dec("20")))
             .await
             .unwrap(); // total 40
-        let detail = s.confirm(purchase.id, None, None).await.unwrap();
+        let detail = s.confirm(purchase.id, None).await.unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
 
         let paid = s
-            .record_payment(purchase.id, acc.id, cash, dec("15"), d(2024, 5, 10))
+            .record_payment(purchase.id, cash, dec("15"), d(2024, 5, 10))
             .await
             .unwrap();
         let paid_tx_id = paid

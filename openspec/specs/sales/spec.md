@@ -39,8 +39,9 @@ different accounts over time. The customer, the credit rules and the receivable 
 - **Derived, never stored:** `total = SUM(qty × unit_price)`, `paid = SUM(payments)`,
   `due = total − paid`. Paid is a derived state, not a status.
 - A sale cannot be confirmed twice, and a confirmed sale cannot be edited. Only a draft can.
-- **Cash only at confirmation:** the `(account, method)` pair must be in the finance allowlist, checked
-  before any document number, stock or finance write. A rejected pair returns 400 with no side effect.
+- **Cash only at confirmation:** the method must belong to an account (ownership is resolved
+  before any document number, stock or finance write, and the account is derived from it).
+  An unknown method returns 404, an inactive or unassigned one returns 400 with no side effect.
 - **Credit payments:** each payment posts one `Income` and links it through `transaction_id`; the sale
   is paid when `due = 0`. Overpayment returns 400.
 - **Cancelling** a confirmed sale returns the goods (`In`, reason `Sale-return`) and refunds the money

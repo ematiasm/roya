@@ -1,0 +1,45 @@
+<div id="supplier-detail-inner" class="flex flex-col gap-4">
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="text-lg font-semibold">{{ supplier.name }}</span>
+      <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if supplier.is_active %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{% if supplier.is_active %}active{% else %}inactive{% endif %}</span>
+    </div>
+    {% if let Some(phone) = supplier.phone %}
+    <div class="text-[13px] text-muted">phone {{ phone }}</div>
+    {% endif %}
+    {% if let Some(notes) = supplier.notes %}
+    <div class="text-[13px] text-muted">{{ notes }}</div>
+    {% endif %}
+
+    <div class="my-2 text-2xl font-bold">{{ balance }} <span class="text-[13px] text-muted">outstanding across Confirmed purchases</span></div>
+
+    <div class="mt-4 flex items-center gap-2">
+      {% if supplier.is_active %}
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Deactivate</button>
+      {% else %}
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-post="/web/suppliers/{{ supplier.id }}/activate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Activate</button>
+      {% endif %}
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-delete="/web/suppliers/{{ supplier.id }}" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Delete</button>
+    </div>
+  </section>
+
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="mb-1.5 font-bold text-[13px] text-muted">Purchases ({{ purchases.len() }})</div>
+    {% if purchases.is_empty() %}
+      <div class="text-[13px] text-muted">No purchases from this supplier yet.</div>
+    {% else %}
+      {% for d in purchases %}
+      <a href="/purchases/{{ d.purchase.id }}" class="mb-2 flex items-center justify-between gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-text hover:border-accent2">
+        <div class="flex flex-col">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ d.purchase.status }}</span>
+            <span class="font-semibold">{% if let Some(n) = d.purchase.purchase_number %}{{ n }}{% else %}purchase #{{ d.purchase.id }}{% endif %}</span>
+          </div>
+          <span class="text-[13px] text-muted">{{ d.purchase.purchase_date }} • total {{ d.total }} • paid {{ d.paid }}</span>
+        </div>
+        <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ d.due }}</span>
+      </a>
+      {% endfor %}
+    {% endif %}
+  </section>
+</div>

@@ -42,10 +42,11 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
   - For a credit sale without `due_date`, the due date defaults to
     `sale_date + customer.payment_days`; without a term on the customer it is
     required (400). An explicit date always wins.
-  - Payments carry `account_id + method_id` (N per sale, mixed accounts/methods,
-    sum ≤ total); each posts 1 Income; overpay ⇒ 400; Paid when due = 0.
-  - `account_payment_methods` allowlist enforced (400) before any stock/sequence/
-    finance touch.
+  - Payments name only the `method_id` (N per sale, mixed methods, sum ≤
+    total); each posts 1 Income; overpay ⇒ 400; Paid when due = 0. The account
+    is derived from the method's owner, so an invalid combination is impossible
+    by construction; an unassigned or inactive method ⇒ 400 before any
+    stock/sequence/finance touch.
   - Cancel of Confirmed re-enters stock (`In`, reason `Sale-return`) and posts
     Expense refunds, guarded by `ALLOW_NEGATIVE_BALANCE`.
   - `sale_number` UNIQUE, immutable, NULL only in Draft/Cancelled-from-Draft.
@@ -65,15 +66,16 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
   `GET /api/customers/:id/statement`, `GET /api/customers/ageing`.
 - **Customer receipts (M4)** — `customer_receipts(id, customer_id, account_id,
   method_id, date, notes, created_at)` groups the payments of one handover of
-  money. Collecting applies the amount to the customer's confirmed credit sales
-  oldest debt first, creates one receipt and one linked payment per covered sale,
-  and every grouped payment still posts its own Income with `reference =
-  sale_number`. The receipt stores no total: it is derived as `SUM(allocations)`,
-  so an interrupted collection can never claim more than it applied. More than the
-  outstanding debt ⇒ 400; a `(account, method)` pair outside the allowlist ⇒ 400;
-  both leave no side effect. No route accepts a receipt id: the same-customer rule
-  is enforced by construction in `collect`, and the database triggers stay the
-  backstop. REST: `GET/POST /api/customer-receipts`,
+  money (the stored `account_id` is derived from the method at collect time).
+  Collecting names only the method and applies the amount to the customer's
+  confirmed credit sales oldest debt first, creates one receipt and one linked
+  payment per covered sale, and every grouped payment still posts its own Income
+  with `reference = sale_number`. The receipt stores no total: it is derived as
+  `SUM(allocations)`, so an interrupted collection can never claim more than it
+  applied. More than the outstanding debt ⇒ 400; an unassigned/inactive method
+  ⇒ 400; both leave no side effect. No route accepts a receipt id: the
+  same-customer rule is enforced by construction in `collect`, and the database
+  triggers stay the backstop. REST: `GET/POST /api/customer-receipts`,
   `GET /api/customer-receipts/:id` (list requires `?customer_id=`).
 - **Suppliers (M3)** — `suppliers(id, name UNIQUE, phone, notes, is_active)` plus the
   `product_supplier_costs` satellite holding the per-supplier price with its previous
@@ -90,31 +92,43 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
     Credit stays payable (`due = total`, no Expense until paid).
   - Credit payments each post 1 Expense (`reference = purchase_number`) and the
     payment stores the Expense id; N per purchase,
-    mixed accounts/methods, sum ≤ total; Paid when due = 0; overpay ⇒ 400.
+    mixed methods, sum ≤ total; Paid when due = 0; overpay ⇒ 400.
   - Cancel of Confirmed returns stock (`Out`, reason `Purchase-return`, the M1 CHECK
     expansion) and posts Income refunds per payment; a refund is money entering, so the
     balance guard never blocks it. Draft cancel is a discard with no side effects.
-  - `account_payment_methods` allowlist enforced (400) before any stock/sequence/
-    finance touch; `purchase_number` UNIQUE, immutable, NULL only while Draft (or
-    cancelled before ever being confirmed).
+  - The method's owning account is resolved (400 when unassigned/inactive)
+    before any stock/sequence/finance touch; `purchase_number` UNIQUE, immutable,
+    NULL only while Draft (or cancelled before ever being confirmed).
 - **Sugerido (purchase suggestion)** — low-stock tracked products with suggested
   qty = `max_stock − stock`, the chosen supplier (preferred satellite row, else cheapest
   current cost), satellite cost and subtotal. Products without a satellite row are
   returned in `without_supplier`, never silently dropped.
-- **Payment methods (M0)** — `payment_methods(id, name UNIQUE, is_active)` seeded
-  `Cash, Transfer, Debit, CreditCard, QR` (no `Other`); `account_payment_methods`
-  allowlist `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id`
-  RESTRICT NOT NULL. `sales` has no `account_id`.
-  The allowlist is **explicit configuration, never a silent default**: the dashboard
-  create-account form requires ticking at least one method, the account detail page
-  (`/accounts/:id`) lets you replace the set, and REST uses
-  `GET/PUT /api/accounts/:id/payment-methods` (empty list ⇒ 400, unknown id ⇒ 404).
-  Accounts with no methods are flagged on the dashboard list and detail page, and a
-  payment on them fails with a 400 that points to the configuration.
+- **Payment methods (M0)** — `payment_methods(id, name, account_id NULL,
+  is_active)` seeded `Cash, Transfer, Debit, CreditCard, QR` (no `Other`),
+  unassigned until an account owns them. Each method belongs to at most one
+  account (`UNIQUE(account_id, name)` lets two accounts each own a same-named
+  method as separate rows); `sale_payments.method_id` RESTRICT NOT NULL.
+  `sales` has no `account_id`. Payments name only the method and the account is
+  derived from ownership, so every form is a single method select rendered
+  `"Name — AccountName"`.
+  Method assignment is **explicit configuration, never a silent default**: the
+  dashboard create-account form ticks methods into the new account (unassigned
+  ones are assigned, ones owned elsewhere are duplicated), the account detail
+  page (`/accounts/:id`) assigns/unassigns its set, and REST uses
+  `GET/PUT /api/accounts/:id/payment-methods` (unknown id ⇒ 404, methods owned
+  by another account ⇒ 400; an empty list unassigns everything) plus the global
+  `GET /api/payment-methods` catalog. Accounts with no methods are flagged on
+  the dashboard list and detail page, and paying with an unassigned method fails
+  with a 400 that names the fix.
   Migration 12 still seeds `Caja→Cash`, `Banco→Transfer,Debit,CreditCard`,
   `MP→QR,Transfer` for accounts that already exist, and
-  `PaymentMethodService::ensure_defaults_for_account` keeps that mapping reusable;
-  no accounts are auto-created.
+  `PaymentMethodService::ensure_defaults_for_account` keeps that mapping reusable
+  (assigning free rows, duplicating owned names); no accounts are auto-created.
+  Migration 24 converted the old M:N allowlist (`account_payment_methods`,
+  dropped) to this 1:N ownership, splitting shared methods into one row per
+  account and keeping every method id stable, so payment history is untouched.
+  **Breaking change vs the pair API**: `POST /api/customer-receipts`, sale/purchase
+  confirms and sale/purchase payments no longer accept `account_id`.
 
 ## Architecture
 
@@ -222,6 +236,12 @@ Current migrations:
 - `20240101000023_add_sale_payments_receipt.sql` — `sale_payments.receipt_id`
   (RESTRICT, indexed) + triggers refusing a payment grouped under another
   customer's receipt
+- `20240101000024_payment_methods_single_account.sql` — `payment_methods.account_id`
+  (NULL = unassigned, RESTRICT) + `UNIQUE(account_id, name)` replacing the dropped
+  `account_payment_methods` allowlist; shared methods split into one row per account,
+  orphans stay NULL, method ids stable (history untouched). Runs `-- no-transaction`
+  with `PRAGMA foreign_keys=OFF` for the parent-table swap (a deferred violation from
+  `DROP TABLE` cannot be healed before COMMIT).
 
 ## REST API
 
@@ -240,15 +260,19 @@ curl -X POST http://localhost:3000/api/accounts \
 curl http://localhost:3000/api/accounts/1
 # -> { id,name,balance,created_at, transactions: [...] }
 
-# Payment methods allowlist (explicit; an empty list is rejected)
+# Account methods (ownership; empty list unassigns everything)
 curl http://localhost:3000/api/accounts/1/payment-methods
-# -> { account_id, allowed_method_ids:[1], methods:[{id,name,is_active,allowed}, ...] }
+# -> { account_id, method_ids:[1], methods:[{id,name,account_id,is_active}, ...] }
 
 curl -X PUT http://localhost:3000/api/accounts/1/payment-methods \
   -H "Content-Type: application/json" \
   -d '{"method_ids":[2,3]}'
-# replaces the account's set (no merge); unknown id => 404, [] => 400
+# replaces the account's set (no merge, no stealing: unknown id => 404, methods
+# owned by another account => 400, [] unassigns everything)
 # Accounts without methods cannot record payments; the UI flags them.
+
+curl http://localhost:3000/api/payment-methods
+# -> { methods: [every method with its owning account] }
 
 # Transactions
 curl "http://localhost:3000/api/transactions?account_id=1&from=2024-01-01&to=2024-12-31"
@@ -325,17 +349,17 @@ curl -X PUT http://localhost:3000/api/sales/1 \
 
 curl -X POST http://localhost:3000/api/sales/1/confirm \
   -H "Content-Type: application/json" \
-  -d '{"account_id":1,"method_id":1}'
+  -d '{"method_id":1}'
 # -> 200 detail with sale_number "2024-SALE-000001"; deducts stock,
-#    Cash posts 1 Income with method. Credit: send {} (no account/method),
-#    posts nothing, due = total. Disallowed (account,method) => 400, no touch.
+#    Cash posts 1 Income with the method's account. Credit: send {} (no method),
+#    posts nothing, due = total. Unassigned/inactive method => 400, no touch.
 #    Double confirm => 400.
 
 curl -X POST http://localhost:3000/api/sales/1/payments \
   -H "Content-Type: application/json" \
-  -d '{"account_id":1,"method_id":1,"amount":"15","date":"2024-05-10"}'
-# -> 201 payment + 1 Income (Credit sales; N payments, mixed accounts/methods,
-#    sum <= total; disallowed pair => 400, no finance touch; overpay => 400)
+  -d '{"method_id":1,"amount":"15","date":"2024-05-10"}'
+# -> 201 payment + 1 Income (Credit sales; N payments, mixed methods,
+#    sum <= total; unassigned method => 400, no finance touch; overpay => 400)
 
 curl -X PUT http://localhost:3000/api/sales/lines/1 \
   -H "Content-Type: application/json" \
@@ -387,10 +411,10 @@ curl "http://localhost:3000/api/customers/ageing?as_of=2024-06-30"
 # Customer receipts: collect an amount, oldest debt first
 curl -X POST http://localhost:3000/api/customer-receipts \
   -H "Content-Type: application/json" \
-  -d '{"customer_id":1,"account_id":1,"method_id":1,"amount":"60","date":"2024-06-20","notes":"partial"}'
+  -d '{"customer_id":1,"method_id":1,"amount":"60","date":"2024-06-20","notes":"partial"}'
 # -> 201 receipt detail with the derived total and one allocation per covered
-#    sale, each keeping its own transaction_id; > outstanding => 400, disallowed
-#    (account,method) => 400, both with no side effect
+#    sale, each keeping its own transaction_id; > outstanding => 400, unassigned
+#    method => 400, both with no side effect
 curl "http://localhost:3000/api/customer-receipts?customer_id=1"
 # -> { receipts: [receipt detail with allocations] }
 curl http://localhost:3000/api/customer-receipts/1
@@ -440,17 +464,17 @@ curl -X PUT http://localhost:3000/api/purchases/1 \
 
 curl -X POST http://localhost:3000/api/purchases/1/confirm \
   -H "Content-Type: application/json" \
-  -d '{"account_id":1,"method_id":1}'
+  -d '{"method_id":1}'
 # -> 200 detail with purchase_number "2024-PURCH-000001"; receives stock (In,
 #    reason Purchase) and updates the satellite cost. Credit: send {} (no
-#    account/method), due = total, no Expense. Disallowed (account,method) => 400
+#    method), due = total, no Expense. Unassigned method => 400
 #    with no stock/finance touch. Double confirm => 400.
 
 curl -X POST http://localhost:3000/api/purchases/1/payments \
   -H "Content-Type: application/json" \
-  -d '{"account_id":1,"method_id":1,"amount":"500","date":"2024-05-10"}'
+  -d '{"method_id":1,"amount":"500","date":"2024-05-10"}'
 # -> 201 payment + 1 Expense (Credit purchases; sum <= total; overpay => 400;
-#    disallowed pair => 400 with no finance touch)
+#    unassigned method => 400 with no finance touch)
 
 curl -X PUT http://localhost:3000/api/purchases/lines/1 \
   -H "Content-Type: application/json" \
@@ -524,20 +548,23 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /customers` — customers (M4):
 
-- Customer list with the derived balance, the ageing buckets and the
-  active/inactive/walk-in/over-limit badges (HTMX `GET /web/customers`)
-- Forms:
-  - Create customer: `POST /web/customers` (HTMX; a duplicate name renders the
-    existing matches as a warning)
-  - Edit customer: `POST /web/customers/edit` (HTMX, id in the body; the fields
-    replace the current values and empty optional fields clear)
-  - Activate/deactivate: `POST /web/customers/activate|deactivate` (HTMX, id in body)
-  - Delete: `POST /web/customers/delete` (HTMX, id in body, RESTRICT-aware)
+- Names-only customer list; an inactive name renders muted (HTMX `GET /web/customers`)
+- New customer button opens a `<dialog>` modal with the create form
+  (`POST /web/customers`, HTMX; a duplicate name renders the existing matches
+  as a warning)
+- Selecting a name opens the right slide-over drawer with the customer detail
+  (HTMX `GET /web/customers/detail/:id`); no edit card is shown (the
+  `POST /web/customers/edit` endpoint stays available)
+- Forms (id in the body):
+  - Edit customer: `POST /web/customers/edit` (HTMX; the fields replace the
+    current values and empty optional fields clear)
+  - Activate/deactivate: `POST /web/customers/activate|deactivate` (HTMX)
+  - Delete: `POST /web/customers/delete` (HTMX, RESTRICT-aware)
 
-`GET /customers/:id` — customer statement:
+`GET /customers/:id` — customer statement (same list, drawer open):
 
 - Ageing breakdown, receivable sales and the chronological ledger (HTMX
-  `GET /web/customers/:id/statement`)
+  `GET /web/customers/detail/:id`)
 - Payment history: every receipt with its allocations (HTMX
   `GET /web/customers/:id/receipts`)
 - Collect form: the customer, the amount, the account and the method; applies the
@@ -567,8 +594,14 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 `GET /suppliers` — suppliers + cost satellite (M3):
 
-- Supplier list with active/inactive badge and every satellite cost row (derived
-  raised/lowered alert, preferred marker) (HTMX `GET /web/suppliers`)
+- Names-only supplier list; an inactive name renders muted (HTMX `GET /web/suppliers`)
+- New supplier button opens a `<dialog>` modal with the create form
+  (`POST /web/suppliers`, HTMX); no edit card is shown (the
+  `POST /web/suppliers/edit` endpoint stays available)
+- Selecting a name opens the right slide-over drawer with the supplier header,
+  the outstanding balance (sum of `due` over Confirmed purchases) and that
+  supplier's purchases linking to their records (HTMX
+  `GET /web/suppliers/:id/detail`)
 - Forms:
   - Create supplier: `POST /web/suppliers` (HTMX)
   - Edit supplier: `POST /web/suppliers/edit` (HTMX)
@@ -639,12 +672,13 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
   `sale_date + payment_days`, and without a term the due date is required.
   `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
   Draft/Cancelled-from-Draft. Cash forbids `due_date`. `qty > 0`,
-  `unit_price >= 0`, payments carry `account_id + method_id` (N per sale,
-  mixed, sum ≤ total), reject overpay (`paid + amount <= total`) and disallowed
-  `(account,method)` (400, no stock/sequence/finance touch).
-- `PaymentMethod` rules: `name` UNIQUE, `is_active` 0/1; allowlist
-  `PK(account_id, method_id)` RESTRICT both; `sale_payments.method_id` RESTRICT
-  NOT NULL; unknown method => 404, inactive/disallowed => 400.
+  `unit_price >= 0`, payments name only the `method_id` (N per sale,
+  mixed methods, sum ≤ total), reject overpay (`paid + amount <= total`) and
+  unassigned/inactive methods (400, no stock/sequence/finance touch).
+- `PaymentMethod` rules: `account_id` NULL (unassigned) or one owning account,
+  `UNIQUE(account_id, name)`, `is_active` 0/1; `sale_payments.method_id` RESTRICT
+  NOT NULL; unknown method => 404, inactive/unassigned => 400 with an actionable
+  message.
   - Balance read path: `SELECT kind, amount FROM transactions WHERE account_id=?` summed in Rust (not `SUM()` which would cast TEXT→REAL).
 - `Supplier` rules: `name` trimmed, non-empty, ≤128, UNIQUE; `phone` ≤32 and `notes`
   ≤512 (empty clears to NULL); delete blocked (400) when the supplier has cost rows or
@@ -658,9 +692,9 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
 - `Purchase` rules: Draft editable (lines/header); Confirmed/Cancelled immutable except
   Cancel. `purchase_number` immutable once set (`YYYY-PURCH-NNNNNN`), NULL only in
   Draft/Cancelled-from-Draft. Credit requires `due_date >= purchase_date`, Cash forbids
-  it. `qty > 0`, `unit_cost >= 0`, no duplicated product per purchase, payments carry
-  `account_id + method_id` (mixed, sum ≤ total), reject overpay and disallowed
-  `(account,method)` (400, no stock/sequence/finance touch). Confirm updates the
+  it. `qty > 0`, `unit_cost >= 0`, no duplicated product per purchase, payments name
+  only the `method_id` (mixed methods, sum ≤ total), reject overpay and
+  unassigned/inactive methods (400, no stock/sequence/finance touch). Confirm updates the
   satellite per line; cancelling a Confirmed purchase returns stock and refunds paid
   amounts as Income. No new env vars for purchases (reuses `ALLOW_NEGATIVE_BALANCE` /
   `ALLOW_NEGATIVE_STOCK`).
@@ -672,8 +706,8 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
   deactivation keeps the history.
 - `CustomerReceipt` rules: the receipt is a grouping document with no stored total. Its
   derived amount is `SUM(sale_payments.amount WHERE receipt_id = receipt)`. Collecting
-  validates the customer (404), a positive amount, the account and the `(account,
-  method)` allowlist (400) and `amount ≤ customer balance` (400) before any write, then
+  validates the customer (404), a positive amount, the method's owning account
+  (400 when unassigned/inactive) and `amount ≤ customer balance` (400) before any write, then
   applies the amount oldest-first. A payment may only be grouped under a receipt of its
   own customer (service guard + database trigger), and deleting a referenced receipt is
   refused (RESTRICT). A payment without a receipt is still a direct payment on one sale.

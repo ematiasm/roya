@@ -1,9 +1,20 @@
 // M4 customers (Slice M). Web customers under `/customers` and
 // `/customers/{id}`, Askama + HTMX, thin handlers over `CustomerService`
 // (entity + rules), `SalesService` (derived receivable) and
-// `CustomerReceiptService` (collect). Fragments live in
-// `partials/customer_list.html`, `partials/customer_statement.html` and
-// `partials/receipt_list.html`.
+// `CustomerReceiptService` (collect). The list page shows names only; the
+// per-customer detail (statement + collect form + receipts) lives in
+// `partials/customer_detail.html` and renders both inside the slide-over
+// drawer and as the id-final `/web/customers/detail/{id}` fragment the
+// drawer loads (id-final so the row links stay data-bound record links under
+// the wiring guard). Creation lives in a `<dialog>` modal. Fragments live in
+// `partials/customer_list.html`, `partials/customer_detail.html`,
+// `partials/customer_statement.html` and `partials/receipt_list.html`.
+// Creation lives in a `<dialog>` modal; each list row also carries an ✎
+// button loading the prefilled `partials/customer_edit_form.html` fragment
+// (`/web/customers/edit-form/{id}`, id-final like the detail fragment so the
+// id-free list page keeps no concrete non-final segment under the wiring
+// guard) into a second dialog, posting to the existing `/web/customers/edit`
+// backend.
 //
 // Typed-id actions follow the wiring guard: forms post to collection endpoints
 // with the id in the body (`/web/customers/edit`, `/web/customers/activate`,
@@ -26,8 +37,8 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AccountWithBalance, Ageing, Customer, CustomerStatement, NewCustomer, PaymentMethod,
-    ReceiptDetail, SaleDetail, UpdateCustomer,
+    Ageing, Customer, CustomerStatement, NewCustomer, PaymentMethodWithAccount, ReceiptDetail,
+    SaleDetail, UpdateCustomer,
 };
 use crate::routes::AppState;
 
@@ -53,10 +64,11 @@ struct CustomersTemplate {
     selected: Option<Customer>,
     receipts: Vec<ReceiptDetail>,
     debt_sales: Vec<SaleDetail>,
-    accounts: Vec<AccountWithBalance>,
-    methods: Vec<PaymentMethod>,
+    method_options: Vec<PaymentMethodWithAccount>,
     today: String,
     warning: Option<String>,
+    over_limit: bool,
+    drawer_open: bool,
     nav_key: &'static str,
 }
 
@@ -67,18 +79,35 @@ struct CustomerListPartial {
     warning: Option<String>,
 }
 
+/// The slide-over drawer body: the statement (header, balance, ageing,
+/// documents) plus the collect form and the payment history. The field names
+/// mirror `CustomersTemplate` so `customers.html` can include the same
+/// partial it renders for a direct `/customers/{id}` visit.
 #[derive(Template)]
-#[template(path = "partials/customer_statement.html")]
-struct CustomerStatementPartial {
+#[template(path = "partials/customer_detail.html")]
+struct CustomerDetailPartial {
     statement: Option<CustomerStatement>,
     selected: Option<Customer>,
     debt_sales: Vec<SaleDetail>,
+    receipts: Vec<ReceiptDetail>,
+    method_options: Vec<PaymentMethodWithAccount>,
+    today: String,
+    over_limit: bool,
 }
 
 #[derive(Template)]
 #[template(path = "partials/receipt_list.html")]
 struct ReceiptListPartial {
     receipts: Vec<ReceiptDetail>,
+}
+
+/// Prefilled edit form for the row-level ✎ button: the list rows carry only
+/// the name, so this read-only fragment loads the entity's data into the
+/// `<dialog>` modal. It posts to the existing `/web/customers/edit` backend.
+#[derive(Template)]
+#[template(path = "partials/customer_edit_form.html")]
+struct CustomerEditFormPartial {
+    customer: Customer,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,8 +230,6 @@ async fn list_response(state: &AppState, warning: Option<String>) -> AppResult<R
 
 async fn customers_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
     let customers = customer_rows(&state).await?;
-    let accounts = state.account_service.list_with_balances().await?;
-    let methods = state.payment_method_service.list().await?;
     let tmpl = CustomersTemplate {
         title: "Roya — Customers".to_string(),
         customers,
@@ -210,10 +237,11 @@ async fn customers_page(State(state): State<AppState>) -> Result<Html<String>, A
         selected: None,
         receipts: vec![],
         debt_sales: vec![],
-        accounts,
-        methods,
-        today: today().to_string(),
+        method_options: vec![],
+        today: String::new(),
         warning: None,
+        over_limit: false,
+        drawer_open: false,
         nav_key: "customers",
     };
     Ok(Html(
@@ -227,21 +255,22 @@ async fn customer_statement_page(
 ) -> Result<Html<String>, AppError> {
     let customer = state.customer_service.get_customer(id).await?;
     let statement = state.sales_service.customer_statement(id, today()).await?;
+    let over_limit = over_limit(&customer, statement.balance);
     let debt_sales = state.sales_service.customer_debt_sales(id).await?;
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
-    let accounts = state.account_service.list_with_balances().await?;
-    let methods = state.payment_method_service.list().await?;
+    let method_options = state.payment_method_service.methods_with_accounts().await?;
     let tmpl = CustomersTemplate {
         title: format!("Roya — Statement: {}", customer.name),
-        customers: vec![],
+        customers: customer_rows(&state).await?,
         statement: Some(statement),
         selected: Some(customer),
         receipts,
         debt_sales,
-        accounts,
-        methods,
+        method_options,
         today: today().to_string(),
         warning: None,
+        over_limit,
+        drawer_open: true,
         nav_key: "customers",
     };
     Ok(Html(
@@ -253,17 +282,43 @@ async fn web_customer_list(State(state): State<AppState>) -> AppResult<Response>
     list_response(&state, None).await
 }
 
-async fn web_customer_statement(
+async fn web_customer_detail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    detail_html(&state, id).await
+}
+
+async fn web_customer_edit_form(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     let customer = state.customer_service.get_customer(id).await?;
+    let html = CustomerEditFormPartial { customer }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Html(html))
+}
+
+/// The drawer body with fresh derived data: statement, documents, receipts
+/// and the collect context. Both the detail fragment and the collect action
+/// answer it, so collecting refreshes the balance in place without the client
+/// rebuilding a URL.
+async fn detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
+    let customer = state.customer_service.get_customer(id).await?;
     let statement = state.sales_service.customer_statement(id, today()).await?;
+    let over_limit = over_limit(&customer, statement.balance);
     let debt_sales = state.sales_service.customer_debt_sales(id).await?;
-    let html = CustomerStatementPartial {
+    let receipts = state.customer_receipt_service.list_receipts(id).await?;
+    let method_options = state.payment_method_service.methods_with_accounts().await?;
+    let html = CustomerDetailPartial {
         statement: Some(statement),
         selected: Some(customer),
         debt_sales,
+        receipts,
+        method_options,
+        today: today().to_string(),
+        over_limit,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -333,8 +388,6 @@ pub struct CustomerIdForm {
 pub struct CollectForm {
     #[serde(default)]
     pub customer_id: i64,
-    #[serde(default)]
-    pub account_id: i64,
     #[serde(default)]
     pub method_id: i64,
     #[serde(default)]
@@ -487,7 +540,6 @@ async fn web_collect_receipt(
         .customer_receipt_service
         .collect(
             form.customer_id,
-            form.account_id,
             form.method_id,
             amount,
             date,
@@ -495,14 +547,7 @@ async fn web_collect_receipt(
         )
         .await?;
     if is_htmx(&headers) {
-        let receipts = state
-            .customer_receipt_service
-            .list_receipts(form.customer_id)
-            .await?;
-        let html = ReceiptListPartial { receipts }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        return Ok(Html(html).into_response());
+        return Ok(detail_html(&state, form.customer_id).await?.into_response());
     }
     Ok(Redirect::to(&format!("/customers/{}", form.customer_id)).into_response())
 }
@@ -519,7 +564,8 @@ pub fn router() -> Router<AppState> {
         .route("/web/customers/activate", post(web_activate_customer))
         .route("/web/customers/deactivate", post(web_deactivate_customer))
         .route("/web/customers/delete", post(web_delete_customer))
-        .route("/web/customers/{id}/statement", get(web_customer_statement))
+        .route("/web/customers/detail/{id}", get(web_customer_detail))
+        .route("/web/customers/edit-form/{id}", get(web_customer_edit_form))
         .route("/web/customers/{id}/receipts", get(web_customer_receipts))
         .route("/web/customer-receipts", post(web_collect_receipt))
 }
@@ -676,7 +722,7 @@ mod tests {
             .unwrap();
         state
             .sales_service
-            .confirm(sale.id, None, None)
+            .confirm(sale.id, None)
             .await
             .unwrap();
         WebFixture {
@@ -689,44 +735,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_customers_page_lists_balance_ageing_and_over_limit() {
+    async fn web_customers_page_is_names_only_with_drawer_and_modal() {
         let state = test_state().await;
         let fixture = seed_fixture(&state).await;
         let app = crate::routes::router(state);
 
+        // The list page shows names only: a New customer button opens the
+        // modal, a hidden drawer waits for the detail, and no edit card or
+        // list-level metrics leak through.
         let (status, html) = get_html(app.clone(), "/customers").await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
-        for expected in ["Ana Web", "New Customer", "Edit Customer", "75", "over limit"] {
+        for expected in [
+            "Ana Web",
+            "New customer",
+            "<dialog",
+            "new-customer-dialog",
+            "customer-drawer",
+            "customer-drawer-body",
+        ] {
             assert!(html.contains(expected), "page must show {expected}: {html:.600}");
         }
+        for absent in ["Edit Customer", "over limit", "1-30", "31-60", "61+"] {
+            assert!(
+                !html.contains(absent),
+                "names-only page must not show {absent}: {html:.600}"
+            );
+        }
+        // Each name loads its detail fragment into the drawer.
         assert!(
-            html.contains("1-30") && html.contains("31-60") && html.contains("61+"),
-            "the page must show the ageing buckets: {html:.600}"
+            html.contains(&format!(
+                "hx-get=\"/web/customers/detail/{}\"",
+                fixture.customer
+            )),
+            "names must open the drawer through the detail fragment: {html:.600}"
         );
 
         let (status, html) = get_html(app.clone(), "/web/customers").await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("Ana Web"), "{html:.400}");
+        assert!(
+            !html.contains("over limit"),
+            "the names-only fragment keeps no badges: {html:.400}"
+        );
 
-        // The statement page keeps the customer context and renders its fragments.
+        // The statement page keeps the customer context and renders the drawer
+        // open with its fragments.
         let (status, html) = get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
-        for expected in ["Ana Web", "Ageing", "Receivable sales", "75", "Collect"] {
+        for expected in [
+            "Ana Web",
+            "Ageing",
+            "Receivable sales",
+            "75",
+            "over limit",
+            "Collect",
+            "Payment history",
+        ] {
             assert!(html.contains(expected), "statement must show {expected}: {html:.600}");
         }
         assert!(
-            html.contains(&format!("/web/customers/{}/statement", fixture.customer)),
+            html.contains(&format!("/web/customers/detail/{}", fixture.customer)),
             "statement page must refresh through its fragment endpoint"
         );
 
+        // The detail fragment carries the header, balance, ageing buckets, the
+        // over-limit marker and the collect form for the drawer.
         let (status, html) = get_html(
             app.clone(),
-            &format!("/web/customers/{}/statement", fixture.customer),
+            &format!("/web/customers/detail/{}", fixture.customer),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("Ana Web"), "{html:.400}");
-        assert!(html.contains("current"), "{html:.400}");
+        for expected in [
+            "Ana Web",
+            "current",
+            "1-30",
+            "75",
+            "over limit",
+            "Collect",
+            "Payment history",
+        ] {
+            assert!(html.contains(expected), "detail must show {expected}: {html:.600}");
+        }
 
         let (status, html) = get_html(
             app,
@@ -750,6 +840,15 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(html.contains("Juan Pérez"), "{html:.400}");
+
+        // The names-only list carries no credit limit; the limit renders in
+        // the drawer detail fragment instead.
+        let (row,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE name = 'Juan Pérez'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, html) = get_html(app.clone(), &format!("/web/customers/detail/{row}")).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(html.contains("100"), "{html:.400}");
 
         // A duplicate name is accepted and the existing match is reported.
@@ -841,8 +940,9 @@ mod tests {
         let fixture = seed_fixture(&state).await;
         let app = crate::routes::router(state.clone());
 
-        // The rendered collect form carries the customer, amount, account and
-        // method, and posts to the collection endpoint with the id in the body.
+        // The rendered collect form carries the customer, amount and method
+        // (the account is derived from the method), and posts to the
+        // collection endpoint with the id in the body.
         let (status, html) = get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         let form_start = html
@@ -852,19 +952,22 @@ mod tests {
         for field in [
             "name=\"customer_id\"",
             "name=\"amount\"",
-            "name=\"account_id\"",
             "name=\"method_id\"",
         ] {
             assert!(form.contains(field), "collect form must carry {field}: {form:.600}");
         }
+        assert!(
+            !form.contains("name=\"account_id\""),
+            "the collect form must not ask for an account: {form:.600}"
+        );
 
         // Collect 30 of the 75 debt.
         let (status, html) = post_form(
             app.clone(),
             "/web/customer-receipts",
             &format!(
-                "customer_id={}&account_id={}&method_id={}&amount=30&date=2024-06-20&notes=part",
-                fixture.customer, fixture.account, fixture.cash
+                "customer_id={}&method_id={}&amount=30&date=2024-06-20&notes=part",
+                fixture.customer, fixture.cash
             ),
         )
         .await;
@@ -874,7 +977,7 @@ mod tests {
         // The statement fragment now mixes the sale debit with the payment credit.
         let (status, html) = get_html(
             app.clone(),
-            &format!("/web/customers/{}/statement", fixture.customer),
+            &format!("/web/customers/detail/{}", fixture.customer),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -890,8 +993,8 @@ mod tests {
             app.clone(),
             "/web/customer-receipts",
             &format!(
-                "customer_id={}&account_id={}&method_id={}&amount=1000&date=2024-06-20",
-                fixture.customer, fixture.account, fixture.cash
+                "customer_id={}&method_id={}&amount=1000&date=2024-06-20",
+                fixture.customer, fixture.cash
             ),
         )
         .await;
@@ -913,6 +1016,8 @@ mod tests {
         let fixture = seed_fixture(&state).await;
         let app = crate::routes::router(state);
 
+        // The list page carries only the modal create form: no edit card, no
+        // per-row buttons, and a drawer container waiting for the detail.
         let (status, html) = get_html(app.clone(), "/customers").await;
         assert_eq!(status, StatusCode::OK);
 
@@ -924,17 +1029,14 @@ mod tests {
             targets.push(after[..end].to_string());
             rest = &after[end..];
         }
-        for expected in [
-            "/web/customers",
-            "/web/customers/edit",
-            "/web/customers/deactivate",
-            "/web/customers/delete",
-        ] {
-            assert!(
-                targets.iter().any(|t| t == expected),
-                "customers page must post to {expected}: {targets:?}"
-            );
-        }
+        assert!(
+            targets.iter().any(|t| t == "/web/customers"),
+            "customers page must create through the collection endpoint: {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t == "/web/customers/edit"),
+            "no visible edit card may post to the edit endpoint: {targets:?}"
+        );
         for target in &targets {
             assert!(
                 !target.contains("/0/"),
@@ -945,12 +1047,70 @@ mod tests {
             !html.contains("this.action="),
             "dead onsubmit action rewrite still rendered"
         );
+        assert!(
+            html.contains("id=\"customer-drawer\""),
+            "customers page must carry the detail drawer"
+        );
+        assert!(
+            html.contains("<dialog"),
+            "customers page must create through a modal dialog"
+        );
 
-        let (status, html) = get_html(app, &format!("/customers/{}", fixture.customer)).await;
+        // The detail fragment collects through the collection endpoint.
+        let (status, html) = get_html(
+            app,
+            &format!("/web/customers/detail/{}", fixture.customer),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("hx-post=\"/web/customer-receipts\""),
-            "statement page must collect through the collection endpoint"
+            "detail fragment must collect through the collection endpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn web_customer_edit_form_is_prefilled_and_posts_to_edit() {
+        let state = test_state().await;
+        let fixture = seed_fixture(&state).await;
+        let app = crate::routes::router(state);
+
+        // Each list row carries the ✎ button loading this fragment, next to
+        // the name button opening the drawer: a div row with two buttons,
+        // never a nested button.
+        let (status, html) = get_html(app.clone(), "/web/customers").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(&format!(
+                "hx-get=\"/web/customers/edit-form/{}\"",
+                fixture.customer
+            )),
+            "rows must offer the edit form: {html:.600}"
+        );
+        assert!(
+            html.contains("hx-get=\"/web/customers/detail/"),
+            "the name button must keep opening the drawer: {html:.600}"
+        );
+
+        // The fragment prefills the entity's data and posts to the existing
+        // edit backend with the id in the body.
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/web/customers/edit-form/{}", fixture.customer),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        for expected in [
+            "hx-post=\"/web/customers/edit\"",
+            &format!("name=\"customer_id\" value=\"{}\"", fixture.customer),
+            "value=\"Ana Web\"",
+            "name=\"credit_limit\"",
+            "name=\"payment_days\"",
+        ] {
+            assert!(html.contains(expected), "edit form must show {expected}: {html:.600}");
+        }
+
+        let (status, _) = get_html(app, "/web/customers/edit-form/999999").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

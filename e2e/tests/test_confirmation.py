@@ -28,8 +28,7 @@ def _confirmed_sale(page: Page, api: ApiClient) -> HarnessData:
     confirm_sale(
         api,
         data.sale_id,
-        account_id=data.account_id,
-        method_id=payment_method_id(api, data.account_id, "Cash"),
+        method_id=payment_method_id(api, "Cash"),
     )
     page.goto(f"{api.base_url}/sales/{data.sale_id}")
     expect(page.locator("#sale-record")).to_contain_text("Confirmed")

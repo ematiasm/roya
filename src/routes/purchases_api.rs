@@ -98,7 +98,6 @@ pub struct UpdateLineRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct RecordPaymentRequest {
-    pub account_id: i64,
     pub method_id: i64,
     pub amount: Decimal,
     pub date: NaiveDate,
@@ -106,8 +105,6 @@ pub struct RecordPaymentRequest {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ConfirmPurchaseRequest {
-    #[serde(default)]
-    pub account_id: Option<i64>,
     #[serde(default)]
     pub method_id: Option<i64>,
 }
@@ -351,7 +348,6 @@ async fn record_payment(
         .purchases_service
         .record_payment(
             id,
-            payload.account_id,
             payload.method_id,
             payload.amount,
             payload.date,
@@ -365,10 +361,7 @@ async fn confirm_purchase(
     Path(id): Path<i64>,
     Json(payload): Json<ConfirmPurchaseRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let detail = state
-        .purchases_service
-        .confirm(id, payload.account_id, payload.method_id)
-        .await?;
+    let detail = state.purchases_service.confirm(id, payload.method_id).await?;
     Ok(Json(serde_json::json!(detail)))
 }
 
@@ -571,13 +564,28 @@ mod tests {
 
     async fn allow_cash(pool: &sqlx::SqlitePool, account_id: i64) -> i64 {
         let mid = cash_method_id(pool).await;
-        sqlx::query("INSERT OR IGNORE INTO account_payment_methods (account_id, method_id) VALUES (?, ?)")
+        // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
+        // the name when it is already owned elsewhere in this pool.
+        let assigned = sqlx::query("UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL")
             .bind(account_id)
             .bind(mid)
             .execute(pool)
             .await
-            .unwrap();
-        mid
+            .unwrap()
+            .rows_affected();
+        if assigned == 1 {
+            return mid;
+        }
+        let row: (i64,) = sqlx::query_as(
+            "INSERT INTO payment_methods (name, account_id, is_active) \
+             SELECT name, ?, is_active FROM payment_methods WHERE id = ? RETURNING id",
+        )
+        .bind(account_id)
+        .bind(mid)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        row.0
     }
 
     fn draft_body(supplier_id: i64, payment_type: &str) -> serde_json::Value {
@@ -743,7 +751,7 @@ mod tests {
             app.clone(),
             &format!("/api/purchases/{id}/payments"),
             serde_json::json!({
-                "account_id": acc, "method_id": cash, "amount": "5", "date": "2024-05-10"
+                "method_id": cash, "amount": "5", "date": "2024-05-10"
             }),
         )
         .await;
@@ -828,22 +836,20 @@ mod tests {
         assert_eq!(unsourced_items[0]["suggested_qty"].as_str().unwrap(), "50");
     }
 
-    // -- AC14: allowlist rejection with no side effects --
+    // -- AC14: unassigned-method rejection with no side effects --
     #[tokio::test]
-    async fn ac14_disallowed_pair_rejected_without_side_effects_via_rest() {
+    async fn ac14_unassigned_method_rejected_without_side_effects_via_rest() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let pid = seed_product(&app, "AC14-P", "Product").await;
         seed_stock(&app, pid, "10").await;
         let sup = seed_supplier(&app, "AC14 SUP").await;
-        let acc = seed_account(&app, "caja14").await;
+        let _acc = seed_account(&app, "caja14").await;
+        // Cash belongs to no account: it cannot confirm or pay.
         let cash = cash_method_id(&pool).await;
-        // Cash is allowed on another account only: (acc, Cash) stays disallowed.
-        let other = seed_account(&app, "otra14").await;
-        let _ = allow_cash(&pool, other).await;
 
-        // Cash confirm with a disallowed pair -> 400, no side effects.
+        // Cash confirm with an unassigned method -> 400, no side effects.
         let id = create_draft(&app, sup, "Cash").await;
         add_line(&app, id, pid, "1").await;
         let tx_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
@@ -857,10 +863,10 @@ mod tests {
         let (st, _) = post_json(
             app.clone(),
             &format!("/api/purchases/{id}/confirm"),
-            serde_json::json!({ "account_id": acc, "method_id": cash }),
+            serde_json::json!({ "method_id": cash }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "disallowed pair must be 400");
+        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned method must be 400");
         let tx_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
             .fetch_one(&pool)
             .await
@@ -876,7 +882,7 @@ mod tests {
         assert_eq!(v["purchase"]["status"].as_str().unwrap(), "Draft");
         assert!(v["purchase"]["purchase_number"].is_null());
 
-        // Credit payment with a disallowed pair is also 400 with no finance row.
+        // Credit payment with an unassigned method is also 400 with no finance row.
         let cid = create_draft(&app, sup, "Credit").await;
         add_line(&app, cid, pid, "1").await;
         let (st, _) = post_json(
@@ -890,17 +896,16 @@ mod tests {
             app.clone(),
             &format!("/api/purchases/{cid}/payments"),
             serde_json::json!({
-                "account_id": acc, "method_id": cash, "amount": "1", "date": "2024-05-10"
+                "method_id": cash, "amount": "1", "date": "2024-05-10"
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "disallowed payment must be 400");
-        let tx: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions WHERE account_id = ?")
-            .bind(acc)
+        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned payment must be 400");
+        let tx: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(tx.0, 0, "no finance touch for disallowed payment");
+        assert_eq!(tx.0, 0, "no finance touch for unassigned payment");
     }
 
     // -- Supplier CRUD + satellite cost rule over REST --

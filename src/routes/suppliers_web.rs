@@ -1,7 +1,10 @@
-// Slice G (T13): suppliers web `/suppliers` Askama + HTMX. Supplier CRUD plus
-// the per-product cost satellite (record cost, derived price alert, preferred
-// marker). Thin handlers over SupplierService; the fragment lives in
-// partials/supplier_list.html.
+// Slice G (T13): suppliers web `/suppliers` Askama + HTMX. The list page
+// shows names only; the per-supplier detail (header, Confirmed-due balance,
+// purchases) lives in `partials/supplier_detail.html` and renders as the
+// `/web/suppliers/{id}/detail` fragment the slide-over drawer loads.
+// Supplier CRUD plus the per-product cost satellite (record cost, derived
+// price alert, preferred marker). Thin handlers over SupplierService; the
+// list fragment lives in partials/supplier_list.html.
 use askama::Template;
 use axum::{
     extract::{Form, Path, State},
@@ -16,7 +19,10 @@ use serde::Deserialize;
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewSupplier, Product, ProductSupplierCost, Supplier, UpdateSupplier};
+use crate::models::{
+    NewSupplier, Product, ProductSupplierCost, PurchaseDetail, PurchaseListFilter, PurchaseStatus,
+    Supplier, UpdateSupplier,
+};
 use crate::repositories::{ProductRepository, ProductSupplierCostRepository};
 use crate::routes::AppState;
 
@@ -52,6 +58,25 @@ struct SuppliersTemplate {
 #[template(path = "partials/supplier_list.html")]
 struct SupplierListPartial {
     suppliers: Vec<SupplierView>,
+}
+
+/// The slide-over drawer body: the supplier header, the outstanding balance
+/// (sum of `due` over Confirmed purchases) and that supplier's purchases.
+#[derive(Template)]
+#[template(path = "partials/supplier_detail.html")]
+struct SupplierDetailPartial {
+    supplier: Supplier,
+    balance: Decimal,
+    purchases: Vec<PurchaseDetail>,
+}
+
+/// Prefilled edit form for the row-level ✎ button: the list rows carry only
+/// the name, so this read-only fragment loads the entity's data into the
+/// `<dialog>` modal. It posts to the existing `/web/suppliers/edit` backend.
+#[derive(Template)]
+#[template(path = "partials/supplier_edit_form.html")]
+struct SupplierEditFormPartial {
+    supplier: Supplier,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +187,48 @@ async fn suppliers_page(State(state): State<AppState>) -> Result<Html<String>, A
 async fn web_supplier_list(State(state): State<AppState>) -> AppResult<Response> {
     let suppliers = supplier_views(&state).await?;
     Ok(render_list(suppliers).await?.into_response())
+}
+
+/// Drawer detail for one supplier: the header, the outstanding balance (sum
+/// of `due` over Confirmed purchases, narrowed to this supplier at the
+/// repository) and that supplier's purchases, each linking to its record.
+async fn web_supplier_detail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let supplier = state.supplier_service.get_supplier(id).await?;
+    let filter = PurchaseListFilter {
+        supplier_ids: Some(vec![id]),
+        ..Default::default()
+    };
+    let purchases = state
+        .purchases_service
+        .list_details_filtered(&filter)
+        .await?;
+    let balance: Decimal = purchases
+        .iter()
+        .filter(|d| d.purchase.status == PurchaseStatus::Confirmed)
+        .map(|d| d.due)
+        .sum();
+    let html = SupplierDetailPartial {
+        supplier,
+        balance,
+        purchases,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Html(html))
+}
+
+async fn web_supplier_edit_form(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Html<String>> {
+    let supplier = state.supplier_service.get_supplier(id).await?;
+    let html = SupplierEditFormPartial { supplier }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Html(html))
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +357,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/web/suppliers/edit", post(web_update_supplier))
         .route("/web/suppliers/{id}", delete(web_delete_supplier))
+        .route("/web/suppliers/{id}/detail", get(web_supplier_detail))
+        .route("/web/suppliers/{id}/edit-form", get(web_supplier_edit_form))
         .route("/web/suppliers/{id}/activate", post(web_activate_supplier))
         .route(
             "/web/suppliers/{id}/deactivate",
@@ -348,15 +417,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_suppliers_page_renders() {
+    async fn web_suppliers_page_is_names_only_with_drawer_and_modal() {
         let app = crate::routes::router(test_state().await);
         let (status, html) = get_html(app, "/suppliers").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("Suppliers"), "page should mention Suppliers");
+        for expected in [
+            "Suppliers",
+            "New supplier",
+            "<dialog",
+            "new-supplier-dialog",
+            "supplier-drawer",
+            "supplier-drawer-body",
+            "Record Product Cost",
+        ] {
+            assert!(html.contains(expected), "page must show {expected}: {html:.600}");
+        }
+        assert!(
+            !html.contains("Edit Supplier"),
+            "no edit card may render: {html:.600}"
+        );
     }
 
     #[tokio::test]
-    async fn web_create_supplier_then_list_shows_it() {
+    async fn web_create_supplier_then_list_shows_name_only() {
         let app = crate::routes::router(test_state().await);
         let body = "name=WebSupplier&phone=555&notes=nota";
         assert_eq!(
@@ -369,5 +452,219 @@ mod tests {
             html.contains("WebSupplier"),
             "fragment should contain the new supplier: {html:.400}"
         );
+        // The names-only list carries no phone, notes or cost rows: those
+        // live in the drawer detail fragment.
+        for absent in ["555", "nota", "Costs ("] {
+            assert!(
+                !html.contains(absent),
+                "names-only fragment must not show {absent}: {html:.400}"
+            );
+        }
+        // Each name loads its detail fragment into the drawer.
+        assert!(
+            html.contains("hx-get=\"/web/suppliers/"),
+            "names must open the drawer through the detail fragment: {html:.400}"
+        );
+        assert!(
+            html.contains("/detail\""),
+            "names must target the detail endpoint: {html:.400}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_supplier_detail_reports_confirmed_balance_and_links_documents() {
+        use chrono::NaiveDate;
+        use rust_decimal::Decimal;
+
+        use crate::models::{
+            NewProduct, NewPurchase, NewSupplier, PaymentType, ProductKind,
+        };
+
+        let state = test_state().await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Web Detail Supplier".into(),
+                phone: Some("555-0100".into()),
+                notes: Some("drawer notes".into()),
+            })
+            .await
+            .unwrap();
+        let other = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Unrelated Supplier".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "WEB-SUP-P".into(),
+                name: "prod WEB-SUP-P".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::ZERO),
+                max_stock: Some(Decimal::from(100)),
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        // One Confirmed credit purchase (2 × 10 = 20 due) plus one Draft that
+        // must not move the balance.
+        let confirmed = state
+            .purchases_service
+            .create_draft(NewPurchase {
+                supplier_id: supplier.id,
+                payment_type: PaymentType::Credit,
+                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
+                supplier_invoice_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .add_line(confirmed.id, product.id, Decimal::from(2), Some(Decimal::from(10)))
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(confirmed.id, None)
+            .await
+            .unwrap();
+        let draft = state
+            .purchases_service
+            .create_draft(NewPurchase {
+                supplier_id: supplier.id,
+                payment_type: PaymentType::Credit,
+                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 3).unwrap(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 16).unwrap()),
+                supplier_invoice_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .add_line(draft.id, product.id, Decimal::from(5), Some(Decimal::from(10)))
+            .await
+            .unwrap();
+        // Another supplier's purchase must not leak into this detail.
+        let foreign = state
+            .purchases_service
+            .create_draft(NewPurchase {
+                supplier_id: other.id,
+                payment_type: PaymentType::Credit,
+                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 4).unwrap(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 17).unwrap()),
+                supplier_invoice_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .add_line(foreign.id, product.id, Decimal::from(1), Some(Decimal::from(7)))
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(foreign.id, None)
+            .await
+            .unwrap();
+
+        let app = crate::routes::router(state);
+        let (status, html) = get_html(app, &format!("/web/suppliers/{}/detail", supplier.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        // The balance counts only the Confirmed purchase (2 × 10 = 20); the
+        // 5 × 10 Draft stays out of it.
+        assert!(
+            html.contains(">20 <"),
+            "balance must be exactly the Confirmed due: {html:.600}"
+        );
+        for expected in [
+            "Web Detail Supplier",
+            "555-0100",
+            "drawer notes",
+            "Confirmed",
+            "Draft",
+            &format!("/purchases/{}", confirmed.id),
+            &format!("/purchases/{}", draft.id),
+        ] {
+            assert!(html.contains(expected), "detail must show {expected}: {html:.600}");
+        }
+        assert!(
+            !html.contains(&format!("/purchases/{}", foreign.id)),
+            "another supplier's purchase must not leak in: {html:.600}"
+        );
+
+        // Unknown supplier reads 404, not an empty drawer.
+        let app = crate::routes::router(test_state().await);
+        let (status, _) = get_html(app, "/web/suppliers/999/detail").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn web_supplier_edit_form_is_prefilled_and_posts_to_edit() {
+        use crate::models::NewSupplier;
+
+        let state = test_state().await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Web Edit Supplier".into(),
+                phone: Some("555-0100".into()),
+                notes: Some("edit notes".into()),
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        // Each list row carries the ✎ button loading this fragment, next to
+        // the name button opening the drawer: a div row with two buttons,
+        // never a nested button.
+        let (status, html) = get_html(app.clone(), "/web/suppliers").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(&format!(
+                "hx-get=\"/web/suppliers/{}/edit-form\"",
+                supplier.id
+            )),
+            "rows must offer the edit form: {html:.600}"
+        );
+        assert!(
+            html.contains("/detail\""),
+            "the name button must keep opening the drawer: {html:.400}"
+        );
+
+        // The fragment prefills the entity's data and posts to the existing
+        // edit backend with the id in the body.
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/web/suppliers/{}/edit-form", supplier.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        for expected in [
+            "hx-post=\"/web/suppliers/edit\"",
+            &format!("name=\"id\" value=\"{}\"", supplier.id),
+            "value=\"Web Edit Supplier\"",
+            "value=\"555-0100\"",
+            "value=\"edit notes\"",
+        ] {
+            assert!(html.contains(expected), "edit form must show {expected}: {html:.600}");
+        }
+
+        let (status, _) = get_html(app, "/web/suppliers/999/edit-form").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
