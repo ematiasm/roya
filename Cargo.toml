@@ -2,7 +2,7 @@
 name = "roya"
 version = "0.1.0"
 edition = "2021"
-description = "Local personal finance tracker - Rust + Axum + SQLite"
+description = "Local Business Manager - Rust + Axum + SQLite"
 authors = []
 
 [dependencies]
