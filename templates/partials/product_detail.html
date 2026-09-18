@@ -4,7 +4,12 @@
    this fragment back into `#product-drawer-body` (no URL rebuild needed), fire
    `product-changed` / `product-cost-recorded` / `movement-created`, and the page
    listener refreshes `#product-list`; a successful save also fires
-   `product-saved`, which closes the drawer. Lifecycle actions swap
+   `product-saved`, which closes the drawer. The cost, preferred-cost and
+   movement forms carry `hx-include="#product-filters"` like the lifecycle ones
+   (issue #37): today their drawer answer is the detail fragment, but their
+   endpoints also answer list fragments, so the body always carries the filter
+   the operator is looking at. The save form stays without it: its `category_id`
+   is the product's own, not the filter's. Lifecycle actions swap
    `#product-list` themselves and close the drawer on success via
    `closeProductDrawer()`. #}
 <div id="product-detail-inner" class="flex flex-col gap-4">
@@ -156,7 +161,7 @@
           {% if cost.cost.is_preferred %}
           <span class="rounded-full border border-income/30 bg-income/15 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-income">preferred</span>
           {% else %}
-          <form hx-post="/web/product-costs/preferred" hx-target="#product-drawer-body" hx-swap="innerHTML">
+          <form hx-post="/web/product-costs/preferred" hx-include="#product-filters" hx-target="#product-drawer-body" hx-swap="innerHTML">
             <input type="hidden" name="product_id" value="{{ product.id }}" />
             <input type="hidden" name="supplier_id" value="{{ cost.cost.supplier_id }}" />
             <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Set preferred</button>
@@ -170,6 +175,7 @@
     <form class="mt-4 flex flex-col gap-2.5"
           data-action="Record product cost"
           hx-post="/web/product-costs"
+          hx-include="#product-filters"
           hx-target="#product-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">
@@ -206,6 +212,7 @@
     <form class="flex flex-col gap-2.5"
           data-action="Record movement"
           hx-post="/web/stock-movements"
+          hx-include="#product-filters"
           hx-target="#product-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">

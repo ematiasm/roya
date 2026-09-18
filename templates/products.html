@@ -92,7 +92,12 @@
 
 {# New product modal. The category is a select (not a typed id), and on success
    the dialog closes itself, resets, and the body listeners refresh the list and
-   the Low Stock card off `product-created`. #}
+   the Low Stock card off `product-created`. `hx-include="#product-filters"`
+   merges the live catalogue filter into the body (issue #37), so the answer is
+   the list the operator is looking at — read from the DOM at request time,
+   because the filter changes over htmx without reloading the page. The select's
+   name is `product_category_id`: the filter owns `category_id`, so the
+   product's own category cannot ride the same key. #}
 <dialog id="new-product-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
     <h2 class="text-lg font-semibold">New product</h2>
@@ -101,6 +106,7 @@
   <form class="flex flex-col gap-2.5"
         data-action="Create product"
         hx-post="/web/products"
+        hx-include="#product-filters"
         hx-target="#product-list"
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) { document.getElementById('new-product-dialog').close(); this.reset(); }">
@@ -137,7 +143,7 @@
     </div>
     <div>
       <label>Category (optional)</label>
-      <select id="new-product-category" name="category_id">
+      <select id="new-product-category" name="product_category_id">
         <option value="">No category</option>
         {% for cat in categories %}
         <option value="{{ cat.id }}">{{ cat.name }}</option>

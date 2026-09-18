@@ -4323,8 +4323,11 @@ async fn create_product_full_via_web(
 ) -> i64 {
     let encoded_name = name.replace(' ', "+");
     let category = category_id.map(|c| c.to_string()).unwrap_or_default();
+    // The wire key is `product_category_id`, not `category_id`: the web form
+    // carries `hx-include="#product-filters"`, so the filter owns `category_id`
+    // and the product's own category rides the renamed key (issue #37).
     let body = format!(
-        "sku={sku}&name={encoded_name}&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&category_id={category}"
+        "sku={sku}&name={encoded_name}&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&product_category_id={category}"
     );
     let (status, resp) = post_form(app, "/web/products", &body).await;
     assert_eq!(status, StatusCode::OK, "create product {sku}: {resp}");
@@ -4698,6 +4701,184 @@ async fn products_list_searches_name_sku_and_barcode_and_combines_with_category(
     assert!(
         page.contains(&format!("<option value=\"{yerba_cat}\" selected>")),
         "the category select must reflect the bookmarkable URL: {page:.600}"
+    );
+}
+
+/// Issue #37: the four product mutations answer their non-drawer HTMX caller
+/// with the list the caller is looking at, not the whole catalogue. These posts
+/// ride the shape the browser's forms send: `HX-Request` without an
+/// `HX-Target`, plus the catalogue filter the forms merge from
+/// `#product-filters`. Each filtered answer is checked against a seeded row the
+/// filter must exclude, and the same handler is re-posted without a filter so
+/// the change cannot simply have narrowed everything.
+#[tokio::test]
+async fn product_create_answer_honours_the_active_filter() {
+    let (app, pool) = test_app().await;
+    let alpha_cat = create_category_via_web(&app, &pool, "MutCat Alpha").await;
+    let beta_cat = create_category_via_web(&app, &pool, "MutCat Beta").await;
+    create_product_full_via_web(&app, &pool, "MUT-A", "Alpha Widget", Some(alpha_cat)).await;
+    create_product_full_via_web(&app, &pool, "MUT-B", "Beta Widget", Some(beta_cat)).await;
+
+    // The body carries both the product's own category (renamed to
+    // `product_category_id` because the filter owns `category_id`) and the
+    // active filter, exactly what `hx-include` would merge: only the alpha row
+    // may come back, even though the created product is a beta one.
+    let body = format!(
+        "sku=MUT-C&name=Gamma+Widget&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50&product_category_id={beta_cat}&category_id={alpha_cat}&q=Alpha"
+    );
+    let (status, html) = post_form(&app, "/web/products", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget"),
+        "filtered answer must hold the matching row: {html:.400}"
+    );
+    assert!(
+        !html.contains("Beta Widget"),
+        "filtered answer must not hold the other row: {html:.400}"
+    );
+
+    // The rename must not re-home the product's own category: Gamma lives in
+    // the category the modal selected, not in the filter's category.
+    let gamma = product_id_by_sku(&pool, "MUT-C").await;
+    let (gamma_cat,): (Option<i64>,) =
+        sqlx::query_as("SELECT category_id FROM products WHERE id = ?")
+            .bind(gamma)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        gamma_cat,
+        Some(beta_cat),
+        "the product's own category must ride product_category_id"
+    );
+
+    // Without a filter the answer is still the whole catalogue.
+    let body = "sku=MUT-D&name=Delta+Widget&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50";
+    let (status, html) = post_form(&app, "/web/products", body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget") && html.contains("Beta Widget"),
+        "unfiltered answer must cover the catalogue: {html:.400}"
+    );
+}
+
+#[tokio::test]
+async fn product_movement_answer_honours_the_active_filter() {
+    let (app, pool) = test_app().await;
+    let alpha_cat = create_category_via_web(&app, &pool, "MovCat Alpha").await;
+    let beta_cat = create_category_via_web(&app, &pool, "MovCat Beta").await;
+    let alpha =
+        create_product_full_via_web(&app, &pool, "MOV-A", "Alpha Widget", Some(alpha_cat)).await;
+    create_product_full_via_web(&app, &pool, "MOV-B", "Beta Widget", Some(beta_cat)).await;
+
+    let body = format!(
+        "product_id={alpha}&type=In&qty=3&reason=Initial&date=2024-05-01&category_id={alpha_cat}&q=Alpha"
+    );
+    let (status, html) = post_form(&app, "/web/stock-movements", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget"),
+        "filtered answer must hold the matching row: {html:.400}"
+    );
+    assert!(
+        !html.contains("Beta Widget"),
+        "filtered answer must not hold the other row: {html:.400}"
+    );
+
+    // Without a filter the answer is still the whole catalogue.
+    let body = format!("product_id={alpha}&type=In&qty=1&reason=Sale&date=2024-05-02");
+    let (status, html) = post_form(&app, "/web/stock-movements", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget") && html.contains("Beta Widget"),
+        "unfiltered answer must cover the catalogue: {html:.400}"
+    );
+}
+
+#[tokio::test]
+async fn product_cost_answer_honours_the_active_filter() {
+    let (app, pool) = test_app().await;
+    let alpha_cat = create_category_via_web(&app, &pool, "CostCat Alpha").await;
+    let beta_cat = create_category_via_web(&app, &pool, "CostCat Beta").await;
+    let alpha =
+        create_product_full_via_web(&app, &pool, "PCOST-A", "Alpha Widget", Some(alpha_cat)).await;
+    create_product_full_via_web(&app, &pool, "PCOST-B", "Beta Widget", Some(beta_cat)).await;
+    let supplier = create_supplier_via_web(&app, &pool, "Cost Mut Sup").await;
+
+    let body = format!(
+        "product_id={alpha}&supplier_id={supplier}&cost=12.50&date=2024-05-01&category_id={alpha_cat}&q=Alpha"
+    );
+    let (status, html) = post_form(&app, "/web/product-costs", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget"),
+        "filtered answer must hold the matching row: {html:.400}"
+    );
+    assert!(
+        !html.contains("Beta Widget"),
+        "filtered answer must not hold the other row: {html:.400}"
+    );
+    // The mutation itself still happened behind the filtered list answer.
+    let (rows,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM product_supplier_costs WHERE product_id = ?",
+    )
+    .bind(alpha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "the web post must still create the satellite row");
+
+    // Without a filter the answer is still the whole catalogue.
+    let body = format!("product_id={alpha}&supplier_id={supplier}&cost=13&date=2024-05-02");
+    let (status, html) = post_form(&app, "/web/product-costs", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget") && html.contains("Beta Widget"),
+        "unfiltered answer must cover the catalogue: {html:.400}"
+    );
+}
+
+#[tokio::test]
+async fn product_preferred_cost_answer_honours_the_active_filter() {
+    let (app, pool) = test_app().await;
+    let alpha_cat = create_category_via_web(&app, &pool, "PrefCat Alpha").await;
+    let beta_cat = create_category_via_web(&app, &pool, "PrefCat Beta").await;
+    let alpha =
+        create_product_full_via_web(&app, &pool, "PREF-A", "Alpha Widget", Some(alpha_cat)).await;
+    create_product_full_via_web(&app, &pool, "PREF-B", "Beta Widget", Some(beta_cat)).await;
+    let supplier = create_supplier_via_web(&app, &pool, "Pref Mut Sup").await;
+    record_supplier_cost_via_web(&app, alpha, supplier, "9").await;
+
+    let body = format!(
+        "product_id={alpha}&supplier_id={supplier}&category_id={alpha_cat}&q=Alpha"
+    );
+    let (status, html) = post_form(&app, "/web/product-costs/preferred", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget"),
+        "filtered answer must hold the matching row: {html:.400}"
+    );
+    assert!(
+        !html.contains("Beta Widget"),
+        "filtered answer must not hold the other row: {html:.400}"
+    );
+    // The marker itself still moved, behind the filtered list answer.
+    let (preferred,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM product_supplier_costs WHERE product_id = ? AND is_preferred = 1",
+    )
+    .bind(alpha)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(preferred, 1, "the web post must still move the marker");
+
+    // Without a filter the answer is still the whole catalogue.
+    let body = format!("product_id={alpha}&supplier_id={supplier}");
+    let (status, html) = post_form(&app, "/web/product-costs/preferred", &body).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    assert!(
+        html.contains("Alpha Widget") && html.contains("Beta Widget"),
+        "unfiltered answer must cover the catalogue: {html:.400}"
     );
 }
 
