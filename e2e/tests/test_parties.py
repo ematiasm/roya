@@ -526,6 +526,12 @@ def test_design_screenshots_probe(page: Page, api: ApiClient) -> None:
     ``e2e/.artifacts/design/`` (git-ignored).
     """
     product_id = _seeded_product(api, "SHOT-WIDGET", "Screenshot Widget")
+    # An account that owns a method, so the Collect and Pay supplier cards show a
+    # real option instead of an empty select. Without it the screenshots would
+    # depict a shop with no usable payment method, which is not the design under
+    # review.
+    account_id = create_account_with_methods(api, "Caja", ("Cash",))
+    fund_account(api, account_id, "100.00")
     customer_id = create_customer(
         api,
         "Ana Screenshot",
