@@ -110,6 +110,15 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
   no fue adivinar: el estado verificado de S1b-ii quedaba byte-identical en la copia del verificador en
   `/tmp`, así que el diff contra esa copia dijo exactamente qué había cambiado (todo menos FIX-4). FIX-4, un
   test de 15 líneas, lo escribió el orquestador tras los dos fallos del runner.
+- 2026-09-18: **Entrega de la Fase A temprana en PRs encadenados.** Issue **#40** (con
+  `status:approved`) y cuatro PRs apilados que se mergean de a uno, retargeteando el siguiente después de
+  cada merge: **#41** plan (docs, 657 líneas, dentro de presupuesto) → **#42** kernel S1a (3.661, pide
+  `size:exception`) → **#43** sesión de test S1b-i (307, dentro de presupuesto) → **#44** portón S1b-ii/iii
+  (2.441, pide `size:exception`). Los hijos van en draft a propósito: su base es su padre, así que un merge
+  accidental iría a la rama equivocada.
+- El split del plan como PR propio no estaba en el plan original: salió de aplicar la regla de chained PRs
+  (400 líneas) y ver que el pase honesto de slicing ya se había hecho — S1 → S1a/S1b, y S1b → i/ii/iii. El
+  PR del plan es el paso 0 más barato y deja los PRs de código sin prosa.
 
 ## Verification evidence
 Pendiente por slice; se registra acá con el comando, el resultado y el hash del commit de la
