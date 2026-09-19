@@ -1,10 +1,14 @@
-// Deny-by-default authentication gate (Slice S1b part 2). One middleware in
-// front of every route: the origin check for unsafe methods runs first (even
-// for the public login route), then the public allowlist, then the session.
-// There is exactly one validity opinion in this codebase and it is
-// `IdentityService::resolve_session` — the middleware never decides expiry,
-// revocation or user state itself. Anything not on the allowlist without a
-// valid session is refused, so a forgotten annotation fails closed.
+// Deny-by-default authentication gate (Slice S1b part 2; the forced password
+// change is slice S3 part 1). One middleware in front of every route: the
+// origin check for unsafe methods runs first (even for the public login
+// route), then the public allowlist, then the session, then the
+// `must_change_password` confinement. There is exactly one validity opinion in
+// this codebase and it is `IdentityService::resolve_session` — the middleware
+// never decides expiry, revocation or user state itself. Anything not on the
+// allowlist without a valid session is refused, so a forgotten annotation
+// fails closed. A session whose user still owes the password change is
+// confined to the change form: it may not go anywhere else, but it can always
+// reach `/password`, the logout endpoints and the public allowlist.
 use axum::{
     extract::{Request, State},
     http::{header, HeaderMap, Method, StatusCode},
@@ -111,6 +115,17 @@ pub async fn auth_middleware(
 
     match current_session(&state, req.headers()).await {
         Ok(Some(resolved)) => {
+            // S3 part 1: the forced password change. While the flag is set the
+            // session is confined to the change form, the logout endpoints and
+            // the public allowlist: a change that must happen cannot be walked
+            // around by visiting any other route. Checked after authentication
+            // (the session is already resolved here) and before the permission
+            // read — confinement is not a permission question, it holds for
+            // every principal, and an administrator confined by the bootstrap
+            // holds the whole catalog anyway.
+            if resolved.user.must_change_password && !password_change_allows(&method, &path) {
+                return confine(&path, is_htmx(req.headers()));
+            }
             // S2: resolve the effective permission set (one query, no cache —
             // a matrix edit applies to the next request) and carry the
             // principal in the extensions, where `Require<P>` reads it. The
@@ -191,6 +206,21 @@ pub async fn current_session(
     }
 }
 
+/// The routes a flagged session may still reach, on the methods the flow
+/// needs: the change form itself (read and submit), both logout endpoints
+/// (a flagged operator can still choose to leave instead of changing —
+/// logout must always work), and nothing else. The public allowlist was
+/// already honoured above, so `/static/*` and the favicon stay reachable
+/// without being listed here.
+fn password_change_allows(method: &Method, path: &str) -> bool {
+    match path {
+        "/password" => matches!(method.as_str(), "GET" | "POST"),
+        "/logout" => method == Method::POST,
+        "/api/sessions" => method == Method::DELETE,
+        _ => false,
+    }
+}
+
 fn is_htmx(headers: &HeaderMap) -> bool {
     headers
         .get("HX-Request")
@@ -201,6 +231,32 @@ fn is_htmx(headers: &HeaderMap) -> bool {
 // ---------------------------------------------------------------------------
 // Refusal shapes
 // ---------------------------------------------------------------------------
+
+/// The reason the confinement refusal carries: written in Spanish like the
+/// rest of the operator-facing copy, because the JSON reaches the interface
+/// (the htmx error handler or an API client's log).
+const CONFINEMENT_MESSAGE: &str = "Se requiere cambiar la contraseña antes de continuar";
+
+/// The confinement refusal (AC1/AC16), in the same three shapes the gate
+/// uses, pointed at `/password` instead of `/login`: a full-page navigation
+/// gets a `303`, `/api/*` gets `403` JSON with the reason (an API client must
+/// not be redirected into an HTML form), and an `HX-Request` gets the refusal
+/// with `HX-Redirect: /password` — htmx 1.9.12 performs that navigation on
+/// any status, and the refusal status says the session was valid but may not
+/// go there.
+fn confine(path: &str, htmx: bool) -> Response {
+    if path.starts_with("/api/") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": CONFINEMENT_MESSAGE })),
+        )
+            .into_response();
+    }
+    if htmx {
+        return (StatusCode::FORBIDDEN, [("HX-Redirect", "/password")]).into_response();
+    }
+    Redirect::to("/password").into_response()
+}
 
 /// AC2's three shapes, decided by the caller: `/api/*` reads JSON, an HTMX
 /// request can only navigate, and a full-page navigation gets a redirect that
@@ -320,6 +376,25 @@ mod tests {
 
     fn cookie() -> [(&'static str, &'static str); 1] {
         [("cookie", test_support::TEST_COOKIE)]
+    }
+
+    /// The same production router, but the session's user owes the password
+    /// change (`must_change_password = 1`, the bootstrap-generated-password
+    /// shape). The user's hash is a placeholder: confinement never verifies a
+    /// credential, it reads the flag the session resolution already carried.
+    async fn flagged_test_app() -> (axum::Router, String) {
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = test_support::app_state(pool);
+        let (token, _session_id) = test_support::seed_flagged_session(&state.pool)
+            .await
+            .unwrap();
+        (router(state), token)
     }
 
     // -- allowlist shape ------------------------------------------------------
@@ -448,6 +523,97 @@ mod tests {
         assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
         let authenticated = send(&app, "GET", "/api/accounts", &cookie()).await;
         assert_eq!(authenticated.status(), StatusCode::OK);
+    }
+
+    // -- AC1/AC16: the must_change_password confinement --------------------------
+
+    fn flagged_cookie(token: &str) -> String {
+        format!("roya_session={token}")
+    }
+
+    #[tokio::test]
+    async fn ac16_a_flagged_full_page_request_redirects_to_the_password_route() {
+        let (app, token) = flagged_test_app().await;
+        let cookie = flagged_cookie(&token);
+        let resp = send(&app, "GET", "/products", &[("cookie", cookie.as_str())]).await;
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/password",
+            "a flagged session is confined to the change form"
+        );
+    }
+
+    #[tokio::test]
+    async fn ac16_a_flagged_api_request_is_refused_with_403_json() {
+        // An API client must not be redirected into an HTML form: it reads
+        // the reason in its own shape.
+        let (app, token) = flagged_test_app().await;
+        let cookie = flagged_cookie(&token);
+        let resp = send(&app, "GET", "/api/accounts", &[("cookie", cookie.as_str())]).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            json.get("error").is_some(),
+            "the confinement refusal must carry a reason: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ac16_a_flagged_htmx_request_carries_hx_redirect_to_password() {
+        let (app, token) = flagged_test_app().await;
+        let cookie = flagged_cookie(&token);
+        let resp = send(
+            &app,
+            "GET",
+            "/products",
+            &[("cookie", cookie.as_str()), ("HX-Request", "true")],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resp.headers().get("HX-Redirect").unwrap(), "/password");
+        let bytes = axum::body::to_bytes(resp.into_body(), 16).await.unwrap();
+        assert!(bytes.is_empty(), "the htmx confinement body must be empty");
+    }
+
+    #[tokio::test]
+    async fn ac16_while_flagged_the_change_form_logout_and_static_stay_reachable() {
+        let (app, token) = flagged_test_app().await;
+        let cookie = flagged_cookie(&token);
+
+        // The change form itself, read and (elsewhere) submit.
+        let form = send(&app, "GET", "/password", &[("cookie", cookie.as_str())]).await;
+        assert_eq!(form.status(), StatusCode::OK, "GET /password stays reachable");
+
+        // Logout must always work, confinement included.
+        let logout = send(&app, "POST", "/logout", &[("cookie", cookie.as_str())]).await;
+        assert_eq!(logout.status(), StatusCode::SEE_OTHER, "POST /logout stays reachable");
+        assert_eq!(logout.headers().get(header::LOCATION).unwrap(), "/login");
+
+        // The public allowlist is untouched: static assets load.
+        let asset = send(&app, "GET", "/static/tailwind.css", &[]).await;
+        assert_eq!(asset.status(), StatusCode::OK);
+
+        // The JSON logout endpoint is public by design and stays reachable.
+        let json_logout = send(&app, "DELETE", "/api/sessions", &[("cookie", cookie.as_str())]).await;
+        assert_eq!(json_logout.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn ac16_an_unflagged_session_goes_everywhere_as_before() {
+        // The confinement must not leak onto unflagged sessions: the shared
+        // fixture's user owes no change and reaches every route it could before.
+        let app = test_app().await;
+        for uri in ["/", "/products", "/api/accounts"] {
+            let resp = send(&app, "GET", uri, &cookie()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "GET {uri} with an unflagged session must not be confined"
+            );
+        }
     }
 
     // -- Origin check ---------------------------------------------------------------

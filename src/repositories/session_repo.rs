@@ -85,6 +85,17 @@ pub trait SessionRepository: Send + Sync {
     async fn revoke(&self, token_hash: &str) -> AppResult<bool>;
     /// Revoke every live session of a user (password change / deactivate).
     async fn revoke_all_for_user(&self, user_id: i64) -> AppResult<u64>;
+    /// Revoke every live session of a user EXCEPT the one whose stored digest
+    /// is `keep_token_hash`: the password-change form (a successful change
+    /// kills the user's other sessions and keeps the acting one). One
+    /// statement — no delete, no re-insert, no window in which the acting
+    /// cookie names no row, and the kept row keeps its id and its expiry.
+    /// Idempotent like `revoke`: the second call matches zero rows.
+    async fn revoke_all_for_user_except(
+        &self,
+        user_id: i64,
+        keep_token_hash: &str,
+    ) -> AppResult<u64>;
     /// Removes rows that are expired or revoked, immediately: there is no
     /// retention window, so a revoked-but-unexpired row goes away on the very
     /// next prune. Called by the service, never a background task.
@@ -182,6 +193,26 @@ impl SessionRepository for SqliteSessionRepository {
             "UPDATE sessions SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id = ? AND revoked_at IS NULL",
         )
         .bind(user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn revoke_all_for_user_except(
+        &self,
+        user_id: i64,
+        keep_token_hash: &str,
+    ) -> AppResult<u64> {
+        // One UPDATE, same shape as `revoke_all_for_user` minus the kept row.
+        // The database stamps `revoked_at` with its own strftime 'now' — the
+        // same form every other revocation in this repository writes — and
+        // the kept row is excluded by its stored digest, so no Rust-bound
+        // timestamp crosses the boundary at all.
+        let res = sqlx::query(
+            "UPDATE sessions SET revoked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE user_id = ? AND token_hash != ? AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .bind(keep_token_hash)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -295,6 +326,124 @@ mod tests {
     }
 
     // -- N2: every map_db_err branch is pinned ----------------------------------
+
+    // -- the password-change revocation (AC16, slice S3 part 1) ------------------
+
+    /// The `_except` form is the rule the password change lives on: of three
+    /// live sessions for one user it revokes exactly two, leaves the named
+    /// row fully intact (same id, same expiry, `revoked_at` still NULL), is
+    /// idempotent on a second call, and never touches another user's rows.
+    #[tokio::test]
+    async fn revoke_all_for_user_except_revokes_the_others_and_keeps_the_named_row_alive() {
+        let repo = SqliteSessionRepository::new(pool().await);
+        let user_id = seed_user_id(&repo.pool).await;
+        let now = base_time();
+
+        let kept = insert_session(&repo, "hash-kept", user_id, now).await;
+        let _a = insert_session(&repo, "hash-a", user_id, now).await;
+        let _b = insert_session(&repo, "hash-b", user_id, now).await;
+
+        // A second user with a live session of their own: the statement is
+        // scoped by user_id and must leave this row alone.
+        let other_user: (i64,) = sqlx::query_as(
+            "INSERT INTO users (username, display_name, password_hash) VALUES ('cashier', 'Cashier', 'not-a-real-hash') RETURNING id",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let other = insert_session(&repo, "hash-other", other_user.0, now).await;
+
+        let revoked = repo
+            .revoke_all_for_user_except(user_id, "hash-kept")
+            .await
+            .unwrap();
+        assert_eq!(revoked, 2, "exactly the two other live sessions of the user");
+
+        // The named row survives with its identity untouched: same id, same
+        // expiry, still unrevoked — resolvable like nothing happened.
+        let kept_after = repo
+            .resolve_valid("hash-kept", now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("the kept session must still resolve");
+        assert_eq!(kept_after.0.id, kept.id, "the session row keeps its id");
+        assert_eq!(kept_after.0.expires_at, kept.expires_at, "the expiry is untouched");
+        assert!(kept_after.0.revoked_at.is_none());
+        let live_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        assert_eq!(live_count.0, 1, "exactly one live row remains for the user");
+
+        // The other two sessions of the same user are dead.
+        assert!(repo
+            .resolve_valid("hash-a", now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .resolve_valid("hash-b", now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_none());
+
+        // Another user's rows are never touched.
+        let other_after = repo
+            .resolve_valid("hash-other", now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("another user's session must be untouched");
+        assert_eq!(other_after.0.id, other.id);
+        assert!(other_after.0.revoked_at.is_none());
+
+        // Idempotent: the second call matches zero rows.
+        let again = repo
+            .revoke_all_for_user_except(user_id, "hash-kept")
+            .await
+            .unwrap();
+        assert_eq!(again, 0);
+    }
+
+    /// The kept digest names a row that does not exist (or belongs to someone
+    /// else): the statement must still be a scoped success, revoking the
+    /// user's rows and never another user's.
+    #[tokio::test]
+    async fn revoke_all_for_user_except_with_an_unknown_kept_digest_scopes_by_user() {
+        let repo = SqliteSessionRepository::new(pool().await);
+        let user_id = seed_user_id(&repo.pool).await;
+        let other_user: (i64,) = sqlx::query_as(
+            "INSERT INTO users (username, display_name, password_hash) VALUES ('cajero', 'Cajero', 'not-a-real-hash') RETURNING id",
+        )
+        .fetch_one(&repo.pool)
+        .await
+        .unwrap();
+        let now = base_time();
+        insert_session(&repo, "hash-mine", user_id, now).await;
+        let theirs = insert_session(&repo, "hash-theirs", other_user.0, now).await;
+
+        // Keeping an unknown digest revokes everything of the user's...
+        let revoked = repo
+            .revoke_all_for_user_except(user_id, "hash-no-such-row")
+            .await
+            .unwrap();
+        assert_eq!(revoked, 1);
+        assert!(repo
+            .resolve_valid("hash-mine", now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .is_none());
+        // ... and still never touches the other user's row.
+        let theirs_after = repo
+            .resolve_valid("hash-theirs", now + Duration::seconds(1))
+            .await
+            .unwrap()
+            .expect("another user's session must be untouched");
+        assert_eq!(theirs_after.0.id, theirs.id);
+        assert!(theirs_after.0.revoked_at.is_none());
+    }
 
     /// N2: a duplicate `token_hash` insert (the UNIQUE backstop the service
     /// trusts) must surface as `Conflict`, never as `Database` (500).

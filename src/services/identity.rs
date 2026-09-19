@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use chrono::{Duration, NaiveDateTime};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewSession, NewUserRole, ResolvedSession, User};
+use crate::models::{NewSession, NewUserRole, ResolvedSession, Session, User};
 use crate::repositories::{
     PermissionRepository, RoleRepository, SessionRepository, UserRepository,
 };
@@ -534,13 +534,13 @@ where
         Ok(())
     }
 
-    // -- password change (AC16 groundwork) ---------------------------------------------
+    // -- password change (AC1/AC16, slice S3 part 1) ------------------------------
 
     /// Change a user's password: the current one is verified, the new one is
     /// validated (>= 12 chars, different from the current), the stored hash is
-    /// replaced and `must_change_password` is cleared. Revoking the user's
-    /// other sessions is the caller's job in S1b (it knows the acting session
-    /// id and composes this with `revoke_all_sessions`).
+    /// replaced and `must_change_password` is cleared. Nothing is written when
+    /// the current password does not verify: the validation runs before the
+    /// first write.
     pub async fn change_password(
         &self,
         user_id: i64,
@@ -557,12 +557,12 @@ where
         }
         if new_password.chars().count() < MIN_PASSWORD_LEN {
             return Err(AppError::Validation(
-                "new password must be at least 12 characters".into(),
+                "La nueva contraseña debe tener al menos 12 caracteres.".into(),
             ));
         }
         if new_password == current_password {
             return Err(AppError::Validation(
-                "new password must be different from the current one".into(),
+                "La nueva contraseña debe ser distinta de la actual.".into(),
             ));
         }
         let new_hash = self.hasher.hash(new_password)?;
@@ -572,6 +572,29 @@ where
             .find_by_id(user_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("user {user_id} not found")))
+    }
+
+    /// The password change the confined flow performs (AC16): the change
+    /// above — verify, validate, update the hash, clear the flag — followed
+    /// by the revocation of every session the user holds EXCEPT the one the
+    /// operator is acting through. The repository's
+    /// `revoke_all_for_user_except` expresses the rule in one statement: no
+    /// window in which the acting cookie names no row, no delete/insert, no
+    /// Rust-bound timestamp compared against a database-written one, and the
+    /// acting session keeps its id and its expiry.
+    pub async fn change_password_keep_only_session(
+        &self,
+        keep_session: &Session,
+        current_password: &str,
+        new_password: &str,
+    ) -> AppResult<()> {
+        let user_id = keep_session.user_id;
+        self.change_password(user_id, current_password, new_password)
+            .await?;
+        self.sessions
+            .revoke_all_for_user_except(user_id, &keep_session.token_hash)
+            .await?;
+        Ok(())
     }
 
     // -- mass revocation -----------------------------------------------------------------
@@ -704,6 +727,13 @@ mod tests {
             Ok(false)
         }
         async fn revoke_all_for_user(&self, _user_id: i64) -> AppResult<u64> {
+            Ok(0)
+        }
+        async fn revoke_all_for_user_except(
+            &self,
+            _user_id: i64,
+            _keep_token_hash: &str,
+        ) -> AppResult<u64> {
             Ok(0)
         }
         async fn prune(&self, _now: NaiveDateTime) -> AppResult<u64> {
@@ -1519,6 +1549,77 @@ mod tests {
         assert_eq!(revoked, 2);
         assert!(s.resolve_session(&first.token).await.unwrap().is_none());
         assert!(s.resolve_session(&second.token).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_confined_change_clears_the_flag_kills_the_other_sessions_and_keeps_the_actor() {
+        let (s, _pool, _clock) = svc().await;
+        let boot = s.bootstrap_admin(None).await.unwrap();
+        let generated = boot.generated_password.clone().unwrap();
+        let user_id = boot.user.clone().unwrap().id;
+
+        // Two sessions for the same flagged user, like two open tabs.
+        let acting = s.login("admin", &generated).await.unwrap();
+        let other = s.login("admin", &generated).await.unwrap();
+        assert!(s.resolve_session(&other.token).await.unwrap().is_some());
+
+        let acting_resolved = s
+            .resolve_session(&acting.token)
+            .await
+            .unwrap()
+            .expect("the acting session must resolve before the change");
+
+        s.change_password_keep_only_session(
+            &acting_resolved.session,
+            &generated,
+            "una contraseña nueva larga",
+        )
+        .await
+        .unwrap();
+
+        // The acting session survives under the same cookie token — same row,
+        // same id, same expiry — with the flag cleared...
+        let kept = s
+            .resolve_session(&acting.token)
+            .await
+            .unwrap()
+            .expect("the acting session must survive its own password change");
+        assert_eq!(kept.session.id, acting_resolved.session.id, "same row, same id");
+        assert_eq!(kept.session.expires_at, acting_resolved.session.expires_at);
+        assert!(!kept.user.must_change_password, "the flag must be cleared");
+        // ... the other session of the same user is dead ...
+        assert!(s.resolve_session(&other.token).await.unwrap().is_none());
+        // ... and the stored hash verifies the NEW password only.
+        let stored = s.users.find_with_hash_by_id(user_id).await.unwrap().unwrap();
+        assert!(s.hasher.verify("una contraseña nueva larga", &stored.password_hash));
+        assert!(!s.hasher.verify(&generated, &stored.password_hash));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_current_password_in_the_confined_change_writes_nothing() {
+        let (s, _pool, _clock) = svc().await;
+        let boot = s.bootstrap_admin(None).await.unwrap();
+        let generated = boot.generated_password.clone().unwrap();
+        let acting = s.login("admin", &generated).await.unwrap();
+        let other = s.login("admin", &generated).await.unwrap();
+        let resolved = s.resolve_session(&acting.token).await.unwrap().unwrap();
+
+        let err = s
+            .change_password_keep_only_session(
+                &resolved.session,
+                "not the password at all",
+                "una contraseña nueva larga",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+
+        // Nothing moved: both sessions still resolve and the flag still holds.
+        assert!(s.resolve_session(&acting.token).await.unwrap().is_some());
+        assert!(s.resolve_session(&other.token).await.unwrap().is_some());
+        let stored = s.users.find_with_hash_by_id(acting.user.id).await.unwrap().unwrap();
+        assert!(stored.user.must_change_password);
+        assert!(s.hasher.verify(&generated, &stored.password_hash));
     }
 
     // -- pruning -----------------------------------------------------------------------------

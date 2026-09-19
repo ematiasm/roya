@@ -9,8 +9,10 @@
 //
 // `next` follows the guard's single validation (`security::guard`): a local
 // path only, so the login page cannot be turned into an open redirect.
-// `must_change_password` is deliberately NOT enforced here — the confined
-// `/password` flow is slice S3.
+// The `/password` change form (slice S3 part 1) lives here too: a flagged
+// session is confined to it by the guard, a successful change clears the
+// flag, revokes the user's other sessions keeping the acting one, and sends
+// the operator back to the app.
 use askama::Template;
 use axum::{
     extract::{Query, State},
@@ -37,6 +39,18 @@ use crate::security::guard::{current_session, local_next};
 struct LoginTemplate {
     next: String,
     error: Option<String>,
+}
+
+/// The password-change card (slice S3 part 1). A flagged session is confined
+/// to it; every signed-in operator can also reach it from the sidebar. A
+/// failure re-renders the form with the reason in the shared danger-notice
+/// idiom; a success sends the operator back to the app.
+#[derive(Template)]
+#[template(path = "password.html")]
+struct PasswordTemplate {
+    error: Option<String>,
+    /// The sidebar partial's active-entry key: the page marks its own entry.
+    nav_key: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,10 +149,89 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         .into_response()
 }
 
+// ---------------------------------------------------------------------------
+// The password change (slice S3 part 1)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct PasswordForm {
+    #[serde(default)]
+    current_password: String,
+    #[serde(default)]
+    new_password: String,
+    #[serde(default)]
+    confirm_password: String,
+}
+
+async fn password_page() -> Result<Response, AppError> {
+    let html = render_password(PasswordTemplate {
+        error: None,
+        nav_key: PASSWORD_NAV_KEY,
+    })?;
+    Ok(Html(html).into_response())
+}
+
+/// The sidebar key the password page marks as current; the sidebar partial
+/// carries the matching entry.
+const PASSWORD_NAV_KEY: &str = "password";
+
+async fn password_submit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PasswordForm>,
+) -> Result<Response, AppError> {
+    // The guard guarantees a session here; the handler still resolves it
+    // itself because the rule it enforces needs what the middleware does not
+    // pass down: the acting session row (token digest, expiry, user agent)
+    // the service re-seats while revoking every other session of the user.
+    let resolved = match current_session(&state, &headers).await {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return Ok(Redirect::to("/login").into_response()),
+        Err(e) => return Err(AppError::Internal(format!("session check failed: {e}"))),
+    };
+    // Confirmation matching is the form's own job (two fields, one value);
+    // the credential rules live in the service, the one layer that owns them.
+    if form.new_password != form.confirm_password {
+        return password_refusal("Las contraseñas nuevas no coinciden.", StatusCode::BAD_REQUEST);
+    }
+    match state
+        .identity_service
+        .change_password_keep_only_session(
+            &resolved.session,
+            &form.current_password,
+            &form.new_password,
+        )
+        .await
+    {
+        // Back to the app: the flag is cleared and the acting session survived.
+        Ok(()) => Ok(Redirect::to("/").into_response()),
+        // The current password did not verify: same card, precise reason, and
+        // nothing was written (the service verifies before its first write).
+        Err(AppError::Unauthorized(_)) => {
+            password_refusal("La contraseña actual no es correcta.", StatusCode::UNAUTHORIZED)
+        }
+        // The service's validation (length, difference) speaks Spanish: the
+        // message is operator-facing through this form.
+        Err(AppError::Validation(message)) => {
+            password_refusal(&message, StatusCode::BAD_REQUEST)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn password_refusal(message: &str, status: StatusCode) -> Result<Response, AppError> {
+    let html = render_password(PasswordTemplate {
+        error: Some(message.to_owned()),
+        nav_key: PASSWORD_NAV_KEY,
+    })?;
+    Ok((status, Html(html)).into_response())
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
+        .route("/password", get(password_page).post(password_submit))
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +245,12 @@ fn next_value(next: Option<&str>) -> String {
 }
 
 fn render_login(template: LoginTemplate) -> AppResult<String> {
+    template
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+fn render_password(template: PasswordTemplate) -> AppResult<String> {
     template
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))
@@ -547,10 +646,14 @@ mod tests {
         assert!(resp.headers().get(header::SET_COOKIE).is_some());
     }
 
-    // -- must_change_password is NOT enforced yet (deliberate, asserted) ---------
+    // -- must_change_password is enforced from S3 part 1 -------------------------
 
+    /// The S1b placeholder asserted the opposite (the flag did nothing yet);
+    /// slice S3 part 1 ships the confinement, so the same fixture now asserts
+    /// the real rule: a flagged session is redirected to the change form on
+    /// any other full-page request, and the form itself answers.
     #[tokio::test]
-    async fn must_change_password_does_not_confine_the_session_yet() {
+    async fn must_change_password_confines_the_session_to_the_password_change() {
         let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -568,8 +671,284 @@ mod tests {
         let resp = send(&app, "GET", "/products", &[("cookie", cookie.as_str())], "").await;
         assert_eq!(
             resp.status(),
+            StatusCode::SEE_OTHER,
+            "a flagged session must be confined to the change form"
+        );
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/password");
+
+        let resp = send(&app, "GET", "/password", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "the form itself must answer");
+    }
+
+    // -- the confined flow (AC1 + AC16) -------------------------------------------
+
+    /// The bootstrap with NO env password: the administrator's credential is
+    /// generated (returned here, the one place outside the log) and the user
+    /// is flagged, so the first login lands confined to `/password`.
+    async fn generated_password_app() -> (axum::Router, String) {
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = test_support::app_state(pool);
+        let outcome = state.identity_service.bootstrap_admin(None).await.unwrap();
+        let generated = outcome
+            .generated_password
+            .expect("the generated-password bootstrap returns it once");
+        (router(state), generated)
+    }
+
+    #[tokio::test]
+    async fn the_generated_bootstrap_login_is_confined_until_the_password_changes() {
+        let (app, generated) = generated_password_app().await;
+
+        // The generated token is base64url: urlencoded-safe as-is.
+        let login_body = format!("username=admin&password={generated}");
+        let login = send(&app, "POST", "/login", &form_headers(), &login_body).await;
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let cookie = cookie_pair(&login);
+
+        // Confined: any full-page request lands on the change form.
+        let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(home.status(), StatusCode::SEE_OTHER, "AC1: the bootstrap without ROYA_ADMIN_PASSWORD ends confined");
+        assert_eq!(home.headers().get(header::LOCATION).unwrap(), "/password");
+
+        let form = send(&app, "GET", "/password", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(form.status(), StatusCode::OK);
+        let html = body_string(form).await;
+        assert!(html.contains("name=\"current_password\""), "{html}");
+        assert!(html.contains("name=\"new_password\""), "{html}");
+        assert!(html.contains("name=\"confirm_password\""), "{html}");
+
+        // The change: current verified, new valid and confirmed.
+        let change_body = "current_password={generated}&new_password=brand%20new%20password%2012&confirm_password=brand%20new%20password%2012";
+        let change_body = change_body.replace("{generated}", &generated);
+        let change = send(
+            &app,
+            "POST",
+            "/password",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", cookie.as_str()),
+            ],
+            &change_body,
+        )
+        .await;
+        assert_eq!(change.status(), StatusCode::SEE_OTHER, "a successful change redirects back to the app");
+        assert_eq!(change.headers().get(header::LOCATION).unwrap(), "/");
+
+        // The same session continues into the app, unconfined.
+        let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(home.status(), StatusCode::OK, "AC16: after the change the same session reaches /");
+    }
+
+    #[tokio::test]
+    async fn the_password_change_revokes_the_users_other_sessions_and_keeps_the_actor() {
+        let (app, generated) = generated_password_app().await;
+
+        // Two sessions for the flagged user, like two open tabs.
+        let login_body = format!("username=admin&password={generated}");
+        let first = send(&app, "POST", "/login", &form_headers(), &login_body).await;
+        let second = send(&app, "POST", "/login", &form_headers(), &login_body).await;
+        let acting = cookie_pair(&first);
+        let other = cookie_pair(&second);
+        assert_ne!(acting, other);
+
+        let change_body = "current_password={generated}&new_password=brand%20new%20password%2012&confirm_password=brand%20new%20password%2012"
+            .replace("{generated}", &generated);
+        let change = send(
+            &app,
+            "POST",
+            "/password",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", acting.as_str()),
+            ],
+            &change_body,
+        )
+        .await;
+        assert_eq!(change.status(), StatusCode::SEE_OTHER);
+
+        // The acting session survives; the other one of the same user is dead
+        // (an anonymous-looking refusal, exactly like an absent token).
+        let actor = send(&app, "GET", "/", &[("cookie", acting.as_str())], "").await;
+        assert_eq!(actor.status(), StatusCode::OK, "the acting session must survive");
+        let dead = send(&app, "GET", "/", &[("cookie", other.as_str())], "").await;
+        assert_eq!(dead.status(), StatusCode::SEE_OTHER, "the other session must be revoked");
+        let location = dead.headers().get(header::LOCATION).unwrap().to_str().unwrap();
+        assert!(location.starts_with("/login"), "a dead session is refused like an absent one: {location}");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_current_password_changes_nothing_and_says_why() {
+        let (app, generated) = generated_password_app().await;
+        let login_body = format!("username=admin&password={generated}");
+        let login = send(&app, "POST", "/login", &form_headers(), &login_body).await;
+        let cookie = cookie_pair(&login);
+
+        let change_body = "current_password=not-the-password&new_password=brand%20new%20password%2012&confirm_password=brand%20new%20password%2012";
+        let resp = send(
+            &app,
+            "POST",
+            "/password",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", cookie.as_str()),
+            ],
+            change_body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let html = body_string(resp).await;
+        assert!(
+            html.contains("La contraseña actual no es correcta"),
+            "the form must say why: {html}"
+        );
+
+        // Nothing changed: the session is still confined and the generated
+        // credential still works (the stored hash was never touched).
+        let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(home.status(), StatusCode::SEE_OTHER);
+        assert_eq!(home.headers().get(header::LOCATION).unwrap(), "/password");
+
+        let retry_body = "current_password={generated}&new_password=brand%20new%20password%2012&confirm_password=brand%20new%20password%2012"
+            .replace("{generated}", &generated);
+        let retry = send(
+            &app,
+            "POST",
+            "/password",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", cookie.as_str()),
+            ],
+            &retry_body,
+        )
+        .await;
+        assert_eq!(retry.status(), StatusCode::SEE_OTHER, "the generated credential must still verify after the failed attempt");
+    }
+
+    /// The service's credential rules, exercised through the form: a too-short
+    /// new password, an unchanged one and a mismatched confirmation are each
+    /// refused with their reason, and none of them moves anything (the session
+    /// stays confined, so the flag still holds).
+    #[tokio::test]
+    async fn invalid_new_passwords_are_refused_with_their_reason_and_change_nothing() {
+        let (app, generated) = generated_password_app().await;
+        let login_body = format!("username=admin&password={generated}");
+        let login = send(&app, "POST", "/login", &form_headers(), &login_body).await;
+        let cookie = cookie_pair(&login);
+        let form_headers_with_cookie = vec![
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", cookie.as_str()),
+        ];
+
+        // Too short (below the 12-character minimum).
+        let resp = send(
+            &app,
+            "POST",
+            "/password",
+            &form_headers_with_cookie,
+            &format!("current_password={generated}&new_password=short%20pw&confirm_password=short%20pw"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let html = body_string(resp).await;
+        assert!(html.contains("al menos 12 caracteres"), "{html}");
+
+        // Identical to the current one.
+        let resp = send(
+            &app,
+            "POST",
+            "/password",
+            &form_headers_with_cookie,
+            &format!("current_password={generated}&new_password={generated}&confirm_password={generated}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let html = body_string(resp).await;
+        assert!(html.contains("distinta de la actual"), "{html}");
+
+        // Confirmation mismatch (the form's own check).
+        let resp = send(
+            &app,
+            "POST",
+            "/password",
+            &form_headers_with_cookie,
+            &format!("current_password={generated}&new_password=brand%20new%20password%2012&confirm_password=another%20password%209"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let html = body_string(resp).await;
+        assert!(html.contains("no coinciden"), "{html}");
+
+        // Every refusal left the world unchanged: still confined, and the
+        // generated credential still verifies.
+        let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(home.status(), StatusCode::SEE_OTHER);
+        assert_eq!(home.headers().get(header::LOCATION).unwrap(), "/password");
+        let change_body = "current_password={generated}&new_password=brand%20new%20password%2012&confirm_password=brand%20new%20password%2012"
+            .replace("{generated}", &generated);
+        let change = send(
+            &app,
+            "POST",
+            "/password",
+            &form_headers_with_cookie,
+            &change_body,
+        )
+        .await;
+        assert_eq!(change.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn an_env_password_bootstrap_is_not_confined() {
+        // The e2e harness rides this branch: ROYA_ADMIN_PASSWORD set means the
+        // operator chose the credential and owes no change.
+        let (app, _state) = test_app().await;
+        let login = send(
+            &app,
+            "POST",
+            "/login",
+            &form_headers(),
+            "username=admin&password=bootstrap%20password%201",
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::SEE_OTHER);
+        let cookie = cookie_pair(&login);
+        let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(
+            home.status(),
             StatusCode::OK,
-            "S1b part 2 must not enforce must_change_password (S3 does)"
+            "a bootstrap with ROYA_ADMIN_PASSWORD set must not be confined"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sidebar_links_to_the_password_page_and_the_page_marks_itself_active() {
+        let (app, _state) = test_app().await;
+        let home = send(&app, "GET", "/", &[("cookie", test_support::TEST_COOKIE)], "").await;
+        assert_eq!(home.status(), StatusCode::OK);
+        let html = body_string(home).await;
+        assert!(
+            html.contains("href=\"/password\"") && html.contains("data-nav=\"password\""),
+            "the sidebar must carry the password entry: {html}"
+        );
+
+        let page = send(
+            &app,
+            "GET",
+            "/password",
+            &[("cookie", test_support::TEST_COOKIE)],
+            "",
+        )
+        .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let html = body_string(page).await;
+        assert!(
+            html.contains("data-nav-active=\"true\""),
+            "the password page must mark its own entry active: {html}"
         );
     }
 
