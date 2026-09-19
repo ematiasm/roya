@@ -16,7 +16,8 @@ use chrono::{Duration, NaiveDateTime};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewSession, NewUser, NewUserRole, ResolvedSession, Role, Session, User, UserWithRoles,
+    NewRole, NewSession, NewUser, NewUserRole, ResolvedSession, Role, RoleMatrix,
+    RoleWithHolders, Session, User, UserWithRoles,
 };
 use crate::repositories::{
     PermissionRepository, RoleRepository, SessionRepository, UserRepository,
@@ -58,6 +59,26 @@ const SELF_ROLE_CHANGE_MESSAGE: &str = "No podés cambiar tus propios roles: ped
 /// actor holding only `identity.users.manage` cannot reset a protected
 /// holder's password at all, which closes the takeover path outright.
 const PROTECTED_RESET_TIER_MESSAGE: &str = "Restablecer la contraseña de un usuario que sostiene un rol protegido es una decisión de administración: requiere «identity.roles.manage».";
+/// The one Spanish message every roles-screen mutation refusal for a missing
+/// tier carries. The endpoint gates with `Require<IdentityRolesManage>`; the
+/// service repeats the check (the same posture as `assign_roles`) so the rule
+/// does not depend on every future route remembering the extractor.
+const ROLES_TIER_MESSAGE: &str = "Administrar roles requiere «identity.roles.manage».";
+/// The role-code shape the schema CHECK backs (spec: `^[a-z][a-z0-9_]*$`,
+/// 2-64). Same posture as the username shape: the service reports the rule in
+/// Spanish before the write, the schema CHECK is the backstop.
+const ROLE_CODE_MESSAGE: &str = "El código del rol debe tener entre 2 y 64 caracteres: sólo letras minúsculas, números y guión bajo, empezando con una letra.";
+/// Role display name rule (schema: 1-128 characters).
+const ROLE_NAME_MESSAGE: &str = "El nombre del rol debe tener entre 1 y 128 caracteres.";
+/// Role description rule (schema: at most 256 characters).
+const ROLE_DESCRIPTION_MESSAGE: &str = "La descripción del rol no puede superar los 256 caracteres.";
+/// The rule that closes the matrix self-lockout (S4): an actor stripping
+/// `identity.roles.manage` from a role it itself holds would lock itself —
+/// and everyone sharing the role — out of the roles administration on the
+/// next request, the same lockout class the users screen already refuses for
+/// role sets. The interface never offers the removal (the held permission's
+/// checkbox is pre-ticked); the refusal is real regardless.
+const MATRIX_SELF_LOCKOUT_MESSAGE: &str = "No podés quitar «identity.roles.manage» de un rol que vos sostenés: te dejaría sin acceso a la administración de roles.";
 /// The same tier for role assignment itself: replacing anyone's role set —
 /// granting the protected role, stripping it, creating administrators — is
 /// the decision about the administration, so the rule is checked in the
@@ -87,6 +108,17 @@ fn is_valid_username(username: &str) -> bool {
     alnum(bytes[0])
         && alnum(bytes[bytes.len() - 1])
         && bytes[1..bytes.len() - 1].iter().all(|c| inner(*c))
+}
+/// The role-code shape the schema CHECK backs: 2-64 lowercase ASCII, starting
+/// with a letter, letters/digits/underscore only (spec's `^[a-z][a-z0-9_]*$`).
+fn is_valid_role_code(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    if bytes.len() < 2 || bytes.len() > 64 {
+        return false;
+    }
+    let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|c| alnum(*c) || *c == b'_')
 }
 /// Maximum number of distinct usernames the throttle map tracks at once.
 /// Entries only stay while they are load-bearing — an open cooldown window,
@@ -885,7 +917,279 @@ where
         self.roles.list().await
     }
 
-    // -- mass revocation -----------------------------------------------------------------
+    // -- roles administration (slice S4, T16) ----------------------------------
+
+    /// The tier check every roles-screen mutation repeats in the service (the
+    /// endpoints gate with `Require<IdentityRolesManage>`; the layer that owns
+    /// the rule repeats it, exactly like `assign_roles`).
+    async fn require_roles_tier<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        actor_id: i64,
+    ) -> AppResult<()> {
+        let codes = permissions.effective_for_user(actor_id).await?;
+        if codes.iter().any(|code| code == ROLES_MANAGE_CODE) {
+            Ok(())
+        } else {
+            Err(AppError::Forbidden(ROLES_TIER_MESSAGE.into()))
+        }
+    }
+
+    /// The roles screen's list read (spec, "Permission matrix for the
+    /// interface"): every role with the usernames of the users that hold it.
+    /// The count the list shows and the names a blocked deletion (AC15)
+    /// reports come from the same read. Holders of any state count: the
+    /// `user_roles` RESTRICT foreign key blocks a deletion for inactive
+    /// holders too, so the list must not promise a free deletion the
+    /// database will refuse.
+    pub async fn list_roles_with_holders(&self) -> AppResult<Vec<RoleWithHolders>> {
+        let mut out = Vec::new();
+        for role in self.roles.list().await? {
+            let holders = self.roles.holder_names(role.id).await?;
+            out.push(RoleWithHolders { role, holders });
+        }
+        Ok(out)
+    }
+
+    /// Create a role for the administration screen: the code shape and its
+    /// uniqueness, the display name and the optional description. Nothing is
+    /// written on any refusal: every check runs before the insert. The code
+    /// is immutable in practice (no rename surface exists — a machine name is
+    /// not a relabel), so the shape rule is the one chance to get it right.
+    pub async fn create_role<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        actor_id: i64,
+        code: &str,
+        name: &str,
+        description: &str,
+    ) -> AppResult<Role> {
+        self.require_roles_tier(permissions, actor_id).await?;
+        let code = code.trim();
+        let name = name.trim();
+        let description = description.trim();
+        // Existence before shape (the username posture: the operator learns
+        // the real reason — a taken code — even when both could apply).
+        if let Some(taken) = self.roles.find_by_code(code).await? {
+            return Err(AppError::Conflict(format!(
+                "Ya existe un rol con el código «{}».",
+                taken.code
+            )));
+        }
+        if !is_valid_role_code(code) {
+            return Err(AppError::Validation(ROLE_CODE_MESSAGE.into()));
+        }
+        if name.is_empty() || name.chars().count() > 128 {
+            return Err(AppError::Validation(ROLE_NAME_MESSAGE.into()));
+        }
+        if description.chars().count() > 256 {
+            return Err(AppError::Validation(ROLE_DESCRIPTION_MESSAGE.into()));
+        }
+        self.roles
+            .create(&NewRole {
+                code: code.into(),
+                name: name.into(),
+                // An empty description is no description, not an empty string
+                // the interface renders as blank noise.
+                description: if description.is_empty() {
+                    None
+                } else {
+                    Some(description.into())
+                },
+            })
+            .await
+    }
+
+    /// Edit a role's name and description (the S4 edit form). The code is not
+    /// part of the edit — renames are not offered for any role, and the guard
+    /// trigger refuses them for the protected one. Name and description rules
+    /// match creation; nothing is written on a refusal. The protected role's
+    /// LABEL stays editable on purpose: the triggers lock its code, deletion
+    /// and matrix, and the interface keeps those actions hidden — the label
+    /// is how the operator describes the role to other operators.
+    pub async fn update_role<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        actor_id: i64,
+        role_id: i64,
+        name: &str,
+        description: &str,
+    ) -> AppResult<Role> {
+        self.require_roles_tier(permissions, actor_id).await?;
+        // The role must exist: a bad id is a form error, not a 500.
+        self.roles
+            .find_by_id(role_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("El rol no existe.".into()))?;
+        let name = name.trim();
+        let description = description.trim();
+        if name.is_empty() || name.chars().count() > 128 {
+            return Err(AppError::Validation(ROLE_NAME_MESSAGE.into()));
+        }
+        if description.chars().count() > 256 {
+            return Err(AppError::Validation(ROLE_DESCRIPTION_MESSAGE.into()));
+        }
+        self.roles
+            .update_details(role_id, name, if description.is_empty() { None } else { Some(description) })
+            .await?;
+        self.roles
+            .find_by_id(role_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("El rol no existe.".into()))
+    }
+
+    /// Delete a role (the S4 delete action). Two rules refuse it, both
+    /// explained in Spanish before anything is written:
+    ///
+    /// 1. the protected role — the guard trigger holds the line for every
+    ///    path, and the service refuses here with its own reason;
+    /// 2. a role users hold — the `user_roles` RESTRICT foreign key — with
+    ///    the refusal NAMING the users that block it (AC15), so the operator
+    ///    knows exactly where to remove the role first.
+    ///
+    /// The holders read is the total set (any state): an inactive holder
+    /// blocks the deletion too, so the refusal must name them as well. The
+    /// repository's own mapped refusals stay as the backstop for the window
+    /// between the check and the write.
+    pub async fn delete_role<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        actor_id: i64,
+        role_id: i64,
+    ) -> AppResult<Role> {
+        self.require_roles_tier(permissions, actor_id).await?;
+        let role = self
+            .roles
+            .find_by_id(role_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("El rol no existe.".into()))?;
+        if role.is_system {
+            return Err(AppError::Conflict(
+                "No se puede eliminar un rol protegido: sostiene la administración de la instancia.".into(),
+            ));
+        }
+        let holders = self.roles.holder_names(role_id).await?;
+        if !holders.is_empty() {
+            return Err(AppError::Conflict(format!(
+                "No se puede eliminar el rol «{}»: lo sostienen {}. Primero quitáselo a los usuarios que lo sostienen.",
+                role.code,
+                holders.join(", ")
+            )));
+        }
+        self.roles.delete(role_id).await?;
+        Ok(role)
+    }
+
+    /// The permission matrix read for the edit dialog (S4): the role, the
+    /// whole seeded catalog — the 23 rows the matrix renders, each carrying
+    /// its Spanish description the operator reads before granting — and the
+    /// ids the role currently holds. The held ids are resolved from the
+    /// role's own codes against the catalog; no extra query per row. The
+    /// permission repository rides in as an argument, exactly like
+    /// `effective_permissions` and the other matrix writers: the wiring owns
+    /// it, the service owns the read.
+    pub async fn role_matrix<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        role_id: i64,
+    ) -> AppResult<RoleMatrix> {
+        let role = self
+            .roles
+            .find_by_id(role_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("El rol no existe.".into()))?;
+        let catalog = permissions.list().await?;
+        let held_codes = permissions.codes_for_role(role_id).await?;
+        let held_ids = catalog
+            .iter()
+            .filter(|permission| held_codes.iter().any(|code| code == permission.code.as_str()))
+            .map(|permission| permission.id)
+            .collect();
+        Ok(RoleMatrix {
+            role,
+            catalog,
+            held_ids,
+        })
+    }
+
+    /// Replace a role's whole permission matrix (S4's matrix editor). The
+    /// rules, in the order they refuse:
+    ///
+    /// 1. the tier: the acting principal must hold `identity.roles.manage`
+    ///    (repeated here, the rule's owner — the endpoint gates too);
+    /// 2. the protected role: its matrix is permanent (AC13), so the edit is
+    ///    refused before a row is touched — the interface never offers it;
+    /// 3. the submitted ids are deduplicated and resolved in ONE statement
+    ///    (the same contract as the assignment form's role ids); a missing id
+    ///    is a form error, not a 500;
+    /// 4. the self-lockout rule this slice adds: an edit that would REMOVE
+    ///    `identity.roles.manage` from a role the acting principal itself
+    ///    holds is refused — without it, a holder could strip its own tier
+    ///    through the matrix and lock itself (and everyone sharing the role)
+    ///    out on the next request, the same lockout class the users screen
+    ///    refuses for role sets. The checkbox is pre-ticked, so the interface
+    ///    never offers the removal; the refusal stays real.
+    ///
+    /// The guard trigger remains the database's backstop for the protected
+    /// role's matrix rows and for any future path that reaches the statement
+    /// directly.
+    pub async fn set_role_matrix<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        actor_id: i64,
+        role_id: i64,
+        permission_ids: &[i64],
+    ) -> AppResult<()> {
+        self.require_roles_tier(permissions, actor_id).await?;
+        let role = self
+            .roles
+            .find_by_id(role_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("El rol no existe.".into()))?;
+        if role.is_system {
+            return Err(AppError::Conflict(
+                "No se puede editar la matriz de un rol protegido: sostiene la administración de la instancia.".into(),
+            ));
+        }
+        let mut unique: Vec<i64> = Vec::with_capacity(permission_ids.len());
+        for permission_id in permission_ids {
+            if !unique.contains(permission_id) {
+                unique.push(*permission_id);
+            }
+        }
+        // One statement for the whole submitted set.
+        let found = permissions.find_by_ids(&unique).await?;
+        let mut found_ids: Vec<i64> = found.iter().map(|permission| permission.id).collect();
+        found_ids.sort_unstable();
+        for permission_id in &unique {
+            if found_ids.binary_search(permission_id).is_err() {
+                return Err(AppError::Validation(
+                    "Uno de los permisos indicados no existe.".into(),
+                ));
+            }
+        }
+        // The self-lockout rule: only meaningful when the actor holds THIS
+        // role and the edit removes the tier from it. The submitted set is
+        // already resolved above, so the removal check reads it, not the
+        // database again.
+        let holds_this_role = self
+            .roles
+            .list_for_user(actor_id)
+            .await?
+            .iter()
+            .any(|held| held.id == role_id);
+        if holds_this_role {
+            let current = permissions.codes_for_role(role_id).await?;
+            let removing_tier = current.iter().any(|code| code == ROLES_MANAGE_CODE)
+                && !found.iter().any(|permission| permission.code == ROLES_MANAGE_CODE);
+            if removing_tier {
+                return Err(AppError::Forbidden(MATRIX_SELF_LOCKOUT_MESSAGE.into()));
+            }
+        }
+        permissions.set_role_permissions(role_id, &unique).await
+    }
+
+    // -- mass revocation -------------------------------------------------------------
 
     /// Revoke every live session of a user (password change, deactivation).
     pub async fn revoke_all_sessions(&self, user_id: i64) -> AppResult<u64> {
@@ -1084,6 +1388,20 @@ mod tests {
         ) -> AppResult<Vec<Role>> {
             self.inner.replace_user_roles(user_id, role_ids, granted_by).await
         }
+        async fn create(&self, input: &NewRole) -> AppResult<Role> {
+            self.inner.create(input).await
+        }
+        async fn update_details(
+            &self,
+            id: i64,
+            name: &str,
+            description: Option<&str>,
+        ) -> AppResult<()> {
+            self.inner.update_details(id, name, description).await
+        }
+        async fn holder_names(&self, role_id: i64) -> AppResult<Vec<String>> {
+            self.inner.holder_names(role_id).await
+        }
     }
 
     /// Permission-repository double handing every caller one fixed code set:
@@ -1108,6 +1426,9 @@ mod tests {
             _permission_ids: &[i64],
         ) -> AppResult<()> {
             Ok(())
+        }
+        async fn find_by_ids(&self, _ids: &[i64]) -> AppResult<Vec<crate::models::Permission>> {
+            Ok(Vec::new())
         }
     }
 
@@ -3010,5 +3331,339 @@ mod tests {
         let mut held_codes: Vec<String> = held.iter().map(|r| r.code.clone()).collect();
         held_codes.sort();
         assert_eq!(held_codes, vec!["cajero", "vendedor"]);
+    }
+
+    // -- S4: the roles administration service --------------------------------
+
+    /// Counting permission-repository wrapper over the REAL SQLite repo: the
+    /// matrix editor's "the submitted set resolves in ONE statement" is a
+    /// property of the call shape, not of the answer, so the assertion sits
+    /// where the call is observable (the same double the assignment flow
+    /// carries above).
+    struct CountingMatrixLookups<P: PermissionRepository> {
+        inner: P,
+        /// One entry per `find_by_ids` call, holding the ids it was handed.
+        calls: Arc<Mutex<Vec<Vec<i64>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl<P: PermissionRepository> PermissionRepository for CountingMatrixLookups<P> {
+        async fn list(&self) -> AppResult<Vec<crate::models::Permission>> {
+            self.inner.list().await
+        }
+        async fn effective_for_user(&self, user_id: i64) -> AppResult<Vec<String>> {
+            self.inner.effective_for_user(user_id).await
+        }
+        async fn codes_for_role(&self, role_id: i64) -> AppResult<Vec<String>> {
+            self.inner.codes_for_role(role_id).await
+        }
+        async fn set_role_permissions(
+            &self,
+            role_id: i64,
+            permission_ids: &[i64],
+        ) -> AppResult<()> {
+            self.inner.set_role_permissions(role_id, permission_ids).await
+        }
+        async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<crate::models::Permission>> {
+            self.calls.lock().unwrap().push(ids.to_vec());
+            self.inner.find_by_ids(ids).await
+        }
+    }
+
+    async fn matrix_svc() -> (TestIdentity, SqlitePool) {
+        let (service, pool, _clock) = svc().await;
+        (service, pool)
+    }
+
+    async fn permission_id(pool: &SqlitePool, code: &str) -> i64 {
+        sqlx::query_scalar("SELECT id FROM permissions WHERE code = ?")
+            .bind(code)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The roles screen's service round trip: the list carries holders, the
+    /// create validates shape/uniqueness/name/description in Spanish before
+    /// any write, the edit touches only name and description, and the delete
+    /// refuses a held role NAMING the users that block it. The protected role
+    /// is refused deletion and matrix edits; its label stays editable.
+    #[tokio::test]
+    async fn the_roles_screen_service_validates_creates_edits_and_deletes_in_spanish() {
+        let (service, pool) = matrix_svc().await;
+        let actor = seed_user(&service, "hr-actor", "initial password 1", true).await;
+        let permissions = FixedPermissions(vec![ROLES_MANAGE_CODE.to_string()]);
+
+        // The list read: four seeded roles, nobody holds anything yet.
+        let listed = service.list_roles_with_holders().await.unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.role.code.as_str()).collect::<Vec<_>>(),
+            vec!["admin", "vendedor", "cajero", "deposito"]
+        );
+        assert!(listed.iter().all(|r| r.holders.is_empty()));
+
+        // Create: every rule refused in Spanish BEFORE the write.
+        for (code, name, description, expected) in [
+            ("vendedor", "Otro", "", "Ya existe un rol"),
+            ("Vendedor", "Otro", "", "código del rol"),
+            ("a", "Otro", "", "código del rol"),
+            ("supervisor", "", "", "nombre del rol"),
+            ("supervisor", "Supervisor", &"x".repeat(257), "descripción del rol"),
+        ] {
+            let err = service
+                .create_role(&permissions, actor.id, code, name, description)
+                .await
+                .unwrap_err();
+            match err {
+                AppError::Conflict(m) if m.contains("Ya existe") => {}
+                AppError::Validation(m) if m.contains(expected) => {}
+                other => panic!("create {code}: expected Spanish refusal naming {expected:?}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM roles")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            4,
+            "the refused creations wrote nothing"
+        );
+
+        // The successful create: an ordinary role with its description.
+        let created = service
+            .create_role(&permissions, actor.id, "supervisor", "Supervisor", "Vende y supervisa")
+            .await
+            .unwrap();
+        assert!(!created.is_system);
+        assert_eq!(created.description.as_deref(), Some("Vende y supervisa"));
+
+        // Edit: name and description only; the protected role's LABEL stays
+        // editable (the triggers lock its code and its matrix, not its label).
+        let edited = service
+            .update_role(&permissions, actor.id, created.id, "Supervisión", "")
+            .await
+            .unwrap();
+        assert_eq!(edited.name, "Supervisión");
+        assert_eq!(edited.description, None, "an empty description clears the field");
+        let admin_role = service.roles.find_by_code("admin").await.unwrap().unwrap();
+        let renamed = service
+            .update_role(&permissions, actor.id, admin_role.id, "Administración", "El rol de la administración")
+            .await
+            .unwrap();
+        assert_eq!(renamed.name, "Administración");
+        assert!(renamed.is_system, "the edit never touches the flag");
+
+        // Delete: the protected role first, then a held role (naming its
+        // holders), then the unheld role goes through.
+        let err = service
+            .delete_role(&permissions, actor.id, admin_role.id)
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Conflict(m) => assert!(m.contains("rol protegido"), "{m}"),
+            other => panic!("expected the protected-role conflict, got {other:?}"),
+        }
+        service
+            .roles
+            .grant(&NewUserRole { user_id: actor.id, role_id: created.id, granted_by: actor.id })
+            .await
+            .unwrap();
+        let err = service
+            .delete_role(&permissions, actor.id, created.id)
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Conflict(m) => {
+                assert!(m.contains(actor.username.as_str()), "the refusal must NAME the blocking user: {m}");
+                assert!(m.contains("No se puede eliminar"), "{m}");
+            }
+            other => panic!("expected the holders conflict, got {other:?}"),
+        }
+        assert!(service.roles.find_by_id(created.id).await.unwrap().is_some());
+        // Nobody holds it now: the deletion goes through.
+        service.roles.revoke(actor.id, created.id).await.unwrap();
+        service.delete_role(&permissions, actor.id, created.id).await.unwrap();
+        assert!(service.roles.find_by_id(created.id).await.unwrap().is_none());
+    }
+
+    /// The matrix read and its replacement: the whole 23-row catalog with the
+    /// held ids, and the write resolving the submitted set in ONE
+    /// `find_by_ids` statement (duplicates deduplicated, exactly one call,
+    /// pinned by the counting double) — with the self-lockout rule refusing
+    /// an edit that strips `identity.roles.manage` from a role the ACTOR
+    /// holds, and the same edit succeeding for a role the actor does not
+    /// hold. Nothing is written on the refusal.
+    #[tokio::test]
+    async fn the_matrix_read_and_replacement_resolve_one_statement_and_refuse_the_self_lockout() {
+        let (service, pool) = matrix_svc().await;
+        let holder = seed_user(&service, "supervisor", "initial password 1", true).await;
+        let others = seed_user(&service, "external", "initial password 1", true).await;
+        let visor = service
+            .roles
+            .create(&crate::models::NewRole { code: "visor".into(), name: "Visor".into(), description: None })
+            .await
+            .unwrap();
+        service
+            .roles
+            .grant(&NewUserRole { user_id: holder.id, role_id: visor.id, granted_by: holder.id })
+            .await
+            .unwrap();
+        let roles_manage = permission_id(&pool, "identity.roles.manage").await;
+        let users_read = permission_id(&pool, "identity.users.read").await;
+        // The actor holds visor whose matrix carries the tier (seeded raw
+        // through the real repo write path).
+        SqlitePermissionRepository::new(pool.clone())
+            .set_role_permissions(visor.id, &[roles_manage])
+            .await
+            .unwrap();
+
+        // The read: the whole catalog, the held ids marked.
+        let matrix = service.role_matrix(&SqlitePermissionRepository::new(pool.clone()), visor.id).await.unwrap();
+        assert_eq!(matrix.catalog.len(), 23, "the matrix read is the whole catalog");
+        assert_eq!(matrix.held_ids, vec![roles_manage]);
+        let unknown = service.role_matrix(&SqlitePermissionRepository::new(pool.clone()), 999_999).await;
+        match unknown {
+            Err(AppError::NotFound(m)) => assert!(m.contains("El rol no existe"), "{m}"),
+            other => panic!("expected the Spanish not-found, got {other:?}"),
+        }
+
+        // The counting double watches find_by_ids.
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let permissions = CountingMatrixLookups {
+            inner: SqlitePermissionRepository::new(pool.clone()),
+            calls: calls.clone(),
+        };
+
+        // The self-lockout: the ACTOR holds visor; stripping its tier is
+        // refused before any write, and the submitted set (with a duplicate)
+        // resolved in exactly ONE deduplicated call.
+        let err = service
+            .set_role_matrix(
+                &permissions,
+                holder.id,
+                visor.id,
+                &[users_read, permission_id(&pool, "dashboard.read").await, users_read],
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Forbidden(m) => {
+                assert!(m.contains("No podés"), "{m}");
+                assert!(m.contains("identity.roles.manage"), "{m}");
+            }
+            other => panic!("expected the self-lockout refusal, got {other:?}"),
+        }
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the submitted set must resolve through ONE find_by_ids call: {recorded:?}"
+        );
+        let mut handed = recorded[0].clone();
+        handed.sort_unstable();
+        assert_eq!(
+            handed,
+            {
+                let mut expected = vec![users_read, permission_id(&pool, "dashboard.read").await];
+                expected.sort_unstable();
+                expected
+            },
+            "the one call must carry the deduplicated submitted set"
+        );
+        assert_eq!(
+            SqlitePermissionRepository::new(pool.clone())
+                .codes_for_role(visor.id)
+                .await
+                .unwrap(),
+            vec!["identity.roles.manage".to_string()],
+            "the refused edit writes nothing"
+        );
+
+        // The same removal on a role the actor does NOT hold is legitimate
+        // administration and goes through: `others` holds the tier through a
+        // different role, never the one being edited.
+        let manager = service
+            .roles
+            .create(&crate::models::NewRole { code: "gestor".into(), name: "Gestor".into(), description: None })
+            .await
+            .unwrap();
+        SqlitePermissionRepository::new(pool.clone())
+            .set_role_permissions(manager.id, &[roles_manage])
+            .await
+            .unwrap();
+        service
+            .roles
+            .grant(&NewUserRole { user_id: others.id, role_id: manager.id, granted_by: others.id })
+            .await
+            .unwrap();
+        let target_role = service
+            .roles
+            .create(&crate::models::NewRole { code: "libre".into(), name: "Libre".into(), description: None })
+            .await
+            .unwrap();
+        SqlitePermissionRepository::new(pool.clone())
+            .set_role_permissions(target_role.id, &[roles_manage, users_read])
+            .await
+            .unwrap();
+        service
+            .set_role_matrix(&permissions, others.id, target_role.id, &[users_read])
+            .await
+            .unwrap();
+        assert_eq!(
+            SqlitePermissionRepository::new(pool.clone())
+                .codes_for_role(target_role.id)
+                .await
+                .unwrap(),
+            vec!["identity.users.read".to_string()],
+        );
+    }
+
+    /// The protected matrix refusal is the SERVICE's own message, not the
+    /// database backstop's: the guard refuses the whole edit class BEFORE any
+    /// statement reaches SQLite, whose trigger only blocks the removal half
+    /// of the replacement. The distinction is observable twice: the words
+    /// («editar la matriz de un rol protegido», the sentence AC13 pins on the
+    /// screen, against the trigger's mapped «quitar permisos a un rol
+    /// protegido») and the error precedence (a refused protected edit must
+    /// not surface the form validation for a permission id that does not
+    /// exist). Disabling the service check leaves the screen test green — the
+    /// trigger plus its mapping satisfy it — so this test is the one that
+    /// tells the guard apart from its backstop.
+    #[tokio::test]
+    async fn the_service_refuses_a_protected_role_matrix_edit_with_its_own_reason() {
+        let (service, pool) = matrix_svc().await;
+        let actor = seed_user(&service, "hr-actor", "initial password 1", true).await;
+        let permissions = FixedPermissions(vec![ROLES_MANAGE_CODE.to_string()]);
+        let admin = service.roles.find_by_code("admin").await.unwrap().unwrap();
+        let users_read = permission_id(&pool, "identity.users.read").await;
+        for submitted in [
+            vec![],              // the empty replacement: the removal half
+            vec![users_read],    // a real id: still refused, nothing written
+            vec![999_999],       // a non-existent id: refused BEFORE the form validation
+        ] {
+            let err = service
+                .set_role_matrix(&permissions, actor.id, admin.id, &submitted)
+                .await
+                .unwrap_err();
+            match err {
+                AppError::Conflict(m) => {
+                    assert!(
+                        m.contains("editar la matriz de un rol protegido"),
+                        "the service's own reason, not the database backstop's: {m}"
+                    );
+                    assert!(!m.contains("quitar permisos"), "no trigger-mapped text here: {m}");
+                }
+                other => panic!("expected the protected matrix conflict, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            SqlitePermissionRepository::new(pool.clone())
+                .codes_for_role(admin.id)
+                .await
+                .unwrap()
+                .len(),
+            23,
+            "the protected role's matrix is untouched"
+        );
     }
 }

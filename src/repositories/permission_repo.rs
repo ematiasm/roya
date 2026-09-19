@@ -24,10 +24,18 @@ fn row_to_permission(row: &sqlx::sqlite::SqliteRow) -> Permission {
 fn map_db_err(e: sqlx::Error) -> AppError {
     let s = e.to_string();
     if s.contains("protected role permissions cannot be removed") {
-        // The guard trigger: a protected role's matrix rows are permanent.
-        AppError::Conflict("protected role permissions cannot be removed".into())
+        // The guard trigger (AC13), ledger item closed by S4: the matrix
+        // editor is the screen path that reaches this statement, and its
+        // refusal is the Spanish conflict the interface explains — never the
+        // raw trigger text and never an English message the operator reads
+        // in the notice box.
+        AppError::Conflict(
+            "No se puede quitar permisos a un rol protegido: su matriz está protegida por la base de datos.".into(),
+        )
     } else if s.contains("FOREIGN KEY constraint failed") {
-        AppError::Validation("invalid role or permission reference".into())
+        // The matrix editor pre-validates the submitted ids in one statement,
+        // so a FK here is the backstop for the check-to-write window.
+        AppError::Validation("Uno de los permisos indicados no existe.".into())
     } else {
         AppError::Database(e)
     }
@@ -47,6 +55,12 @@ pub trait PermissionRepository: Send + Sync {
     /// the guard trigger for the protected role).
     async fn set_role_permissions(&self, role_id: i64, permission_ids: &[i64])
         -> AppResult<()>;
+    /// The catalog rows whose ids exist, resolved in ONE statement — the
+    /// matrix form's whole submitted set, the same contract
+    /// `RoleRepository::find_by_ids` carries for the assignment form: one
+    /// round trip, never one query per id, and the caller diffs the submitted
+    /// set against the answer.
+    async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<Permission>>;
 }
 
 #[derive(Clone)]
@@ -139,5 +153,26 @@ impl PermissionRepository for SqlitePermissionRepository {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<Permission>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One statement, one bind per id (the QueryBuilder keeps every id
+        // bound, never interpolated — the sqlx 0.9 audit rule), mirroring
+        // `RoleRepository::find_by_ids`.
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT id, code, module, action, description, created_at FROM permissions WHERE id IN (",
+        );
+        {
+            let mut separated = qb.separated(", ");
+            for id in ids {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+        }
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(row_to_permission).collect())
     }
 }

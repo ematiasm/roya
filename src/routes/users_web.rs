@@ -774,7 +774,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let html = body_string(resp).await;
         assert!(html.contains("test-admin"), "{html:.400}");
-        for absent in ["Nuevo usuario", "Desactivar", "Roles", "Contraseña"] {
+        for absent in ["Nuevo usuario", "Desactivar", ">Roles</button>", "Contraseña"] {
             assert!(
                 !html.contains(absent),
                 "a read-only principal must not see {absent}: {html:.600}"
