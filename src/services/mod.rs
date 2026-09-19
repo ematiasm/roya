@@ -2,6 +2,7 @@ pub mod account;
 pub mod customer_receipts;
 pub mod customers;
 pub mod finance_methods;
+pub mod identity;
 pub mod inventory;
 pub mod purchases;
 pub mod sales;
@@ -12,6 +13,9 @@ pub use account::AccountService;
 pub use customer_receipts::CustomerReceiptService;
 pub use customers::CustomerService;
 pub use finance_methods::PaymentMethodService;
+// Unused until the S1b router wiring consumes the identity service.
+#[allow(unused_imports)]
+pub use identity::IdentityService;
 pub use inventory::InventoryService;
 pub use purchases::PurchasesService;
 pub use sales::SalesService;

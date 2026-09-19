@@ -3,6 +3,7 @@ mod error;
 mod models;
 mod repositories;
 mod routes;
+mod security;
 mod services;
 #[cfg(test)]
 mod smoke_tests;

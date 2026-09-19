@@ -16,6 +16,19 @@ pub enum AppError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// Identity authentication refused (401). The login flow always carries a
+    /// fixed generic message so unknown user, wrong password and inactive user
+    /// are indistinguishable by status, body or wording.
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+
+    /// Identity authorization refused (403): the principal is authenticated
+    /// but lacks the permission the handler declares. Constructed by the
+    /// `Require<P>` extractor, which arrives with the S1b wiring.
+    #[allow(dead_code)]
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -29,6 +42,8 @@ impl IntoResponse for AppError {
             Self::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             Self::Validation(m) => (StatusCode::BAD_REQUEST, m.clone()),
             Self::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
+            Self::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.clone()),
+            Self::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             Self::Database(e) => {
                 tracing::error!(error = %e, "database error");
                 // Map unique constraint to 409

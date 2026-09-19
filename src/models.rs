@@ -1236,6 +1236,108 @@ pub struct ReceiptDetail {
     pub method_name: String,
 }
 
+// ---------------------------------------------------------------------------
+// M5 identity kernel (Slice S1a). Users and sessions only: RBAC roles,
+// permissions and the audit columns arrive in later slices. The ordinary
+// `User` read never carries `password_hash`; `UserWithHash` exists only for
+// the credential-verification path and is deliberately not `Serialize`, so
+// the PHC string can never ride a response. Sessions store the sha256 digest
+// of the cookie token (`token_hash`), never the token itself.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)] // service methods are wired into the router in slice S1b
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub is_active: bool,
+    pub must_change_password: bool,
+    pub last_login_at: Option<chrono::NaiveDateTime>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// A user together with its argon2id PHC string. Constructed only by the
+/// authentication read paths (`find_with_hash_by_*`) and consumed only by
+/// `IdentityService` when verifying a credential; it must never be serialized.
+/// `Debug` is hand-written so a log line can never print the stored verifier.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct UserWithHash {
+    pub user: User,
+    pub password_hash: String,
+}
+
+impl std::fmt::Debug for UserWithHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserWithHash")
+            .field("user", &self.user)
+            .field("password_hash", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Service-level input for user creation. `password_hash` arrives already
+/// hashed; plaintext passwords never enter the repository layer. `Debug` is
+/// hand-written so logs and test output cannot print the hash material.
+#[allow(dead_code)]
+#[derive(Clone)]
+pub struct NewUser {
+    pub username: String,
+    pub display_name: String,
+    pub password_hash: String,
+    pub must_change_password: bool,
+}
+
+impl std::fmt::Debug for NewUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewUser")
+            .field("username", &self.username)
+            .field("display_name", &self.display_name)
+            .field("password_hash", &"<redacted>")
+            .field("must_change_password", &self.must_change_password)
+            .finish()
+    }
+}
+
+// No `Serialize`: the session row carries `token_hash`, and nothing in this
+// slice serializes it — any future response view must be a dedicated DTO.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct Session {
+    pub id: i64,
+    /// sha256 (base64url) of the cookie token; the raw token is never stored.
+    pub token_hash: String,
+    pub user_id: i64,
+    pub created_at: chrono::NaiveDateTime,
+    pub expires_at: chrono::NaiveDateTime,
+    pub last_seen_at: chrono::NaiveDateTime,
+    pub revoked_at: Option<chrono::NaiveDateTime>,
+    pub user_agent: Option<String>,
+}
+
+/// Service-level input for session creation. `expires_at` and the matching
+/// `last_seen_at` come from the injected clock.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct NewSession {
+    pub token_hash: String,
+    pub user_id: i64,
+    pub expires_at: chrono::NaiveDateTime,
+    pub last_seen_at: chrono::NaiveDateTime,
+    pub user_agent: Option<String>,
+}
+
+/// What request authentication resolves: the acting user plus the live
+/// session row. No secrets: the token itself never survives login.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct ResolvedSession {
+    pub user: User,
+    pub session: Session,
+}
+
 impl ReceiptDetail {
     pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>) -> Self {
         let total = allocations.iter().map(|payment| payment.amount).sum();
