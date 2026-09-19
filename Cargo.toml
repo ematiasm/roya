@@ -23,4 +23,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dotenvy = "0.15"
 anyhow = "1"
 async-trait = "0.1"
+argon2 = "0.5"
+sha2 = "0.10"
+getrandom = "0.2"
+base64 = "0.22"
 

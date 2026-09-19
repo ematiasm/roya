@@ -1,9 +1,10 @@
 # Tasks: add-identity-module
 
 ## Review Workload Forecast
-- Estimated: ~5,300 lines across 15 slices — Phase A (authorization) ~3,400 lines in 9 slices (S1b alone
-  ~800-1,000, dominated by mechanical test-cookie plumbing), Phase B (audit) ~1,900 lines in 6 slices.
-  Slices are chained branches, one PR each.
+- Estimated: ~7,000-7,700 lines across 15 slices. Phase A (authorization) ~5,500 in 9 slices — S1a came
+  in at ~2,500 lines (kernel core: 2,313 new + 201 modified, with roughly a third of it tests), S1b ~900
+  dominated by mechanical test-cookie plumbing, and S2-S8 ~2,000 together. Phase B (audit) ~1,900 in 6
+  slices. Slices are chained branches, one PR each.
 - Chained PRs recommended: **Yes — every slice.**
 - 400-line budget risk: **High** for every slice, and extreme if Phase A were attempted as one PR.
 - Decision needed before apply: **Yes** — the user decides whether Phase B runs immediately after Phase A
@@ -12,19 +13,32 @@
 ## Phase A — authorization
 
 ### S1a — identity kernel core (additive, router untouched)
-- [ ] T1: dependencies (`argon2`, and the already-locked `sha2`, `getrandom`, `base64`), `security/password.rs`
+- [x] T1: dependencies (`argon2`, and the already-locked `sha2`, `getrandom`, `base64`), `security/password.rs`
       with the production parameters and a light test hasher, plus the test that pins the production cost.
-- [ ] T2: migrations `create_identity_users` and `create_identity_sessions` with the triggers.
-- [ ] T3: models `User` (no hash), `UserWithHash` (authentication only), `NewUser`, `Session`, `NewSession`,
+- [x] T2: migrations `create_identity_users` and `create_identity_sessions` with the triggers.
+- [x] T3: models `User` (no hash), `UserWithHash` (authentication only), `NewUser`, `Session`, `NewSession`,
       plus the `error.rs` variants for unauthorized (401) and forbidden (403), mapping to the existing
       JSON response shape.
-- [ ] T4: `UserRepository` and `SessionRepository` traits and SQLite impls (validity decided in SQL).
-- [ ] T5: `AuthService` (the identity service): bootstrap admin, login with constant-time verification and
+- [x] T4: `UserRepository` and `SessionRepository` traits and SQLite impls (validity decided in SQL).
+- [x] T5: `AuthService` (the identity service): bootstrap admin, login with constant-time verification and
       the generic failure, in-memory throttle with an injected clock, session mint/resolve/renew/revoke,
       logout. Tests for AC1, AC4-AC9, AC23.
 
+S1a closed by three verification rounds: 359 baseline → 410 tests, 0 failures. Round one found two tests that
+could not detect the property they named plus the timestamp-encoding bug behind `prune` (now AC25); round two
+found a throttle-cap regression introduced by round one's fix; round three broke each fix on purpose and
+confirmed every one of them fails when reverted. See `odd/tasks/identity-rbac.md` for the mutation tables and
+the residual risks S1b inherits.
+
 ### S1b — the wiring (the one unavoidably large slice)
 - [ ] T6: `security/guard.rs` middleware with the public allowlist and the three refusal shapes.
+- [ ] T6b: remove every temporary `#[allow(dead_code)]` / `#[allow(unused_imports)]` attribute that S1a
+      added (15 of them, in `security/mod.rs`, `repositories/{user,session}_repo.rs`, `services/identity.rs`,
+      `models.rs`, `error.rs`, `repositories/mod.rs`, `services/mod.rs`): once the router consumes the kernel
+      they are no longer honest, and the slice is not done until `grep -rn 'allow(dead_code)\|allow(unused_imports)'
+      src/security src/services/identity.rs src/repositories/user_repo.rs src/repositories/session_repo.rs`
+      returns only genuinely justified entries (S1a suppressed 48 warnings with them, so leaving them is
+      leaving 48 warnings hidden).
 - [ ] T7: `identity_web.rs` (`GET /login`, `POST /login`, `POST /logout`) and `identity_api.rs`
       (`POST`/`DELETE /api/sessions`), the login template, `AppState` and `main.rs` wiring, environment
       variables, CORS narrowed from the wildcard.
@@ -78,6 +92,10 @@
 ## Verify
 - [ ] `cargo test` green at the end of every slice, with the new tests present and the regression tests
       validated by reintroducing the bug in a throwaway copy.
+- [ ] Every test that claims a guard must be mutation-validated: S1a shipped two tests whose names asserted
+      properties they could not detect (`ac5_success_clears_the_counter`, the prune revoked branch), both
+      caught by independent verification and fixed. No slice closes without its own mutation table.
+- [ ] AC25 holds for every new comparison against a database-written timestamp.
 - [ ] `cargo check --all-targets` with no new errors.
 - [ ] Browser suite green for the identity slice, plus a manual smoke per enforcement slice: log in as a
       restricted user, confirm the refused action is refused at the handler.

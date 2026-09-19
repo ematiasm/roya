@@ -14,8 +14,8 @@
   deleted, they are deactivated; an inactive user cannot log in and cannot hold a session.
 
 ### sessions
-- `id PK`, `token_hash TEXT NOT NULL UNIQUE` (sha256 hex of the cookie token; the token itself is never
-  stored)
+- `id PK`, `token_hash TEXT NOT NULL UNIQUE` (the sha256 digest of the cookie token, base64url-encoded;
+  the token itself is never stored)
 - `user_id NOT NULL REFERENCES users(id) ON DELETE CASCADE`
 - `created_at`, `expires_at`, `last_seen_at` NOT NULL, `revoked_at TEXT NULL`, `user_agent TEXT NULL` (≤ 256)
 - Indexes on `user_id`, `expires_at`.
@@ -77,8 +77,8 @@
 ## Rules
 - **Authentication.** `POST /login` verifies the password against the stored argon2id hash in constant
   time. Unknown username, wrong password and inactive user all answer the same message ("Usuario o
-  contraseña incorrectos") with the same status, and the password verification is performed even when the
-  username does not exist so the answer time does not leak existence. On success: a new session row, the
+  contraseña incorrectos") with the same status, and a cost-equivalent argon2 hash of a dummy credential is
+  computed even when the username does not exist, so the answer time does not leak existence. On success: a new session row, the
   `Set-Cookie` header, `last_login_at` updated, and a redirect to `/` or to the validated `next` path.
 - **Throttling.** Five consecutive failures for the same username (case-insensitive) start a 60-second
   cooldown during which every attempt for that username is refused before the password is verified. A
@@ -147,13 +147,15 @@
       JSON for `/api/*`, `401` + `HX-Redirect` for `HX-Request`.
 - [ ] AC3: a request to a deliberately unannotated handler is still refused, proving deny-by-default.
 - [ ] AC4: unknown username, wrong password and inactive user produce the same message and status, and a
-      non-existent username still costs a password verification.
+      non-existent username still costs cost-equivalent argon2 work (a full-cost hash of a dummy credential
+      with the production parameters).
 - [ ] AC5: five consecutive failures throttle the next attempt before verification; a success clears the
       counter; the cooldown expires.
 - [ ] AC6: a successful login creates one session row whose `token_hash` is the sha256 of the cookie value
       and whose raw token appears in no table, log or template.
 - [ ] AC7: a session whose `expires_at` has passed is refused although the row still exists; a revoked
-      session is refused immediately; revoking twice is idempotent; `revoked_at` cannot be cleared.
+      session is refused immediately; a session whose owning user has been deactivated is refused exactly
+      like an unknown token; revoking twice is idempotent; `revoked_at` cannot be cleared.
 - [ ] AC8: activity after 30 idle minutes extends `expires_at`; activity before it does not.
 - [ ] AC9: logout clears the cookie, revokes the row, and works with an already-invalid token.
 - [ ] AC10: a handler declaring a permission the principal lacks is refused with `403` — JSON for `/api/*`
@@ -185,3 +187,7 @@
 - [ ] AC23: no password, token or hash appears in any response body, log line or template.
 - [ ] AC24: the existing HTTP tests authenticate through the shared kernel test helper, and no test-only
       authentication bypass exists in non-test code (verified by grep for a test/flag branch in the guard).
+- [ ] AC25: every timestamp the code binds or writes uses the SQLite ISO-Z form
+      (`%Y-%m-%dT%H:%M:%S%.3fZ`), proven by a test that crosses the boundary — a column written by the
+      database compared against a Rust-bound value of the same instant, in the direction the comparison
+      runs. A mixed encoding must fail that test.

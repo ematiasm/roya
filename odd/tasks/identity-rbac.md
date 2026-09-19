@@ -82,7 +82,10 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
 - Verificación independiente por slice (`gentle-ai-verify`) antes del PR de cada una
 
 ## Tasks
-- [ ] S1 — Fundación de autenticación (T1–T8)
+- [x] S1a — Núcleo del kernel de identidad (T1–T5): deps, migraciones `users`/`sessions`, modelos, repos,
+      `IdentityService`, 43 tests propios. Sin router: aditivo.
+- [ ] S1b — El wiring: middleware + login/logout + API de sesiones + `test_support` + plumbing de cookie en
+      los ~160 tests HTTP existentes + borrar los 15 `#[allow]` temporales (T6, T6b, T7, T8)
 - [ ] S2 — Núcleo RBAC: catálogo, guardas, `Require<P>` (T9–T12)
 - [ ] S3 — Administración de usuarios + cambio de contraseña obligatorio (T13–T15)
 - [ ] S4 — Administración de roles y matriz de permisos (T16–T17)
@@ -96,15 +99,64 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
 - 2026-09-18: reconocimiento del repo (sin auth, convención de departamentos, invariantes),
   preguntas de diseño respondidas por el usuario, artefactos OpenSpec escritos, rama
   `feat/identity-rbac` creada desde `main` limpio (`38bf6b5`).
+- 2026-09-18: **S1a implementada y verificada** por un writer delegado y un verificador independiente
+  (`gentle-ai-verify`). División de S1 en S1a/S1b decidida al escribir el brief: S1a es aditiva (el router
+  no se toca) y S1b es el cambio rompiente, así que el presupuesto de revisión no se junta en un solo PR.
+  El writer frenó una vez con un bloqueo legítimo —`src/security/` no compila sin `mod security;` en
+  `src/main.rs`, que mi brief había excluido— y se resolvió autorizando esa única línea.
 
 ## Verification evidence
 Pendiente por slice; se registra acá con el comando, el resultado y el hash del commit de la
 unidad de trabajo.
 
+### S1a — `cargo test` 402 passed / 0 failed · `cargo check --all-targets` 0 errores
+- Baseline medido en un clon limpio de `f560e44`: **359 passed / 0 failed**. El 359 del verificador es el
+  número autoritativo; los 351/169/324 de observaciones viejas son históricos.
+- Primera pasada del writer: 391 passed. Verificación independiente: **PASS-WITH-FINDINGS**, con dos tests
+  que no probaban lo que su nombre afirma (probado con mutaciones) y un bug de encoding.
+- Ronda de corrección (10 hallazgos): 402 passed / 0 failed, 11 tests nuevos, 5 mutaciones re-ejecutadas.
+- Hallazgos que valen la pena recordar:
+  - **F3 (bug real, no del brief):** DB escribe `…T00:49:59.249Z`, Rust bindeaba `… 00:49:59`; `'T'` > `' '`,
+    así que `revoked_at <= ?` nunca matcheaba una fila del mismo día y `prune` no borraba sesiones
+    revocadas hasta el día siguiente. Ahora hay un encoder único en `src/db.rs` y el AC25 lo sella con un
+    test que cruza el borde DB↔Rust.
+  - **F1/F2 (cobertura falsa):** `ac5_success_clears_the_counter` pasaba con `clear_attempts` en no-op, y
+    borrar `AND u.is_active = 1` de `resolve_valid` dejaba la suite verde. Los dos son ahora
+    mutation-validados.
+  - **F5/F4/F6:** `Debug` filtraba el PHC; input inválido salía como 500 en vez de `Validation`; el bootstrap
+    chocaba (`Conflict`) si `admin` existía inactivo.
+  - **Deuda de F5:** la slice agrega 15 `#[allow]` que suprimen 51 warnings de bin (54 en `--all-targets`) del
+    código nuevo: el «cero warnings nuevos» del writer era cierto *por supresión*, y los dos primeros
+    números que circulamos (48) eran de una lectura parcial. S1b los borra: quedó como criterio de cierre T6b.
+
+### Segunda y tercera ronda (verificación → corrección → verificación)
+- La re-verificación de la ronda de corrección dio **COMMIT WITH NOTED RISK**: los 10 hallazgos confirmados
+  arreglados, y **un defecto nuevo introducido por el arreglo de F8** — el `retain` del throttle conservaba
+  para siempre las entradas parciales (`cooldown_until == None`), así que 1.024 usernames distintos saturaban
+  el mapa de forma permanente y a partir de ahí las claves nuevas no se trackeaban (brute force sin cooldown).
+  Los dos tests de F8 lo ocultaban porque usaban `max_failures: 1`, una configuración incapaz de producir el
+  estado que decían acotar. Lo probó con el default real (`max_failures: 5`).
+- Ronda final (presupuesto duro de 15 min, reusando el `target/` tibio — la ronda anterior se colgó 30 min
+  pagando un rebuild en frío por mutación): el decay por `last_failure` quedó con horizonte configurable
+  (15 min, documentado contra el cooldown de 60 s), y **7 mutaciones independientes** confirman que cada
+  arreglo rompe un test al revertirlo. Veredicto: **SAFE TO COMMIT**.
+- Números del verificador sobre el tradeoff residual: el plateau sostenido por username es **~295 intentos/h**
+  y lo fija el cooldown (que ya reiniciaba el contador en la ronda 1), no el decay; un atacante pausado baja
+  a ~16-20/h. Sostener la saturación del mapa exige ~85 hashes argon2/s continuos. No es un agujero nuevo.
+- Cautela metodológica aprendida: restaurar un archivo con `cp -a` conserva el mtime viejo y cargo puede
+  reusar el artefacto mutado en silencio (al verificador le leyó 406/4 en vez de 410/0). `touch` después de
+  restaurar, siempre.
+
 ## Carga de revisión
-14 slices encadenadas; Fase A ~2,600 líneas, Fase B ~1,900. Cada slice supera el presupuesto de
-400 líneas por sí sola, así que los PRs encadenados son la regla y no una preferencia. Corte
-natural: Fase A entrega un producto coherente (identidad + autorización) y Fase B puede esperar.
+14 slices encadenadas más S1a/S1b (15 en total): Fase A ~5,500 líneas, Fase B ~1,900. S1a sola midió ~2,500
+líneas (2,313 nuevas + 201 modificadas). Cada slice supera el presupuesto de 400 líneas por sí sola, así
+que los PRs encadenados son la regla y no una preferencia. Corte natural: Fase A entrega un producto
+coherente (identidad + autorización) y Fase B puede esperar.
 
 ## Next step
-S1 T1–T2: dependencias, `security/password.rs` y las dos primeras migraciones.
+S1b: middleware de negación por defecto, `/login`+`/logout`, `POST`/`DELETE /api/sessions`,
+`security/test_support.rs`, y el plumbing de cookie en los ~160 tests HTTP existentes.
+
+Riesgos residuales que S1b hereda y debe mirar: el throttle es en memoria y por proceso (documentado);
+mientras el mapa esté saturado una clave nueva no se trackea (ventana acotada, autocurativa, con el costo de
+argon2 como limitador real); y los 15 `#[allow]` temporales, cuyo borrado es criterio de cierre.
