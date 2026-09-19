@@ -10,6 +10,7 @@ pub mod purchases_web;
 pub mod sales_api;
 pub mod sales_web;
 pub mod suppliers_web;
+pub mod users_web;
 pub mod web;
 
 use axum::{http::StatusCode, response::IntoResponse, Json, Router};
@@ -269,6 +270,7 @@ pub fn router(state: AppState) -> Router {
         .merge(purchases_api::router())
         .merge(purchases_web::router())
         .merge(suppliers_web::router())
+        .merge(users_web::router())
         .nest_service("/static", ServeDir::new("static"))
         .fallback(route_not_found)
         // Deny by default (S1b part 2): one gate in front of every route and

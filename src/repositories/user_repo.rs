@@ -40,10 +40,17 @@ fn map_db_err(e: sqlx::Error) -> AppError {
         if s.contains("username") {
             // The NOCASE unique index is the backstop the service already
             // checks for; a race between two creates lands here, not in a 500.
-            AppError::Conflict("username already exists".into())
+            AppError::Conflict("El nombre de usuario ya existe.".into())
         } else {
-            AppError::Conflict("user already exists".into())
+            AppError::Conflict("El usuario ya existe.".into())
         }
+    } else if s.contains("cannot deactivate the last active user holding a protected role") {
+        // The guard trigger (AC14): the database refuses to leave the shop
+        // without an active administrator. The interface explains the rule,
+        // never the trigger string.
+        AppError::Conflict(
+            "No se puede desactivar: es el último usuario activo que sostiene un rol protegido. Primero asigná el rol a otro usuario.".into(),
+        )
     } else if s.contains("FOREIGN KEY constraint failed") {
         // user_roles.granted_by is ON DELETE RESTRICT (and a role holder's own
         // grant records the user too): a role grant records who granted it,
@@ -52,10 +59,12 @@ fn map_db_err(e: sqlx::Error) -> AppError {
     } else if s.contains("CHECK constraint failed") {
         if s.contains("users_username_shape") {
             AppError::Validation(
-                "username must be 3-64 lowercase ASCII characters (letters, digits, dot, underscore, hyphen)".into(),
+                "El nombre de usuario debe tener entre 3 y 64 caracteres: letras minúsculas, números y . _ - (sin espacios ni mayúsculas).".into(),
             )
         } else if s.contains("users_display_name_shape") {
-            AppError::Validation("display name must be 1-128 characters".into())
+            AppError::Validation(
+                "El nombre para mostrar debe tener entre 1 y 128 caracteres.".into(),
+            )
         } else {
             AppError::Validation("user fields violate schema rules".into())
         }
@@ -79,6 +88,9 @@ pub trait UserRepository: Send + Sync {
     async fn set_must_change_password(&self, id: i64, value: bool) -> AppResult<()>;
     async fn set_active(&self, id: i64, active: bool) -> AppResult<()>;
     async fn touch_last_login(&self, id: i64, when: NaiveDateTime) -> AppResult<()>;
+    /// Every user, creation order (the S3 users list read). The ordinary
+    /// read: no hash material.
+    async fn list(&self) -> AppResult<Vec<User>>;
 }
 
 // S1a's `count_active_admins` lived here as a username shortcut, with a note
@@ -196,7 +208,10 @@ impl UserRepository for SqliteUserRepository {
         .bind(if active { 1i64 } else { 0i64 })
         .bind(id)
         .execute(&self.pool)
-        .await?;
+        .await
+        // The deactivation guard trigger (AC14) refuses through this write,
+        // so the refusal must be mapped here, not left as a raw 500.
+        .map_err(map_db_err)?;
         Ok(())
     }
 
@@ -209,6 +224,17 @@ impl UserRepository for SqliteUserRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn list(&self) -> AppResult<Vec<User>> {
+        let rows = sqlx::query(
+            r#"SELECT id, username, display_name, is_active, must_change_password,
+                      last_login_at, created_at, updated_at
+               FROM users ORDER BY id"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_user).collect())
     }
 }
 
@@ -251,7 +277,10 @@ mod tests {
             AppError::Validation(m) => m.clone(),
             other => panic!("expected Validation, got {other:?}"),
         };
-        assert!(msg.contains("username"), "message must name the rule: {msg}");
+        assert!(
+            msg.contains("nombre de usuario"),
+            "message must name the rule (Spanish operator copy): {msg}"
+        );
     }
 
     #[tokio::test]
@@ -277,7 +306,10 @@ mod tests {
             AppError::Validation(m) => m.clone(),
             other => panic!("expected Validation, got {other:?}"),
         };
-        assert!(msg.contains("display name"), "message must name the field: {msg}");
+        assert!(
+            msg.contains("nombre para mostrar"),
+            "message must name the field (Spanish operator copy): {msg}"
+        );
     }
 
     /// A role grant records who granted it (`user_roles.granted_by ... ON

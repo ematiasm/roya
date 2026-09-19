@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use chrono::{Duration, NaiveDateTime};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewSession, NewUserRole, ResolvedSession, Session, User};
+use crate::models::{
+    NewSession, NewUser, NewUserRole, ResolvedSession, Role, Session, User, UserWithRoles,
+};
 use crate::repositories::{
     PermissionRepository, RoleRepository, SessionRepository, UserRepository,
 };
@@ -36,6 +38,56 @@ pub const GENERIC_LOGIN_FAILURE: &str = "Usuario o contraseña incorrectos";
 const DUMMY_CREDENTIAL: &str = "roya-identity-verification-dummy";
 /// Minimum accepted new password length (`POST /password`, spec Rules).
 const MIN_PASSWORD_LEN: usize = 12;
+/// The one Spanish message every password rule below the minimum reports, so
+/// the login change form, user creation and the admin reset all say the same
+/// thing about the same rule.
+const MIN_PASSWORD_MESSAGE: &str = "La contraseña debe tener al menos 12 caracteres.";
+/// Username shape (spec: `^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`, 3-64). The
+/// schema CHECK is the backstop; the service reports the rule in Spanish
+/// before the write is attempted.
+const USERNAME_SHAPE_MESSAGE: &str = "El nombre de usuario debe tener entre 3 y 64 caracteres: sólo letras minúsculas, números y . _ - (sin espacios, empezando y terminando con letra o número).";
+/// Display name rule (spec: 1-128 characters).
+const DISPLAY_NAME_MESSAGE: &str = "El nombre para mostrar debe tener entre 1 y 128 caracteres.";
+/// The one Spanish message for the rule that closes the assignment takeover:
+/// nobody — with any permission — changes their own roles. The interface
+/// hides the action for self; the refusal must be real regardless.
+const SELF_ROLE_CHANGE_MESSAGE: &str = "No podés cambiar tus propios roles: pedí el cambio a otro administrador.";
+/// The tier rule of the admin password reset (spec, "Admin password reset"):
+/// taking over an account that administers the instance is a decision about
+/// the administration, so it belongs to the `identity.roles.manage` tier. An
+/// actor holding only `identity.users.manage` cannot reset a protected
+/// holder's password at all, which closes the takeover path outright.
+const PROTECTED_RESET_TIER_MESSAGE: &str = "Restablecer la contraseña de un usuario que sostiene un rol protegido es una decisión de administración: requiere «identity.roles.manage».";
+/// The same tier for role assignment itself: replacing anyone's role set —
+/// granting the protected role, stripping it, creating administrators — is
+/// the decision about the administration, so the rule is checked in the
+/// service too, not only at the endpoint's gate.
+const ASSIGN_TIER_MESSAGE: &str = "Cambiar el conjunto de roles de otro usuario requiere «identity.roles.manage».";
+/// The users screen never exists without it, and neither does the actor: the
+/// permission code the assignment tier gates (kept as a constant so the
+/// service never hardcodes a literal).
+const ROLES_MANAGE_CODE: &str = <crate::security::authz::IdentityRolesManage as crate::security::authz::Permission>::CODE;
+
+/// The one Spanish message every "the target user does not exist" refusal in
+/// the administration flow carries (the interface never shows an id).
+fn user_not_found() -> String {
+    "El usuario no existe.".into()
+}
+
+/// The username shape the schema CHECK backs: 3-64 lowercase ASCII alnum,
+/// with dots/underscores/hyphens allowed in the middle only (spec's
+/// `^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`).
+fn is_valid_username(username: &str) -> bool {
+    let bytes = username.as_bytes();
+    if bytes.len() < 3 || bytes.len() > 64 {
+        return false;
+    }
+    let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    let inner = |c: u8| alnum(c) || c == b'.' || c == b'_' || c == b'-';
+    alnum(bytes[0])
+        && alnum(bytes[bytes.len() - 1])
+        && bytes[1..bytes.len() - 1].iter().all(|c| inner(*c))
+}
 /// Maximum number of distinct usernames the throttle map tracks at once.
 /// Entries only stay while they are load-bearing — an open cooldown window,
 /// or a last failure within `ThrottleConfig::decay` — so the cap's worst
@@ -541,6 +593,15 @@ where
     /// replaced and `must_change_password` is cleared. Nothing is written when
     /// the current password does not verify: the validation runs before the
     /// first write.
+    ///
+    /// Failed current-password attempts share the login's per-username
+    /// in-memory throttle (same map, same config, injected clock): the
+    /// confinement gate makes `/password` the one route a confined session
+    /// can hammer, and without a counter it would be a guessing machine at
+    /// the account's own (possibly temporary, possibly observed) credential.
+    /// The check runs BEFORE verification and a success clears the counter,
+    /// exactly like the login path; the sharing is deliberate — a confined
+    /// session's guessing also cools down that username's login.
     pub async fn change_password(
         &self,
         user_id: i64,
@@ -552,7 +613,15 @@ where
             .find_with_hash_by_id(user_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("user {user_id} not found")))?;
+        let key = with_hash.user.username.to_lowercase();
+        let now = self.clock.now();
+        if self.throttled(&key, now) {
+            // Same generic refusal as a wrong password: the throttle must not
+            // be distinguishable from a failed attempt.
+            return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.into()));
+        }
         if !self.hasher.verify(current_password, &with_hash.password_hash) {
+            self.record_failure(&key, now);
             return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.into()));
         }
         if new_password.chars().count() < MIN_PASSWORD_LEN {
@@ -568,6 +637,7 @@ where
         let new_hash = self.hasher.hash(new_password)?;
         self.users.update_password_hash(user_id, &new_hash).await?;
         self.users.set_must_change_password(user_id, false).await?;
+        self.clear_attempts(&key);
         self.users
             .find_by_id(user_id)
             .await?
@@ -595,6 +665,224 @@ where
             .revoke_all_for_user_except(user_id, &keep_session.token_hash)
             .await?;
         Ok(())
+    }
+
+    // -- users administration (slice S3 part 2, T13) ---------------------------
+
+    /// Create a user for the administration screen: the username shape and
+    /// its case-insensitive uniqueness, the display name and an initial
+    /// password that satisfies `MIN_PASSWORD_LEN`. The target is flagged
+    /// `must_change_password`: the acting administrator chose the password
+    /// (the same posture as the bootstrap's generated one), so the target's
+    /// first session is confined to the change form until it is replaced.
+    /// Nothing is written on any refusal: the checks run before the hash.
+    pub async fn create_user(
+        &self,
+        username: &str,
+        display_name: &str,
+        password: &str,
+    ) -> AppResult<User> {
+        let username = username.trim();
+        let display_name = display_name.trim();
+        // Case-insensitive uniqueness first: a NOCASE collision with an
+        // existing user is a conflict even when the posted casing would fail
+        // the shape check, so the operator learns the real reason.
+        if let Some(taken) = self.users.find_by_username(username).await? {
+            return Err(AppError::Conflict(format!(
+                "El nombre de usuario «{}» ya existe.",
+                taken.username
+            )));
+        }
+        if !is_valid_username(username) {
+            return Err(AppError::Validation(USERNAME_SHAPE_MESSAGE.into()));
+        }
+        if display_name.is_empty() || display_name.chars().count() > 128 {
+            return Err(AppError::Validation(DISPLAY_NAME_MESSAGE.into()));
+        }
+        if password.chars().count() < MIN_PASSWORD_LEN {
+            return Err(AppError::Validation(MIN_PASSWORD_MESSAGE.into()));
+        }
+        let hash = self.hasher.hash(password)?;
+        self.users
+            .create(&NewUser {
+                username: username.into(),
+                display_name: display_name.into(),
+                password_hash: hash,
+                must_change_password: true,
+            })
+            .await
+    }
+
+    /// Activate or deactivate a user (AC14). Deactivating drops every live
+    /// session of the user: an inactive user cannot hold a session. The
+    /// deactivation guard trigger refuses when this is the last active
+    /// holder of a protected role; the repository maps that refusal to the
+    /// Spanish conflict the interface explains, so the operator never sees
+    /// the trigger string.
+    pub async fn set_user_active(&self, user_id: i64, active: bool) -> AppResult<User> {
+        let existing = self
+            .users
+            .find_by_id(user_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(user_not_found()))?;
+        if existing.is_active == active {
+            // Idempotent: nothing to write and nothing to revoke.
+            return Ok(existing);
+        }
+        self.users.set_active(user_id, active).await?;
+        if !active {
+            self.revoke_all_sessions(user_id).await?;
+        }
+        self.users
+            .find_by_id(user_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(user_not_found()))
+    }
+
+    /// The administrator password reset (spec Rules, "Admin password reset"):
+    /// a temporary password for ANOTHER user, flagged so the target's next
+    /// session is confined to the change form. The resetter's own flag is
+    /// never touched, and their previous password is never shown or read.
+    /// The acting user is refused resetting themselves through this path:
+    /// their own credential change is `/password`, which verifies the
+    /// current password — the check this flow cannot do on their behalf.
+    ///
+    /// The tier rule lives here (the service owns the rule, the route cannot
+    /// know the target's roles declaratively): a target holding a protected
+    /// role is reset only by an actor who holds `identity.roles.manage` —
+    /// whoever holds it decides who administers the instance, so taking over
+    /// one of its accounts is a decision about the administration. An actor
+    /// with only `identity.users.manage` resets the passwords of users
+    /// holding NO protected role: the takeover path of the corrected
+    /// finding is gone. The permission repository rides in as an argument,
+    /// exactly like `effective_permissions` and `assign_roles`.
+    pub async fn admin_reset_password<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        actor_id: i64,
+        target_id: i64,
+        new_password: &str,
+    ) -> AppResult<User> {
+        if actor_id == target_id {
+            return Err(AppError::Validation(
+                "Para cambiar tu propia contraseña usá la página «Cambiar contraseña».".into(),
+            ));
+        }
+        let target = self
+            .users
+            .find_by_id(target_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(user_not_found()))?;
+        if new_password.chars().count() < MIN_PASSWORD_LEN {
+            return Err(AppError::Validation(MIN_PASSWORD_MESSAGE.into()));
+        }
+        let target_holds_protected = self
+            .roles
+            .list_for_user(target_id)
+            .await?
+            .iter()
+            .any(|role| role.is_system);
+        if target_holds_protected {
+            let actor_codes = permissions.effective_for_user(actor_id).await?;
+            if !actor_codes.iter().any(|code| code == ROLES_MANAGE_CODE) {
+                return Err(AppError::Forbidden(PROTECTED_RESET_TIER_MESSAGE.into()));
+            }
+        }
+        let hash = self.hasher.hash(new_password)?;
+        self.users.update_password_hash(target_id, &hash).await?;
+        self.users.set_must_change_password(target_id, true).await?;
+        // No revocation: the target's live sessions stay valid but are
+        // confined to the change form by the flag gate from their very next
+        // request — they can change it right there.
+        Ok(target)
+    }
+
+    /// Replace a user's whole role set (spec, Role assignment). The
+    /// authorization model (written into the spec by the corrected takeover
+    /// finding) lives here, the layer that owns the rule:
+    ///
+    /// 1. The acting principal must hold `identity.roles.manage` — the tier
+    ///    that decides who administers the instance. The endpoint also gates
+    ///    with `Require<IdentityRolesManage>`; the service repeats the check
+    ///    so the rule does not depend on every future route remembering the
+    ///    extractor.
+    /// 2. NOBODY changes their own roles, with any permission. One rule
+    ///    closes both self-escalation (a `identity.users.manage` actor
+    ///    granting itself the protected role) and the self-lockout the old
+    ///    check guarded — and the mirrored case the old check missed. The
+    ///    interface hides the action for self; the refusal here is real.
+    /// 3. The submitted ids are resolved in ONE statement (pinned by the
+    ///    counting-double test: exactly one `find_by_ids` call carrying the
+    ///    whole deduplicated set) and every missing id is a form error, not
+    ///    a 500.
+    ///
+    /// On top of all three, the guard trigger refuses a change that would
+    /// strip the last active protected-role holder — the database's
+    /// backstop, not a substitute for the rules above — and the repository
+    /// maps its refusal. The permission repository rides in as an
+    /// argument, exactly like `effective_permissions`: the wiring owns it,
+    /// the service owns the rule.
+    pub async fn assign_roles<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        actor_id: i64,
+        user_id: i64,
+        role_ids: &[i64],
+    ) -> AppResult<Vec<Role>> {
+        // Rule 1: the tier. The same check the endpoint's gate makes, owned
+        // by the layer the rule belongs to.
+        let actor_codes = permissions.effective_for_user(actor_id).await?;
+        if !actor_codes.iter().any(|code| code == ROLES_MANAGE_CODE) {
+            return Err(AppError::Forbidden(ASSIGN_TIER_MESSAGE.into()));
+        }
+        // The target must exist: a bad id is a form error, not a 500.
+        if self.users.find_by_id(user_id).await?.is_none() {
+            return Err(AppError::NotFound(user_not_found()));
+        }
+        if user_id == actor_id {
+            // Rule 2: nobody edits their own set, with any permission. One
+            // rule closes self-escalation and self-lockout alike.
+            return Err(AppError::Forbidden(SELF_ROLE_CHANGE_MESSAGE.into()));
+        }
+        let mut unique: Vec<i64> = Vec::with_capacity(role_ids.len());
+        for role_id in role_ids {
+            if !unique.contains(role_id) {
+                unique.push(*role_id);
+            }
+        }
+        // One statement for the whole submitted set: a per-id existence
+        // query turned a large form into one round trip per id.
+        let found = self.roles.find_by_ids(&unique).await?;
+        let mut found_ids: Vec<i64> = found.iter().map(|role| role.id).collect();
+        found_ids.sort_unstable();
+        for role_id in &unique {
+            if found_ids.binary_search(role_id).is_err() {
+                return Err(AppError::Validation(
+                    "Uno de los roles indicados no existe.".into(),
+                ));
+            }
+        }
+        self.roles.replace_user_roles(user_id, &unique, actor_id).await
+    }
+
+    /// The users-screen read (spec, "users list"): every user with the roles
+    /// they hold and their state. Composed from the two identity reads —
+    /// one per user — because the role join lives behind the roles
+    /// repository and the user read carries no hash material.
+    pub async fn list_users_with_roles(&self) -> AppResult<Vec<UserWithRoles>> {
+        let mut out = Vec::new();
+        for user in self.users.list().await? {
+            let roles = self.roles.list_for_user(user.id).await?;
+            out.push(UserWithRoles { user, roles });
+        }
+        Ok(out)
+    }
+
+    /// The role list the assignment form renders as checkboxes (S4 owns the
+    /// roles administration screen; this is the read its users-side
+    /// counterpart needs).
+    pub async fn role_list(&self) -> AppResult<Vec<Role>> {
+        self.roles.list().await
     }
 
     // -- mass revocation -----------------------------------------------------------------
@@ -738,6 +1026,88 @@ mod tests {
         }
         async fn prune(&self, _now: NaiveDateTime) -> AppResult<u64> {
             Ok(0)
+        }
+    }
+
+    /// Counting role-repository wrapper: the same double pattern as
+    /// `FailingInsertSessions` above, but a pass-through spy instead of a
+    /// failure — it delegates every call to the real SQLite repository and
+    /// records the `find_by_ids` calls it saw. The assignment contract's
+    /// "the submitted set resolves in ONE statement" is a property of the
+    /// service's call shape, not of the returned set (a per-id loop with the
+    /// same semantics would answer identically), so the assertion has to sit
+    /// here, where the call is observable.
+    struct CountingFindByIds<R: RoleRepository> {
+        inner: R,
+        /// One entry per `find_by_ids` call, holding the ids it was handed.
+        calls: Arc<Mutex<Vec<Vec<i64>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl<R: RoleRepository> RoleRepository for CountingFindByIds<R> {
+        async fn find_by_id(&self, id: i64) -> AppResult<Option<Role>> {
+            self.inner.find_by_id(id).await
+        }
+        async fn find_by_code(&self, code: &str) -> AppResult<Option<Role>> {
+            self.inner.find_by_code(code).await
+        }
+        async fn list(&self) -> AppResult<Vec<Role>> {
+            self.inner.list().await
+        }
+        async fn list_for_user(&self, user_id: i64) -> AppResult<Vec<Role>> {
+            self.inner.list_for_user(user_id).await
+        }
+        async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<Role>> {
+            self.calls.lock().unwrap().push(ids.to_vec());
+            self.inner.find_by_ids(ids).await
+        }
+        async fn count_active_holders(&self, role_id: i64) -> AppResult<i64> {
+            self.inner.count_active_holders(role_id).await
+        }
+        async fn count_active_protected_holders(&self) -> AppResult<i64> {
+            self.inner.count_active_protected_holders().await
+        }
+        async fn grant(&self, input: &NewUserRole) -> AppResult<()> {
+            self.inner.grant(input).await
+        }
+        async fn revoke(&self, user_id: i64, role_id: i64) -> AppResult<()> {
+            self.inner.revoke(user_id, role_id).await
+        }
+        async fn delete(&self, id: i64) -> AppResult<()> {
+            self.inner.delete(id).await
+        }
+        async fn replace_user_roles(
+            &self,
+            user_id: i64,
+            role_ids: &[i64],
+            granted_by: i64,
+        ) -> AppResult<Vec<Role>> {
+            self.inner.replace_user_roles(user_id, role_ids, granted_by).await
+        }
+    }
+
+    /// Permission-repository double handing every caller one fixed code set:
+    /// the assign_roles tier check reads it as the actor's effective codes,
+    /// so the test needs no seeded role matrix to authorize the actor.
+    struct FixedPermissions(Vec<String>);
+
+    #[async_trait::async_trait]
+    impl PermissionRepository for FixedPermissions {
+        async fn list(&self) -> AppResult<Vec<crate::models::Permission>> {
+            Ok(Vec::new())
+        }
+        async fn effective_for_user(&self, _user_id: i64) -> AppResult<Vec<String>> {
+            Ok(self.0.clone())
+        }
+        async fn codes_for_role(&self, _role_id: i64) -> AppResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn set_role_permissions(
+            &self,
+            _role_id: i64,
+            _permission_ids: &[i64],
+        ) -> AppResult<()> {
+            Ok(())
         }
     }
 
@@ -2015,5 +2385,630 @@ mod tests {
             after.last_login_at, None,
             "a failed session insert must not advance last_login_at: the touch runs after the insert"
         );
+    }
+
+    // -- users administration (slice S3 part 2) ---------------------------------
+
+    /// The Spanish text of a validation refusal, unwrapped for assertions.
+    fn validation_text(err: AppError) -> String {
+        match err {
+            AppError::Validation(m) => m,
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    fn conflict_text(err: AppError) -> String {
+        match err {
+            AppError::Conflict(m) => m,
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// The raw `user_roles` trail of one (user, role) pair: who granted it
+    /// and when (the database default writes `granted_at`).
+    async fn grant_trail(pool: &SqlitePool, user_id: i64, role_id: i64) -> (i64, Option<String>) {
+        sqlx::query_as(
+            "SELECT granted_by, granted_at FROM user_roles WHERE user_id = ? AND role_id = ?",
+        )
+        .bind(user_id)
+        .bind(role_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_create_user_validates_the_rules_and_flags_the_target() {
+        let (s, _pool, _clock) = svc().await;
+
+        // Username shape (the service speaks Spanish; nothing is written).
+        for bad in ["AB", "ok!", "-lead", "trail-", "a"] {
+            let err = s
+                .create_user(bad, "Ok name", "initial password 1")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "{bad}: {err:?}");
+        }
+        // Display name rule.
+        let err = s
+            .create_user("teller", "", "initial password 1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+        // Initial password rule.
+        let err = s
+            .create_user("teller", "Teller", "short")
+            .await
+            .unwrap_err();
+        let msg = validation_text(err);
+        assert!(msg.contains("12"), "the refusal names the minimum: {msg}");
+
+        // The happy path: the target owes the change (the acting
+        // administrator chose the credential).
+        let user = s
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        assert_eq!(user.username, "teller");
+        assert_eq!(user.display_name, "Teller");
+        assert!(user.is_active);
+        assert!(user.must_change_password);
+
+        // Uniqueness is case-insensitive (the NOCASE index, pre-checked).
+        let err = s
+            .create_user("TELLER", "Other", "initial password 1")
+            .await
+            .unwrap_err();
+        let msg = conflict_text(err);
+        assert!(msg.contains("ya existe"), "{msg}");
+        assert!(msg.contains("teller"), "the refusal names the taken name: {msg}");
+
+        // Every refusal above wrote nothing: exactly one user beyond the
+        // pre-existing rows exists.
+        assert_eq!(s.users.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deactivation_revokes_sessions_and_the_last_protected_holder_refusal_explains_itself(
+    ) {
+        let (s, _pool, _clock) = svc().await;
+        let admin = s
+            .bootstrap_admin(Some("bootstrap pw 12"))
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        let target = s
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        let login = s.login("teller", "initial password 1").await.unwrap();
+
+        // Deactivating an ordinary user works and drops their live session.
+        s.set_user_active(target.id, false).await.unwrap();
+        assert!(!s.users.find_by_id(target.id).await.unwrap().unwrap().is_active);
+        assert!(
+            s.resolve_session(&login.token).await.unwrap().is_none(),
+            "a deactivated user cannot hold a session"
+        );
+
+        // Re-activation works; deactivating twice is idempotent.
+        s.set_user_active(target.id, true).await.unwrap();
+        let again = s.set_user_active(target.id, true).await.unwrap();
+        assert!(again.is_active);
+
+        // The last active protected-role holder is refused with the mapped
+        // Spanish message — never the trigger string, never a 500.
+        let err = s
+            .set_user_active(admin.id, false)
+            .await
+            .unwrap_err();
+        let msg = conflict_text(err);
+        assert!(msg.contains("último"), "{msg}");
+        assert!(msg.contains("rol protegido"), "{msg}");
+        assert!(
+            !msg.contains("cannot deactivate"),
+            "the trigger string must not reach the operator: {msg}"
+        );
+        assert!(s.users.find_by_id(admin.id).await.unwrap().unwrap().is_active);
+
+        // A second administrator makes the same deactivation succeed.
+        let second = s
+            .create_user("second", "Second", "initial password 1")
+            .await
+            .unwrap();
+        let admin_role = s.roles.find_by_code("admin").await.unwrap().unwrap();
+        s.roles
+            .grant(&NewUserRole {
+                user_id: second.id,
+                role_id: admin_role.id,
+                granted_by: admin.id,
+            })
+            .await
+            .unwrap();
+        s.set_user_active(admin.id, false).await.unwrap();
+        assert!(!s.users.find_by_id(admin.id).await.unwrap().unwrap().is_active);
+        assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn admin_reset_flags_the_target_never_the_actor_and_refuses_self_reset() {
+        let (s, pool, _clock) = svc().await;
+        let admin = s
+            .bootstrap_admin(Some("bootstrap pw 12"))
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        let target = s
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        let permissions = SqlitePermissionRepository::new(pool.clone());
+
+        // Resetting oneself through the administration path is refused:
+        // that change is `/password`, which verifies the current password.
+        let err = s
+            .admin_reset_password(&permissions, admin.id, admin.id, "temp password 12")
+            .await
+            .unwrap_err();
+        let msg = validation_text(err);
+        assert!(msg.contains("Cambiar contraseña"), "{msg}");
+        let stored = s.users.find_with_hash_by_id(admin.id).await.unwrap().unwrap();
+        assert!(
+            s.hasher.verify("bootstrap pw 12", &stored.password_hash),
+            "a refused self-reset must not touch the credential"
+        );
+
+        // A too-short temporary password is refused and writes nothing.
+        let err = s
+            .admin_reset_password(&permissions, admin.id, target.id, "short")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)));
+        let stored = s.users.find_with_hash_by_id(target.id).await.unwrap().unwrap();
+        assert!(
+            s.hasher.verify("initial password 1", &stored.password_hash),
+            "the refused reset must not touch the stored hash"
+        );
+
+        // The real reset: the TARGET is flagged, the ACTOR is not.
+        s.admin_reset_password(&permissions, admin.id, target.id, "temp password 34")
+            .await
+            .unwrap();
+        let target_after = s.users.find_by_id(target.id).await.unwrap().unwrap();
+        assert!(target_after.must_change_password, "the target owes the change");
+        let admin_after = s.users.find_by_id(admin.id).await.unwrap().unwrap();
+        assert!(
+            !admin_after.must_change_password,
+            "the actor's flag must never be touched"
+        );
+        let stored = s.users.find_with_hash_by_id(target.id).await.unwrap().unwrap();
+        assert!(s.hasher.verify("temp password 34", &stored.password_hash));
+        assert!(!s.hasher.verify("initial password 1", &stored.password_hash));
+    }
+
+    #[tokio::test]
+    async fn assign_roles_records_the_grant_trail_and_refuses_the_lockouts() {
+        let (s, pool, _clock) = svc().await;
+        let admin = s
+            .bootstrap_admin(Some("bootstrap pw 12"))
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        let target = s
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        let permissions = SqlitePermissionRepository::new(pool.clone());
+        let vendedor = s.roles.find_by_code("vendedor").await.unwrap().unwrap();
+        let admin_role = s.roles.find_by_code("admin").await.unwrap().unwrap();
+
+        // A plain assignment records granted_by (the actor) and granted_at.
+        let held = s
+            .assign_roles(&permissions, admin.id, target.id, &[vendedor.id])
+            .await
+            .unwrap();
+        assert_eq!(
+            held.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["vendedor"]
+        );
+        let (granted_by, granted_at) = grant_trail(&pool, target.id, vendedor.id).await;
+        assert_eq!(granted_by, admin.id, "the grant records the acting principal");
+        assert!(granted_at.is_some(), "the database wrote the grant instant");
+
+        // A role id that does not exist is a form error, not a 500.
+        let err = s
+            .assign_roles(&permissions, admin.id, target.id, &[vendedor.id, 999_999])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "{err:?}");
+        // A bad target id too.
+        let err = s
+            .assign_roles(&permissions, admin.id, 999_999, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+
+        // The acting administrator may not edit their own role set, with any
+        // permission: one rule closes self-escalation and the self-lockout.
+        let err = s
+            .assign_roles(&permissions, admin.id, admin.id, &[vendedor.id])
+            .await
+            .unwrap_err();
+        let msg = match err {
+            AppError::Forbidden(m) => m,
+            other => panic!("expected Forbidden, got {other:?}"),
+        };
+        assert!(msg.contains("propios roles"), "{msg}");
+        // The refusal changed nothing: the administrator still holds the
+        // protected role.
+        assert_eq!(held_role_codes(&s, admin.id).await, vec!["admin"]);
+
+        // The trigger's refusal, through the service: the target becomes the
+        // only active protected holder, and stripping their grant is refused
+        // with the mapped message.
+        s.assign_roles(&permissions, admin.id, target.id, &[admin_role.id])
+            .await
+            .unwrap();
+        s.set_user_active(admin.id, false).await.unwrap();
+        let err = s
+            .assign_roles(&permissions, admin.id, target.id, &[])
+            .await
+            .unwrap_err();
+        let msg = conflict_text(err);
+        assert!(msg.contains("última asignación"), "{msg}");
+        assert_eq!(held_role_codes(&s, target.id).await, vec!["admin"]);
+
+        // The second holder returns and the same removal succeeds.
+        s.set_user_active(admin.id, true).await.unwrap();
+        s.assign_roles(&permissions, admin.id, target.id, &[])
+            .await
+            .unwrap();
+        assert!(held_role_codes(&s, target.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_users_list_read_composes_roles_and_state() {
+        let (s, pool, _clock) = svc().await;
+        let admin = s
+            .bootstrap_admin(Some("bootstrap pw 12"))
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        let target = s
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        let permissions = SqlitePermissionRepository::new(pool.clone());
+        let vendedor = s.roles.find_by_code("vendedor").await.unwrap().unwrap();
+        s.assign_roles(&permissions, admin.id, target.id, &[vendedor.id])
+            .await
+            .unwrap();
+
+        let list = s.list_users_with_roles().await.unwrap();
+        assert_eq!(list.len(), 2);
+        let admin_row = list.iter().find(|r| r.user.id == admin.id).unwrap();
+        assert_eq!(
+            admin_row.roles.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["admin"]
+        );
+        assert!(admin_row.user.is_active);
+        let target_row = list.iter().find(|r| r.user.id == target.id).unwrap();
+        assert_eq!(
+            target_row.roles.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["vendedor"]
+        );
+
+        // The role list read: the four seeded roles, creation order.
+        let roles = s.role_list().await.unwrap();
+        let codes: Vec<&str> = roles.iter().map(|r| r.code.as_str()).collect();
+        assert_eq!(codes, ["admin", "vendedor", "cajero", "deposito"]);
+    }
+
+    // -- corrected finding: the assignment and reset tier rules --------------
+
+    /// Seed a user carrying exactly the given permission codes through a
+    /// custom role, via the real grant path (the role row is seeded directly:
+    /// role creation is S4's screen, not this service's).
+    async fn seed_principal_with_codes(
+        s: &TestIdentity,
+        pool: &SqlitePool,
+        username: &str,
+        codes: &[&str],
+    ) -> User {
+        let user = seed_user(s, username, "the actor password", true).await;
+        let code = format!("tier_{username}");
+        sqlx::query("INSERT INTO roles (code, name) VALUES (?, ?)")
+            .bind(&code)
+            .bind(username)
+            .execute(pool)
+            .await
+            .unwrap();
+        for perm in codes {
+            sqlx::query(
+                "INSERT INTO role_permissions (role_id, permission_id) \
+                 SELECT r.id, p.id FROM roles r JOIN permissions p ON p.code = ? \
+                 WHERE r.code = ?",
+            )
+            .bind(perm)
+            .bind(&code)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let role_id: i64 =
+            sqlx::query_scalar("SELECT id FROM roles WHERE code = ?")
+                .bind(&code)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        s.roles
+            .grant(&NewUserRole {
+                user_id: user.id,
+                role_id,
+                granted_by: user.id,
+            })
+            .await
+            .unwrap();
+        user
+    }
+
+    /// The corrected takeover finding, at the service: a principal holding
+    /// ONLY `identity.users.manage` cannot reset a protected holder's
+    /// password at all (the takeover path is gone), while an actor holding
+    /// the `identity.roles.manage` tier may — and the ordinary user's reset
+    /// stays inside the users tier.
+    #[tokio::test]
+    async fn the_reset_tier_rule_refuses_the_users_tier_on_a_protected_holder() {
+        let (s, pool, _clock) = svc().await;
+        let admin = s
+            .bootstrap_admin(Some("bootstrap pw 12"))
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        let gestor = seed_principal_with_codes(
+            &s,
+            &pool,
+            "gestor",
+            &["identity.users.read", "identity.users.manage"],
+        )
+        .await;
+        let permissions = SqlitePermissionRepository::new(pool.clone());
+
+        // (d) the takeover path: refused BEFORE anything is written.
+        let err = s
+            .admin_reset_password(&permissions, gestor.id, admin.id, "temp password 99")
+            .await
+            .unwrap_err();
+        let msg = match err {
+            AppError::Forbidden(m) => m,
+            other => panic!("expected Forbidden, got {other:?}"),
+        };
+        assert!(msg.contains("identity.roles.manage"), "{msg}");
+        let stored = s
+            .users
+            .find_with_hash_by_id(admin.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            s.hasher.verify("bootstrap pw 12", &stored.password_hash),
+            "the refused reset must not touch the credential"
+        );
+        assert!(!stored.user.must_change_password);
+
+        // (e) the ordinary target: the users tier still resets it.
+        let teller = s
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        s.admin_reset_password(&permissions, gestor.id, teller.id, "temp password 55")
+            .await
+            .unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_id(teller.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.user.must_change_password);
+        assert!(s.hasher.verify("temp password 55", &stored.password_hash));
+
+        // The roles tier may take the protected holder over: a principal
+        // holding both tiers resets the administrator's password.
+        let gestor_roles = seed_principal_with_codes(
+            &s,
+            &pool,
+            "gestor_roles",
+            &["identity.users.read", "identity.users.manage", "identity.roles.manage"],
+        )
+        .await;
+        s.admin_reset_password(&permissions, gestor_roles.id, admin.id, "temp password 77")
+            .await
+            .unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_id(admin.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(s.hasher.verify("temp password 77", &stored.password_hash));
+    }
+
+    /// The corrected brute-force surface: failed current-password attempts
+    /// share the login's per-username throttle. N consecutive failures
+    /// refuse the next attempt BEFORE verification, and a success clears
+    /// the counter so a real user is never stuck behind stale failures.
+    #[tokio::test]
+    async fn wrong_current_passwords_throttle_before_verification_and_a_success_clears_the_counter() {
+        let (s, _pool, clock, hasher) = spy_svc().await;
+        let boot = s.bootstrap_admin(None).await.unwrap();
+        let generated = boot.generated_password.clone().unwrap();
+        let user = boot.user.unwrap();
+
+        for _ in 0..5 {
+            let err = s
+                .change_password(user.id, "a wrong guess", "una contraseña nueva larga")
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Unauthorized(_)));
+        }
+        // The cooldown is on: the next attempt — even with the RIGHT current
+        // password — is refused before any verification happens.
+        let before = hasher.verify_calls.load(Ordering::SeqCst);
+        let err = s
+            .change_password(user.id, &generated, "una contraseña nueva larga")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert_eq!(
+            hasher.verify_calls.load(Ordering::SeqCst),
+            before,
+            "the throttled attempt must not verify"
+        );
+
+        // Past the cooldown, the real credential gets through, and the
+        // success clears the failure counter.
+        clock.advance(Duration::seconds(61));
+        s.change_password(user.id, &generated, "una contraseña nueva larga")
+            .await
+            .unwrap();
+        let before = hasher.verify_calls.load(Ordering::SeqCst);
+        let err = s
+            .change_password(user.id, "a fresh wrong guess", "otra contraseña larga")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Unauthorized(_)));
+        assert_eq!(
+            hasher.verify_calls.load(Ordering::SeqCst),
+            before + 1,
+            "the cleared counter must let the next attempt reach verification"
+        );
+    }
+
+    /// The corrected parser finding, at the service: the submitted set is
+    /// resolved in ONE statement, so a form with many ids assigns exactly
+    /// the submitted set (duplicates deduplicated) without one query per id.
+    #[tokio::test]
+    async fn a_roles_assignment_with_many_ids_assigns_exactly_the_submitted_set() {
+        let (s, pool, _clock) = svc().await;
+        let admin = s
+            .bootstrap_admin(Some("bootstrap pw 12"))
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        let target = s
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        let permissions = SqlitePermissionRepository::new(pool.clone());
+        for i in 0..120 {
+            sqlx::query("INSERT INTO roles (code, name) VALUES (?, ?)")
+                .bind(format!("tmp{i}"))
+                .bind(format!("Temporal {i}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let mut ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM roles ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        // One duplicated id in the middle: the set is what counts.
+        ids.push(ids[60]);
+        let held = s
+            .assign_roles(&permissions, admin.id, target.id, &ids)
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 124, "the submitted set, without the duplicate");
+        let mut held_ids: Vec<i64> = held.iter().map(|r| r.id).collect();
+        held_ids.sort_unstable();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(held_ids, ids);
+    }
+
+    /// The "one statement" claim, pinned where it is observable: a counting
+    /// role-repository double records the `find_by_ids` calls the service
+    /// makes, so a regression to one query per id (same returned set, same
+    /// green tests otherwise) fails here. The call must happen exactly once
+    /// and carry the whole submitted set, deduplicated.
+    #[tokio::test]
+    async fn assign_roles_resolves_the_whole_submitted_set_through_find_by_ids_exactly_once(
+    ) {
+        let pool = test_pool().await;
+        let clock = FakeClock::new(base_time());
+        let calls: Arc<Mutex<Vec<Vec<i64>>>> = Arc::new(Mutex::new(Vec::new()));
+        let service = IdentityService::new(
+            SqliteUserRepository::new(pool.clone()),
+            SqliteSessionRepository::new(pool.clone()),
+            CountingFindByIds {
+                inner: SqliteRoleRepository::new(pool.clone()),
+                calls: calls.clone(),
+            },
+            clock.clone(),
+            PasswordHasher::light(),
+            SessionPolicy::new(12, false),
+            ThrottleConfig::default(),
+        );
+        let admin = service
+            .bootstrap_admin(Some("bootstrap pw 12"))
+            .await
+            .unwrap()
+            .user
+            .unwrap();
+        let target = service
+            .create_user("teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        let vendedor = service
+            .roles
+            .find_by_code("vendedor")
+            .await
+            .unwrap()
+            .unwrap();
+        let cajero = service
+            .roles
+            .find_by_code("cajero")
+            .await
+            .unwrap()
+            .unwrap();
+        let permissions = FixedPermissions(vec![ROLES_MANAGE_CODE.to_string()]);
+
+        // Duplicated id included: the one call must carry the deduplicated
+        // submitted set, not one call per id.
+        let submitted = vec![vendedor.id, cajero.id, vendedor.id];
+        let held = service
+            .assign_roles(&permissions, admin.id, target.id, &submitted)
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the submitted set must resolve through ONE find_by_ids call: {recorded:?}"
+        );
+        let mut expected = submitted.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        let mut handed = recorded[0].clone();
+        handed.sort_unstable();
+        assert_eq!(
+            handed, expected,
+            "the one call must carry the whole submitted set"
+        );
+        // And the assignment itself is the submitted set, through the real
+        // repository the spy delegates to (compared as a set: the returned
+        // order is the statement's, not the test's).
+        let mut held_codes: Vec<String> = held.iter().map(|r| r.code.clone()).collect();
+        held_codes.sort();
+        assert_eq!(held_codes, vec!["cajero", "vendedor"]);
     }
 }

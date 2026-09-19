@@ -56,6 +56,11 @@
     <div data-nav-group="account">
       <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Account</div>
       <div class="flex flex-col gap-0.5">
+        {# The users administration screen (slice S3 part 2). The route
+           requires `identity.users.read` — the handler is what refuses. AC21
+           (hiding this entry from principals that cannot read it) is S7's
+           nav gating: until then the entry stays visible for everyone. #}
+        {% call nav_item("users", "/users", "Usuarios", "M15 9.75a3 3 0 11-6 0 3 3 0 016 0zM15 12a3.75 3.75 0 013.75 3.75v3.375c0 .207-.168.375-.375.375h-1.5a.375.375 0 01-.375-.375V17.25m-6-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25m14.25-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25a3.75 3.75 0 00-3.75-3.75h-.375zM6.75 6a3.75 3.75 0 013.75 3.75v3.375c0 .207.168.375.375.375h7.5a.375.375 0 00.375-.375V9.75A3.75 3.75 0 0015 6h-1.5") %}
         {# The password page (slice S3 part 1): reachable from the sidebar for
            every signed-in operator, and the one page a confined session may
            still open. Its nav_key is "password", which the page's struct

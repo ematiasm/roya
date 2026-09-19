@@ -28,9 +28,32 @@ fn map_db_err(e: sqlx::Error) -> AppError {
     let s = e.to_string();
     if s.contains("UNIQUE constraint failed") {
         AppError::Conflict("role code already exists".into())
+    } else if s.contains("cannot remove the last grant of a protected role to an active user") {
+        // The guard trigger (AC14): removing this grant would leave the shop
+        // without an active administrator. The interface explains the rule
+        // and the way out, never the trigger string.
+        AppError::Conflict(
+            "No se puede quitar el rol: es la última asignación activa de un rol protegido. Primero asignáselo a otro usuario.".into(),
+        )
+    } else if s.contains("protected role cannot be deleted") {
+        // The guard trigger (AC13), mapped HERE and not only in `delete`:
+        // every statement that deletes a role row can hit it — the S4
+        // screen's delete route, a script, the delete phase of an INSERT OR
+        // REPLACE — and none of them may answer a raw 500 that leaks the
+        // trigger text. `delete` maps the same refusal first; this branch is
+        // the backstop for every other path.
+        AppError::Conflict("No se puede eliminar un rol protegido.".into())
     } else if s.contains("FOREIGN KEY constraint failed") {
-        // user_roles.role_id is ON DELETE RESTRICT: assigned users block.
-        AppError::Conflict("role is assigned to users".into())
+        // GRANT-CONTEXT ONLY. The generic SQLite message says nothing about
+        // which reference failed, and this repository has two very different
+        // refusals behind it: on the grant/replace statements a submitted id
+        // names a row that does not exist (the assignment form pre-validates,
+        // so this is the honest reason there), while on a role DELETE it is
+        // the users still holding the role. `delete` maps the holders'
+        // refusal itself and never falls through to this branch; any other
+        // DELETE-shaped path must do the same instead of dressing the
+        // holders' refusal as a missing id.
+        AppError::Validation("Uno de los roles indicados no existe.".into())
     } else if s.contains("CHECK constraint failed") {
         if s.contains("roles_code_shape") {
             AppError::Validation(
@@ -57,6 +80,11 @@ pub trait RoleRepository: Send + Sync {
     async fn list(&self) -> AppResult<Vec<Role>>;
     /// Roles of one user, by the user_roles join.
     async fn list_for_user(&self, user_id: i64) -> AppResult<Vec<Role>>;
+    /// The roles whose ids exist, resolved in ONE statement. The assignment
+    /// flow validates a whole submitted set at once (a parser that answered
+    /// one query per id let a large form burn one round trip per id); the
+    /// caller diffs the submitted set against the answer.
+    async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<Role>>;
     /// Count active holders of one role (AC15: the interface names the users
     /// that block a deletion).
     async fn count_active_holders(&self, role_id: i64) -> AppResult<i64>;
@@ -69,6 +97,12 @@ pub trait RoleRepository: Send + Sync {
     /// grant of an active user; this repository surfaces that refusal as the
     /// conflict the interface explains.
     async fn revoke(&self, user_id: i64, role_id: i64) -> AppResult<()>;
+    /// Delete a role row (the S4 roles screen's delete action). Two things
+    /// refuse it and both live in the schema: the guard trigger for a
+    /// protected role (AC13) and the `user_roles` RESTRICT foreign key when
+    /// any user holds it (AC15). This method is where both refusals are
+    /// mapped to the Spanish message the interface explains.
+    async fn delete(&self, id: i64) -> AppResult<()>;
     /// Replace a user's whole role set in one transaction (S3's assignment
     /// form posts the complete new set). Returns the roles the user ends
     /// with; refuses (via the trigger) when the change would strip the last
@@ -137,6 +171,28 @@ impl RoleRepository for SqliteRoleRepository {
         Ok(rows.iter().map(row_to_role).collect())
     }
 
+    async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<Role>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // One statement, one bind per id (the QueryBuilder keeps every id
+        // bound, never interpolated — the sqlx 0.9 audit rule); SQLite's
+        // variable cap (32 766 on the bundled build) sits far above any real
+        // submission.
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            "SELECT id, code, name, description, is_system, created_at, updated_at FROM roles WHERE id IN (",
+        );
+        {
+            let mut separated = qb.separated(", ");
+            for id in ids {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+        }
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(row_to_role).collect())
+    }
+
     async fn count_active_holders(&self, role_id: i64) -> AppResult<i64> {
         let row: (i64,) = sqlx::query_as(
             r#"SELECT COUNT(*) FROM user_roles ur
@@ -183,6 +239,31 @@ impl RoleRepository for SqliteRoleRepository {
             .execute(&self.pool)
             .await
             .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    async fn delete(&self, id: i64) -> AppResult<()> {
+        sqlx::query("DELETE FROM roles WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                let s = e.to_string();
+                if s.contains("protected role cannot be deleted") {
+                    // AC13: the guard trigger; absolute, a second
+                    // administrator changes nothing.
+                    AppError::Conflict("No se puede eliminar un rol protegido.".into())
+                } else if s.contains("FOREIGN KEY constraint failed") {
+                    // AC15: user_roles.role_id is ON DELETE RESTRICT — the
+                    // users holding the role block the deletion (the S4
+                    // screen names them; here the reason is named).
+                    AppError::Conflict(
+                        "No se puede eliminar el rol: hay usuarios con este rol asignado. Primero quitáselo a los usuarios que lo sostienen.".into(),
+                    )
+                } else {
+                    map_db_err(e)
+                }
+            })?;
         Ok(())
     }
 
@@ -616,5 +697,140 @@ mod tests {
             "FOREIGN KEY constraint failed",
             "user_roles.role_id is ON DELETE RESTRICT: assigned users block the delete"
         );
+    }
+
+    // -- S3 part 2: the delete path maps both refusals to Spanish conflicts ----
+
+    /// The S4 screen will call `delete`; the mapped refusals it explains are
+    /// shipped here so the message text cannot drift from the schema.
+    #[tokio::test]
+    async fn the_delete_refusal_for_a_protected_role_is_mapped_to_a_spanish_conflict() {
+        let p = pool().await;
+        seed_admin_holders(&p, &["first-admin"]).await;
+        let roles = SqliteRoleRepository::new(p.clone());
+        let admin = roles.find_by_code("admin").await.unwrap().unwrap();
+        let err = roles.delete(admin.id).await.unwrap_err();
+        let msg = match &err {
+            AppError::Conflict(m) => m.clone(),
+            other => panic!("expected Conflict, got {other:?}"),
+        };
+        assert!(msg.contains("rol protegido"), "{msg}");
+        assert!(!msg.contains("protected role"), "no raw trigger text: {msg}");
+        assert!(roles.find_by_code("admin").await.unwrap().is_some());
+    }
+
+    /// AC15's interface explanation: a role held by users cannot be deleted,
+    /// and the refusal names the reason in Spanish (the S4 screen names the
+    /// blocking users; the message exists here first).
+    #[tokio::test]
+    async fn the_delete_refusal_for_an_assigned_role_names_the_users_that_block_it() {
+        let p = pool().await;
+        seed_admin_holders(&p, &["first-admin"]).await;
+        let roles = SqliteRoleRepository::new(p.clone());
+        let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
+        let user: i64 =
+            sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        roles
+            .grant(&NewUserRole {
+                user_id: user,
+                role_id: vendedor.id,
+                granted_by: user,
+            })
+            .await
+            .unwrap();
+        let err = roles.delete(vendedor.id).await.unwrap_err();
+        let msg = match &err {
+            AppError::Conflict(m) => m.clone(),
+            other => panic!("expected Conflict, got {other:?}"),
+        };
+        assert!(msg.contains("usuarios"), "{msg}");
+        assert!(msg.contains("asignado"), "{msg}");
+        assert!(!msg.contains("FOREIGN KEY"), "no raw SQL text: {msg}");
+        assert!(roles.find_by_code("vendedor").await.unwrap().is_some());
+    }
+
+    /// A role nobody holds deletes cleanly through the same path.
+    #[tokio::test]
+    async fn an_unassigned_role_deletes_cleanly() {
+        let p = pool().await;
+        let roles = SqliteRoleRepository::new(p.clone());
+        let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
+        roles.delete(vendedor.id).await.unwrap();
+        assert!(roles.find_by_code("vendedor").await.unwrap().is_none());
+    }
+
+    // -- the shared mapper knows the two delete-shaped refusals (correction
+    //    round: the protected delete refusal fell through to a generic 500
+    //    on any path but `delete`, and the FK branch claimed the grant
+    //    context's reason for a refusal it cannot know) -------------------
+
+    /// The protected-delete trigger mapped by the SHARED mapper, not only by
+    /// `delete`'s own closure: a future path that deletes a role row through
+    /// `map_db_err` reports the Spanish conflict instead of a raw 500.
+    #[tokio::test]
+    async fn map_db_err_maps_the_protected_delete_trigger_to_a_spanish_conflict() {
+        let p = pool().await;
+        seed_admin_holders(&p, &["first-admin"]).await;
+        let err = sqlx::query("DELETE FROM roles WHERE code = 'admin'")
+            .execute(&p)
+            .await
+            .unwrap_err();
+        match map_db_err(err) {
+            AppError::Conflict(m) => {
+                assert!(m.contains("rol protegido"), "{m}");
+                assert!(!m.contains("protected role"), "no raw trigger text: {m}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// The FK branch keeps its grant-context claim: it is reached by the
+    /// grant/replace statements (a submitted id naming a missing row), and
+    /// the delete path maps the holders' refusal itself.
+    #[tokio::test]
+    async fn a_grant_naming_a_missing_role_is_a_validation_naming_the_submitted_set() {
+        let p = pool().await;
+        seed_admin_holders(&p, &["first-admin"]).await;
+        let user: i64 =
+            sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        let err = SqliteRoleRepository::new(p.clone())
+            .grant(&NewUserRole {
+                user_id: user,
+                role_id: 999_999,
+                granted_by: user,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(m) => assert!(m.contains("roles indicados"), "{m}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    // -- S3 correction round: the assignment set is resolved in one query ----
+
+    #[tokio::test]
+    async fn find_by_ids_answers_the_existing_subset_of_many_ids_in_one_statement() {
+        let p = pool().await;
+        let roles = SqliteRoleRepository::new(p.clone());
+        let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
+        let cajero = roles.find_by_code("cajero").await.unwrap().unwrap();
+        // Duplicates in, existing ids mixed with a missing one: the answer is
+        // the existing subset, in the statement's own order.
+        let found = roles
+            .find_by_ids(&[vendedor.id, 999_999, cajero.id, vendedor.id])
+            .await
+            .unwrap();
+        let mut codes: Vec<&str> = found.iter().map(|r| r.code.as_str()).collect();
+        codes.sort();
+        assert_eq!(codes, vec!["cajero", "vendedor"]);
+        // The empty set asks nothing.
+        assert!(roles.find_by_ids(&[]).await.unwrap().is_empty());
     }
 }
