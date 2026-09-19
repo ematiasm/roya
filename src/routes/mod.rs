@@ -222,6 +222,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{router, AppState};
+    use crate::security::test_support;
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -234,6 +235,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        // S1b part 1: seed the fixed test session every request will authenticate with.
+        test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, true)
     }
 
@@ -244,6 +247,7 @@ mod tests {
             let req = Request::builder()
                 .method("GET")
                 .uri(uri)
+                .header("cookie", test_support::TEST_COOKIE)
                 .body(Body::empty())
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();

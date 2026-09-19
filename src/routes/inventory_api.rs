@@ -373,6 +373,8 @@ mod tests {
     use std::str::FromStr;
     use tower::ServiceExt;
 
+    use crate::security::test_support;
+
     async fn test_state(allow_stock: bool) -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
@@ -384,6 +386,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        // S1b part 1: seed the fixed test session every request will authenticate with.
+        test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, allow_stock)
     }
 
@@ -392,6 +396,7 @@ mod tests {
             .method("POST")
             .uri(uri)
             .header("content-type", "application/json")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -406,6 +411,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri(uri)
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -425,6 +431,7 @@ mod tests {
             .method("PUT")
             .uri(uri)
             .header("content-type", "application/json")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -500,7 +507,7 @@ mod tests {
         let (st, _) = post_json(app.clone(), &format!("/api/products/{bid}/barcodes"), serde_json::json!({"code":"7790001"})).await;
         assert_eq!(st, StatusCode::CONFLICT);
         // Delete product without movements cascades barcodes.
-        let req = Request::builder().method("DELETE").uri(format!("/api/products/{aid}")).body(Body::empty()).unwrap();
+        let req = Request::builder().method("DELETE").uri(format!("/api/products/{aid}")).header("cookie", test_support::TEST_COOKIE).body(Body::empty()).unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }

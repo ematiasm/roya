@@ -715,6 +715,7 @@ mod tests {
 
     use crate::models::PaymentType;
     use crate::routes::AppState;
+    use crate::security::test_support;
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -729,6 +730,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        // S1b part 1: seed the fixed test session every request will authenticate with.
+        test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, true)
     }
 
@@ -754,6 +757,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri(uri)
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -768,6 +772,7 @@ mod tests {
             .uri(uri)
             .header("content-type", "application/x-www-form-urlencoded")
             .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -966,6 +971,7 @@ mod tests {
             .uri("/web/sales")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1200,6 +1206,7 @@ mod tests {
             .uri(format!("/web/sales/{}/header", fixture.sale_id))
             .header("content-type", "application/x-www-form-urlencoded")
             .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1315,6 +1322,7 @@ mod tests {
             .uri("/web/sales/payments")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1482,6 +1490,7 @@ mod tests {
             .method("POST")
             .uri("/web/sales")
             .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
