@@ -249,6 +249,13 @@ Current migrations:
   orphans stay NULL, method ids stable (history untouched). Runs `-- no-transaction`
   with `PRAGMA foreign_keys=OFF` for the parent-table swap (a deferred violation from
   `DROP TABLE` cannot be healed before COMMIT).
+- `20240101000025_create_identity_users.sql` — `users` (S1a identity kernel: the
+  login key with a lowercase-COLLATE unique index, argon2id `password_hash` never
+  returned by any read path, `is_active` deactivation, `must_change_password` flag,
+  seeded `admin`)
+- `20240101000026_create_identity_sessions.sql` — `sessions` (S1a: one row per login,
+  only the sha256 digest of the cookie token is stored, validity decided in SQL,
+  permanent revocation guarded by a trigger)
 
 ## REST API
 
@@ -522,6 +529,10 @@ Money is `rust_decimal::Decimal` serialized as **string** (`serde-with-str`) to 
 
 ## Web UI
 
+`GET /login` — the login screen (S1b): the only page an anonymous visitor can reach. It renders a centered card without the app navigation — no sidebar, no logout button — with the username and password fields, a hidden `next` (a validated local path or empty) and the dismissible notice region; a failed attempt re-renders the page with the generic Spanish message (`Usuario o contraseña incorrectos`), which deliberately says nothing about whether the username exists. A successful login sets the session cookie and redirects to the validated `next` or `/`. Behind a session, `POST /logout` revokes it and clears the cookie (a plain form, no JavaScript needed).
+
+Machine clients use the same surface over JSON: `POST /api/sessions` with `{"username":"…","password":"…"}` answers `204` plus the session cookie, and `DELETE /api/sessions` revokes and clears it (idempotent, `204`).
+
 `GET /` — dashboard:
 
 - Total balance (derived)
@@ -670,6 +681,12 @@ The entrypoint imports Tailwind, scans only `templates/` (`@source`), and define
 | `ENFORCE_CREDIT_LIMIT` | `true` | If `true`, confirming a credit sale whose projected debt exceeds the customer's `credit_limit` is rejected (400); a null limit is unlimited either way. If `false`, the sale is confirmed and the interface reports the customer as over limit |
 | `PORT` | `3000` | HTTP port |
 | `RUST_LOG` | `info` | tracing filter |
+| `ROYA_ADMIN_PASSWORD` | *(unset)* | The bootstrap administrator's password. Unset means a password is generated and logged once at startup (with `must_change_password` set), so the operator must read the log to get in; set, the value is used as-is and never logged |
+| `ROYA_SESSION_TTL_HOURS` | `12` | Absolute session lifetime in hours: the cookie's `Max-Age` and the session row's expiry are set together |
+| `ROYA_COOKIE_SECURE` | `false` | **Required when the app is served over HTTPS**: set it to `true` or `1`, or the session cookie is not marked `Secure` and can travel over plain HTTP. Without HTTPS, leave it off — browsers drop `Secure` cookies on plain HTTP, which would make login impossible |
+| `ROYA_ALLOWED_ORIGINS` | *(unset)* | Comma-separated list of origins (`https://app.example.com`) allowed by CORS. Unset = same-origin only: no wildcard, and no `Access-Control-Allow-Origin` header is ever emitted (the old wildcard is gone) |
+| `ROYA_LOGIN_THROTTLE_ATTEMPTS` | `5` | Failed logins per username before the throttle kicks in |
+| `ROYA_LOGIN_THROTTLE_SECONDS` | `60` | Throttle window in seconds: further attempts on a throttled username return the generic error until it elapses |
 
 ## Validation & Balance Rules
 
@@ -894,11 +911,16 @@ scripts/build-css.sh       — regenerates static/tailwind.css with the standalo
 
 `src/templates/` placeholder exists for spec compliance; Askama loads from `templates/` at crate root (standard).
 
-## No Heavy ORM / No Docker / No Auth
+## No Heavy ORM / No Docker
 
 - No Diesel/SeaORM.
 - No microservices, no mandatory Docker (just `cargo run`).
-- No auth (local single-user).
+- **Auth (S1 identity)**: every route except `/login`, `POST /api/sessions`,
+  `DELETE /api/sessions` and `/static/*` is behind a deny-by-default session
+  gate. The bootstrap `admin` user is seeded at startup (password from
+  `ROYA_ADMIN_PASSWORD` or generated and logged once); the session cookie is
+  `HttpOnly`, `SameSite=Lax`, `Path=/`, with a 12h absolute TTL and revocation
+  on logout. Unsafe HTTP methods are additionally refused cross-origin.
 - `tower-http` trace + cors + static file serving (`ServeDir`).
 
 ## Tests (manual)
