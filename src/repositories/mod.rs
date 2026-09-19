@@ -28,13 +28,10 @@ pub use product_supplier_cost_repo::{
 };
 pub use purchase_repo::{PurchaseRepository, SqlitePurchaseRepository};
 pub use sale_repo::{SaleRepository, SqliteSaleRepository};
-// Unused until the S1b router wiring consumes the identity repositories.
-#[allow(unused_imports)]
 pub use session_repo::{SessionRepository, SqliteSessionRepository};
 pub use stock_repo::{SqliteStockMovementRepository, StockMovementRepository};
 pub use supplier_repo::{SqliteSupplierRepository, SupplierRepository};
 pub use transaction_repo::{SqliteTransactionRepository, TransactionRepository};
-#[allow(unused_imports)]
 pub use user_repo::{SqliteUserRepository, UserRepository};
 
 use rust_decimal::Decimal;

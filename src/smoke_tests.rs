@@ -98,6 +98,50 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, String) {
     send(app, "GET", uri, None, false, String::new()).await
 }
 
+/// FIX-4: a browser must be able to load the vendored assets before a session
+/// exists, so the property is asserted over HTTP and without any cookie. The
+/// route is on the public allowlist; `is_public` alone would not catch a
+/// regression in the middleware that still refused the request.
+#[tokio::test]
+async fn static_assets_load_without_a_session() {
+    let (app, _pool) = test_app().await;
+    for uri in ["/static/htmx.min.js", "/static/tailwind.css"] {
+        let (status, body) = send_anonymous(&app, "GET", uri, None, false, String::new()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{uri} must load without a session; body: {body:.200}"
+        );
+    }
+}
+
+/// Same as [`send`] but without the shared session cookie: only the targets
+/// that must be reachable anonymously (the static assets) use it.
+async fn send_anonymous(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    content_type: Option<&str>,
+    htmx: bool,
+    body: String,
+) -> (StatusCode, String) {
+    let mut builder = Request::builder().method(method).uri(uri);
+    if let Some(ct) = content_type {
+        builder = builder.header("content-type", ct);
+    }
+    if htmx {
+        builder = builder.header("HX-Request", "true");
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
 /// POST the way HTMX does: `hx-post` target plus the `HX-Request` header.
 async fn post_form(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
     send(
@@ -970,7 +1014,19 @@ async fn probe_or_fail(
     method: &str,
     target: &str,
 ) -> Result<(), String> {
-    let (status, body) = send(probe_app, method, target, None, false, String::new()).await;
+    // POST /logout revokes the session its cookie carries, so it cannot be
+    // probed on the shared probe app: the first probe would kill the session
+    // every later probe authenticates with. It also cannot be probed
+    // anonymously: the gate refuses an anonymous request with the same 303 a
+    // registered logout answers, so a rename would leave the guard green. A
+    // dedicated app with its own pool gives the probe a live session that only
+    // this one probe revokes, which restores the route-existence oracle.
+    let (status, body) = if method == "POST" && target == "/logout" {
+        let (logout_app, _logout_pool) = test_app().await;
+        send(&logout_app, method, target, None, false, String::new()).await
+    } else {
+        send(probe_app, method, target, None, false, String::new()).await
+    };
     if body.contains(ROUTE_FALLBACK_MARKER) {
         return Err(format!(
             "{page}: {attr}=\"{target}\" ({method}) hit the routing fallback: no route matches"
@@ -5214,3 +5270,5 @@ async fn search_matches_ignore_accents_and_case() {
     let list = product_list_html(&app, "?q=CAFÉ").await;
     assert!(list.contains("Café"), "the catalogue must find Café by CAFÉ: {list}");
 }
+
+

@@ -1,11 +1,9 @@
-// Identity kernel (Slice S1a): transversal security primitives shared by every
-// department. This is NOT a department and depends on none: password hashing
-// and verification, session token minting/hashing and the TTL policy. The
-// middleware and `Require<P>` extractors that sit on top of these are slice
-// S1b; the module list below is where they will be declared. Until that wiring
-// lands, the whole module is intentionally uncalled from the router.
-#![allow(dead_code)]
-#![allow(unused_imports)]
+// Identity kernel (Slice S1a/S1b): transversal security primitives shared by
+// every department. This is NOT a department: password hashing and
+// verification, session token minting/hashing, the TTL policy and the
+// deny-by-default gate that consumes `AppState` (which itself depends on the
+// kernel, not the other way around). `Require<P>` extractors arrive with S2.
+pub mod guard;
 pub mod password;
 pub mod session;
 
@@ -14,5 +12,6 @@ pub mod session;
 #[cfg(test)]
 pub mod test_support;
 
-pub use password::{PasswordHasher, PasswordHashing};
-pub use session::{hash_token, mint_token, SessionPolicy, RENEWAL_AFTER_SECS, SESSION_COOKIE};
+pub use guard::auth_middleware;
+pub use password::PasswordHasher;
+pub use session::SessionPolicy;

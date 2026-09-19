@@ -34,7 +34,9 @@ impl PasswordHasher {
     }
 
     /// Test-only cost (~1 MiB / 1 iteration): same API, ~100x cheaper, so the
-    /// suite never sleeps on hashing. Never use it outside tests.
+    /// suite never sleeps on hashing. Compiled out of production builds, which
+    /// is what its "never use it outside tests" doc comment always meant.
+    #[cfg(test)]
     pub fn light() -> Self {
         Self {
             params: Params::new(1024, 1, 1, None)

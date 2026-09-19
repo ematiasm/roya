@@ -23,8 +23,9 @@ pub enum AppError {
     Unauthorized(String),
 
     /// Identity authorization refused (403): the principal is authenticated
-    /// but lacks the permission the handler declares. Constructed by the
-    /// `Require<P>` extractor, which arrives with the S1b wiring.
+    /// but lacks the permission the handler declares. Constructed ONLY by the
+    /// `Require<P>` extractor, which arrives with the S2 RBAC wiring; nothing
+    /// else may answer 403 today.
     #[allow(dead_code)]
     #[error("forbidden: {0}")]
     Forbidden(String),

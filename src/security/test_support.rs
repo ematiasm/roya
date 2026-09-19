@@ -1,13 +1,11 @@
 // Test-only identity support (part 1 of the S1b slice split). Every HTTP test
 // module authenticates with ONE fixed session token: `seed_session` inserts a
 // real user plus a live session through the real repositories, and
-// `with_cookie`/`TEST_COOKIE` put the token on the request. Nothing enforces
-// anything yet (the deny-by-default middleware is part 2), so the cookie is
-// sent and ignored today; part 2 flips enforcement on and every test is already
-// authenticated, so no assertion changes.
-//
-// The design is deliberately constant-shaped: no test needs a new variable, no
-// helper signature changes and no call site is rewritten beyond one header.
+// `with_cookie`/`TEST_COOKIE` put the token on the request. Part 2 turned the
+// deny-by-default gate on, so these requests authenticate the way a client
+// does: through the cookie, resolved by the same `IdentityService` production
+// uses. No test-only bypass exists (AC24); `app_state` below is the separate
+// light-hasher construction path part 2 asked for.
 use axum::http::request::Builder;
 use sqlx::SqlitePool;
 
@@ -16,7 +14,9 @@ use crate::models::{NewSession, NewUser};
 use crate::repositories::{
     SessionRepository, SqliteSessionRepository, SqliteUserRepository, UserRepository,
 };
-use crate::security::session::{hash_token, SessionPolicy, SESSION_COOKIE};
+use crate::security::password::PasswordHasher;
+use crate::security::session::{hash_token, mint_token, SessionPolicy, SESSION_COOKIE};
+use crate::services::identity::{IdentityService, SystemClock, ThrottleConfig};
 
 /// The one session token every HTTP test authenticates with. Fixed so the
 /// cookie value can be a compile-time constant; only its sha256 digest is
@@ -90,6 +90,51 @@ pub async fn seed_session(pool: &SqlitePool) -> AppResult<i64> {
 /// already authenticated for part 2's deny-by-default middleware.
 pub fn with_cookie(builder: Builder) -> Builder {
     builder.header(axum::http::header::COOKIE, TEST_COOKIE)
+}
+
+/// Test-only `AppState` construction: identical to the production path
+/// (`AppState::new` semantics) except the identity service uses
+/// [`PasswordHasher::light()`]. This is the separate construction path part 2
+/// asked for — production parameters are never silently weakened.
+pub fn app_state(pool: SqlitePool) -> crate::routes::AppState {
+    let identity = IdentityService::new(
+        SqliteUserRepository::new(pool.clone()),
+        SqliteSessionRepository::new(pool.clone()),
+        SystemClock,
+        PasswordHasher::light(),
+        SessionPolicy::new(12, false),
+        ThrottleConfig::default(),
+    );
+    crate::routes::AppState::with_identity_service(pool, false, true, true, identity)
+}
+
+/// Seed one extra user flagged `must_change_password` plus one live session
+/// for it, returning the raw token (the cookie value). S1b part 2 asserts the
+/// flag is NOT enforced yet, so S3's enforcement is a deliberate change.
+pub async fn seed_flagged_session(pool: &SqlitePool) -> AppResult<(String, i64)> {
+    let policy = SessionPolicy::new(TEST_TTL_HOURS, false);
+    let now = crate::services::identity::Clock::now(&SystemClock);
+    let users = SqliteUserRepository::new(pool.clone());
+    let sessions = SqliteSessionRepository::new(pool.clone());
+    let user = users
+        .create(&NewUser {
+            username: "flagged-admin".to_string(),
+            display_name: "Flagged Admin".to_string(),
+            password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+            must_change_password: true,
+        })
+        .await?;
+    let token = mint_token()?;
+    let session = sessions
+        .insert(&NewSession {
+            token_hash: hash_token(&token),
+            user_id: user.id,
+            expires_at: policy.expires_at(now),
+            last_seen_at: now,
+            user_agent: None,
+        })
+        .await?;
+    Ok((token, session.id))
 }
 
 #[cfg(test)]

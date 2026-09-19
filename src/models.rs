@@ -1245,7 +1245,6 @@ pub struct ReceiptDetail {
 // of the cookie token (`token_hash`), never the token itself.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] // service methods are wired into the router in slice S1b
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: i64,
@@ -1262,7 +1261,6 @@ pub struct User {
 /// authentication read paths (`find_with_hash_by_*`) and consumed only by
 /// `IdentityService` when verifying a credential; it must never be serialized.
 /// `Debug` is hand-written so a log line can never print the stored verifier.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct UserWithHash {
     pub user: User,
@@ -1281,7 +1279,6 @@ impl std::fmt::Debug for UserWithHash {
 /// Service-level input for user creation. `password_hash` arrives already
 /// hashed; plaintext passwords never enter the repository layer. `Debug` is
 /// hand-written so logs and test output cannot print the hash material.
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct NewUser {
     pub username: String,
@@ -1303,7 +1300,6 @@ impl std::fmt::Debug for NewUser {
 
 // No `Serialize`: the session row carries `token_hash`, and nothing in this
 // slice serializes it — any future response view must be a dedicated DTO.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Session {
     pub id: i64,
@@ -1319,7 +1315,6 @@ pub struct Session {
 
 /// Service-level input for session creation. `expires_at` and the matching
 /// `last_seen_at` come from the injected clock.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct NewSession {
     pub token_hash: String,
@@ -1331,7 +1326,6 @@ pub struct NewSession {
 
 /// What request authentication resolves: the acting user plus the live
 /// session row. No secrets: the token itself never survives login.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ResolvedSession {
     pub user: User,

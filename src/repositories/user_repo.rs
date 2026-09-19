@@ -4,8 +4,6 @@
 // through the COLLATE NOCASE unique index, so lookups are case-insensitive and
 // duplicates are impossible in any casing. Users are deactivated, never
 // deleted here; the CASCADE delete lives on the sessions FK for erasure only.
-// (dead_code allowed: the identity service is wired into the router in S1b.)
-#![allow(dead_code)]
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sqlx::{Row, SqlitePool};
