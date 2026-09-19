@@ -66,6 +66,8 @@ there is no scheduler in this application, and a session table that only grows i
 | Roles as a free-form matrix vs a fixed enum in code | Rows, with `admin` protected | The user wants to define roles without a deploy; the protected role guarantees an administrator always exists; cost: a lockout class of bugs, answered by triggers rather than by UI care |
 | Permission set loaded per request vs cached in memory | Per request | Correct and simple: revocation and role edits apply to the next request, and there is no cache to invalidate; cost: one extra query per request, invisible at this scale |
 | Store the session token vs its SHA-256 | Hash only | A leaked database does not hand out live sessions, and revocation stays a row update; cost: one extra hash per request and no way to "recover" a session token, which is exactly the point |
+| Authenticating in the tests: rewrite every request site vs a kernel test helper | Per-module wrappers delegating to `security/test_support.rs`, with no test-only auth bypass | ~160 HTTP tests construct the router and would fail the moment the middleware lands; cost: a large mechanical diff inside the breaking slice, isolated as cookie plumbing so a reviewer can skim it |
+| Full-page refusal: JSON 403 (what the existing error type does) vs a small HTML page | HTML page for full-page requests, JSON everywhere else | A JSON body rendered in the browser is a dead end for someone who typed a URL; cost: one more template, and the refusal shape is decided from the path and the `HX-Request` header, exactly like the web modules already do with `is_htmx` |
 | CSRF tokens in every form vs cookie flags plus origin check | `SameSite=Lax`, `HttpOnly`, `Secure` when configured, plus an origin check on unsafe methods | No template churn across ten screens and no new state; cost: honest and written down — a same-site subdomain compromise is not covered, and non-browser clients that send no `Origin` are allowed through (they can forge anything anyway, and they still need a valid session) |
 | Login throttling in memory vs a table of attempts | In memory, per username, with an injected clock | Closes the obvious brute force without new tables or cleanup, and stays testable; cost: the counter resets on restart and is per process — written down as a limitation, not a silent gap |
 | Test-speed hashing: production params everywhere vs a light hasher in tests | Both: production params by default, light params for tests, plus a test that pins the production parameters | argon2id at OWASP parameters costs ~50-100 ms per login and the suite logs in hundreds of times; cost: the suite does not exercise production cost, so a test asserts the defaults instead |
@@ -91,8 +93,12 @@ there is no scheduler in this application, and a session table that only grows i
 ## Enforcement wiring
 - Middleware resolves the session once per request and inserts `Principal` into request extensions.
 - `Require<P: Permission>` is a zero-sized extractor: it reads `Principal` and compares `P::CODE` against
-  the resolved set. Missing permission answers `403` with a Spanish notice fragment for HTML/HTMX and a
-  JSON body for `/api/*`.
+  the resolved set. A refusal answers `403` in the shape the caller can read: JSON `{"error": ...}` for
+  `/api/*` and for HTMX requests (the existing `htmx:responseError` handler in `base.html` already turns a
+  JSON error into the dismissible `#notice` box, so no new fragment is needed), and a minimal HTML page
+  (`templates/forbidden.html`, extending `base.html` so the navigation survives) for a full-page HTML
+  request. The refusal message is read by the operator, so it is written in Spanish like the rest of the
+  interface copy.
 - Whole-module surfaces that are uniformly gated may use a router-level guard instead of a per-handler
   extractor, but only when every route in that group needs exactly the same permission; mixed surfaces
   use per-handler extractors.
@@ -121,12 +127,22 @@ On startup, if no active user holds the protected role, the application seeds `a
   middleware; `identity_web.rs` and `identity_api.rs` are merged.
 - `main.rs`: reads the new environment variables, logs the bootstrap outcome (never the password unless
   generated), and drops the wildcard CORS origin.
-- Every route test and `src/smoke_tests.rs` gains the authenticated helper; unauthenticated requests that
-  used to assert 200 now assert the redirect, which is the point of the change.
+- Every route test and `src/smoke_tests.rs` gains the authenticated helper: ~160 HTTP tests across 14
+  modules build `routes::router(state)` and would otherwise start receiving redirects. The churn is
+  mechanical — a cookie header inside each module's already-existing `get_html`/`post_form` wrappers — and
+  it is deliberately **not** a test-only bypass: tests authenticate the way a client does. A small
+  `#[cfg(test)]` kernel helper (`security/test_support.rs`) seeds the principal and mints the session, so
+  there is one source of truth for how a test logs in.
 - `README.md`: the "No Heavy ORM / No Docker / No Auth" section, the module table, the migrations list and
   the environment variables.
-- `e2e/tests/test_harness.py`: a login step in the browser harness, and a new slice for the interactions
-  (login, forced password change, session expiry mid-HTMX, permission denied on an HTMX form).
+- `e2e/conftest.py` and `e2e/helpers.py`: `ApiClient` uses `urllib` with no cookie jar and the browser
+  fixture builds a fresh context per test, so the login belongs in the fixtures once per server (a cookie
+  threaded through the `urllib` requests, `context.add_cookies(...)` for the browser) rather than in every
+  test. New slice for the interactions only a browser can see: login, forced password change, session
+  expiry mid-HTMX, and a permission-denied HTMX form.
+- `static/tailwind.css`: the CSS is a committed build scanned from `templates/` (`@source "../templates"`),
+  so new utility classes in the new templates require `scripts/build-css.sh` and the regenerated file in the
+  same commit.
 - `openspec/specs/`: a new `identity` capability on delivery, plus the `verification` spec's note about the
   new browser cases.
 
@@ -146,10 +162,14 @@ On startup, if no active user holds the protected role, the application seeds `a
 Phase A (authorization) and Phase B (audit). Each slice is its own branch and PR, chained, with `cargo test`
 green and an independent verification before the next slice starts.
 
-- **S1** auth foundation: deps, migrations 1-2, models, user/session repositories, `AuthService`
-  (bootstrap, login, throttle, logout, session resolution), `security/password.rs`, `security/session.rs`,
-  `security/guard.rs` middleware, `identity_web.rs` login/logout, `identity_api.rs` sessions, `AppState`,
-  env vars, the authenticated test helper plus every existing test adapted.
+- **S1a** identity kernel core: deps, migrations 1-2, models, user/session repositories, `AuthService`
+  (bootstrap, login, throttle, logout, session resolution), `security/password.rs`, `security/session.rs`.
+  Purely additive: the router is untouched, so the suite stays green and no existing test changes.
+- **S1b** the wiring: `security/guard.rs` middleware, `identity_web.rs` login/logout, `identity_api.rs`
+  sessions, `AppState`, env vars and CORS narrowed, `security/test_support.rs`, and the cookie plumbing in
+  the ~160 existing HTTP tests. This is the one unavoidably large slice (~800-1,000 lines), because the
+  suite has to be green in the same commit that starts refusing anonymous requests. Its diff is dominated
+  by mechanical header plumbing, and it is the only slice where that is true.
 - **S2** RBAC core: migration 3 (catalog and seeded roles), `security/authz.rs` (Principal, catalog,
   `Require<P>`), `IdentityService` permission resolution, `role_repo`/`permission_repo`, catalog drift test.
 - **S3** users admin: `/users` list, create, deactivate, admin password reset, role assignment with

@@ -94,9 +94,10 @@
   refused: `/api/*` answers `401` with `{"error":"unauthorized"}`; an `HX-Request` answers `401` with
   `HX-Redirect: /login` and no body; any other request answers `303` to `/login` (with `next` only when it
   is a local path).
-- **Authorization.** A handler that declares `Require<P>` runs only if the principal holds `P`. Refusal is
-  `403`: JSON for `/api/*`, a Spanish notice fragment (`data-notice`, `role="status"`) for HTML and HTMX.
-  A refusal writes nothing.
+- **Authorization.** A handler that declares `Require<P>` runs only if the principal holds `P`. A refusal
+  is `403` and writes nothing, in the shape the caller reads: JSON `{"error": ...}` for `/api/*` and for
+  HTMX requests (the global `htmx:responseError` handler renders it as the `#notice` box), and a minimal
+  HTML page for a full-page HTML request. The message reaches the operator, so it is written in Spanish.
 - **Protected role and last administrator.** The database refuses: deleting a `is_system` role, changing
   its code, deleting its `role_permissions` rows, deactivating the last active user holding it, and
   deleting the last grant of that role to an active user. The interface reports the refusal in Spanish and
@@ -155,8 +156,9 @@
       session is refused immediately; revoking twice is idempotent; `revoked_at` cannot be cleared.
 - [ ] AC8: activity after 30 idle minutes extends `expires_at`; activity before it does not.
 - [ ] AC9: logout clears the cookie, revokes the row, and works with an already-invalid token.
-- [ ] AC10: a handler declaring a permission the principal lacks is refused with `403` and writes nothing;
-      the same handler runs when the permission is granted through any of the user's roles.
+- [ ] AC10: a handler declaring a permission the principal lacks is refused with `403` — JSON for `/api/*`
+      and for HTMX, an HTML page for a full-page request — and writes nothing; the same handler runs when the
+      permission is granted through any of the user's roles.
 - [ ] AC11: effective permissions are the union across roles; a user with no roles has none; editing a
       role's matrix changes the next request without restarting.
 - [ ] AC12: the shared catalog test fails if a code exists in one side only (verified by removing a row
@@ -181,3 +183,5 @@
 - [ ] AC22: the browser suite covers login, forced password change, session expiry during an HTMX request,
       and a permission-denied HTMX form.
 - [ ] AC23: no password, token or hash appears in any response body, log line or template.
+- [ ] AC24: the existing HTTP tests authenticate through the shared kernel test helper, and no test-only
+      authentication bypass exists in non-test code (verified by grep for a test/flag branch in the guard).

@@ -1,8 +1,9 @@
 # Tasks: add-identity-module
 
 ## Review Workload Forecast
-- Estimated: ~4,500 lines across 14 slices — Phase A (authorization) ~2,600 lines in 8 slices, Phase B
-  (audit) ~1,900 lines in 6 slices. Slices are chained branches, one PR each.
+- Estimated: ~5,300 lines across 15 slices — Phase A (authorization) ~3,400 lines in 9 slices (S1b alone
+  ~800-1,000, dominated by mechanical test-cookie plumbing), Phase B (audit) ~1,900 lines in 6 slices.
+  Slices are chained branches, one PR each.
 - Chained PRs recommended: **Yes — every slice.**
 - 400-line budget risk: **High** for every slice, and extreme if Phase A were attempted as one PR.
 - Decision needed before apply: **Yes** — the user decides whether Phase B runs immediately after Phase A
@@ -10,21 +11,25 @@
 
 ## Phase A — authorization
 
-### S1 — authentication foundation
+### S1a — identity kernel core (additive, router untouched)
 - [ ] T1: dependencies (`argon2`, and the already-locked `sha2`, `getrandom`, `base64`), `security/password.rs`
       with the production parameters and a light test hasher, plus the test that pins the production cost.
 - [ ] T2: migrations `create_identity_users` and `create_identity_sessions` with the triggers.
-- [ ] T3: models `User`, `NewUser`, `Session`, `Principal` (kernel-side) + `error.rs` variants for
-      unauthorized/forbidden.
+- [ ] T3: models `User` (no hash), `UserWithHash` (authentication only), `NewUser`, `Session`, `NewSession`,
+      plus the `error.rs` variants for unauthorized (401) and forbidden (403), mapping to the existing
+      JSON response shape.
 - [ ] T4: `UserRepository` and `SessionRepository` traits and SQLite impls (validity decided in SQL).
-- [ ] T5: `AuthService`: bootstrap admin, login with constant-time verification and the generic failure,
-      in-memory throttle with an injected clock, session mint/resolve/renew/revoke, logout.
-- [ ] T6: `security/session.rs` cookie read/write with the flags, `security/guard.rs` middleware with the
-      public allowlist and the three refusal shapes.
+- [ ] T5: `AuthService` (the identity service): bootstrap admin, login with constant-time verification and
+      the generic failure, in-memory throttle with an injected clock, session mint/resolve/renew/revoke,
+      logout. Tests for AC1, AC4-AC9, AC23.
+
+### S1b — the wiring (the one unavoidably large slice)
+- [ ] T6: `security/guard.rs` middleware with the public allowlist and the three refusal shapes.
 - [ ] T7: `identity_web.rs` (`GET /login`, `POST /login`, `POST /logout`) and `identity_api.rs`
-      (`POST`/`DELETE /api/sessions`), templates for the login page, `AppState` and `main.rs` wiring,
-      environment variables, CORS narrowed.
-- [ ] T8: the authenticated route-test helper and every existing test adapted; tests for AC1-AC9, AC20, AC23.
+      (`POST`/`DELETE /api/sessions`), the login template, `AppState` and `main.rs` wiring, environment
+      variables, CORS narrowed from the wildcard.
+- [ ] T8: `security/test_support.rs` (the shared authentication helper for tests) plus the cookie plumbing
+      in the ~160 existing HTTP tests; tests for AC2, AC3, AC20, AC24.
 
 ### S2 — RBAC core
 - [ ] T9: migration `create_identity_rbac` (catalog, seeded roles, guarded inserts) and
