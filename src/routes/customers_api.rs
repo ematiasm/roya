@@ -356,6 +356,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::routes::AppState;
+    use crate::security::test_support;
 
     async fn test_state(enforce_credit_limit: bool) -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -369,6 +370,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        // S1b part 1: seed the fixed test session every request will authenticate with.
+        test_support::seed_session(&pool).await.unwrap();
         AppState::new_with_credit_limit(pool, false, true, enforce_credit_limit)
     }
 
@@ -378,7 +381,7 @@ mod tests {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let mut builder = Request::builder().method(method).uri(uri);
+        let mut builder = test_support::with_cookie(Request::builder().method(method).uri(uri));
         let payload = match body {
             Some(v) => {
                 builder = builder.header("content-type", "application/json");

@@ -9,5 +9,10 @@
 pub mod password;
 pub mod session;
 
+// Test-only support (S1b part 1): the fixed test session every HTTP test
+// authenticates with. Compiled out of production builds.
+#[cfg(test)]
+pub mod test_support;
+
 pub use password::{PasswordHasher, PasswordHashing};
 pub use session::{hash_token, mint_token, SessionPolicy, RENEWAL_AFTER_SECS, SESSION_COOKIE};

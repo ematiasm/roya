@@ -425,6 +425,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::routes::AppState;
+    use crate::security::test_support;
 
     const FORM: &str = "application/x-www-form-urlencoded";
 
@@ -441,6 +442,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        // S1b part 1: seed the fixed test session every request will authenticate with.
+        test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, true)
     }
 
@@ -451,7 +454,7 @@ mod tests {
         content_type: Option<&str>,
         body: String,
     ) -> (StatusCode, String) {
-        let mut builder = Request::builder().method(method).uri(uri);
+        let mut builder = test_support::with_cookie(Request::builder().method(method).uri(uri));
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
         }

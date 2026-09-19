@@ -1017,6 +1017,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::routes::AppState;
+    use crate::security::test_support;
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -1029,6 +1030,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        // S1b part 1: seed the fixed test session every request will authenticate with.
+        test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, true)
     }
 
@@ -1036,6 +1039,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri(uri)
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1082,6 +1086,7 @@ mod tests {
             .uri("/web/products")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -1205,7 +1210,8 @@ mod tests {
             .method("POST")
             .uri(uri)
             .header("content-type", "application/x-www-form-urlencoded")
-            .header("HX-Request", "true");
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE);
         for (k, v) in extra_headers {
             builder = builder.header(*k, *v);
         }
@@ -1478,6 +1484,7 @@ mod tests {
             .method("POST")
             .uri("/web/products/edit")
             .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

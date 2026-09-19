@@ -587,6 +587,7 @@ mod tests {
         ProductKind,
     };
     use crate::routes::AppState;
+    use crate::security::test_support;
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -600,6 +601,8 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        // S1b part 1: seed the fixed test session every request will authenticate with.
+        test_support::seed_session(&pool).await.unwrap();
         // Enforcement off: the fixture confirms an over-limit sale and the page
         // must report the customer as over limit (the 400 path is covered by the
         // REST and smoke suites).
@@ -610,6 +613,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri(uri)
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -624,6 +628,7 @@ mod tests {
             .uri(uri)
             .header("content-type", "application/x-www-form-urlencoded")
             .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
             .body(Body::from(body.to_string()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
