@@ -36,31 +36,40 @@ so it is split on the review-friendly seam: the mechanical test plumbing lands f
 anything, and the behaviour change second, when the tests already authenticate.
 
 #### S1b-i — test-session plumbing (no behaviour change)
-- [ ] `security/test_support.rs`: a fixed test session token, the cookie constant, `seed_session` through the
+- [x] `security/test_support.rs`: a fixed test session token, the cookie constant, `seed_session` through the
       real repositories, `with_cookie`, and a test proving `resolve_session` resolves it.
-- [ ] Every route test module plus `src/smoke_tests.rs`: the session is seeded in `test_state()` and the
+- [x] Every route test module plus `src/smoke_tests.rs`: the session is seeded in `test_state()` and the
       cookie rides in the local request helpers. No assertion changes; the suite stays at 410.
 
 #### S1b-ii — the gate
-- [ ] T6: `security/guard.rs` middleware with the public allowlist, the three refusal shapes and the origin
+- [x] T6: `security/guard.rs` middleware with the public allowlist, the three refusal shapes and the origin
       check on unsafe methods.
-- [ ] T6b: remove every temporary `#[allow(dead_code)]` / `#[allow(unused_imports)]` attribute that S1a
+- [x] T6b: remove every temporary `#[allow(dead_code)]` / `#[allow(unused_imports)]` attribute that S1a
       added (15 of them, in `security/mod.rs`, `repositories/{user,session}_repo.rs`, `services/identity.rs`,
       `models.rs`, `error.rs`, `repositories/mod.rs`, `services/mod.rs`): once the router consumes the kernel
       they are no longer honest, and the slice is not done until `grep -rn 'allow(dead_code)\|allow(unused_imports)'
       src/security src/services/identity.rs src/repositories/user_repo.rs src/repositories/session_repo.rs`
       returns only genuinely justified entries (S1a suppressed 51 bin warnings with them, so leaving them is
       leaving 51 warnings hidden). The `AppError::Forbidden` one stays until S2 constructs it.
-- [ ] T7: `identity_web.rs` (`GET /login`, `POST /login`, `POST /logout`), the login template, the sidebar
+- [x] T7: `identity_web.rs` (`GET /login`, `POST /login`, `POST /logout`), the login template, the sidebar
       logout control, `AppState` and `main.rs` wiring, environment variables, CORS narrowed from the wildcard,
       and the bootstrap call. `must_change_password` is deliberately NOT enforced yet (its route arrives in
       S3, and enforcing the confinement now would lock the bootstrap administrator out).
-- [ ] T8: the gate's own tests — AC2 in its three shapes, AC3 over a representative protected-route list,
+- [x] T8: the gate's own tests — AC2 in its three shapes, AC3 over a representative protected-route list,
       AC24 (an app built through the shared test helper still refuses a request with no cookie), the origin
       check, a full login round trip, `next` validation against an external URL, and that
       `must_change_password` is not enforced yet; plus the end-to-end `curl` probe against the real binary
       (303 to `/login`, 401 for `/api/*`, cookie set on a correct password, 200 with the cookie, logout,
       dead cookie refused).
+
+S1b-ii went through an adversarial verification that returned DO NOT COMMIT: an exploitable open redirect
+(CWE-601) hid behind a `next` validator that rejected `\`, `\r` and `\n` but not TAB, so `/<TAB>/evil.com`
+reached the `Location` header raw and Chromium collapsed it to `//evil.com` off-origin. The correction round
+replaced the enumeration with `char::is_control()`, percent-encodes `next` as a query parameter, added a
+12-entry hostile table at both the unit and end-to-end levels, restored the wiring guard's route-existence
+oracle for `POST /logout` (an anonymous probe could not tell a refusal from a registered route), and added an
+HTTP-level anonymous `/static/*` test. 433 -> 439 tests; the browser half of the attack was re-run in real
+Chromium against the real binary with a decoy server that received no request at all.
 
 #### S1b-iii — the JSON session API and the second test layer
 - [ ] T9: `src/routes/identity_api.rs` (`POST /api/sessions` with JSON credentials answering `204` +
