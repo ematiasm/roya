@@ -1,0 +1,43 @@
+{# Login page (Slice S1b part 2). Plain HTML form — no htmx: credentials are
+   the one action a client without JavaScript and without a session must be
+   able to complete. The hidden `next` is a validated local path (see
+   security::guard::local_next) or empty, so the login can never become an
+   open redirect. On failure the server re-renders this page with the generic
+   Spanish message in the shared danger-notice idiom; on success it sets the
+   session cookie and redirects. #}
+{% extends "base.html" %}
+{% block title %}Iniciar sesión — Roya{% endblock %}
+{# No navigation shell: the login card renders without the sidebar (and its
+   logout button), which belongs only to pages behind a session. #}
+{% block sidebar %}{% endblock %}
+{% block content %}
+<div class="flex min-h-[60vh] items-center justify-center">
+  <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6">
+    <h1 class="mb-4 text-lg font-semibold">Iniciar sesión</h1>
+
+    {% if let Some(message) = error %}
+    <div class="mb-4 flex items-start justify-between gap-3 rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger"
+         data-notice="error" role="alert">
+      <div class="min-w-0 flex-1 break-words">{{ message }}</div>
+      <button type="button" class="shrink-0 rounded border border-current px-2 py-0.5 text-xs"
+              data-notice-dismiss="true" aria-label="Cerrar">✕</button>
+    </div>
+    {% endif %}
+
+    <form method="post" action="/login" class="flex flex-col gap-3">
+      <input type="hidden" name="next" value="{{ next }}" />
+      <div>
+        <label for="username">Usuario</label>
+        <input id="username" name="username" type="text" required autofocus
+               autocomplete="username" autocapitalize="none" spellcheck="false" />
+      </div>
+      <div>
+        <label for="password">Contraseña</label>
+        <input id="password" name="password" type="password" required
+               autocomplete="current-password" />
+      </div>
+      <button type="submit">Iniciar sesión</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

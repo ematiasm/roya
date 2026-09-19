@@ -92,8 +92,12 @@
   expired token.
 - **Deny by default.** Any request whose path is not in the public allowlist without a valid session is
   refused: `/api/*` answers `401` with `{"error":"unauthorized"}`; an `HX-Request` answers `401` with
-  `HX-Redirect: /login` and no body; any other request answers `303` to `/login` (with `next` only when it
-  is a local path).
+  `HX-Redirect: /login` and no body; any other request answers `303` to `/login`.
+- **`next` is only a local path, and it is encoded.** A request may carry `next` only when it starts with a
+  single `/`, is not `//`, contains no backslash and contains no control character at all
+  (`char::is_control`, because the URL parser strips TAB/CR/LF before parsing and a raw TAB turns
+  `/<TAB>/evil.com` into the network-path-relative `//evil.com`). The value is emitted percent-encoded as a
+  query parameter so a filtered page survives the round trip, and every hostile value falls back to `/`.
 - **Authorization.** A handler that declares `Require<P>` runs only if the principal holds `P`. A refusal
   is `403` and writes nothing, in the shape the caller reads: JSON `{"error": ...}` for `/api/*` and for
   HTMX requests (the global `htmx:responseError` handler renders it as the `#notice` box), and a minimal

@@ -62,5 +62,13 @@
        class="mt-1 inline-block text-[12px] font-normal text-muted no-underline hover:text-text hover:underline">
       <span class="md:hidden lg:inline">REST API ↗</span><span class="hidden md:inline lg:hidden">API</span>
     </a>
+    {# Static logout (S1b part 2): a plain POST, no htmx — logout must work
+       without JavaScript, and the middleware's origin check accepts a
+       same-origin form post. An anonymous POST to /logout is refused by the
+       gate with a redirect to /login, so the button is harmless when signed
+       out. The current user's display name arrives with S7's nav gating. #}
+    <form method="post" action="/logout" class="mt-2">
+      <button type="submit" class="w-full">Cerrar sesión</button>
+    </form>
   </div>
 </aside>

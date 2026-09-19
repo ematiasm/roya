@@ -104,6 +104,21 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
   no se toca) y S1b es el cambio rompiente, así que el presupuesto de revisión no se junta en un solo PR.
   El writer frenó una vez con un bloqueo legítimo —`src/security/` no compila sin `mod security;` en
   `src/main.rs`, que mi brief había excluido— y se resolvió autorizando esa única línea.
+- 2026-09-18: **S1b partes 1 y 2**, con dos timeouts de runner en el camino: un writer que falló sin escribir
+  nada (la slice combinada no entró en una corrida de contexto) y un fix writer que se colgó 30 minutos
+  *después* de terminar sus fixes. La slice se partió en tres por eso, y la recuperación del segundo timeout
+  no fue adivinar: el estado verificado de S1b-ii quedaba byte-identical en la copia del verificador en
+  `/tmp`, así que el diff contra esa copia dijo exactamente qué había cambiado (todo menos FIX-4). FIX-4, un
+  test de 15 líneas, lo escribió el orquestador tras los dos fallos del runner.
+- 2026-09-18: **Entrega de la Fase A temprana en PRs encadenados.** Issue **#40** (con
+  `status:approved`) y cuatro PRs apilados que se mergean de a uno, retargeteando el siguiente después de
+  cada merge: **#41** plan (docs, 657 líneas, dentro de presupuesto) → **#42** kernel S1a (3.661, pide
+  `size:exception`) → **#43** sesión de test S1b-i (307, dentro de presupuesto) → **#44** portón S1b-ii/iii
+  (2.441, pide `size:exception`). Los hijos van en draft a propósito: su base es su padre, así que un merge
+  accidental iría a la rama equivocada.
+- El split del plan como PR propio no estaba en el plan original: salió de aplicar la regla de chained PRs
+  (400 líneas) y ver que el pase honesto de slicing ya se había hecho — S1 → S1a/S1b, y S1b → i/ii/iii. El
+  PR del plan es el paso 0 más barato y deja los PRs de código sin prosa.
 
 ## Verification evidence
 Pendiente por slice; se registra acá con el comando, el resultado y el hash del commit de la
@@ -147,6 +162,34 @@ unidad de trabajo.
   reusar el artefacto mutado en silencio (al verificador le leyó 406/4 en vez de 410/0). `touch` después de
   restaurar, siempre.
 
+### S1b-i — plumbing de sesión de test (`4ead61e`, `f0e2e5d`)
+- 411 passed (+1) con **171 tests HTTP re-autenticados y 0 aserciones tocadas**, probado aritméticamente: el
+  diff tiene 7 líneas borradas y todas son reescrituras de `Request::builder()` para encadenar la cookie;
+  cero líneas de `assert`/`StatusCode` agregadas o borradas. El helper siembra una sesión real por los
+  repositorios de producción y ancla el nombre de la cookie con un `const fn assert` + round-trip por el
+  parser real.
+
+### S1b-ii — el portón (`433 → 439`)
+- Sonda end-to-end con el binario real: `GET /` anónimo → 303 a `/login?next=/`; `/api/accounts` → 401;
+  login correcto → 303 + `Set-Cookie: HttpOnly; SameSite=Lax; Path=/; Max-Age=43200`; `GET /` con cookie →
+  200; logout → 303 y la fila queda **revocada** (no solo la cookie borrada); cookie muerta → 303;
+  cross-origin → 403.
+- **El verificador encontró un open redirect explotable (CWE-601) que ni el writer ni yo vimos:**
+  `local_next` rechazaba `\`, `\r` y `\n` pero **no TAB**; `next=/\t/evil.com` pasaba la validación, salía
+  crudo en `Location: /\t/evil.com`, y Chromium —que borra TAB/CR/LF *antes* de parsear la URL— lo colapsaba
+  a `//evil.com` y navegaba fuera del sitio. El test que decía cubrirlo probaba `http://evil.example.com` y
+  nada más. Veredicto de esa ronda: **DO NOT COMMIT**.
+- Fix: `!next.chars().any(char::is_control)` (regla general, no enumeración de caracteres), `next` emitido
+  percent-encoded como query param, tabla de 12 hostiles unitaria **y** end-to-end por `POST /login`, y el
+  oráculo de ruta inexistente restaurado para `POST /logout` (que había quedado sondeándose anónimo: un 303
+  de rechazo es indistinguible de un 303 de ruta registrada, así que renombrar la ruta dejaba el guard verde).
+- Re-verificación: **SAFE TO COMMIT**, con la mitad de navegador reproducida **en Chromium real contra el
+  binario real**: todos los casos hostiles terminan en el origen de la app y el servidor señuelo no recibió
+  una sola request. Cinco mutaciones confirman que cada test nuevo falla al revertir su fix.
+- Corrección de un número mío: predije «−51 warnings» al borrar los 15 `#[allow]`; el resultado neto fue
+  +7 (51 → 58), y los 51 previos eran dead code de finanzas/ventas/inventario ajeno a esta slice. Los +7 son
+  dead code de *fixtures de test*, no deuda de S2/S3 — eso vive en el target bin.
+
 ## Carga de revisión
 14 slices encadenadas más S1a/S1b (15 en total): Fase A ~5,500 líneas, Fase B ~1,900. S1a sola midió ~2,500
 líneas (2,313 nuevas + 201 modificadas). Cada slice supera el presupuesto de 400 líneas por sí sola, así
@@ -154,9 +197,10 @@ que los PRs encadenados son la regla y no una preferencia. Corte natural: Fase A
 coherente (identidad + autorización) y Fase B puede esperar.
 
 ## Next step
-S1b: middleware de negación por defecto, `/login`+`/logout`, `POST`/`DELETE /api/sessions`,
-`security/test_support.rs`, y el plumbing de cookie en los ~160 tests HTTP existentes.
+S1b-iii: la API JSON de sesiones (`POST`/`DELETE /api/sessions` + su entrada en la allowlist), el shell propio
+para la página de login (hoy el visitante anónimo ve la navegación y el botón de logout), los seis env vars en
+`README.md`/`env.example` —con `ROYA_COOKIE_SECURE` marcado como obligatorio en HTTPS—, cobertura de `Secure`
+en el borde real, y el arreglo del harness de e2e (que a esta altura ya no puede autenticarse).
 
-Riesgos residuales que S1b hereda y debe mirar: el throttle es en memoria y por proceso (documentado);
-mientras el mapa esté saturado una clave nueva no se trackea (ventana acotada, autocurativa, con el costo de
-argon2 como limitador real); y los 15 `#[allow]` temporales, cuyo borrado es criterio de cierre.
+Deuda explícita que no se resuelve en S1b-iii: la navegación de `HX-Redirect` sigue sin probarse en navegador
+(un test de header es un test de atributo, no de comportamiento; va en S8).

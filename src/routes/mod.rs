@@ -1,6 +1,8 @@
 pub mod api;
 pub mod customers_api;
 pub mod customers_web;
+pub mod identity_api;
+pub mod identity_web;
 pub mod inventory_api;
 pub mod inventory_web;
 pub mod purchases_api;
@@ -19,10 +21,13 @@ use crate::repositories::{
     SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
     SqlitePaymentMethodRepository, SqliteProductRepository,
     SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteSaleRepository,
-    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTransactionRepository,
+    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteSessionRepository,
+    SqliteTransactionRepository, SqliteUserRepository,
 };
+use crate::security::auth_middleware;
+use crate::services::identity::{SystemClock, ThrottleConfig};
 use crate::services::{
-    AccountService, CustomerReceiptService, CustomerService, InventoryService,
+    AccountService, CustomerReceiptService, CustomerService, IdentityService, InventoryService,
     PaymentMethodService, PurchasesService, SalesService, SupplierService, TransactionService,
 };
 
@@ -84,6 +89,15 @@ pub type PurchasesSvc = PurchasesService<
     SqlitePaymentMethodRepository,
 >;
 
+/// The identity service the deny-by-default gate and the login/logout routes
+/// resolve sessions through: SQLite repositories, wall-clock UTC, argon2id.
+pub type IdentitySvc = IdentityService<
+    SqliteUserRepository,
+    SqliteSessionRepository,
+    SystemClock,
+    crate::security::PasswordHasher,
+>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -97,6 +111,9 @@ pub struct AppState {
     pub payment_method_service: MethodSvc,
     pub supplier_service: SupplierSvc,
     pub purchases_service: PurchasesSvc,
+    /// Identity kernel service (S1b): the single session-validity opinion the
+    /// guard and the login/logout routes share.
+    pub identity_service: IdentitySvc,
     pub allow_negative: bool,
     pub allow_negative_stock: bool,
     /// `ENFORCE_CREDIT_LIMIT` (default true): the sales service rejects a credit
@@ -116,6 +133,57 @@ impl AppState {
         allow_negative: bool,
         allow_negative_stock: bool,
         enforce_credit_limit: bool,
+    ) -> Self {
+        // Production identity defaults: 12h absolute TTL, non-Secure cookie and
+        // the shipped throttle shape. `main` overrides the policy and throttle
+        // from the environment via `new_with_identity`; the hasher is always
+        // the production argon2id (parameters pinned by a test in password.rs).
+        Self::new_with_identity(
+            pool,
+            allow_negative,
+            allow_negative_stock,
+            enforce_credit_limit,
+            crate::security::SessionPolicy::new(12, false),
+            ThrottleConfig::default(),
+        )
+    }
+
+    /// `main`'s constructor: the environment-configured session policy and
+    /// login throttle, production hasher always.
+    pub fn new_with_identity(
+        pool: SqlitePool,
+        allow_negative: bool,
+        allow_negative_stock: bool,
+        enforce_credit_limit: bool,
+        policy: crate::security::SessionPolicy,
+        throttle: ThrottleConfig,
+    ) -> Self {
+        let identity_service = IdentityService::new(
+            SqliteUserRepository::new(pool.clone()),
+            SqliteSessionRepository::new(pool.clone()),
+            SystemClock,
+            crate::security::PasswordHasher::production(),
+            policy,
+            throttle,
+        );
+        Self::with_identity_service(
+            pool,
+            allow_negative,
+            allow_negative_stock,
+            enforce_credit_limit,
+            identity_service,
+        )
+    }
+
+    /// Inject a fully-built identity service. The test suite uses this through
+    /// `security/test_support` (light hasher); production constructors build
+    /// the service themselves so the production hasher cannot be swapped out.
+    pub fn with_identity_service(
+        pool: SqlitePool,
+        allow_negative: bool,
+        allow_negative_stock: bool,
+        enforce_credit_limit: bool,
+        identity_service: IdentitySvc,
     ) -> Self {
         let acc_repo = SqliteAccountRepository::new(pool.clone());
         let tx_repo = SqliteTransactionRepository::new(pool.clone());
@@ -176,6 +244,7 @@ impl AppState {
             payment_method_service,
             supplier_service,
             purchases_service,
+            identity_service,
             allow_negative,
             allow_negative_stock,
             enforce_credit_limit,
@@ -187,6 +256,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(api::router())
         .merge(web::router())
+        .merge(identity_web::router())
+        .merge(identity_api::router())
         .merge(customers_api::router())
         .merge(customers_web::router())
         .merge(inventory_api::router())
@@ -198,6 +269,12 @@ pub fn router(state: AppState) -> Router {
         .merge(suppliers_web::router())
         .nest_service("/static", ServeDir::new("static"))
         .fallback(route_not_found)
+        // Deny by default (S1b part 2): one gate in front of every route and
+        // the fallback, so an unlisted path fails closed.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -252,6 +329,34 @@ mod tests {
                 .unwrap();
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "{uri} should be served");
+        }
+    }
+
+    /// S1b part 2, FIX-4: the same assets must also load for a request that
+    /// carries NO session at all. `/static/*` is the only route a browser hits
+    /// before it has a cookie (the login page itself depends on both files), so
+    /// a redirect here would leave every page unstyled and htmx-less — the
+    /// allowlist entry has to be proven over HTTP, not only through the
+    /// `is_public` predicate it is built from.
+    #[tokio::test]
+    async fn static_assets_load_without_a_session() {
+        let app = router(test_state().await);
+        for uri in ["/static/htmx.min.js", "/static/tailwind.css"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{uri} must load anonymously: the login page needs it before any cookie exists"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            assert!(!bytes.is_empty(), "{uri} must serve real bytes, not an empty body");
         }
     }
 }

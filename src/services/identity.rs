@@ -7,8 +7,6 @@
 // answer time does not leak existence, throttling happens before verification,
 // session validity is decided in SQL, and the injected clock makes every time
 // rule testable without sleeping. Routing, middleware and templates are S1b.
-// (dead_code allowed: nothing calls the service until the S1b router wiring.)
-#![allow(dead_code)]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 

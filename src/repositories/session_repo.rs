@@ -5,8 +5,6 @@
 // expired, revoked or deactivated-owner session is refused by the query, not
 // only by service code. Renewal is a single UPDATE of `last_seen_at` +
 // `expires_at`; revocation is idempotent and permanent (schema trigger).
-// (dead_code allowed: the identity service is wired into the router in S1b.)
-#![allow(dead_code)]
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use sqlx::{Row, SqlitePool};

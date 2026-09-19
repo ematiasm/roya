@@ -81,6 +81,17 @@ impl SessionPolicy {
         cookie
     }
 
+    /// `Set-Cookie` value that expires the session cookie. Same flags as
+    /// `serialize_cookie` with `Max-Age=0`, so the browser drops it the same
+    /// way it stores it. Logout uses this; never build the header by hand.
+    pub fn clear_cookie(&self) -> String {
+        let mut cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+        if self.secure {
+            cookie.push_str("; Secure");
+        }
+        cookie
+    }
+
     /// Extract the session token from a `Cookie` request header, ignoring every
     /// other cookie present. Missing cookie or missing token => `None`.
     pub fn parse_cookie(&self, cookie_header: &str) -> Option<String> {
@@ -157,6 +168,20 @@ mod tests {
         assert!(!plain.contains("Secure"));
 
         let secure = SessionPolicy::new(12, true).serialize_cookie("tok");
+        assert!(secure.ends_with("; Secure"));
+    }
+
+    #[test]
+    fn clear_cookie_expires_with_the_same_flags() {
+        let plain = SessionPolicy::new(12, false).clear_cookie();
+        assert!(plain.starts_with("roya_session=;"));
+        assert!(plain.contains("HttpOnly"));
+        assert!(plain.contains("SameSite=Lax"));
+        assert!(plain.contains("Path=/"));
+        assert!(plain.contains("Max-Age=0"));
+        assert!(!plain.contains("Secure"));
+
+        let secure = SessionPolicy::new(12, true).clear_cookie();
         assert!(secure.ends_with("; Secure"));
     }
 

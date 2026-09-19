@@ -10,7 +10,14 @@
 </head>
 <body class="bg-bg font-sans text-text">
   <div class="flex min-h-screen">
+    {# The app shell's navigation lives in this block so a page can render
+       without it. Default content = the sidebar partial, so every existing
+       page is unchanged; the login page (S1b part 2) overrides the block as
+       empty — an anonymous visitor on the login card must not see the whole
+       app navigation or the logout button. #}
+    {% block sidebar %}
     {% include "partials/sidebar.html" %}
+    {% endblock %}
 
     <div class="flex min-w-0 flex-1 flex-col">
       <!-- Mobile header: the drawer toggle lives here, below md only. -->
