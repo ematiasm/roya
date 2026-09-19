@@ -44,6 +44,11 @@ fn map_db_err(e: sqlx::Error) -> AppError {
         } else {
             AppError::Conflict("user already exists".into())
         }
+    } else if s.contains("FOREIGN KEY constraint failed") {
+        // user_roles.granted_by is ON DELETE RESTRICT (and a role holder's own
+        // grant records the user too): a role grant records who granted it,
+        // and that reference holds the user row the statement tried to delete.
+        AppError::Conflict("this user granted a role: the grant records who granted it, and the deletion is held".into())
     } else if s.contains("CHECK constraint failed") {
         if s.contains("users_username_shape") {
             AppError::Validation(
@@ -74,11 +79,14 @@ pub trait UserRepository: Send + Sync {
     async fn set_must_change_password(&self, id: i64, value: bool) -> AppResult<()>;
     async fn set_active(&self, id: i64, active: bool) -> AppResult<()>;
     async fn touch_last_login(&self, id: i64, when: NaiveDateTime) -> AppResult<()>;
-    /// Active holders of the protected administrator identity. Until RBAC
-    /// arrives (slice S2, `user_roles`), "administrator" is the seeded `admin`
-    /// username; this read switches to the roles join then.
-    async fn count_active_admins(&self) -> AppResult<i64>;
 }
+
+// S1a's `count_active_admins` lived here as a username shortcut, with a note
+// that it would switch to a roles join in S2. S2 unified the predicate on the
+// one the triggers protect — active holders of ANY `is_system` role — and
+// that read already existed as `role_repo::count_active_protected_holders`, so
+// the method was removed rather than duplicated: one query, one meaning, and
+// the bootstrap now consults exactly what the guards enforce.
 
 #[derive(Clone)]
 pub struct SqliteUserRepository {
@@ -202,29 +210,18 @@ impl UserRepository for SqliteUserRepository {
         .await?;
         Ok(())
     }
-
-    async fn count_active_admins(&self) -> AppResult<i64> {
-        let row: (i64,) = sqlx::query_as(
-            r#"SELECT COUNT(*) FROM users
-               WHERE is_active = 1 AND username = 'admin' COLLATE NOCASE"#,
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::str::FromStr;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     async fn pool() -> SqlitePool {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .create_if_missing(true)
-            .foreign_keys(true);
+        // The NIT's mapping test writes a `user_roles` grant fixture, so this
+        // pool also takes the shared options (foreign keys + recursive
+        // triggers), like every pool that can reach those tables.
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -281,5 +278,43 @@ mod tests {
             other => panic!("expected Validation, got {other:?}"),
         };
         assert!(msg.contains("display name"), "message must name the field: {msg}");
+    }
+
+    /// A role grant records who granted it (`user_roles.granted_by ... ON
+    /// DELETE RESTRICT`), so deleting that user is held by a foreign key, not
+    /// by a guard trigger. The raw SQLite text is a bare SQL string; the
+    /// mapping here is what the interface will explain instead.
+    #[tokio::test]
+    async fn a_grantor_user_delete_maps_the_foreign_key_refusal() {
+        let p = pool().await;
+        let repo = SqliteUserRepository::new(p.clone());
+        let grantor = repo.create(&new_user("hr-grantor", "HR")).await.unwrap();
+        let holder = repo.create(&new_user("teller", "Teller")).await.unwrap();
+        sqlx::query(
+            r#"INSERT INTO user_roles (user_id, role_id, granted_by)
+               VALUES (?, (SELECT id FROM roles WHERE code = 'admin'), ?)"#,
+        )
+        .bind(holder.id)
+        .bind(grantor.id)
+        .execute(&p)
+        .await
+        .unwrap();
+
+        let err = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(grantor.id)
+            .execute(&p)
+            .await
+            .unwrap_err();
+        let mapped = map_db_err(err);
+        match &mapped {
+            AppError::Conflict(message) => {
+                assert!(
+                    message.contains("granted a role"),
+                    "the refusal must name the reason: {message}"
+                );
+                assert!(!message.contains("FOREIGN KEY"), "no raw SQL text: {message}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 }

@@ -1,28 +1,35 @@
-// M5 identity kernel (Slice S1a). IdentityService owns the credential and
-// session lifecycle: bootstrap admin, login with an in-memory throttle, session
-// resolution with sliding renewal, logout, password change and mass revocation.
-// Invariants owned here: the login failure is always the same generic error
-// (unknown user, wrong password and inactive user are indistinguishable), the
-// unknown-username path still pays a full verification cost (dummy hash) so
-// answer time does not leak existence, throttling happens before verification,
-// session validity is decided in SQL, and the injected clock makes every time
-// rule testable without sleeping. Routing, middleware and templates are S1b.
+// M5 identity kernel (Slice S1a, RBAC core added by S2). IdentityService owns
+// the credential and session lifecycle: bootstrap admin, login with an
+// in-memory throttle, session resolution with sliding renewal, logout, password
+// change and mass revocation. Invariants owned here: the login failure is
+// always the same generic error (unknown user, wrong password and inactive user
+// are indistinguishable), the unknown-username path still pays a full
+// verification cost (dummy hash) so answer time does not leak existence,
+// throttling happens before verification, session validity is decided in SQL,
+// and the injected clock makes every time rule testable without sleeping.
+// Routing, middleware and templates are S1b; the effective-permission read and
+// the bootstrap's protected-role grant are S2.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{Duration, NaiveDateTime};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewSession, ResolvedSession, User};
-use crate::repositories::{SessionRepository, UserRepository};
+use crate::models::{NewSession, NewUserRole, ResolvedSession, User};
+use crate::repositories::{
+    PermissionRepository, RoleRepository, SessionRepository, UserRepository,
+};
 use crate::security::password::PasswordHashing;
 use crate::security::session::{hash_token, mint_token, SessionPolicy};
 
-/// The seeded administrator username. Until RBAC arrives (S2), "administrator"
-/// means this username; the repository's admin count switches to the roles
-/// join then.
+/// The seeded administrator username.
 pub const BOOTSTRAP_ADMIN_USERNAME: &str = "admin";
 pub const BOOTSTRAP_ADMIN_DISPLAY_NAME: &str = "Admin";
+/// The protected role the bootstrap administrator holds (AC1 + AC14: the
+/// triggers' holder arithmetic is only meaningful once the seeded
+/// administrator actually holds the role). Same machine name as the username,
+/// different rows.
+pub const BOOTSTRAP_ADMIN_ROLE_CODE: &str = "admin";
 /// Fixed generic login failure. Never append details: the sameness is the AC.
 pub const GENERIC_LOGIN_FAILURE: &str = "Usuario o contraseña incorrectos";
 /// Cost-equivalent stand-in verified against when the username does not exist.
@@ -147,15 +154,19 @@ impl std::fmt::Debug for LoginOutcome {
 }
 
 #[derive(Clone)]
-pub struct IdentityService<U, S, C, H>
+pub struct IdentityService<U, S, R, C, H>
 where
     U: UserRepository,
     S: SessionRepository,
+    R: RoleRepository,
     C: Clock,
     H: PasswordHashing,
 {
     pub users: U,
     pub sessions: S,
+    /// The identity department owns its tables: the role grants the bootstrap
+    /// writes live here (S2).
+    pub roles: R,
     pub clock: C,
     pub hasher: H,
     pub policy: SessionPolicy,
@@ -165,16 +176,18 @@ where
     attempts: Arc<Mutex<HashMap<String, ThrottleState>>>,
 }
 
-impl<U, S, C, H> IdentityService<U, S, C, H>
+impl<U, S, R, C, H> IdentityService<U, S, R, C, H>
 where
     U: UserRepository,
     S: SessionRepository,
+    R: RoleRepository,
     C: Clock,
     H: PasswordHashing,
 {
     pub fn new(
         users: U,
         sessions: S,
+        roles: R,
         clock: C,
         hasher: H,
         policy: SessionPolicy,
@@ -183,6 +196,7 @@ where
         Self {
             users,
             sessions,
+            roles,
             clock,
             hasher,
             policy,
@@ -276,26 +290,54 @@ where
     /// but inactive `admin` is reactivated with the new password, while an
     /// active one keeps the no-op behaviour.
     pub async fn bootstrap_admin(&self, env_password: Option<&str>) -> AppResult<BootstrapOutcome> {
-        if self.users.count_active_admins().await? > 0 {
+        // The gate is the real quantity (S2): an ACTIVE user holding the
+        // protected role. On an S1a-era database the administrator exists but
+        // predates `user_roles`, so the count is zero and the bootstrap below
+        // completes the seeding by granting the role.
+        // The bootstrap's "is there an administrator?" decision reads the
+        // same quantity the triggers protect: active holders of ANY
+        // `is_system` role. A second protected role therefore satisfies it
+        // too — the friendly pre-check cannot disagree with the real guard
+        // (see `count_active_protected_holders`).
+        if self.roles.count_active_protected_holders().await? > 0 {
             return Ok(BootstrapOutcome {
                 created: false,
                 user: None,
                 generated_password: None,
             });
         }
-        let credential = self.bootstrap_credential(env_password)?;
         if let Some(existing) = self
             .users
             .find_with_hash_by_username(BOOTSTRAP_ADMIN_USERNAME)
             .await?
         {
+            if existing.user.is_active {
+                // Upgraded deployment: the S1a administrator is active but
+                // predates the roles join, so the count above is zero and the
+                // seeding is incomplete. Grant the protected role and touch
+                // NOTHING else: the stored credential keeps verifying, and a
+                // reset here would lock a working operator out on upgrade.
+                self.grant_protected_role(existing.user.id).await?;
+                let user = self
+                    .users
+                    .find_by_id(existing.user.id)
+                    .await?
+                    .unwrap_or(existing.user);
+                return Ok(BootstrapOutcome {
+                    created: true,
+                    user: Some(user),
+                    generated_password: None,
+                });
+            }
             // The username is taken by a deactivated account; creating it
             // again would only collide with the NOCASE unique index. Recover
             // instead: reactivate and set the new credential.
             let id = existing.user.id;
+            let credential = self.bootstrap_credential(env_password)?;
             self.users.update_password_hash(id, &credential.password_hash).await?;
             self.users.set_must_change_password(id, credential.must_change).await?;
             self.users.set_active(id, true).await?;
+            self.grant_protected_role(id).await?;
             let user = self
                 .users
                 .find_by_id(id)
@@ -307,6 +349,7 @@ where
                 generated_password: credential.generated_password,
             });
         }
+        let credential = self.bootstrap_credential(env_password)?;
         let user = self
             .users
             .create(&crate::models::NewUser {
@@ -316,11 +359,34 @@ where
                 must_change_password: credential.must_change,
             })
             .await?;
+        self.grant_protected_role(user.id).await?;
         Ok(BootstrapOutcome {
             created: true,
             user: Some(user),
             generated_password: credential.generated_password,
         })
+    }
+
+    /// Grant the protected role to the bootstrap administrator: the write the
+    /// schema demands (`granted_by`/`granted_at`), idempotent through the
+    /// grant's ON CONFLICT DO NOTHING, so a re-run cannot duplicate the row.
+    async fn grant_protected_role(&self, user_id: i64) -> AppResult<()> {
+        let admin = self
+            .roles
+            .find_by_code(BOOTSTRAP_ADMIN_ROLE_CODE)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "the seeded protected role is missing: run the migrations first".to_string(),
+                )
+            })?;
+        self.roles
+            .grant(&NewUserRole {
+                user_id,
+                role_id: admin.id,
+                granted_by: user_id,
+            })
+            .await
     }
 
     /// Hash the bootstrap password: the env password is used as-is, or one is
@@ -441,6 +507,24 @@ where
         Ok(Some(ResolvedSession { user, session }))
     }
 
+    // -- effective permissions (AC11, Slice S2) -----------------------------------
+
+    /// The union of the permission codes of every role the user holds
+    /// (AC11), resolved in ONE query. No cache: a matrix edit applies to the
+    /// next request, and a user with no roles resolves to the empty set.
+    /// The permission repository rides in as an argument so the service's
+    /// constructor — and with it the shared test-support construction path —
+    /// stays untouched: the wiring owns the repositories, the service owns
+    /// the read that answers "may this user do this?".
+    pub async fn effective_permissions<P: PermissionRepository>(
+        &self,
+        permissions: &P,
+        user_id: i64,
+    ) -> AppResult<std::collections::BTreeSet<String>> {
+        let codes = permissions.effective_for_user(user_id).await?;
+        Ok(codes.into_iter().collect())
+    }
+
     // -- logout (AC9) ---------------------------------------------------------------
 
     /// Revoke the session behind a token. Unknown/expired/already-revoked
@@ -510,19 +594,23 @@ mod tests {
     use super::*;
     use crate::models::NewUser;
     use crate::models::Session;
-    use crate::repositories::{SqliteSessionRepository, SqliteUserRepository};
+    use crate::repositories::{
+        RoleRepository, SqlitePermissionRepository, SqliteRoleRepository, SqliteSessionRepository,
+        SqliteUserRepository,
+    };
+    use crate::security::authz::PERMISSIONS;
     use crate::security::password::PasswordHasher;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use chrono::NaiveDate;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::{Row, SqlitePool};
-    use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     type TestIdentity = IdentityService<
         SqliteUserRepository,
         SqliteSessionRepository,
+        SqliteRoleRepository,
         FakeClock,
         PasswordHasher,
     >;
@@ -633,10 +721,7 @@ mod tests {
     }
 
     async fn test_pool() -> SqlitePool {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .create_if_missing(true)
-            .foreign_keys(true);
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -653,6 +738,7 @@ mod tests {
         let service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             clock.clone(),
             PasswordHasher::light(),
             policy,
@@ -661,13 +747,14 @@ mod tests {
         (service, pool, clock)
     }
 
-    async fn spy_svc() -> (IdentityService<SqliteUserRepository, SqliteSessionRepository, FakeClock, SpyHasher>, SqlitePool, FakeClock, SpyHasher) {
+    async fn spy_svc() -> (IdentityService<SqliteUserRepository, SqliteSessionRepository, SqliteRoleRepository, FakeClock, SpyHasher>, SqlitePool, FakeClock, SpyHasher) {
         let pool = test_pool().await;
         let clock = FakeClock::new(base_time());
         let hasher = SpyHasher::new();
         let service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             clock.clone(),
             hasher.clone(),
             SessionPolicy::new(12, false),
@@ -676,8 +763,8 @@ mod tests {
         (service, pool, clock, hasher)
     }
 
-    async fn seed_user<U, S, C, H>(
-        s: &IdentityService<U, S, C, H>,
+    async fn seed_user<U, S, R, C, H>(
+        s: &IdentityService<U, S, R, C, H>,
         username: &str,
         password: &str,
         active: bool,
@@ -685,6 +772,7 @@ mod tests {
     where
         U: UserRepository,
         S: SessionRepository,
+        R: RoleRepository,
         C: Clock,
         H: PasswordHashing,
     {
@@ -792,7 +880,7 @@ mod tests {
         assert!(!second.created, "a second bootstrap must not run");
         assert!(second.user.is_none());
 
-        let count = s.users.count_active_admins().await.unwrap();
+        let count = s.roles.count_active_protected_holders().await.unwrap();
         assert_eq!(count, 1);
 
         // The original credential still verifies: nothing was overwritten.
@@ -805,13 +893,27 @@ mod tests {
         assert!(s.hasher.verify("first password 1", &stored.password_hash));
     }
 
+    /// An S1a-era database state the S2 upgrade can encounter: the
+    /// administrator row exists, deactivated, and `user_roles` is empty. Raw
+    /// SQL on purpose — this state predates the grant path, and the S2
+    /// triggers refuse to reach it through sanctioned writes (role_repo's
+    /// tests prove those refusals).
+    async fn seed_inactive_admin(pool: &SqlitePool) -> i64 {
+        sqlx::query(
+            r#"INSERT INTO users (username, display_name, password_hash, must_change_password, is_active)
+               VALUES ('admin', 'Admin', 'placeholder-not-a-real-argon2-hash', 0, 0)"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap()
+        .last_insert_rowid()
+    }
+
     #[tokio::test]
     async fn ac1_bootstrap_recovers_an_inactive_admin() {
-        let (s, _pool, _clock) = svc().await;
-        let first = s.bootstrap_admin(Some("first password 1")).await.unwrap();
-        let admin_id = first.user.unwrap().id;
-        s.users.set_active(admin_id, false).await.unwrap();
-        assert_eq!(s.users.count_active_admins().await.unwrap(), 0);
+        let (s, pool, _clock) = svc().await;
+        let admin_id = seed_inactive_admin(&pool).await;
+        assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 0);
 
         let recovery = s.bootstrap_admin(Some("second password 2")).await.unwrap();
         assert!(recovery.created, "the inactive admin must be recovered, not collided");
@@ -827,15 +929,15 @@ mod tests {
         assert!(s.hasher.verify("second password 2", &stored.password_hash));
         assert!(!s.hasher.verify("first password 1", &stored.password_hash));
         // Exactly one admin row: the recovery reactivated it, never re-created.
-        assert_eq!(s.users.count_active_admins().await.unwrap(), 1);
+        assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
+        // D2: the recovered administrator also ends up holding the role.
+        assert_eq!(held_role_codes(&s, admin_id).await, vec!["admin"]);
     }
 
     #[tokio::test]
     async fn ac1_bootstrap_generated_password_also_recovers_an_inactive_admin() {
-        let (s, _pool, _clock) = svc().await;
-        let first = s.bootstrap_admin(Some("first password 1")).await.unwrap();
-        let admin_id = first.user.unwrap().id;
-        s.users.set_active(admin_id, false).await.unwrap();
+        let (s, pool, _clock) = svc().await;
+        let admin_id = seed_inactive_admin(&pool).await;
 
         let recovery = s.bootstrap_admin(None).await.unwrap();
         assert!(recovery.created);
@@ -844,6 +946,226 @@ mod tests {
         assert!(stored.user.is_active);
         assert!(stored.user.must_change_password, "generated recovery flags the change");
         assert!(s.hasher.verify(&generated, &stored.password_hash));
+        // D2: the generated-password recovery also ends with the role granted.
+        assert_eq!(held_role_codes(&s, admin_id).await, vec!["admin"]);
+    }
+
+    /// The role codes one user holds, through the real roles join the
+    /// effective-permission read uses.
+    async fn held_role_codes<U, S, R, C, H>(
+        s: &IdentityService<U, S, R, C, H>,
+        user_id: i64,
+    ) -> Vec<String>
+    where
+        U: UserRepository,
+        S: SessionRepository,
+        R: RoleRepository,
+        C: Clock,
+        H: PasswordHashing,
+    {
+        s.roles
+            .list_for_user(user_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.code)
+            .collect()
+    }
+
+    // -- AC14 (S2): the bootstrap administrator is a real protected-role holder ---
+
+    #[tokio::test]
+    async fn ac14_a_fresh_bootstrap_administrator_holds_exactly_the_catalog() {
+        let (s, pool, _clock) = svc().await;
+        let outcome = s.bootstrap_admin(Some("env password 123")).await.unwrap();
+        assert!(outcome.created);
+        let admin_id = outcome.user.unwrap().id;
+        assert_eq!(held_role_codes(&s, admin_id).await, vec!["admin"]);
+
+        // Through the roles join — the same one query the middleware resolves
+        // per request — the administrator holds the whole 23-code catalog.
+        let permissions = SqlitePermissionRepository::new(pool.clone());
+        let mut codes = permissions.effective_for_user(admin_id).await.unwrap();
+        codes.sort();
+        let mut want: Vec<&str> = PERMISSIONS.to_vec();
+        want.sort();
+        assert_eq!(
+            codes, want,
+            "the bootstrap administrator must hold the whole seeded catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn ac14_the_trigger_now_protects_the_real_bootstrap_holder() {
+        let (s, pool, _clock) = svc().await;
+        let admin_id = s
+            .bootstrap_admin(Some("env password 123"))
+            .await
+            .unwrap()
+            .user
+            .unwrap()
+            .id;
+
+        // Deactivating the administrator is refused by the schema trigger with
+        // its own text — the S2 upgrade from the username shortcut is live.
+        let err = sqlx::query("UPDATE users SET is_active = 0 WHERE id = ?")
+            .bind(admin_id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        match err {
+            sqlx::Error::Database(db) => assert_eq!(
+                db.message(),
+                "cannot deactivate the last active user holding a protected role"
+            ),
+            other => panic!("expected the guard trigger, got {other:?}"),
+        }
+
+        // A second administrator makes the refused deactivation succeed ...
+        let second = s
+            .users
+            .create(&NewUser {
+                username: "second-admin".into(),
+                display_name: "Second".into(),
+                password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+        let admin_role = s.roles.find_by_code("admin").await.unwrap().unwrap();
+        s.roles
+            .grant(&NewUserRole {
+                user_id: second.id,
+                role_id: admin_role.id,
+                granted_by: admin_id,
+            })
+            .await
+            .unwrap();
+        s.users.set_active(admin_id, false).await.unwrap();
+        assert!(!s.users.find_by_id(admin_id).await.unwrap().unwrap().is_active);
+        // ... and the first administrator's grant can now be removed too.
+        s.roles.revoke(admin_id, admin_role.id).await.unwrap();
+        assert!(held_role_codes(&s, admin_id).await.is_empty());
+        // Exactly one active protected-role holder is left: the second admin.
+        assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn ac14_an_upgraded_active_administrator_gets_the_role_without_a_credential_reset() {
+        // The other upgrade edge: an S1a administrator that is still active
+        // and holds no role. The seeding completes by granting; the stored
+        // credential keeps verifying.
+        let (s, pool, _clock) = svc().await;
+        let users = SqliteUserRepository::new(pool.clone());
+        let created = users
+            .create(&NewUser {
+                username: "admin".into(),
+                display_name: "Admin".into(),
+                password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                must_change_password: false,
+            })
+            .await
+            .unwrap();
+
+        let outcome = s.bootstrap_admin(Some("whatever password")).await.unwrap();
+        assert!(outcome.created, "the seeding completes the upgrade by granting");
+        assert!(outcome.generated_password.is_none());
+        // The credential was NOT reset: the placeholder hash survives, and the
+        // bootstrap password must not verify against it.
+        let stored = s.users.find_with_hash_by_username("admin").await.unwrap().unwrap();
+        assert_eq!(stored.password_hash, "placeholder-not-a-real-argon2-hash");
+        assert!(
+            !s.hasher.verify("whatever password", &stored.password_hash),
+            "bootstrap must not overwrite a live administrator's credential"
+        );
+        assert!(!stored.user.must_change_password);
+        // The role landed, and the count the next bootstrap consults is 1.
+        assert_eq!(held_role_codes(&s, created.id).await, vec!["admin"]);
+        assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
+    }
+
+    /// The service's "is there an administrator?" predicate and the guard
+    /// triggers must agree on ANY `is_system` role, not only `admin`: with a
+    /// second protected role in play, a holder of just that role satisfies
+    /// the bootstrap and is protected by the same arithmetic.
+    #[tokio::test]
+    async fn ac14_the_protected_holder_predicate_agrees_with_the_triggers_across_two_protected_roles() {
+        let (s, pool, _clock) = svc().await;
+        // A second protected role, as an operator could create one by direct
+        // SQL (the flag is writable at INSERT time; the trigger refuses to
+        // flip it afterwards).
+        sqlx::query(
+            r#"INSERT INTO roles (code, name, description, is_system)
+               VALUES ('dueno', 'Dueño', 'El dueño del local.', 1)"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A user who holds ONLY the second protected role.
+        let holder = seed_user(&s, "duena", "the right password", true).await;
+        let dueno = s.roles.find_by_code("dueno").await.unwrap().unwrap();
+        s.roles
+            .grant(&NewUserRole {
+                user_id: holder.id,
+                role_id: dueno.id,
+                granted_by: holder.id,
+            })
+            .await
+            .unwrap();
+
+        // The service counts them: the friendly pre-check sees an
+        // administrator where the old code-keyed predicate saw zero.
+        assert_eq!(
+            s.roles.count_active_protected_holders().await.unwrap(),
+            1,
+            "the service must count holders of every protected role"
+        );
+
+        // ... and the triggers agree: refusing the last holder.
+        let err = sqlx::query("UPDATE users SET is_active = 0 WHERE id = ?")
+            .bind(holder.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        match err {
+            sqlx::Error::Database(db) => assert_eq!(
+                db.message(),
+                "cannot deactivate the last active user holding a protected role"
+            ),
+            other => panic!("expected the guard trigger, got {other:?}"),
+        }
+        let err = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(holder.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        match err {
+            sqlx::Error::Database(db) => assert_eq!(
+                db.message(),
+                "cannot delete the last active user holding a protected role"
+            ),
+            other => panic!("expected the guard trigger, got {other:?}"),
+        }
+
+        // ... and the bootstrap agrees too: with a protected-role holder
+        // active, it seeds nothing.
+        let second = s.bootstrap_admin(Some("whatever password")).await.unwrap();
+        assert!(!second.created, "a protected-role holder is an administrator");
+
+        // A second holder makes the same refusals lift — both protected roles
+        // share the arithmetic.
+        let partner = seed_user(&s, "socio", "the right password", true).await;
+        s.roles
+            .grant(&NewUserRole {
+                user_id: partner.id,
+                role_id: dueno.id,
+                granted_by: holder.id,
+            })
+            .await
+            .unwrap();
+        s.users.set_active(holder.id, false).await.unwrap();
+        assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -911,14 +1233,15 @@ mod tests {
 
     // -- AC5: throttling ------------------------------------------------------------
 
-    async fn fail_n_times<U, S, C, H>(
-        s: &IdentityService<U, S, C, H>,
+    async fn fail_n_times<U, S, R, C, H>(
+        s: &IdentityService<U, S, R, C, H>,
         username: &str,
         password: &str,
         n: u32,
     ) where
         U: UserRepository,
         S: SessionRepository,
+        R: RoleRepository,
         C: Clock,
         H: PasswordHashing,
     {
@@ -929,10 +1252,11 @@ mod tests {
     }
 
     /// One failed login, asserting only the generic outcome (F8 helpers).
-    async fn s_login_fail<U, S, C, H>(s: &IdentityService<U, S, C, H>, username: &str)
+    async fn s_login_fail<U, S, R, C, H>(s: &IdentityService<U, S, R, C, H>, username: &str)
     where
         U: UserRepository,
         S: SessionRepository,
+        R: RoleRepository,
         C: Clock,
         H: PasswordHashing,
     {
@@ -1314,6 +1638,7 @@ mod tests {
         let service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             clock.clone(),
             hasher.clone(),
             SessionPolicy::new(12, false),
@@ -1368,6 +1693,7 @@ mod tests {
         let service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             clock.clone(),
             PasswordHasher::light(),
             SessionPolicy::new(12, false),
@@ -1424,6 +1750,7 @@ mod tests {
         let service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             clock.clone(),
             PasswordHasher::light(),
             SessionPolicy::new(12, false),
@@ -1473,6 +1800,7 @@ mod tests {
         let service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             clock.clone(),
             hasher.clone(),
             SessionPolicy::new(12, false),
@@ -1560,6 +1888,7 @@ mod tests {
         let service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             FailingInsertSessions,
+            SqliteRoleRepository::new(pool.clone()),
             clock.clone(),
             PasswordHasher::light(),
             SessionPolicy::new(12, false),

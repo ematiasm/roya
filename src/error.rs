@@ -24,9 +24,9 @@ pub enum AppError {
 
     /// Identity authorization refused (403): the principal is authenticated
     /// but lacks the permission the handler declares. Constructed ONLY by the
-    /// `Require<P>` extractor, which arrives with the S2 RBAC wiring; nothing
-    /// else may answer 403 today.
-    #[allow(dead_code)]
+    /// `Require<P>` extractor (security/authz.rs), whose refusal shapes the
+    /// response per caller — JSON for `/api/*` and HTMX, the `forbidden.html`
+    /// page for a full-page navigation.
     #[error("forbidden: {0}")]
     Forbidden(String),
 

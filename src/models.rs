@@ -1332,6 +1332,48 @@ pub struct ResolvedSession {
     pub session: Session,
 }
 
+// ---------------------------------------------------------------------------
+// RBAC (M5 identity kernel, slice S2)
+// ---------------------------------------------------------------------------
+
+/// A role row. `code` is the machine name (unique, `^[a-z][a-z0-9_]*$`),
+/// `name` is the Spanish label the interface shows. `is_system` marks the
+/// protected role: the database triggers refuse to delete it, rename it or
+/// remove its permission rows.
+#[derive(Debug, Clone)]
+pub struct Role {
+    pub id: i64,
+    pub code: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub is_system: bool,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// A permission-catalog row: `<module>.<action>` (or `<module>.<resource>
+/// .<action>`) with the human-readable pieces the S4 permission matrix shows.
+/// The catalog is data seeded by migration; the drift test in
+/// `security/authz.rs` keeps it byte-identical to the compiled catalog.
+#[derive(Debug, Clone)]
+pub struct Permission {
+    pub id: i64,
+    pub code: String,
+    pub module: String,
+    pub action: String,
+    pub description: String,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// Service-level input for assigning a role to a user. `granted_by` records
+/// who made the privilege change (spec: granting a role is itself one).
+#[derive(Debug, Clone)]
+pub struct NewUserRole {
+    pub user_id: i64,
+    pub role_id: i64,
+    pub granted_by: i64,
+}
+
 impl ReceiptDetail {
     pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>) -> Self {
         let total = allocations.iter().map(|payment| payment.amount).sum();

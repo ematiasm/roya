@@ -1,0 +1,23 @@
+{# Full-page refusal for a permission the principal lacks (Slice S2, AC10).
+   Extends base.html, so the app shell — the navigation the principal may
+   still use — renders around the refusal instead of leaving the operator on a
+   dead JSON body. (Navigation gating by permission is S5–S7: until then the
+   sidebar shows every entry and the handler, not the markup, is what
+   refuses.) The message is the Spanish sentence the Require<P> extractor
+   builds; JSON shapes for /api/* and HTMX come from the same module. #}
+{% extends "base.html" %}
+{% block title %}Sin permiso — Roya{% endblock %}
+{% block content %}
+<div class="flex min-h-[60vh] items-center justify-center">
+  <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6">
+    <h1 class="mb-4 text-lg font-semibold">Acción no permitida</h1>
+    <div class="mb-4 flex items-start justify-between gap-3 rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger"
+         data-notice="error" role="alert">
+      <div class="min-w-0 flex-1 break-words">{{ message }}</div>
+      <button type="button" class="shrink-0 rounded border border-current px-2 py-0.5 text-xs"
+              data-notice-dismiss="true" aria-label="Cerrar">✕</button>
+    </div>
+    <p class="text-sm text-muted">Si necesita acceso a esta acción, consulte con un administrador.</p>
+  </div>
+</div>
+{% endblock %}
