@@ -35,6 +35,7 @@ use std::str::FromStr;
 use tower::ServiceExt;
 
 use crate::routes::AppState;
+use crate::security::test_support;
 
 /// Substring the router-level 404 fallback must render. Handler-level 404s carry
 /// their own message, so this marker is what makes a routing miss observable.
@@ -62,6 +63,8 @@ async fn test_app() -> (Router, SqlitePool) {
         .await
         .unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    // S1b part 1: seed the fixed test session every request will authenticate with.
+    test_support::seed_session(&pool).await.unwrap();
     let state = AppState::new(pool.clone(), false, true);
     (crate::routes::router(state), pool)
 }
@@ -74,7 +77,7 @@ async fn send(
     htmx: bool,
     body: String,
 ) -> (StatusCode, String) {
-    let mut builder = Request::builder().method(method).uri(uri);
+    let mut builder = test_support::with_cookie(Request::builder().method(method).uri(uri));
     if let Some(ct) = content_type {
         builder = builder.header("content-type", ct);
     }
