@@ -28,7 +28,7 @@ from typing import Iterator
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page
 
-from helpers import ApiClient
+from helpers import ApiClient, SeedError
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 E2E_ROOT = Path(__file__).resolve().parent
@@ -75,6 +75,10 @@ class LiveServer:
     db_path: Path
     log_path: Path
     process: subprocess.Popen
+    # The (name, value) session cookie the harness earned by logging in once
+    # after readiness; both clients (the API seeder and the browser context)
+    # share it, so no test ever logs in itself.
+    session_cookie: tuple[str, str] | None = None
 
     _stopped: bool = False
 
@@ -138,6 +142,20 @@ def _wait_until_ready(server: LiveServer) -> None:
 # ---------------------------------------------------------------------------
 # Server fixtures
 # ---------------------------------------------------------------------------
+
+# Fixed credentials for the spawned server; the username is the application's
+# bootstrap administrator. Setting ROYA_ADMIN_PASSWORD makes the login
+# reproducible: no test scrapes the once-logged generated password, and the
+# env-password bootstrap leaves must_change_password false, so the first
+# session lands on the dashboard instead of the password-change route.
+TEST_ADMIN_USERNAME = "admin"
+TEST_ADMIN_PASSWORD = "roya-e2e-fixed-password"
+
+
+def _login_session(server: LiveServer) -> tuple[str, str]:
+    """Log the harness in through the real JSON endpoint, once per server."""
+    client = ApiClient(server.url)
+    return client.login(TEST_ADMIN_USERNAME, TEST_ADMIN_PASSWORD)
 
 # The development database the harness must never open. Its state is captured
 # before each spawn so the live server can be proven not to have written it.
@@ -223,6 +241,9 @@ def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
             "DATABASE_URL": f"sqlite://{db_path}",
             "PORT": str(port),
             "RUST_LOG": "info",
+            # A fixed bootstrap password: the login gate is deny-by-default, so
+            # without it no seeded request or browser navigation would get in.
+            "ROYA_ADMIN_PASSWORD": TEST_ADMIN_PASSWORD,
         }
     )
 
@@ -248,6 +269,10 @@ def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
     try:
         _wait_until_ready(server)
         _assert_throwaway_database(server, dev_before)
+        # Login immediately after readiness, before any test body runs: the
+        # ordering is explicit here, so no seed helper can ever run before a
+        # session exists. Every client below shares the resulting cookie.
+        server.session_cookie = _login_session(server)
     except Exception:
         process.kill()
         process.wait(timeout=10)
@@ -265,8 +290,12 @@ def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
 
 @pytest.fixture
 def api(live_server: LiveServer) -> ApiClient:
-    """HTTP client for seeding, on the same endpoints the browser uses."""
-    return ApiClient(live_server.url)
+    """HTTP client for seeding, on the same endpoints the browser uses.
+
+    It shares the session the harness logged in with, so seeding runs behind
+    the same gate the browser does.
+    """
+    return ApiClient(live_server.url, session_cookie=live_server.session_cookie)
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +348,32 @@ def page(
     """
     context = browser.new_context(**browser_context_args)
     context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    # The browser context shares the session the harness logged in with, so
+    # every test's `page.goto` is already authenticated and no test performs a
+    # login step of its own. Gate-behaviour tests that need an unauthenticated
+    # visitor build their own context (see tests/test_identity.py).
+    #
+    # A missing cookie means the harness failed to authenticate the suite, which
+    # would silently turn every browser test into an anonymous one. Fail loudly
+    # here instead of letting a whole slice degrade to redirects to /login.
+    if live_server.session_cookie is None:
+        raise SeedError(
+            "the harness has no session cookie: `live_server` did not log in, so every "
+            "browser test would silently run unauthenticated"
+        )
+    name, value = live_server.session_cookie
+    context.add_cookies(
+        [
+            {
+                "name": name,
+                "value": value,
+                "domain": "127.0.0.1",
+                "path": "/",
+                "httpOnly": True,
+                "sameSite": "Lax",
+            }
+        ]
+    )
     page = context.new_page()
     try:
         yield page

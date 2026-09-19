@@ -29,10 +29,51 @@ class SeedError(RuntimeError):
 
 
 class ApiClient:
-    """Minimal JSON/form client over the running application's HTTP API."""
+    """Minimal JSON/form client over the running application's HTTP API.
 
-    def __init__(self, base_url: str) -> None:
+    Deliberately no cookie jar: the client carries the one session cookie
+    ``POST /api/sessions`` sets and sends it on every request. The suite logs
+    in once per server (see ``conftest``) and hands the cookie pair here, so
+    seeding rides the same session the browser tests use.
+    """
+
+    def __init__(self, base_url: str, session_cookie: tuple[str, str] | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        # (name, value) of the session cookie, or None while anonymous.
+        self.session_cookie = session_cookie
+
+    def login(self, username: str, password: str) -> tuple[str, str]:
+        """Log in through ``POST /api/sessions`` and keep the session cookie.
+
+        The endpoint answers ``204`` with a session ``Set-Cookie`` on success
+        and a bare ``401`` without one on failure, so the header is the whole
+        verdict: a refused login raises and leaves any stored cookie untouched.
+        """
+        request = urllib.request.Request(
+            f"{self.base_url}/api/sessions",
+            data=json.dumps({"username": username, "password": password}).encode(
+                "utf-8"
+            ),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
+                raw = response.headers.get("Set-Cookie")
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise SeedError(
+                f"POST /api/sessions -> HTTP {error.code}: {detail}"
+            ) from error
+        except urllib.error.URLError as error:
+            raise SeedError(f"POST /api/sessions failed: {error.reason}") from error
+        if not raw:
+            raise SeedError("POST /api/sessions answered without a Set-Cookie header")
+        # The cookie is one `name=value` pair followed by flags, none of which
+        # belong on the wire we send back.
+        name, value = raw.split(";", 1)[0].split("=", 1)
+        self.session_cookie = (name.strip(), value.strip())
+        return self.session_cookie
 
     def get_json(self, path: str) -> Any:
         return self._request("GET", path, accept="application/json")
@@ -76,6 +117,9 @@ class ApiClient:
         accept: str | None = None,
     ) -> Any:
         headers: dict[str, str] = {}
+        if self.session_cookie is not None:
+            name, value = self.session_cookie
+            headers["Cookie"] = f"{name}={value}"
         if content_type is not None:
             headers["Content-Type"] = content_type
         if accept is not None:

@@ -1022,7 +1022,12 @@ scripts/e2e.sh          # headless; see e2e/README.md for setup and options
 The suite builds the binary once, spawns it against a throwaway SQLite file on a
 free port whose isolation it proves from the server's own log, seeds data through
 the HTTP API reading each step's effect back, and writes a Playwright trace,
-screenshot and server log only when a test fails. `cargo test` stays independent
+screenshot and server log only when a test fails. Because the login gate is
+deny-by-default, the harness spawns the binary with a fixed test
+`ROYA_ADMIN_PASSWORD` and logs in once per server: the HTTP-API seeder and every
+browser context share that session cookie, so no test handles login itself
+(the gate's own behaviour is covered in `e2e/tests/test_identity.py`).
+`cargo test` stays independent
 of it and keeps its current speed; business rules remain in the Rust suite. The
 one-time Chromium download, the covered flows and the deliberate boundary are
 documented in [`e2e/README.md`](e2e/README.md).

@@ -63,6 +63,14 @@ itself always runs headless; nothing in the repository depends on `--headed`.
 - Seeds data through the HTTP API, on the same endpoints a browser calls, so a
   broken endpoint fails the seed loudly instead of being papered over; each seed
   step also reads back the effect, so a 2xx that stored nothing still fails.
+- Logs in once per spawned server: the login gate is deny-by-default, so the
+  harness spawns the binary with a fixed `ROYA_ADMIN_PASSWORD` (no test ever
+  scrapes the once-logged generated password), calls `POST /api/sessions` once
+  right after the server is ready, and both clients then share that session
+  cookie — the HTTP-API seeder sends it on every request and the Playwright
+  browser context is created with it. No test performs a login step of its own;
+  the gate-behaviour tests in `tests/test_identity.py` are the deliberate
+  exception and use an anonymous context.
 - Uses Playwright's auto-waiting and explicit expectations. No fixed-duration
   sleep ever stands in for a condition: a fixed sleep turns a real failure into a
   slow pass. The only sleeps are the two bounded polling loops that re-check a
@@ -73,6 +81,12 @@ itself always runs headless; nothing in the repository depends on `--headed`.
 Slice E1 is the harness: `tests/test_harness.py` proves the isolated server starts
 and releases its port, a failure leaves openable evidence, and the seed helpers
 refuse a silent no-op.
+
+Slice S1b is the login gate, in `tests/test_identity.py`: an unauthenticated
+browser is redirected to the login page and logging in through the real form
+reaches the dashboard, a wrong password keeps the visitor on the form with the
+generic error, and `ROYA_COOKIE_SECURE=1` is proven on the real `Set-Cookie`
+wire (the default harness cookie carries no `Secure` flag).
 
 Slice E2 is the critical flows:
 
