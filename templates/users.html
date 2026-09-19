@@ -1,0 +1,91 @@
+{# Users administration (slice S3 part 2, T13). Follows the customers/suppliers
+   pattern: the full page renders the list shell and the create `<dialog>`; the
+   list fragment (`partials/user_list.html`) is swapped by htmx and refreshed
+   out of band after every mutation; a second `<dialog>` loads the role
+   assignment and password reset forms as id-final fragments
+   (`/web/users/roles-form/{id}`, `/web/users/password-form/{id}`), following
+   the customer edit-form idiom. Copy is Spanish, like the rest of the identity
+   screens (login, password, forbidden). AC21 (hiding the sidebar entry from
+   principals that cannot read it) is deferred to S7: the entry stays visible
+   and the route itself is what refuses. #}
+{% extends "base.html" %}
+{% block title %}Usuarios — Roya{% endblock %}
+{% block content %}
+<div class="mb-4 flex items-center gap-2">
+  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">usuarios · roles y credenciales</span>
+</div>
+<div class="mb-4 flex items-center justify-between gap-2">
+  <h2 class="text-lg font-semibold">Usuarios</h2>
+  {% if can_manage %}
+  <div class="flex items-center gap-2">
+    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/users" hx-target="#user-list" hx-swap="innerHTML">↻ Actualizar</button>
+    <button type="button" onclick="document.getElementById('new-user-dialog').showModal()">Nuevo usuario</button>
+  </div>
+  {% endif %}
+</div>
+<div id="user-list"
+     hx-get="/web/users"
+     hx-trigger="refresh from:body, load"
+     hx-swap="innerHTML">
+  {% include "partials/user_list.html" %}
+</div>
+
+<dialog id="new-user-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
+  {% if can_manage %}
+  <div class="mb-3 flex items-center justify-between gap-6">
+    <h2 class="text-lg font-semibold">Nuevo usuario</h2>
+    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-user-dialog').close()">✕</button>
+  </div>
+  <form class="flex flex-col gap-2.5"
+        data-action="Create user"
+        hx-post="/web/users"
+        hx-target="#user-list"
+        hx-swap="innerHTML"
+        hx-on::after-request="if(event.detail.successful) this.reset()">
+    <div>
+      <label>Usuario</label>
+      <input type="text" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" placeholder="caja1…" />
+    </div>
+    <div>
+      <label>Nombre para mostrar</label>
+      <input type="text" name="display_name" required maxlength="128" placeholder="María Pérez…" />
+    </div>
+    <div>
+      <label>Contraseña inicial</label>
+      <input type="password" name="password" required minlength="12" autocomplete="new-password" />
+    </div>
+    <button type="submit">Crear usuario</button>
+    <div class="text-[13px] text-muted">
+      El usuario deberá cambiar esta contraseña en su primer inicio de sesión.
+      Sólo letras minúsculas, números y . _ - en el nombre de usuario.
+    </div>
+  </form>
+  {% endif %}
+</dialog>
+
+<dialog id="user-edit-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
+  <div id="user-edit-dialog-body"></div>
+</dialog>
+
+<script>
+  function closeUserEditDialog() {
+    var dlg = document.getElementById('user-edit-dialog');
+    if (dlg && dlg.open) dlg.close();
+  }
+  document.addEventListener('keydown', function (evt) {
+    if (evt.key !== 'Escape') return;
+    var dlg = document.getElementById('new-user-dialog');
+    if (dlg && dlg.open) return;
+    closeUserEditDialog();
+  });
+  document.body.addEventListener('user-created', function () {
+    var dlg = document.getElementById('new-user-dialog');
+    if (dlg && dlg.open) dlg.close();
+  });
+  document.body.addEventListener('user-changed', function () {
+    htmx.trigger('#user-list', 'refresh');
+    closeUserEditDialog();
+  });
+</script>
+{% endblock %}

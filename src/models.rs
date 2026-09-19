@@ -1365,6 +1365,16 @@ pub struct Permission {
     pub created_at: chrono::NaiveDateTime,
 }
 
+/// One user together with the roles they hold (S3 users screen): the list
+/// read the administration page renders — username, display name, state and
+/// the Spanish role labels. Carries no credential material: it wraps the
+/// ordinary `User` read.
+#[derive(Debug, Clone)]
+pub struct UserWithRoles {
+    pub user: User,
+    pub roles: Vec<Role>,
+}
+
 /// Service-level input for assigning a role to a user. `granted_by` records
 /// who made the privilege change (spec: granting a role is itself one).
 #[derive(Debug, Clone)]

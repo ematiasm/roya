@@ -30,6 +30,13 @@ pub enum AppError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// The request body exceeds the handler's own size limit (413). The
+    /// app-wide JSON shape reaches the operator in Spanish: an oversized form
+    /// is a refusal the operator reads, not an English plain-text buffering
+    /// error from the extractor layer.
+    #[error("payload too large: {0}")]
+    PayloadTooLarge(String),
+
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
@@ -45,6 +52,7 @@ impl IntoResponse for AppError {
             Self::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             Self::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m.clone()),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
+            Self::PayloadTooLarge(m) => (StatusCode::PAYLOAD_TOO_LARGE, m.clone()),
             Self::Database(e) => {
                 tracing::error!(error = %e, "database error");
                 // Map unique constraint to 409

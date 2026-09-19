@@ -137,6 +137,28 @@ this list awaiting deactivation (S3 part 2) and S4:
 
 No `#[allow]` attributes were added; the grep above stays empty.
 
+**S3 part 2 re-measure (2026-09-21):** `cargo check --all-targets` **66 → 60 warnings**, no
+`#[allow]` attributes; the grep above stays empty. Graduated items (made reachable by the users
+administration screen and its service/repo writes):
+
+| Graduated item | Consumed by S3 part 2 |
+| --- | --- |
+| `Require<P>` construction, `forbidden_response`, `ForbiddenTemplate`, `Principal::has`/`has_permission` | the `/users` routes are the first production handlers to declare and refuse through them |
+| `Principal.user_id` (read) | `granted_by` on the grant writes and the reset's actor/target distinction |
+| `Role` fields `code`/`name`/`is_system` | the users list and the assignment checkboxes read them |
+| `user_repo::find_by_username` | `create_user`'s NOCASE uniqueness pre-check |
+| `user_repo::list` (new) | `list_users_with_roles` |
+| `role_repo::{find_by_id, list, list_for_user, replace_user_roles}` | the assignment form, the list read and the grant replacement |
+| `revoke_all_for_user` + `revoke_all_sessions` | deactivation revokes the deactivated user's sessions |
+
+Still dormant for their slices: `role_repo::{count_active_holders, revoke, delete}` (S4 — `delete`
+exists since this slice, message shipped, screen pending), `permission_repo::{list,
+codes_for_role->used by assign_roles only}` — actually `codes_for_role` graduated here (the
+self-lockout rule reads it); remaining `permission_repo::{list, set_role_permissions, row_to_permission,
+map_db_err}` and the `Permission` struct are S4. `Principal.{username, display_name,
+must_change_password}` and `Role.{description, created_at, updated_at}` remain S4/S5-S7. The count
+must still be back at or below 58 by the end of S7, with no `#[allow]` attributes as the mechanism.
+
 **Requirement:** the count must be back at or below 58 by the end of S7, with **no
 `#[allow(dead_code)]` / `#[allow(unused_imports)]` attributes as the mechanism**: each
 consuming slice makes its surface reachable (S3 and S4 cover the repositories and
@@ -144,8 +166,51 @@ service methods, S5-S7 cover the extractor, the refusal shapes and the principal
 reads), and S7's closing check re-runs `cargo check --all-targets`.
 
 ### S3 — users administration
-- [ ] T13: `/users` list with roles and state, create, deactivate/activate, admin password reset, role
+- [x] T13: `/users` list with roles and state, create, deactivate/activate, admin password reset, role
       assignment with `granted_by`, and the interface explanation of every trigger refusal.
+      (Done by S3 part 2, 2026-09-21: the screen is `routes/users_web.rs` + `templates/users.html` and
+      three partials, on the customers pattern; `Require<IdentityUsersRead>` on the reads and
+      `Require<IdentityUsersManage>` on the five mutations — the first real consumers of the extractor
+      and the full-page refusal page. The service owns the rules: `create_user` (username shape,
+      NOCASE uniqueness, `MIN_PASSWORD_LEN`, target flagged), `set_user_active` (deactivation revokes
+      all the user's sessions), `admin_reset_password` (flags the target, never the actor; self-reset
+      refused), `assign_roles` (records `granted_by`, pre-validates the role ids, refuses the acting
+      administrator stripping their own `identity.roles.manage`). The trigger refusals are mapped in
+      the repositories to Spanish conflicts: `user_repo::set_active` for the last-protected-holder
+      deactivation (AC14), `role_repo::delete` for both the protected role (AC13) and the assigned
+      role (AC15). The role-assignment checkboxes repeat the `role_ids` key, which `Form` refuses as a
+      duplicate field; that one handler reads the raw form body with a dependency-free parser.)
+
+- [x] T13 (corrected round, 2026-09-21 — the adversarial verification's reproduced administrative
+      takeover): the authorization model was split so escalation has nowhere to live. The roles
+      endpoint is gated `identity.roles.manage` (the tier that decides who administers the instance;
+      the service repeats the tier check so it does not depend on the extractor alone), NOBODY may
+      change their own role set with any permission (one rule closes self-escalation and the old
+      self-lockout), and the admin password reset applies its tier in the service against the
+      TARGET's roles: a protected holder's password additionally requires `identity.roles.manage`,
+      so a `identity.users.manage`-only principal cannot take over any administrator. The
+      cross-account consequences of each tier are written into the spec ("Cross-account honesty").
+      Also in this round: `POST /password` failures share the login's per-username throttle; the
+      submitted role ids resolve in one statement (`RoleRepository::find_by_ids`); the oversized
+      roles-form body answers `413` in the app's Spanish JSON shape (the raw-body handler owns its
+      limit); `role_repo::map_db_err` maps the protected-delete trigger to its Spanish conflict and
+      the FK branch is documented as grant-context only; a duplicated `user_id` in the roles form is
+      refused instead of silently keeping the last value.
+- [x] T13 (second correction round, 2026-09-21 — re-verification: COMMIT WITH NOTED RISK, four
+      documentation/UX items): (1) the spec's "Cross-account honesty" no longer promises that
+      `identity.roles.manage` alone can reset any password — the reset endpoint is gated
+      `identity.users.manage`, so the sentence now states both gates and the both-tiers rule for
+      protected holders; (2) the persisted `identity.users.manage` description no longer promises role
+      assignment (it is seeded data the S4 matrix renders): the code catalog corrected, migration
+      `20240101000029_clarify_identity_permission_descriptions.sql` updates the seeded rows (also the
+      underdescribed `identity.roles.manage`, whose gate covers role-set changes), and the AC12 drift
+      test now compares DESCRIPTIONS as well as codes (`PERMISSION_DESCRIPTIONS` mirror + a
+      one-sided-description mutation test) — the audit of the other 21 descriptions found no further
+      contradictions; (3) the "one statement" claim is pinned by a counting role-repository double
+      asserting `assign_roles` calls `find_by_ids` exactly once with the whole deduplicated set;
+      (4) a present-but-empty `role_ids=` value is the empty set, not a 400 (the UI omits the key;
+      the last-holder trigger stays the real backstop), while `%`, `%zz` and non-numeric values stay
+      refused.
 - [x] T14: `GET`/`POST /password` and the `must_change_password` gate in the middleware.
       (Done by S3 part 1, 2026-09-20, corrected round: the confinement lives in the middleware after
       the session resolution — a full-page request answers `303` to `/password`, `/api/*` a `403` JSON
@@ -157,7 +222,14 @@ reads), and S7's closing check re-runs `cargo check --all-targets`.
       window, no re-seat (the first pass's revoke-all → prune → re-insert workaround was removed in
       the correction round). The sidebar gains the password entry; T13's `/users` administration and
       the AC13/AC15 part of T15 are still open.)
-- [ ] T15: tests for AC13-AC16, AC21 (users surface).
+- [x] T15: tests for AC13-AC16, AC21 (users surface).
+      (AC13/AC14/AC15/AC16 done: S3 part 1 covered AC16 and the confined flow; S3 part 2 ships the
+      AC13/AC14 refusals through the screen (last administrator refused with the Spanish reason and
+      nothing written, a second administrator created through the screen unblocks), the AC15 message
+      in `role_repo::delete`, the reset flagging target-not-actor, the create/activate/deactivate
+      round trips, the create-uniqueness conflict and the AC10 shapes on the real routes (403 full
+      page / HTMX JSON / write-nothing). AC21 is deferred to S7's nav gating: the sidebar entry is
+      shipped visible and the route is what refuses.)
 
 ### S4 — roles administration
 - [ ] T16: `/roles` list, create, edit, delete, and the permission matrix per module and action.

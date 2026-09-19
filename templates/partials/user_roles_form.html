@@ -1,0 +1,34 @@
+{# The role assignment form (S3 part 2, corrected round): replaces the user's
+   whole role set through POST /web/users/roles (identity.roles.manage: the
+   tier that decides who administers the instance), one checkbox per role,
+   checked when held. The backend refuses — with its reason in Spanish — when
+   the change would deactivate the last administrator, and refuses ANY change
+   of the actor's own set: nobody edits their own roles, so no principal can
+   escalate or lock itself out through this form (the button is hidden for
+   the acting user's row; the refusal is real regardless). #}
+<div class="mb-3 flex items-center justify-between gap-6">
+  <h2 class="text-lg font-semibold">Roles de {{ user.user.username }}</h2>
+  <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('user-edit-dialog').close()">✕</button>
+</div>
+<form class="flex flex-col gap-2.5"
+      data-action="Assign roles"
+      hx-post="/web/users/roles"
+      hx-target="#user-list"
+      hx-swap="innerHTML"
+      hx-on::after-request="if(event.detail.successful) document.getElementById('user-edit-dialog').close()">
+  <input type="hidden" name="user_id" value="{{ user.user.id }}" />
+  <div class="flex flex-col gap-1.5">
+    {% for role in roles %}
+    <label class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
+      <input type="checkbox" name="role_ids" value="{{ role.id }}"
+             {% for held in user.roles %}{% if held.id == role.id %}checked{% endif %}{% endfor %} />
+      <span class="font-semibold">{{ role.name }}</span>
+      <span class="text-[12px] text-muted">{{ role.code }}</span>
+      {% if role.is_system %}
+      <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] text-muted">protegido</span>
+      {% endif %}
+    </label>
+    {% endfor %}
+  </div>
+  <button type="submit">Guardar roles</button>
+</form>

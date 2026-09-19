@@ -1,0 +1,63 @@
+{# The users list fragment, swapped by htmx. Every row shows username,
+   display name, state and the Spanish labels of the roles the user holds.
+   Actions render only for the tier that may perform them — `can_manage`
+   (identity.users.manage: credentials, state) and `can_manage_roles`
+   (identity.roles.manage: the role set): the role assignment is its own
+   tier, so a principal that may reset passwords but not grant roles sees
+   only its own actions. The routes refuse anyway — the markup is courtesy,
+   the handler is the enforcement. Mutations post to collection endpoints
+   with the id in the body (the wiring guard: htmx cannot interpolate a path
+   segment from an input value). #}
+<div id="user-list-inner">
+  {% if users.is_empty() %}
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No hay usuarios — usá «Nuevo usuario» arriba.</div>
+  {% else %}
+    <div class="flex flex-col gap-1.5">
+      {% for r in users %}
+      <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 hover:border-accent2">
+        <div class="min-w-0 flex-1">
+          <div class="truncate font-semibold {% if r.user.is_active %}text-text{% else %}text-muted{% endif %}">
+            {{ r.user.username }}
+            {% if r.user.must_change_password %}
+            <span class="ml-1 rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-normal text-muted">debe cambiar la contraseña</span>
+            {% endif %}
+          </div>
+          <div class="truncate text-[13px] text-muted">{{ r.user.display_name }}{% if !r.roles.is_empty() %} · {% for role in r.roles %}{{ role.name }}{% if !loop.last %}, {% endif %}{% endfor %}{% endif %}</div>
+        </div>
+        <span class="shrink-0 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] {% if r.user.is_active %}text-accent{% else %}text-muted{% endif %}">
+          {% if r.user.is_active %}Activo{% else %}Inactivo{% endif %}
+        </span>
+        {% if can_manage_roles && r.user.id != acting_user_id %}
+        <button type="button"
+                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                title="Asignar roles"
+                aria-label="Asignar roles"
+                hx-get="/web/users/roles-form/{{ r.user.id }}"
+                hx-target="#user-edit-dialog-body"
+                hx-swap="innerHTML"
+                hx-on::after-request="if(event.detail.successful) document.getElementById('user-edit-dialog').showModal()">Roles</button>
+        {% endif %}
+        {% if can_manage %}
+        <button type="button"
+                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                title="Nueva contraseña"
+                aria-label="Nueva contraseña"
+                hx-get="/web/users/password-form/{{ r.user.id }}"
+                hx-target="#user-edit-dialog-body"
+                hx-swap="innerHTML"
+                hx-on::after-request="if(event.detail.successful) document.getElementById('user-edit-dialog').showModal()">Contraseña</button>
+        <form hx-post="/web/users/{% if r.user.is_active %}deactivate{% else %}activate{% endif %}"
+              hx-target="#user-list"
+              hx-swap="innerHTML"
+              class="shrink-0">
+          <input type="hidden" name="user_id" value="{{ r.user.id }}" />
+          <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">
+            {% if r.user.is_active %}Desactivar{% else %}Activar{% endif %}
+          </button>
+        </form>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>

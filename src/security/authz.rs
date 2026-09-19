@@ -3,7 +3,9 @@
 // declares what it needs in its argument list — `Require<SalesCreate>` — and
 // the compiler, not a string comparison at the call site, ties the declaration
 // to the catalog. `PERMISSIONS` below is the single source of truth the
-// migration seeds from and the drift test compares the database against: a
+// migration seeds from and the drift test compares the database against
+// (codes and, since the S3 correction round, descriptions — the matrix copy
+// an operator reads must never promise more than the gate allows): a
 // permission only exists if code enforces it, and a seeded row cannot exist
 // without an enforcer.
 //
@@ -84,13 +86,61 @@ permission!(IdentityUsersRead, "identity.users.read", "View users.");
 permission!(
     IdentityUsersManage,
     "identity.users.manage",
-    "Create users, assign roles and reset passwords."
+    "Create users and reset passwords of accounts holding no protected role."
 );
 permission!(
     IdentityRolesManage,
     "identity.roles.manage",
-    "Create roles and edit the permission matrix."
+    "Create roles, edit the permission matrix and change other accounts' role sets."
 );
+
+/// The whole catalog. This constant is the single source of truth: the drift
+/// test (AC12) fails if the database holds a code this list does not, or this
+/// list holds a code the database does not — which is the reason the catalog
+/// stays seeded rather than UI-created: a permission created in the interface
+/// would tick boxes that gate nothing.
+/// The seeded Spanish description each catalog row carries in the database —
+/// the operator-facing copy the S4 permission matrix renders. This constant is
+/// the code-side mirror the drift test compares the database against (same
+/// contract as `PERMISSIONS`, extended to descriptions by the S3 correction
+/// round): a description that disagrees with its row must fail the drift test,
+/// because the matrix is what an operator reads before granting. Migration
+/// `20240101000027_create_identity_rbac.sql` seeds these texts and migration
+/// `20240101000029_clarify_identity_permission_descriptions.sql` corrects the
+/// two identity rows whose original wording overclaimed (it promised role
+/// assignment on the users tier, which the endpoint gates behind the roles
+/// tier); a fresh database and a pre-existing one end on the same texts.
+pub const PERMISSION_DESCRIPTIONS: &[(&str, &str)] = &[
+    (DashboardRead::CODE, "Ver el panel principal"),
+    (FinanceRead::CODE, "Ver cuentas y movimientos"),
+    (FinanceWrite::CODE, "Registrar y editar movimientos"),
+    (FinanceMethodsManage::CODE, "Administrar cuentas y medios de pago"),
+    (InventoryRead::CODE, "Ver productos y stock"),
+    (InventoryWrite::CODE, "Crear y editar productos"),
+    (InventoryStockWrite::CODE, "Ajustar stock"),
+    (SalesRead::CODE, "Ver ventas"),
+    (SalesCreate::CODE, "Registrar ventas"),
+    (SalesCancel::CODE, "Anular ventas"),
+    (CustomersRead::CODE, "Ver clientes"),
+    (CustomersWrite::CODE, "Crear y editar clientes"),
+    (CustomersCollect::CODE, "Registrar cobros"),
+    (PurchasesRead::CODE, "Ver compras"),
+    (PurchasesCreate::CODE, "Registrar compras"),
+    (PurchasesCancel::CODE, "Anular compras"),
+    (PurchasesCostsRead::CODE, "Ver costos por proveedor"),
+    (PurchasesCostsWrite::CODE, "Editar costos por proveedor"),
+    (SuppliersRead::CODE, "Ver proveedores"),
+    (SuppliersWrite::CODE, "Crear y editar proveedores"),
+    (IdentityUsersRead::CODE, "Ver usuarios"),
+    (
+        IdentityUsersManage::CODE,
+        "Crear usuarios y restablecer contraseñas de cuentas sin roles protegidos",
+    ),
+    (
+        IdentityRolesManage::CODE,
+        "Crear roles, editar la matriz de permisos y cambiar los roles de otras cuentas",
+    ),
+];
 
 /// The whole catalog. This constant is the single source of truth: the drift
 /// test (AC12) fails if the database holds a code this list does not, or this
@@ -127,6 +177,13 @@ pub const PERMISSIONS: &[&str] = &[
 /// (or a list entry without its marker) fails to build. The runtime database
 /// comparison stays in the drift test; this only keeps the list itself honest.
 const _: () = assert!(PERMISSIONS.len() == 23, "the catalog holds 23 permissions");
+
+/// Compile-time census for the description mirror: every code appears exactly
+/// once with its description, and the pair list covers the same 23 codes.
+const _: () = assert!(
+    PERMISSION_DESCRIPTIONS.len() == 23,
+    "the description mirror covers all 23 permissions"
+);
 
 // ---------------------------------------------------------------------------
 // Principal
@@ -736,36 +793,57 @@ mod tests {
     // -- AC12: the catalog drift test ---------------------------------------------
 
     /// The drift the AC12 comparison exists to catch, computed the same way
-    /// the catalog assertion does: sorted set difference, with the offending
-    /// codes named. Empty means the two catalogs agree.
-    fn catalog_drift(compiled: &[&str], database: &[String]) -> String {
-        let compiled: std::collections::BTreeSet<&str> = compiled.iter().copied().collect();
-        let database: std::collections::BTreeSet<&str> =
-            database.iter().map(String::as_str).collect();
-        let seeded_only: Vec<&&str> = database.difference(&compiled).collect();
-        let compiled_only: Vec<&&str> = compiled.difference(&database).collect();
-        if seeded_only.is_empty() && compiled_only.is_empty() {
+    /// the catalog assertion does: sorted map difference, with the offending
+    /// codes and description mismatches named. Empty means the two catalogs
+    /// agree on both codes and descriptions.
+    fn catalog_drift(compiled: &[(&str, &str)], database: &[(String, String)]) -> String {
+        let compiled: std::collections::BTreeMap<&str, &str> =
+            compiled.iter().copied().collect();
+        let database: std::collections::BTreeMap<&str, &str> = database
+            .iter()
+            .map(|(code, description)| (code.as_str(), description.as_str()))
+            .collect();
+        let mut problems: Vec<String> = Vec::new();
+        for (code, description) in &database {
+            match compiled.get(code) {
+                None => problems.push(format!("in the database but not the code: {code}")),
+                Some(compiled_description) if compiled_description != description => problems
+                    .push(format!(
+                        "description drift for {code}: database {description:?} vs code {compiled_description:?}"
+                    )),
+                _ => {}
+            }
+        }
+        for code in compiled.keys() {
+            if !database.contains_key(code) {
+                problems.push(format!("in the code but not the database: {code}"));
+            }
+        }
+        if problems.is_empty() {
             String::new()
         } else {
-            format!(
-                "catalog drift: in the database but not the code: {seeded_only:?}; \
-                 in the code but not the database: {compiled_only:?}"
-            )
+            format!("catalog drift: {}", problems.join("; "))
         }
     }
 
     /// Assert the two catalogs are equal through the shared drift function, so
-    /// the drift test and its mutation proofs exercise the same comparison.
+    /// the drift test and its mutation proofs exercise the same comparison —
+    /// codes AND descriptions.
     async fn assert_catalog_matches(db: &SqlitePool) {
-        let database: Vec<String> =
-            sqlx::query("SELECT code FROM permissions ORDER BY code")
+        let database: Vec<(String, String)> =
+            sqlx::query("SELECT code, description FROM permissions ORDER BY code")
                 .fetch_all(db)
                 .await
                 .unwrap()
                 .iter()
-                .filter_map(|row| row.try_get::<String, _>(0).ok())
+                .filter_map(|row| {
+                    Some((
+                        row.try_get::<String, _>(0).ok()?,
+                        row.try_get::<String, _>(1).ok()?,
+                    ))
+                })
                 .collect();
-        let drift = catalog_drift(PERMISSIONS, &database);
+        let drift = catalog_drift(PERMISSION_DESCRIPTIONS, &database);
         assert!(
             drift.is_empty(),
             "the compiled catalog and the seeded catalog must be identical: {drift}"
@@ -816,17 +894,22 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        let database: Vec<String> =
-            sqlx::query("SELECT code FROM permissions")
+        let database: Vec<(String, String)> =
+            sqlx::query("SELECT code, description FROM permissions")
                 .fetch_all(&db)
                 .await
                 .unwrap()
                 .iter()
-                .filter_map(|row| row.try_get::<String, _>(0).ok())
+                .filter_map(|row| {
+                    Some((
+                        row.try_get::<String, _>(0).ok()?,
+                        row.try_get::<String, _>(1).ok()?,
+                    ))
+                })
                 .collect();
         // The same comparison the drift test asserts must now produce a
         // non-empty drift naming the seeded-only code.
-        let drift = catalog_drift(PERMISSIONS, &database);
+        let drift = catalog_drift(PERMISSION_DESCRIPTIONS, &database);
         assert!(
             drift.contains("drifted.code"),
             "a renamed catalog row must break the comparison the drift test asserts: {drift}"
@@ -837,11 +920,14 @@ mod tests {
     /// row stays seeded must break the equality too.
     #[test]
     fn ac12_removing_a_catalog_entry_breaks_the_catalog_equality() {
-        let database: Vec<String> = PERMISSIONS.iter().map(|c| c.to_string()).collect();
-        let drifted: Vec<&str> = PERMISSIONS
+        let database: Vec<(String, String)> = PERMISSION_DESCRIPTIONS
+            .iter()
+            .map(|(code, description)| (code.to_string(), description.to_string()))
+            .collect();
+        let drifted: Vec<(&str, &str)> = PERMISSION_DESCRIPTIONS
             .iter()
             .copied()
-            .filter(|code| *code != SalesCancel::CODE)
+            .filter(|(code, _)| *code != SalesCancel::CODE)
             .collect();
         // The same comparison, fed a code list missing one entry, must name
         // the drifted side.
@@ -849,6 +935,39 @@ mod tests {
         assert!(
             drift.contains("sales.cancel"),
             "a removed catalog entry must break the comparison the drift test asserts: {drift}"
+        );
+    }
+
+    /// The S3 correction round's extension: a description changed on one side
+    /// only is drift too — the permission matrix renders it, so an operator
+    /// must never read a promise the gate does not keep.
+    #[tokio::test]
+    async fn ac12_changing_a_seeded_description_breaks_the_catalog_equality() {
+        let db = pool().await;
+        sqlx::query(
+            "UPDATE permissions SET description = 'overclaimed promise' \
+             WHERE code = 'identity.users.manage'",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let database: Vec<(String, String)> =
+            sqlx::query("SELECT code, description FROM permissions")
+                .fetch_all(&db)
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|row| {
+                    Some((
+                        row.try_get::<String, _>(0).ok()?,
+                        row.try_get::<String, _>(1).ok()?,
+                    ))
+                })
+                .collect();
+        let drift = catalog_drift(PERMISSION_DESCRIPTIONS, &database);
+        assert!(
+            drift.contains("description drift for identity.users.manage"),
+            "a one-sided description edit must break the comparison: {drift}"
         );
     }
 
