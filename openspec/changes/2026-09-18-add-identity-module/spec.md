@@ -45,6 +45,9 @@
 - Rules: the catalog is data seeded by migration; the application does not create permission rows at
   runtime. A test asserts the seeded catalog equals the catalog compiled into `security/authz.rs`, so a
   code-level permission cannot exist without its row and a seeded row cannot exist without an enforcer.
+  The comparison covers codes and descriptions: a seeded description must say what the code's gate
+  actually allows (the operator reads it in the S4 permission matrix before granting), and a
+  one-sided edit of either breaks the test.
 
 ### role_permissions
 - `role_id NOT NULL REFERENCES roles(id) ON DELETE CASCADE`, `permission_id NOT NULL REFERENCES
@@ -109,13 +112,44 @@
 - **Password change.** `GET /password` renders the change form; `POST /password` requires the current
   password, validates the new one (≥ 12 characters, not equal to the current one, confirmed twice) and
   updates `password_hash`, clears `must_change_password`, and revokes every other session of that user.
-  While `must_change_password = 1`, every other non-public route redirects to `/password`.
-- **Admin password reset.** `POST /web/users/password` sets a temporary password for another user
-  (`identity.users.manage` + audit) and sets `must_change_password = 1` on the target; the resetter never
-  sees the target's previous password.
+  While `must_change_password = 1`, every other non-public route redirects to `/password`. Failed
+  current-password attempts share the login's per-username in-memory throttle (same map, same
+  `ROYA_LOGIN_THROTTLE_*` config, same injected clock): the confinement must not become a guessing
+  machine. A success clears the counter, like a successful login does.
+- **Admin password reset.** `POST /web/users/password` sets a temporary password for another user and
+  sets `must_change_password = 1` on the target; the resetter never sees the target's previous
+  password. The endpoint is gated `identity.users.manage`, and the tier rule is applied in the
+  service against the TARGET's roles: resetting the password of a user who holds a protected role
+  additionally requires `identity.roles.manage` — taking over an account that administers the
+  instance is a decision about the administration — so an actor holding only
+  `identity.users.manage` cannot reset a protected holder's password at all, and the takeover path
+  (reset another administrator's password, log in as them) does not exist. Resetting oneself through
+  this path is refused (that change is `/password`).
 - **Role assignment.** `POST /web/users/roles` replaces a user's role set, recording `granted_by` and
-  `granted_at` for the newly granted ones, refusing the removal of the last active protected-role holder,
-  and refusing a change that would leave the acting administrator without `identity.roles.manage`.
+  `granted_at` for the newly granted ones, and is gated `identity.roles.manage` — the tier that
+  decides who administers the instance (the service repeats the check, so the rule does not depend
+  on every future route remembering the extractor). NOBODY changes their own role set, with any
+  permission: one rule closes self-escalation and the self-lockout alike, and the interface hides
+  the action for self while the refusal stays real. The removal of the last active protected-role
+  holder remains refused by the database trigger — the backstop, not a substitute — and the
+  submitted role ids are resolved in one statement (one `find_by_ids` call carrying the whole set,
+  pinned by a counting-double test), and a body carrying `role_ids` with an empty value is the empty
+  set — the well-formed spelling of no roles (the interface omits the key), not a form error; a
+  malformed value is still refused. The raw-body handler buffers the form through
+  its own limit and answers an oversized body with `413` in the app's Spanish JSON shape, never
+  the extractor's English plain-text error.
+- **Cross-account honesty (what each tier may do to another account).** Whoever holds
+  `identity.roles.manage` decides who administers the instance: with it, a principal can grant or
+  strip the protected role on any account but its own, but it cannot reset any password on its own —
+  the reset endpoint is gated `identity.users.manage`, and the service adds the `roles.manage`
+  requirement only when the target holds a protected role. Whoever holds `identity.users.manage` can
+  take over the accounts it is allowed to touch: create users, activate/deactivate them, edit their
+  display name, and reset the password of any user holding NO protected role — an ordinary
+  credential takeover of accounts it can already see and manage. Resetting a protected holder's
+  password therefore needs both tiers, and it is the pair that hands over the administration. A permission whose consequence is not written down is one
+  an operator cannot grant knowingly: granting `identity.users.manage` means handing over the
+  credentials of every non-protected account; granting `identity.roles.manage` means handing over
+  the instance's administration.
 - **Audit.** Every insert into an audited table writes `created_by = principal.user_id`; every update sets
   `updated_by`. Documents created by another document (a sale's payment, a purchase's payment, a movement
   produced by a sale) carry the acting principal of the originating request, so a flow never invents a

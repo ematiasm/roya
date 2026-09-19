@@ -87,7 +87,8 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
 - [ ] S1b — El wiring: middleware + login/logout + API de sesiones + `test_support` + plumbing de cookie en
       los ~160 tests HTTP existentes + borrar los 15 `#[allow]` temporales (T6, T6b, T7, T8)
 - [ ] S2 — Núcleo RBAC: catálogo, guardas, `Require<P>` (T9–T12)
-- [ ] S3 — Administración de usuarios + cambio de contraseña obligatorio (T13–T15)
+- [x] S3 — Administración de usuarios + cambio de contraseña obligatorio (T13–T15; AC21 de la
+      superficie de usuarios queda para S7, ver S3 part 2 en Progreso)
 - [ ] S4 — Administración de roles y matriz de permisos (T16–T17)
 - [ ] S5 — Enforcement: finanzas e inventario (T18–T19)
 - [ ] S6 — Enforcement: ventas y clientes (T20–T21)
@@ -251,14 +252,95 @@ coherente (identidad + autorización) y Fase B puede esperar.
   `GET /` inmediatamente tras login 200 sin confinamiento. Ronda anterior: `GET /api/accounts` marcado
   403 JSON con motivo y `HX-Request` 403 + `HX-Redirect: /password`.
 
-## Next step
-S1b-iii: la API JSON de sesiones (`POST`/`DELETE /api/sessions` + su entrada en la allowlist), el shell propio
-para la página de login (hoy el visitante anónimo ve la navegación y el botón de logout), los seis env vars en
-`README.md`/`env.example` —con `ROYA_COOKIE_SECURE` marcado como obligatorio en HTTPS—, cobertura de `Secure`
-en el borde real, y el arreglo del harness de e2e (que a esta altura ya no puede autenticarse).
+### S3 part 2 — la administración de usuarios (T13 + la parte de usuarios de T15)
+- Branch `feat/users-administration` desde `main` (`44325b7`). Consumidora real del kernel de S2:
+  - **Service** (`IdentityService`): `create_user` (forma del username y unicidad NOCASE pre-chequeada,
+    display name, contraseña inicial con `MIN_PASSWORD_LEN`, el target sale marcado
+    `must_change_password` — el administrador eligió la credencial, como en el bootstrap generado),
+    `set_user_active` (desactivar revoca todas las sesiones del usuario vía
+    `revoke_all_for_user`; idempotente), `admin_reset_password` (marcado sobre el **target**, nunca el
+    actor; auto-reset rechazado — ese cambio es `/password`, que verifica la actual; sin revocación:
+    las sesiones vivas del target quedan vivas pero confinadas por el portón al próximo request),
+    `assign_roles` (`replace_user_roles` con `granted_by` = actor; pre-valida que los roles existan;
+    rechaza que el administrador actuante se edite a sí mismo un conjunto sin `identity.roles.manage` —
+    la regla de la spec «Role assignment» que ningún trigger cubre), y las lecturas
+    `list_users_with_roles` (users.list + list_for_user por usuario) y `role_list`.
+  - **Repositorios**: `UserRepository::list` nuevo; `user_repo::set_active` ahora mapea errores (el
+    trigger de AC14 llegaba como 500 crudo) y `map_db_err` gana la rama del trigger con su texto
+    español («No se puede desactivar: es el último usuario activo que sostiene un rol protegido…»);
+    los mensajes UNIQUE y CHECK de users pasaron a español (F4 y la copia operator-facing, ver ronda de
+    tests preexistentes abajo). `RoleRepository::delete` nuevo (S4 lo consumirá): mapea el trigger de
+    AC13 («No se puede eliminar un rol protegido») y el FK RESTRICT de AC15 («hay usuarios con este rol
+    asignado») a Conflict español; el FK en el camino grant/replace pasa a Validation («Uno de los roles
+    indicados no existe»).
+  - **Pantalla** (`users_web.rs` + `templates/users.html` + `partials/user_list.html`,
+    `user_roles_form.html`, `user_password_form.html`), patrón customers exacto: página + fragmento de
+    lista + `<dialog>` de creación + segundo `<dialog>` que carga los formularios de roles y reset por
+    fragmentos id-finales (`/web/users/roles-form/{id}`, `/web/users/password-form/{id}`), eventos
+    `HX-Trigger` (`user-created`/`user-changed`), `data-action` para el notice de éxito, ids en el body
+    en los endpoints de colección. En la única asignación de roles las casillas repiten la clave
+    `role_ids`, que `Form` (serde_urlencoded) rechaza como campo duplicado: ese handler lee el body crudo
+    con un parser propio sin dependencia nueva (los demás formularios siguen con `Form` +
+    `#[serde(default)]`). Copia en español como el resto de la familia identity; los `data-action` del
+    notice quedan en inglés («Create user saved») porque el sufijo vive en base.html, que esta slice no
+    toca.
+  - **Gating**: `GET /users`, `GET /web/users` → `Require<IdentityUsersRead>`; las cinco mutaciones →
+    `Require<IdentityUsersManage>`. La pantalla lee el `Principal` como `Extension` para `granted_by` y
+    para el `can_manage` que esconde los botones. Primera consumición real del extractor y de
+    `templates/forbidden.html` por una ruta de producción.
+  - **Sidebar**: entrada «Usuarios» (`nav_key = "users"`) en el grupo Account, icono heroicons,
+    clases existentes — sin recompilar CSS. Su ocultamiento por permiso (AC21) queda para S7.
+- Tests: +16 (5 service, 3 role_repo, 8 route). Los de ruta usan el fixture compartido más un rol
+  custom con los dos permisos identity.users otorgado al usuario de prueba, para que el administrador
+  de bootstrap siga siendo el único holder protegido y la aritmética de AC14 quede observable.
+- AC13/AC14/AC15 por pantalla: el último administrador no se desactiva (409 + mensaje español + nada
+  escrito) y un segundo administrador creado por la pantalla desbloquea; el mensaje de rol asignado a
+  usuarios existe en `role_repo::delete` (la pantalla es S4). El reset del administrador marca al
+  target y no al actor; rechaza el auto-reset y la contraseña corta sin escribir nada.
+- **No alcanzado (frontera exacta):** AC21 (ocultar la entrada del sidebar) — deferred a S7 como pide
+  el brief; la pantalla de roles y la matriz (S4) — el mensaje de AC15 existe pero no su pantalla; la
+  edición del display name (no estaba en los entregables); el e2e de la pantalla en navegador (S8).
+- Números: `cargo test` 496 → **512 passed / 0 failed** (+16); `cargo check --all-targets` 0 errores,
+  **66 → 60 warnings**; grep de allows vacío; `scripts/e2e.sh -k identity` 4 passed.
 
-Deuda explícita que no se resuelve en S1b-iii: la navegación de `HX-Redirect` sigue sin probarse en navegador
-(un test de header es un test de atributo, no de comportamiento; va en S8).
+### Ronda de corrección S3-ii (verificación adversaria: DO NOT COMMIT — takeover administrativo reproducido)
+- El verificador reprodujo con el binario real que un principal con **sólo** `identity.users.manage`
+  se autorgaba el rol `admin` (200), creaba cuentas y las volvía administradoras (200), pasaba de 403
+  a 200 en lecturas, **reseteaba la contraseña de otro administrador y entraba como él** (200 → login
+  303) y le quitaba el rol protegido a otro administrador (200). La regla de self-lockout sólo
+  protegía la retención del actor; el caso espejo no existía.
+- **Modelo de autorización implementado (decisión de diseño, aplicada tal como se especificó):**
+  `identity.users.read` ve la lista; `identity.users.manage` crea usuarios, activa/desactiva, edita
+  el display name y **resetea la contraseña de un usuario sin rol protegido**; `identity.roles.manage`
+  **cambia el conjunto de roles de cualquiera menos el propio** y resetea la contraseña de quien
+  sostiene un rol protegido (tomarse una cuenta que administra la instancia es una decisión sobre la
+  administración). **Nadie cambia sus propios roles, con ningún permiso** — una sola regla cierra la
+  auto-escalada y el self-lockout. El trigger de último holder protegido queda como backstop de la
+  base, no como sustituto. La regla de tier del reset vive en el servicio contra los roles del
+  TARGET; el endpoint `/web/users/roles` además se porta a `Require<IdentityRolesManage>`, y el
+  servicio repite el chequeo de tier para que no dependa del extractor. La interface esconde el
+  botón Roles para la fila propia (`acting_user_id`) y lo separa del tier de usuarios
+  (`can_manage_roles`).
+- Hallazgos menores cerrados en la misma ronda: `POST /password` comparte el throttle por-username
+  del login (misma clave, mismo reloj inyectado; N fallos seguidos rechazan el siguiente intento
+  antes de verificar y el éxito limpia el contador); los ids de roles se resuelven en una sola
+  statement (`RoleRepository::find_by_ids`, `QueryBuilder` con binds, convención del repo); el body
+  sobredimensionado del form de roles responde `413` con la forma JSON de la app en español
+  (`AppError::PayloadTooLarge`, límite propio del handler de 64 KiB); `role_repo::map_db_err` mapea
+  el trigger de borrado del rol protegido a su conflicto español y la rama FK queda documentada como
+  grant-context only (el camino de delete mapea el motivo de los holders); un `user_id` duplicado en
+  el form de roles se rechaza (400) en lugar de quedarse con el último valor.
+- La spec de S3 escribe el modelo («Admin password reset», «Role assignment» y «Cross-account
+  honesty»: qué puede hacerle cada tier a otra cuenta, y que un permiso con consecuencia no escrita
+  es uno que un operador no puede otorgar a sabiendas).
+
+## Next step
+S4: la administración de roles (T16–T17) — la pantalla de roles, la creación/edición/baja y la matriz
+de permisos. `RoleRepository::delete` y sus dos mensajes de rechazo ya existen de S3 part 2; le falta
+la pantalla y su gating (`identity.roles.manage`), y consumir los dormidos restantes de su lista
+(`count_active_holders`, `revoke`, `delete`, `Permission`/`row_to_permission`/`map_db_err` de
+`permission_repo`, y los campos de auditoría de `Role`). La deuda explícita de navegador sigue: la
+navegación de `HX-Redirect` sin probarse en navegador (S8).
 
 ### S2 — núcleo RBAC (T9–T12)
 - Migración `create_identity_rbac`: 23 permisos con inserts guardados, `admin` protegido con el catálogo
@@ -394,3 +476,39 @@ re-mide con `cargo check --all-targets`.
   el motivo (revocación real, cambios de permiso que aplican en el request siguiente, ninguna clave de firma
   que rotar) y la condición para reconsiderar (multi-instancia sin estado compartido, o un cliente externo
   que deba verificar sin tocar la base).
+
+### S3-ii — segunda ronda de corrección (re-verificación: COMMIT WITH NOTED RISK, 2026-09-21)
+La verificación cerró el takeover sin defecto de comportamiento y dejó cuatro ítems de documentación/UX,
+resueltos así (sin commits: el orquestador maneja el git):
+
+1. **La especificación sobreprometía (MINOR, contrato del operador).** «Cross-account honesty» decía que
+   `identity.roles.manage` podía «tomar cualquier cuenta reseteando la contraseña — incluso la de un
+   holder protegido», pero el endpoint de reset está gated `identity.users.manage`: quien tiene solo
+   roles.manage no llega. El texto reescrito enuncia la puerta y la regla de tiers (la regla del tier
+   dentro del servicio sigue real): el reset de un holder protegido exige los DOS tiers. Releído el
+   resto de las reglas reescritas: ninguna otra oración promete un poder que una gate no entrega.
+2. **Descripción persistida contradictoria con su propia gate (hallazgo nuevo, dato sembrado).**
+   `identity.users.manage` se describía «Crear usuarios, asignar roles y restablecer contraseñas», pero
+   asignar roles exige `identity.roles.manage` — y esa descripción es lo que el operador va a leer en la
+   matriz de S4 antes de otorgar. Corrección en el catálogo del código + migración nueva
+   `20240101000029_clarify_identity_permission_descriptions.sql` (no se tocó la 27, ya mergeada): la
+   descripción de `identity.roles.manage` también se completó (su gate cubre cambiar roles de otras
+   cuentas). Auditoría de las otras 21 descripciones: sin contradicciones, se dejaron como estaban.
+   El test de drift de AC12 ahora compara descripciones además de códigos: espejo
+   `PERMISSION_DESCRIPTIONS` en `authz.rs` + test de mutación de descripción unilateral.
+3. **«One statement» sin test que lo respalde.** `find_by_ids` solo tenía test del conjunto devuelto:
+   un loop por id con la misma semántica quedaba verde. Test nuevo a nivel de servicio con un double
+   contando (mismo patrón que `FailingInsertSessions`): la llamada a `find_by_ids` debe ser exactamente
+   UNA y llevar el conjunto deduplicado completo.
+4. **Forma vacía bien formada contestaba 400 (NIT).** `role_ids=` (clave presente, valor vacío) era
+   rechazado como id inválido; la UI omite la clave cuando no hay tilde. Ahora el valor presente-vacío
+   es el conjunto vacío; los valores malformados (`%`, `%zz`, no numéricos) siguen rechazados. El
+   backstop real sigue siendo el trigger del último holder.
+
+- Números: `cargo test` 523 → **526 passed / 0 failed** (+3: el test de mutación de descripción, el
+  double contando de `find_by_ids`, y el de la forma vacía); `cargo check --all-targets` **0 errores,
+  60 warnings** (sin cambio neto: la superficie nueva es test-montada y consume ítems ya contados);
+  grep de allows **vacío**; migración 29 aplicada a base fresca (1..29) y a base con 27 ya aplicada
+  (1..28 + 29): ambos extremos idénticos (23 filas, descripciones corregidas); drift probado fallando
+  con una descripción cambiada de un solo lado (falla nombrando el código y las dos cadenas) y
+  restaurado en verde; `scripts/e2e.sh -k identity` 4 passed.
