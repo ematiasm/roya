@@ -204,3 +204,138 @@ en el borde real, y el arreglo del harness de e2e (que a esta altura ya no puede
 
 Deuda explícita que no se resuelve en S1b-iii: la navegación de `HX-Redirect` sigue sin probarse en navegador
 (un test de header es un test de atributo, no de comportamiento; va en S8).
+
+### S2 — núcleo RBAC (T9–T12)
+- Migración `create_identity_rbac`: 23 permisos con inserts guardados, `admin` protegido con el catálogo
+  completo, y las matrices de `vendedor`/`cajero`/`deposito` exactas al spec. Corrección clave sobre la
+  corrida interrumpida: tres statements usaban `JOIN ( VALUES (...) ) AS wanted(code)` — sintaxis de
+  PostgreSQL; SQLite no soporta alias de columna sobre una lista VALUES y además faltaba la relación
+  `permissions` en el FROM. Reescritos con `JOIN permissions p ON p.code IN (...)` + `NOT EXISTS`;
+  verificados statement por statement contra SQLite real (solo 35–37 fallaban; el resto de ambas
+  migraciones, incluidos los 5 triggers, ejecutaban limpio).
+- `security/authz.rs`: catálogo compilado (`PERMISSIONS`, 23 códigos + censo const), `Principal`,
+  `Require<P>` con las tres formas de rechazo, y el drift test de AC12 con ambas direcciones de mutación
+  ejerciendo la misma comparación (borrar la fila es imposible por diseño: la FK en cascada dispara el
+  trigger del rol protegido — la migración se niega a des-grantar al admin; la mutación legal es renombrar).
+- `role_repo`/`permission_repo` + `IdentityService::effective_permissions` (una query, sin cache) y el
+  middleware que arma el `Principal` por request.
+- Triggers probados con SQL crudo y el texto real de SQLite: los 5 rechazos de AC13/AC14/AC15
+  (`SQLITE_CONSTRAINT_TRIGGER`) + un segundo administrador desbloquea los dos que dependen de la aritmética
+  de usuarios (el delete/rename/matriz del rol protegido son absolutos).
+- Tests: 470 → 474 passed / 0 failed; `scripts/e2e.sh -k identity` 4 passed.
+
+#### D1 — la resolución de permisos del middleware
+Ya estaba cableada (la corrida interrumpida la dejó escrita): `auth_middleware` resuelve la sesión, pide el
+conjunto efectivo vía `IdentityService::effective_permissions` (una query, sin cache) e inserta el
+`Principal` poblado en las extensiones. Lo que faltaba era la prueba de AC11 del lado matriz: nueva
+`ac11_a_role_matrix_edit_applies_to_the_next_request_without_a_restart` — edita la matriz de `vendedor`
+por el camino real de S4 (`set_role_permissions`) y exige que el siguiente request (sin restart) pase de
+200 a 403 y de vuelta a 200. El union-across-roles y el no-roles ya estaban probados por el middleware
+(`ac11_permissions_are_the_union...`, `ac11_a_user_with_no_roles_holds_none`).
+
+#### D2 — el administrador de bootstrap ahora sostiene el rol protegido
+- `bootstrap_admin` otorga `roles.code = 'admin'` al administrador que crea, al que recupera (inactivo) y
+  al caso de upgrade (admin activo sin rol: solo el grant, **sin tocar la credencial** — un reset ahí
+  dejaría afuera a un operador vivo al actualizar). Idempotente por el ON CONFLICT DO NOTHING del grant;
+  `granted_by` es el propio admin.
+- `count_active_admins` (user_repo) migró del atajo por username al join real por roles, como su propio
+  comentario de S1a prometía. El comentario quedó actualizado.
+- Tests nuevos en `services/identity.rs`: `ac14_a_fresh_bootstrap_administrator_holds_exactly_the_catalog`
+  (23 códigos por el join), `ac14_the_trigger_now_protects_the_real_holder` (desactivar al bootstrap admin
+  se rechaza con el texto del trigger; con un segundo admin, la desactivación y el borrado del grant
+  suceden), `ac14_an_upgraded_active_administrator_gets_the_role_without_a_credential_reset`, y los dos
+  tests de recovery de S1a reescritos como fixtures de base actualizada (admin inactivo sembrado por SQL crudo:
+  con los triggers vivos ese estado ya no es alcanzable por escrituras legítimas — lo prueban los tests de
+  role_repo). Total: 474 passed / 0 failed.
+- Consecuencia de warning: el grant real volvió alcanzable la cadena de `role_repo` en el bin
+  (trait, struct, `new`, `find_by_code`, `grant`, `row_to_role`, `map_db_err`, `NewUserRole`): 6 warnings
+  menos sin `#[allow]`.
+
+#### D3 — número de warnings anotado
+`cargo check --all-targets`: **58 en `main` → 68 tras S2**. Sin ningún `#[allow]`; el grep sigue vacío.
+El delta es superficie dormida por diseño, con su slice consumidora anotada (tabla completa en
+`openspec/changes/2026-09-18-add-identity-module/tasks.md`, sección «S2 warning ledger»): el extractor y
+las formas de rechazo (S5–S7), los métodos S3/S4 de los repos, `change_password`/`MIN_PASSWORD_LEN` (S3)
+y los structs `Role`/`Permission`. **Requisito registrado: el conteo vuelve a ≤58 al cierre de S7, sin
+atributos `#[allow]` como mecanismo** — cada slice consumidora vuelve alcanzable su superficie y S7
+re-mide con `cargo check --all-targets`.
+
+### Ronda de corrección del guard (verificación independiente: DO NOT COMMIT)
+- **Bypass 1 (bloqueante):** el flip de `roles.is_system` desarmaba toda la garantía: `UPDATE roles SET
+  is_system = 0 WHERE code='admin'` [NO-ERROR] y después `DELETE FROM roles` [NO-ERROR] borraban el rol
+  protegido y su matriz. Fix: `trg_roles_protected_is_system_immutable` (`BEFORE UPDATE OF is_system`,
+  rechaza el flip en ambas direcciones con su propio texto: «protected status is decided at seed time and
+  cannot change»). La bandera queda decidida en el seed: la migración 27 inserta los roles con su valor
+  final **antes** de que existan los triggers de la 28 — verificado. Re-ejecutadas las dos statements del
+  bypass: la primera ahora aborta y el rol y sus 44 filas de matriz sobreviven.
+- **Bypass 2 (bloqueante):** `DELETE FROM users` del último admin activo desencadenaba el cascade hacia
+  `user_roles` y el trigger de grants evaluaba a mitad de cascade. Fix: `trg_users_last_protected_holder_no_delete`
+  (`BEFORE DELETE ON users`, evaluado antes de cualquier cascade, cuando `user_roles` aún tiene las filas;
+  texto: «cannot delete the last active user holding a protected role»). El trigger de `user_roles` queda.
+  Probado: el delete del último holder se rechaza, sucede con un segundo holder activo, y un usuario sin rol
+  protegido sigue pudiendo borrarse. Matiz del fixture: un admin autograntado está además retenido por el
+  RESTRICT de su propio `granted_by` (el delete muere por FK, no por el trigger) — la prueba usa grants
+  otorgados por un tercero persistente, como el repro del verificador.
+- **MAJOR unificado:** `count_active_admins` (que miraba `r.code='admin'`) fue **eliminado** de
+  `user_repo`; el bootstrap y los tests usan `role_repo::count_active_protected_holders` — exactamente lo
+  que los triggers protegen (cualquier `is_system = 1`). El comentario S1a que prometía el switch quedó
+  reemplazado por la nota de unificación. Test nuevo:
+  `ac14_the_protected_holder_predicate_agrees_with_the_triggers_across_two_protected_roles` — con un rol
+  protegido `dueno`, el servicio cuenta a su holder, los triggers lo protegen (desactivar y borrar se
+  rechazan), el bootstrap siembra nada, y un segundo holder levanta los rechazos.
+- **MINOR (REPLACE):** los pools que pueden escribir `roles`/`user_roles` toman sus opciones de una única
+  constructora `db::base_connect_options` (foreign keys + `recursive_triggers`); `create_pool` la usa y los
+  test pools de `test_support`, `authz`, `guard`, `role_repo`, `identity` y `user_repo` pasaron a ella —
+  sin copiar listas de opciones. `permission_repo` no tiene pool de test propio (sin módulo de tests).
+  Otros pools del repo que tocan esas tablas: los route-tests de `identity_web.rs` e `identity_api.rs`
+  escriben en `user_roles` vía el bootstrap que ejercitan — **fuera de las superficies editables de esta
+  ronda, reportado, sin tocar**; `smoke_tests` ya tenía el pragma y solo lee (sesiones). Ningún pool de
+  departamento alcanza esas tablas (lo sella el grep de AC20).
+  Tests nuevos: `an_insert_or_replace_of_a_protected_role_row_aborts` y
+  `an_insert_or_replace_of_a_protected_grant_aborts` en `role_repo` — con el pragma compartido, ambos
+  REPLACE abortan y la fila/matriz sobrevive.
+- **NIT:** `user_repo::map_db_err` mapea el FK crudo («this user granted a role: the grant records who
+  granted it, and the deletion is held», 409). Test: `a_grantor_user_delete_maps_the_foreign_key_refusal`.
+- Regresión duradera en Rust para los dos bloqueantes:
+  `ac13_the_protected_status_flag_cannot_be_flipped` (flip en ambas direcciones rechazado, rol y matriz
+  intactos) y `ac14_the_last_active_protected_holder_cannot_be_deleted_by_user_row` en `role_repo`.
+- Números: `cargo test` 474 → **480 passed / 0 failed** (+6); `cargo check --all-targets` **68 warnings**
+  (sin cambio neto: el conteo no se movió, la tabla dormida se actualizó en ambos documentos); grep
+  vacío; `scripts/e2e.sh -k identity` 4 passed.
+
+### S2 — las dos rondas de verificación independiente
+- **Ronda 1: DO NOT COMMIT.** Dos maneras de romper la garantía "el administrador siempre existe", y las
+  481 pruebas no las veían:
+  1. **La protección dependía de una columna escribible.** Todos los triggers miraban `OLD.is_system = 1` y
+     nada rechazaba `UPDATE roles SET is_system = 0`: con dos sentencias comunes desaparecían el rol
+     protegido y su matriz de 23 permisos, mientras `count_active_admins` (que miraba `code='admin'`)
+     seguía reportando "hay 1 admin". Guarda de base y chequeo de servicio divergían justo bajo el bypass.
+  2. **El borrado del usuario se llevaba la última asignación.** `DELETE FROM users` sobre el último
+     administrador activo: la cláusula `EXISTS(... u.is_active = 1)` es falsa *durante la cascada*, así que
+     el trigger no disparaba. Los admins auto-otorgados se salvaban solo por el FK `granted_by RESTRICT`.
+  Más un MAJOR (dos predicados para el mismo concepto: `code='admin'` en el servicio, `is_system=1` en los
+  triggers) y dos menores (el agujero de `INSERT OR REPLACE` cerrado solo por un pragma por conexión; el
+  texto crudo de FK al borrar un otorgante).
+- **Corrección:** trigger `is_system` inmutable en ambas direcciones (el flag se decide al sembrar),
+  `BEFORE DELETE ON users` evaluado antes de la cascada, `count_active_admins` **borrado** en favor del
+  único `count_active_protected_holders` que ya existía, constructor único `db::base_connect_options`, y el
+  FK mapeado a un 409 con motivo.
+- **Ronda 2: COMMIT WITH NOTED RISK.** Los dos blockers muertos y probados con la tabla de bypass re-corrida
+  (estado intacto tras cada intento, incluidos `INSERT OR REPLACE` sobre el rol y sobre la asignación).
+  Y por fin la **tabla de mutaciones del enforcement**: las cuatro mutaciones (permiso que permite siempre,
+  principal ausente que no falla cerrado, forma del 403 cruzada, unión reducida a un solo rol) rompen tests
+  — o sea que los tests de `Require<P>` no son decoración. El verificador no alcanzó a ejecutar el mapeo del
+  FK; lo corrí yo (`a_grantor_user_delete_maps_the_foreign_key_refusal`, 1 passed).
+- **NIT cerrado por el orquestador:** el verificador probó que un pool construido a mano sin el constructor
+  compartido reabre el borrado del último admin (`INSERT OR REPLACE INTO users` con el pragma apagado) — hoy
+  inalcanzable, pero es la clase de agujero que vuelve. Se agregó un guard por grep en el módulo de tests de
+  `authz.rs` (`every_identity_pool_comes_from_the_shared_connect_options`), en la misma familia que el guard
+  de AC20, **validado por mutación**: con el patrón inyectado en `guard.rs` falla nombrando el archivo, y
+  restaurado pasa. Es un test agregado después de la ronda de verificación, y queda dicho acá.
+- **Números finales de S2:** `cargo test` 474 → **481 passed / 0 failed**; `cargo check --all-targets` 0
+  errores, **68 warnings** con el ledger ítem por ítem y la exigencia de volver a ≤58 al cerrar S7 sin
+  `#[allow]`; grep de allows **vacío**; `scripts/e2e.sh -k identity` 4 passed.
+- **Decisión registrada de paso:** el diseño ahora tiene una fila que compara sesión opaca contra JWT, con
+  el motivo (revocación real, cambios de permiso que aplican en el request siguiente, ninguna clave de firma
+  que rotar) y la condición para reconsiderar (multi-instancia sin estado compartido, o un cliente externo
+  que deba verificar sin tocar la base).

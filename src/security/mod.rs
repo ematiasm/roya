@@ -3,6 +3,7 @@
 // verification, session token minting/hashing, the TTL policy and the
 // deny-by-default gate that consumes `AppState` (which itself depends on the
 // kernel, not the other way around). `Require<P>` extractors arrive with S2.
+pub mod authz;
 pub mod guard;
 pub mod password;
 pub mod session;

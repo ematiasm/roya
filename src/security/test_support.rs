@@ -12,7 +12,8 @@ use sqlx::SqlitePool;
 use crate::error::AppResult;
 use crate::models::{NewSession, NewUser};
 use crate::repositories::{
-    SessionRepository, SqliteSessionRepository, SqliteUserRepository, UserRepository,
+    SessionRepository, SqliteRoleRepository, SqliteSessionRepository, SqliteUserRepository,
+    UserRepository,
 };
 use crate::security::password::PasswordHasher;
 use crate::security::session::{hash_token, mint_token, SessionPolicy, SESSION_COOKIE};
@@ -100,6 +101,7 @@ pub fn app_state(pool: SqlitePool) -> crate::routes::AppState {
     let identity = IdentityService::new(
         SqliteUserRepository::new(pool.clone()),
         SqliteSessionRepository::new(pool.clone()),
+        SqliteRoleRepository::new(pool.clone()),
         SystemClock,
         PasswordHasher::light(),
         SessionPolicy::new(12, false),
@@ -142,21 +144,18 @@ mod tests {
     use super::*;
     use crate::security::password::PasswordHasher;
     use crate::services::identity::{IdentityService, SystemClock, ThrottleConfig};
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::str::FromStr;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     type TestIdentity = IdentityService<
         SqliteUserRepository,
         SqliteSessionRepository,
+        SqliteRoleRepository,
         SystemClock,
         PasswordHasher,
     >;
 
     async fn test_pool() -> SqlitePool {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .create_if_missing(true)
-            .foreign_keys(true);
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -190,6 +189,7 @@ mod tests {
         let service = TestIdentity::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             SystemClock,
             PasswordHasher::light(),
             policy,
@@ -203,6 +203,13 @@ mod tests {
             .unwrap_or_else(|| panic!("seeded session {session_id} must resolve"));
         assert_eq!(resolved.user.username, TEST_USERNAME);
         assert!(resolved.user.is_active, "seeded user is active");
+        // The resolved session row is part of the production read: the fields
+        // S3's session list and revocation screens render (and the ones the
+        // middleware's expiry check reads) survive the round-trip.
+        assert_eq!(resolved.session.user_id, resolved.user.id);
+        assert!(!resolved.session.token_hash.is_empty(), "the digest is stored, never the token");
+        assert!(resolved.session.created_at > chrono::Utc::now().naive_utc() - chrono::Duration::minutes(1));
+        assert!(resolved.session.user_agent.is_none());
         assert_eq!(resolved.session.id, session_id);
         assert!(resolved.session.revoked_at.is_none());
 

@@ -21,16 +21,28 @@ pub fn encode_sqlite_timestamp(value: NaiveDateTime) -> String {
     value.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
-/// Create a pool from DATABASE_URL.  Falls back to `sqlite://roya.db`.
-pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let opts = SqliteConnectOptions::from_str(database_url)?
+/// The base connect options for every pool that can write `roles` or
+/// `user_roles`. Both settings are per connection and neither is enforceable
+/// from inside the schema, so the identity triggers' completeness depends on
+/// them being set in one place:
+///
+/// - `foreign_keys` — the grant graph leans on RESTRICT/CASCADE edges
+///   (`granted_by`, `role_id`);
+/// - `recursive_triggers` — REPLACE-shaped statements (INSERT OR REPLACE,
+///   REPLACE INTO, UPDATE OR REPLACE) fire BEFORE DELETE triggers only with
+///   the pragma, so without it an `INSERT OR REPLACE INTO roles` silently
+///   rewrites the protected row and its matrix. The walk-in backstop
+///   triggers only RAISE(ABORT), so enabling this cannot recurse.
+pub fn base_connect_options(database_url: &str) -> Result<SqliteConnectOptions, sqlx::Error> {
+    Ok(SqliteConnectOptions::from_str(database_url)?
         .create_if_missing(true)
         .foreign_keys(true)
-        // Per-connection: SQLite fires BEFORE DELETE triggers during REPLACE
-        // conflict resolution (INSERT OR REPLACE, REPLACE INTO, UPDATE OR
-        // REPLACE) only when recursive triggers are on. The walk-in backstop
-        // triggers only RAISE(ABORT), so enabling this cannot recurse.
-        .pragma("recursive_triggers", "1")
+        .pragma("recursive_triggers", "1"))
+}
+
+/// Create a pool from DATABASE_URL.  Falls back to `sqlite://roya.db`.
+pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let opts = base_connect_options(database_url)?
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 

@@ -164,8 +164,7 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::str::FromStr;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tower::ServiceExt;
 
     use crate::routes::router;
@@ -178,10 +177,7 @@ mod tests {
     /// administrator with a real (light-hashed) credential. `TEST_USERNAME`'s
     /// seeded hash is a placeholder and must never be logged in against.
     async fn test_app() -> (axum::Router, AppState) {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .create_if_missing(true)
-            .foreign_keys(true);
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -555,10 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn must_change_password_does_not_confine_the_session_yet() {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .create_if_missing(true)
-            .foreign_keys(true);
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)

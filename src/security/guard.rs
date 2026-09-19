@@ -16,7 +16,9 @@ use serde_json::json;
 
 use crate::error::{AppError, AppResult};
 use crate::models::ResolvedSession;
+use crate::repositories::SqlitePermissionRepository;
 use crate::routes::AppState;
+use crate::security::authz::Principal;
 
 // ---------------------------------------------------------------------------
 // Public allowlist
@@ -83,7 +85,7 @@ fn pattern_matches(pattern: &str, path: &str) -> bool {
 /// fallback (a routing miss) is behind the gate too.
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_owned();
@@ -108,7 +110,32 @@ pub async fn auth_middleware(
     }
 
     match current_session(&state, req.headers()).await {
-        Ok(Some(_)) => next.run(req).await,
+        Ok(Some(resolved)) => {
+            // S2: resolve the effective permission set (one query, no cache —
+            // a matrix edit applies to the next request) and carry the
+            // principal in the extensions, where `Require<P>` reads it. The
+            // permission repository is built here, per request, from the pool
+            // the state already holds; the identity department owns its
+            // tables, the kernel owns the read that answers "may this user do
+            // this?".
+            let permissions_repo = SqlitePermissionRepository::new(state.pool.clone());
+            match state
+                .identity_service
+                .effective_permissions(&permissions_repo, resolved.user.id)
+                .await
+            {
+                Ok(permissions) => {
+                    req.extensions_mut()
+                        .insert(Principal::from_user(&resolved.user, permissions));
+                    next.run(req).await
+                }
+                // A failed permission read (database error) is a 500, never a
+                // silent pass — the same posture as the session check below.
+                Err(e) => {
+                    AppError::Internal(format!("permission check failed: {e}")).into_response()
+                }
+            }
+        }
         Ok(None) => refuse(&path, &target, is_htmx(req.headers())),
         // A failed session read (database error) is a 500, never a silent pass.
         Err(e) => AppError::Internal(format!("session check failed: {e}")).into_response(),
@@ -220,11 +247,10 @@ fn encode_query_value(value: &str) -> String {
 }
 
 fn forbidden_origin() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(json!({ "error": "Origen no permitido" })),
-    )
-        .into_response()
+    // The same JSON shape `AppError::Forbidden` produces; going through the
+    // error type keeps the one 403 constructor the interface has, and the CSRF
+    // refusal text is Spanish like every other operator-facing copy.
+    AppError::Forbidden("Origen no permitido".to_string()).into_response()
 }
 
 /// A `next` value is honoured only when it is a local path: it must start with
@@ -256,8 +282,7 @@ pub fn local_next(next: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use axum::body::Body;
-    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-    use std::str::FromStr;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tower::ServiceExt;
 
     use crate::routes::router;
@@ -266,10 +291,7 @@ mod tests {
     /// The full production router over the part-1 test fixture: same
     /// construction a client experiences, with the light test hasher.
     async fn test_app() -> axum::Router {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
-            .unwrap()
-            .create_if_missing(true)
-            .foreign_keys(true);
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)

@@ -20,9 +20,9 @@ use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
     SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
     SqlitePaymentMethodRepository, SqliteProductRepository,
-    SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteSaleRepository,
-    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteSessionRepository,
-    SqliteTransactionRepository, SqliteUserRepository,
+    SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteRoleRepository,
+    SqliteSaleRepository, SqliteStockMovementRepository, SqliteSupplierRepository,
+    SqliteSessionRepository, SqliteTransactionRepository, SqliteUserRepository,
 };
 use crate::security::auth_middleware;
 use crate::services::identity::{SystemClock, ThrottleConfig};
@@ -94,6 +94,7 @@ pub type PurchasesSvc = PurchasesService<
 pub type IdentitySvc = IdentityService<
     SqliteUserRepository,
     SqliteSessionRepository,
+    SqliteRoleRepository,
     SystemClock,
     crate::security::PasswordHasher,
 >;
@@ -161,6 +162,7 @@ impl AppState {
         let identity_service = IdentityService::new(
             SqliteUserRepository::new(pool.clone()),
             SqliteSessionRepository::new(pool.clone()),
+            SqliteRoleRepository::new(pool.clone()),
             SystemClock,
             crate::security::PasswordHasher::production(),
             policy,

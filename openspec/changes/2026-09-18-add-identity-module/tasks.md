@@ -90,6 +90,43 @@ Chromium against the real binary with a decoy server that received no request at
       catalog-drift test.
 - [ ] T12: tests for AC10-AC12, AC19 (partial: the identity side), AC20.
 
+#### S2 warning ledger (recorded 2026-09-19; updated in the guard-hardening correction round)
+`cargo check --all-targets` measured **58 warnings on `main`** and **68 after S2** (unchanged by the
+guard-hardening round: its triggers and tests replace one another one for one, and the bootstrap wiring
+made `role_repo::count_active_protected_holders` reachable, moving it out of this list while `revoke`
+joined the S3 side). No
+`#[allow(dead_code)]` / `#[allow(unused_imports)]` attributes were added;
+`grep -rn 'allow(dead_code)\|allow(unused_imports)' src/` stays empty. The +10 delta is
+surface S2 ships ahead of its consumers (the bootstrap protected-role grant and the
+middleware's effective-permission resolution are wired and reachable; what remains is
+dormant by design, exercised by tests, awaiting its consuming slice):
+
+| Dormant item | Location | Consumed by |
+| --- | --- | --- |
+| `Principal` identity-field reads (`user_id`, `username`, `display_name`, `must_change_password`) | `src/security/authz.rs:141` | S5-S7 (navigation, forced-change gate) |
+| `Principal::has` / `has_permission` | `src/security/authz.rs:164` | S5 (the extractor's membership check) |
+| `Require<P>` construction | `src/security/authz.rs:189` | S5-S7 (handler declarations) |
+| `forbidden_response` | `src/security/authz.rs:233` | S5-S7 (the extractor's rejection) |
+| `ForbiddenTemplate` | `src/security/authz.rs:262` | S5-S7 (full-page refusal) |
+| `Role` field reads (`code`, `name`, `description`, `is_system`, timestamps) | `src/models.rs:1346` | S3 (users list), S4 (roles list) |
+| `Permission` model struct | `src/models.rs:1359` | S4 (permission matrix rows) |
+| `permission_repo::map_db_err` | `src/repositories/permission_repo.rs:24` | S4 (matrix editor refusals) |
+| `permission_repo::{list, codes_for_role, set_role_permissions}` | `src/repositories/permission_repo.rs:40` | S4 (matrix editor) |
+| `role_repo::{find_by_id, list, list_for_user, count_active_holders, revoke, replace_user_roles}` | `src/repositories/role_repo.rs:54` | S3 (assignment form, deactivation), S4 (roles admin) |
+| `user_repo::{find_by_username, find_with_hash_by_id}` | `src/repositories/user_repo.rs:67` | S3 (users admin) |
+| `MIN_PASSWORD_LEN` | `src/services/identity.rs:38` | S3 (password-change validation) |
+| `IdentityService::{change_password, revoke_all_sessions}` | `src/services/identity.rs:539` | S3 (password change) |
+
+(`src/routes/mod.rs:122`/`:128` — `enforce_credit_limit`, `AppState::new`/
+`new_with_credit_limit` — and the finance/products/service items are pre-existing
+`main` dead code, not S2 debt.)
+
+**Requirement:** the count must be back at or below 58 by the end of S7, with **no
+`#[allow(dead_code)]` / `#[allow(unused_imports)]` attributes as the mechanism**: each
+consuming slice makes its surface reachable (S3 and S4 cover the repositories and
+service methods, S5-S7 cover the extractor, the refusal shapes and the principal
+reads), and S7's closing check re-runs `cargo check --all-targets`.
+
 ### S3 — users administration
 - [ ] T13: `/users` list with roles and state, create, deactivate/activate, admin password reset, role
       assignment with `granted_by`, and the interface explanation of every trigger refusal.
