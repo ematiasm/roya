@@ -1,0 +1,92 @@
+{# Roles administration (slice S4, T16). Follows the users screen exactly:
+   the full page renders the list shell and the create `<dialog>`; the list
+   fragment (`partials/role_list.html`) is swapped by htmx and refreshed out
+   of band after every mutation; a second `<dialog>` loads, per role, the
+   id-final edit fragment (`/web/roles/edit-form/{id}`) carrying the details
+   form AND the permission matrix grouped by module. Copy is Spanish, like
+   the rest of the identity screens.
+
+   The screen is gated `identity.roles.manage` on every surface — reads
+   included, because the catalog has no `identity.roles.read` and this slice
+   does not invent a permission code (deliberate mapping, written into the
+   spec): anyone who reaches this page may act on roles, so the markup offers
+   the actions unconditionally and the handlers are what refuse. AC21
+   (hiding the sidebar entry from principals that cannot read it) is S7, as
+   for /users: the entry stays visible and the route itself refuses. #}
+{% extends "base.html" %}
+{% block title %}Roles — Roya{% endblock %}
+{% block content %}
+<div class="mb-4 flex items-center gap-2">
+  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">roles · matriz de permisos</span>
+</div>
+<div class="mb-4 flex items-center justify-between gap-2">
+  <h2 class="text-lg font-semibold">Roles</h2>
+  <div class="flex items-center gap-2">
+    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/roles" hx-target="#role-list" hx-swap="innerHTML">↻ Actualizar</button>
+    <button type="button" onclick="document.getElementById('new-role-dialog').showModal()">Nuevo rol</button>
+  </div>
+</div>
+<div id="role-list"
+     hx-get="/web/roles"
+     hx-trigger="refresh from:body, load"
+     hx-swap="innerHTML">
+  {% include "partials/role_list.html" %}
+</div>
+
+<dialog id="new-role-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
+  <div class="mb-3 flex items-center justify-between gap-6">
+    <h2 class="text-lg font-semibold">Nuevo rol</h2>
+    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-role-dialog').close()">✕</button>
+  </div>
+  <form class="flex flex-col gap-2.5"
+        data-action="Create role"
+        hx-post="/web/roles"
+        hx-target="#role-list"
+        hx-swap="innerHTML"
+        hx-on::after-request="if(event.detail.successful) this.reset()">
+    <div>
+      <label>Código</label>
+      <input type="text" name="code" required minlength="2" maxlength="64" pattern="[a-z][a-z0-9_]*" placeholder="supervisor…" />
+    </div>
+    <div>
+      <label>Nombre</label>
+      <input type="text" name="name" required maxlength="128" placeholder="Supervisor…" />
+    </div>
+    <div>
+      <label>Descripción (opcional)</label>
+      <input type="text" name="description" maxlength="256" placeholder="Qué puede hacer este rol…" />
+    </div>
+    <button type="submit">Crear rol</button>
+    <div class="text-[13px] text-muted">
+      El código es el nombre máquina del rol y no se puede cambiar después:
+      sólo letras minúsculas, números y guión bajo, empezando con una letra.
+    </div>
+  </form>
+</dialog>
+
+<dialog id="role-edit-dialog" class="rounded-2xl border border-border bg-card p-5 text-text overflow-y-auto">
+  <div id="role-edit-dialog-body"></div>
+</dialog>
+
+<script>
+  function closeRoleEditDialog() {
+    var dlg = document.getElementById('role-edit-dialog');
+    if (dlg && dlg.open) dlg.close();
+  }
+  document.addEventListener('keydown', function (evt) {
+    if (evt.key !== 'Escape') return;
+    var dlg = document.getElementById('new-role-dialog');
+    if (dlg && dlg.open) return;
+    closeRoleEditDialog();
+  });
+  document.body.addEventListener('role-created', function () {
+    var dlg = document.getElementById('new-role-dialog');
+    if (dlg && dlg.open) dlg.close();
+  });
+  document.body.addEventListener('role-changed', function () {
+    htmx.trigger('#role-list', 'refresh');
+    closeRoleEditDialog();
+  });
+</script>
+{% endblock %}

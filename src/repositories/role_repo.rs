@@ -1,15 +1,20 @@
-// Identity kernel: roles repository (Slice S2). One row per role; `is_system`
-// marks the protected role whose deletion, rename and permission removals the
-// schema triggers refuse. Deletion is only ever attempted through the ordinary
-// `DELETE`: a role still assigned to any user is held by the `user_roles`
-// RESTRICT foreign key (AC15), and a protected role is held by the guard
-// trigger (AC13) — the repository maps both refusals to `Conflict` so the
-// interface can explain which users or which rule block the action.
+// Identity kernel: roles repository (Slice S2; the roles screen writes added
+// by S4). One row per role; `is_system` marks the protected role whose
+// deletion, rename and permission removals the schema triggers refuse.
+// Deletion is only ever attempted through the ordinary `DELETE`: a role still
+// assigned to any user is held by the `user_roles` RESTRICT foreign key
+// (AC15), and a protected role is held by the guard trigger (AC13) — the
+// repository maps both refusals to `Conflict` so the interface can explain
+// which users or which rule block the action. S4 closes the two trigger
+// mappings this file still owed: the protected-code rename (`protected role
+// code cannot change`) and the schema CHECKs the create/edit forms can hit,
+// so no statement reachable from the roles screen leaks a raw trigger string
+// or an English 500.
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewUserRole, Role};
+use crate::models::{NewRole, NewUserRole, Role};
 
 fn row_to_role(row: &sqlx::sqlite::SqliteRow) -> Role {
     let system: i64 = row.get("is_system");
@@ -27,7 +32,18 @@ fn row_to_role(row: &sqlx::sqlite::SqliteRow) -> Role {
 fn map_db_err(e: sqlx::Error) -> AppError {
     let s = e.to_string();
     if s.contains("UNIQUE constraint failed") {
-        AppError::Conflict("role code already exists".into())
+        // The S4 create/edit forms pre-check uniqueness, so this branch is
+        // the backstop for the window between the check and the write.
+        AppError::Conflict("Ya existe un rol con ese código.".into())
+    } else if s.contains("protected role code cannot change") {
+        // The guard trigger (AC13, ledger closed by S4): the protected role's
+        // machine name is decided at seed time. No statement reachable from
+        // the roles screen changes a `code` (the edit form edits name and
+        // description only), so this mapping keeps any future path — or a
+        // script — from leaking the trigger text as a 500.
+        AppError::Conflict(
+            "No se puede cambiar el código de un rol protegido: su nombre máquina está fijado al sembrar.".into(),
+        )
     } else if s.contains("cannot remove the last grant of a protected role to an active user") {
         // The guard trigger (AC14): removing this grant would leave the shop
         // without an active administrator. The interface explains the rule
@@ -55,17 +71,22 @@ fn map_db_err(e: sqlx::Error) -> AppError {
         // holders' refusal as a missing id.
         AppError::Validation("Uno de los roles indicados no existe.".into())
     } else if s.contains("CHECK constraint failed") {
+        // The create/edit forms validate the same rules in the service (the
+        // operator reads them in Spanish before the write); these are the
+        // mapped backstops for the statements that reach the schema first.
         if s.contains("roles_code_shape") {
             AppError::Validation(
-                "role code must be 2-64 lowercase ASCII characters (letters, digits, underscore), starting with a letter"
+                "El código del rol debe tener entre 2 y 64 caracteres: sólo letras minúsculas, números y guión bajo, empezando con una letra."
                     .into(),
             )
         } else if s.contains("roles_name_shape") {
-            AppError::Validation("role name must be 1-128 characters".into())
+            AppError::Validation("El nombre del rol debe tener entre 1 y 128 caracteres.".into())
         } else if s.contains("roles_description_shape") {
-            AppError::Validation("role description must be at most 256 characters".into())
+            AppError::Validation(
+                "La descripción del rol no puede superar los 256 caracteres.".into(),
+            )
         } else {
-            AppError::Validation("role fields violate schema rules".into())
+            AppError::Validation("Los campos del rol no cumplen las reglas del esquema.".into())
         }
     } else {
         AppError::Database(e)
@@ -109,6 +130,20 @@ pub trait RoleRepository: Send + Sync {
     /// active protected-role holder.
     async fn replace_user_roles(&self, user_id: i64, role_ids: &[i64], granted_by: i64)
         -> AppResult<Vec<Role>>;
+    /// Create a role row (the S4 create form). The schema CHECK is the
+    /// backstop behind the service's shape validation; the UNIQUE index
+    /// backs the pre-checked uniqueness.
+    async fn create(&self, input: &NewRole) -> AppResult<Role>;
+    /// Edit a role's name and description (the S4 edit form). The code is
+    /// not part of this statement: renames are refused by the guard trigger
+    /// for a protected role and are not offered by the interface for any
+    /// role (a machine name is not a relabel). Touches `updated_at`.
+    async fn update_details(&self, id: i64, name: &str, description: Option<&str>)
+        -> AppResult<()>;
+    /// Usernames of EVERY user holding the role (AC15): the names a blocked
+    /// deletion reports. `user_roles.role_id` is ON DELETE RESTRICT for
+    /// holders of any state, active or not, so the refusal names all of them.
+    async fn holder_names(&self, role_id: i64) -> AppResult<Vec<String>>;
 }
 
 #[derive(Clone)]
@@ -317,6 +352,51 @@ impl RoleRepository for SqliteRoleRepository {
         .await?;
         tx.commit().await?;
         Ok(rows.iter().map(row_to_role).collect())
+    }
+
+    async fn create(&self, input: &NewRole) -> AppResult<Role> {
+        let row = sqlx::query(
+            r#"INSERT INTO roles (code, name, description)
+               VALUES (?, ?, ?)
+               RETURNING id, code, name, description, is_system, created_at, updated_at"#,
+        )
+        .bind(&input.code)
+        .bind(&input.name)
+        .bind(&input.description)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(row_to_role(&row))
+    }
+
+    async fn update_details(&self, id: i64, name: &str, description: Option<&str>)
+        -> AppResult<()> {
+        sqlx::query(
+            r#"UPDATE roles
+               SET name = ?, description = ?,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ?"#,
+        )
+        .bind(name)
+        .bind(description)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(())
+    }
+
+    async fn holder_names(&self, role_id: i64) -> AppResult<Vec<String>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            r#"SELECT u.username FROM user_roles ur
+               JOIN users u ON u.id = ur.user_id
+               WHERE ur.role_id = ?
+               ORDER BY u.username"#,
+        )
+        .bind(role_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }
 
@@ -760,6 +840,52 @@ mod tests {
         let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
         roles.delete(vendedor.id).await.unwrap();
         assert!(roles.find_by_code("vendedor").await.unwrap().is_none());
+    }
+
+    /// `holder_names` has NO `is_active` filter, on purpose: the `user_roles`
+    /// RESTRICT foreign key does not distinguish active from inactive
+    /// holders, so neither does the read that names them (spec: "the refusal
+    /// names the blocking users, whatever their state"). A DEACTIVATED
+    /// holder must be named too — otherwise the operator would face a
+    /// deletion refusal naming nobody — and the deletion stays refused with
+    /// the deactivated holder still in the set.
+    #[tokio::test]
+    async fn holder_names_names_a_deactivated_holder_too_and_the_delete_stays_refused() {
+        let p = pool().await;
+        seed_admin_holders(&p, &["first-admin", "second-admin"]).await;
+        let users = SqliteUserRepository::new(p.clone());
+        let roles = SqliteRoleRepository::new(p.clone());
+        let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
+        let first: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        let second: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'second-admin'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        for user_id in [first, second] {
+            roles
+                .grant(&NewUserRole { user_id, role_id: vendedor.id, granted_by: user_id })
+                .await
+                .unwrap();
+        }
+        users.set_active(first, false).await.unwrap();
+
+        // The read is the TOTAL set: the deactivated holder is named too.
+        let named = roles.holder_names(vendedor.id).await.unwrap();
+        assert_eq!(named, vec!["first-admin".to_string(), "second-admin".to_string()]);
+
+        // And the deletion is still refused with the holders' reason.
+        let err = roles.delete(vendedor.id).await.unwrap_err();
+        match &err {
+            AppError::Conflict(m) => {
+                assert!(m.contains("asignado"), "{m}");
+                assert!(!m.contains("FOREIGN KEY"), "no raw SQL text: {m}");
+            }
+            other => panic!("expected the holders conflict, got {other:?}"),
+        }
+        assert!(roles.find_by_code("vendedor").await.unwrap().is_some());
     }
 
     // -- the shared mapper knows the two delete-shaped refusals (correction

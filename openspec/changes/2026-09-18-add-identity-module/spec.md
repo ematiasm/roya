@@ -129,8 +129,12 @@
   `granted_at` for the newly granted ones, and is gated `identity.roles.manage` — the tier that
   decides who administers the instance (the service repeats the check, so the rule does not depend
   on every future route remembering the extractor). NOBODY changes their own role set, with any
-  permission: one rule closes self-escalation and the self-lockout alike, and the interface hides
-  the action for self while the refusal stays real. The removal of the last active protected-role
+  permission: the rule closes CHANGING YOUR OWN ROLE SET DIRECTLY, and that direct path is where
+  both self-escalation and the self-lockout would come from, so one refusal closes them alike; the
+  interface hides the action for self while the refusal stays real. The rule does not claim to
+  close self-escalation in general: the permission matrix leaves a roles-manage holder one tick
+  away from widening a **non-protected** role it occupies (the protected role's matrix cannot be edited by anyone, so a holder whose only role is the protected one has no matrix path at all) — the indirect path and its consequence are written down
+  in Cross-account honesty, not denied here. The removal of the last active protected-role
   holder remains refused by the database trigger — the backstop, not a substitute — and the
   submitted role ids are resolved in one statement (one `find_by_ids` call carrying the whole set,
   pinned by a counting-double test), and a body carrying `role_ids` with an empty value is the empty
@@ -138,18 +142,68 @@
   malformed value is still refused. The raw-body handler buffers the form through
   its own limit and answers an oversized body with `413` in the app's Spanish JSON shape, never
   the extractor's English plain-text error.
+- **Roles administration (S4).** The screen `/roles` is where the RBAC core becomes editable: the
+  list (code, name, description, protected flag, how many users hold it), a create dialog, an edit
+  dialog, a delete action and the permission matrix — the 23 seeded codes grouped by module, each
+  carrying its seeded Spanish description, the corrected wording the operator reads before
+  granting. Saving the matrix REPLACES the role's whole set: the unticked codes are removed, not
+  merely left out.
+  - **Gating.** Every surface of the screen — reads included — requires `identity.roles.manage`.
+    The mapping is deliberate and written down here because the catalog has no
+    `identity.roles.read`, and inventing one would need a migration the v1 catalog does not have;
+    the cost is stated plainly: an operator who may only LOOK at roles must hold the management
+    permission. The handler, not the markup, is the enforcement.
+  - **The protected role is presented as locked.** No delete, no code rename, no matrix edit: the
+    triggers enforce it, the interface never offers it (the row's button is a read-only "Ver", the
+    dialog renders the matrix without checkboxes and without a submit), and the handlers refuse it
+    with the reason in Spanish. Its name and description stay editable — the triggers lock the
+    code, not the label.
+  - **A held role cannot be deleted, and the refusal names the blocking users** (AC15): every user
+    holding the role is named in the Spanish conflict, whatever their state — the `user_roles`
+    RESTRICT foreign key does not distinguish active from inactive holders, so neither does the
+    refusal or the list count.
+  - **The matrix self-lockout rule (new in S4).** A matrix edit that would REMOVE
+    `identity.roles.manage` from a role the acting principal currently holds is refused, with the
+    reason in Spanish and nothing written. Without it, a roles-manage holder could strip its own
+    tier through the matrix and lock itself — and everyone sharing the role — out of the
+    administration on the very next request: the same lockout class the users screen already
+    refuses for role sets. The interface pre-ticks the held permission, so it never offers the
+    removal; the refusal is real regardless.
+  - **Trigger mappings (ledger closed by S4).** Every trigger refusal reachable from this screen
+    maps to its own Spanish conflict, never a generic 500 or a raw trigger string: the protected
+    delete (`protected role cannot be deleted`), the protected rename (`protected role code cannot
+    change`), the protected matrix removal (`protected role permissions cannot be removed`) and
+    the schema CHECK refusals for the role's fields. The create/edit forms validate the same
+    rules in the service (code shape `^[a-z][a-z0-9_]*$`, 2-64; name 1-128; description ≤ 256,
+    optional), so the CHECKs are backstops for the check-to-write window.
+  - **The code is never an editable field.** A machine name is not a relabel: the edit form carries
+    name and description only, for every role — so the protected role's rename refusal is not
+    reachable through the interface by construction, and the trigger's mapping covers every other
+    path (scripts, future screens) that could reach it.
 - **Cross-account honesty (what each tier may do to another account).** Whoever holds
   `identity.roles.manage` decides who administers the instance: with it, a principal can grant or
-  strip the protected role on any account but its own, but it cannot reset any password on its own —
-  the reset endpoint is gated `identity.users.manage`, and the service adds the `roles.manage`
-  requirement only when the target holds a protected role. Whoever holds `identity.users.manage` can
-  take over the accounts it is allowed to touch: create users, activate/deactivate them, edit their
-  display name, and reset the password of any user holding NO protected role — an ordinary
-  credential takeover of accounts it can already see and manage. Resetting a protected holder's
-  password therefore needs both tiers, and it is the pair that hands over the administration. A permission whose consequence is not written down is one
-  an operator cannot grant knowingly: granting `identity.users.manage` means handing over the
-  credentials of every non-protected account; granting `identity.roles.manage` means handing over
-  the instance's administration.
+  strip the protected role on any account but its own. While it holds only this permission it
+  cannot reset any password — the reset endpoint is gated `identity.users.manage`, and the service
+  adds the `roles.manage` requirement only when the target holds a protected role. But one indirect
+  path reopens the pair from this tier alone, and it must be read before granting: the matrix
+  editor (S4) refuses only REMOVING `identity.roles.manage` from a role the actor holds — it never
+  refuses ADDING permissions to a **non-protected** role the actor occupies (the protected role's matrix is refused for every actor, so this path exists only through an ordinary role). A roles-manage holder can therefore
+  tick `identity.users.manage` onto a role it holds, get `200`, and hold the pair on the next
+  request — and the pair can reset a protected holder's password and take over the
+  administration. En palabras del operador: quien puede editar la matriz puede marcarse
+  `identity.users.manage` en un rol propio **no protegido**, y con ese par puede restablecer la contraseña de quien
+  sostiene un rol protegido y tomar la instancia. Conceder «Crear roles, editar la matriz de
+  permisos y cambiar los roles de otras cuentas» no entrega solamente la decisión de quién
+  administra: entrega la instancia. Whoever holds `identity.users.manage` can take over the
+  accounts it is allowed to touch: create users, activate/deactivate them, edit their display
+  name, and reset the password of any user holding NO protected role — an ordinary credential
+  takeover of accounts it can already see and manage. Resetting a protected holder's password
+  needs both permissions held together, and a roles-manage holder can assemble the pair itself
+  through the matrix — so it is not only the pair that hands over the administration:
+  `identity.roles.manage` alone already carries the path to it. A permission whose consequence is
+  not written down is one an operator cannot grant knowingly: granting `identity.users.manage`
+  means handing over the credentials of every non-protected account; granting
+  `identity.roles.manage` means handing over the instance itself.
 - **Audit.** Every insert into an audited table writes `created_by = principal.user_id`; every update sets
   `updated_by`. Documents created by another document (a sale's payment, a purchase's payment, a movement
   produced by a sale) carry the acting principal of the originating request, so a flow never invents a

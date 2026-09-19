@@ -1384,6 +1384,38 @@ pub struct NewUserRole {
     pub granted_by: i64,
 }
 
+/// Service-level input for creating a role (S4 roles screen). `code` is the
+/// machine name the schema CHECK validates (`^[a-z][a-z0-9_]*$`, 2-64); the
+/// service pre-checks the shape so the operator reads the rule in Spanish
+/// before the write is attempted, with the CHECK as the backstop.
+#[derive(Debug, Clone)]
+pub struct NewRole {
+    pub code: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
+/// One role together with the usernames of the users that hold it (S4 roles
+/// list and the AC15 refusal): the count the list shows AND the names a
+/// blocked deletion reports. Holders of ANY state count — `user_roles`
+/// RESTRICT blocks the deletion for inactive holders too.
+#[derive(Debug, Clone)]
+pub struct RoleWithHolders {
+    pub role: Role,
+    pub holders: Vec<String>,
+}
+
+/// A role's permission matrix read (S4): the role, the whole seeded catalog
+/// (the 23 rows the matrix renders, each with its Spanish description) and
+/// the ids of the permissions the role currently holds. The screen groups the
+/// catalog by module and ticks the held ids.
+#[derive(Debug, Clone)]
+pub struct RoleMatrix {
+    pub role: Role,
+    pub catalog: Vec<Permission>,
+    pub held_ids: Vec<i64>,
+}
+
 impl ReceiptDetail {
     pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>) -> Self {
         let total = allocations.iter().map(|payment| payment.amount).sum();

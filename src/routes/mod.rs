@@ -7,6 +7,7 @@ pub mod inventory_api;
 pub mod inventory_web;
 pub mod purchases_api;
 pub mod purchases_web;
+pub mod roles_web;
 pub mod sales_api;
 pub mod sales_web;
 pub mod suppliers_web;
@@ -271,6 +272,7 @@ pub fn router(state: AppState) -> Router {
         .merge(purchases_web::router())
         .merge(suppliers_web::router())
         .merge(users_web::router())
+        .merge(roles_web::router())
         .nest_service("/static", ServeDir::new("static"))
         .fallback(route_not_found)
         // Deny by default (S1b part 2): one gate in front of every route and

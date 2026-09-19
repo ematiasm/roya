@@ -1,0 +1,55 @@
+{# The roles list fragment, swapped by htmx (slice S4). Every row shows the
+   machine code, the Spanish name, the description, the protected flag and
+   how many users hold it (AC15's count; the refusal of a blocked deletion
+   names them). The protected role is presented as locked: its row button is
+   the read-only "Ver" and it never renders a delete form — the triggers
+   refuse the action, the interface never offers it, and the handlers refuse
+   it anyway. Mutations post to collection endpoints with the id in the body
+   (the wiring guard: htmx cannot interpolate a path segment from an input
+   value). The delete form carries no data-action: like activate/deactivate
+   on the users screen, the disappearance of the row is the feedback and the
+   refusals reach the notice box through the global htmx:responseError
+   handler. #}
+<div id="role-list-inner">
+  {% if roles.is_empty() %}
+    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No hay roles — usá «Nuevo rol» arriba.</div>
+  {% else %}
+    <div class="flex flex-col gap-1.5">
+      {% for r in roles %}
+      <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 hover:border-accent2">
+        <div class="min-w-0 flex-1">
+          <div class="truncate font-semibold text-text">
+            {{ r.role.name }}
+            {% if r.role.is_system %}
+            <span class="ml-1 rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-normal text-muted">protegido</span>
+            {% endif %}
+          </div>
+          <div class="truncate text-[13px] text-muted">
+            {{ r.role.code }}{% if r.role.description.is_some() %} · {{ r.role.description.as_ref().unwrap() }}{% endif %}
+          </div>
+        </div>
+        <span class="shrink-0 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] {% if r.holders.is_empty() %}text-muted{% else %}text-accent{% endif %}">
+          {% if r.holders.is_empty() %}sin usuarios{% else %}{{ r.holders.len() }} usuario{% if r.holders.len() > 1 %}s{% endif %}{% endif %}
+        </span>
+        <button type="button"
+                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                title="{% if r.role.is_system %}Ver rol protegido{% else %}Editar rol y permisos{% endif %}"
+                aria-label="{% if r.role.is_system %}Ver rol protegido{% else %}Editar rol y permisos{% endif %}"
+                hx-get="/web/roles/edit-form/{{ r.role.id }}"
+                hx-target="#role-edit-dialog-body"
+                hx-swap="innerHTML"
+                hx-on::after-request="if(event.detail.successful) document.getElementById('role-edit-dialog').showModal()">{% if r.role.is_system %}Ver{% else %}Editar{% endif %}</button>
+        {% if !r.role.is_system %}
+        <form hx-post="/web/roles/delete"
+              hx-target="#role-list"
+              hx-swap="innerHTML"
+              class="shrink-0">
+          <input type="hidden" name="role_id" value="{{ r.role.id }}" />
+          <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Eliminar</button>
+        </form>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>
