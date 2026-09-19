@@ -24,11 +24,8 @@ use crate::routes::AppState;
 
 /// The public allowlist: every entry carries the one-line reason it is public,
 /// and anything not listed requires a valid session — deny by default. A new
-/// entry needs the same argument written down here. The JSON session endpoints
-/// (`/api/sessions`) are deliberately NOT listed: they arrive with the S1b
-/// part 3 API slice, and until then refusing them anonymously is the correct
-/// default, not an omission.
-const PUBLIC_ROUTES: [(Method, &'static str, &'static str); 4] = [
+/// entry needs the same argument written down here.
+const PUBLIC_ROUTES: [(Method, &'static str, &'static str); 6] = [
     (
         Method::GET,
         "/login",
@@ -48,6 +45,16 @@ const PUBLIC_ROUTES: [(Method, &'static str, &'static str); 4] = [
         Method::GET,
         "/favicon.ico",
         "reserved for the favicon a browser requests on its own before any session exists; the route is public so that request never needs one (no file is shipped yet, which is deliberate)",
+    ),
+    (
+        Method::POST,
+        "/api/sessions",
+        "the JSON login (S1b part 3): a machine client earns its first session with credentials through the same IdentityService::login the web form uses; without a session there is nothing to protect yet",
+    ),
+    (
+        Method::DELETE,
+        "/api/sessions",
+        "the JSON logout (S1b part 3): revoking the session the cookie names must work without one, exactly like the web logout; an unknown or absent token is an idempotent 204",
     ),
 ];
 
@@ -112,6 +119,9 @@ pub async fn auth_middleware(
 /// `Origin` does not match the `Host` header. See `origin_host_matches` for
 /// what passes.
 fn is_unsafe(method: &Method) -> bool {
+    // PATCH is deliberately absent: no `patch(` route exists yet. Add it here in
+    // the same change that adds the first one, or that route would silently
+    // skip the origin check.
     matches!(method.as_str(), "POST" | "PUT" | "DELETE")
 }
 
@@ -300,6 +310,10 @@ mod tests {
             ("GET", "/static/htmx.min.js"),
             ("GET", "/static/tailwind.css"),
             ("GET", "/favicon.ico"),
+            // S1b part 3: the JSON session surface is public exactly on the
+            // two verbs that earn or revoke the first session.
+            ("POST", "/api/sessions"),
+            ("DELETE", "/api/sessions"),
         ] {
             assert!(
                 is_public(&method.parse().unwrap(), path),
@@ -311,11 +325,14 @@ mod tests {
         // But not a look-alike sibling or another verb.
         assert!(!is_public(&"GET".parse().unwrap(), "/staticx/evil"));
         assert!(!is_public(&"POST".parse().unwrap(), "/static/htmx.min.js"));
-        // Deny by default: everything else is refused.
+        // Deny by default: everything else is refused. `/api/sessions` is
+        // public only for POST (login) and DELETE (logout); a read verb on the
+        // same path is not on the allowlist and sessions are never enumerable.
         for (method, path) in [
             ("GET", "/"),
             ("GET", "/sales"),
-            ("DELETE", "/api/sessions"),
+            ("GET", "/api/sessions"),
+            ("PUT", "/api/sessions"),
             ("POST", "/logout"),
             ("GET", "/loginx"),
         ] {

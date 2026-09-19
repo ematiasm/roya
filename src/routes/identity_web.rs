@@ -37,10 +37,6 @@ use crate::security::guard::{current_session, local_next};
 struct LoginTemplate {
     next: String,
     error: Option<String>,
-    /// Only here because `base.html` includes the sidebar partial, whose
-    /// `nav_key` comparisons compile against every page struct. The login page
-    /// highlights nothing.
-    nav_key: &'static str,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,7 +73,6 @@ async fn login_page(
     let template = LoginTemplate {
         next: next_value(query.next.as_deref()),
         error: None,
-        nav_key: "login",
     };
     let html = render_login(template)?;
     Ok(Html(html).into_response())
@@ -112,7 +107,6 @@ async fn login_submit(
             let template = LoginTemplate {
                 next: next_value(form.next.as_deref()),
                 error: Some(message),
-                nav_key: "login",
             };
             let html = render_login(template)?;
             Ok((StatusCode::UNAUTHORIZED, Html(html)).into_response())
@@ -247,6 +241,37 @@ mod tests {
     }
 
     // -- the login page ---------------------------------------------------------
+
+    /// S1b part 3a: the login page renders without the app shell. An anonymous
+    /// visitor on the login card must not see the whole navigation or a logout
+    /// button, while a page served behind a session still carries both.
+    #[tokio::test]
+    async fn the_login_page_renders_no_sidebar_and_a_signed_in_page_keeps_it() {
+        let (app, _state) = test_app().await;
+        let login = send(&app, "GET", "/login", &[], "").await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let html = body_string(login).await;
+        assert!(
+            !html.contains("action=\"/logout\""),
+            "the login page must not render the logout form: {html}"
+        );
+        assert!(
+            !html.contains("data-nav="),
+            "the login page must not render a navigation item: {html}"
+        );
+        // The shell the login dropped is still everywhere else.
+        let home = send(&app, "GET", "/", &[("cookie", test_support::TEST_COOKIE)], "").await;
+        assert_eq!(home.status(), StatusCode::OK);
+        let html = body_string(home).await;
+        assert!(
+            html.contains("action=\"/logout\""),
+            "an authenticated page must still render the logout form"
+        );
+        assert!(
+            html.contains("data-nav="),
+            "an authenticated page must still render navigation"
+        );
+    }
 
     #[tokio::test]
     async fn login_page_renders_the_form_anonymously() {

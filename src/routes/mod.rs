@@ -1,6 +1,7 @@
 pub mod api;
 pub mod customers_api;
 pub mod customers_web;
+pub mod identity_api;
 pub mod identity_web;
 pub mod inventory_api;
 pub mod inventory_web;
@@ -256,6 +257,7 @@ pub fn router(state: AppState) -> Router {
         .merge(api::router())
         .merge(web::router())
         .merge(identity_web::router())
+        .merge(identity_api::router())
         .merge(customers_api::router())
         .merge(customers_web::router())
         .merge(inventory_api::router())

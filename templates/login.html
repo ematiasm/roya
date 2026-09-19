@@ -7,6 +7,9 @@
    session cookie and redirects. #}
 {% extends "base.html" %}
 {% block title %}Iniciar sesión — Roya{% endblock %}
+{# No navigation shell: the login card renders without the sidebar (and its
+   logout button), which belongs only to pages behind a session. #}
+{% block sidebar %}{% endblock %}
 {% block content %}
 <div class="flex min-h-[60vh] items-center justify-center">
   <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6">
