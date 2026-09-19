@@ -89,7 +89,7 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
 - [ ] S2 — Núcleo RBAC: catálogo, guardas, `Require<P>` (T9–T12)
 - [x] S3 — Administración de usuarios + cambio de contraseña obligatorio (T13–T15; AC21 de la
       superficie de usuarios queda para S7, ver S3 part 2 en Progreso)
-- [ ] S4 — Administración de roles y matriz de permisos (T16–T17)
+- [x] S4 — Administración de roles y matriz de permisos (T16–T17)
 - [ ] S5 — Enforcement: finanzas e inventario (T18–T19)
 - [ ] S6 — Enforcement: ventas y clientes (T20–T21)
 - [ ] S7 — Enforcement: compras, proveedores, identidad y dashboard (T22–T23)
@@ -334,13 +334,131 @@ coherente (identidad + autorización) y Fase B puede esperar.
   honesty»: qué puede hacerle cada tier a otra cuenta, y que un permiso con consecuencia no escrita
   es uno que un operador no puede otorgar a sabiendas).
 
+### S4 — la administración de roles y la matriz (T16–T17)
+- Branch `feat/roles-administration` desde `main` actualizado. Consumidora de la superficie dormida
+  de S2/S3: `role_repo::delete` (con sus dos conflictos ya mapeados), `permission_repo::{list,
+  set_role_permissions, map_db_err}`, `Role.description` y la estructura `Permission`.
+  - **Pantalla** (`roles_web.rs` + `templates/roles.html` + `partials/role_list.html`,
+    `partials/role_edit_form.html`), patrón users exacto: página + fragmento de lista + `<dialog>`
+    de creación + segundo `<dialog>` que carga por fragmento id-final
+    (`/web/roles/edit-form/{id}`) el formulario de detalles Y la matriz. Eventos `HX-Trigger`
+    (`role-created`/`role-changed`), `data-action` para el notice («Create role», «Edit role»,
+    «Edit permissions»), ids en el body, `#[serde(default)]`. El form de matriz repite la clave
+    `permission_ids`, así que ese handler lee el body crudo con su propio límite de 64 KiB y
+    responde `413` en español — mismo patrón que el form de roles de la pantalla de usuarios.
+  - **Service**: `list_roles_with_holders` (los holders de CUALQUIER estado: el FK RESTRICT no
+    distingue activos de inactivos), `create_role` (forma del código `^[a-z][a-z0-9_]*$` 2-64,
+    unicidad pre-chequeada, nombre 1-128, descripción opcional ≤ 256), `update_role` (sólo nombre
+    y descripción — el código no es campo editable en NINGÚN rol: un nombre máquina no es una
+    etiqueta, y así el rechazo de renombrado del rol protegido es inalcanzable por construcción
+    desde la interfaz), `delete_role` (rechaza el rol protegido y, si usuarios lo sostienen,
+    NOMBRA a los usuarios que bloquean), `role_matrix` (el catálogo completo de 23 con los ids
+    sostenidos) y `set_role_matrix` (deduplica y resuelve el conjunto en UNA statement
+    — `find_by_ids` nuevo de permission_repo, fijado por un double contando, el mismo patrón de
+    `assign_roles` — y rechaza la edición de la matriz del rol protegido).
+  - **La regla nueva que cierra el hueco real**: rechazar una edición de matriz que le Quite
+    `identity.roles.manage` a un rol que el principal ACTUANTE sostiene. Sin ella, un holder de
+    roles.manage se quitaba su propio tier por la matriz y quedaba — junto con todos los que
+    comparten el rol — afuera de la administración en el request siguiente: la misma clase de
+    lockout que la pantalla de usuarios ya rechaza para los conjuntos de roles. La casilla viene
+    pretildada, así que la interfaz nunca ofrece la quitada; el rechazo es real igual.
+  - **Gating**: toda la superficie — lecturas incluidas — declara `Require<IdentityRolesManage>`.
+    Decisión deliberada escrita en la spec: el catálogo no tiene `identity.roles.read`, y
+    inventar un código exige migración; el costo queda dicho: un operador que sólo puede MIRAR
+    roles necesita sostener el permiso de administración. Cada mutación repite el chequeo de tier
+    en el servicio, como `assign_roles`.
+  - **Los dos trigger mappings pendientes de la bitácora, cerrados**: el rechazo de renombrado
+    (`protected role code cannot change`) ahora mapea en `role_repo::map_db_err` a su conflicto
+    español («No se puede cambiar el código de un rol protegido: su nombre máquina está fijado al
+    sembrar.»), y el rechazo de matriz (`protected role permissions cannot be removed`) pasó de su
+    texto inglés crudo en `permission_repo::map_db_err` a su conflicto español («No se puede quitar
+    permisos a un rol protegido…»). También los CHECK de schema de `roles` (forma del código,
+    nombre, descripción) pasaron a español, y el UNIQUE del código es un 409 español de respaldo.
+  - **El rol protegido, presentado como bloqueado**: sin botón de baja (la fila ofrece «Ver»), el
+    diálogo muestra su matriz sin casillas y sin submit, con la nota de por qué; los handlers
+    rechazan igual, con el motivo en español. Su nombre y descripción siguen editables (los
+    triggers bloquean el código, no la etiqueta).
+  - **Sidebar**: entrada «Roles» (`nav_key = "roles"`) en el grupo Account, icono heroicons
+    shield-check, clases existentes — sin recompilar CSS. Su ocultamiento por permiso (AC21) queda
+    para S7, como `/users`.
+- Tests: +15 (13 de ruta, 2 de servicio). Los de ruta cubren AC17 (tilde de
+  `identity.users.read` sobre el rol del propio actor → `GET /users` 403 → 200 → 403 sin restart;
+  la quitada legítima mantiene el tier), AC13 (matriz y baja del rol protegido rechazadas con el
+  motivo en español y nada escrito; diálogo de sólo lectura; sin Eliminar; sin campo de código),
+  AC15 (la baja de un rol sostenido rechazada nombrando a los usuarios), el self-lockout de
+  matriz (403, nada escrito, y la misma quitada sobre un rol que el actor NO sostiene sucede), el
+  principal sin `roles.manage` rechazado en la página (403 HTML) y en cada mutación (403 JSON con
+  el código), las idas y vueltas de creación/edición con el conflicto de código duplicado, las
+  formas malformadas, el body sobredimensionado en 413, el `role_id` duplicado rechazado, el
+  conjunto presente-vacío como conjunto vacío y el reemplazo del conjunto completo. Los de
+  servicio cubren los mismos rechazos en español antes de toda escritura.
+- Números: `cargo test` 526 → **541 passed / 0 failed** (+15); `cargo check --all-targets`
+  **0 errores, 60 → 56 warnings** (ledger re-medido en tasks.md; los dos dormidos restantes de
+  role_repo — `count_active_holders` y `revoke` — no tienen consumidor natural en esta pantalla:
+  la baja bloquea por el conjunto TOTAL y el otorgamiento vive en la pantalla de usuarios);
+  grep de allows vacío; `scripts/e2e.sh -k identity` 4 passed.
+- Sonda en vivo con el binario real (base descartable, `ROYA_ADMIN_PASSWORD` seteada):
+  `GET /roles` 200; crear `supervisor` 200 + `HX-Trigger: role-created`; crear usuario y
+  asignarle el rol; `GET /users` como ese usuario 403; tilde de `identity.users.read` por la
+  matriz 200; el request siguiente del mismo usuario `GET /users` **200** sin restart; baja de
+  `vendedor` sostenido → 409 «No se puede eliminar el rol «vendedor»: lo sostienen probesup.
+  Primero quitáselo a los usuarios que lo sostienen.»; edición de matriz del rol protegido →
+  409 «No se puede editar la matriz de un rol protegido: sostiene la administración de la
+  instancia.»; baja del rol protegido → 409; self-lockout de matriz (el holder quitándole
+  `identity.roles.manage` a su propio rol) → 403 «No podés quitar «identity.roles.manage» de un
+  rol que vos sostenés: te dejaría sin acceso a la administración de roles.»; un principal sin
+  `roles.manage`: `GET /roles` 403 HTML («Acción no permitida») y `POST /web/roles/matrix` 403
+  JSON con el extractor («Se necesita el permiso «identity.roles.manage»…»). Basura de la sonda
+  eliminada.
+- **No alcanzado (frontera exacta): nada** — la slice completa entró: pantalla, matriz, reglas,
+  gating, sidebar, los dos trigger mappings y los tests. Quedan, por diseño de otras slices:
+  el ocultamiento del sidebar (S7), el e2e de navegador de esta pantalla (S8), y el test
+  AC11/AC17 de mutación (revertir el chequeo del self-lockout rompe su test — verificado por el
+  doble contando y el caso espejo del rol no sostenido).
+
+### S4 — ronda de corrección (re-verificación: COMMIT WITH NOTED RISK, 2026-09-22)
+Un hallazgo de documentación (la misma clase que ya mordió dos veces) y tres afirmaciones sin test
+que las respaldara. Texto + tests; ningún cambio de comportamiento.
+
+1. **MAJOR (documentación): la spec prometía cerrar la auto-escalada y no lo hace.** La regla de
+   no-cambio-de-rol-propio cierra el camino DIRECTO; la matriz reabre el indirecto (un holder de
+   `identity.roles.manage` tilda `identity.users.manage` sobre un rol que ocupa, recibe 200, y el
+   par queda vivo en el request siguiente — AC17 codifica el auto-otorgamiento como intencional).
+   El código está bien y el texto estaba mal: la oración se re-scopó al cambio del PROPIO conjunto
+   de roles, y «Cross-account honesty» enuncia la consecuencia en palabras del operador, sin
+   suavizar — con el permiso, el holder puede sumar CUALQUIER permiso a un rol que ocupa, con ese
+   par puede restablecer la contraseña de un holder protegido, y lo que entrega es la instancia
+   entera, no solamente la decisión de quién administra. Releído el resto del bloque: ninguna otra
+   afirmación queda contradicha por el camino de la matriz.
+2. **MINOR: el rechazo de matriz protegida a nivel de servicio no estaba fijado por test.**
+   Desactivar el chequeo `is_system` de `set_role_matrix` deja verde
+   `ac13_..._locked_through_the_screen` (el trigger + su mapping lo satisfacen). **El guard se
+   queda** — no es un duplicado del backstop: el trigger sólo bloquea la MITAD de quitada del
+   reemplazo, mientras el servicio rechaza la clase entera de edición antes de que nada llegue a
+   la base, con su propio mensaje (la oración que AC13 fija en pantalla) y su propia precedencia
+   (rechaza antes de que la validación de forma conteste por un id inexistente). Test nuevo a
+   nivel de servicio contra conjunto vacío, id real e id inexistente; mutación probada (guard
+   desactivado → el test nuevo falla, el de pantalla sigue verde).
+3. **MINOR: «un holder desactivado es nombrado» estaba afirmado sin test.** `holder_names` no
+   filtra `is_active` a propósito; test nuevo en `role_repo` fija el conjunto TOTAL (el holder
+   desactivado también se nombra) y la baja que sigue rechazada; mutación probada (agregar el
+   filtro `is_active = 1` → el test falla).
+4. **NIT: la gate con principal sólo-`users.manage` no tenía test.** Las gates se probaban con un
+   principal sin permisos, que no distingue «sin permisos» de «los permisos equivocados». Test
+   nuevo de ruta: un principal con `identity.users.read` + `identity.users.manage` pero sin
+   `identity.roles.manage` recibe el rechazo en la página (403 HTML nombrando la gate) y en la
+   mutación de matriz (403 JSON), llega a `/users` (prueba del fixture) y no escribe nada;
+   mutación probada (gate de página cambiada a `IdentityUsersManage` → el test nuevo falla).
+- Números: `cargo test` 541 → **544 passed / 0 failed** (+3); `cargo check --all-targets` **0
+  errores, 56 warnings** (sin cambio); grep de allows **vacío**.
+
 ## Next step
-S4: la administración de roles (T16–T17) — la pantalla de roles, la creación/edición/baja y la matriz
-de permisos. `RoleRepository::delete` y sus dos mensajes de rechazo ya existen de S3 part 2; le falta
-la pantalla y su gating (`identity.roles.manage`), y consumir los dormidos restantes de su lista
-(`count_active_holders`, `revoke`, `delete`, `Permission`/`row_to_permission`/`map_db_err` de
-`permission_repo`, y los campos de auditoría de `Role`). La deuda explícita de navegador sigue: la
-navegación de `HX-Redirect` sin probarse en navegador (S8).
+S5: enforcement de finanzas e inventario (T18–T19) — `Require<P>` por acción en las rutas de ambos
+departamentos, nav gating y el fragmento 403 para HTMX. La pantalla de roles y su matriz están
+entregadas; los dormidos que restan de la lista de S4 (`count_active_holders`, `revoke`,
+`Role.{created_at, updated_at}`, `Permission.{action, created_at}`) no tienen consumidor natural en
+esta pantalla y quedan anotados en el ledger para el re-measure de S7. La deuda explícita de
+navegador sigue: la navegación de `HX-Redirect` sin probarse en navegador (S8).
 
 ### S2 — núcleo RBAC (T9–T12)
 - Migración `create_identity_rbac`: 23 permisos con inserts guardados, `admin` protegido con el catálogo

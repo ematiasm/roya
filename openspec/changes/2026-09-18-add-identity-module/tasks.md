@@ -232,8 +232,95 @@ reads), and S7's closing check re-runs `cargo check --all-targets`.
       shipped visible and the route is what refuses.)
 
 ### S4 — roles administration
-- [ ] T16: `/roles` list, create, edit, delete, and the permission matrix per module and action.
-- [ ] T17: tests for AC17, AC13 (through the interface), AC15.
+- [x] T16: `/roles` list, create, edit, delete, and the permission matrix per module and action.
+      (Done by S4, 2026-09-22: the screen is `routes/roles_web.rs` + `templates/roles.html` and
+      two partials, on the users-screen pattern — create `<dialog>`, id-final edit fragment
+      carrying the details form AND the matrix, `HX-Trigger` events `role-created`/`role-changed`,
+      collection endpoints with the id in the body, and the raw-body parse pattern with its own
+      64 KiB limit for the matrix form whose checkboxes repeat `permission_ids`. Service rules:
+      `list_roles_with_holders` (holders of any state: the RESTRICT FK does not distinguish),
+      `create_role` (code shape and uniqueness, name, optional description ≤ 256), `update_role`
+      (name/description only — the code is never an editable field), `delete_role` (refuses a held
+      role NAMING the blocking users, refuses the protected role), `role_matrix` (the 23-row
+      catalog with the held ids), `set_role_matrix` (deduplicates and resolves the submitted set
+      in ONE `find_by_ids` statement — pinned by a counting double — refuses the protected role's
+      matrix, and refuses the NEW self-lockout rule: an edit removing `identity.roles.manage` from
+      a role the acting principal holds). Every mutation repeats the `identity.roles.manage` tier
+      check in the service, as `assign_roles` does. Gating: every surface — reads included —
+      declares `Require<IdentityRolesManage>` (deliberate, no `identity.roles.read` exists and a
+      new code would need a migration; the cost is written into the spec). The sidebar gains the
+      Roles entry. The two trigger mappings the ledger left pending are closed: the protected
+      rename (`protected role code cannot change`) and the protected matrix removal
+      (`protected role permissions cannot be removed`) map to their own Spanish conflicts in the
+      repositories, plus the schema CHECK refusals for the role's fields.)
+- [x] T17: tests for AC17, AC13 (through the interface), AC15.
+      (Done by S4: AC17 — a matrix edit through the screen applies to the next request, proven
+      both ways by ticking `identity.users.read` onto the actor's role and watching `GET /users`
+      go 403 → 200 → 403 without a restart; AC13 — the protected role's matrix edit and delete
+      refused with the Spanish reason and nothing written, the dialog rendering read-only, no
+      delete offered, no code field for any role; AC15 — the held role's deletion refused naming
+      the blocking users; plus the self-lockout refusal, the under-permissioned principal refused
+      on the page and on every mutation in the right shape with nothing written, the create/edit
+      round trips with the duplicate-code conflict, the malformed-code and malformed-id refusals,
+      the oversized matrix body answering 413 in the app shape, the duplicated `role_id` refused,
+      and the whole-set replacement semantics. Service level: the Spanish refusals before any
+      write and the counting double pinning the one-statement resolution.)
+
+#### S4 correction round (2026-09-22 — verification: COMMIT WITH NOTED RISK, one documentation
+finding + three claims with no test behind them; text plus tests, no behaviour change)
+1. **MAJOR (documentation): the spec overclaimed the self-escalation closure.** The no-self-role
+   change sentence claimed one rule closes "self-escalation and the self-lockout alike", but it
+   only closes the DIRECT path; the matrix reopens the indirect one (a roles-manage holder ticks
+   `identity.users.manage` onto a role it holds, gets `200`, and holds the pair on the next
+   request — AC17 codifies self-granting as intended). Code right, text wrong: the sentence is
+   rescoped to changing your own role set directly, and Cross-account honesty now states the
+   consequence plainly, in the operator's words — with `identity.roles.manage` the holder can add
+   ANY permission to a role it occupies, the pair can reset a protected holder's password, and the
+   permission hands over the instance, not merely the decision of who administers. The rest of the
+   block re-read: no other claim is contradicted by the matrix path.
+2. **MINOR: the service-level protected-matrix refusal was not test-pinned** — disabling the
+   `is_system` check in `set_role_matrix` left `ac13_..._locked_through_the_screen` green (the
+   SQLite trigger plus its mapping satisfy it). The guard STAYS — it is not a duplicate of the
+   backstop: the trigger only blocks the REMOVAL half of the replacement, while the service
+   refuses the whole edit class before any statement reaches the database, with its own message
+   (the sentence AC13 pins on the screen) and its own error precedence (it refuses before the
+   form validation could answer a missing permission id). New service test pins the service's own
+   conflict against the empty set, a real id, and a non-existent id; mutation-validated (guard
+   disabled → the new test fails, the screen test stays green).
+3. **MINOR: "a deactivated holder is named" was claimed and untested.** `holder_names` has no
+   `is_active` filter on purpose; a repository test now pins the TOTAL set (a deactivated holder
+   is named too) and the still-refused deletion; mutation-validated (adding the
+   `is_active = 1` filter → the test fails).
+4. **NIT: the `users.manage`-only gate case was untested** — the gate tests used an
+   empty-permission principal, which cannot separate "no permission" from "the wrong permission".
+   New route test: a principal holding `identity.users.read` + `identity.users.manage` but not
+   `identity.roles.manage` is refused the roles page (403 HTML naming the gate) and the matrix
+   mutation (403 JSON naming the gate), reaches `/users` (fixture proof), and writes nothing;
+   mutation-validated (page gate swapped to `IdentityUsersManage` → the new test fails).
+- Numbers: `cargo test` 541 → **544 passed / 0 failed** (+3 tests, no behaviour change);
+  `cargo check --all-targets` **0 errors, 56 warnings** (unchanged); allows grep empty.
+
+#### S4 warning ledger re-measure (2026-09-22)
+`cargo check --all-targets` **60 → 56 warnings**, no `#[allow]` attributes; the grep stays empty.
+Graduated items (made reachable by the roles screen and its service/repo writes):
+
+| Graduated item | Consumed by S4 |
+| --- | --- |
+| `permission_repo::{list, set_role_permissions, row_to_permission, map_db_err}` | the matrix read (`role_matrix`) and its replacement (`set_role_permissions`, refusals mapped) |
+| `Permission` model struct (as a constructed, read value) | the matrix rows; residue: fields `action`/`created_at` are still never read (the matrix renders code + description) |
+| `role_repo::delete` | the delete flow through the service (the mapped refusals the S3 round shipped are now screen-backed) |
+| `Role.description` | the list rows and the edit dialog |
+
+New surface written and consumed at birth (no new warnings): `role_repo::{create,
+update_details, holder_names}`, `permission_repo::find_by_ids`, the service methods
+(`list_roles_with_holders`, `create_role`, `update_role`, `delete_role`, `role_matrix`,
+`set_role_matrix`), the models (`NewRole`, `RoleWithHolders`, `RoleMatrix`) and the routes with
+their templates. Still dormant for their slices: `role_repo::{count_active_holders, revoke}`
+(S4's deletion blocks on ALL holders — the total set via `holder_names` — and grant/revocation
+lives on the users screen, so their natural consumer is a future holder-view flow; noted for
+S7's re-measure), `Role.{created_at, updated_at}`, `Permission.{action, created_at}` and
+`Principal.{username, display_name, must_change_password}` (S5-S7). The count must still be
+back at or below 58 by the end of S7, with no `#[allow]` attributes as the mechanism.
 
 ### S5 — enforcement: finance and inventory
 - [ ] T18: `Require<P>` per action on every route of both departaments, nav gating, 403 fragment for HTMX.
