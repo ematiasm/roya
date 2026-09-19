@@ -52,8 +52,17 @@ declared where the action is: `Require<SalesCreate>` in a handler's argument lis
    rebuild that enforces `NOT NULL` on `created_by` while preserving rows (the pattern already used by
    `add_sales_customer`).
 
-Sessions are pruned opportunistically (expired or long-revoked rows) rather than by a background task:
+Sessions are pruned opportunistically (rows that are expired or revoked, immediately — there is no
+retention window and none is needed, because revocation is permanent) rather than by a background task:
 there is no scheduler in this application, and a session table that only grows is a slow leak.
+
+**Timestamps have exactly one encoding.** The migrations' `DEFAULT`s write
+`strftime('%Y-%m-%dT%H:%M:%fZ','now')`, and chrono's `Display` writes a different shape for the same
+instant, so every timestamp Rust binds or writes goes through the single encoder in `src/db.rs`
+(`%Y-%m-%dT%H:%M:%S%.3fZ`). Independent verification of S1a found the mixed encoding the hard way: the
+text comparison `revoked_at <= ?` never matched a row revoked the same day, so `prune` silently kept
+revoked sessions until the next calendar day. Any future `WHERE <database-written column> <op> ?` —
+including the Phase B audit columns — inherits this rule, and AC25 keeps it honest.
 
 ## Key decisions and tradeoffs
 | Option | Chosen | Why / cost |
@@ -79,7 +88,8 @@ there is no scheduler in this application, and a session table that only grows i
 ## Session and cookie model
 - Cookie `roya_session`, `HttpOnly`, `SameSite=Lax`, `Path=/`, `Max-Age` = absolute TTL; `Secure` added
   when `ROYA_COOKIE_SECURE=1` (documented as required when the app is served over HTTPS).
-- Token: 32 random bytes, base64url in the cookie; `sha256` hex in `sessions.token_hash`.
+- Token: 32 random bytes, base64url in the cookie; the sha256 digest, base64url-encoded, in
+  `sessions.token_hash`.
 - Absolute TTL `ROYA_SESSION_TTL_HOURS` (default 12) and sliding renewal: when `last_seen_at` is older
   than 30 minutes, a request extends `expires_at` to `now + TTL` in the same statement that updates
   `last_seen_at`. Idle time is therefore also bounded by the TTL, and the renewal is one UPDATE.
