@@ -196,6 +196,61 @@ líneas (2,313 nuevas + 201 modificadas). Cada slice supera el presupuesto de 40
 que los PRs encadenados son la regla y no una preferencia. Corte natural: Fase A entrega un producto
 coherente (identidad + autorización) y Fase B puede esperar.
 
+### S3 part 1 — el cambio de contraseña obligatorio (T14)
+- Branch `feat/identity-password-change` desde `main` limpio (`5067def`). El flag `must_change_password`
+  ya no es decorativo:
+  - **El confinamiento vive en el middleware** (`guard.rs`), después de la resolución de sesión y antes
+    de la lectura de permisos (el confinamiento no es una pregunta de permisos: rige para todo principal).
+    Mismas tres formas que el portón, apuntadas a `/password`: página completa `303`, `/api/*` `403` JSON
+    con motivo («Se requiere cambiar la contraseña antes de continuar»), `HX-Request` `403` +
+    `HX-Redirect: /password`. Sigue alcanzable mientras el flag está puesto: `/password` (GET/POST),
+    ambos logouts y la allowlist pública; el origin check y el deny-by-default quedan aguas arriba.
+  - **El servicio es la capa que tiene la regla**: `IdentityService::change_password_keep_only_session`
+    compone `change_password` (verificar actual, validar la nueva con `MIN_PASSWORD_LEN`, distinta;
+    actualizar el hash; limpiar el flag) con la revocación de todas las demás sesiones del usuario:
+    `SessionRepository::revoke_all_for_user_except(user_id, keep_token_hash)`, un solo UPDATE con
+    `AND token_hash != ? AND revoked_at IS NULL` y el `revoked_at` sellado por el strftime propio de la
+    base — sin delete, sin re-insert, sin prune, sin ventana en la que la cookie actuante no nombre
+    fila, sin ningún timestamp bindeado por Rust cruzando el borde, y con la fila actuante conservando
+    id y expiración (lo que la Fase B va a leer del historial de sesiones). Idempotente como `revoke`:
+    la segunda llamada matchea cero filas.
+    [Corrección de la primera pasada] La primera implementación expresó "dejar viva esta sesión" con
+    revocar-todo → prune → re-insert del mismo digest, porque `session_repo.rs` no estaba en las
+    superficies autorizadas del brief. Tenía tres defectos reales en una ruta de seguridad: ventana de
+    cero sesiones entre revoke y re-insert, dependencia de la comparación Rust-bindeado vs.
+    DB-escrito que produjo el bug F3 (un reloj inyectado desincronizado convertía el cambio de
+    contraseña en un cierre de sesión), y una fila de sesión con identidad cambiada sin motivo. Con
+    `session_repo.rs` autorizado en la ronda de corrección, el re-seat se eliminó por completo y el
+    método del repo quedó como la única expresión del "salvo esta". `revoke_all_for_user` (todo-o-nada)
+    queda para la desactivación (S3 part 2) y S4.
+  - `GET/POST /password` en `identity_web.rs`: tarjeta en el idioma de login/forbidden (español, notice
+    de peligro), campos actual/nueva/confirmación. La confirmación es del formulario; las reglas de
+    credencial son del servicio (sus mensajes de validación pasaron a español — hasta ahora dormidos,
+    nunca visibles para el operador). Contraseña actual incorrecta: 401 con «La contraseña actual no es
+    correcta» y nada escrito (el servicio verifica antes del primer write). La confirmación que no
+    coincide, la corta y la igual a la actual: 400 con su motivo y nada cambiado.
+  - **Sidebar**: grupo «Account» con la entrada `password` (icono candado heroicons, solo clases
+    existentes — no hizo falta recompilar `static/tailwind.css`); la página marca `nav_key = "password"`.
+  - **El placeholder de S1b se invirtió, no se borró**: `must_change_password_does_not_confine_the_session_yet`
+    → `must_change_password_confines_the_session_to_the_password_change`, mismo fixture
+    (`seed_flagged_session`), aserción al revés (303 a `/password` + la página responde 200).
+  - Tests nuevos: 15 (5 del confinamiento en `guard.rs`, 2 del servicio sobre el `FakeClock`
+    compartido, 6 de la ruta, 2 del método nuevo en `session_repo`). Los de servicio vuelven al
+    `FakeClock` una vez eliminado el re-seat: con el método `_except` ningún timestamp bindeado
+    compara contra `revoked_at` escritos por la base, así que la determinismia del reloj inyectado
+    vale de nuevo en toda la suite.
+- Números (ronda de corrección, re-seat reemplazado por `_except`): `cargo test` 481 → **496 passed /
+  0 failed** (+15 sobre la base de 481); `cargo check --all-targets` 0 errores, **66 warnings** (68 en
+  la base − 4 graduados por S3 part 1 + 2 que vuelven a dormirse con el re-seat eliminado:
+  `revoke_all_for_user` del repo y `revoke_all_sessions` del servicio, esperando desactivación y S4);
+  grep de allows vacío; `scripts/e2e.sh -k identity` 4 passed.
+- Sonda en vivo con el binario real (ronda de corrección): sin `ROYA_ADMIN_PASSWORD`, dos logins del
+  admin marcado — actuante `GET /` 303 a `/password`, `GET /password` 200, la otra sesión `GET /` 303 a
+  `/password` (viva y confinada), `POST /password` 303 a `/`, actuante `GET /` 200, y la otra sesión
+  `GET /` **303 a `/login?next=%2F`** (muerta, sobre HTTP real); con `ROYA_ADMIN_PASSWORD` seteada —
+  `GET /` inmediatamente tras login 200 sin confinamiento. Ronda anterior: `GET /api/accounts` marcado
+  403 JSON con motivo y `HX-Request` 403 + `HX-Redirect: /password`.
+
 ## Next step
 S1b-iii: la API JSON de sesiones (`POST`/`DELETE /api/sessions` + su entrada en la allowlist), el shell propio
 para la página de login (hoy el visitante anónimo ve la navegación y el botón de logout), los seis env vars en

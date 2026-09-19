@@ -90,7 +90,7 @@ Chromium against the real binary with a decoy server that received no request at
       catalog-drift test.
 - [ ] T12: tests for AC10-AC12, AC19 (partial: the identity side), AC20.
 
-#### S2 warning ledger (recorded 2026-09-19; updated in the guard-hardening correction round)
+#### S2 warning ledger (recorded 2026-09-19; updated in the guard-hardening correction round; consumed by S3 part 1 on 2026-09-20)
 `cargo check --all-targets` measured **58 warnings on `main`** and **68 after S2** (unchanged by the
 guard-hardening round: its triggers and tests replace one another one for one, and the bootstrap wiring
 made `role_repo::count_active_protected_holders` reachable, moving it out of this list while `revoke`
@@ -113,13 +113,29 @@ dormant by design, exercised by tests, awaiting its consuming slice):
 | `permission_repo::map_db_err` | `src/repositories/permission_repo.rs:24` | S4 (matrix editor refusals) |
 | `permission_repo::{list, codes_for_role, set_role_permissions}` | `src/repositories/permission_repo.rs:40` | S4 (matrix editor) |
 | `role_repo::{find_by_id, list, list_for_user, count_active_holders, revoke, replace_user_roles}` | `src/repositories/role_repo.rs:54` | S3 (assignment form, deactivation), S4 (roles admin) |
-| `user_repo::{find_by_username, find_with_hash_by_id}` | `src/repositories/user_repo.rs:67` | S3 (users admin) |
-| `MIN_PASSWORD_LEN` | `src/services/identity.rs:38` | S3 (password-change validation) |
-| `IdentityService::{change_password, revoke_all_sessions}` | `src/services/identity.rs:539` | S3 (password change) |
+| `user_repo::find_by_username` | `src/repositories/user_repo.rs:67` | S3 (users admin) |
+| ~~`user_repo::find_with_hash_by_id`~~ | ~~`src/repositories/user_repo.rs:67`~~ | **consumed by S3 part 1** (`change_password` reads the stored hash; the method left the dormant list) |
+| ~~`MIN_PASSWORD_LEN`~~ | ~~`src/services/identity.rs:38`~~ | **consumed by S3 part 1** (the change form validates through it) |
+| ~~`IdentityService::{change_password, revoke_all_sessions}`~~ | ~~`src/services/identity.rs:539`~~ | **consumed by S3 part 1** (the `/password` flow composes them) |
 
 (`src/routes/mod.rs:122`/`:128` — `enforce_credit_limit`, `AppState::new`/
 `new_with_credit_limit` — and the finance/products/service items are pre-existing
 `main` dead code, not S2 debt.)
+
+**S3 part 1 re-measure (2026-09-20, corrected round):** the first pass measured **68 → 64**;
+the correction replaced the revoke-all → prune → re-seat workaround with
+`SessionRepository::revoke_all_for_user_except` (one statement, the acting session keeps its id
+and expiry), which moved the count to **66**: the four S3 graduations stay
+(`change_password` + `MIN_PASSWORD_LEN` + `find_with_hash_by_id` − the re-seat had also made
+`revoke_all_for_user`/`revoke_all_sessions` reachable), and the all-or-nothing form returns to
+this list awaiting deactivation (S3 part 2) and S4:
+
+| Re-dormant item | Location | Consumed by |
+| --- | --- | --- |
+| `revoke_all_for_user` | `src/repositories/session_repo.rs:87` | S3 part 2 (deactivation), S4 |
+| `revoke_all_sessions` | `src/services/identity.rs:603` | S3 part 2 (deactivation) |
+
+No `#[allow]` attributes were added; the grep above stays empty.
 
 **Requirement:** the count must be back at or below 58 by the end of S7, with **no
 `#[allow(dead_code)]` / `#[allow(unused_imports)]` attributes as the mechanism**: each
@@ -130,7 +146,17 @@ reads), and S7's closing check re-runs `cargo check --all-targets`.
 ### S3 — users administration
 - [ ] T13: `/users` list with roles and state, create, deactivate/activate, admin password reset, role
       assignment with `granted_by`, and the interface explanation of every trigger refusal.
-- [ ] T14: `GET`/`POST /password` and the `must_change_password` gate in the middleware.
+- [x] T14: `GET`/`POST /password` and the `must_change_password` gate in the middleware.
+      (Done by S3 part 1, 2026-09-20, corrected round: the confinement lives in the middleware after
+      the session resolution — a full-page request answers `303` to `/password`, `/api/*` a `403` JSON
+      reason, an `HX-Request` the refusal with `HX-Redirect: /password`; `/password` (GET/POST), both
+      logout endpoints and the public allowlist stay reachable. `POST /password` verifies the current
+      password, validates the new one (≥ 12 chars, different, confirmed), updates the hash, clears
+      the flag and revokes every other session of the user keeping the acting one, expressed by
+      `SessionRepository::revoke_all_for_user_except(user_id, keep_token_hash)` — one UPDATE, no
+      window, no re-seat (the first pass's revoke-all → prune → re-insert workaround was removed in
+      the correction round). The sidebar gains the password entry; T13's `/users` administration and
+      the AC13/AC15 part of T15 are still open.)
 - [ ] T15: tests for AC13-AC16, AC21 (users surface).
 
 ### S4 — roles administration
