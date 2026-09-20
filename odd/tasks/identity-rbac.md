@@ -105,6 +105,9 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
   - [x] T28 (S11) — ventas/clientes: migración 32 + plomería del actor + display + tests AC18–AC19
         (2026-09-20, ver S11 en Progreso; la tabla `customers`, que la lista original nunca asignó,
         aterrizó aquí con el departamento que la posee, y `sale_lines` hereda el actor de su venta)
+  - [x] T29 (S12) — compras/proveedores: migración 33 + plomería del actor + display + tests AC18–AC19
+        (2026-09-20, ver S12 en Progreso; `purchase_lines` hereda el actor de su compra, y un
+        cambio de línea estampa `updated_by` del borrador)
 
 ## Progress
 - 2026-09-18: reconocimiento del repo (sin auth, convención de departamentos, invariantes),
@@ -1363,3 +1366,95 @@ Admin • Actualizado por Admin", estado de cuenta renderizando "Cliente registr
 `sale_payments` y `customer_receipts` con `created_by = admin`; base de la sonda termina con
 `PRAGMA foreign_key_check` vacío y exactamente un centinela.
 
+
+## Progreso S12 (T29, cuarto slice de Fase B) — 2026-09-20
+
+Rama `feat/audit-purchases-suppliers`, creada desde `main` con S9, S10 y S11 entregados. Writer
+delegado; el patrón de S9–S11 se copió sin inventar un cuarto patrón.
+
+**Entregado:** `migrations/20240101000033_add_audit_purchases_suppliers.sql` — rebuild controlado
+(marcador `-- no-transaction`, `PRAGMA foreign_keys = OFF/ON`, centinela condicional, backfill por
+`INSERT ... SELECT`) de `suppliers`, `product_supplier_costs`, `purchases` y `purchase_payments`
+con `created_by NOT NULL` + `updated_by NULL`, ambas FK RESTRICT a `users`. `purchase_lines` no
+lleva columnas: hereda el actor de su compra, y la migración lo dice en su comentario. La
+definición VIVA de cada tabla es la que produjo la cadena: `suppliers` (13), `product_supplier_costs`
+(14), `purchases` (15) no fueron tocadas por ninguna migración posterior; `purchase_payments` es la
+de la 17 más los links de transacción de la 19. Hallazgo verificado: NINGÚN trigger referencia
+estas cuatro tablas (los triggers del schema cubren sesiones, walk-in de clientes, agrupación de
+receipts de `sale_payments` y guardas de identidad), así que — a diferencia de la migración 32 —
+nada hubo que dropear y recrear alrededor de los renombres; el orden del rebuild (suppliers
+primero, como padre de las demás) evitó el problema de los RENAME. El centinela: la migración
+REUTILIZA el de la 30 (el INSERT guardado es DEFENSIVO, y el comentario del archivo dice cuál de los
+dos caminos hace). Ambos caminos testeados.
+
+**Plomería:** el actor viaja explícito como argumento ruta (`Principal.user_id`) → servicio →
+repositorio: crear/editar proveedor, activar/desactivar (es una edición: `updated_by` lo lleva),
+crear borrador, editar header, CAMBIO DE LÍNEA (add/update/remove estampan el `updated_by` del
+borrador con el actor del request — el renglón hereda el actor de su compra pero el documento fue
+editado), confirmar (setea `updated_by` y el costo satélite que escribe lleva el actor del
+request confirmante), cancelar (ambos lados), todo pago (el pago cash del confirm, el pago suelto
+y cada pago de `pay_supplier` llevan el actor del request que los produjo), y el costo satélite con
+su flag preferido (create/shift/refresh/set_preferred/clear_preferred, todos con `updated_by` del
+request). Los flujos de compra ya threadaban el actor para finanzas e inventario (S9/S10); aquí se
+EXTENDIÓ el mismo argumento. Los repos de compras/proveedores siguen sin leer tablas de identidad
+(AC20); los nombres de display se resuelven en la capa de wiring (`routes/mod.rs::audit_actor_names`).
+
+**Display:** el detalle de compra (`partials/purchase_detail.html`) muestra "Registrado por" /
+"Actualizado por" (la creación y la última edición: edit de header, cambio de línea, confirm o
+cancel), resueltos en `record_context` de `purchases_web.rs`; el drawer de proveedor
+(`partials/supplier_detail.html`) muestra "Proveedor registrado por" / "Actualizado por" —
+etiquetado para lo que es (la atribución de la FILA del proveedor, no del saldo ni de las compras),
+la misma lección de lectura que S11 hizo en el estado de cuenta. Español en la copia, clases
+Tailwind ya existentes. Nunca un id crudo.
+
+**Tests nuevos (7):** `ac18_the_purchase_records_two_different_actors_and_its_payment_the_flows_actor`
+(Alice crea, Bob edita/confirmA — el costo del confirm lleva el actor confirmante — Alice paga y
+cancela), `ac18_a_supplier_records_two_different_actors`,
+`ac18_the_supplier_cost_and_its_preferred_flag_carry_their_actors` (create/shift/refresh +
+prefer/clear, cada uno con su actor), `ac19_the_upgrade_attributes_every_purchases_and_suppliers_
+row_to_the_system_sentinel` (upgrade demostrado: filas legacy en las cuatro tablas, ids
+preservados, cero sin atribuir, centinela único reutilizado, `created_by NOT NULL` en las cuatro,
+fk_check vacío, y las protecciones de runtime — UNIQUE name/number/par, CHECKs, RESTRICT e índice
+parcial del preferred — sonando igual que antes), `ac19_the_purchases_migration_recreates_a_
+missing_sentinel` (camino defensivo), y los dos displays con dos principales y conteos exactos:
+`audit_the_purchase_record_shows_the_actor_display_name` y
+`audit_the_supplier_detail_shows_the_actor_display_name`.
+
+**Mutaciones validadas** (cada guard roto y su test como testigo): `suppliers.created_by` (bind
+dropped), `suppliers.updated_by` en update y en set_active (binds dropped), `purchases.created_by`
+(bind dropped), `touch_draft` `updated_by` (bind dropped), `update_draft`/`set_confirmed`/
+`set_cancelled` `updated_by` (binds dropped), `purchase_payments.created_by` (bind dropped),
+`set_payment_refund_transaction` `updated_by` (bind dropped), `product_supplier_costs.created_by`
+(bind dropped), `shift_cost`/`refresh_cost_date`/`set_preferred` (promote)/`clear_preferred`
+(demote) `updated_by` (binds dropped), el actor del flujo en `record_cost` y en `create_payment`
+del record_payment (reemplazado por 0 → FK falla), el backfill de la migración a NULL (la
+migración aborta con NOT NULL) y los dos displays (la línea del template eliminada → conteo 0 ≠ 1).
+
+**Auditoría de preservación de constraints** (antes/después de la migración 33, comparado objeto
+por objeto en `sqlite_master` y con `PRAGMA table_info/foreign_key_list/index_list`): columnas
+(excluyendo las audit), FKs, índices, triggers y CHECKs/UNIQUEs — SAME en las cuatro tablas;
+única diferencia declarada: el orden de columnas de `purchase_payments` (los links que la
+migración 19 agregó con ALTER TABLE al final vuelven a su posición natural; la app nunca usa
+INSERT posicional ni SELECT *). Cero triggers referenciaban las tablas, así que nada se dropeó ni
+recreó; cada CHECK/FK/UNIQUE probado en runtime insertando o violando lo que prohíbe (nombre
+duplicado de proveedor, is_active=2, par (producto, proveedor) duplicado, is_preferred=2, segundo
+preferido del mismo producto, status/payment_type CHECK, purchase_number UNIQUE, FK de pago a
+purchase inexistente, DELETE RESTRICT del proveedor referenciado, DELETE del centinela).
+
+**Test preexistente tocado (fuera de las superficies, para ratificar):**
+`src/services/transaction.rs` — su fixture crudo `link_purchase_payment` insertaba
+`suppliers`, `purchases` y `purchase_payments` sin actor; `created_by NOT NULL` lo hizo imposible
+y el fixture mínimo ahora lleva el actor centinela, sin cambiar lo que la prueba verifica (el
+conflicto del delete de una transacción enlazada).
+
+**Números:** baseline `cargo test` **638 passed / 0 failed**; cierre **645 passed / 0 failed**
+(638 + 7 nuevos). `cargo check --all-targets` 0 errores, ledger en **55 warnings** (57 crudas −
+2 resúmenes, igual que el cierre de S11); `grep allow(dead_code)|allow(unused_imports)` src/ →
+nada nuevo. `scripts/e2e.sh -k parties`: **9 passed / 1 skipped** (la sonda de screenshot opt-in,
+igual que el baseline); `-k identity`: **7 passed**; cero cambios en `e2e/`. Sonda en vivo con el
+binario real (DATABASE_URL propio, bootstrap del admin): proveedor creado por la API, costo
+registrado, compra Credit confirmada y pagada por la API → `suppliers`/`product_supplier_costs`/
+`purchases`/`purchase_payments` con `created_by = admin` (no el centinela), detalle de compra
+renderizando "Registrado por Admin • Actualizado por Admin", drawer de proveedor renderizando
+"Proveedor registrado por Admin"; base de la sonda termina con `PRAGMA foreign_key_check` vacío,
+exactamente un centinela y ningún usuario más.

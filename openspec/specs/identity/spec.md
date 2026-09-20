@@ -2,9 +2,10 @@
 
 > Provenance: promoted from `openspec/changes/2026-09-18-add-identity-module/` (Phase A) on
 > delivery, 2026-09-23, and verified claim by claim against the code and the migration chain. The
-> audit of the actor on every business table is **in progress, per department**, and this spec states
-> the departments that ship today: the finance tables carry it (see "What the actor audit covers
-> today"). The remaining departments are planned in
+> audit of the actor on every business table is **in progress, per department**, and this spec
+> states the departments that ship today: the finance, inventory and sales/customers tables, and
+> now the purchases/suppliers tables, carry it (see "What the actor audit covers today"). The
+> identity tables' own audit is planned in
 > `openspec/changes/2026-09-19-add-actor-audit/`, and this section is updated as each one lands rather
 > than describing the end state ahead of the code. Behaviour stated here is verified by the test suites, not by a reviewed upstream
 > proposal.
@@ -76,7 +77,8 @@ catalog below are one contract: the route table in this spec is the operator-fac
 ### created_by / updated_by
 - `created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE RESTRICT`, `updated_by INTEGER NULL`
   (same FK) on the audited tables (see "What the actor audit covers today"); document lines and
-  join rows (`sale_lines`, `product_barcodes`) inherit their parent's actor and carry no columns.
+  join rows (`sale_lines`, `purchase_lines`, `product_barcodes`) inherit their parent's actor and
+  carry no columns.
 
 ### role_permissions
 - `role_id NOT NULL REFERENCES roles(id) ON DELETE CASCADE`, `permission_id NOT NULL REFERENCES
@@ -88,9 +90,10 @@ catalog below are one contract: the route table in this spec is the operator-fac
   NOT NULL`, unique `(user_id, role_id)`.
 - The grant trail — who granted, and when — is the actor record this capability owns. Beyond it,
   the audit columns ship per department: `accounts`, `transactions`, `payment_methods`,
-  `categories`, `products`, `stock_movements`, `sales`, `sale_payments`, `customer_receipts` and
-  `customers` carry `created_by`/`updated_by` today (see "What the actor audit covers today"),
-  and the other departments are planned in `openspec/changes/2026-09-19-add-actor-audit/`.
+  `categories`, `products`, `stock_movements`, `sales`, `sale_payments`, `customer_receipts`,
+  `customers`, `purchases`, `purchase_payments`, `suppliers` and `product_supplier_costs` carry
+  `created_by`/`updated_by` today (see "What the actor audit covers today"), and the identity
+  tables' own audit is planned in `openspec/changes/2026-09-19-add-actor-audit/`.
 
 ## Derived reads
 - `effective_permissions(user) = UNION of the permissions of the user's roles`, resolved per
@@ -266,12 +269,15 @@ non-protected account; granting `identity.roles.manage` means handing over the i
 ### What the actor audit covers today
 `user_roles` records `granted_by` and `granted_at` for every role grant, and every mutation of
 `accounts`, `transactions`, `payment_methods`, `categories`, `products`, `stock_movements`,
-`sales`, `sale_payments`, `customer_receipts` and `customers` records its actor in `created_by`
+`sales`, `sale_payments`, `customer_receipts`, `customers`, `purchases`, `purchase_payments`,
+`suppliers` and `product_supplier_costs` records its actor in `created_by`
 (NOT NULL, `ON DELETE RESTRICT` to `users`) and `updated_by`, written from the request's principal
 — never from anything the request itself can supply — and shown as a name in the account views,
-the product detail / stock list, the sale record and the customer statement.
-`product_barcodes` and `sale_lines` carry no columns of their own: a join or line row inherits the
-actor of its parent row, as the plan's Audit section states for lines and join rows.
+the product detail / stock list, the sale record, the customer statement, the purchase record and
+the supplier drawer.
+`product_barcodes`, `sale_lines` and `purchase_lines` carry no columns of their own: a join or
+line row inherits the actor of its parent row, as the plan's Audit section states for lines and
+join rows.
 
 A movement produced INSIDE another document carries the flow's request actor: a sale or purchase
 confirm (or cancel) stamps the stock movements with the same acting user that stamps the flow's
@@ -284,14 +290,17 @@ which the migration creates when there is something to attribute. It is delibera
 attributing them to one would invent history. The sentinel consumes `users.id = 1` on a fresh
 install because the seeded payment methods are rows the audit must attribute; it cannot log in (an
 unusable credential and an inactive state, two independent guards) and appears in the users list as
-an inactive account, which is where the attribution is explained rather than hidden. The inventory
-and the sales/customers migrations reuse that same sentinel — their own guarded inserts are
-defensive, firing only if the account is somehow absent when there are rows to attribute. The
-sale's payment rows and its customer receipt carry the actor of the flow's own request (the
-confirming, payment or collection request), never the sale's creator and never a fresh one.
+an inactive account, which is where the attribution is explained rather than hidden. The
+inventory, the sales/customers and the purchases/suppliers migrations reuse that same sentinel —
+their own guarded inserts are defensive, firing only if the account is somehow absent when there
+are rows to attribute. The sale's payment rows and its customer receipt carry the actor of the
+flow's own request (the confirming, payment or collection request), never the sale's creator and
+never a fresh one — and the same argument covers the purchase side: a purchase's payment, the
+satellite cost rows its confirm writes and a line change's stamp on the draft all carry the flow's
+request actor.
 
-Every remaining department's tables record no actor yet: the audit there is Phase B (see the
-provenance note).
+Every remaining table (`users`, `roles`, `permissions`) records no actor yet: the identity
+tables' own audit is the next Phase B slice (see the provenance note).
 
 ### Boundaries
 Identity performs SQL only against identity tables; no department queries identity tables or
