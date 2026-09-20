@@ -19,9 +19,14 @@ then archives its own scope.
       request's actor down. The pre-existing rows' actor is the migration-created `sistema`
       sentinel, per the rule above; see the slice's section in `odd/tasks/identity-rbac.md` for
       the demonstrated upgrade sequence, the mutation table and the verification numbers.)
-- [ ] T27 (S10): audit for inventory tables (`categories`, `products`, `product_barcodes` inherits,
+- [x] T27 (S10): audit for inventory tables (`categories`, `products`, `product_barcodes` inherits,
       `stock_movements`) — the movement's actor is the request's principal even when the movement is
-      produced by a sale or purchase confirm.
+      produced by a sale or purchase confirm. (2026-09-20: delivered on `feat/audit-inventory`;
+      migration 31 reuses migration 30's `sistema` sentinel — its guarded insert is defensive only —
+      and the sale/purchase confirm/cancel flows extend the same `actor` argument they already thread
+      for their finance rows into the inventory `record_movement` call. See the slice's section in
+      `odd/tasks/identity-rbac.md` for the demonstrated upgrade sequence, the mutation table and the
+      verification numbers.)
 - [ ] T28 (S11): audit for sales and customer receipts (`sales`, `sale_lines` inherits, `sale_payments`,
       `customer_receipts`) — the sale's payment rows carry the same actor as the flow's request.
 - [ ] T29 (S12): audit for purchases, suppliers and supplier costs (`purchases`, `purchase_lines`
