@@ -6,9 +6,12 @@ use std::str::FromStr;
 use crate::error::{AppError, AppResult};
 use crate::models::{NewProduct, Product, ProductBarcode, ProductKind};
 
+/// The audit actor is an explicit argument on every mutation (M5 Phase B,
+/// slice S10): the acting user's id from the request's `Principal`, threaded
+/// route → service → repository, never invented by the repository.
 #[async_trait]
 pub trait ProductRepository: Send + Sync {
-    async fn create(&self, input: &NewProduct) -> AppResult<Product>;
+    async fn create(&self, actor: i64, input: &NewProduct) -> AppResult<Product>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Product>>;
     async fn find_by_sku(&self, sku: &str) -> AppResult<Option<Product>>;
     /// Exact SKU regardless of case, used by the scanner/SKU resolution path.
@@ -20,12 +23,13 @@ pub trait ProductRepository: Send + Sync {
     async fn list(&self) -> AppResult<Vec<Product>>;
     async fn list_by_category(&self, category_id: i64) -> AppResult<Vec<Product>>;
     async fn count_by_category(&self, category_id: i64) -> AppResult<i64>;
-    async fn set_active(&self, id: i64, active: bool) -> AppResult<Product>;
+    async fn set_active(&self, actor: i64, id: i64, active: bool) -> AppResult<Product>;
     /// Persist a full merged row for an existing product. The service merges the
     /// patch over the current row and validates it, so the repository stays
     /// patch-agnostic: one UPDATE rewrites every editable column and returns the
-    /// re-read row.
-    async fn update(&self, id: i64, input: &NewProduct) -> AppResult<Product>;
+    /// re-read row. `actor` is the audit actor of the request performing the
+    /// edit: it lands on `updated_by` while `created_by` stays untouched.
+    async fn update(&self, actor: i64, id: i64, input: &NewProduct) -> AppResult<Product>;
     async fn delete(&self, id: i64) -> AppResult<bool>;
     async fn exists(&self, id: i64) -> AppResult<bool>;
 }
@@ -68,6 +72,8 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Product {
         location: row.get("location"),
         notes: row.get("notes"),
         is_active: active == 1,
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -101,13 +107,13 @@ impl SqliteProductRepository {
 
 #[async_trait]
 impl ProductRepository for SqliteProductRepository {
-    async fn create(&self, input: &NewProduct) -> AppResult<Product> {
+    async fn create(&self, actor: i64, input: &NewProduct) -> AppResult<Product> {
         let row = sqlx::query(
             r#"INSERT INTO products
                (sku, name, kind, category_id, unit, sale_price, cost_price,
-                track_stock, min_stock, max_stock, location, notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at"#,
+                track_stock, min_stock, max_stock, location, notes, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.sku)
         .bind(&input.name)
@@ -121,6 +127,7 @@ impl ProductRepository for SqliteProductRepository {
         .bind(input.max_stock.map(|d| d.to_string()))
         .bind(input.location.clone())
         .bind(input.notes.clone())
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -129,7 +136,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Product>> {
         let row = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at FROM products WHERE id = ?"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -139,7 +146,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn find_by_sku(&self, sku: &str) -> AppResult<Option<Product>> {
         let row = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at FROM products WHERE sku = ?"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE sku = ?"#,
         )
         .bind(sku)
         .fetch_optional(&self.pool)
@@ -149,7 +156,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>> {
         let row = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at FROM products WHERE sku = ? COLLATE NOCASE ORDER BY id LIMIT 1"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE sku = ? COLLATE NOCASE ORDER BY id LIMIT 1"#,
         )
         .bind(sku)
         .fetch_optional(&self.pool)
@@ -176,7 +183,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn list(&self) -> AppResult<Vec<Product>> {
         let rows = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at FROM products ORDER BY id"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products ORDER BY id"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -185,7 +192,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn list_by_category(&self, category_id: i64) -> AppResult<Vec<Product>> {
         let rows = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at FROM products WHERE category_id = ? ORDER BY id"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE category_id = ? ORDER BY id"#,
         )
         .bind(category_id)
         .fetch_all(&self.pool)
@@ -202,27 +209,28 @@ impl ProductRepository for SqliteProductRepository {
         Ok(row.0)
     }
 
-    async fn set_active(&self, id: i64, active: bool) -> AppResult<Product> {
+    async fn set_active(&self, actor: i64, id: i64, active: bool) -> AppResult<Product> {
         let row = sqlx::query(
-            r#"UPDATE products SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at"#,
+            r#"UPDATE products SET is_active = ?, updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ? RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(if active { 1i64 } else { 0i64 })
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_product(row))
     }
 
-    async fn update(&self, id: i64, input: &NewProduct) -> AppResult<Product> {
+    async fn update(&self, actor: i64, id: i64, input: &NewProduct) -> AppResult<Product> {
         let row = sqlx::query(
             r#"UPDATE products
                SET sku = ?, name = ?, kind = ?, category_id = ?, unit = ?,
                    sale_price = ?, cost_price = ?, track_stock = ?, min_stock = ?,
                    max_stock = ?, location = ?, notes = ?,
-                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                   updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
-               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_at, updated_at"#,
+               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.sku)
         .bind(&input.name)
@@ -236,6 +244,7 @@ impl ProductRepository for SqliteProductRepository {
         .bind(input.max_stock.map(|d| d.to_string()))
         .bind(input.location.clone())
         .bind(input.notes.clone())
+        .bind(actor)
         .bind(id)
         .fetch_optional(&self.pool)
         .await
@@ -299,6 +308,15 @@ mod tests {
         SqliteProductRepository::new(test_pool().await)
     }
 
+    /// The acting user for repo-level writes: the migration's sentinel, valid
+    /// as an actor. Attribution differences are asserted at the service level,
+    /// where two dedicated users exist.
+    async fn actor(r: &SqliteProductRepository) -> i64 {
+        crate::security::test_support::audit_actor_id(&r.pool)
+            .await
+            .unwrap()
+    }
+
     fn product_input(sku: &str) -> NewProduct {
         NewProduct {
             sku: sku.to_string(),
@@ -321,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn update_persists_the_full_row_and_returns_it() {
         let r = repo().await;
-        let created = r.create(&product_input("REPO-U1")).await.unwrap();
+        let created = r.create(actor(&r).await, &product_input("REPO-U1")).await.unwrap();
         let input = NewProduct {
             sku: "REPO-U2".to_string(),
             name: "renamed".to_string(),
@@ -336,7 +354,7 @@ mod tests {
             location: Some("shelf 9".to_string()),
             notes: Some("repo note".to_string()),
         };
-        let updated = r.update(created.id, &input).await.unwrap();
+        let updated = r.update(actor(&r).await, created.id, &input).await.unwrap();
         assert_eq!(updated.id, created.id);
         assert_eq!(updated.sku, "REPO-U2");
         assert_eq!(updated.name, "renamed");
@@ -358,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn update_unknown_id_is_not_found() {
         let r = repo().await;
-        let err = r.update(99999, &product_input("REPO-GHOST")).await.unwrap_err();
+        let err = r.update(actor(&r).await, 99999, &product_input("REPO-GHOST")).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 }

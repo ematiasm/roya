@@ -78,7 +78,21 @@ struct HiddenByFilterNotice {
 #[derive(Template)]
 #[template(path = "partials/stock_list.html")]
 struct StockListPartial {
-    items: Vec<ProductStock>,
+    /// One row per stock-tracked product with its audit actor resolved to a
+    /// display name (see `StockRow` below).
+    items: Vec<StockRow>,
+}
+
+/// One row of the low/negative stock fragment with its audit actors resolved
+/// to display names (M5 Phase B, slice S10): the department returns ids, the
+/// wiring layer resolves them, so the interface shows a name and never an id.
+struct StockRow {
+    ps: ProductStock,
+    /// Display name of the product's creator ("Registrado por"); `None` only
+    /// when the id resolves to nothing (a concurrent deactivation).
+    created_by_name: Option<String>,
+    /// Display name of the last editor, when the product was edited at all.
+    updated_by_name: Option<String>,
 }
 
 /// The picker results fragment. Generic on purpose: the record page supplies the
@@ -104,12 +118,22 @@ pub struct ProductCostView {
 /// The product slide-over drawer body: the header with derived stock and the
 /// inline edit form, the per-supplier cost satellite (record/switch preferred)
 /// and the stock movement form. Field names are the template task's contract.
+/// The audit actors are display names resolved in the wiring layer (M5 Phase
+/// B, slice S10) — the header shows "Registrado por"/"Actualizado por" like
+/// the finance detail does.
 #[derive(Template)]
 #[template(path = "partials/product_detail.html")]
 struct ProductDetailPartial {
     product: Product,
     stock: Decimal,
     suggested: Option<Decimal>,
+    /// Display name of the product's creator ("Registrado por"). Every
+    /// product has one (`created_by` is NOT NULL); it renders even when the
+    /// actor is the migration's sentinel.
+    created_by_name: Option<String>,
+    /// Display name of the last editor ("Actualizado por"), only rendered
+    /// when the product has been edited at all.
+    updated_by_name: Option<String>,
     categories: Vec<crate::models::Category>,
     supplier_costs: Vec<ProductCostView>,
     suppliers: Vec<crate::models::Supplier>,
@@ -288,9 +312,7 @@ async fn web_low_stock(
     _: Require<InventoryRead>,
 ) -> Result<Html<String>, AppError> {
     let items = state.inventory_service.low_stock().await?;
-    let html = StockListPartial { items }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let html = stock_list_html(&state, items).await?;
     Ok(Html(html))
 }
 
@@ -299,10 +321,29 @@ async fn web_negative_stock(
     _: Require<InventoryRead>,
 ) -> Result<Html<String>, AppError> {
     let items = state.inventory_service.negative_stock().await?;
-    let html = StockListPartial { items }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let html = stock_list_html(&state, items).await?;
     Ok(Html(html))
+}
+
+/// Resolve the stock rows' audit actors in the wiring layer and render the
+/// fragment: one statement covers every row, the same way the finance detail
+/// resolves its names.
+async fn stock_list_html(state: &AppState, items: Vec<ProductStock>) -> AppResult<String> {
+    let mut actor_ids = items.iter().map(|ps| ps.product.created_by).collect::<Vec<i64>>();
+    actor_ids.extend(items.iter().filter_map(|ps| ps.product.updated_by));
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let name_for = |id: i64| names.get(&id).cloned();
+    let rows = items
+        .into_iter()
+        .map(|ps| StockRow {
+            created_by_name: name_for(ps.product.created_by),
+            updated_by_name: ps.product.updated_by.and_then(name_for),
+            ps,
+        })
+        .collect();
+    StockListPartial { items: rows }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 /// The empty option's label is caller-owned: the catalogue filter says "All
@@ -412,7 +453,10 @@ async fn web_product_detail(
 
 /// The drawer body with fresh derived data. The detail read and every mutating
 /// drawer action answer it, so saving/costs/movements refresh the drawer in
-/// place without the client rebuilding a URL.
+/// place without the client rebuilding a URL. The audit actors are resolved
+/// HERE, in the wiring layer, because a department may not read identity
+/// tables (AC20) and the view must show a name, never an id — the same way
+/// the finance detail does it.
 async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
     let ps = state.inventory_service.product_stock(id).await?;
     let categories = state.inventory_service.categories.list().await?;
@@ -429,11 +473,19 @@ async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String
             ProductCostView { cost, supplier_name }
         })
         .collect();
+    let mut actor_ids = vec![ps.product.created_by];
+    actor_ids.extend(ps.product.updated_by);
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let name_for = |id: i64| names.get(&id).cloned();
+    let created_by_name = name_for(ps.product.created_by);
+    let updated_by_name = ps.product.updated_by.and_then(name_for);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let html = ProductDetailPartial {
         product: ps.product,
         stock: ps.stock,
         suggested: ps.suggested,
+        created_by_name,
+        updated_by_name,
         categories,
         supplier_costs,
         suppliers,
@@ -623,13 +675,14 @@ fn parse_opt_i64(s: &str) -> AppResult<Option<i64>> {
 async fn web_create_category(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreateCategoryForm>,
 ) -> Result<axum::response::Response, AppError> {
     let parent_id = parse_opt_i64(&form.parent_id)?;
     state
         .inventory_service
-        .create_category(&form.name, parent_id)
+        .create_category(principal.user_id, &form.name, parent_id)
         .await?;
     if is_htmx(&headers) {
         let mut resp = Html(String::new()).into_response();
@@ -643,6 +696,7 @@ async fn web_create_category(
 async fn web_create_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreateProductForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -697,7 +751,7 @@ async fn web_create_product(
             Some(form.notes)
         },
     };
-    let created = state.inventory_service.create_product(input).await?;
+    let created = state.inventory_service.create_product(principal.user_id, input).await?;
     if is_htmx(&headers) {
         // The answer is the list the caller is looking at: the filter rides the
         // body via `hx-include="#product-filters"` (issue #37), so an active
@@ -733,6 +787,7 @@ async fn web_create_product(
 async fn web_create_movement(
     State(state): State<AppState>,
     _: Require<InventoryStockWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreateMovementForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -760,7 +815,7 @@ async fn web_create_movement(
         reference: form.reference.trim().to_string(),
         date,
     };
-    state.inventory_service.record_movement(input).await?;
+    state.inventory_service.record_movement(principal.user_id, input).await?;
     if is_htmx(&headers) {
         // Drawer submissions target `#product-drawer-body`: answer the fresh
         // detail fragment (stock and header reloaded) and keep the existing
@@ -793,6 +848,7 @@ async fn web_create_movement(
 async fn web_edit_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Query(filter): Query<WebProductFilter>,
     Form(form): Form<EditProductForm>,
@@ -850,7 +906,10 @@ async fn web_edit_product(
             },
         ),
     };
-    state.inventory_service.update_product(form.id, patch).await?;
+    state
+        .inventory_service
+        .update_product(principal.user_id, form.id, patch)
+        .await?;
     if is_htmx(&headers) {
         let from_drawer = headers
             .get("HX-Target")
@@ -963,12 +1022,13 @@ async fn web_set_preferred_cost(
 async fn web_activate_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
     state
         .inventory_service
-        .set_product_active(form.product_id, true)
+        .set_product_active(principal.user_id, form.product_id, true)
         .await?;
     product_lifecycle_response(&state, &headers, &form).await
 }
@@ -976,12 +1036,13 @@ async fn web_activate_product(
 async fn web_deactivate_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
     state
         .inventory_service
-        .set_product_active(form.product_id, false)
+        .set_product_active(principal.user_id, form.product_id, false)
         .await?;
     product_lifecycle_response(&state, &headers, &form).await
 }
@@ -1061,6 +1122,13 @@ mod tests {
 
     use crate::routes::AppState;
     use crate::security::test_support;
+
+    /// A valid acting user for fixture writes through the service: the
+    /// migration's sentinel. Route-level tests authenticate through the
+    /// seeded session, so the route's own actor is the session's user.
+    async fn audit_actor_id(state: &AppState) -> i64 {
+        test_support::audit_actor_id(&state.pool).await.unwrap()
+    }
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -1209,7 +1277,9 @@ mod tests {
         let state = test_state().await;
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: "DRAWER-GATE".into(),
                 name: "drawer gate prod".into(),
                 kind: ProductKind::Product,
@@ -1581,7 +1651,9 @@ mod tests {
 
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: "PICK-1".into(),
                 name: "Yerba Picker".into(),
                 kind: ProductKind::Product,
@@ -1707,7 +1779,9 @@ mod tests {
     async fn seed_tracked_product(state: &AppState, sku: &str) -> crate::models::Product {
         state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: sku.into(),
                 name: format!("prod {sku}"),
                 kind: ProductKind::Product,
@@ -1746,7 +1820,9 @@ mod tests {
         let product = seed_tracked_product(&state, "DETAIL-1").await;
         state
             .inventory_service
-            .record_movement(crate::models::NewMovement {
+            .record_movement(
+                audit_actor_id(&state).await,
+                crate::models::NewMovement {
                 product_id: product.id,
                 qty: Decimal::from(5),
                 movement_type: crate::models::MovementType::In,
@@ -1889,17 +1965,23 @@ mod tests {
         // carries the product's own `category_id`, so the keys would collide.
         let cat_a = state
             .inventory_service
-            .create_category("Edit Cat A", None)
+            .create_category(
+                audit_actor_id(&state).await,
+                "Edit Cat A", None)
             .await
             .unwrap();
         let cat_b = state
             .inventory_service
-            .create_category("Edit Cat B", None)
+            .create_category(
+                audit_actor_id(&state).await,
+                "Edit Cat B", None)
             .await
             .unwrap();
         let _other = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: "EDIT-OTHER".into(),
                 name: "other EDIT-OTHER".into(),
                 kind: ProductKind::Product,
@@ -1982,12 +2064,16 @@ mod tests {
         let state = test_state().await;
         let category = state
             .inventory_service
-            .create_category("Clear Cat", None)
+            .create_category(
+                audit_actor_id(&state).await,
+                "Clear Cat", None)
             .await
             .unwrap();
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: "CLEAR-1".into(),
                 name: "clearable prod".into(),
                 kind: ProductKind::Product,
@@ -2176,7 +2262,9 @@ mod tests {
         let product = seed_tracked_product(&state, "MOVE-WEB").await;
         let service = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: "SRV-WEB".into(),
                 name: "service SRV-WEB".into(),
                 kind: ProductKind::Service,
@@ -2238,17 +2326,23 @@ mod tests {
         let state = test_state().await;
         let cat_a = state
             .inventory_service
-            .create_category("Life Cat A", None)
+            .create_category(
+                audit_actor_id(&state).await,
+                "Life Cat A", None)
             .await
             .unwrap();
         let cat_b = state
             .inventory_service
-            .create_category("Life Cat B", None)
+            .create_category(
+                audit_actor_id(&state).await,
+                "Life Cat B", None)
             .await
             .unwrap();
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: "LIFE-WEB".into(),
                 name: "prod LIFE-WEB".into(),
                 kind: ProductKind::Product,
@@ -2266,7 +2360,9 @@ mod tests {
             .unwrap();
         let other = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
                 sku: "LIFE-OTHER".into(),
                 name: "prod LIFE-OTHER".into(),
                 kind: ProductKind::Product,
@@ -2347,7 +2443,9 @@ mod tests {
         // Delete with movements: 400, row survives.
         state
             .inventory_service
-            .record_movement(crate::models::NewMovement {
+            .record_movement(
+                audit_actor_id(&state).await,
+                crate::models::NewMovement {
                 product_id: product.id,
                 qty: Decimal::from(3),
                 movement_type: crate::models::MovementType::In,
@@ -2367,5 +2465,120 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "a product with movements survives delete");
+    }
+
+    // -- audit attribution (M5 Phase B, slice S10, AC18): what the view shows --
+
+    /// The product detail shows the actor as a DISPLAY NAME, never an id:
+    /// "Registrado por" names the creator and an edit adds "Actualizado por"
+    /// without erasing the creator. Two principals drive the flow so the two
+    /// names are distinct — the shared session user creates the product, a
+    /// second probe session edits it. The low-stock fragment shows the same
+    /// name on its rows.
+    #[tokio::test]
+    async fn audit_inventory_detail_view_shows_the_actor_display_name() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+
+        // The shared session user ("Test Admin") creates the product.
+        let (status, resp) = post_form_with_cookie(
+            app.clone(),
+            "/web/products",
+            "sku=AUDIT-VIEW&name=Audited+product&kind=&product_category_id=&unit=un&sale_price=10&cost_price=&min_stock=&max_stock=&location=&notes=",
+            &[("hx-request", "true")],
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let product_id: i64 =
+            sqlx::query_scalar("SELECT id FROM products WHERE sku = 'AUDIT-VIEW'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        // A second principal (display name "Test Probe") edits the product.
+        let probe_token =
+            test_support::seed_session_with_permissions(&state.pool, &["inventory.write"])
+                .await
+                .unwrap();
+        let (status, resp) = post_form_with_cookie(
+            app.clone(),
+            "/web/products/edit",
+            &format!(
+                "id={product_id}&sku=AUDIT-VIEW&name=Audited+product&kind=&category_id=&unit=un&sale_price=12&cost_price=&min_stock=&max_stock=&location=&notes=",
+            ),
+            &[("hx-request", "true")],
+            &test_support::cookie_for(&probe_token),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+
+        let (status, page) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(
+            page.matches("Registrado por Test Admin").count(),
+            1,
+            "the detail names the creator's display name: {page}"
+        );
+        assert_eq!(
+            page.matches("Actualizado por Test Probe").count(),
+            1,
+            "the edit names its editor: {page}"
+        );
+        assert!(
+            !page.contains("Registrado por 1"),
+            "the interface never renders a raw user id: {page}"
+        );
+    }
+
+    /// The low-stock fragment shows the same attribution: every row names the
+    /// product's creator as a display name.
+    #[tokio::test]
+    async fn audit_the_stock_list_rows_show_the_actor_display_name() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+
+        // A tracked product below its minimum stock.
+        let (status, resp) = post_form_with_cookie(
+            app.clone(),
+            "/web/products",
+            "sku=LOW-VIEW&name=Low+product&kind=&product_category_id=&unit=un&sale_price=10&cost_price=5&track_stock=1&min_stock=5&max_stock=50&location=&notes=",
+            &[("hx-request", "true")],
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let product_id: i64 =
+            sqlx::query_scalar("SELECT id FROM products WHERE sku = 'LOW-VIEW'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        state
+            .inventory_service
+            .record_movement(
+                audit_actor_id(&state).await,
+                crate::models::NewMovement {
+                    product_id,
+                    qty: Decimal::from(1),
+                    movement_type: crate::models::MovementType::In,
+                    reason: crate::models::MovementReason::Initial,
+                    reference: String::new(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let (status, html) = get_html(app, "/web/low-stock").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(
+            html.matches("Producto registrado por Test Admin").count(),
+            1,
+            "the stock row names the product's creator, and says that is what it names: {html}"
+        );
+        assert!(
+            !html.contains("Producto registrado por 1"),
+            "the fragment never renders a raw user id: {html}"
+        );
     }
 }

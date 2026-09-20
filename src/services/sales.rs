@@ -882,16 +882,21 @@ where
 
         // Stock Out (reason Sale) for tracked Product lines only.
         // Service / untracked lines are sellable without stock moves (AC9).
+        // The movement carries the CONFIRMING request's actor — the same
+        // argument that stamps the finance rows — never a fresh one (AC18).
         for (line, _) in &tracked {
             self.inventory
-                .record_movement(NewMovement {
-                    product_id: line.product_id,
-                    qty: line.qty,
-                    movement_type: MovementType::Out,
-                    reason: MovementReason::Sale,
-                    reference: sale_number.clone(),
-                    date: sale.sale_date,
-                })
+                .record_movement(
+                    actor,
+                    NewMovement {
+                        product_id: line.product_id,
+                        qty: line.qty,
+                        movement_type: MovementType::Out,
+                        reason: MovementReason::Sale,
+                        reference: sale_number.clone(),
+                        date: sale.sale_date,
+                    },
+                )
                 .await?;
         }
 
@@ -1104,17 +1109,21 @@ where
             }
         }
 
-        // Stock In (reason Sale-return) for tracked lines.
+        // Stock In (reason Sale-return) for tracked lines. The movement
+        // carries the cancelling request's actor, like its refund Expense.
         for line in &tracked {
             self.inventory
-                .record_movement(NewMovement {
-                    product_id: line.product_id,
-                    qty: line.qty,
-                    movement_type: MovementType::In,
-                    reason: MovementReason::SaleReturn,
-                    reference: sale_number.clone(),
-                    date: sale.sale_date,
-                })
+                .record_movement(
+                    actor,
+                    NewMovement {
+                        product_id: line.product_id,
+                        qty: line.qty,
+                        movement_type: MovementType::In,
+                        reason: MovementReason::SaleReturn,
+                        reference: sale_number.clone(),
+                        date: sale.sale_date,
+                    },
+                )
                 .await?;
         }
 
@@ -1274,7 +1283,9 @@ mod tests {
 
     async fn seed_product(s: &Svc, sku: &str, price: &str) -> crate::models::Product {
         s.inventory
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(s).await,
+                NewProduct {
                 sku: sku.into(),
                 name: format!("prod {sku}"),
                 kind: ProductKind::Product,
@@ -1294,7 +1305,9 @@ mod tests {
 
     async fn seed_service(s: &Svc, sku: &str) -> crate::models::Product {
         s.inventory
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(s).await,
+                NewProduct {
                 sku: sku.into(),
                 name: format!("svc {sku}"),
                 kind: ProductKind::Service,
@@ -1314,7 +1327,9 @@ mod tests {
 
     async fn seed_stock(s: &Svc, product_id: i64, qty: &str) {
         s.inventory
-            .record_movement(NewMovement {
+            .record_movement(
+                audit_actor(s).await,
+                NewMovement {
                 product_id,
                 qty: dec(qty),
                 movement_type: MovementType::In,
@@ -3421,5 +3436,38 @@ mod tests {
         let income = rows.iter().find(|tx| tx.is_income()).unwrap();
         assert_eq!(income.created_by, operator, "the flow's actor, not a fresh one");
         assert_ne!(income.created_by, acc.created_by, "distinct from the account's creator");
+    }
+
+    /// AC18, the INVENTORY half of the sale flow: the stock movement a
+    /// confirmed sale produces carries the CONFIRMING request's actor — the
+    /// same argument that stamps the flow's finance rows — never a fresh one,
+    /// and it stays distinct from the product's own creator.
+    #[tokio::test]
+    async fn ac18_the_sale_flow_movement_carries_the_flows_actor() {
+        let (s, pool) = svc().await;
+        let creator = test_support::seed_audit_user(&pool, "stock-alice", "Alice").await.unwrap();
+        let operator = test_support::seed_audit_user(&pool, "stock-bob", "Bob").await.unwrap();
+
+        let acc = s.transactions.accounts.create(creator, "stockwallet").await.unwrap();
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let prod = seed_product(&s, "STOCKFLOW", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        assert_ne!(prod.created_by, operator, "the two actors are distinguishable");
+        let customer = seed_customer(&s, "stock-walkin", None, None).await;
+        let sale = draft_with_line(&s, customer.id, PaymentType::Cash, None, prod.id, "1").await;
+
+        let _detail = s.confirm(operator, sale.id, Some(cash)).await.unwrap();
+        let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
+        let sale_move = moves
+            .iter()
+            .find(|m| m.reason == MovementReason::Sale)
+            .unwrap_or_else(|| panic!("the sale confirm produced its own movement"));
+        assert_eq!(sale_move.created_by, operator, "the flow's actor, not a fresh one");
+        assert_ne!(
+            sale_move.created_by, prod.created_by,
+            "distinct from the product's creator"
+        );
+        assert_eq!(sale_move.updated_by, None, "an append-only movement has no editor");
     }
 }

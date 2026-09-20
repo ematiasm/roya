@@ -299,8 +299,9 @@ mod tests {
     }
 
     async fn seed_product(pool: &SqlitePool, sku: &str, cost_price: &str) -> i64 {
+        let actor = crate::security::test_support::audit_actor_id(pool).await.unwrap();
         SqliteProductRepository::new(pool.clone())
-            .create(&NewProduct {
+            .create(actor, &NewProduct {
                 sku: sku.into(),
                 name: format!("prod {sku}"),
                 kind: ProductKind::Product,

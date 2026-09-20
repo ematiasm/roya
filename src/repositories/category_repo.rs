@@ -4,9 +4,12 @@ use sqlx::{Row, SqlitePool};
 use crate::error::{AppError, AppResult};
 use crate::models::Category;
 
+/// The audit actor is an explicit argument on every mutation (M5 Phase B,
+/// slice S10): the acting user's id from the request's `Principal`, threaded
+/// route → service → repository, never invented by the repository.
 #[async_trait]
 pub trait CategoryRepository: Send + Sync {
-    async fn create(&self, name: &str, parent_id: Option<i64>) -> AppResult<Category>;
+    async fn create(&self, actor: i64, name: &str, parent_id: Option<i64>) -> AppResult<Category>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Category>>;
     async fn find_by_parent_and_name(
         &self,
@@ -17,6 +20,7 @@ pub trait CategoryRepository: Send + Sync {
     async fn list_children(&self, parent_id: i64) -> AppResult<Vec<Category>>;
     async fn update(
         &self,
+        actor: i64,
         id: i64,
         name: &str,
         parent_id: Option<i64>,
@@ -31,6 +35,8 @@ fn row_to_category(row: sqlx::sqlite::SqliteRow) -> Category {
         id: row.get("id"),
         name: row.get("name"),
         parent_id: row.get("parent_id"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -59,13 +65,14 @@ impl SqliteCategoryRepository {
 
 #[async_trait]
 impl CategoryRepository for SqliteCategoryRepository {
-    async fn create(&self, name: &str, parent_id: Option<i64>) -> AppResult<Category> {
+    async fn create(&self, actor: i64, name: &str, parent_id: Option<i64>) -> AppResult<Category> {
         let row = sqlx::query(
-            r#"INSERT INTO categories (name, parent_id) VALUES (?, ?)
-               RETURNING id, name, parent_id, created_at"#,
+            r#"INSERT INTO categories (name, parent_id, created_by) VALUES (?, ?, ?)
+               RETURNING id, name, parent_id, created_by, updated_by, created_at"#,
         )
         .bind(name)
         .bind(parent_id)
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -74,7 +81,7 @@ impl CategoryRepository for SqliteCategoryRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Category>> {
         let row = sqlx::query(
-            r#"SELECT id, name, parent_id, created_at FROM categories WHERE id = ?"#,
+            r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -92,7 +99,7 @@ impl CategoryRepository for SqliteCategoryRepository {
         let row = match parent_id {
             Some(pid) => {
                 sqlx::query(
-                    r#"SELECT id, name, parent_id, created_at FROM categories
+                    r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories
                        WHERE parent_id = ? AND name = ?"#,
                 )
                 .bind(pid)
@@ -102,7 +109,7 @@ impl CategoryRepository for SqliteCategoryRepository {
             }
             None => {
                 sqlx::query(
-                    r#"SELECT id, name, parent_id, created_at FROM categories
+                    r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories
                        WHERE parent_id IS NULL AND name = ?"#,
                 )
                 .bind(name)
@@ -115,7 +122,7 @@ impl CategoryRepository for SqliteCategoryRepository {
 
     async fn list(&self) -> AppResult<Vec<Category>> {
         let rows =
-            sqlx::query(r#"SELECT id, name, parent_id, created_at FROM categories ORDER BY id"#)
+            sqlx::query(r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories ORDER BY id"#)
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows.into_iter().map(row_to_category).collect())
@@ -123,7 +130,7 @@ impl CategoryRepository for SqliteCategoryRepository {
 
     async fn list_children(&self, parent_id: i64) -> AppResult<Vec<Category>> {
         let rows = sqlx::query(
-            r#"SELECT id, name, parent_id, created_at FROM categories WHERE parent_id = ? ORDER BY id"#,
+            r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories WHERE parent_id = ? ORDER BY id"#,
         )
         .bind(parent_id)
         .fetch_all(&self.pool)
@@ -133,16 +140,18 @@ impl CategoryRepository for SqliteCategoryRepository {
 
     async fn update(
         &self,
+        actor: i64,
         id: i64,
         name: &str,
         parent_id: Option<i64>,
     ) -> AppResult<Category> {
         let row = sqlx::query(
-            r#"UPDATE categories SET name = ?, parent_id = ? WHERE id = ?
-               RETURNING id, name, parent_id, created_at"#,
+            r#"UPDATE categories SET name = ?, parent_id = ?, updated_by = ? WHERE id = ?
+               RETURNING id, name, parent_id, created_by, updated_by, created_at"#,
         )
         .bind(name)
         .bind(parent_id)
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await

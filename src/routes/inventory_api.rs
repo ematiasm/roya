@@ -145,11 +145,12 @@ async fn list_categories(
 async fn create_category(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateCategoryRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let cat = state
         .inventory_service
-        .create_category(&payload.name, payload.parent_id)
+        .create_category(principal.user_id, &payload.name, payload.parent_id)
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(cat))))
 }
@@ -171,12 +172,13 @@ async fn get_category(
 async fn update_category(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateCategoryRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let cat = state
         .inventory_service
-        .update_category(id, payload.name.as_deref(), payload.parent_id)
+        .update_category(principal.user_id, id, payload.name.as_deref(), payload.parent_id)
         .await?;
     Ok(Json(serde_json::json!(cat)))
 }
@@ -209,6 +211,7 @@ async fn list_products(
 async fn create_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateProductRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let input = NewProduct {
@@ -225,7 +228,7 @@ async fn create_product(
         location: payload.location,
         notes: payload.notes,
     };
-    let product = state.inventory_service.create_product(input).await?;
+    let product = state.inventory_service.create_product(principal.user_id, input).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(product))))
 }
 
@@ -241,12 +244,14 @@ async fn get_product(
 async fn update_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateProductRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let product = state
         .inventory_service
         .update_product(
+            principal.user_id,
             id,
             crate::models::UpdateProduct {
                 sku: payload.sku,
@@ -333,6 +338,7 @@ async fn list_movements(
 async fn create_movement(
     State(state): State<AppState>,
     _: Require<InventoryStockWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateMovementRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let input = NewMovement {
@@ -343,7 +349,7 @@ async fn create_movement(
         reference: payload.reference.unwrap_or_default(),
         date: payload.date,
     };
-    let mov = state.inventory_service.record_movement(input).await?;
+    let mov = state.inventory_service.record_movement(principal.user_id, input).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(mov))))
 }
 
@@ -400,7 +406,6 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::security::test_support;
-
     async fn test_state(allow_stock: bool) -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()

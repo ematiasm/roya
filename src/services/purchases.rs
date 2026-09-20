@@ -659,17 +659,22 @@ where
         let seq = self.sequences.next_number("PURCH", year).await?;
         let purchase_number = format_purchase_number(year, seq);
 
-        // Stock In (reason Purchase) for tracked Product lines only.
+        // Stock In (reason Purchase) for tracked Product lines only. The
+        // movement carries the CONFIRMING request's actor — the same argument
+        // that stamps the finance rows — never a fresh one (AC18).
         for line in &tracked {
             self.inventory
-                .record_movement(NewMovement {
-                    product_id: line.product_id,
-                    qty: line.qty,
-                    movement_type: MovementType::In,
-                    reason: MovementReason::Purchase,
-                    reference: purchase_number.clone(),
-                    date: purchase.purchase_date,
-                })
+                .record_movement(
+                    actor,
+                    NewMovement {
+                        product_id: line.product_id,
+                        qty: line.qty,
+                        movement_type: MovementType::In,
+                        reason: MovementReason::Purchase,
+                        reference: purchase_number.clone(),
+                        date: purchase.purchase_date,
+                    },
+                )
                 .await?;
         }
 
@@ -929,17 +934,21 @@ where
             }
         }
 
-        // Stock Out (reason Purchase-return) for tracked lines.
+        // Stock Out (reason Purchase-return) for tracked lines. The movement
+        // carries the cancelling request's actor, like its refund Income.
         for line in &tracked {
             self.inventory
-                .record_movement(NewMovement {
-                    product_id: line.product_id,
-                    qty: line.qty,
-                    movement_type: MovementType::Out,
-                    reason: MovementReason::PurchaseReturn,
-                    reference: purchase_number.clone(),
-                    date: purchase.purchase_date,
-                })
+                .record_movement(
+                    actor,
+                    NewMovement {
+                        product_id: line.product_id,
+                        qty: line.qty,
+                        movement_type: MovementType::Out,
+                        reason: MovementReason::PurchaseReturn,
+                        reference: purchase_number.clone(),
+                        date: purchase.purchase_date,
+                    },
+                )
                 .await?;
         }
 
@@ -1144,7 +1153,9 @@ mod tests {
         max: &str,
     ) -> crate::models::Product {
         s.inventory
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(s).await,
+                NewProduct {
                 sku: sku.into(),
                 name: format!("prod {sku}"),
                 kind: ProductKind::Product,
@@ -1164,7 +1175,9 @@ mod tests {
 
     async fn seed_service(s: &Svc, sku: &str, cost: &str) -> crate::models::Product {
         s.inventory
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(s).await,
+                NewProduct {
                 sku: sku.into(),
                 name: format!("svc {sku}"),
                 kind: ProductKind::Service,
@@ -1184,7 +1197,9 @@ mod tests {
 
     async fn seed_stock(s: &Svc, product_id: i64, qty: &str) {
         s.inventory
-            .record_movement(NewMovement {
+            .record_movement(
+                audit_actor(s).await,
+                NewMovement {
                 product_id,
                 qty: dec(qty),
                 movement_type: MovementType::In,
@@ -2618,12 +2633,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(kept.0, 1, "existing movements survive the CHECK rebuild");
-        // The widened CHECK accepts the new Purchase-return reason.
+        // The widened CHECK accepts the new Purchase-return reason. The audit
+        // column (slice S10) is NOT NULL: the write carries the sentinel, the
+        // same actor the migration attributed the legacy row to.
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO stock_movements (product_id, qty, type, reason, reference, date) \
-             VALUES (?, '1', 'Out', 'Purchase-return', '2024-PURCH-000001', '2024-01-02')",
+            "INSERT INTO stock_movements (product_id, qty, type, reason, reference, date, created_by) \
+             VALUES (?, '1', 'Out', 'Purchase-return', '2024-PURCH-000001', '2024-01-02', ?)",
         )
         .bind(product_id.0)
+        .bind(actor)
         .execute(&pool)
         .await
         .unwrap();
@@ -2799,5 +2818,50 @@ mod tests {
             reads, 3,
             "one filtered query plus the matching document's lines and payments only, got {reads} reads for 20 purchases"
         );
+    }
+
+    /// AC18, the INVENTORY half of the purchase flow: the stock movement a
+    /// confirmed purchase produces carries the CONFIRMING request's actor —
+    /// the same argument that stamps the flow's finance rows — never a fresh
+    /// one, and it stays distinct from the product's own creator.
+    #[tokio::test]
+    async fn ac18_the_purchase_flow_movement_carries_the_flows_actor() {
+        let (s, pool) = svc().await;
+        let creator = test_support::seed_audit_user(&pool, "pur-alice", "Alice").await.unwrap();
+        let operator = test_support::seed_audit_user(&pool, "pur-bob", "Bob").await.unwrap();
+
+        let acc = seed_account(&s, "purstock").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let prod = seed_product(&s, "PURFLOW", "5").await;
+        // The fixture is seeded by the migration's sentinel: a valid actor,
+        // but distinct from BOTH dedicated users, so the movement assertion
+        // below can tell all three apart.
+        assert_eq!(
+            prod.created_by,
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            "the fixture's actor is the sentinel"
+        );
+        assert_ne!(prod.created_by, creator);
+        assert_ne!(prod.created_by, operator, "the two actors are distinguishable");
+        let sup = seed_supplier(&s, "Pur Flow Sup").await;
+
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(purchase.id, prod.id, dec("3"), Some(dec("4")))
+            .await
+            .unwrap();
+
+        let _detail = s.confirm(operator, purchase.id, Some(cash)).await.unwrap();
+        let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
+        let purchase_move = moves
+            .iter()
+            .find(|m| m.reason == MovementReason::Purchase)
+            .unwrap_or_else(|| panic!("the purchase confirm produced its own movement"));
+        assert_eq!(purchase_move.created_by, operator, "the flow's actor, not a fresh one");
+        assert_ne!(
+            purchase_move.created_by, prod.created_by,
+            "distinct from the product's creator"
+        );
+        assert_eq!(purchase_move.updated_by, None, "an append-only movement has no editor");
     }
 }

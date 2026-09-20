@@ -6,9 +6,13 @@ use std::str::FromStr;
 use crate::error::AppResult;
 use crate::models::{MovementReason, MovementType, NewMovement, StockMovement};
 
+/// The audit actor is an explicit argument on every mutation (M5 Phase B,
+/// slice S10): `actor` is the acting user's id from the request's `Principal`.
+/// For a movement produced inside a sale/purchase confirm, the flow passes ITS
+/// request's actor down — the movement never records a fresh actor (AC18).
 #[async_trait]
 pub trait StockMovementRepository: Send + Sync {
-    async fn create(&self, input: &NewMovement) -> AppResult<StockMovement>;
+    async fn create(&self, actor: i64, input: &NewMovement) -> AppResult<StockMovement>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<StockMovement>>;
     async fn list_by_product(&self, product_id: i64) -> AppResult<Vec<StockMovement>>;
     async fn count_by_product(&self, product_id: i64) -> AppResult<i64>;
@@ -42,6 +46,8 @@ fn row_to_movement(row: sqlx::sqlite::SqliteRow) -> StockMovement {
             .unwrap_or(MovementReason::Purchase),
         reference: row.get("reference"),
         date: row.get("date"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -67,11 +73,11 @@ impl SqliteStockMovementRepository {
 
 #[async_trait]
 impl StockMovementRepository for SqliteStockMovementRepository {
-    async fn create(&self, input: &NewMovement) -> AppResult<StockMovement> {
+    async fn create(&self, actor: i64, input: &NewMovement) -> AppResult<StockMovement> {
         let row = sqlx::query(
-            r#"INSERT INTO stock_movements (product_id, qty, type, reason, reference, date)
-               VALUES (?, ?, ?, ?, ?, ?)
-               RETURNING id, product_id, qty, type, reason, reference, date, created_at"#,
+            r#"INSERT INTO stock_movements (product_id, qty, type, reason, reference, date, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, product_id, qty, type, reason, reference, date, created_by, updated_by, created_at"#,
         )
         .bind(input.product_id)
         .bind(input.qty.to_string())
@@ -79,6 +85,7 @@ impl StockMovementRepository for SqliteStockMovementRepository {
         .bind(input.reason.to_string())
         .bind(&input.reference)
         .bind(input.date)
+        .bind(actor)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_movement(row))
@@ -86,7 +93,7 @@ impl StockMovementRepository for SqliteStockMovementRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<StockMovement>> {
         let row = sqlx::query(
-            r#"SELECT id, product_id, qty, type, reason, reference, date, created_at
+            r#"SELECT id, product_id, qty, type, reason, reference, date, created_by, updated_by, created_at
                FROM stock_movements WHERE id = ?"#,
         )
         .bind(id)
@@ -97,7 +104,7 @@ impl StockMovementRepository for SqliteStockMovementRepository {
 
     async fn list_by_product(&self, product_id: i64) -> AppResult<Vec<StockMovement>> {
         let rows = sqlx::query(
-            r#"SELECT id, product_id, qty, type, reason, reference, date, created_at
+            r#"SELECT id, product_id, qty, type, reason, reference, date, created_by, updated_by, created_at
                FROM stock_movements WHERE product_id = ? ORDER BY date, id"#,
         )
         .bind(product_id)
