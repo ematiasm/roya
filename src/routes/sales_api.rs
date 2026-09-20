@@ -15,6 +15,14 @@ use crate::error::{AppError, AppResult};
 use crate::models::{PaymentType, UpdateSaleDraft};
 use crate::routes::AppState;
 
+// S6 enforcement (AC10): the extractor declares the permission each action
+// needs. Reads are `sales.read`; the draft lifecycle (create, edit, lines,
+// confirm) is `sales.create` — the catalog has no `sales.write`, so recording
+// a sale IS editing the draft; cancelling is its own tier `sales.cancel`;
+// recording money on a confirmed sale is the collection capability
+// `customers.collect` (see the note on `record_payment`).
+use crate::security::authz::{CustomersCollect, Require, SalesCancel, SalesCreate, SalesRead};
+
 // ---------------------------------------------------------------------------
 // Request DTOs (JSON, English names)
 // ---------------------------------------------------------------------------
@@ -84,6 +92,7 @@ pub struct CancelSaleRequest {
 
 async fn list_sales(
     State(state): State<AppState>,
+    _: Require<SalesRead>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let sales = state.sales_service.list_details().await?;
     Ok(Json(serde_json::json!({ "sales": sales })))
@@ -91,6 +100,7 @@ async fn list_sales(
 
 async fn sale_debt(
     State(state): State<AppState>,
+    _: Require<SalesRead>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let debt = state.sales_service.outstanding_debt().await?;
     Ok(Json(serde_json::json!({ "debt": debt })))
@@ -98,6 +108,7 @@ async fn sale_debt(
 
 async fn create_sale(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     Json(payload): Json<CreateSaleRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let customer_id = payload
@@ -120,6 +131,7 @@ async fn create_sale(
 
 async fn get_sale(
     State(state): State<AppState>,
+    _: Require<SalesRead>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let detail = state.sales_service.get_detail(id).await?;
@@ -128,6 +140,7 @@ async fn get_sale(
 
 async fn update_sale(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
@@ -149,6 +162,7 @@ async fn update_sale(
 
 async fn add_line(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     Path(id): Path<i64>,
     Json(payload): Json<AddLineRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
@@ -161,6 +175,7 @@ async fn add_line(
 
 async fn update_line(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     Path(line_id): Path<i64>,
     Json(payload): Json<UpdateLineRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
@@ -173,14 +188,22 @@ async fn update_line(
 
 async fn remove_line(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     Path(line_id): Path<i64>,
 ) -> crate::error::AppResult<StatusCode> {
     state.sales_service.remove_line(line_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+// The code names the capability, not the screen: a payment on a confirmed
+// sale is money received against an owed balance — a collection — so the gate
+// is `customers.collect` and not `sales.create`. The cost is written into the
+// S6 mapping table: a `sales.create`-only principal cannot register a payment
+// on the sale it recorded; no seeded matrix separates the two codes (both
+// `vendedor` and `cajero` hold the pair), so no natural operator is hit.
 async fn record_payment(
     State(state): State<AppState>,
+    _: Require<CustomersCollect>,
     Path(id): Path<i64>,
     Json(payload): Json<RecordPaymentRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
@@ -191,8 +214,14 @@ async fn record_payment(
     Ok((StatusCode::CREATED, Json(serde_json::json!(payment))))
 }
 
+// Confirming IS completing the sale the principal recorded: the cash tender
+// it embeds is part of the sale itself (one Income + payment row created by
+// the same lifecycle step), so the gate stays `sales.create` even though the
+// embedded tender posts money — the standalone payment endpoints are where
+// `customers.collect` draws the line.
 async fn confirm_sale(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     Path(id): Path<i64>,
     Json(payload): Json<ConfirmSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
@@ -202,6 +231,7 @@ async fn confirm_sale(
 
 async fn cancel_sale(
     State(state): State<AppState>,
+    _: Require<SalesCancel>,
     Path(id): Path<i64>,
     Json(payload): Json<CancelSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
@@ -423,6 +453,385 @@ mod tests {
                 "customer_id": customer_id, "payment_type": payment_type,
                 "sale_date": sale_date
             })
+        }
+    }
+
+    // -- S6 enforcement (AC10): the permission gates on the real handlers ------
+
+    /// Same as [`post_json`]/[`get_json`], but with an explicit cookie: `None`
+    /// means the truly anonymous request (the shared TEST_COOKIE belongs to
+    /// the full-permission principal), and `Some(cookie)` drives a probe
+    /// principal minted by [`test_support::seed_session_with_permissions`].
+    async fn send_json_as(
+        app: axum::Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let req = builder
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// One draft sale with a line behind real stock, created by the shared
+    /// full-permission principal, so a limited probe can be refused acting
+    /// on it. Returns (sale_id, line_id).
+    async fn draft_sale_with_line(
+        app: &axum::Router,
+        pool: &sqlx::SqlitePool,
+        sku: &str,
+    ) -> (i64, i64) {
+        let pid = seed_product(app, sku, "Product").await;
+        seed_stock(app, pid, "100").await;
+        let body = draft_body(pool, "Ana Draft", "Credit").await;
+        let (st, v) =
+            send_json_as(app.clone(), "POST", "/api/sales", Some(test_support::TEST_COOKIE), Some(body))
+                .await;
+        assert_eq!(st, StatusCode::CREATED, "seed draft sale: {v}");
+        let sale_id = v["sale"]["id"].as_i64().unwrap();
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale_id}/lines"),
+            Some(test_support::TEST_COOKIE),
+            Some(serde_json::json!({ "product_id": pid, "qty": "2" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "seed line: {v}");
+        let line_id = v["id"].as_i64().unwrap();
+        (sale_id, line_id)
+    }
+
+    /// A principal holding ONLY `sales.read` reads everything and is refused
+    /// every mutation, each naming its own code: the draft lifecycle is
+    /// `sales.create`, cancelling is `sales.cancel`, and money received on a
+    /// sale is the collection capability `customers.collect`.
+    #[tokio::test]
+    async fn ac10_a_sales_read_only_principal_reads_and_is_refused_the_writes() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let (sale, line) = draft_sale_with_line(&app, &pool, "S6-RO").await;
+        let probe = test_support::seed_session_with_permissions(&pool, &["sales.read"])
+            .await
+            .unwrap();
+        let probe_cookie = test_support::cookie_for(&probe);
+
+        // The reads the probe is allowed.
+        let (st, _) = send_json_as(app.clone(), "GET", "/api/sales", Some(&probe_cookie), None).await;
+        assert_eq!(st, StatusCode::OK, "sales.read must open the list");
+        let (st, _) = send_json_as(app.clone(), "GET", "/api/sales/debt", Some(&probe_cookie), None).await;
+        assert_eq!(st, StatusCode::OK, "sales.read must open the debt report");
+        let (st, _) = send_json_as(
+            app.clone(),
+            "GET",
+            &format!("/api/sales/{sale}"),
+            Some(&probe_cookie),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "sales.read must open the detail");
+
+        // Draft creation and header edit: sales.create.
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            "/api/sales",
+            Some(&probe_cookie),
+            Some(draft_body(&pool, "Denied Create", "Credit").await),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            "the refusal must name sales.create: {v}"
+        );
+        let (st, v) = send_json_as(
+            app.clone(),
+            "PUT",
+            &format!("/api/sales/{sale}"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({ "notes": "hacked" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            "the refusal must name sales.create: {v}"
+        );
+
+        // Lines: the same draft-recording gate.
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/lines"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({ "product_id": 1, "qty": "1" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            "the refusal must name sales.create: {v}"
+        );
+        let (st, v) = send_json_as(
+            app.clone(),
+            "PUT",
+            &format!("/api/sales/lines/{line}"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({ "qty": "9", "unit_price": "9" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            "the refusal must name sales.create: {v}"
+        );
+        let (st, v) = send_json_as(
+            app.clone(),
+            "DELETE",
+            &format!("/api/sales/lines/{line}"),
+            Some(&probe_cookie),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+        // Confirm: still the recording tier (the embedded cash tender is part
+        // of the sale itself).
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/confirm"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            "the refusal must name sales.create: {v}"
+        );
+
+        // Cancel: its own tier.
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/cancel"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("sales.cancel"),
+            "the refusal must name sales.cancel: {v}"
+        );
+
+        // Payment on a sale: money received = a collection, customers.collect.
+        let (st, v) = send_json_as(
+            app,
+            "POST",
+            &format!("/api/sales/{sale}/payments"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({ "method_id": 1, "amount": "5", "date": "2024-05-03" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("customers.collect"),
+            "the refusal must name customers.collect: {v}"
+        );
+    }
+
+    /// The refusal writes nothing: the refused draft creation leaves the sales
+    /// table where it was, the refused payment leaves no payment row behind
+    /// the confirmed sale, and a refused cancel keeps the status.
+    #[tokio::test]
+    async fn ac10_a_sales_refusal_writes_nothing() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let (sale, _line) = draft_sale_with_line(&app, &pool, "S6-NOWRITE").await;
+        let probe = test_support::seed_session_with_permissions(
+            &pool,
+            &["sales.read", "customers.read"],
+        )
+        .await
+        .unwrap();
+        let probe_cookie = test_support::cookie_for(&probe);
+
+        let sales_before: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sales").fetch_one(&pool).await.unwrap();
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            "/api/sales",
+            Some(&probe_cookie),
+            Some(draft_body(&pool, "Denied Write", "Credit").await),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let sales_after: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sales").fetch_one(&pool).await.unwrap();
+        assert_eq!(sales_after, sales_before, "a refused create must write nothing");
+
+        // Confirm the sale as the shared principal, then refuse a payment.
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/confirm"),
+            Some(test_support::TEST_COOKIE),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "confirm: {v}");
+        let payments_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/payments"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({ "method_id": 1, "amount": "5", "date": "2024-05-03" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let payments_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(payments_after, payments_before, "a refused payment must write nothing");
+
+        // A refused cancel leaves the sale Confirmed.
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/cancel"),
+            Some(&probe_cookie),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let (st, v) = send_json_as(
+            app,
+            "GET",
+            &format!("/api/sales/{sale}"),
+            Some(test_support::TEST_COOKIE),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["sale"]["status"], "Confirmed", "a refused cancel must not flip the status");
+    }
+
+    /// A principal holding the permissions gets the normal answers: the
+    /// confirmed sale accepts its standalone payment and its cancel.
+    #[tokio::test]
+    async fn ac10_the_sales_holding_principal_gets_the_normal_answer() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let holder = test_support::seed_session_with_permissions(
+            &pool,
+            &[
+                "sales.read",
+                "sales.create",
+                "sales.cancel",
+                "customers.read",
+                "customers.collect",
+            ],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&holder);
+        let (sale, _line) = draft_sale_with_line(&app, &pool, "S6-HOLDER").await;
+        let acc = seed_account(&app, "cajaS6").await;
+        let cash = allow_cash(&pool, acc).await;
+
+        // Confirm: sales.create answers its normal 200.
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/confirm"),
+            Some(&cookie),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "confirm: {v}");
+
+        // Payment: customers.collect answers its normal 201.
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            &format!("/api/sales/{sale}/payments"),
+            Some(&cookie),
+            Some(serde_json::json!({ "method_id": cash, "amount": "10", "date": "2024-05-03" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "payment: {v}");
+
+        // Cancel: sales.cancel answers its normal 200.
+        let (st, v) = send_json_as(
+            app,
+            "POST",
+            &format!("/api/sales/{sale}/cancel"),
+            Some(&cookie),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "cancel: {v}");
+        assert_eq!(v["sale"]["status"], "Cancelled");
+    }
+
+    /// The gate order must not change: an anonymous request gets the JSON
+    /// unauthorized gate, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_json_gate_not_the_permission_refusal() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let (st, v) = send_json_as(app, "GET", "/api/sales", None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        assert_eq!(v["error"], "unauthorized");
+    }
+
+    /// The read gates are real too: a principal WITHOUT `sales.read` (it holds
+    /// an unrelated permission, so this is not a broken fixture) is refused
+    /// every sales read.
+    #[tokio::test]
+    async fn the_read_gates_refuse_a_principal_without_the_read_permission() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let (sale, _line) = draft_sale_with_line(&app, &pool, "S6-NOREAD").await;
+        let probe = test_support::seed_session_with_permissions(&pool, &["customers.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+
+        for uri in ["/api/sales", "/api/sales/debt", &format!("/api/sales/{sale}")] {
+            let (st, v) = send_json_as(app.clone(), "GET", uri, Some(&cookie), None).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{uri}: {v}");
+            assert!(
+                v["error"].as_str().unwrap_or_default().contains("sales.read"),
+                "{uri} must name sales.read: {v}"
+            );
         }
     }
 

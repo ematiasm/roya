@@ -476,7 +476,7 @@ tests built on since S3/S4; the happy-path tests keep granting their own sets th
 
 Final S5 numbers: `cargo test` 544 → **560 passed / 0 failed** (+16 enforcement tests; the 11
 fixture-premise tests returned green with wiring only); `cargo check --all-targets` 0 errors,
-**58 warnings (delta 0 vs HEAD measured the same day)**; allows grep empty;
+**58 warnings (delta 0 vs HEAD measured the same day)**; the dead-code/unused-import allow grep is empty — the two `#[allow` hits a repo-wide grep finds in `src/` predate this feature and suppress nothing here: a `clippy::too_many_arguments` on a smoke-suite helper and a mention inside a doc comment;
 `scripts/e2e.sh -k identity` 4 passed, **-k products 13 passed / 1 skipped (opt-in screenshot
 probe)**, `-k filters` 7 passed. Live probe with the real binary (throwaway DB,
 `ROYA_ADMIN_PASSWORD` set): admin login → `GET /` 200, `GET /products` 200, `GET /web/accounts`
@@ -544,9 +544,189 @@ and the administrator still answers 200.
    codes today, and if a future matrix does, the fix is an OR of the two codes on that one read,
    not a new kernel type.
 
-### S6 — enforcement: sales and customers
-- [ ] T20: `Require<P>` per action, nav gating, and the refusal fragment on the drawer/modal flows.
-- [ ] T21: tests for AC10 and AC21 on the real handlers.
+### S6 — enforcement: sales and customers — ENTREGADA (writer round) 2026-09-20, nav gating deferido a S7
+- [x] T20: `Require<P>` per action on every route of both departments (52 handler gates over 41 route
+      paths: 11 sales API + 12 customers API + 17 sales web + 12 customers web) — **nav gating is NOT in
+      this slice: it stays S7's**, as the S5/S6 briefs fix. The refusal fragments need no new work: the
+      HTMX JSON shape and the full-page refusal card already answer every gated drawer/modal endpoint.
+- [x] T21: tests for AC10 on the real handlers (18 new tests, every one of the 52 gates
+      mutation-validated one gate at a time) — AC21's exposure guard at the HANDLER level is done for
+      both departments; the interface-hiding half is S7, as in S5.
+
+#### S6 enforcement mapping (written by the writer round of 2026-09-20)
+Per-handler `Require<P>` on every route; NO router-level guard (same reason as S5: the modules mix
+read/write/cancel on the same paths). The collection adapters (`/web/sales/{lines,confirm,payments,cancel}`)
+and the path-based handlers they mirror were refactored to share ungated `*_impl` bodies so BOTH
+registered handlers declare their own real gate — see the mutation-table note below.
+
+`src/routes/sales_api.rs`:
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/api/sales` | GET | `sales.read` |
+| `/api/sales/debt` | GET | `sales.read` |
+| `/api/sales/{id}` | GET | `sales.read` |
+| `/api/sales` | POST | `sales.create` |
+| `/api/sales/{id}` | PUT | `sales.create` |
+| `/api/sales/{id}/lines` | POST | `sales.create` |
+| `/api/sales/lines/{line_id}` | PUT | `sales.create` |
+| `/api/sales/lines/{line_id}` | DELETE | `sales.create` |
+| `/api/sales/{id}/payments` | POST | `customers.collect` |
+| `/api/sales/{id}/confirm` | POST | `sales.create` |
+| `/api/sales/{id}/cancel` | POST | `sales.cancel` |
+
+`src/routes/customers_api.rs`:
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/api/customers` | GET | `customers.read` |
+| `/api/customers` | POST | `customers.write` |
+| `/api/customers/ageing` | GET | `customers.read` |
+| `/api/customers/{id}` | GET | `customers.read` |
+| `/api/customers/{id}` | PUT | `customers.write` |
+| `/api/customers/{id}` | DELETE | `customers.write` |
+| `/api/customers/{id}/statement` | GET | `customers.read` |
+| `/api/customers/{id}/activate` | POST | `customers.write` |
+| `/api/customers/{id}/deactivate` | POST | `customers.write` |
+| `/api/customer-receipts` | GET | `customers.read` |
+| `/api/customer-receipts` | POST | `customers.collect` |
+| `/api/customer-receipts/{id}` | GET | `customers.read` |
+
+`src/routes/sales_web.rs`:
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/sales` | GET | `sales.read` |
+| `/sales/{id}` | GET | `sales.read` |
+| `/web/sales` | GET | `sales.read` |
+| `/web/sales` | POST | `sales.create` |
+| `/web/sales/debt` | GET | `sales.read` |
+| `/web/sales/lines` | POST | `sales.create` |
+| `/web/sales/confirm` | POST | `sales.create` |
+| `/web/sales/payments` | POST | `customers.collect` |
+| `/web/sales/cancel` | POST | `sales.cancel` |
+| `/web/sales/{id}` | GET | `sales.read` |
+| `/web/sales/{id}/lines` | POST | `sales.create` |
+| `/web/sales/{sale_id}/lines/{line_id}` | POST | `sales.create` |
+| `/web/sales/{sale_id}/lines/{line_id}` | DELETE | `sales.create` |
+| `/web/sales/{id}/header` | POST | `sales.create` |
+| `/web/sales/{id}/confirm` | POST | `sales.create` |
+| `/web/sales/{id}/payments` | POST | `customers.collect` |
+| `/web/sales/{id}/cancel` | POST | `sales.cancel` |
+
+`src/routes/customers_web.rs`:
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/customers` | GET | `customers.read` |
+| `/customers/{id}` | GET | `customers.read` |
+| `/web/customers` | GET | `customers.read` |
+| `/web/customers` | POST | `customers.write` |
+| `/web/customers/edit` | POST | `customers.write` |
+| `/web/customers/activate` | POST | `customers.write` |
+| `/web/customers/deactivate` | POST | `customers.write` |
+| `/web/customers/delete` | POST | `customers.write` |
+| `/web/customers/detail/{id}` | GET | `customers.read` |
+| `/web/customers/edit-form/{id}` | GET | `customers.read` |
+| `/web/customers/{id}/receipts` | GET | `customers.read` |
+| `/web/customer-receipts` | POST | `customers.collect` |
+
+Mapping decisions worth the reviewer's attention (the four judgement calls the S6 brief named):
+- **A payment on a sale is `customers.collect`, not `sales.create`** (the drawer form, its JSON twin and
+  the collection adapter): the code names the capability, and money received against an owed balance is
+  a collection — the `sale_payments` row posts its own Income transaction, exactly what the
+  customer-receipt collect does per allocation. The cost, recorded deliberately (fail-closed): a
+  principal holding `sales.create` WITHOUT `customers.collect` cannot register a payment on the sale it
+  recorded. No seeded matrix separates the pair (both `vendedor` and `cajero` hold both codes; the
+  protected role holds everything), so no natural operator is hit. The S5 contract holds: if a future
+  matrix separates them, the fix is an OR of the two codes on that one action, not a new kernel type.
+- **The customer-receipt flow (`/api/customer-receipts`, `/web/customer-receipts`) is
+  `customers.collect` for the collect and `customers.read` for its reads**: grouping several invoices
+  into one receipt is the capability the code was written for. Receipt reads are reads of the
+  customer's account (`customers.read`) — the same gate the statement uses — so a read-only operator
+  can see the collections it may not create.
+- **The customer statement (`/api/customers/{id}/statement`, `/customers/{id}`, the drawer detail
+  fragments) is a single `customers.read` gate**, not an AND with `sales.read`: the statement renders
+  THAT customer's own documents as the receivable ledger, which is the customer module's own view; the
+  cost is stated plainly — a `customers.read`-only principal sees the sale documents of that customer
+  (number/date/total), data the receivable is meaningless without — but never the sales list or another
+  customer's sales. Same shape as S5's deliberate consequences; no seeded matrix separates the pair.
+- **The sale-debt page (`/web/sales/debt`, `/api/sales/debt`) is `sales.read`**: the debt summary is
+  unpaid SALES (the sales screen's banner), not customer data. The mirrored cost: a
+  `customers.read`-only collector is refused the sales debt report; `cajero` holds `sales.read`, so no
+  seeded operator is hit.
+- **Confirming a cash sale stays `sales.create` even though it embeds a tender**: the confirm-embedded
+  payment is part of the sale lifecycle itself (one Income + payment row in the same step); the
+  standalone payment endpoints are where `customers.collect` draws the line.
+- **Cross-capability dependency (fail-closed, recorded):** creating a sale needs a customer — the
+  create dialog's selector is rendered server-side into `/sales` (no extra fetch), but the record
+  page's product picker reads `/web/product-search` (`inventory.read`, S5-gated) and an under-permissioned
+  client cannot resolve products it may not see. Seeded sales holders (`vendedor`, `cajero`) hold
+  `inventory.read`, so no natural operator is hit; the server-side `resolve_product_ref` inside
+  `web_add_line` stays a service composition, not a permission grant. Single-code annotations remain
+  the v1 contract; an OR is the documented future shape, per S5.
+
+#### S6 mutation table (writer round — every gate removed, its test observed FAILING, then restored)
+
+The S5 lesson was enforced from the first pass, and it caught a real gap early: the first test wave used
+a read-only probe (holding `sales.read`/`customers.read`) whose READ assertions (expect 200) stay green
+when the read gate is deleted — the exact S5 "no test would notice the removal" class. Caught by the
+first mutation run (3 of 11 sales_api gates survived deletion), fixed by adding a
+`the_read_gates_refuse_a_principal_without_the_read_permission` test to EACH of the four modules (a
+probe holding an UNRELATED permission — never the empty-set probe — so a wrong-permission gate cannot
+pass for a broken fixture). After the fix, all 52 gates bite.
+
+Mutation method: one gate at a time (deleting a whole cluster would only bite at the first refusal of
+each test), test observed failing, gate restored; the final diff keeps every annotation. The four
+sales_web collection adapters initially delegated with a manually constructed `Require::default()`,
+which would have made the inner handlers' gates removal-safe only by compile error; the adapters and
+path handlers now share ungated `*_impl` bodies and each registered handler declares its own gate, so
+every gate fails a test at runtime instead of breaking the build.
+
+| Cluster | Gates | Test(s) that fail when the gate is removed |
+| --- | --- | --- |
+| sales API reads (list, debt, detail) | 3 × `SalesRead` | `the_read_gates_refuse_a_principal_without_the_read_permission` (403→200) |
+| sales API draft lifecycle (create, update, add/update/remove line, confirm) | 7 × `SalesCreate` | `ac10_a_sales_read_only_principal_...` (403→201/200) and, for create, `ac10_a_sales_refusal_writes_nothing` (row count grows) |
+| sales API payment | `CustomersCollect` | both AC10 refusal tests (403→201; payment row count grows) |
+| sales API cancel | `SalesCancel` | both AC10 tests (403→200; status flips to Cancelled) |
+| customers API reads (list, get, ageing, statement, receipts reads) | 6 × `CustomersRead` | `the_read_gates_refuse_a_principal_without_the_read_permission` |
+| customers API entity writes (create, update, delete, activate, deactivate) | 5 × `CustomersWrite` | `ac10_a_customers_read_only_principal_...` and, for create/delete, `ac10_a_customers_refusal_writes_nothing` |
+| customers API collect | `CustomersCollect` | both AC10 tests (receipt count grows) |
+| sales web reads (page, record page, list, debt, detail fragments) | 5 × `SalesRead` | `the_read_gates_refuse_a_principal_without_the_read_permission` |
+| sales web draft lifecycle (create, add/update/remove line, confirm, header) | 6 × `SalesCreate` | `ac10_a_sales_read_only_principal_...` and, for create/confirm, `ac10_the_sales_web_refusal_writes_nothing` |
+| sales web payment (path + collection adapter) | 2 × `CustomersCollect` | the AC10 pair / `the_sales_collection_adapters_carry_their_own_gate` |
+| sales web cancel (path + collection adapter) | 2 × `SalesCancel` | the AC10 pair / `the_sales_collection_adapters_carry_their_own_gate` |
+| sales web collection adapters (lines, confirm) | 2 × `SalesCreate` | `the_sales_collection_adapters_carry_their_own_gate` |
+| customers web reads (page, statement page, list, detail, edit form, receipts fragments) | 6 × `CustomersRead` | `the_read_gates_refuse_a_principal_without_the_read_permission` |
+| customers web entity writes (create, edit, activate, deactivate, delete) | 5 × `CustomersWrite` | `ac10_a_customers_read_only_principal_...` and, for delete, `ac10_the_customers_web_refusal_writes_nothing` |
+| customers web collect | `CustomersCollect` | both AC10 tests (receipt count grows) |
+
+52 gates removed individually → 52 observed failures; no gate needed a forced justification and no
+handler turned out to declare the wrong permission (the four judgement calls above survived the
+mutation review unchanged).
+
+New tests (18, named per module): `ac10_a_sales_read_only_principal_reads_and_is_refused_the_writes`,
+`ac10_a_sales_refusal_writes_nothing`, `ac10_the_sales_holding_principal_gets_the_normal_answer`,
+`the_read_gates_refuse_a_principal_without_the_read_permission`,
+`an_anonymous_request_still_gets_the_json_gate_not_the_permission_refusal` (sales_api); the same
+five-name pattern for customers_api; `ac10_a_sales_read_only_principal_is_refused_the_web_mutations_in_both_shapes`,
+`ac10_the_sales_web_refusal_writes_nothing`, `ac10_the_sales_web_holding_principal_gets_the_normal_answer`,
+`the_sales_collection_adapters_carry_their_own_gate`, plus the read-gate and anonymous tests (sales_web);
+`ac10_a_customers_read_only_principal_is_refused_the_web_mutations`,
+`ac10_the_customers_web_refusal_writes_nothing`,
+`ac10_the_customers_web_holding_principal_gets_the_normal_answer`, plus the read-gate and anonymous
+tests (customers_web).
+
+#### S6 warning ledger re-measure (2026-09-20, end state)
+`cargo check --all-targets` **0 errors, 56 lint warnings (delta 0 vs `main`, measured the ledger way:
+58 raw `warning:` lines minus the 2 per-target summary lines)**. No `#[allow]` attributes added; the dead-code/unused-import allow grep is empty — the two `#[allow` hits a repo-wide grep finds in `src/` predate this feature and suppress nothing here: a `clippy::too_many_arguments` on a smoke-suite helper and a mention inside a doc comment. NO dormant ledger item graduates by warning count in this slice — `Require<P>`
+construction, the refusal shapes and `Principal::has`/`has_permission` had already graduated with S3
+part 2, and this slice only widens their production consumers (52 more handlers). Still dormant:
+`Principal.{username, display_name, must_change_password}` (S7 navigation),
+`role_repo::{count_active_holders, revoke}`, `Role.{created_at, updated_at}`,
+`Permission.{action, created_at}`. The count must still be back at or below 56 by the end of S7, with
+no `#[allow]` attributes as the mechanism. `test_support.rs` needed NO change this slice:
+`seed_session_with_permissions` covered every probe the tests needed.
 
 ### S7 — enforcement: purchases, suppliers, identity, dashboard
 - [ ] T22: `Require<P>` per action, nav gating, dashboard and identity screens gated.
@@ -557,39 +737,38 @@ and the administrator still answers 200.
 - [ ] T25: README (no-auth section, module table, migrations, environment), `env.example`, and
       `openspec/specs/identity/spec.md` promoted; the change folder archived for Phase A.
 
-## WHERE THE FEATURE PAUSES (2026-09-19, after S5) and how to resume
+## WHERE THE FEATURE PAUSES (2026-09-20, after S6) and how to resume
 The parent pauses the feature branch after this slice. State of the ledger when work stops:
 
 **Done (Phase A):** S1a (identity kernel), S1b (deny-by-default gate + login/logout + test plumbing),
 S2 (RBAC core: catalog, guards, `Require<P>`, effective-permission middleware, drift test),
 S3 part 1 (forced password change), S3 part 2 (users administration + the tier-rule correction
-round), S4 (roles administration + permission matrix + its correction round), **S5 (enforcement:
-finance + inventory — this slice; nav-gating deliberately deferred to S7)**.
+round), S4 (roles administration + permission matrix + its correction round), S5 (enforcement:
+finance + inventory), **S6 (enforcement: sales + customers — this slice; nav-gating deliberately
+deferred to S7)**.
 
 **Remaining (in order, one PR each):**
-1. **S6 — enforcement: sales and customers** (T20–T21): per-handler `Require<P>`, nav gating is
-   still S7; tests for AC10/AC21 on the real handlers.
-2. **S7 — enforcement: purchases, suppliers, identity, dashboard** (T22–T23): the LAST enforcement
+1. **S7 — enforcement: purchases, suppliers, identity, dashboard** (T22–T23): the LAST enforcement
    slice; includes the sidebar/navigation hiding by permission (AC21 — needs the principal plumbed
-   into every page struct, the reason S5/S6 left the sidebar alone) and the ledger re-measure
+   into every page struct, the reason S5/S6/S7 leave the sidebar alone) and the ledger re-measure
    (`cargo check --all-targets` back to ≤ 56 with NO `#[allow]` as the mechanism; 56 is what
    `main` measures — see the S5 warning ledger correction).
-3. **S8 — Phase A close** (T24–T25): the browser slice for AC22 and the two browser debts carried
+2. **S8 — Phase A close** (T24–T25): the browser slice for AC22 and the two browser debts carried
    since S1b/S3 — the session-expiry `HX-Redirect` mid-HTMX case and the permission-denied HTMX
    form, still unproven in a real browser — plus README (no-auth section, module table,
    migrations, env vars), `env.example`, promoting `openspec/specs/identity/spec.md` and archiving
    the change folder for Phase A.
-4. **Phase B — audit of the actor per department** (T26–T31): `created_by`/`updated_by` plumbing
+3. **Phase B — audit of the actor per department** (T26–T31): `created_by`/`updated_by` plumbing
    and display, department by department, ending in the spec's audit section and archive.
 
 **Concrete human follow-ups on pause:**
 - The remote branch `feat/roles-administration` still exists on `origin` although its PR #48 is
   already merged into `origin/main` (verified with `git branch -a` on 2026-09-19). Decided: leave it
   un-deleted for now; deleting it is the owner's call, it holds nothing unmerged.
-- This slice has NO work-unit commit yet: the writer does not commit; the parent owns git state —
-  commit `feat/enforcement-finance-inventory` as one work unit before retargeting anything.
+- This slice (S6, `feat/enforcement-sales-customers`) has NO work-unit commit yet: the writer does
+  not commit; the parent owns git state — commit it as one work unit before retargeting anything.
 - On resume: `mem_context` + project/feature-scoped `mem_search`, then read
-  `odd/tasks/identity-rbac.md` and this change folder; the next unfinished task is S6 (T20).
+  `odd/tasks/identity-rbac.md` and this change folder; the next unfinished task is S7 (T22).
 
 ## Phase B — audit
 - [ ] T26 (S9): audit migration for finance tables, actor plumbing, display, tests for AC18-AC19.
