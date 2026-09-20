@@ -14,6 +14,7 @@ never a proposal.
 | [sales](sales/spec.md) | M2 | Sales, lines, payments, document numbering, cash and credit, cancellation |
 | [purchases](purchases/spec.md) | M3 | Suppliers, per-supplier cost history, purchases, purchase orders from the reorder suggestion, cancellation |
 | [customers](customers/spec.md) | M4 | Customers, the protected walk-in, credit rules, derived receivables and ageing, receipts that group a handover across sales |
+| [identity](identity/spec.md) | M5 | Users, revocable sessions, roles with editable permission matrices, the permission catalog, the deny-by-default kernel, the route → permission contract, and the role-grant trail (the actor on business tables is planned, not built) |
 | [verification](verification/spec.md) | — | The two test layers, the boundary between them, the browser harness contract, and the rule that makes a green suite mean something |
 
 ## Architecture invariants
@@ -22,6 +23,8 @@ These hold across every capability and are the rules a new module must respect.
 
 1. **One database, hard logical boundaries.** All modules share `roya.db`. A module writes only
    its own tables and reaches other modules exclusively through their services. No cross-module SQL.
+   Identity is a peer that is not a department: it is a transversal kernel (invariant 12), not one
+   more module.
 2. **Upstream points at downstream, never the reverse.** Sales and purchases may reference accounts,
    products and payment methods. Finance and inventory must never reference sales or purchases.
    Concretely: a foreign key from a payment to the transaction it produced is allowed; the reverse
@@ -59,6 +62,12 @@ These hold across every capability and are the rules a new module must respect.
     in the browser suite and may not be approximated by a Rust test that checks an attribute. And a
     regression test is validated by reintroducing the bug and watching it fail: three times here a test
     that looked like a guard was decoration.
+12. **Authorization is declared at the route, answered by the kernel.** A department handler declares
+    the permission its action needs (`Require<P>`); the security kernel resolves the principal and
+    answers. Deny by default: an undeclared route still needs a valid session, and a route that needs
+    a permission declares it — the route → permission table in the identity spec is the contract.
+    No department reads identity tables or takes the identity service as a dependency; the kernel is
+    transversal and identity is not a department.
 
 ## Verification
 

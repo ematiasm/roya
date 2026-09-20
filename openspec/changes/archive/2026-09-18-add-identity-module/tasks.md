@@ -1117,8 +1117,17 @@ at or below 56 by the end of S7, no `#[allow]` as the mechanism) is CLOSED at 55
       an action the interface offers. The limited principal (role `solo_consulta` holding exactly
       `sales.read`) is built through the roles and users screens; no Rust file, template or migration
       was touched.)
-- [ ] T25: README (no-auth section, module table, migrations, environment), `env.example`, and
+- [x] T25: README (no-auth section, module table, migrations, environment), `env.example`, and
       `openspec/specs/identity/spec.md` promoted; the change folder archived for Phase A.
+      (Done by the close slice, 2026-09-23: `openspec/specs/identity/spec.md` is the present-tense
+      capability spec with the complete route → permission table verified against the code;
+      `openspec/specs/README.md` gained the M5 row and the transversal-kernel invariant; the five
+      department specs gained an Authorization section pointing at that table; the README feature
+      list, project structure, migrations 27–29 and the browser-suite count were updated (the env
+      table and `env.example` were already correct from S1b-iii and were verified, not rewritten);
+      the Phase B scope (T26–T31 below, the actor columns) moved to
+      `openspec/changes/2026-09-19-add-actor-audit/` so this archive records only what was
+      delivered.)
 
 ## WHERE THE FEATURE PAUSES (2026-09-20, after S6) and how to resume
 The parent pauses the feature branch after this slice. State of the ledger when work stops:
@@ -1164,6 +1173,11 @@ deferred to S7)**.
   `odd/tasks/identity-rbac.md` and this change folder; the next unfinished task is S7 (T22).
 
 ## Phase B — audit
+
+> Phase B no longer belongs to this change: it was carried out, untouched, to
+> `openspec/changes/2026-09-19-add-actor-audit/` (proposal, spec, tasks) when Phase A closed, so
+> the archive records only what was delivered. The rows below are kept unchecked as the record of
+> what moved; do not work from this folder.
 - [ ] T26 (S9): audit migration for finance tables, actor plumbing, display, tests for AC18-AC19.
 - [ ] T27 (S10): audit for inventory tables.
 - [ ] T28 (S11): audit for sales and customer receipts.
@@ -1184,7 +1198,7 @@ deferred to S7)**.
 - [ ] Independent verification of each slice before its PR, and a post-merge gate after Phase A.
 
 ## Archiving
-- [ ] On merge of Phase A: create `openspec/specs/identity/spec.md` from AC1-AC17 and AC20-AC23, update the
+- [x] On merge of Phase A: create `openspec/specs/identity/spec.md` from AC1-AC17 and AC20-AC23, update the
       `verification` capability with the new browser cases, and move this change's Phase A scope to
       `openspec/changes/archive/`.
 - [ ] On merge of Phase B: extend `openspec/specs/identity/spec.md` with the audit rules and AC18-AC19, and

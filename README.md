@@ -8,6 +8,16 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
 
 ## Features
 
+- **Identity & RBAC (M5)** — every route is behind a deny-by-default session gate: users with
+  argon2id credentials, revocable sessions (sha256 token hash only, SQL-decided validity, absolute
+  TTL with a 30-minute sliding renewal), a permission catalog seeded by migration and compared to
+  the compiled one by a drift test, roles whose permission matrix is edited from the interface
+  (`/users`, `/roles`), a protected `admin` role and last-administrator guarantees enforced by
+  database triggers, the navigation rendering only the entries the principal may read, and role
+  grants recording who granted them (`user_roles.granted_by`/`granted_at`). Every department route
+  declares the permission its action needs; the kernel answers — see
+  `openspec/specs/identity/spec.md` for the complete route → permission table. Recording the actor
+  on every business table is planned, not built (Phase B, `openspec/changes/2026-09-19-add-actor-audit/`).
 - **Account** — `id, name, cached_balance, created_at`
 - **Transaction** — `id, account_id (FK), kind (Income/Expense), amount (Decimal), description, reference (nullable, opaque), date (NaiveDate), created_at`
 - Balance is **always derived** `SUM(Income) - SUM(Expense)` — `cached_balance` is kept in sync transactionally but never trusted for reads.
@@ -151,6 +161,9 @@ src/
   models.rs      — entities + DTOs
   db.rs          — pool + embedded migrations
   error.rs       — thiserror + IntoResponse
+  security/      — the identity kernel: password.rs (argon2id), session.rs (cookie),
+                   authz.rs (principal, permission catalog, Require<P>, nav view), guard.rs
+                   (deny-by-default middleware), test_support.rs (the shared authenticated test helper)
   services/      — business rules (balance guards, validation)
   repositories/  — AccountRepository / TransactionRepository traits + SQLite impls
   routes/        — api.rs (JSON) + web.rs (Askama/HTMX)
@@ -256,6 +269,16 @@ Current migrations:
 - `20240101000026_create_identity_sessions.sql` — `sessions` (S1a: one row per login,
   only the sha256 digest of the cookie token is stored, validity decided in SQL,
   permanent revocation guarded by a trigger)
+- `20240101000027_create_identity_rbac.sql` — `roles`, `permissions` (the 23-code seeded
+  catalog), `role_permissions`, `user_roles` with the `granted_by`/`granted_at` grant trail;
+  seeded `admin` (protected, holds the whole catalog) plus `vendedor`, `cajero`, `deposito`
+  with their matrices, every insert guarded so re-running cannot duplicate
+- `20240101000028_create_identity_guards.sql` — the lockout triggers: a protected role cannot be
+  deleted, renamed or have its permission rows removed; the last active holder of the protected
+  role cannot be deactivated or lose its grant
+- `20240101000029_clarify_identity_permission_descriptions.sql` — corrected seeded descriptions
+  for the two `identity.*` manage codes (they now say exactly what the gate allows; the AC12 drift
+  test compares descriptions as well as codes)
 
 ## REST API
 
@@ -647,7 +670,7 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
 
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
-Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases), Catalogue (Products, Suppliers, Customers) and Cash (Accounts, currently the dashboard section). Each page's rendering struct carries a nav key and the server marks the active entry, so the state is correct without JavaScript. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path. A response that carries its own server-rendered notice wins over the generic `<action> saved` text: the create-under-filter answer swaps its notice out of band into `#notice` (`templates/partials/notice.html`) and marks it `data-notice-server`, which `base.html` reads to skip the generic one. The name travels in the body rather than an `HX-Trigger` payload because product names are arbitrary UTF-8: a raw non-ASCII header value reaches the client as mojibake, since XHR decodes header bytes as ISO-8859-1 (`HeaderValue` itself accepts bytes >= 0x80), and re-encoding the name into ASCII by hand is the fragile part, not the header.
+Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases), Catalogue (Products, Suppliers, Customers), Cash (Accounts, currently the dashboard section) and Account (Users, Roles, Password). Each page's rendering struct carries a nav view built from the request's principal, so the server renders only the entries that principal may read (each entry declares the permissions its href and named blocks need — the mapping lives in `authz::NAV_ENTRIES` and is drift-tested) and hides a group heading when nothing in it is visible; the active entry is marked server-side, so the state is correct without JavaScript. The signed-in user's display name and username sit next to the logout control. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path. A response that carries its own server-rendered notice wins over the generic `<action> saved` text: the create-under-filter answer swaps its notice out of band into `#notice` (`templates/partials/notice.html`) and marks it `data-notice-server`, which `base.html` reads to skip the generic one. The name travels in the body rather than an `HX-Trigger` payload because product names are arbitrary UTF-8: a raw non-ASCII header value reaches the client as mojibake, since XHR decodes header bytes as ISO-8859-1 (`HeaderValue` itself accepts bytes >= 0x80), and re-encoding the name into ASCII by hand is the fragile part, not the header.
 
 ## Styles & local assets
 
@@ -866,6 +889,9 @@ src/services/customers.rs  — customer CRUD, walk-in protection, duplicate-name
 src/services/customer_receipts.rs — collect oldest-first: one receipt grouping one payment per covered sale
 src/services/suppliers.rs  — supplier CRUD + product/supplier satellite cost rule
 src/services/purchases.rs  — Draft/Confirm/Pay/Cancel + suggestion builder (orchestrates stock, finance, satellite)
+src/services/identity.rs   — identity: bootstrap admin, login with constant-time verification and
+                             the generic failure, the in-memory throttle, session mint/resolve/
+                             renew/revoke, password change, the users and roles tier rules
 src/repositories/account_repo.rs
 src/repositories/transaction_repo.rs
 src/repositories/category_repo.rs
@@ -878,6 +904,10 @@ src/repositories/customer_receipt_repo.rs — receipt document + allocations rea
 src/repositories/supplier_repo.rs      — Supplier SQLite impl (RESTRICT-aware delete)
 src/repositories/product_supplier_cost_repo.rs — satellite cost SQLite impl
 src/repositories/purchase_repo.rs      — Purchase/PurchaseLine/PurchasePayment SQLite impl
+src/repositories/user_repo.rs          — User SQLite impl (NOCASE username, active flag)
+src/repositories/session_repo.rs       — Session SQLite impl (SQL-decided validity, sliding renewal)
+src/repositories/role_repo.rs          — Role SQLite impl (holders, grant replacement)
+src/repositories/permission_repo.rs    — Permission SQLite impl (catalog, role matrix)
 src/repositories/doc_sequence_repo.rs  — atomic YYYY-SALE-NNNNNN / YYYY-PURCH-NNNNNN numbering
 src/routes/api.rs
 src/routes/web.rs
@@ -890,10 +920,19 @@ src/routes/customers_web.rs — Web /customers + statement Askama + HTMX
 src/routes/purchases_api.rs — REST /api/suppliers, /api/product-supplier-costs, /api/purchases
 src/routes/purchases_web.rs — Web /purchases Askama + HTMX (incl. Sugerido)
 src/routes/suppliers_web.rs — Web /suppliers Askama + HTMX
+src/routes/identity_web.rs — GET/POST /login, POST /logout, GET/POST /password
+src/routes/identity_api.rs — POST/DELETE /api/sessions (JSON session API)
+src/routes/users_web.rs    — Web /users: list, create, deactivate/activate, password reset, roles
+src/routes/roles_web.rs    — Web /roles: list, create, edit, delete, permission matrix
 src/routes/mod.rs
 templates/base.html
 templates/dashboard.html
 templates/account_detail.html
+templates/login.html
+templates/password.html
+templates/forbidden.html   — the full-page 403 card (navigation obeys the same rule)
+templates/users.html
+templates/roles.html
 templates/products.html
 templates/sales.html
 templates/customers.html
@@ -901,7 +940,9 @@ templates/purchases.html
 templates/suppliers.html
 templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_list.html,
                              purchase_detail.html, supplier_list.html, suggestion_list.html,
-                             customer_list.html, customer_statement.html, receipt_list.html
+                             customer_list.html, customer_statement.html, receipt_list.html,
+                             sidebar.html (the permission-gated navigation), user_list.html,
+                             role_list.html, user_roles_form.html, user_password_form.html
 migrations/*.sql
 assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/, @theme palette)
 static/tailwind.css        — compiled stylesheet (committed; rebuild via scripts/build-css.sh)
@@ -915,12 +956,18 @@ scripts/build-css.sh       — regenerates static/tailwind.css with the standalo
 
 - No Diesel/SeaORM.
 - No microservices, no mandatory Docker (just `cargo run`).
-- **Auth (S1 identity)**: every route except `/login`, `POST /api/sessions`,
-  `DELETE /api/sessions` and `/static/*` is behind a deny-by-default session
-  gate. The bootstrap `admin` user is seeded at startup (password from
-  `ROYA_ADMIN_PASSWORD` or generated and logged once); the session cookie is
-  `HttpOnly`, `SameSite=Lax`, `Path=/`, with a 12h absolute TTL and revocation
-  on logout. Unsafe HTTP methods are additionally refused cross-origin.
+- **Auth (S1/S2 identity)**: every route except `/login` (GET/POST), `POST/DELETE /api/sessions`,
+  `/static/*` and `GET /favicon.ico` is behind a deny-by-default session gate — an undeclared route is still refused,
+  and every department handler additionally declares the permission its action needs
+  (`Require<P>`): refused with `403` in the shape the caller reads (JSON for `/api/*` and HTMX, an
+  HTML card for a full page). The bootstrap `admin` user is seeded at startup (password from
+  `ROYA_ADMIN_PASSWORD` or generated and logged once, confined to `/password` until changed); the
+  session cookie is `HttpOnly`, `SameSite=Lax`, `Path=/`, with a 12h absolute TTL, a 30-minute
+  sliding renewal and revocation on logout; failed logins are throttled per username and unsafe
+  HTTP methods are refused cross-origin. Roles and their permission matrices are editable at
+  `/roles`, users at `/users` (tiered: reads `identity.users.read`, mutations
+  `identity.users.manage`, role sets and the roles screen `identity.roles.manage`), and the sidebar
+  renders only the entries the principal may read.
 - `tower-http` trace + cors + static file serving (`ServeDir`).
 
 ## Tests (manual)
@@ -1019,8 +1066,10 @@ its own Node runtime inside the suite's virtual environment):
 scripts/e2e.sh          # headless; see e2e/README.md for setup and options
 ```
 
-The suite builds the binary once, spawns it against a throwaway SQLite file on a
-free port whose isolation it proves from the server's own log, seeds data through
+The suite currently covers 62 tests (plus 4 opt-in probes — two screenshot probes and two
+artifact probes — that skip by default, `ROYA_E2E_*_PROBE=1`). It builds the binary once, spawns it
+against a throwaway SQLite file on a free port whose isolation it proves from the server's own
+log, seeds data through
 the HTTP API reading each step's effect back, and writes a Playwright trace,
 screenshot and server log only when a test fails. Because the login gate is
 deny-by-default, the harness spawns the binary with a fixed test

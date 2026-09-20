@@ -49,6 +49,15 @@ ON DELETE SET NULL), `unit` (short free text: `un`, `kg`, `lt`, `m`, `hs`), `sal
   create forms.
 - Configuration: `ALLOW_NEGATIVE_STOCK` (default `true`).
 
+## Authorization
+Every inventory route requires the permission its action declares, enforced by the security kernel —
+the route → permission table in `identity/spec.md` is the authority. The product drawer
+(`/web/products/detail/{id}`) is double-gated `inventory.read` AND `purchases.costs.read`: it
+renders per-supplier cost rows owned by the purchases department, and its cost forms write with the
+data owner's code (`purchases.costs.write`) even though the form lives in this department's page.
+This is also a cross-capability pair: the product picker other screens read (`/web/product-search`)
+is `inventory.read`, so a sales recorder needs the inventory read it holds in every seeded matrix.
+
 ## Verification
 `src/services/inventory.rs` (acceptance criteria AC1–AC7 and their triangulation cases) and
 `src/routes/inventory_api.rs`. The smoke suite exercises the product and stock paths through the real
