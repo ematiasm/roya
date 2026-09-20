@@ -91,7 +91,7 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
       superficie de usuarios queda para S7, ver S3 part 2 en Progreso)
 - [x] S4 — Administración de roles y matriz de permisos (T16–T17)
 - [ ] S5 — Enforcement: finanzas e inventario (T18–T19)
-- [ ] S6 — Enforcement: ventas y clientes (T20–T21)
+- [x] S6 — Enforcement: ventas y clientes (T20–T21; nav gating queda para S7)
 - [ ] S7 — Enforcement: compras, proveedores, identidad y dashboard (T22–T23)
 - [ ] S8 — Cierre de Fase A: slice de navegador + README + specs (T24–T25)
 - [ ] Fase B — Auditoría del actor por departamento (T26–T31)
@@ -700,40 +700,39 @@ resueltos así (sin commits: el orquestador maneja el git):
   con una descripción cambiada de un solo lado (falla nombrando el código y las dos cadenas) y
   restaurado en verde; `scripts/e2e.sh -k identity` 4 passed.
 
-## DÓNDE SE FRENA EL FEATURE (post-S5, 2026-09-19) y cómo se retoma
+## DÓNDE SE FRENA EL FEATURE (post-S6, 2026-09-20) y cómo se retoma
 El orquestador frena el feature después de esta slice. Estado al frenar:
 
 **Entregado (Fase A):** S1a (núcleo del kernel), S1b (portón + login/logout + plumbing de test),
 S2 (núcleo RBAC: catálogo, guardas, `Require<P>`, resolución efectiva por middleware, drift test),
 S3-i (cambio de contraseña obligatorio), S3-ii (administración de usuarios + ronda de corrección),
-S4 (administración de roles + matriz + ronda de corrección), **S5 (enforcement de finanzas e
-inventario — esta slice; ocultamiento del nav deferido a S7 por diseño del brief)**.
+S4 (administración de roles + matriz + ronda de corrección), S5 (enforcement de finanzas e
+inventario), **S6 (enforcement de ventas y clientes — esta slice; ocultamiento del nav deferido a
+S7 por diseño del brief)**.
 
 **Falta (en orden, un PR por slice):**
-1. **S6 — enforcement de ventas y clientes** (T20–T21): `Require<P>` por acción; el nav gating
-   sigue siendo de S7; tests de AC10/AC21 sobre los handlers reales.
-2. **S7 — enforcement de compras, proveedores, identidad y dashboard** (T22–T23): la ÚLTIMA slice
+1. **S7 — enforcement de compras, proveedores, identidad y dashboard** (T22–T23): la ÚLTIMA slice
    de enforcement; incluye el ocultamiento del sidebar por permiso (AC21 — exige enchufar el
    `Principal` en cada struct de página, la razón por la que S5/S6 no tocaron el nav) y el
    re-measure del ledger (`cargo check --all-targets` de vuelta a ≤ 56 sin `#[allow]` como
    mecanismo).
-3. **S8 — cierre de Fase A** (T24–T25): la slice de navegador para AC22 y las dos deudas de
+2. **S8 — cierre de Fase A** (T24–T25): la slice de navegador para AC22 y las dos deudas de
    navegador arrastradas desde S1b/S3 — la expiración de sesión con `HX-Redirect` en pleno HTMX y
    el formulario HTMX rechazado por permisos, sin probarse todavía en un navegador real — más
    README (sección no-auth, tabla de módulos, migraciones, variables), `env.example`, el promote
    de `openspec/specs/identity/spec.md` y el archivado del change folder.
-4. **Fase B — auditoría del actor por departamento** (T26–T31): `created_by`/`updated_by` y su
+3. **Fase B — auditoría del actor por departamento** (T26–T31): `created_by`/`updated_by` y su
    visualización, departamento por departamento, cerrando con la sección de auditoría de la spec.
 
 **Pendientes concretos de humano al frenar:**
 - La rama remota `feat/roles-administration` sigue en `origin` aunque su PR #48 ya está mergeado
   en `origin/main` (verificado con `git branch -a` el 2026-09-19). Decisión registrada: queda SIN
   borrar; borrarla es decisión del dueño, no tiene nada sin mergear.
-- Esta slice NO tiene commit de unidad de trabajo todavía: el writer no commitea; el orquestador
-  maneja el git — commitear `feat/enforcement-finance-inventory` como una unidad antes de
+- Esta slice (S6, `feat/enforcement-sales-customers`) NO tiene commit de unidad de trabajo todavía:
+  el writer no commitea; el orquestador maneja el git — commitearla como una unidad antes de
   retargetear cualquier PR.
 - Al reanudar: `mem_context` + `mem_search` por proyecto/feature, releer
-  `odd/tasks/identity-rbac.md` y el change folder; la próxima tarea sin terminar es S6 (T20).
+  `odd/tasks/identity-rbac.md` y el change folder; la próxima tarea sin terminar es S7 (T22).
 
 ### S5 — ronda de corrección (verificación independiente: COMMIT WITH NOTED RISK, 2026-09-19)
 Un MAJOR de cobertura y dos NITs. Texto + tests; ninguna anotación cambió de valor.
@@ -777,3 +776,53 @@ Números de la ronda: `cargo test` 560 → **566 passed / 0 failed** (+6, todos 
 `cargo check --all-targets` 0 errores, **56 warnings** (método corregido: sin líneas de resumen);
 grep de allows vacío; `scripts/e2e.sh -k identity` 4 passed, `-k products` 13 passed / 1 skipped
 (probe opt-in). `git diff --stat` de la ronda: 2 archivos, +238 (sólo tests).
+
+### S6 — enforcement de ventas y clientes (T20–T21; ronda de writer, 2026-09-20)
+Branch `feat/enforcement-sales-customers` desde `main` actualizado (checkout ya montado por el
+orquestador). Superficies usadas: `sales_api.rs`, `sales_web.rs`, `customers_api.rs`,
+`customers_web.rs`, `tasks.md` (openspec) y este ledger. `authz.rs`, `test_support.rs`,
+`models.rs`, `error.rs` y los servicios NO cambiaron: `seed_session_with_permissions` sostuvo
+todas las probes que los tests necesitaron.
+
+- **Las 52 gates anotadas** (41 rutas: 11 sales API + 12 customers API + 17 sales web + 12
+  customers web; tabla completa y decisiones en `tasks.md`, sección S6). Per-handler, sin guard
+  router-level. `sales.cancel` tiene gate propio en sus 3 endpoints (API, web path, adapter).
+- **Los cuatro juicios del brief decididos y escritos:** pago sobre una venta =
+  `customers.collect` (la capacidad es cobrar dinero sobre un saldo; el costo para el tier de
+  ventas queda escrito — un principal con sólo `sales.create` no puede registrar el pago de la
+  venta que registró); customer-receipts = `customers.collect` con lecturas `customers.read`;
+  estado de cuenta = `customers.read` solo (el ledger del cliente es vista propia del módulo de
+  clientes; el costo — ver documentos de venta de ESE cliente — queda escrito); página de deuda de
+  ventas = `sales.read` (es deuda de VENTAS, no dato de cliente). Confirmar una venta sigue siendo
+  `sales.create` aunque incruste el cobro del contado (el pago incrustado es parte del ciclo de la
+  venta misma). Ninguna matriz sembrada separa los pares de códigos, así que ningún operador
+  natural pisa los costos (fail-closed documentado, mismo contrato que S5).
+- **18 tests nuevos** (AC10 sobre los handlers reales): por módulo — probe de solo-lectura que lee
+  todo y es rechazada en cada mutación nombrando su código (JSON para `/api/*` y HTMX, HTML de
+  página completa para el POST de navegador), un probe SIN el permiso de lectura (con un permiso
+  NO relacionado, no el conjunto vacío) que pinnea las gates de lectura, un holder que obtiene sus
+  estados normales, pruebas de no-escritura (conteos de filas y status que no se voltea), y el
+  test de orden de gates (anónimo → login redirect / 401 JSON, nunca 403 de permiso).
+- **La lección de S5 mordió temprano y fue cerrada en la ronda:** la primera pasada de tests usaba
+  un probe read-only cuyas aserciones de lectura (esperar 200) siguen verdes sin la gate de
+  lectura — la primera corrida de mutaciones mostró 3 de 11 gates de sales_api sin morder. Cerrado
+  con `the_read_gates_refuse_a_principal_without_the_read_permission` en cada módulo; después, las
+  52 gates mordieron una por una (método: quitar UNA gate, observar el test FALLANDO, restaurar).
+- **Refactor del delegation:** los 4 adapters de colección de sales web (`/web/sales/{lines,
+  confirm,payments,cancel}`) y los handlers de path ya no comparten el marcador construido a mano
+  (`Require::default()`): ambos handlers registrados declaran su propia gate real y comparten
+  cuerpos `*_impl` SIN gate, de modo que quitar cualquiera de las dos gates compila y hace fallar
+  exactamente al test que la pinnea (antes, quitar la gate del handler interno era un error de
+  compilación, no una mordida de test).
+- Números de la ronda: `cargo test` 566 → **587 passed / 0 failed** (+18); `cargo check
+  --all-targets` 0 errores, **56 warnings** (delta 0, método del ledger); grep de allows vacío;
+  `scripts/e2e.sh -k identity` 4 passed, `-k parties` 9 passed / 1 skipped (probe opt-in).
+  Probe en vivo con el binario real (DB desechable, `ROYA_ADMIN_PASSWORD` set): anónimo 303 a
+  `/login?next=%2Fsales` y 401 JSON en `/api/sales`; admin → `GET /sales` 200, `GET /customers`
+  200, `POST /web/customers` 303; usuario real `caja1` creado y asignado POR LAS PANTALLAS
+  (`POST /web/users` 303, rol `limitado` creado por pantalla con matriz `sales.read` +
+  `customers.read` por `/web/roles/matrix`, asignado por `/web/users/roles`), confinado →
+  `/password` lo desbloquea; después: `POST /web/customers` 403 (HTMX JSON nombrando
+  `customers.write`), `POST /api/sales` 403 `sales.create`, `POST /api/customer-receipts` 403
+  `customers.collect`, `DELETE /api/customers/1` 403 `customers.write` — y el admin sigue en 200.
+  `git diff --stat` de la ronda: 4 archivos fuente, +1601/−10, más los dos documentos.
