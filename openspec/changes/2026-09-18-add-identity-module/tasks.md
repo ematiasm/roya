@@ -157,9 +157,12 @@ codes_for_role->used by assign_roles only}` — actually `codes_for_role` gradua
 self-lockout rule reads it); remaining `permission_repo::{list, set_role_permissions, row_to_permission,
 map_db_err}` and the `Permission` struct are S4. `Principal.{username, display_name,
 must_change_password}` and `Role.{description, created_at, updated_at}` remain S4/S5-S7. The count
-must still be back at or below 58 by the end of S7, with no `#[allow]` attributes as the mechanism.
+must still be back at or below 56 by the end of S7 (the running target has been 56 all along —
+`main` measures 56 with the summary-lines-excluded count; the 58 that circulated in the S2 era
+included the two per-target summary lines), with no `#[allow]` attributes as the mechanism.
 
-**Requirement:** the count must be back at or below 58 by the end of S7, with **no
+**Requirement:** the count must be back at or below 56 by the end of S7, with **no
+`#[allow(dead_code)]` / `#[allow(unused_imports)]` attributes as the mechanism**: each, with **no
 `#[allow(dead_code)]` / `#[allow(unused_imports)]` attributes as the mechanism**: each
 consuming slice makes its surface reachable (S3 and S4 cover the repositories and
 service methods, S5-S7 cover the extractor, the refusal shapes and the principal
@@ -320,11 +323,226 @@ their templates. Still dormant for their slices: `role_repo::{count_active_holde
 lives on the users screen, so their natural consumer is a future holder-view flow; noted for
 S7's re-measure), `Role.{created_at, updated_at}`, `Permission.{action, created_at}` and
 `Principal.{username, display_name, must_change_password}` (S5-S7). The count must still be
-back at or below 58 by the end of S7, with no `#[allow]` attributes as the mechanism.
+back at or below 56 by the end of S7, with no `#[allow]` attributes as the mechanism.
 
-### S5 — enforcement: finance and inventory
-- [ ] T18: `Require<P>` per action on every route of both departaments, nav gating, 403 fragment for HTMX.
-- [ ] T19: tests for AC10 on the real handlers, AC21, and the exposure guard over the two departaments.
+### S5 — enforcement: finance and inventory (T18–T19) — ENTREGADA 2026-09-19, con el nav gating deferido a S7
+- [x] T18: `Require<P>` per action on every route of both departaments (per-handler everywhere; the
+      drawer fragment carries a double gate) — **nav gating is NOT in this slice: it stays S7's**, as
+      the S5 brief fixes ("Do not gate the navigation: hiding sidebar entries needs the principal
+      plumbed into every page struct, which is S7's slice"). The 403 shapes already existed; this
+      slice's handlers are their first finance/inventory consumers.
+- [x] T19: tests for AC10 on the real handlers (16 new tests, mutation-validated) — AC21's exposure
+      guard at the HANDLER level is done for both departments; the interface-hiding half of AC21 is
+      S7. The full-surface exposure guard grep belongs to S7's T23.
+
+#### S5 warning ledger re-measure (2026-09-19, CORRECTED in the verification round)
+Final measurement, in the slice's end state, counting only lint warnings (the two per-target
+`generated N warnings` summary lines are not lint warnings and must not be counted):
+**56 warnings, delta 0 — the brief's number and the S4 note were both correct.** The writer's
+first pass recorded 58 on both the branch and a throwaway HEAD copy because the count script
+included the two summary lines; the re-measure method (raw `warning:` lines minus summaries)
+settles the running record back at **56 both sides**. No `#[allow]` attributes; the grep stays
+empty. NO dormant ledger item graduates by warning count in this slice: the items the S2 table
+attributed to S5 (`Require<P>` construction, `forbidden_response`, `ForbiddenTemplate`,
+`Principal::has`/`has_permission`) had already graduated with S3 part 2's `/users` routes; S5
+widens their production consumers (30+ finance/inventory handlers) without moving the count.
+Still dormant: `Principal.{username, display_name, must_change_password}` (S7 navigation),
+`role_repo::{count_active_holders, revoke}`, `Role.{created_at, updated_at}`,
+`Permission.{action, created_at}`. The count must still be back at or below 56 by the end of S7,
+with no `#[allow]` attributes as the mechanism. (The earlier "≤ 58" target in this section and
+the D2/S2 requirement text carry the same stale number — S7's re-measure must use 56, which is
+what `main` has always measured.)
+
+#### S5 enforcement mapping (written by the writer round of 2026-09-19)
+Per-handler `Require<P>` on every finance and inventory route; NO router-level guard is used — each
+module mixes read/write/stock-write on the same paths, so a module-level layer would over-gate the
+reads. One handler (the product drawer fragment) declares TWO extractors because it renders two
+owners' data (see the note below). Purchases/sales/customers/suppliers routes are untouched (S6/S7).
+
+`src/routes/api.rs` (finance JSON):
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/api/accounts` | GET | `finance.read` |
+| `/api/accounts` | POST | `finance.methods.manage` |
+| `/api/accounts/{id}` | GET | `finance.read` |
+| `/api/payment-methods` | GET | `finance.read` |
+| `/api/accounts/{id}/payment-methods` | GET | `finance.methods.manage` |
+| `/api/accounts/{id}/payment-methods` | PUT | `finance.methods.manage` |
+| `/api/transactions` | GET | `finance.read` |
+| `/api/transactions` | POST | `finance.write` |
+| `/api/transactions/{id}` | PUT | `finance.write` |
+| `/api/transactions/{id}` | DELETE | `finance.write` |
+
+`src/routes/web.rs` (dashboard + finance HTML/HTMX):
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/` | GET | `dashboard.read` |
+| `/accounts/{id}` | GET | `finance.read` |
+| `/accounts/{id}/payment-methods` | POST | `finance.methods.manage` |
+| `/web/accounts` | GET | `finance.read` |
+| `/web/accounts` | POST | `finance.methods.manage` |
+| `/web/account-options` | GET | `finance.read` |
+| `/web/transactions` | GET | `finance.read` |
+| `/web/transactions` | POST | `finance.write` |
+| `/web/transactions/{id}` | DELETE | `finance.write` |
+
+`src/routes/inventory_api.rs`:
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/api/categories` | GET | `inventory.read` |
+| `/api/categories` | POST | `inventory.write` |
+| `/api/categories/{id}` | GET | `inventory.read` |
+| `/api/categories/{id}` | PUT | `inventory.write` |
+| `/api/categories/{id}` | DELETE | `inventory.write` |
+| `/api/products` | GET | `inventory.read` |
+| `/api/products` | POST | `inventory.write` |
+| `/api/products/{id}` | GET | `inventory.read` |
+| `/api/products/{id}` | PUT | `inventory.write` |
+| `/api/products/{id}` | DELETE | `inventory.write` |
+| `/api/products/{id}/stock` | GET | `inventory.read` |
+| `/api/products/{id}/barcodes` | GET | `inventory.read` |
+| `/api/products/{id}/barcodes` | POST | `inventory.write` |
+| `/api/stock-movements` | GET | `inventory.read` |
+| `/api/stock-movements` | POST | `inventory.stock.write` |
+| `/api/low-stock` | GET | `inventory.read` |
+| `/api/negative-stock` | GET | `inventory.read` |
+
+`src/routes/inventory_web.rs` (products screen):
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/products` | GET | `inventory.read` |
+| `/web/products` | GET | `inventory.read` |
+| `/web/products` | POST | `inventory.write` |
+| `/web/categories` | POST | `inventory.write` |
+| `/web/category-options` | GET | `inventory.read` |
+| `/web/product-options` | GET | `inventory.read` |
+| `/web/product-search` | GET | `inventory.read` |
+| `/web/products/detail/{id}` | GET | `inventory.read` AND `purchases.costs.read` (two extractors) |
+| `/web/products/edit` | POST | `inventory.write` |
+| `/web/products/activate` | POST | `inventory.write` |
+| `/web/products/deactivate` | POST | `inventory.write` |
+| `/web/products/delete` | POST | `inventory.write` |
+| `/web/product-costs` | POST | `purchases.costs.write` |
+| `/web/product-costs/preferred` | POST | `purchases.costs.write` |
+| `/web/stock-movements` | POST | `inventory.stock.write` |
+| `/web/low-stock` | GET | `inventory.read` |
+| `/web/negative-stock` | GET | `inventory.read` |
+
+Mapping decisions worth the reviewer's attention:
+- Account creation (`POST /api/accounts`, `POST /web/accounts`) is gated `finance.methods.manage`, not
+  `finance.write`: the seeded description of that code is "Administrar cuentas y medios de pago" and
+  `finance.write`'s is "Registrar y editar movimientos" — the ledger structure is the manage tier.
+- `GET /api/payment-methods` stays `finance.read` (a read of the methods catalog); the ALLOWLIST
+  endpoints (both directions of `/api/accounts/{id}/payment-methods` and the web save) are the
+  `finance.methods.manage` surface.
+- Known consequence, recorded deliberately (fail-closed, not a hole): a principal holding ONLY
+  `finance.methods.manage` is refused `GET /api/payment-methods` — the catalog of the very
+  payment methods it may administer. No seeded matrix separates the codes (whoever holds
+  `methods.manage` also holds `finance.read` in every catalog matrix, and the protected role
+  holds everything), so no operator hits it today. If a future matrix separates them, the
+  correct shape is an OR of the two codes on that one read — do NOT invent a new kernel type for
+  it; the single-code annotation stays the v1 contract.
+- The account-detail page is a finance READ (`finance.read`): a read-only operator can view the
+  account and its transactions; the allowlist form it renders is refused server-side on submit. The
+  interface hiding is S7 (AC21), the handler is the enforcement.
+- `/web/products/detail/{id}` (the product drawer) requires `inventory.read` AND
+  `purchases.costs.read`: the fragment renders per-supplier cost rows, so an inventory-only principal
+  must get the refusal instead of cost data it may not see (the seeded `deposito` role holds both).
+- `POST /web/product-costs{,/preferred}` carry `purchases.costs.write` — the codes of the module that
+  owns the data, as the S5 brief fixes, even though the form lives in the product drawer.
+- Residual noted honestly: a principal holding `purchases.costs.write` WITHOUT `inventory.read` that
+  records a cost through the non-drawer branch receives the catalogue list fragment (the issue #37
+  filter answer), which is inventory data. No natural operator holds that combination (the catalog's
+  seeded matrices never separate them), so the slice keeps the single-code annotation and documents
+  the edge instead of over-gating.
+
+#### S5 fixture resolution and final numbers (2026-09-19, correction round — Option 1 approved)
+The first pass seeded the shared test principal with all 23 codes, which made the identity screens'
+refusal fixtures (users/roles) red. Two variants were measured; the user approved the one
+implemented: the shared principal holds a CUSTOM role (`probe_all`) with all 23 catalog codes
+through the same real grant path the bootstrap performs (`roles.grant`, `granted_by` = the user
+itself, idempotent) — NOT the protected `admin` role, because a second seeded protected holder
+would make `bootstrap_admin` see an existing holder and never create the administrator, breaking
+the login fixtures' semantics (measured: 20 failures across 4 files under that variant vs. 11
+under this one). The authorized fixture-wiring follow-up: `users_web.rs` and `roles_web.rs`
+`test_pool()` switched to `seed_session_without_roles` (fixture wiring ONLY — no assertion, status
+or body check touched, no test renamed). The permissionless variant is exactly what those screens'
+tests built on since S3/S4; the happy-path tests keep granting their own sets through
+`app_with_permissions`.
+
+Final S5 numbers: `cargo test` 544 → **560 passed / 0 failed** (+16 enforcement tests; the 11
+fixture-premise tests returned green with wiring only); `cargo check --all-targets` 0 errors,
+**58 warnings (delta 0 vs HEAD measured the same day)**; allows grep empty;
+`scripts/e2e.sh -k identity` 4 passed, **-k products 13 passed / 1 skipped (opt-in screenshot
+probe)**, `-k filters` 7 passed. Live probe with the real binary (throwaway DB,
+`ROYA_ADMIN_PASSWORD` set): admin login → `GET /` 200, `GET /products` 200, `GET /web/accounts`
+200, `POST /web/accounts` 303, `POST /api/transactions` 201; negative case end-to-end — a real
+user holding only `vendedor` (created and assigned through the screens, confinement lifted via
+`/password`): `GET /products` 200 (holds `inventory.read`), `POST /web/accounts` 403 HTML naming
+`finance.methods.manage`, `POST /api/products` 403 JSON naming `inventory.write`, HTMX
+`POST /web/products` 403, `PUT /api/accounts/1/payment-methods` 403, `GET /api/accounts` 403 —
+and the administrator still answers 200.
+
+#### S5 correction round (2026-09-19, verification: COMMIT WITH NOTED RISK — one MAJOR + two NITs)
+
+1. **MAJOR (coverage): two gates had no mutation-visible test.** Removing `Require<InventoryWrite>`
+   from `web_edit_product` and `Require<DashboardRead>` from the dashboard left the whole suite
+   green — the first round's AC10 tests only reached `/web/products` POST, `/web/stock-movements`
+   and `/web/product-costs`. Fixed with permission-refusal tests for every handler the first round
+   did not pin, each in the shape its caller reads. All annotations kept as annotated (each
+   handler's action really is the permission it declares); none needed re-mapping.
+
+   New tests (6, in `inventory_web.rs` and `web.rs`):
+   - `the_product_edit_gate_refuses_an_inventory_read_only_principal` — HTMX JSON naming
+     `inventory.write`; also proves the refused edit left the product's stored name untouched.
+   - `the_product_activate_gate_refuses_an_inventory_read_only_principal` — HTMX JSON.
+   - `the_product_deactivate_gate_refuses_an_inventory_read_only_principal` — HTMX JSON; also
+     asserts `is_active` did not flip.
+   - `the_product_delete_gate_refuses_an_inventory_read_only_principal_and_writes_nothing` —
+     plain browser post → full-page HTML refusal naming `inventory.write`; counts `products`
+     rows before/after (no-write proof).
+   - `the_category_gate_refuses_an_inventory_read_only_principal` — HTMX JSON; counts
+     `categories` rows before/after (no-write proof).
+   - `the_dashboard_gate_refuses_a_principal_without_it_and_opens_with_it` — an inventory-only
+     principal gets the full-page refusal naming `dashboard.read`; a `dashboard.read`-holding
+     principal gets 200.
+
+   The movement-creation gate was already pinned by the first round's
+   `ac10_an_inventory_read_only_principal_is_refused_the_htmx_mutations` (an inventory.read-only
+   principal is refused there); this round's mutation table proves that too.
+
+   **The round's mutation table** (each gate removed, its test observed FAILING, then restored;
+   the round's final diff is tests-only — no annotation survived removed):
+
+   | # | Annotation removed | Test that failed | Observed failure |
+   | --- | --- | --- | --- |
+   | M1 | `web_edit_product`: `Require<InventoryWrite>` | `the_product_edit_gate_refuses_an_inventory_read_only_principal` | 200 with the list fragment (the edit ran) instead of 403 |
+   | M2 | `web_activate_product`: `Require<InventoryWrite>` | `the_product_activate_gate_refuses_an_inventory_read_only_principal` | 200 with the list fragment instead of 403 |
+   | M3 | `web_deactivate_product`: `Require<InventoryWrite>` | `the_product_deactivate_gate_refuses_an_inventory_read_only_principal` | 200 with the list fragment instead of 403 |
+   | M4 | `web_delete_product`: `Require<InventoryWrite>` | `the_product_delete_gate_..._writes_nothing` | **303** (the delete really happened and redirected) instead of 403 |
+   | M5 | `web_create_category`: `Require<InventoryWrite>` | `the_category_gate_refuses_an_inventory_read_only_principal` | 200 instead of 403 |
+   | M6 | `web_create_movement`: `Require<InventoryStockWrite>` | `ac10_an_inventory_read_only_principal_is_refused_the_htmx_mutations` (first-round test) | **404 `product 1 not found`** — the handler ran instead of the gate refusing |
+   | M7 | `dashboard`: `Require<DashboardRead>` | `the_dashboard_gate_refuses_a_principal_without_it_and_opens_with_it` | 200 instead of 403 |
+
+   No test failed to bite; none needed a forced justification, and no handler turned out to
+   declare the wrong permission (edit/lifecycle/delete/category are product mutations =
+   `inventory.write`; the dashboard reads `dashboard.read`).
+
+2. **NIT (ledger count): the writer's first-pass method counted the two per-target `generated N
+   warnings` summary lines, reporting 58. The real count — raw `warning:` lint lines minus
+   summaries — is 56 in both the branch and `main`; the brief and the S4 note were correct all
+   along. The S5 warning-ledger section was rewritten with the corrected method and number, and
+   every "≤ 58" target in this file and the ODD ledger now reads ≤ 56.**
+
+3. **NIT (half-documented over-gating): a principal holding ONLY `finance.methods.manage` is
+   refused `GET /api/payment-methods` — the catalog of the methods it may administer.** Recorded
+   in the mapping decisions as a known fail-closed consequence: no seeded matrix separates the
+   codes today, and if a future matrix does, the fix is an OR of the two codes on that one read,
+   not a new kernel type.
 
 ### S6 — enforcement: sales and customers
 - [ ] T20: `Require<P>` per action, nav gating, and the refusal fragment on the drawer/modal flows.
@@ -338,6 +556,40 @@ back at or below 58 by the end of S7, with no `#[allow]` attributes as the mecha
 - [ ] T24: browser slice (`e2e/tests/test_identity.py`) for AC22, wired into the harness login step.
 - [ ] T25: README (no-auth section, module table, migrations, environment), `env.example`, and
       `openspec/specs/identity/spec.md` promoted; the change folder archived for Phase A.
+
+## WHERE THE FEATURE PAUSES (2026-09-19, after S5) and how to resume
+The parent pauses the feature branch after this slice. State of the ledger when work stops:
+
+**Done (Phase A):** S1a (identity kernel), S1b (deny-by-default gate + login/logout + test plumbing),
+S2 (RBAC core: catalog, guards, `Require<P>`, effective-permission middleware, drift test),
+S3 part 1 (forced password change), S3 part 2 (users administration + the tier-rule correction
+round), S4 (roles administration + permission matrix + its correction round), **S5 (enforcement:
+finance + inventory — this slice; nav-gating deliberately deferred to S7)**.
+
+**Remaining (in order, one PR each):**
+1. **S6 — enforcement: sales and customers** (T20–T21): per-handler `Require<P>`, nav gating is
+   still S7; tests for AC10/AC21 on the real handlers.
+2. **S7 — enforcement: purchases, suppliers, identity, dashboard** (T22–T23): the LAST enforcement
+   slice; includes the sidebar/navigation hiding by permission (AC21 — needs the principal plumbed
+   into every page struct, the reason S5/S6 left the sidebar alone) and the ledger re-measure
+   (`cargo check --all-targets` back to ≤ 56 with NO `#[allow]` as the mechanism; 56 is what
+   `main` measures — see the S5 warning ledger correction).
+3. **S8 — Phase A close** (T24–T25): the browser slice for AC22 and the two browser debts carried
+   since S1b/S3 — the session-expiry `HX-Redirect` mid-HTMX case and the permission-denied HTMX
+   form, still unproven in a real browser — plus README (no-auth section, module table,
+   migrations, env vars), `env.example`, promoting `openspec/specs/identity/spec.md` and archiving
+   the change folder for Phase A.
+4. **Phase B — audit of the actor per department** (T26–T31): `created_by`/`updated_by` plumbing
+   and display, department by department, ending in the spec's audit section and archive.
+
+**Concrete human follow-ups on pause:**
+- The remote branch `feat/roles-administration` still exists on `origin` although its PR #48 is
+  already merged into `origin/main` (verified with `git branch -a` on 2026-09-19). Decided: leave it
+  un-deleted for now; deleting it is the owner's call, it holds nothing unmerged.
+- This slice has NO work-unit commit yet: the writer does not commit; the parent owns git state —
+  commit `feat/enforcement-finance-inventory` as one work unit before retargeting anything.
+- On resume: `mem_context` + project/feature-scoped `mem_search`, then read
+  `odd/tasks/identity-rbac.md` and this change folder; the next unfinished task is S6 (T20).
 
 ## Phase B — audit
 - [ ] T26 (S9): audit migration for finance tables, actor plumbing, display, tests for AC18-AC19.
