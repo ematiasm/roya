@@ -511,6 +511,11 @@ pub struct Sale {
     pub receipt_no: Option<String>,
     pub notes: String,
     pub cancel_reason: Option<String>,
+    /// Audit actor (M5 Phase B, slice S11): who created the sale and who last
+    /// edited it (a header edit, the confirm or the cancel). A line adds no
+    /// columns of its own: it inherits the sale's actor.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
     pub confirmed_at: Option<chrono::NaiveDateTime>,
@@ -554,6 +559,12 @@ pub struct SalePayment {
     /// The owning sale's document number, resolved by the receipt-allocation read
     /// so a receipt names the sale the way the user does; `None` in other reads.
     pub sale_number: Option<String>,
+    /// Audit actor (M5 Phase B, slice S11): the acting user of the request that
+    /// recorded the payment — for a receipt-grouped payment, the collection
+    /// request's actor, never a fresh one (AC18). `updated_by` is the user who
+    /// linked a refund to it, when the sale was cancelled.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -1098,6 +1109,11 @@ pub struct Customer {
     pub credit_limit: Option<Decimal>,
     /// Default credit term in days; NULL means no default term.
     pub payment_days: Option<i64>,
+    /// Audit actor (M5 Phase B, slice S11): who created the customer and who
+    /// last edited it. The seeded walk-in predates the audit, so its actor is
+    /// the migration's sentinel.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -1235,6 +1251,11 @@ pub struct CustomerReceipt {
     pub date: NaiveDate,
     /// Optional free text (trimmed, <= 256 chars), NULL when empty.
     pub notes: Option<String>,
+    /// Audit actor (M5 Phase B, slice S11): the acting user of the collection
+    /// request that produced the receipt. The receipt has no edit path, so
+    /// `updated_by` stays NULL.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 

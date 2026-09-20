@@ -1073,8 +1073,10 @@ mod tests {
 
     async fn seed_credit_sale(app: &Router, pool: &sqlx::SqlitePool) -> i64 {
         let (customer_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO customers (name) VALUES ('Regression Buyer') RETURNING id",
+            "INSERT INTO customers (name, created_by) VALUES (?, ?) RETURNING id",
         )
+        .bind("Regression Buyer")
+        .bind(test_support::audit_actor_id(pool).await.unwrap())
         .fetch_one(pool)
         .await
         .unwrap();

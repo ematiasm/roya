@@ -54,6 +54,8 @@ fn row_to_sale(row: sqlx::sqlite::SqliteRow) -> Sale {
         receipt_no: row.get("receipt_no"),
         notes: row.get("notes"),
         cancel_reason: row.get("cancel_reason"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         confirmed_at: row.get("confirmed_at"),
@@ -89,6 +91,8 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> SalePayment {
         // Only the receipt-allocation query selects `sale_number`; every other
         // payment read leaves it `None`.
         sale_number: row.try_get::<Option<String>, _>("sale_number").unwrap_or(None),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -114,7 +118,7 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 pub trait SaleRepository: Send + Sync {
     /// `customer_name` is the snapshot resolved by the service through
     /// `CustomerService`; this layer never reads the `customers` table.
-    async fn create_sale(&self, input: &NewSale, customer_name: &str) -> AppResult<Sale>;
+    async fn create_sale(&self, actor: i64, input: &NewSale, customer_name: &str) -> AppResult<Sale>;
     async fn find_sale(&self, id: i64) -> AppResult<Option<Sale>>;
     async fn find_sale_by_number(&self, number: &str) -> AppResult<Option<Sale>>;
     async fn list_sales(&self) -> AppResult<Vec<Sale>>;
@@ -142,11 +146,11 @@ pub trait SaleRepository: Send + Sync {
         &self,
     ) -> AppResult<Vec<(Sale, Vec<SaleLine>, Vec<SalePayment>)>>;
     /// Update Draft header fields (service guarantees Draft status).
-    async fn update_draft(&self, id: i64, patch: &UpdateSaleDraft) -> AppResult<Sale>;
+    async fn update_draft(&self, id: i64, actor: i64, patch: &UpdateSaleDraft) -> AppResult<Sale>;
     /// Transition Draft -> Confirmed with assigned number.
-    async fn set_confirmed(&self, id: i64, sale_number: &str) -> AppResult<Sale>;
+    async fn set_confirmed(&self, id: i64, actor: i64, sale_number: &str) -> AppResult<Sale>;
     /// Transition Draft/Confirmed -> Cancelled.
-    async fn set_cancelled(&self, id: i64, reason: Option<&str>) -> AppResult<Sale>;
+    async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale>;
 
     async fn create_line(
         &self,
@@ -167,6 +171,7 @@ pub trait SaleRepository: Send + Sync {
     /// still belongs to its sale and keeps its own transaction link.
     async fn create_payment(
         &self,
+        actor: i64,
         sale_id: i64,
         account_id: i64,
         method_id: i64,
@@ -179,6 +184,7 @@ pub trait SaleRepository: Send + Sync {
     /// row it refunds. The original `transaction_id` is left untouched.
     async fn set_payment_refund_transaction(
         &self,
+        actor: i64,
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<SalePayment>;
@@ -228,7 +234,7 @@ impl SqliteSaleRepository {
 
 #[async_trait]
 impl SaleRepository for SqliteSaleRepository {
-    async fn create_sale(&self, input: &NewSale, customer_name: &str) -> AppResult<Sale> {
+    async fn create_sale(&self, actor: i64, input: &NewSale, customer_name: &str) -> AppResult<Sale> {
         let receipt = input.receipt_no.clone().and_then(|s| {
             let t = s.trim().to_string();
             if t.is_empty() {
@@ -240,9 +246,9 @@ impl SaleRepository for SqliteSaleRepository {
         let notes = input.notes.clone().unwrap_or_default();
         let row = sqlx::query(
             r#"INSERT INTO sales
-               (status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes)
-               VALUES ('Draft', ?, ?, ?, ?, ?, ?, ?)
-               RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               (status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, created_by)
+               VALUES ('Draft', ?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(input.payment_type.to_string())
         .bind(input.customer_id)
@@ -251,6 +257,7 @@ impl SaleRepository for SqliteSaleRepository {
         .bind(input.due_date)
         .bind(receipt)
         .bind(notes)
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -259,7 +266,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn find_sale(&self, id: i64) -> AppResult<Option<Sale>> {
         let row = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE id = ?"#,
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -269,7 +276,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn find_sale_by_number(&self, number: &str) -> AppResult<Option<Sale>> {
         let row = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE sale_number = ?"#,
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM sales WHERE sale_number = ?"#,
         )
         .bind(number)
         .fetch_optional(&self.pool)
@@ -281,7 +288,7 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
         let rows = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales ORDER BY id"#,
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM sales ORDER BY id"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -292,7 +299,7 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM sales",
+            "SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM sales",
         );
         let has_filter = filter.status.is_some()
             || filter.customer_ids.is_some()
@@ -337,7 +344,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn list_confirmed_credit_sales(&self, customer_id: i64) -> AppResult<Vec<Sale>> {
         let rows = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at
                FROM sales
                WHERE customer_id = ? AND status = 'Confirmed' AND payment_type = 'Credit'
                ORDER BY id"#,
@@ -366,7 +373,7 @@ impl SaleRepository for SqliteSaleRepository {
         &self,
     ) -> AppResult<Vec<(Sale, Vec<SaleLine>, Vec<SalePayment>)>> {
         let rows = sqlx::query(
-            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at
+            r#"SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at
                FROM sales
                WHERE status = 'Confirmed' AND payment_type = 'Credit'
                ORDER BY due_date, sale_date, id"#,
@@ -397,7 +404,7 @@ impl SaleRepository for SqliteSaleRepository {
         self.tick();
 
         let mut payments_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at FROM sale_payments WHERE sale_id IN (",
+            "SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at FROM sale_payments WHERE sale_id IN (",
         );
         {
             let mut separated = payments_qb.separated(", ");
@@ -436,7 +443,7 @@ impl SaleRepository for SqliteSaleRepository {
             .collect())
     }
 
-    async fn update_draft(&self, id: i64, patch: &UpdateSaleDraft) -> AppResult<Sale> {
+    async fn update_draft(&self, id: i64, actor: i64, patch: &UpdateSaleDraft) -> AppResult<Sale> {
         let existing = self
             .find_sale(id)
             .await?
@@ -463,13 +470,15 @@ impl SaleRepository for SqliteSaleRepository {
         let row = sqlx::query(
             r#"UPDATE sales
                SET sale_date = ?, due_date = ?, receipt_no = ?, notes = ?,
+                   updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(sale_date)
         .bind(due_date)
         .bind(receipt_no)
         .bind(notes)
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -477,15 +486,17 @@ impl SaleRepository for SqliteSaleRepository {
         Ok(row_to_sale(row))
     }
 
-    async fn set_confirmed(&self, id: i64, sale_number: &str) -> AppResult<Sale> {
+    async fn set_confirmed(&self, id: i64, actor: i64, sale_number: &str) -> AppResult<Sale> {
         let row = sqlx::query(
             r#"UPDATE sales
                SET sale_number = ?, status = 'Confirmed',
+                   updated_by = ?,
                    confirmed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(sale_number)
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -493,7 +504,7 @@ impl SaleRepository for SqliteSaleRepository {
         Ok(row_to_sale(row))
     }
 
-    async fn set_cancelled(&self, id: i64, reason: Option<&str>) -> AppResult<Sale> {
+    async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -505,11 +516,13 @@ impl SaleRepository for SqliteSaleRepository {
         let row = sqlx::query(
             r#"UPDATE sales
                SET status = 'Cancelled', cancel_reason = ?,
+                   updated_by = ?,
                    cancelled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(clean)
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -592,6 +605,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn create_payment(
         &self,
+        actor: i64,
         sale_id: i64,
         account_id: i64,
         method_id: i64,
@@ -601,9 +615,9 @@ impl SaleRepository for SqliteSaleRepository {
         receipt_id: Option<i64>,
     ) -> AppResult<SalePayment> {
         let row = sqlx::query(
-            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, transaction_id, receipt_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at"#,
+            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, transaction_id, receipt_id, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at"#,
         )
         .bind(sale_id)
         .bind(account_id)
@@ -612,6 +626,7 @@ impl SaleRepository for SqliteSaleRepository {
         .bind(date)
         .bind(transaction_id)
         .bind(receipt_id)
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -620,14 +635,16 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn set_payment_refund_transaction(
         &self,
+        actor: i64,
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<SalePayment> {
         let row = sqlx::query(
-            r#"UPDATE sale_payments SET refund_transaction_id = ? WHERE id = ?
-               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at"#,
+            r#"UPDATE sale_payments SET refund_transaction_id = ?, updated_by = ? WHERE id = ?
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at"#,
         )
         .bind(refund_transaction_id)
+        .bind(actor)
         .bind(payment_id)
         .fetch_one(&self.pool)
         .await
@@ -639,7 +656,7 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
         let rows = sqlx::query(
-            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_at
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at
                FROM sale_payments WHERE sale_id = ? ORDER BY id"#,
         )
         .bind(sale_id)
@@ -650,7 +667,7 @@ impl SaleRepository for SqliteSaleRepository {
 
     async fn list_payments_by_receipt(&self, receipt_id: i64) -> AppResult<Vec<SalePayment>> {
         let rows = sqlx::query(
-            r#"SELECT sp.id, sp.sale_id, sp.account_id, sp.method_id, sp.amount, sp.date, sp.transaction_id, sp.refund_transaction_id, sp.receipt_id, sp.created_at, s.sale_number
+            r#"SELECT sp.id, sp.sale_id, sp.account_id, sp.method_id, sp.amount, sp.date, sp.transaction_id, sp.refund_transaction_id, sp.receipt_id, sp.created_by, sp.updated_by, sp.created_at, s.sale_number
                FROM sale_payments sp
                JOIN sales s ON s.id = sp.sale_id
                WHERE sp.receipt_id = ? ORDER BY sp.id"#,

@@ -74,6 +74,10 @@ struct SalePageTemplate {
     oob_picker: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    /// Audit display names (M5 Phase B, slice S11): the sale's creator and its
+    /// last editor, resolved in this wiring layer.
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -103,6 +107,9 @@ struct SaleDetailPartial {
     oob_picker: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    /// Audit display names: who created the sale, and who last edited it.
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,16 +193,28 @@ struct SaleRecordContext {
     record: SaleRecord,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    /// Audit display names: the sale's creator and its last editor, resolved
+    /// here in the wiring layer (AC20: the service never reads identity).
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
 }
 
 async fn record_context(state: &AppState, sale_id: i64) -> AppResult<SaleRecordContext> {
     let record = state.sales_service.get_record(sale_id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut actor_ids = vec![record.sale.created_by];
+    actor_ids.extend(record.sale.updated_by);
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let name_for = |id: i64| names.get(&id).cloned();
+    let created_by_name = name_for(record.sale.created_by);
+    let updated_by_name = record.sale.updated_by.and_then(name_for);
     Ok(SaleRecordContext {
         record,
         method_options,
         today,
+        created_by_name,
+        updated_by_name,
     })
 }
 
@@ -205,6 +224,8 @@ fn render_record(context: SaleRecordContext, oob_picker: bool) -> AppResult<Html
         oob_picker,
         method_options: context.method_options,
         today: context.today,
+        created_by_name: context.created_by_name,
+        updated_by_name: context.updated_by_name,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -377,6 +398,8 @@ async fn sale_record_page(
         oob_picker: false,
         method_options: context.method_options,
         today: context.today,
+        created_by_name: context.created_by_name,
+        updated_by_name: context.updated_by_name,
         nav_key: "sales",
         nav: Nav::for_principal(&principal),
     };
@@ -480,6 +503,7 @@ pub struct UpdateSaleHeaderForm {
 async fn web_create_sale(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreateSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -505,14 +529,17 @@ async fn web_create_sale(
         .ok_or_else(|| AppError::Validation("customer is required".into()))?;
     let sale = state
         .sales_service
-        .create_draft(crate::models::NewSale {
-            customer_id,
-            payment_type,
-            sale_date: parse_date_or_today(&form.sale_date)?,
-            due_date,
-            receipt_no,
-            notes: Some(form.notes),
-        })
+        .create_draft(
+            principal.user_id,
+            crate::models::NewSale {
+                customer_id,
+                payment_type,
+                sale_date: parse_date_or_today(&form.sale_date)?,
+                due_date,
+                receipt_no,
+                notes: Some(form.notes),
+            },
+        )
         .await?;
     let location = format!("/sales/{}", sale.id);
     if is_htmx(&headers) {
@@ -690,6 +717,7 @@ async fn cancel_sale_impl(
 async fn web_update_sale_header(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<UpdateSaleHeaderForm>,
@@ -705,6 +733,7 @@ async fn web_update_sale_header(
         .sales_service
         .update_draft(
             id,
+            principal.user_id,
             UpdateSaleDraft {
                 sale_date,
                 due_date: Some(due_date),
@@ -836,16 +865,19 @@ mod tests {
     async fn seed_customer(state: &AppState, name: &str) -> crate::models::Customer {
         state
             .customer_service
-            .create_customer(crate::models::NewCustomer {
-                name: name.into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(state).await,
+                crate::models::NewCustomer {
+                    name: name.into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    payment_days: None,
+                },
+            )
             .await
             .unwrap()
             .customer
@@ -976,7 +1008,7 @@ mod tests {
         let customer = seed_customer(state, "Record Buyer").await;
         let sale = state
             .sales_service
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&state).await, NewSale {
                 customer_id: customer.id,
                 payment_type,
                 sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
@@ -1413,7 +1445,7 @@ mod tests {
         for _ in 0..2 {
             let sale = state
                 .sales_service
-                .create_draft(NewSale {
+                .create_draft(audit_actor(&state).await, NewSale {
                     customer_id: payer.id,
                     payment_type: PaymentType::Credit,
                     sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
@@ -1503,7 +1535,7 @@ mod tests {
         for _ in 0..2 {
             let sale = state
                 .sales_service
-                .create_draft(NewSale {
+                .create_draft(audit_actor(&state).await, NewSale {
                     customer_id: typist.id,
                     payment_type: PaymentType::Credit,
                     sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),

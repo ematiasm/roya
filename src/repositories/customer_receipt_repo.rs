@@ -21,6 +21,8 @@ fn row_to_receipt(row: sqlx::sqlite::SqliteRow) -> CustomerReceipt {
         method_id: row.get("method_id"),
         date: row.get("date"),
         notes: row.get("notes"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -38,7 +40,7 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 
 #[async_trait]
 pub trait CustomerReceiptRepository: Send + Sync {
-    async fn create(&self, input: &NewReceipt) -> AppResult<CustomerReceipt>;
+    async fn create(&self, actor: i64, input: &NewReceipt) -> AppResult<CustomerReceipt>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<CustomerReceipt>>;
     /// Receipts of one customer, oldest first (`date`, then id).
     async fn list_by_customer(&self, customer_id: i64) -> AppResult<Vec<CustomerReceipt>>;
@@ -70,17 +72,18 @@ impl SqliteCustomerReceiptRepository {
 
 #[async_trait]
 impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
-    async fn create(&self, input: &NewReceipt) -> AppResult<CustomerReceipt> {
+    async fn create(&self, actor: i64, input: &NewReceipt) -> AppResult<CustomerReceipt> {
         let row = sqlx::query(
-            r#"INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes)
-               VALUES (?, ?, ?, ?, ?)
-               RETURNING id, customer_id, account_id, method_id, date, notes, created_at"#,
+            r#"INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes, created_by)
+               VALUES (?, ?, ?, ?, ?, ?)
+               RETURNING id, customer_id, account_id, method_id, date, notes, created_by, updated_by, created_at"#,
         )
         .bind(input.customer_id)
         .bind(input.account_id)
         .bind(input.method_id)
         .bind(input.date)
         .bind(input.notes.clone())
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -89,7 +92,7 @@ impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<CustomerReceipt>> {
         let row = sqlx::query(
-            r#"SELECT id, customer_id, account_id, method_id, date, notes, created_at
+            r#"SELECT id, customer_id, account_id, method_id, date, notes, created_by, updated_by, created_at
                FROM customer_receipts WHERE id = ?"#,
         )
         .bind(id)
@@ -100,7 +103,7 @@ impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
 
     async fn list_by_customer(&self, customer_id: i64) -> AppResult<Vec<CustomerReceipt>> {
         let rows = sqlx::query(
-            r#"SELECT id, customer_id, account_id, method_id, date, notes, created_at
+            r#"SELECT id, customer_id, account_id, method_id, date, notes, created_by, updated_by, created_at
                FROM customer_receipts WHERE customer_id = ? ORDER BY date, id"#,
         )
         .bind(customer_id)
@@ -189,32 +192,35 @@ mod tests {
                 .await
                 .unwrap();
 
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let err = repo
-            .create(&receipt(999_999, account_id, method_id))
+            .create(actor, &receipt(999_999, account_id, method_id))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         let stored = repo
-            .create(&receipt(customer_id, account_id, method_id))
+            .create(actor, &receipt(customer_id, account_id, method_id))
             .await
             .unwrap();
         assert_eq!(repo.list_by_customer(customer_id).await.unwrap().len(), 1);
 
         let (sale_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO sales (status, payment_type, customer_id, sale_date)\n             VALUES ('Confirmed', 'Credit', ?, '2024-06-01') RETURNING id",
+            "INSERT INTO sales (status, payment_type, customer_id, sale_date, created_by)\n             VALUES ('Confirmed', 'Credit', ?, '2024-06-01', ?) RETURNING id",
         )
         .bind(customer_id)
+        .bind(actor)
         .fetch_one(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id)\n             VALUES (?, ?, ?, '10', '2024-06-01', ?)",
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id, created_by)\n             VALUES (?, ?, ?, '10', '2024-06-01', ?, ?)",
         )
         .bind(sale_id)
         .bind(account_id)
         .bind(method_id)
         .bind(stored.id)
+        .bind(actor)
         .execute(&pool)
         .await
         .unwrap();
