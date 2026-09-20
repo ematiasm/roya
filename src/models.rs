@@ -45,6 +45,11 @@ pub struct Account {
     pub name: String,
     /// Stored as TEXT in SQLite, mapped via rust_decimal db-sqlx feature
     pub cached_balance: Decimal,
+    /// Audit actor (M5 Phase B): the user id that created the row. The
+    /// interface resolves it to a display name; it never shows the id.
+    pub created_by: i64,
+    /// The user id of the last edit, when the row has been edited at all.
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -58,6 +63,12 @@ pub struct Transaction {
     /// Opaque source reference (document number). NULL for manual transactions.
     pub reference: Option<String>,
     pub date: NaiveDate,
+    /// Audit actor (M5 Phase B): who created the movement, and who last edited
+    /// it. A movement produced inside a document flow carries the acting user
+    /// of the flow's request, never a fresh actor. The interface resolves these
+    /// ids to display names; it never shows the ids.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -121,6 +132,9 @@ pub struct AccountWithBalance {
     pub name: String,
     pub balance: Decimal,
     pub cached_balance: Decimal,
+    /// Audit actor (M5 Phase B): who created and who last edited the account.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -129,6 +143,9 @@ pub struct AccountDetail {
     pub id: i64,
     pub name: String,
     pub balance: Decimal,
+    /// Audit actor (M5 Phase B): who created and who last edited the account.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub transactions: Vec<Transaction>,
 }
@@ -542,6 +559,9 @@ pub struct PaymentMethod {
     /// The owning account; NULL means unassigned and unusable for payments.
     pub account_id: Option<i64>,
     pub is_active: bool,
+    /// Audit actor (M5 Phase B): who created and who last reassigned the method.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 

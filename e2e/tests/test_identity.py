@@ -238,10 +238,14 @@ def _assign_role_through_the_screen(
 ) -> None:
     """Grant one role to a user through the users screen's Roles dialog.
 
-    The acting administrator's own row hides the button, so the only
-    "Asignar roles" control on the page is the freshly created user's.
+    The button is scoped to the CREATED user's row: the acting administrator's
+    own row hides the control, but the migration's ``sistema`` sentinel is a
+    real (inactive, roleless) account row with one too, so the click must name
+    whose row it means instead of assuming a single match.
     """
-    page.locator('#user-list button[aria-label="Asignar roles"]').click()
+    page.locator("#user-list-inner > div > div", has_text=username).locator(
+        'button[aria-label="Asignar roles"]'
+    ).click()
     dialog = page.locator("#user-edit-dialog")
     expect(dialog).to_contain_text(f"Roles de {username}")
     dialog.locator("label", has_text=role_name).locator(

@@ -31,9 +31,10 @@ async fn list_accounts(
 async fn create_account(
     State(state): State<AppState>,
     _: Require<FinanceMethodsManage>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateAccountRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let acc = state.account_service.create(&payload.name).await?;
+    let acc = state.account_service.create(principal.user_id, &payload.name).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(acc))))
 }
 
@@ -81,13 +82,14 @@ async fn get_account_payment_methods(
 async fn put_account_payment_methods(
     State(state): State<AppState>,
     _: Require<FinanceMethodsManage>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateAccountPaymentMethodsRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     state.account_service.require_exists(id).await?;
     let methods = state
         .payment_method_service
-        .replace_account_methods(id, &payload.method_ids)
+        .replace_account_methods(principal.user_id, id, &payload.method_ids)
         .await?;
     Ok(Json(methods_json(id, methods)))
 }
@@ -117,11 +119,13 @@ async fn list_transactions(
 async fn create_transaction(
     State(state): State<AppState>,
     _: Require<FinanceWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateTransactionRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let tx = state
         .transaction_service
         .create_with_reference(
+            principal.user_id,
             payload.account_id,
             payload.kind,
             payload.amount,
@@ -136,12 +140,13 @@ async fn create_transaction(
 async fn update_transaction(
     State(state): State<AppState>,
     _: Require<FinanceWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTransactionRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
     let tx = state
         .transaction_service
-        .update(id, payload.kind, payload.amount, payload.description, payload.date)
+        .update(principal.user_id, id, payload.kind, payload.amount, payload.description, payload.date)
         .await?;
     Ok(Json(serde_json::json!(tx)))
 }

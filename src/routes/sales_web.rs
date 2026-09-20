@@ -599,21 +599,23 @@ async fn web_remove_line(
 async fn web_confirm_sale(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    confirm_sale_impl(state, headers, id, form).await
+    confirm_sale_impl(state, principal.user_id, headers, id, form).await
 }
 
 async fn confirm_sale_impl(
     state: AppState,
+    actor: i64,
     headers: HeaderMap,
     id: i64,
     form: ConfirmSaleForm,
 ) -> Result<axum::response::Response, AppError> {
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
-    state.sales_service.confirm(id, method_id).await?;
+    state.sales_service.confirm(actor, id, method_id).await?;
     if is_htmx(&headers) {
         return changed(&state, id).await;
     }
@@ -626,15 +628,17 @@ async fn confirm_sale_impl(
 async fn web_record_payment(
     State(state): State<AppState>,
     _: Require<CustomersCollect>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
 ) -> Result<axum::response::Response, AppError> {
-    record_payment_impl(state, headers, id, form).await
+    record_payment_impl(state, principal.user_id, headers, id, form).await
 }
 
 async fn record_payment_impl(
     state: AppState,
+    actor: i64,
     headers: HeaderMap,
     id: i64,
     form: RecordPaymentForm,
@@ -643,7 +647,7 @@ async fn record_payment_impl(
     let date = parse_date_or_today(&form.date)?;
     state
         .sales_service
-        .record_payment(id, form.method_id, amount, date)
+        .record_payment(actor, id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
         return changed(&state, id).await;
@@ -654,15 +658,17 @@ async fn record_payment_impl(
 async fn web_cancel_sale(
     State(state): State<AppState>,
     _: Require<SalesCancel>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<CancelSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    cancel_sale_impl(state, headers, id, form).await
+    cancel_sale_impl(state, principal.user_id, headers, id, form).await
 }
 
 async fn cancel_sale_impl(
     state: AppState,
+    actor: i64,
     headers: HeaderMap,
     id: i64,
     form: CancelSaleForm,
@@ -672,7 +678,7 @@ async fn cancel_sale_impl(
     } else {
         Some(form.reason.trim().to_string())
     };
-    state.sales_service.cancel(id, reason).await?;
+    state.sales_service.cancel(actor, id, reason).await?;
     if is_htmx(&headers) {
         return changed(&state, id).await;
     }
@@ -738,28 +744,31 @@ async fn web_add_line_collection(
 async fn web_confirm_sale_collection(
     state: State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    confirm_sale_impl(state.0, headers, form.sale_id, form).await
+    confirm_sale_impl(state.0, principal.user_id, headers, form.sale_id, form).await
 }
 
 async fn web_record_payment_collection(
     state: State<AppState>,
     _: Require<CustomersCollect>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<RecordPaymentForm>,
 ) -> Result<axum::response::Response, AppError> {
-    record_payment_impl(state.0, headers, form.sale_id, form).await
+    record_payment_impl(state.0, principal.user_id, headers, form.sale_id, form).await
 }
 
 async fn web_cancel_sale_collection(
     state: State<AppState>,
     _: Require<SalesCancel>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CancelSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    cancel_sale_impl(state.0, headers, form.sale_id, form).await
+    cancel_sale_impl(state.0, principal.user_id, headers, form.sale_id, form).await
 }
 
 pub fn router() -> Router<AppState> {
@@ -797,6 +806,14 @@ mod tests {
     use crate::models::PaymentType;
     use crate::routes::AppState;
     use crate::security::test_support;
+
+    /// A valid acting user for the mechanical call sites: the migration's
+    /// sentinel account (the system actor pre-existing rows are attributed to).
+    /// The audit-attribution tests seed their own users instead, because there
+    /// the point is telling two actors apart.
+    async fn audit_actor(state: &AppState) -> i64 {
+        test_support::audit_actor_id(&state.pool).await.unwrap()
+    }
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -977,10 +994,10 @@ mod tests {
             .add_line(sale.id, product.id, Decimal::from(2), None)
             .await
             .unwrap();
-        let account = state.account_service.create("Caja").await.unwrap();
+        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
         state
             .payment_method_service
-            .ensure_defaults_for_account(account.id, "Caja")
+            .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
             .await
             .unwrap();
         let method = state
@@ -1102,12 +1119,13 @@ mod tests {
         let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
         state
             .sales_service
-            .confirm(fixture.sale_id, None)
+            .confirm(audit_actor(&state).await, fixture.sale_id, None)
             .await
             .unwrap();
         state
             .sales_service
-            .record_payment(
+
+            .record_payment(audit_actor(&state).await, 
                 fixture.sale_id,
                 fixture.method_id,
                 Decimal::from(10),
@@ -1180,7 +1198,7 @@ mod tests {
 
         state
             .sales_service
-            .confirm(fixture.sale_id, None)
+            .confirm(audit_actor(&state).await, fixture.sale_id, None)
             .await
             .unwrap();
         let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
@@ -1201,7 +1219,7 @@ mod tests {
 
         state
             .sales_service
-            .cancel(fixture.sale_id, Some("customer return".to_string()))
+            .cancel(audit_actor(&state).await, fixture.sale_id, Some("customer return".to_string()))
             .await
             .unwrap();
         let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
@@ -1232,7 +1250,8 @@ mod tests {
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         state
             .sales_service
-            .confirm(
+
+            .confirm(audit_actor(&state).await, 
                 fixture.sale_id,
                 Some(fixture.method_id),
             )
@@ -1281,7 +1300,7 @@ mod tests {
 
         state
             .sales_service
-            .confirm(fixture.sale_id, None)
+            .confirm(audit_actor(&state).await, fixture.sale_id, None)
             .await
             .unwrap();
         let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
@@ -1367,10 +1386,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let account = state.account_service.create("Caja").await.unwrap();
+        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
         state
             .payment_method_service
-            .ensure_defaults_for_account(account.id, "Caja")
+            .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
             .await
             .unwrap();
         let cash = state
@@ -1405,7 +1424,7 @@ mod tests {
                 .unwrap();
             state
                 .sales_service
-                .confirm(sale.id, None)
+                .confirm(audit_actor(&state).await, sale.id, None)
                 .await
                 .unwrap();
             sale_ids.push(sale.id);
@@ -2083,7 +2102,7 @@ mod tests {
 
         state
             .sales_service
-            .confirm(fixture.sale_id, None)
+            .confirm(audit_actor(&state).await, fixture.sale_id, None)
             .await
             .unwrap();
         let payments_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments")

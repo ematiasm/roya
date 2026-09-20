@@ -11,6 +11,7 @@ use crate::models::{Transaction, TransactionKind};
 pub trait TransactionRepository: Send + Sync {
     async fn create(
         &self,
+        actor: i64,
         account_id: i64,
         kind: TransactionKind,
         amount: Decimal,
@@ -22,7 +23,7 @@ pub trait TransactionRepository: Send + Sync {
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Transaction>>;
     async fn list(&self, filter: &crate::models::TransactionFilter) -> AppResult<Vec<Transaction>>;
     async fn list_by_account(&self, account_id: i64) -> AppResult<Vec<Transaction>>;
-    async fn update(&self, tx: &Transaction) -> AppResult<Transaction>;
+    async fn update(&self, tx: &Transaction, actor: i64) -> AppResult<Transaction>;
     async fn delete(&self, id: i64) -> AppResult<bool>;
     async fn balance_for_account(&self, account_id: i64) -> AppResult<Decimal>;
     async fn sync_cached_balance(&self, account_id: i64) -> AppResult<()>;
@@ -64,6 +65,8 @@ fn row_to_tx(row: sqlx::sqlite::SqliteRow) -> Transaction {
         description: row.get("description"),
         reference: row.get("reference"),
         date: row.get("date"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -91,6 +94,7 @@ async fn balance_for_account_raw(pool: &SqlitePool, account_id: i64) -> Result<D
 impl TransactionRepository for SqliteTransactionRepository {
     async fn create(
         &self,
+        actor: i64,
         account_id: i64,
         kind: TransactionKind,
         amount: Decimal,
@@ -101,9 +105,9 @@ impl TransactionRepository for SqliteTransactionRepository {
         let mut tx = self.pool.begin().await?;
 
         let row = sqlx::query(
-            r#"INSERT INTO transactions (account_id, kind, amount, description, reference, date)
-               VALUES (?, ?, ?, ?, ?, ?)
-               RETURNING id, account_id, kind, amount, description, reference, date, created_at"#,
+            r#"INSERT INTO transactions (account_id, kind, amount, description, reference, date, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at"#,
         )
         .bind(account_id)
         .bind(kind.to_string())
@@ -111,6 +115,7 @@ impl TransactionRepository for SqliteTransactionRepository {
         .bind(description)
         .bind(reference)
         .bind(date)
+        .bind(actor)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -122,7 +127,7 @@ impl TransactionRepository for SqliteTransactionRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Transaction>> {
         let row = sqlx::query(
-            r#"SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE id = ?"#,
+            r#"SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -135,14 +140,14 @@ impl TransactionRepository for SqliteTransactionRepository {
         let rows = match (filter.account_id, filter.from, filter.to) {
             (None, None, None) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions ORDER BY date DESC, id DESC",
                 )
                 .fetch_all(&self.pool)
                 .await?
             }
             (Some(aid), None, None) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE account_id = ? ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE account_id = ? ORDER BY date DESC, id DESC",
                 )
                 .bind(aid)
                 .fetch_all(&self.pool)
@@ -150,7 +155,7 @@ impl TransactionRepository for SqliteTransactionRepository {
             }
             (None, Some(from), None) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE date >= ? ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE date >= ? ORDER BY date DESC, id DESC",
                 )
                 .bind(from)
                 .fetch_all(&self.pool)
@@ -158,7 +163,7 @@ impl TransactionRepository for SqliteTransactionRepository {
             }
             (None, None, Some(to)) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE date <= ? ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE date <= ? ORDER BY date DESC, id DESC",
                 )
                 .bind(to)
                 .fetch_all(&self.pool)
@@ -166,7 +171,7 @@ impl TransactionRepository for SqliteTransactionRepository {
             }
             (Some(aid), Some(from), None) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE account_id = ? AND date >= ? ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE account_id = ? AND date >= ? ORDER BY date DESC, id DESC",
                 )
                 .bind(aid).bind(from)
                 .fetch_all(&self.pool)
@@ -174,7 +179,7 @@ impl TransactionRepository for SqliteTransactionRepository {
             }
             (Some(aid), None, Some(to)) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE account_id = ? AND date <= ? ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE account_id = ? AND date <= ? ORDER BY date DESC, id DESC",
                 )
                 .bind(aid).bind(to)
                 .fetch_all(&self.pool)
@@ -182,7 +187,7 @@ impl TransactionRepository for SqliteTransactionRepository {
             }
             (None, Some(from), Some(to)) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE date >= ? AND date <= ? ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE date >= ? AND date <= ? ORDER BY date DESC, id DESC",
                 )
                 .bind(from).bind(to)
                 .fetch_all(&self.pool)
@@ -190,7 +195,7 @@ impl TransactionRepository for SqliteTransactionRepository {
             }
             (Some(aid), Some(from), Some(to)) => {
                 sqlx::query(
-                    "SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE account_id = ? AND date >= ? AND date <= ? ORDER BY date DESC, id DESC",
+                    "SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE account_id = ? AND date >= ? AND date <= ? ORDER BY date DESC, id DESC",
                 )
                 .bind(aid).bind(from).bind(to)
                 .fetch_all(&self.pool)
@@ -202,7 +207,7 @@ impl TransactionRepository for SqliteTransactionRepository {
 
     async fn list_by_account(&self, account_id: i64) -> AppResult<Vec<Transaction>> {
         let rows = sqlx::query(
-            r#"SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE account_id = ? ORDER BY date DESC, id DESC"#,
+            r#"SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE account_id = ? ORDER BY date DESC, id DESC"#,
         )
         .bind(account_id)
         .fetch_all(&self.pool)
@@ -210,16 +215,17 @@ impl TransactionRepository for SqliteTransactionRepository {
         Ok(rows.into_iter().map(row_to_tx).collect())
     }
 
-    async fn update(&self, tx_rec: &Transaction) -> AppResult<Transaction> {
+    async fn update(&self, tx_rec: &Transaction, actor: i64) -> AppResult<Transaction> {
         let mut conn = self.pool.begin().await?;
         let row = sqlx::query(
-            r#"UPDATE transactions SET kind = ?, amount = ?, description = ?, date = ? WHERE id = ?
-               RETURNING id, account_id, kind, amount, description, reference, date, created_at"#,
+            r#"UPDATE transactions SET kind = ?, amount = ?, description = ?, date = ?, updated_by = ? WHERE id = ?
+               RETURNING id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at"#,
         )
         .bind(tx_rec.kind.to_string())
         .bind(tx_rec.amount.to_string())
         .bind(&tx_rec.description)
         .bind(tx_rec.date)
+        .bind(actor)
         .bind(tx_rec.id)
         .fetch_one(&mut *conn)
         .await?;
@@ -232,7 +238,7 @@ impl TransactionRepository for SqliteTransactionRepository {
 
     async fn delete(&self, id: i64) -> AppResult<bool> {
         let existing = sqlx::query(
-            r#"SELECT id, account_id, kind, amount, description, reference, date, created_at FROM transactions WHERE id = ?"#,
+            r#"SELECT id, account_id, kind, amount, description, reference, date, created_by, updated_by, created_at FROM transactions WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)

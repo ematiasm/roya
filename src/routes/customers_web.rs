@@ -561,6 +561,7 @@ async fn web_delete_customer(
 async fn web_collect_receipt(
     State(state): State<AppState>,
     _: Require<CustomersCollect>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CollectForm>,
 ) -> AppResult<Response> {
@@ -568,7 +569,9 @@ async fn web_collect_receipt(
     let date = parse_date_or_today(&form.date)?;
     state
         .customer_receipt_service
+
         .collect(
+            principal.user_id,
             form.customer_id,
             form.method_id,
             amount,
@@ -618,6 +621,14 @@ mod tests {
     };
     use crate::routes::AppState;
     use crate::security::test_support;
+
+    /// A valid acting user for the mechanical call sites: the migration's
+    /// sentinel account (the system actor pre-existing rows are attributed to).
+    /// The audit-attribution tests seed their own users instead, because there
+    /// the point is telling two actors apart.
+    async fn audit_actor(state: &AppState) -> i64 {
+        test_support::audit_actor_id(&state.pool).await.unwrap()
+    }
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -697,10 +708,10 @@ mod tests {
     /// One customer with a 75 credit debt (3 × 25) and the account/method pair
     /// the collect form uses.
     async fn seed_fixture(state: &AppState) -> WebFixture {
-        let account = state.account_service.create("Caja").await.unwrap();
+        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
         state
             .payment_method_service
-            .ensure_defaults_for_account(account.id, "Caja")
+            .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
             .await
             .unwrap();
         let cash = state
@@ -776,7 +787,7 @@ mod tests {
             .unwrap();
         state
             .sales_service
-            .confirm(sale.id, None)
+            .confirm(audit_actor(&state).await, sale.id, None)
             .await
             .unwrap();
         WebFixture {

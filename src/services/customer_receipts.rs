@@ -86,6 +86,7 @@ where
     /// it reports is derived from that sum, never stored.
     pub async fn collect(
         &self,
+        actor: i64,
         customer_id: i64,
         method_id: i64,
         amount: Decimal,
@@ -142,6 +143,7 @@ where
         for allocation in &plan {
             self.sales
                 .record_payment_with_receipt(
+                    actor,
                     allocation.sale_id,
                     method_id,
                     allocation.amount,
@@ -302,6 +304,7 @@ mod tests {
         SqliteStockMovementRepository, SqliteTransactionRepository,
     };
     use crate::services::{CustomerService, InventoryService, TransactionService};
+    use crate::security::test_support;
 
     type ReceiptSvc = crate::services::CustomerReceiptService<
         SqliteCustomerReceiptRepository,
@@ -330,6 +333,16 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    /// A valid acting user for the mechanical call sites: the migration's
+    /// sentinel account (the system actor pre-existing rows are attributed to).
+    /// The audit-attribution tests below seed their own users instead, because
+    /// there the point is telling two actors apart.
+    async fn audit_actor(s: &ReceiptSvc) -> i64 {
+        test_support::audit_actor_id(&s.sales.transactions.accounts.pool)
+            .await
+            .unwrap()
     }
 
     /// Production wiring, in-memory: the receipt service wraps the same sales
@@ -412,7 +425,13 @@ mod tests {
     }
 
     async fn seed_account(s: &ReceiptSvc, name: &str) -> i64 {
-        s.sales.transactions.accounts.create(name).await.unwrap().id
+        s.sales
+            .transactions
+            .accounts
+            .create(audit_actor(s).await, name)
+            .await
+            .unwrap()
+            .id
     }
 
     async fn seed_customer(s: &ReceiptSvc, name: &str) -> i64 {
@@ -447,7 +466,7 @@ mod tests {
     async fn allow(s: &ReceiptSvc, account_id: i64, method_id: i64) {
         s.sales
             .payment_methods
-            .set_method_account(method_id, Some(account_id))
+            .set_method_account(audit_actor(s).await, method_id, Some(account_id))
             .await
             .unwrap();
     }
@@ -488,7 +507,7 @@ mod tests {
             .add_line(sale.id, product_id, dec(qty), None)
             .await
             .unwrap();
-        s.sales.confirm(sale.id, None).await.unwrap()
+        s.sales.confirm(audit_actor(&s).await, sale.id, None).await.unwrap()
     }
 
     async fn receipt_count(pool: &SqlitePool) -> i64 {
@@ -543,7 +562,7 @@ mod tests {
         let debts = three_debts(&s, customer, product).await;
 
         let detail = s
-            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -633,7 +652,7 @@ mod tests {
         three_debts(&s, customer, product).await;
 
         let detail = s
-            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -678,7 +697,7 @@ mod tests {
         credit_sale(&s, beto, product, "4", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(ana, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, ana, cash, dec("30"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -736,7 +755,7 @@ mod tests {
             .unwrap();
         let err = s
             .sales
-            .record_payment_with_receipt(
+            .record_payment_with_receipt(audit_actor(&s).await, 
                 sale.sale.id,
                 cash,
                 dec("40"),
@@ -766,7 +785,7 @@ mod tests {
 
         let payment = s
             .sales
-            .record_payment(sale.sale.id, cash, dec("15"), d(2024, 6, 20))
+            .record_payment(audit_actor(&s).await, sale.sale.id, cash, dec("15"), d(2024, 6, 20))
             .await
             .unwrap();
 
@@ -792,7 +811,7 @@ mod tests {
         allow(&s, account, cash).await;
         let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
         let detail = s
-            .collect(customer, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("30"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -838,7 +857,7 @@ mod tests {
         let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(customer, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("30"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -860,7 +879,7 @@ mod tests {
         allow(&s, account, cash).await;
         let debts = three_debts(&s, customer, product).await;
 
-        s.collect(customer, cash, dec("80"), d(2024, 6, 20), None)
+        s.collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -881,7 +900,7 @@ mod tests {
         let largest = credit_sale(&s, customer, product, "10", d(2024, 6, 15)).await; // 100
 
         let detail = s
-            .collect(customer, cash, dec("40"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("40"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -912,7 +931,7 @@ mod tests {
         let same_date = credit_sale_on(&s, customer, product, "3", d(2024, 5, 1), due).await;
 
         let detail = s
-            .collect(customer, cash, dec("90"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("90"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -936,11 +955,11 @@ mod tests {
 
         // A direct payment reduces the debt the receipt can allocate over.
         s.sales
-            .record_payment(sale.sale.id, cash, dec("10"), d(2024, 6, 10))
+            .record_payment(audit_actor(&s).await, sale.sale.id, cash, dec("10"), d(2024, 6, 10))
             .await
             .unwrap();
         let detail = s
-            .collect(customer, cash, dec("20"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("20"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -998,7 +1017,7 @@ mod tests {
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
-            .collect(customer, cash, dec("31"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("31"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1020,7 +1039,7 @@ mod tests {
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
-            .collect(customer, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("10"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1044,7 +1063,7 @@ mod tests {
 
         for amount in [dec("0"), dec("-5")] {
             let err = s
-                .collect(customer, cash, amount, d(2024, 6, 20), None)
+                .collect(audit_actor(&s).await, customer, cash, amount, d(2024, 6, 20), None)
                 .await
                 .unwrap_err();
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1059,7 +1078,7 @@ mod tests {
         let cash = method_id(&s, "Cash").await;
 
         let err = s
-            .collect(999_999, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, 999_999, cash, dec("10"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
 
@@ -1095,7 +1114,7 @@ mod tests {
             .unwrap()
             .is_empty());
         let err = s
-            .collect(walkin, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, walkin, cash, dec("10"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1116,7 +1135,7 @@ mod tests {
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(
+            .collect(audit_actor(&s).await, 
                 customer,
                 cash,
                 dec("10"),
@@ -1128,7 +1147,7 @@ mod tests {
         assert_eq!(detail.receipt.notes.as_deref(), Some("half now"));
 
         let err = s
-            .collect(
+            .collect(audit_actor(&s).await, 
                 customer,
                 cash,
                 dec("10"),
@@ -1152,7 +1171,7 @@ mod tests {
         allow(&s, account, cash).await;
         three_debts(&s, customer, product).await;
         let detail = s
-            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
@@ -1197,7 +1216,7 @@ mod tests {
         .unwrap();
 
         let err = s
-            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         eprintln!("injected mid-loop failure: {err}");
@@ -1303,7 +1322,7 @@ mod tests {
         .unwrap();
 
         let err = s
-            .collect(customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
             .await
             .unwrap_err();
         eprintln!("injected first-payment failure: {err}");
@@ -1455,7 +1474,7 @@ mod tests {
         // The service path still groups its own customer's payment.
         let paid = s
             .sales
-            .record_payment_with_receipt(
+            .record_payment_with_receipt(audit_actor(&s).await, 
                 ana_sale.sale.id,
                 cash,
                 dec("1"),
@@ -1496,7 +1515,7 @@ mod tests {
 
         let err = s
             .sales
-            .record_payment_with_receipt(
+            .record_payment_with_receipt(audit_actor(&s).await, 
                 ana_sale.sale.id,
                 cash,
                 dec("10"),
@@ -1535,7 +1554,7 @@ mod tests {
             .unwrap();
         let paid = s
             .sales
-            .record_payment_with_receipt(
+            .record_payment_with_receipt(audit_actor(&s).await, 
                 ana_sale.sale.id,
                 cash,
                 dec("10"),

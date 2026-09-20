@@ -135,6 +135,7 @@ impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::test_support;
     use chrono::NaiveDate;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
@@ -175,11 +176,13 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let (account_id,): (i64,) =
-            sqlx::query_as("INSERT INTO accounts (name) VALUES ('Caja') RETURNING id")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (account_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO accounts (name, created_by) VALUES ('Caja', ?) RETURNING id",
+        )
+        .bind(test_support::audit_actor_id(&pool).await.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         let (method_id,): (i64,) =
             sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
                 .fetch_one(&pool)

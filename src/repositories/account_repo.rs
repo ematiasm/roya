@@ -12,7 +12,7 @@ use crate::models::{Account, AccountWithBalance};
 
 #[async_trait]
 pub trait AccountRepository: Send + Sync {
-    async fn create(&self, name: &str) -> AppResult<Account>;
+    async fn create(&self, actor: i64, name: &str) -> AppResult<Account>;
     async fn list(&self) -> AppResult<Vec<Account>>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Account>>;
     async fn list_with_balances(&self) -> AppResult<Vec<AccountWithBalance>>;
@@ -35,6 +35,8 @@ fn row_to_account(row: sqlx::sqlite::SqliteRow) -> Account {
         id: row.get("id"),
         name: row.get("name"),
         cached_balance: parse_decimal(&cached_str),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -56,28 +58,34 @@ impl SqliteAccountRepository {
 
 #[async_trait]
 impl AccountRepository for SqliteAccountRepository {
-    async fn create(&self, name: &str) -> AppResult<Account> {
+    async fn create(&self, actor: i64, name: &str) -> AppResult<Account> {
         let row = sqlx::query(
-            r#"INSERT INTO accounts (name) VALUES (?) RETURNING id, name, cached_balance, created_at"#,
+            r#"INSERT INTO accounts (name, created_by) VALUES (?, ?)
+               RETURNING id, name, cached_balance, created_by, updated_by, created_at"#,
         )
         .bind(name.trim())
+        .bind(actor)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_account(row))
     }
 
     async fn list(&self) -> AppResult<Vec<Account>> {
-        let rows = sqlx::query(r#"SELECT id, name, cached_balance, created_at FROM accounts ORDER BY id"#)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query(
+            r#"SELECT id, name, cached_balance, created_by, updated_by, created_at FROM accounts ORDER BY id"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(row_to_account).collect())
     }
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Account>> {
-        let row = sqlx::query(r#"SELECT id, name, cached_balance, created_at FROM accounts WHERE id = ?"#)
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            r#"SELECT id, name, cached_balance, created_by, updated_by, created_at FROM accounts WHERE id = ?"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(row_to_account))
     }
 
@@ -93,6 +101,8 @@ impl AccountRepository for SqliteAccountRepository {
                 name: acc.name,
                 balance,
                 cached_balance: acc.cached_balance,
+                created_by: acc.created_by,
+                updated_by: acc.updated_by,
                 created_at: acc.created_at,
             });
         }
@@ -108,6 +118,8 @@ impl AccountRepository for SqliteAccountRepository {
             name: acc.name,
             balance,
             cached_balance: acc.cached_balance,
+            created_by: acc.created_by,
+            updated_by: acc.updated_by,
             created_at: acc.created_at,
         }))
     }

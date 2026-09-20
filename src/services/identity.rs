@@ -2213,16 +2213,18 @@ mod tests {
     #[tokio::test]
     async fn change_password_rejects_short_and_repeated_passwords() {
         let (s, _pool, _clock) = svc().await;
-        seed_user(&s, "teller", "current password", true).await;
+        // seed_user's row sits AFTER migration 30's sentinel account, so its id
+        // is resolved, never assumed to be 1.
+        let teller = seed_user(&s, "teller", "current password", true).await;
 
         let err = s
-            .change_password(1, "current password", "short")
+            .change_password(teller.id, "current password", "short")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         let err = s
-            .change_password(1, "current password", "current password")
+            .change_password(teller.id, "current password", "current password")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -2785,8 +2787,10 @@ mod tests {
         assert!(msg.contains("teller"), "the refusal names the taken name: {msg}");
 
         // Every refusal above wrote nothing: exactly one user beyond the
-        // pre-existing rows exists.
-        assert_eq!(s.users.list().await.unwrap().len(), 1);
+        // pre-existing rows exists. The pre-existing rows are migration 30's
+        // sentinel account (`sistema`, inactive, roleless — Phase B's system
+        // actor for rows that predate the audit), so the list is two long.
+        assert_eq!(s.users.list().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -3010,7 +3014,11 @@ mod tests {
             .unwrap();
 
         let list = s.list_users_with_roles().await.unwrap();
-        assert_eq!(list.len(), 2);
+        // The migration's sentinel account (`sistema`, inactive, roleless) is a
+        // real user row, so the list shows it next to the two accounts the test
+        // created — that visibility is the ratified Phase B posture: the audit
+        // explains its own attribution instead of hiding it.
+        assert_eq!(list.len(), 3);
         let admin_row = list.iter().find(|r| r.user.id == admin.id).unwrap();
         assert_eq!(
             admin_row.roles.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
