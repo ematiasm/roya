@@ -88,6 +88,33 @@ reaches the dashboard, a wrong password keeps the visitor on the form with the
 generic error, and `ROYA_COOKIE_SECURE=1` is proven on the real `Set-Cookie`
 wire (the default harness cookie carries no `Secure` flag).
 
+Slice S8 part 1 completes AC22 in the same module, all through the real
+screens:
+
+- the forced password change — a user created through the users screen is
+  flagged `must_change_password` (the list shows the badge), its first login is
+  confined to `/password`, another screen's URL typed by hand bounces back to
+  the change form, and completing the change lands on the dashboard with the
+  same session reaching the screen it could not reach before;
+- session expiry during an HTMX request (the debt carried since S1b) — the
+  test owns its login, expires the session row server-side (the same
+  sha256/base64url digest the application stores, in the throwaway database),
+  clicks the users screen's refresh control, and asserts the browser
+  navigated to the login page. The server's `401` + `HX-Redirect: /login` is
+  proven on the wire as part of the same assertion; the navigation is the
+  part no Rust test can make, because only the browser decides what htmx
+  1.9.12 does with a correct server response.
+- a permission-denied HTMX form — a principal whose role holds exactly
+  `sales.read` (built through the roles screen's matrix editor and the users
+  screen's Roles dialog) submits the New Sale form; the refusal reaches the
+  operator as the app's notice (`Create sale failed — Se necesita el permiso
+  «sales.create»…`) and the DOM never swaps as if the action had succeeded.
+
+The expiry helper, `expire_session_in_database` in `helpers.py`, is the suite's
+one deliberate non-HTTP step: expiring a row is not an action the interface
+offers, and it touches only the throwaway database the spawned server already
+owns.
+
 Slice E2 is the critical flows:
 
 - `tests/test_picker.py` — a barcode scan adds a line in one interaction and the

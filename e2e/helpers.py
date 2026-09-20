@@ -7,16 +7,27 @@ browser itself calls and the documented JSON routes next to them (barcodes, for
 instance, are added through ``POST /api/products/{id}/barcodes``). Nothing here
 touches the development database: the server the client points at runs on a
 throwaway file.
+
+The one deliberate exception is ``expire_session_in_database``: the AC22
+session-expiry case needs the session invalid server-side while the browser
+still holds its cookie, and expiring the row is not an action the interface
+offers (logout revokes, it does not expire). It writes to the throwaway
+database only — the file the spawned server already owns — and never to the
+development database the harness guards.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 # A seed request is a local call; ten seconds is far more than enough and keeps
@@ -26,6 +37,42 @@ _REQUEST_TIMEOUT_SECONDS = 10.0
 
 class SeedError(RuntimeError):
     """A seed request failed; the endpoint is broken and the suite must say so."""
+
+
+# The timestamp form the application writes into SQLite (src/db.rs): ISO with a
+# `T`, milliseconds and a trailing `Z`, so the SQL comparison
+# `expires_at > :now` sees a value that is unambiguously in the past.
+_EXPIRED_SQLITE_TIMESTAMP = "1970-01-01T00:00:00.000Z"
+
+
+def expire_session_in_database(db_path: Path, token: str) -> None:
+    """Expire the session row the raw cookie token names, in the throwaway db.
+
+    AC22's session-expiry case must be about *expiry*, not logout: the row
+    stays, the cookie stays in the browser, and the server alone must decide
+    the session is dead. The digest is the same sha256/base64url-no-pad form
+    the application stores (``security/session.rs``), computed from the token
+    the browser actually holds, so the row updated here is the row the next
+    request resolves.
+    """
+    digest = base64.urlsafe_b64encode(hashlib.sha256(token.encode("utf-8")).digest())
+    token_hash = digest.decode("ascii").rstrip("=")
+    connection = sqlite3.connect(str(db_path), timeout=5.0)
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        cursor = connection.execute(
+            "UPDATE sessions SET expires_at = ? "
+            "WHERE token_hash = ? AND revoked_at IS NULL",
+            (_EXPIRED_SQLITE_TIMESTAMP, token_hash),
+        )
+        connection.commit()
+        if cursor.rowcount != 1:
+            raise SeedError(
+                f"expected to expire exactly one live session row, moved {cursor.rowcount}; "
+                "the token digest did not match a live row"
+            )
+    finally:
+        connection.close()
 
 
 class ApiClient:
