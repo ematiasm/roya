@@ -98,6 +98,10 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
 - [ ] Fase B — Auditoría del actor por departamento (T26–T31)
   - [x] T26 (S9) — finanzas: migración 30 + plomería del actor + display + tests AC18–AC19
         (2026-09-20, ver S9 en Progreso; T27–T31 copian el patrón)
+  - [x] T27 (S10) — inventario: migración 31 + plomería del actor + display + tests AC18–AC19
+        (2026-09-20, ver S10 en Progreso; el gemelo de flujo de venta/compra entró en este slice
+        porque `created_by NOT NULL` en `stock_movements` es la plomería inter-departamentos de
+        sus movimientos)
 
 ## Progress
 - 2026-09-18: reconocimiento del repo (sin auth, convención de departamentos, invariantes),
@@ -1203,3 +1207,71 @@ comportamiento, no una sola guard). **Números de cierre:** `cargo test` **623 p
 (613 + 10 nuevos); `scripts/e2e.sh` completa **62 passed / 4 skipped** (idéntico al baseline de
 `main`, cero fallos nuevos); ledger en **55 warnings** (57 crudas − 2 resúmenes), sin
 `#[allow]`.
+
+## Progreso S10 (T27, segundo slice de Fase B) — 2026-09-20
+
+Rama `feat/audit-inventory`, creada desde `main` con S9 entregado. Writer delegado; el patrón de
+S9 se copió sin inventar un segundo patrón.
+
+**Entregado:** `migrations/20240101000031_add_audit_inventory.sql` — rebuild controlado (marcador
+`-- no-transaction`, `PRAGMA foreign_keys = OFF/ON`, sentinel condicional, backfill por
+`INSERT ... SELECT`) de `categories`, `products` y `stock_movements` con `created_by NOT NULL` +
+`updated_by NULL`, ambas FK RESTRICT a `users`. El reason CHECK de `stock_movements` es el
+EXPANDIDO de las migraciones 11 y 18 (siete razones), no el original de la migración 6.
+`product_barcodes` no lleva columnas: hereda el actor de su producto, como los renglones de
+documento del plan, y la migración lo dice en su comentario. El centinela: la migración REUTILIZA
+el de la migración 30 (en toda base construida por la cadena existe, porque la migración 12 siembra
+los cinco métodos de pago y la 30 siempre encuentra filas que atribuir); el INSERT guardado de la
+31 es DEFENSIVO — solo dispara si el centinela está ausente y hay filas de inventario que
+atribuir — y el comentario del archivo dice cuál de los dos caminos hace. La forma del centinela
+defensivo es byte-idéntica a la de la 30 (inactivo, sin roles, credencial malformada).
+
+**Plomería:** el actor viaja explícito como argumento ruta (`Principal.user_id`) → servicio →
+repositorio: crear/editar categoría, crear/editar producto, alternar is_active (es una edición:
+`updated_by` lo lleva igual) y todo movimiento que producen las pantallas de inventario
+(`record_movement(actor, …)`). Los movimientos producidos DENTRO de los flujos llevan el actor
+del request origen: `SalesService.confirm/cancel` y `PurchasesService.confirm/cancel` extienden
+el MISMO argumento `actor` que ya usaban para sus filas de finanzas al `record_movement` —
+no hay segundo camino. Los repos de inventario siguen sin leer tablas de identidad (AC20);
+los nombres de display se resuelven en la capa de wiring (`routes/mod.rs::audit_actor_names`).
+
+**Display:** el detalle de producto muestra "Registrado por" / "Actualizado por" (resueltos en
+`product_detail_html`, como el detalle de finanzas) y las filas de la lista de stock
+(`stock_list.html`, low/negative stock) muestran el mismo nombre. Español en la copia, clases
+Tailwind ya existentes (sin rebuild de CSS). Nunca un id crudo.
+
+**Tests nuevos (8):** `ac18_inventory_create_and_update_store_two_different_actors` (dos usuarios
+dedicados, producto + categoría + toggle is_active), `ac18_a_movement_records_the_actor_of_the_
+request_that_caused_it`, `ac18_the_sale_flow_movement_carries_the_flows_actor` (gemelo en
+`sales.rs` del test de finanzas), `ac18_the_purchase_flow_movement_carries_the_flows_actor`
+(gemelo en `purchases.rs`), `ac19_the_upgrade_attributes_every_inventory_row_to_the_system_
+sentinel` y `ac19_the_inventory_migration_recreates_a_missing_sentinel` (camino defensivo, en
+`smoke_tests.rs` porque el scan AC20 cubre el archivo entero de cada departamento),
+`audit_inventory_detail_view_shows_the_actor_display_name` y
+`audit_the_stock_list_rows_show_the_actor_display_name` (con dos principales y conteos, para
+que la mutación no pase vacuosa).
+
+**Mutaciones validadas** (cada guard roto y su test como testigo): `products.created_by` (bind
+dropped → NOT NULL aborta el create), `products.updated_by` (bind dropped → el test espera
+`Some(bob)` y recibe `None`), `set_active` `updated_by` (bind dropped), `categories.created_by`
+y `categories.updated_by` (binds dropped), `stock_movements.created_by` (bind dropped), el actor
+del flujo de venta (reemplazado por 0 → FK falla y el test ve el error), el actor del flujo de
+compra (ídem), el backfill de la migración a NULL (la migración aborta con NOT NULL y el test
+AC19 la ve fallar), y los dos displays (la línea del template eliminada → conteo 0 ≠ 1).
+
+**Test preexistente tocado:** `tri_purchase_return_check_expansion_preserves_existing_movements`
+(`purchases.rs`): su INSERT post-migración en `stock_movements` omitía `created_by`, que ahora es
+NOT NULL; se le agregó el actor centinela (el mismo que la migración atribuye a la fila legacy),
+sin cambiar lo que la prueba verifica (la expansión del CHECK).
+
+**Números:** baseline `cargo test` **623 passed / 0 failed**; cierre **631 passed / 0 failed**
+(623 + 8 nuevos). `cargo check --all-targets` 0 errores, ledger en **55 warnings** (57 crudas −
+2 resúmenes, igual que el cierre de S9); `grep allow(dead_code)|allow(unused_imports)` src/ →
+nada nuevo. `scripts/e2e.sh -k products`: **13 passed / 1 skipped** (la sonda de screenshot opt-in,
+igual que el baseline); `-k identity`: **7 passed**; cero cambios en `e2e/`. Sonda en vivo con el
+binario real (`DATABASE_URL` propio, bootstrap del admin): producto creado por la UI web y
+movimiento registrado por el formulario del drawer → detalle renderizando "Registrado por Admin",
+`stock_movements.created_by = admin` (no el centinela); gemelo de flujo de venta: confirmación de
+venta Cash como admin → los dos movimientos reason=Sale llevan `created_by = admin`; base de la
+sonda termina con `PRAGMA foreign_key_check` vacío.
+

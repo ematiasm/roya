@@ -667,7 +667,9 @@ mod tests {
             .unwrap();
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
                 sku: "WEB-SUP-P".into(),
                 name: "prod WEB-SUP-P".into(),
                 kind: ProductKind::Product,
@@ -850,7 +852,9 @@ mod tests {
             .unwrap();
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
                 sku: "WEB-SUP-C".into(),
                 name: "prod WEB-SUP-C".into(),
                 kind: ProductKind::Product,
@@ -1004,7 +1008,9 @@ mod tests {
             .unwrap();
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
                 sku: "WEB-PAY-C".into(),
                 name: "prod WEB-PAY-C".into(),
                 kind: ProductKind::Product,
@@ -1496,7 +1502,9 @@ mod tests {
             .unwrap();
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
                 sku: "HOLDER-SUP-P".into(),
                 name: "prod HOLDER-SUP-P".into(),
                 kind: ProductKind::Product,

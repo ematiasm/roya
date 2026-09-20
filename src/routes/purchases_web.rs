@@ -1139,7 +1139,9 @@ mod tests {
 
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
                 sku: "REC-PUR".into(),
                 name: "Record purchase product".into(),
                 kind: ProductKind::Product,
@@ -1241,7 +1243,9 @@ mod tests {
 
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
                 sku: sku.into(),
                 name: format!("prod {sku}"),
                 kind: ProductKind::Product,

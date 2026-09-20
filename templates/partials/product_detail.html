@@ -30,6 +30,11 @@
     </div>
     <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • ${{ product.sale_price }}</div>
     <div class="text-[13px] text-muted">stock {{ stock }}{% if let Some(min) = product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = product.max_stock %} • max {{ max }}{% endif %}</div>
+    {# Audit attribution (M5 Phase B): who registered the product and who last
+       changed it, shown as a display name resolved in the wiring layer — the
+       same rows the finance detail shows. The sentinel renders as its own
+       name, which says what happened instead of hiding it. #}
+    <div class="text-[13px] text-muted">Registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = updated_by_name %} • Actualizado por {{ name }}{% endif %}</div>
 
     {# Lifecycle actions live beside the header like the customers drawer: hidden
        id, POST, list swap, drawer closes only when the request succeeded. The

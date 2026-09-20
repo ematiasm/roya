@@ -61,6 +61,7 @@ where
 
     pub async fn create_category(
         &self,
+        actor: i64,
         name: &str,
         parent_id: Option<i64>,
     ) -> AppResult<Category> {
@@ -80,11 +81,14 @@ where
                 "category already exists under this parent".into(),
             ));
         }
-        self.categories.create(&clean, parent_id).await
+        self.categories.create(actor, &clean, parent_id).await
     }
 
+    /// `actor` is the audit actor of the editing request (M5 Phase B, slice
+    /// S10): it lands on `updated_by` while the row's creator stays recorded.
     pub async fn update_category(
         &self,
+        actor: i64,
         id: i64,
         name: Option<&str>,
         parent_id: Option<Option<i64>>,
@@ -156,7 +160,7 @@ where
             }
         }
 
-        self.categories.update(id, &new_name, new_parent).await
+        self.categories.update(actor, id, &new_name, new_parent).await
     }
 
     pub async fn delete_category(&self, id: i64) -> AppResult<()> {
@@ -312,12 +316,15 @@ where
         })
     }
 
-    pub async fn create_product(&self, input: NewProduct) -> AppResult<Product> {
+    /// `actor` is the audit actor of the creating request (M5 Phase B, slice
+    /// S10): the acting user's id from the `Principal`, threaded down, never
+    /// invented here.
+    pub async fn create_product(&self, actor: i64, input: NewProduct) -> AppResult<Product> {
         let clean = self.validate_product(input).await?;
         if self.products.find_by_sku(&clean.sku).await?.is_some() {
             return Err(AppError::Conflict("sku already exists".into()));
         }
-        self.products.create(&clean).await
+        self.products.create(actor, &clean).await
     }
 
     /// Patch edit over the current row. The patch merges onto the loaded product
@@ -325,7 +332,9 @@ where
     /// the same `validate_product` rules as create, so an edit can never bypass a
     /// business rule. The only edit-specific check is the duplicate SKU, done
     /// against other rows only so re-sending the same SKU is not a conflict.
-    pub async fn update_product(&self, id: i64, patch: UpdateProduct) -> AppResult<Product> {
+    /// `actor` is the audit actor of the editing request: it lands on
+    /// `updated_by` while `created_by` keeps the row's creator.
+    pub async fn update_product(&self, actor: i64, id: i64, patch: UpdateProduct) -> AppResult<Product> {
         let current = self.get_product(id).await?;
         let merged = NewProduct {
             sku: patch.sku.unwrap_or_else(|| current.sku.clone()),
@@ -349,12 +358,14 @@ where
                 }
             }
         }
-        self.products.update(id, &clean).await
+        self.products.update(actor, id, &clean).await
     }
 
-    pub async fn set_product_active(&self, id: i64, active: bool) -> AppResult<Product> {
+    /// A lifecycle toggle is a product update: `updated_by` carries the acting
+    /// user the same way an edit does.
+    pub async fn set_product_active(&self, actor: i64, id: i64, active: bool) -> AppResult<Product> {
         self.get_product(id).await?;
-        self.products.set_active(id, active).await
+        self.products.set_active(actor, id, active).await
     }
 
     pub async fn delete_product(&self, id: i64) -> AppResult<()> {
@@ -543,7 +554,12 @@ where
         }
     }
 
-    pub async fn record_movement(&self, input: NewMovement) -> AppResult<StockMovement> {
+    /// `actor` is the audit actor of the request recording the movement (M5
+    /// Phase B, slice S10): for a movement produced inside a sale or purchase
+    /// confirm, the flow passes ITS request's actor down — the same argument
+    /// that stamps the finance rows — so the movement never records a fresh
+    /// actor (AC18).
+    pub async fn record_movement(&self, actor: i64, input: NewMovement) -> AppResult<StockMovement> {
         match input.movement_type {
             MovementType::In | MovementType::Out => {
                 if input.qty <= Decimal::ZERO {
@@ -588,7 +604,7 @@ where
             }
         }
 
-        self.movements.create(&input).await
+        self.movements.create(actor, &input).await
     }
 
     // -- derived ------------------------------------------------------------
@@ -671,6 +687,7 @@ mod tests {
         SqliteBarcodeRepository, SqliteCategoryRepository, SqliteProductRepository,
         SqliteStockMovementRepository,
     };
+    use crate::security::test_support;
     use rust_decimal::Decimal;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
@@ -711,6 +728,15 @@ mod tests {
         Decimal::from_str(s).unwrap()
     }
 
+    /// The acting user for fixture writes: the migration's sentinel. The
+    /// attribution tests create dedicated users instead, so two actors can be
+    /// told apart.
+    async fn actor(s: &Svc) -> i64 {
+        crate::security::test_support::audit_actor_id(&s.products.pool)
+            .await
+            .unwrap()
+    }
+
     fn product_input(sku: &str) -> NewProduct {
         NewProduct {
             sku: sku.to_string(),
@@ -742,8 +768,8 @@ mod tests {
     #[tokio::test]
     async fn ac1_duplicate_sku_is_conflict() {
         let s = svc(true).await;
-        s.create_product(product_input("SKU-1")).await.unwrap();
-        let err = s.create_product(product_input("SKU-1")).await.unwrap_err();
+        s.create_product(actor(&s).await, product_input("SKU-1")).await.unwrap();
+        let err = s.create_product(actor(&s).await, product_input("SKU-1")).await.unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
     }
 
@@ -757,10 +783,10 @@ mod tests {
             max_stock: None,
             ..product_input("SRV-1")
         };
-        let created = s.create_product(svc_prod).await.unwrap();
+        let created = s.create_product(actor(&s).await, svc_prod).await.unwrap();
         assert!(!created.track_stock);
         let err = s
-            .record_movement(movement(created.id, "1", MovementType::In))
+            .record_movement(actor(&s).await, movement(created.id, "1", MovementType::In))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -769,14 +795,14 @@ mod tests {
     #[tokio::test]
     async fn ac3_bad_qty_and_unknown_product() {
         let s = svc(true).await;
-        let p = s.create_product(product_input("AC3")).await.unwrap();
+        let p = s.create_product(actor(&s).await, product_input("AC3")).await.unwrap();
         let err = s
-            .record_movement(movement(p.id, "0", MovementType::In))
+            .record_movement(actor(&s).await, movement(p.id, "0", MovementType::In))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
-            .record_movement(movement(99999, "1", MovementType::In))
+            .record_movement(actor(&s).await, movement(99999, "1", MovementType::In))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
@@ -785,20 +811,20 @@ mod tests {
     #[tokio::test]
     async fn ac4_category_cycle_rejected() {
         let s = svc(true).await;
-        let root = s.create_category("root", None).await.unwrap();
+        let root = s.create_category(actor(&s).await, "root", None).await.unwrap();
         let child = s
-            .create_category("child", Some(root.id))
+            .create_category(actor(&s).await, "child", Some(root.id))
             .await
             .unwrap();
         // descendant-parent cycle
         let err = s
-            .update_category(root.id, None, Some(Some(child.id)))
+            .update_category(actor(&s).await, root.id, None, Some(Some(child.id)))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // self-parent cycle
         let err = s
-            .update_category(root.id, None, Some(Some(root.id)))
+            .update_category(actor(&s).await, root.id, None, Some(Some(root.id)))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -807,34 +833,34 @@ mod tests {
     #[tokio::test]
     async fn ac5_delete_nonempty_category_blocked() {
         let s = svc(true).await;
-        let root = s.create_category("r", None).await.unwrap();
-        s.create_category("c", Some(root.id)).await.unwrap();
+        let root = s.create_category(actor(&s).await, "r", None).await.unwrap();
+        s.create_category(actor(&s).await, "c", Some(root.id)).await.unwrap();
         let err = s.delete_category(root.id).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
-        let leaf = s.create_category("leaf", None).await.unwrap();
+        let leaf = s.create_category(actor(&s).await, "leaf", None).await.unwrap();
         let mut inp = product_input("CAT-P");
         inp.category_id = Some(leaf.id);
-        s.create_product(inp).await.unwrap();
+        s.create_product(actor(&s).await, inp).await.unwrap();
         let err = s.delete_category(leaf.id).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
-        let empty = s.create_category("empty", None).await.unwrap();
+        let empty = s.create_category(actor(&s).await, "empty", None).await.unwrap();
         s.delete_category(empty.id).await.unwrap();
     }
 
     #[tokio::test]
     async fn ac6_strict_mode_blocks_negative() {
         let s = svc(false).await;
-        let p = s.create_product(product_input("STRICT")).await.unwrap();
-        s.record_movement(NewMovement {
+        let p = s.create_product(actor(&s).await, product_input("STRICT")).await.unwrap();
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Purchase,
             ..movement(p.id, "5", MovementType::In)
         })
         .await
         .unwrap();
         let err = s
-            .record_movement(NewMovement {
+            .record_movement(actor(&s).await, NewMovement {
                 reason: MovementReason::Sale,
                 ..movement(p.id, "10", MovementType::Out)
             })
@@ -847,14 +873,14 @@ mod tests {
     #[tokio::test]
     async fn ac7_permissive_mode_allows_negative_and_lists_it() {
         let s = svc(true).await;
-        let p = s.create_product(product_input("PERM")).await.unwrap();
-        s.record_movement(NewMovement {
+        let p = s.create_product(actor(&s).await, product_input("PERM")).await.unwrap();
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Purchase,
             ..movement(p.id, "5", MovementType::In)
         })
         .await
         .unwrap();
-        s.record_movement(NewMovement {
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Sale,
             ..movement(p.id, "10", MovementType::Out)
         })
@@ -870,20 +896,20 @@ mod tests {
     #[tokio::test]
     async fn tri_stock_sums_signed_movements_and_suggests_reorder() {
         let s = svc(true).await;
-        let p = s.create_product(product_input("SUM")).await.unwrap();
-        s.record_movement(NewMovement {
+        let p = s.create_product(actor(&s).await, product_input("SUM")).await.unwrap();
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Initial,
             ..movement(p.id, "20", MovementType::In)
         })
         .await
         .unwrap();
-        s.record_movement(NewMovement {
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Sale,
             ..movement(p.id, "8", MovementType::Out)
         })
         .await
         .unwrap();
-        s.record_movement(NewMovement {
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Adjust,
             ..movement(p.id, "-2", MovementType::Adjust)
         })
@@ -895,7 +921,7 @@ mod tests {
         assert!(ps.suggested.is_none());
 
         // Drop to low stock: 10 - 8 = 2 <= min(5) => suggested = max - stock = 48
-        s.record_movement(NewMovement {
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Sale,
             ..movement(p.id, "8", MovementType::Out)
         })
@@ -911,8 +937,8 @@ mod tests {
     #[tokio::test]
     async fn tri_duplicate_barcode_is_conflict() {
         let s = svc(true).await;
-        let a = s.create_product(product_input("BC-A")).await.unwrap();
-        let b = s.create_product(product_input("BC-B")).await.unwrap();
+        let a = s.create_product(actor(&s).await, product_input("BC-A")).await.unwrap();
+        let b = s.create_product(actor(&s).await, product_input("BC-B")).await.unwrap();
         s.add_barcode(a.id, "7790001").await.unwrap();
         let err = s.add_barcode(a.id, "7790001").await.unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
@@ -923,8 +949,8 @@ mod tests {
     #[tokio::test]
     async fn tri_product_delete_restrict_with_movements_cascade_barcodes() {
         let s = svc(true).await;
-        let with_hist = s.create_product(product_input("DEL-H")).await.unwrap();
-        s.record_movement(NewMovement {
+        let with_hist = s.create_product(actor(&s).await, product_input("DEL-H")).await.unwrap();
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Initial,
             ..movement(with_hist.id, "3", MovementType::In)
         })
@@ -934,7 +960,7 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         // Without movements delete succeeds and cascades barcodes.
-        let plain = s.create_product(product_input("DEL-C")).await.unwrap();
+        let plain = s.create_product(actor(&s).await, product_input("DEL-C")).await.unwrap();
         let bc = s.add_barcode(plain.id, "CASCADE-1").await.unwrap();
         s.delete_product(plain.id).await.unwrap();
         assert!(s.get_product(plain.id).await.is_err());
@@ -964,7 +990,7 @@ mod tests {
             ..bad
         };
         assert!(matches!(
-            s.create_product(bad).await.unwrap_err(),
+            s.create_product(actor(&s).await, bad).await.unwrap_err(),
             AppError::Validation(_)
         ));
         // Tracked without min/max rejected.
@@ -974,7 +1000,7 @@ mod tests {
             ..product_input("TRK-BAD")
         };
         assert!(matches!(
-            s.create_product(bad).await.unwrap_err(),
+            s.create_product(actor(&s).await, bad).await.unwrap_err(),
             AppError::Validation(_)
         ));
         // Untracked product rejects movements.
@@ -984,17 +1010,17 @@ mod tests {
             max_stock: None,
             ..product_input("UNTRK")
         };
-        let u = s.create_product(untracked).await.unwrap();
+        let u = s.create_product(actor(&s).await, untracked).await.unwrap();
         let err = s
-            .record_movement(movement(u.id, "1", MovementType::In))
+            .record_movement(actor(&s).await, movement(u.id, "1", MovementType::In))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // Inactive product rejects movements.
-        let p = s.create_product(product_input("INACT")).await.unwrap();
-        s.set_product_active(p.id, false).await.unwrap();
+        let p = s.create_product(actor(&s).await, product_input("INACT")).await.unwrap();
+        s.set_product_active(actor(&s).await, p.id, false).await.unwrap();
         let err = s
-            .record_movement(movement(p.id, "1", MovementType::In))
+            .record_movement(actor(&s).await, movement(p.id, "1", MovementType::In))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1003,16 +1029,16 @@ mod tests {
     #[tokio::test]
     async fn tri_root_duplicate_name_and_adjust_zero() {
         let s = svc(true).await;
-        s.create_category("dup", None).await.unwrap();
-        let err = s.create_category("dup", None).await.unwrap_err();
+        s.create_category(actor(&s).await, "dup", None).await.unwrap();
+        let err = s.create_category(actor(&s).await, "dup", None).await.unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
         // Same name under different parent is fine.
-        let other = s.create_category("other", None).await.unwrap();
-        s.create_category("dup", Some(other.id)).await.unwrap();
+        let other = s.create_category(actor(&s).await, "other", None).await.unwrap();
+        s.create_category(actor(&s).await, "dup", Some(other.id)).await.unwrap();
 
-        let p = s.create_product(product_input("ADJ0")).await.unwrap();
+        let p = s.create_product(actor(&s).await, product_input("ADJ0")).await.unwrap();
         let err = s
-            .record_movement(movement(p.id, "0", MovementType::Adjust))
+            .record_movement(actor(&s).await, movement(p.id, "0", MovementType::Adjust))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1028,9 +1054,9 @@ mod tests {
             SqliteStockMovementRepository::new(pool.clone()),
             true,
         );
-        let p = s.create_product(product_input("NOFIN")).await.unwrap();
+        let p = s.create_product(actor(&s).await, product_input("NOFIN")).await.unwrap();
         s.add_barcode(p.id, "NOFIN-BC").await.unwrap();
-        s.record_movement(NewMovement {
+        s.record_movement(actor(&s).await, NewMovement {
             reason: MovementReason::Purchase,
             ..movement(p.id, "4", MovementType::In)
         })
@@ -1058,15 +1084,15 @@ mod tests {
     async fn n4_search_matches_name_sku_and_barcode() {
         let s = svc(true).await;
         let yerba = s
-            .create_product(named("YERBA-500", "Yerba Mate"))
+            .create_product(actor(&s).await, named("YERBA-500", "Yerba Mate"))
             .await
             .unwrap();
         let galletas = s
-            .create_product(named("GAL-10", "Galletitas"))
+            .create_product(actor(&s).await, named("GAL-10", "Galletitas"))
             .await
             .unwrap();
         s.add_barcode(yerba.id, "7790000000017").await.unwrap();
-        s.record_movement(movement(yerba.id, "7", MovementType::In))
+        s.record_movement(actor(&s).await, movement(yerba.id, "7", MovementType::In))
             .await
             .unwrap();
 
@@ -1095,7 +1121,7 @@ mod tests {
     async fn n4_search_is_bounded_and_empty_query_returns_nothing() {
         let s = svc(true).await;
         for i in 0..15 {
-            s.create_product(named(&format!("BULK-{i:02}"), &format!("Bulk item {i}")))
+            s.create_product(actor(&s).await, named(&format!("BULK-{i:02}"), &format!("Bulk item {i}")))
                 .await
                 .unwrap();
         }
@@ -1121,13 +1147,13 @@ mod tests {
     async fn n4_resolve_prefers_barcode_then_sku_then_id() {
         let s = svc(true).await;
         let scanned = s
-            .create_product(named("SCAN-SKU", "Scanned product"))
+            .create_product(actor(&s).await, named("SCAN-SKU", "Scanned product"))
             .await
             .unwrap();
         s.add_barcode(scanned.id, "12345").await.unwrap();
         // Same text as the barcode on purpose: the barcode must win.
         let sku_twin = s
-            .create_product(named("12345", "SKU twin"))
+            .create_product(actor(&s).await, named("12345", "SKU twin"))
             .await
             .unwrap();
 
@@ -1138,7 +1164,7 @@ mod tests {
         );
 
         let plain = s
-            .create_product(named("PLAIN-9", "Plain product"))
+            .create_product(actor(&s).await, named("PLAIN-9", "Plain product"))
             .await
             .unwrap();
         assert_eq!(
@@ -1162,8 +1188,8 @@ mod tests {
     #[tokio::test]
     async fn n4_resolve_unknown_explains_the_search_match_count() {
         let s = svc(true).await;
-        s.create_product(named("Y-500", "Yerba Mate")).await.unwrap();
-        s.create_product(named("Y-900", "Yerba Premium"))
+        s.create_product(actor(&s).await, named("Y-500", "Yerba Mate")).await.unwrap();
+        s.create_product(actor(&s).await, named("Y-900", "Yerba Premium"))
             .await
             .unwrap();
 
@@ -1188,8 +1214,8 @@ mod tests {
         #[tokio::test]
         async fn update_product_full_edit_changes_every_field() {
             let s = svc(true).await;
-            let cat = s.create_category("edit-cat", None).await.unwrap();
-            let p = s.create_product(product_input("EDIT-1")).await.unwrap();
+            let cat = s.create_category(actor(&s).await, "edit-cat", None).await.unwrap();
+            let p = s.create_product(actor(&s).await, product_input("EDIT-1")).await.unwrap();
             let patch = UpdateProduct {
                 sku: Some("EDIT-2".into()),
                 name: Some("Edited product".into()),
@@ -1204,7 +1230,7 @@ mod tests {
                 location: Some(Some("shelf 3".into())),
                 notes: Some(Some("edited".into())),
             };
-            let updated = s.update_product(p.id, patch).await.unwrap();
+            let updated = s.update_product(actor(&s).await, p.id, patch).await.unwrap();
             assert_eq!(updated.id, p.id);
             assert_eq!(updated.sku, "EDIT-2");
             assert_eq!(updated.name, "Edited product");
@@ -1225,10 +1251,10 @@ mod tests {
         #[tokio::test]
         async fn update_product_default_patch_leaves_product_untouched() {
             let s = svc(true).await;
-            let p = s.create_product(product_input("NOPATCH")).await.unwrap();
+            let p = s.create_product(actor(&s).await, product_input("NOPATCH")).await.unwrap();
             let before = s.get_product(p.id).await.unwrap();
             let updated = s
-                .update_product(p.id, UpdateProduct::default())
+                .update_product(actor(&s).await, p.id, UpdateProduct::default())
                 .await
                 .unwrap();
             for field in [
@@ -1258,9 +1284,9 @@ mod tests {
         #[tokio::test]
         async fn update_product_clears_min_max_when_untracked() {
             let s = svc(true).await;
-            let p = s.create_product(product_input("CLR")).await.unwrap();
+            let p = s.create_product(actor(&s).await, product_input("CLR")).await.unwrap();
             let updated = s
-                .update_product(
+                .update_product(actor(&s).await, 
                     p.id,
                     UpdateProduct {
                         track_stock: Some(false),
@@ -1281,11 +1307,11 @@ mod tests {
         #[tokio::test]
         async fn update_product_sku_conflict_only_against_other_rows() {
             let s = svc(true).await;
-            let a = s.create_product(product_input("UPD-A")).await.unwrap();
-            let b = s.create_product(product_input("UPD-B")).await.unwrap();
+            let a = s.create_product(actor(&s).await, product_input("UPD-A")).await.unwrap();
+            let b = s.create_product(actor(&s).await, product_input("UPD-B")).await.unwrap();
 
             let err = s
-                .update_product(
+                .update_product(actor(&s).await, 
                     a.id,
                     UpdateProduct {
                         sku: Some("UPD-B".into()),
@@ -1298,7 +1324,7 @@ mod tests {
 
             // Same product re-sending its own SKU while changing the name.
             let ok = s
-                .update_product(
+                .update_product(actor(&s).await, 
                     b.id,
                     UpdateProduct {
                         sku: Some("UPD-B".into()),
@@ -1317,11 +1343,11 @@ mod tests {
         #[tokio::test]
         async fn update_product_invalid_patch_is_validation() {
             let s = svc(true).await;
-            let p = s.create_product(product_input("INV-P")).await.unwrap();
+            let p = s.create_product(actor(&s).await, product_input("INV-P")).await.unwrap();
 
             // Service that tracks stock.
             let err = s
-                .update_product(
+                .update_product(actor(&s).await, 
                     p.id,
                     UpdateProduct {
                         kind: Some(ProductKind::Service),
@@ -1335,7 +1361,7 @@ mod tests {
 
             // max < min (merged with the current min).
             let err = s
-                .update_product(
+                .update_product(actor(&s).await, 
                     p.id,
                     UpdateProduct {
                         max_stock: Some(Some(dec("1"))),
@@ -1348,7 +1374,7 @@ mod tests {
 
             // sale_price 0 for a product.
             let err = s
-                .update_product(
+                .update_product(actor(&s).await, 
                     p.id,
                     UpdateProduct {
                         sale_price: Some(Decimal::ZERO),
@@ -1370,7 +1396,7 @@ mod tests {
         async fn update_product_unknown_id_is_not_found() {
             let s = svc(true).await;
             let err = s
-                .update_product(
+                .update_product(actor(&s).await, 
                     99999,
                     UpdateProduct {
                         sku: Some("GHOST".into()),
@@ -1381,4 +1407,79 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
         }
+
+    // -- audit attribution (M5 Phase B, slice S10, AC18) --------------------------
+
+    /// AC18 on the inventory surface: a product records who created it, and an
+    /// edit records the editor WITHOUT erasing the creator. Two dedicated
+    /// users make the assertion meaningful: the row carries the creator's id
+    /// on `created_by` and the editor's on `updated_by`. Categories carry the
+    /// same audit the same way.
+    #[tokio::test]
+    async fn ac18_inventory_create_and_update_store_two_different_actors() {
+        let s = svc(true).await;
+        let pool = s.products.pool.clone();
+        let alice = test_support::seed_audit_user(&pool, "inv-alice", "Alice").await.unwrap();
+        let bob = test_support::seed_audit_user(&pool, "inv-bob", "Bob").await.unwrap();
+
+        let product = s.create_product(alice, product_input("AUDIT-P")).await.unwrap();
+        assert_eq!(product.created_by, alice, "the product records its creator");
+        assert_eq!(product.updated_by, None);
+
+        let updated = s
+            .update_product(
+                bob,
+                product.id,
+                UpdateProduct {
+                    name: Some("renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.created_by, alice, "the creator attribution survives the edit");
+        assert_eq!(updated.updated_by, Some(bob), "the edit records the editor");
+
+        // A lifecycle toggle is a product update: `updated_by` carries the
+        // acting user the same way, without erasing the creator.
+        let deactivated = s.set_product_active(alice, product.id, false).await.unwrap();
+        assert_eq!(deactivated.created_by, alice, "the creator is still recorded");
+        assert_eq!(deactivated.updated_by, Some(alice), "the toggle records its actor");
+
+        let category = s.create_category(alice, "Audit cat", None).await.unwrap();
+        assert_eq!(category.created_by, alice);
+        assert_eq!(category.updated_by, None);
+        let renamed = s
+            .update_category(bob, category.id, Some("Renamed cat"), None)
+            .await
+            .unwrap();
+        assert_eq!(renamed.created_by, alice, "the creator survives the edit");
+        assert_eq!(renamed.updated_by, Some(bob), "the edit records the editor");
+    }
+
+    /// AC18: a movement records the actor of the request that caused it, and
+    /// the movement's actor is INDEPENDENT of the product's creator — a
+    /// movement recorded by another user carries that user, never the
+    /// product's creator and never a fresh actor.
+    #[tokio::test]
+    async fn ac18_a_movement_records_the_actor_of_the_request_that_caused_it() {
+        let s = svc(true).await;
+        let pool = s.products.pool.clone();
+        let creator = test_support::seed_audit_user(&pool, "mv-product", "Product Op").await.unwrap();
+        let operator = test_support::seed_audit_user(&pool, "mv-stock", "Stock Op").await.unwrap();
+
+        let p = s.create_product(creator, product_input("MV-ACT")).await.unwrap();
+        let mv = s
+            .record_movement(operator, movement(p.id, "5", MovementType::In))
+            .await
+            .unwrap();
+        assert_eq!(mv.created_by, operator, "the movement records the acting user");
+        assert_ne!(
+            mv.created_by, p.created_by,
+            "the movement's actor is the request's, not the product's"
+        );
+        assert_eq!(mv.updated_by, None, "an append-only movement has no editor");
+        let stored = s.movements.find_by_id(mv.id).await.unwrap().unwrap();
+        assert_eq!(stored.created_by, operator);
+    }
 }

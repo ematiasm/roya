@@ -278,6 +278,10 @@ pub struct Category {
     pub id: i64,
     pub name: String,
     pub parent_id: Option<i64>,
+    /// Audit actor: the acting user's id (M5 Phase B, slice S10) — the row's
+    /// creator, and its last editor when one exists.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -297,6 +301,9 @@ pub struct Product {
     pub location: Option<String>,
     pub notes: Option<String>,
     pub is_active: bool,
+    /// Audit actor: the acting user's id (M5 Phase B, slice S10).
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -329,6 +336,11 @@ pub struct StockMovement {
     pub reason: MovementReason,
     pub reference: String,
     pub date: NaiveDate,
+    /// Audit actor: the acting user's id (M5 Phase B, slice S10) — for a
+    /// movement produced inside a sale/purchase flow, the flow's request
+    /// actor, never a fresh one (AC18).
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 

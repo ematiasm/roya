@@ -725,7 +725,9 @@ mod tests {
             .id;
         let product = state
             .inventory_service
-            .create_product(NewProduct {
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
                 sku: "WEB-CUST-P".into(),
                 name: "prod WEB-CUST-P".into(),
                 kind: ProductKind::Product,
@@ -743,7 +745,9 @@ mod tests {
             .unwrap();
         state
             .inventory_service
-            .record_movement(NewMovement {
+            .record_movement(
+                audit_actor(&state).await,
+                NewMovement {
                 product_id: product.id,
                 qty: Decimal::from(100),
                 movement_type: MovementType::In,

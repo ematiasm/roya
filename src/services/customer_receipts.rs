@@ -393,7 +393,9 @@ mod tests {
         let product = s
             .sales
             .inventory
-            .create_product(NewProduct {
+            .create_product(
+                test_support::audit_actor_id(&s.sales.inventory.products.pool).await.unwrap(),
+                NewProduct {
                 sku: sku.into(),
                 name: format!("prod {sku}"),
                 kind: ProductKind::Product,
@@ -411,7 +413,9 @@ mod tests {
             .unwrap();
         s.sales
             .inventory
-            .record_movement(NewMovement {
+            .record_movement(
+                test_support::audit_actor_id(&s.sales.inventory.products.pool).await.unwrap(),
+                NewMovement {
                 product_id: product.id,
                 qty: dec("1000"),
                 movement_type: MovementType::In,

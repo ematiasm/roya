@@ -5645,3 +5645,209 @@ async fn ac19_deleting_the_system_actor_is_refused_by_the_audit_foreign_key() {
         .unwrap();
     assert_eq!(still_there.0, 1);
 }
+
+// ---------------------------------------------------------------------------
+// AC19 (inventory audit, M5 Phase B slice S10): the upgrade sequence on the
+// inventory tables — a database built with the migrations up to 30, business
+// rows in categories/products/stock_movements and no user beyond the sentinel.
+// ---------------------------------------------------------------------------
+
+/// A pool with the migration chain stopped just after the finance audit (the
+/// pre-31 inventory schema is real) plus legacy inventory rows, planted the
+/// way pre-audit code wrote them: no created_by column exists to fill.
+async fn upgraded_pool_with_legacy_inventory_rows() -> (Vec<i64>, sqlx::SqlitePool) {
+    let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run_to(20240101000030, &pool).await.unwrap();
+
+    let category_id: (i64,) = sqlx::query_as(
+        "INSERT INTO categories (name) VALUES ('legacy-cat') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let product_id: (i64,) = sqlx::query_as(
+        "INSERT INTO products (sku, name, kind, category_id, unit, sale_price, cost_price, track_stock) \
+         VALUES ('LEGACY-P', 'Legacy', 'Product', ?, 'un', '1', '0', 1) RETURNING id",
+    )
+    .bind(category_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let movement_id: (i64,) = sqlx::query_as(
+        "INSERT INTO stock_movements (product_id, qty, type, reason, reference, date) \
+         VALUES (?, '5', 'In', 'Purchase', '', '2024-01-01') RETURNING id",
+    )
+    .bind(product_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    (
+        vec![category_id.0, product_id.0, movement_id.0],
+        pool,
+    )
+}
+
+/// The upgrade attributes every pre-existing inventory row to the sentinel it
+/// REUSES (migration 30 created it on this database), loses no row and no id,
+/// and leaves `created_by` NOT NULL — a future write that omits the actor is
+/// refused by the database. The RESTRICT foreign key holds the sentinel in
+/// place for the inventory rows the same way it already does for finance.
+#[tokio::test]
+async fn ac19_the_upgrade_attributes_every_inventory_row_to_the_system_sentinel() {
+    let (legacy_ids, pool) = upgraded_pool_with_legacy_inventory_rows().await;
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let sentinel = test_support::audit_actor_id(&pool).await.unwrap();
+
+    // Rows preserved, ids preserved, zero unattributed: every legacy row is
+    // exactly where it was, pointing at the sentinel.
+    for (table, id) in [
+        ("categories", legacy_ids[0]),
+        ("products", legacy_ids[1]),
+        ("stock_movements", legacy_ids[2]),
+    ] {
+        let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ? AND created_by = ?"
+        )))
+        .bind(id)
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0, 1,
+            "{table}: the legacy row survived with its id, attributed to the sentinel"
+        );
+    }
+    // The sentinel attribution is total: no row of the three tables points
+    // anywhere else.
+    for table in ["categories", "products", "stock_movements"] {
+        let unattributed: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE created_by IS NULL OR created_by != ?"
+        )))
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unattributed.0, 0, "{table}: no row lost its actor");
+    }
+
+    // `created_by` is NOT NULL on all three rebuilt tables: a write that
+    // omits the actor is refused by the database.
+    for (table, sql) in [
+        ("categories", "INSERT INTO categories (name) VALUES ('no-actor')"),
+        (
+            "products",
+            "INSERT INTO products (sku, name, kind, unit, sale_price, cost_price, track_stock) \
+             VALUES ('NO-ACTOR', 'x', 'Product', 'un', '1', '0', 0)",
+        ),
+        (
+            "stock_movements",
+            "INSERT INTO stock_movements (product_id, qty, type, reason, date) \
+             VALUES (1, '1', 'In', 'Initial', '2024-01-01')",
+        ),
+    ] {
+        let refused = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .execute(&pool)
+            .await;
+        assert!(
+            refused.is_err(),
+            "{table}: created_by is NOT NULL after the rebuild"
+        );
+    }
+
+    // The re-enabled foreign keys find the same graph that existed before:
+    // no violation anywhere.
+    let violations: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+
+    // The RESTRICT audit foreign key holds the sentinel in place for the
+    // inventory rows too: deleting it is refused and the row survives.
+    let refused = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(sentinel)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        "the audit FK refuses the deletion: {refused}"
+    );
+    let still_there: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(still_there.0, 1);
+}
+
+/// The defensive path: the migration REUSES the sentinel migration 30
+/// created, and only creates one if it is somehow absent. This test makes it
+/// absent — the finance tables are emptied and the sentinel deleted after
+/// migration 30 — plants legacy inventory rows, and runs the rest of the
+/// chain: migration 31 must create its own sentinel and attribute the rows
+/// to it.
+#[tokio::test]
+async fn ac19_the_inventory_migration_recreates_a_missing_sentinel() {
+    let (legacy_ids, pool) = upgraded_pool_with_legacy_inventory_rows().await;
+    // Make the sentinel absent: empty the finance tables that reference it
+    // (RESTRICT refuses a direct delete), then delete the account.
+    sqlx::query("DELETE FROM payment_methods").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM transactions").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM accounts").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM users").execute(&pool).await.unwrap();
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before.0, 0, "the sentinel is gone when migration 31 runs");
+
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let sentinel = test_support::audit_actor_id(&pool).await.unwrap();
+    for (table, id) in [
+        ("categories", legacy_ids[0]),
+        ("products", legacy_ids[1]),
+        ("stock_movements", legacy_ids[2]),
+    ] {
+        let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ? AND created_by = ?"
+        )))
+        .bind(id)
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0, 1,
+            "{table}: the defensive sentinel exists and owns the legacy row"
+        );
+    }
+    // The defensive sentinel is the same shape migration 30's is: inactive,
+    // roleless, unusable credential.
+    let sentinel_row: (i64, i64) = sqlx::query_as(
+        "SELECT is_active, must_change_password FROM users WHERE id = ?",
+    )
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sentinel_row.0, 0, "the recreated sentinel is inactive");
+    let roles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = ?")
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(roles.0, 0, "the recreated sentinel holds no role");
+}
