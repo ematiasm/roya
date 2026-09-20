@@ -728,6 +728,205 @@ part 2, and this slice only widens their production consumers (52 more handlers)
 no `#[allow]` attributes as the mechanism. `test_support.rs` needed NO change this slice:
 `seed_session_with_permissions` covered every probe the tests needed.
 
+### S7 part 1 — enforcement: purchases and suppliers (T22 in part) — ENTREGADA (writer round) 2026-09-20, nav gating deferido a S7 part 2
+- [x] T22 (part): `Require<P>` per action on every route of both departments (51 handler gates over 40
+      route paths: 21 purchases/suppliers API handlers + 18 purchases web handlers + 12 suppliers web
+      handlers) — **nav gating is NOT in this slice: it stays S7 part 2's**, as the S5/S6/S7 briefs
+      fix. The refusal fragments needed no new work: the HTMX JSON shape and the full-page refusal
+      card already answer every gated page, fragment and drawer endpoint.
+- [x] T23 (part): tests for AC10 on the real handlers (17 new tests, every one of the 51 gates
+      mutation-validated one gate at a time) — AC21's exposure guard at the HANDLER level is done for
+      both departments; the interface-hiding half (and the full-surface exposure guard grep) is S7
+      part 2, as in S5/S6.
+
+#### S7 part 1 enforcement mapping (written by the writer round of 2026-09-20)
+Per-handler `Require<P>` on every route; NO router-level guard (same reason as S5/S6: the modules mix
+read/write/cancel on the same paths). The four purchases_web collection adapters
+(`/web/purchases/{lines,confirm,payments,cancel}`) were refactored to share ungated `*_impl` bodies so
+BOTH registered handlers declare their own real gate — the same S6 refactor, every gate fails a test at
+runtime instead of breaking the build.
+
+`src/routes/purchases_api.rs` (purchases + the suppliers/cost REST twins):
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/api/purchases` | GET | `purchases.read` |
+| `/api/purchases/suggestions` | GET | `inventory.read` (judgement C) |
+| `/api/purchases` | POST | `purchases.create` |
+| `/api/purchases/{id}` | GET | `purchases.read` |
+| `/api/purchases/{id}` | PUT | `purchases.create` |
+| `/api/purchases/{id}/lines` | POST | `purchases.create` |
+| `/api/purchases/lines/{line_id}` | PUT | `purchases.create` |
+| `/api/purchases/lines/{line_id}` | DELETE | `purchases.create` |
+| `/api/purchases/{id}/payments` | POST | `purchases.create` (judgement A) |
+| `/api/supplier-payments` | POST | `purchases.create` (judgement A) |
+| `/api/purchases/{id}/confirm` | POST | `purchases.create` |
+| `/api/purchases/{id}/cancel` | POST | `purchases.cancel` |
+| `/api/suppliers` | GET | `suppliers.read` |
+| `/api/suppliers` | POST | `suppliers.write` |
+| `/api/suppliers/{id}` | GET | `suppliers.read` |
+| `/api/suppliers/{id}` | PUT | `suppliers.write` |
+| `/api/suppliers/{id}` | DELETE | `suppliers.write` |
+| `/api/suppliers/{id}/activate` | POST | `suppliers.write` |
+| `/api/suppliers/{id}/deactivate` | POST | `suppliers.write` |
+| `/api/product-supplier-costs` | GET | `purchases.costs.read` |
+| `/api/product-supplier-costs` | POST | `purchases.costs.write` |
+
+`src/routes/purchases_web.rs` (purchases screen):
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/purchases` | GET | `purchases.read` |
+| `/purchases/{id}` | GET | `purchases.read` |
+| `/web/purchases` | GET | `purchases.read` |
+| `/web/purchases` | POST | `purchases.create` |
+| `/web/purchases/suggestions` | GET | `inventory.read` (judgement C) |
+| `/web/purchases/from-suggestion` | POST | `purchases.create` (judgement D) |
+| `/web/purchases/lines` | POST | `purchases.create` (adapter) |
+| `/web/purchases/confirm` | POST | `purchases.create` (adapter) |
+| `/web/purchases/payments` | POST | `purchases.create` (adapter, judgement A) |
+| `/web/purchases/cancel` | POST | `purchases.cancel` (adapter) |
+| `/web/purchases/{id}` | GET | `purchases.read` |
+| `/web/purchases/{id}/lines` | POST | `purchases.create` |
+| `/web/purchases/{purchase_id}/lines/{line_id}` | POST | `purchases.create` |
+| `/web/purchases/{purchase_id}/lines/{line_id}` | DELETE | `purchases.create` |
+| `/web/purchases/{id}/header` | POST | `purchases.create` |
+| `/web/purchases/{id}/confirm` | POST | `purchases.create` |
+| `/web/purchases/{id}/payments` | POST | `purchases.create` (judgement A) |
+| `/web/purchases/{id}/cancel` | POST | `purchases.cancel` |
+
+`src/routes/suppliers_web.rs` (suppliers screen):
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/suppliers` | GET | `suppliers.read` |
+| `/web/suppliers` | GET | `suppliers.read` |
+| `/web/suppliers` | POST | `suppliers.write` |
+| `/web/suppliers/edit` | POST | `suppliers.write` |
+| `/web/suppliers/{id}` | DELETE | `suppliers.write` |
+| `/web/suppliers/{id}/detail` | GET | `suppliers.read` AND `purchases.costs.read` (two extractors, judgement B) |
+| `/web/suppliers/{id}/edit-form` | GET | `suppliers.read` |
+| `/web/suppliers/{id}/activate` | POST | `suppliers.write` |
+| `/web/suppliers/{id}/deactivate` | POST | `suppliers.write` |
+| `/web/supplier-costs` | POST | `purchases.costs.write` |
+| `/web/supplier-payments` | POST | `purchases.create` (judgement A) |
+
+Mapping decisions worth the reviewer's attention (the four judgement calls the S7 brief named):
+- **A payment to a supplier is `purchases.create`, not `suppliers.write`** (both payment endpoints:
+  the per-purchase record and the supplier-level handover): the catalog has no `purchases.pay` and the
+  payment is a PURCHASE-side movement — it writes `purchase_payments` rows against purchases, posts the
+  Expense through the finance kernel, and lives in `PurchasesService` (`pay_supplier`), exactly where
+  `customers.collect` lives in the sales mirror. `suppliers.write` is the supplier ENTITY tier (create,
+  edit, deactivate, delete a supplier), and granting entity editing must not hand over money
+  movements. The cost, recorded deliberately (fail-closed): a principal holding `suppliers.write`
+  WITHOUT `purchases.create` sees the pay card in the drawer it may open (its read gates hold) and is
+  refused on submit, naming `purchases.create`. No seeded matrix separates the pair (no seeded role
+  holds `suppliers.write` at all, and the protected role holds everything), so no natural operator is
+  hit; if a future matrix separates them, the fix is an OR of the two codes on that one action, not a
+  new kernel type (the S5/S6 contract).
+- **B: the supplier drawer (`/web/suppliers/{id}/detail`) is a DOUBLE gate — `suppliers.read` AND
+  `purchases.costs.read`** — because the fragment renders per-supplier cost rows, the SAME data the S5
+  product drawer already gates `purchases.costs.read`; one dataset reached from two screens must not
+  answer to two permissions. The costs write keeps the data owner's code too: `POST /web/supplier-costs`
+  is `purchases.costs.write` even though the form lives in the supplier drawer (mirror of S5's
+  `/web/product-costs`). The page and list fragment stay single `suppliers.read`: they render names
+  only (the cost rows live in the drawer), so a suppliers-only principal reads the list and is refused
+  the drawer naming `purchases.costs.read` — the S5 product-drawer shape, pinned by
+  `the_supplier_drawer_carries_the_double_gate_like_the_product_drawer` in both refusal directions.
+- **C: the reorder suggestions (`/api/purchases/suggestions`, `/web/purchases/suggestions`) are
+  `inventory.read`**: the suggestion is stock-derived data (current stock vs min/max, resolved supplier
+  and satellite cost), not a purchase document; the codes it is built from are `inventory.read` + the
+  costs read, and the list the operator scans lives on the inventory side of the boundary. The costs,
+  recorded deliberately: a `purchases.read`-only principal is refused the suggestions fragment while
+  still seeing suggestions embedded server-side in `/purchases` (see the page note below), and a
+  `suppliers.read`-only principal is refused them entirely. No seeded matrix separates the pair
+  (`deposito` holds `inventory.read` + `purchases.read` together; admin holds everything).
+- **D: creating the purchase order from a suggestion (`POST /web/purchases/from-suggestion`) is
+  `purchases.create`**: the suggestion list is read with `inventory.read`, but the document it creates
+  is a purchase (draft + its first line in one step), so the creation gate is the recording tier. The
+  suggestion is re-derived INSIDE the handler as a service composition — never a permission grant, the
+  S6 `resolve_product_ref` shape — so a `purchases.create`-only principal can act on a suggestion it
+  could not have listed itself; the cost is that its input arrives from a client it cannot verify, and
+  the service re-derives every business value (supplier, qty, cost) from the database anyway.
+- **The purchases page `/purchases` is a single `purchases.read` gate.** Deliberate consequence, same
+  contract as S6's cross-capability dependency: the page server-renders the reorder suggestions
+  (stock-derived, `inventory.read` data) and the supplier roster (`suppliers.read` data) its create
+  dialog needs, so a purchases-only principal sees that embedded context; the suggestion fragment and
+  the supplier screens themselves refuse it. Seeded purchase holders (`deposito`, admin) hold both, so
+  no natural operator is hit; an AND of the codes is the documented future shape, not a new kernel
+  type.
+- **Confirming a purchase stays `purchases.create`** even when it embeds the cash tender: the
+  embedded payment is part of the purchase lifecycle itself (one Expense + payment rows in the same
+  step), the same call S6 made for confirming a cash sale.
+- **The purchase record page and fragments are a single `purchases.read` gate** (not an AND with the
+  costs or suppliers codes): the record renders THAT purchase's own documents — lines with unit cost,
+  payments with account and method — which are purchases data; the line costs are purchase data, not
+  the per-supplier satellite. Same shape as S6's customer statement.
+
+#### S7 part 1 mutation table (writer round — every gate removed, its test observed FAILING, then restored)
+
+The S5 lesson was enforced from the first pass: every module carries a read-gate test driven by a
+principal holding an UNRELATED permission (never the empty set), so a wrong-permission gate cannot pass
+for a broken fixture. Mutation method: one gate at a time, test observed failing, gate restored; the
+final diff keeps every annotation. 51 removals → 51 observed failures; no gate needed a forced
+justification and no handler turned out to declare the wrong permission (the four judgement calls
+above survived the mutation review unchanged).
+
+| Cluster | Gates | Test(s) that fail when the gate is removed | Observed failure |
+| --- | --- | --- | --- |
+| suppliers API reads (list, get) | 2 × `SuppliersRead` | `the_read_gates_refuse_a_principal_without_the_read_permission` (purchases_api) | 200 with the supplier JSON (handler ran) instead of 403 |
+| suppliers API entity writes (create, update, activate, deactivate, delete) | 5 × `SuppliersWrite` | `ac10_a_purchases_read_only_principal_reads_and_is_refused_the_writes` | 201/200/400 (handler ran; delete hit the satellite RESTRICT 400) instead of 403 |
+| costs API read | `PurchasesCostsRead` | the read-gates test | 200 with the costs JSON instead of 403 |
+| costs API write | `PurchasesCostsWrite` | the read-only-principal test | 201 with the recorded cost instead of 403 |
+| purchases API reads (list, get) | 2 × `PurchasesRead` | the read-gates test | 200 with the purchases JSON instead of 403 |
+| purchases API suggestions | `InventoryRead` | the read-gates test | 200 with the suggestions JSON instead of 403 |
+| purchases API draft lifecycle (create, update, add/update/remove line, confirm) | 6 × `PurchasesCreate` | the read-only test; for create, `ac10_a_purchases_refusal_writes_nothing` (row count grows) | handler ran (200/201/204) or its own validation answered instead of 403 |
+| purchases API payments (per-purchase + supplier-level) | 2 × `PurchasesCreate` | the write-nothing test | the payment really posted instead of 403 |
+| purchases API cancel | `PurchasesCancel` | the write-nothing test | 200, status flipped to Cancelled instead of 403 |
+| purchases web reads (page, record, list, detail fragments) | 4 × `PurchasesRead` | `the_read_gates_refuse_a_principal_without_the_read_permission` (purchases_web) | 200 with the page/fragment instead of 403 HTML |
+| purchases web suggestions | `InventoryRead` | the read-gates test | 200 with the fragment instead of 403 naming `inventory.read` |
+| purchases web create + seed-from-suggestion | 2 × `PurchasesCreate` | the web write-nothing test / the read-only web test | 303 to the new record instead of 403 |
+| purchases web path mutations (add/update/remove line, header, confirm, payment, cancel) | 8 × (`PurchasesCreate` / `PurchasesCancel`) | the web read-only test / the write-nothing test | handler ran (fragment 200) instead of 403 |
+| purchases web collection adapters (lines, confirm, payments, cancel) | 4 × (own gate) | `the_purchases_collection_adapters_carry_their_own_gate` | the delegated action ran instead of 403 |
+| suppliers web reads (page, list fragment, edit form) | 3 × `SuppliersRead` | the read-gates test (suppliers_web) | 200 with the page/fragment instead of 403 HTML |
+| supplier drawer double gate | `SuppliersRead` + `PurchasesCostsRead` (2 removals) | `the_read_gates...` (drawer case) / `the_supplier_drawer_carries_the_double_gate_like_the_product_drawer` | drawer rendered (200) instead of 403 naming the removed gate |
+| suppliers web entity writes (create, edit, activate, deactivate, delete) | 5 × `SuppliersWrite` | the suppliers read-only test / the write-nothing test | handler ran (fragment/list answer) instead of 403 |
+| suppliers web cost record | `PurchasesCostsWrite` | the write-nothing test | the cost row was written instead of 403 |
+| suppliers web pay | `PurchasesCreate` | the suppliers read-only test | the payment ran instead of 403 naming `purchases.create` |
+
+New tests (17, named per module): `the_read_gates_refuse_a_principal_without_the_read_permission`,
+`ac10_a_purchases_read_only_principal_reads_and_is_refused_the_writes`,
+`ac10_a_purchases_refusal_writes_nothing`,
+`ac10_the_purchases_holding_principal_gets_the_normal_answer`,
+`an_anonymous_request_still_gets_the_json_gate_not_the_permission_refusal` (purchases_api);
+`the_read_gates_refuse_a_principal_without_the_read_permission`,
+`ac10_a_purchases_read_only_principal_is_refused_the_web_mutations`,
+`the_purchases_collection_adapters_carry_their_own_gate`,
+`ac10_the_purchases_web_refusal_writes_nothing`,
+`ac10_the_purchases_web_holding_principal_gets_the_normal_answer`,
+`an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal` (purchases_web);
+`the_read_gates_refuse_a_principal_without_the_read_permission`,
+`the_supplier_drawer_carries_the_double_gate_like_the_product_drawer`,
+`ac10_a_suppliers_read_only_principal_is_refused_the_web_mutations`,
+`ac10_the_suppliers_web_refusal_writes_nothing`,
+`ac10_the_suppliers_web_holding_principal_gets_the_normal_answer`,
+`an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal` (suppliers_web).
+
+#### S7 part 1 warning ledger re-measure (2026-09-20, end state)
+`cargo check --all-targets` **0 errors, 56 lint warnings (delta 0 vs `main`, measured the ledger way:
+58 raw `warning:` lines minus the 2 per-target summary lines)**. The first pass's own test module
+exposed one `unused import: PaymentType` warning in `suppliers_web.rs` (the writer's new test imported
+what it used inline); fixed by removing the import — the convention held: fix the cause, never add an
+attribute. No `#[allow]` attributes added; the dead-code/unused-import allow grep is empty. NO dormant
+ledger item graduates by warning count in this slice — the extractor, the refusal shapes and the
+principal membership checks already graduated in S3 part 2, and this slice only widens their
+production consumers (51 more handlers). Still dormant:
+`Principal.{username, display_name, must_change_password}` (S7 part 2 navigation),
+`role_repo::{count_active_holders, revoke}`, `Role.{created_at, updated_at}`,
+`Permission.{action, created_at}`. The count must still be back at or below 56 by the end of S7, with
+no `#[allow]` attributes as the mechanism. `test_support.rs`, `authz.rs`, `models.rs` and `error.rs`
+needed NO change this slice: `seed_session_with_permissions` covered every probe the tests needed.
+
 ### S7 — enforcement: purchases, suppliers, identity, dashboard
 - [ ] T22: `Require<P>` per action, nav gating, dashboard and identity screens gated.
 - [ ] T23: tests for AC10 and AC21, and the full-surface exposure guard.
@@ -762,6 +961,13 @@ deferred to S7)**.
    and display, department by department, ending in the spec's audit section and archive.
 
 **Concrete human follow-ups on pause:**
+- **S7 part 1 (`feat/enforcement-purchases-suppliers`, writer round 2026-09-20) is DONE but has NO
+  work-unit commit yet: the writer does not commit; the parent owns git state — commit it as one work
+  unit. The pause map below still reads as of after S6; on top of it, S7 part 1 landed the 51
+  purchases/suppliers gates with their mutation-validated tests (see the S7 part 1 sections above);
+  what remains of S7 is S7 part 2: nav gating (AC21 — the principal plumbed into every page struct),
+  the dashboard and identity screens' nav exposure, and the full-surface exposure guard grep, plus
+  this ledger's closing re-measure.**
 - The remote branch `feat/roles-administration` still exists on `origin` although its PR #48 is
   already merged into `origin/main` (verified with `git branch -a` on 2026-09-19). Decided: leave it
   un-deleted for now; deleting it is the owner's call, it holds nothing unmerged.
