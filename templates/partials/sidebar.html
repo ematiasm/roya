@@ -4,11 +4,21 @@
    `nav_key` and this partial compares it, so the state is correct without
    JavaScript and a test can assert it. Askama cannot read the request path.
 
+   Every entry is permission-gated (S7 part 2, AC21): the page struct carries a
+   `nav` view (`security::authz::Nav`, built from the request's principal) and
+   the macro renders an entry only when the principal holds the permission the
+   entry's route declares — the same code the route's `Require<P>` names, the
+   mapping decided in one place (`authz::NAV_ENTRIES`). The drift tests in
+   `authz.rs` fail when a `nav_item` key has no declared mapping, so a new
+   entry cannot render ungated. Groups render only when at least one of their
+   entries does, so a limited principal never sees an empty heading.
+
    Responsive: full at `lg`, icons only at `md`, drawer below `md` (toggled by
    `#drawer-toggle` in `base.html`). Every entry keeps `title` so the icon-only
    layout stays usable. #}
 
 {% macro nav_item(key, href, label, icon_d) %}
+{% if nav.visible(key) %}
 <a href="{{ href }}"
    data-nav="{{ key }}"
    {% if nav_key == key %}aria-current="page" data-nav-active="true"{% endif %}
@@ -17,6 +27,7 @@
   <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="{{ icon_d }}"/></svg>
   <span class="truncate md:hidden lg:inline">{{ label }}</span>
 </a>
+{% endif %}
 {% endmacro %}
 
 <aside id="sidebar" data-sidebar
@@ -28,6 +39,7 @@
   </div>
 
   <nav class="flex flex-1 flex-col gap-5 overflow-y-auto px-2 py-4" aria-label="Main navigation">
+    {% if nav.group_visible("operation") %}
     <div data-nav-group="operation">
       <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Operation</div>
       <div class="flex flex-col gap-0.5">
@@ -36,7 +48,9 @@
         {% call nav_item("purchases", "/purchases", "Purchases", "M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.129-.504 1.09-1.124a17.902 17.902 0 00-3.213-9.193 2.056 2.056 0 00-1.58-.86H14.25M16.5 18.75h-2.25m0-11.177v-.958c0-.568-.422-1.048-.987-1.106a48.554 48.554 0 00-10.026 0 1.106 1.106 0 00-.987 1.106v7.635m12-6.677v6.677m0 4.5v-4.5m0 0h-12") %}
       </div>
     </div>
+    {% endif %}
 
+    {% if nav.group_visible("catalogue") %}
     <div data-nav-group="catalogue">
       <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Catalogue</div>
       <div class="flex flex-col gap-0.5">
@@ -45,29 +59,38 @@
         {% call nav_item("customers", "/customers", "Customers", "M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z") %}
       </div>
     </div>
+    {% endif %}
 
+    {% if nav.group_visible("cash") %}
     <div data-nav-group="cash">
       <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Cash</div>
       <div class="flex flex-col gap-0.5">
-        {# No accounts page exists yet; the entry points at the dashboard section. #}
+        {# No accounts page exists yet; the entry points at the dashboard
+           section. The entry needs TWO codes (declared in `authz.rs`): the
+           gate of the route the href opens (`dashboard.read`, the `/` route)
+           plus the data-owner permission of the accounts block it names
+           (`finance.read`, which also gates the block's data routes) — the
+           dashboard renders the block conditionally on that same code, so a
+           principal that cannot see the block never sees the entry either. #}
         {% call nav_item("accounts", "/#accounts", "Accounts", "M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5v-.75A.75.75 0 003 15h-.75M15 10.5a3 3 0 11-6 0 3 3 0 016 0zm3 0h.008v.008H18V10.5zm-12 0h.008v.008H6V10.5z") %}
       </div>
     </div>
+    {% endif %}
+    {% if nav.group_visible("account") %}
     <div data-nav-group="account">
       <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Account</div>
       <div class="flex flex-col gap-0.5">
         {# The users administration screen (slice S3 part 2). The route
-           requires `identity.users.read` — the handler is what refuses. AC21
-           (hiding this entry from principals that cannot read it) is S7's
-           nav gating: until then the entry stays visible for everyone. #}
+           requires `identity.users.read`, and the mapping in `authz.rs`
+           declares the same code for this entry: a principal that cannot
+           read the screen never sees the entry either (AC21). #}
         {% call nav_item("users", "/users", "Usuarios", "M15 9.75a3 3 0 11-6 0 3 3 0 016 0zM15 12a3.75 3.75 0 013.75 3.75v3.375c0 .207-.168.375-.375.375h-1.5a.375.375 0 01-.375-.375V17.25m-6-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25m14.25-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25a3.75 3.75 0 00-3.75-3.75h-.375zM6.75 6a3.75 3.75 0 013.75 3.75v3.375c0 .207.168.375.375.375h7.5a.375.375 0 00.375-.375V9.75A3.75 3.75 0 0015 6h-1.5") %}
         {# The roles administration screen and the permission matrix (slice
            S4). The route requires `identity.roles.manage` — the whole
            surface is gated by the management tier, because the catalog has
            no `identity.roles.read` and inventing one would need a
-           migration (the deliberate mapping the S4 spec records). AC21's
-           hiding is S7, as for /users: the entry stays visible and the
-           route is what refuses. #}
+           migration (the deliberate mapping the S4 spec records). The
+           entry declares the same code, so the nav agrees with the gate. #}
         {% call nav_item("roles", "/roles", "Roles", "M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.585 3.477 10.374 9 11.625 5.526-1.25 9-6.04 9-11.625 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z") %}
         {# The password page (slice S3 part 1): reachable from the sidebar for
            every signed-in operator, and the one page a confined session may
@@ -76,10 +99,21 @@
         {% call nav_item("password", "/password", "Password", "M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z") %}
       </div>
     </div>
+    {% endif %}
   </nav>
 
   {# Secondary shell facts: below navigation, muted, never competing. #}
   <div class="shrink-0 border-t border-border px-3 py-3 text-[12px] text-muted md:text-center lg:text-left">
+    {# The signed-in user (S7 part 2): display name plus username next to the
+       logout control. Rendered from the request's principal via `nav`; the
+       anonymous fallback (the fail-closed refusal) carries no name, so the
+       line is skipped. #}
+    {% if !nav.display_name.is_empty() %}
+    <div data-sidebar-user class="mb-1">
+      <div class="truncate font-medium text-text md:hidden lg:block">{{ nav.display_name }}</div>
+      <div class="truncate md:hidden lg:block">{{ nav.username }}</div>
+    </div>
+    {% endif %}
     <div class="truncate md:hidden lg:block">local · SQLite</div>
     <a href="/api/accounts" target="_blank" rel="noreferrer"
        class="mt-1 inline-block text-[12px] font-normal text-muted no-underline hover:text-text hover:underline">
@@ -89,7 +123,7 @@
        without JavaScript, and the middleware's origin check accepts a
        same-origin form post. An anonymous POST to /logout is refused by the
        gate with a redirect to /login, so the button is harmless when signed
-       out. The current user's display name arrives with S7's nav gating. #}
+       out. The signed-in user's name renders just above (S7 part 2). #}
     <form method="post" action="/logout" class="mt-2">
       <button type="submit" class="w-full">Cerrar sesión</button>
     </form>

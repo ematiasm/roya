@@ -45,6 +45,11 @@
       </div>
     </div>
 
+    {# The reorder suggestions are stock-derived data: the fragment and the
+       API are gated `inventory.read`, so the server-rendered block obeys the
+       same gate (S7 part 2). A principal that cannot refresh the list never
+       sees the block — the page and its fragment can no longer disagree. #}
+    {% if show_suggestions %}
     <div class="rounded-2xl border border-border bg-card p-5" id="suggestion-section">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Sugerido</h2>
@@ -58,6 +63,7 @@
       </div>
       <div class="mt-2 text-[13px] text-muted">Sugerido = max − stock when stock ≤ min. Supplier = preferred satellite row, else cheapest current cost. Products without a cost row are listed separately. Serving a suggestion opens its new draft record.</div>
     </div>
+    {% endif %}
   </div>
 
   <div class="flex flex-col gap-6">

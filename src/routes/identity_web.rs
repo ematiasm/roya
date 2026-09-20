@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
 use crate::routes::AppState;
+use crate::security::authz::Nav;
 use crate::security::guard::{current_session, local_next};
 
 // ---------------------------------------------------------------------------
@@ -51,6 +52,11 @@ struct PasswordTemplate {
     error: Option<String>,
     /// The sidebar partial's active-entry key: the page marks its own entry.
     nav_key: &'static str,
+    /// The sidebar's nav view (S7 part 2): the entries this principal may
+    /// read, its names, and its `must_change_password` flag — when set, the
+    /// page says so: the operator confined by an administrator reset learns
+    /// why the app is refusing everything else.
+    nav: Nav,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,10 +169,13 @@ struct PasswordForm {
     confirm_password: String,
 }
 
-async fn password_page() -> Result<Response, AppError> {
+async fn password_page(
+    principal: axum::Extension<crate::security::authz::Principal>,
+) -> Result<Response, AppError> {
     let html = render_password(PasswordTemplate {
         error: None,
         nav_key: PASSWORD_NAV_KEY,
+        nav: Nav::for_principal(&principal),
     })?;
     Ok(Html(html).into_response())
 }
@@ -177,6 +186,7 @@ const PASSWORD_NAV_KEY: &str = "password";
 
 async fn password_submit(
     State(state): State<AppState>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<PasswordForm>,
 ) -> Result<Response, AppError> {
@@ -192,7 +202,7 @@ async fn password_submit(
     // Confirmation matching is the form's own job (two fields, one value);
     // the credential rules live in the service, the one layer that owns them.
     if form.new_password != form.confirm_password {
-        return password_refusal("Las contraseñas nuevas no coinciden.", StatusCode::BAD_REQUEST);
+        return password_refusal(&principal, "Las contraseñas nuevas no coinciden.", StatusCode::BAD_REQUEST);
     }
     match state
         .identity_service
@@ -208,21 +218,26 @@ async fn password_submit(
         // The current password did not verify: same card, precise reason, and
         // nothing was written (the service verifies before its first write).
         Err(AppError::Unauthorized(_)) => {
-            password_refusal("La contraseña actual no es correcta.", StatusCode::UNAUTHORIZED)
+            password_refusal(&principal, "La contraseña actual no es correcta.", StatusCode::UNAUTHORIZED)
         }
         // The service's validation (length, difference) speaks Spanish: the
         // message is operator-facing through this form.
         Err(AppError::Validation(message)) => {
-            password_refusal(&message, StatusCode::BAD_REQUEST)
+            password_refusal(&principal, &message, StatusCode::BAD_REQUEST)
         }
         Err(other) => Err(other),
     }
 }
 
-fn password_refusal(message: &str, status: StatusCode) -> Result<Response, AppError> {
+fn password_refusal(
+    principal: &crate::security::authz::Principal,
+    message: &str,
+    status: StatusCode,
+) -> Result<Response, AppError> {
     let html = render_password(PasswordTemplate {
         error: Some(message.to_owned()),
         nav_key: PASSWORD_NAV_KEY,
+        nav: Nav::for_principal(principal),
     })?;
     Ok((status, Html(html)).into_response())
 }
@@ -743,6 +758,44 @@ mod tests {
         // The same session continues into the app, unconfined.
         let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
         assert_eq!(home.status(), StatusCode::OK, "AC16: after the change the same session reaches /");
+    }
+
+    /// The password page says why it is confining: a flagged session sees the
+    /// Spanish confinement notice, a clean session does not (S7 part 2 — the
+    /// principal's `must_change_password` field reaches the interface).
+    #[tokio::test]
+    async fn the_password_page_says_why_it_confines_a_flagged_session() {
+        let opts = crate::db::base_connect_options("sqlite::memory:").unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        test_support::seed_session(&pool).await.unwrap();
+        let state = test_support::app_state(pool);
+        let (token, _user_id) = test_support::seed_flagged_session(&state.pool)
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        let cookie = format!("roya_session={token}");
+
+        let form = send(&app, "GET", "/password", &[("cookie", cookie.as_str())], "").await;
+        assert_eq!(form.status(), StatusCode::OK);
+        let html = body_string(form).await;
+        assert!(
+            html.contains("Tu sesión está confinada"),
+            "the flagged session must see why it is confined: {html:.600}"
+        );
+
+        // The unflagged shared principal: no confinement notice.
+        let plain = send(&app, "GET", "/password", &[("cookie", test_support::TEST_COOKIE)], "").await;
+        assert_eq!(plain.status(), StatusCode::OK);
+        let html = body_string(plain).await;
+        assert!(
+            !html.contains("Tu sesión está confinada"),
+            "an unflagged session must not see the confinement notice: {html:.600}"
+        );
     }
 
     #[tokio::test]

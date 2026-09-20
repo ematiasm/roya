@@ -21,7 +21,9 @@ use crate::models::{
     DebtSummary, PaymentType, SaleDetail, SaleListFilter, SaleRecord, SaleStatus, UpdateSaleDraft,
 };
 use crate::routes::AppState;
-use crate::security::authz::{CustomersCollect, Require, SalesCancel, SalesCreate, SalesRead};
+use crate::security::authz::{
+    CustomersCollect, Nav, Require, SalesCancel, SalesCreate, SalesRead,
+};
 use crate::services::sales::DEBT_BANNER_LIMIT;
 
 // S6 enforcement (AC10): reads are `sales.read`; the draft lifecycle (create,
@@ -52,6 +54,8 @@ struct SalesTemplate {
     filter_number: String,
     filter_from: String,
     filter_to: String,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 /// The `/sales/{id}` record page. The page-header values are struct fields, so
@@ -71,6 +75,8 @@ struct SalePageTemplate {
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -232,6 +238,7 @@ async fn changed_with_picker(
 async fn sales_page(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Query(query): Query<SaleListQuery>,
 ) -> Result<Html<String>, AppError> {
     let sales = state
@@ -255,6 +262,7 @@ async fn sales_page(
         filter_number: query.number.trim().to_string(),
         filter_from: query.from.trim().to_string(),
         filter_to: query.to.trim().to_string(),
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -342,6 +350,7 @@ async fn web_sale_debt(
 async fn sale_record_page(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     let context = record_context(&state, id).await?;
@@ -369,6 +378,7 @@ async fn sale_record_page(
         method_options: context.method_options,
         today: context.today,
         nav_key: "sales",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,

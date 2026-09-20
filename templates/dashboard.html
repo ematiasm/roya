@@ -16,7 +16,12 @@
       <div class="text-[13px] text-muted">{% if allow_negative %}Negative balances allowed{% else %}Negative balances blocked{% endif %} • Derived from transactions</div>
     </div>
 
-    <!-- Accounts -->
+    <!-- Accounts: the block the `accounts` nav entry names. It renders only
+         when the principal holds `finance.read`, the data-owner permission of
+         the balances it shows — the same code the block's data routes
+         (`/web/accounts`, the account API) carry, and the second code the
+         `accounts` entry declares in `authz.rs`. -->
+    {% if show_accounts %}
     <div class="rounded-2xl border border-border bg-card p-5" id="accounts">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Accounts</h2>
@@ -29,6 +34,7 @@
         {% include "partials/account_list.html" %}
       </div>
     </div>
+    {% endif %}
 
     <!-- Transaction history (filtered) -->
     <div class="rounded-2xl border border-border bg-card p-5" id="tx-section">

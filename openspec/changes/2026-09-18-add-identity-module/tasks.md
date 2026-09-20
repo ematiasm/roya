@@ -112,7 +112,8 @@ dormant by design, exercised by tests, awaiting its consuming slice):
 | `Permission` model struct | `src/models.rs:1359` | S4 (permission matrix rows) |
 | `permission_repo::map_db_err` | `src/repositories/permission_repo.rs:24` | S4 (matrix editor refusals) |
 | `permission_repo::{list, codes_for_role, set_role_permissions}` | `src/repositories/permission_repo.rs:40` | S4 (matrix editor) |
-| `role_repo::{find_by_id, list, list_for_user, count_active_holders, revoke, replace_user_roles}` | `src/repositories/role_repo.rs:54` | S3 (assignment form, deactivation), S4 (roles admin) |
+| `role_repo::{find_by_id, list, list_for_user, replace_user_roles}` | `src/repositories/role_repo.rs:54` | S3 (assignment form, deactivation), S4 (roles admin) |
+| `role_repo::{count_active_holders, revoke}` | `src/repositories/role_repo.rs:54` | **no known consumer yet** (corrected by the S7 part 2 correction round: the original S2 row assigned them to S3/S4 and the closing ledgers carried them to Phase B, but neither slice consumed them and Phase B's audit columns will NOT — `revoke` is the single-grant removal that surfaces the AC14 guard and `count_active_holders` the AC15 holder count, both shipped as the S2 trait surface exercised by tests; production grant/revocation lives on the users screen through `replace_user_roles` and deletion blocks on `holder_names` plus the RESTRICT FK) |
 | `user_repo::find_by_username` | `src/repositories/user_repo.rs:67` | S3 (users admin) |
 | ~~`user_repo::find_with_hash_by_id`~~ | ~~`src/repositories/user_repo.rs:67`~~ | **consumed by S3 part 1** (`change_password` reads the stored hash; the method left the dormant list) |
 | ~~`MIN_PASSWORD_LEN`~~ | ~~`src/services/identity.rs:38`~~ | **consumed by S3 part 1** (the change form validates through it) |
@@ -927,9 +928,182 @@ production consumers (51 more handlers). Still dormant:
 no `#[allow]` attributes as the mechanism. `test_support.rs`, `authz.rs`, `models.rs` and `error.rs`
 needed NO change this slice: `seed_session_with_permissions` covered every probe the tests needed.
 
+### S7 part 2 — nav gating, the sidebar's truth, and the ledger close — ENTREGADA (writer round) 2026-09-20
+- [x] T22 (rest): AC21 delivered — the principal plumbed into every page struct and the sidebar showing
+      only the entries that principal may read. The kernel-side nav view lives in `security/authz.rs`:
+      `NavEntry`/`NAV_ENTRIES` (the ONE mapping entry → permission, one row per entry with the sidebar
+      group) and `Nav` (`for_principal`, the anonymous fail-closed fallback, `visible(key)`,
+      `group_visible(group)`). Thirteen full-page template structs carry the `nav` field
+      (`web.rs` ×2, `inventory_web.rs`, `sales_web.rs` ×2, `customers_web.rs`, `purchases_web.rs` ×2,
+      `suppliers_web.rs`, `users_web.rs`, `roles_web.rs`, the password page in `identity_web.rs`, and the
+      refusal card in `authz.rs`); the sidebar's `nav_item` macro gates EVERY entry by construction
+      (`{% if nav.visible(key) %}`), so an entry cannot render ungated, and the group headings hide when
+      a group has no visible entry. The login page keeps overriding the sidebar block and needs no
+      principal. The sidebar shows the signed-in user's display name and username next to the logout
+      control (the S3-ii deferral), and the password page says why it confines a flagged session — the
+      principal's `must_change_password` field reaching the operator.
+- [x] T23 (rest): tests for AC21 (4 new tests, every claim mutation-validated below) — the navigation
+      shows exactly the readable entries in both directions, the bootstrap administrator sees all, and
+      the drift discipline the permission catalog uses now covers the nav mapping (template keys vs
+      `NAV_ENTRIES`, both directions, plus catalog membership).
+
+#### S7 part 2 mapping decisions (written by the writer round of 2026-09-20)
+- **The mapping in one place.** `NAV_ENTRIES` declares: dashboard → `dashboard.read`, sales →
+  `sales.read`, purchases → `purchases.read`, products → `inventory.read`, suppliers → `suppliers.read`,
+  customers → `customers.read`, accounts → `finance.read` (the entry points at the dashboard section;
+  the finance reads carry that code), users → `identity.users.read`, roles → `identity.roles.manage`
+  (the S4 deliberate tier — no `identity.roles.read` exists), and password → no code (every signed-in
+  operator). Each code is the one the entry's route itself declares; no route's permission was re-decided
+  in this slice.
+- **The suggestion block (part 1's UX item) — the page renders it conditionally, the fragment's gate
+  stands.** Chosen: render `/purchases`'s Sugerido block only when the principal holds `inventory.read`
+  (the gate the fragment AND the API already carry), keeping the route permission untouched — this
+  slice reads permissions, it does not re-decide them, and the suggestion is stock-derived data, so the
+  `inventory.read` gate was the right one and the PAGE was the wrong half. When not permitted the page
+  renders no block at all (and skips the service read), so a `purchases.read`-only principal can no
+  longer see data its own refresh button would refuse. The supplier roster embedded in the create
+  dialog stays the recorded S7 part 1 consequence (the dialog needs it to record a purchase).
+- **The declared order rule for the double-gated drawers** is now in the spec (see spec.md Rules): the
+  extractors run in declaration order and the FIRST one to fail names the refusal; the drawer's
+  own-screen read is declared first, the costs read second.
+- **Pre-existing tests touched (2, same intent, stronger assertion):**
+  `ac10_a_full_page_request_without_the_permission_gets_the_html_refusal` (authz.rs) and
+  `ac10_a_plain_browser_mutation_refusal_is_the_html_page` (inventory_web.rs) both asserted the refusal
+  page renders `data-nav="dashboard"`. Under AC21 the kernel probe (no permissions) and the
+  inventory-only probe no longer see the dashboard entry — the assertion was proving the OPPOSITE of the
+  new rule. Updated to `data-nav="password"` (always visible, the shell still renders) and
+  `data-nav="products"` respectively — the second now also proves the refusal's nav reflects the
+  principal. No assertion of refusal behavior was touched.
+
+#### S7 part 2 mutation table (writer round — every claim observed FAILING, then restored)
+
+| # | Mutation | Test that failed | Observed failure |
+| --- | --- | --- | --- |
+| M1 | The `nav.visible(key)` gate dropped from the `sales` entry (the template renders it for everyone) | `ac21_a_limited_principal_sees_exactly_the_entries_it_may_read` | the hidden-entry assertion fired: `the entry sales must be hidden from this principal` |
+| M2 | `NAV_ENTRIES` maps `products` to `SuppliersRead::CODE` instead of `InventoryRead::CODE` | the same test | the readable-entry assertion fired: `the readable entry products must render` |
+| M3 | A `nav_item("reports", ...)` added to the sidebar partial with no declared row | `ac21_every_sidebar_entry_declares_a_catalog_permission` | `sidebar entry "reports" has no declared nav mapping` |
+| M4 | The `{% if show_suggestions %}` gate dropped from `/purchases`'s Sugerido section | `ac21_the_suggestions_block_hides_from_a_principal_that_cannot_refresh_it` | `the Sugerido block must not render for a principal the suggestions fragment would refuse` |
+
+#### S7 part 2 warning ledger re-measure (2026-09-20, closing measure — the FIRST graduation since S4)
+`cargo check --all-targets` **0 errors, 55 lint warnings (delta −1 vs `main`'s 56; measured the ledger
+way: 57 raw `warning:` lines minus the 2 per-target summary lines)**. The count falls for the first time
+since S4's 60 → 56. Graduated items (made production-readable by this slice):
+
+| Graduated item | Consumed by S7 part 2 |
+| --- | --- |
+| `Principal.{username, display_name, must_change_password}` | the sidebar renders display name + username next to logout (`Nav::for_principal`), and the password page reads `must_change_password` to say why the session is confined; the `_PIN_IDENTITY_FIELDS` pin left `authz.rs` (the fields are production-read now, `Principal.user_id` had already graduated with S3 part 2) |
+
+Still dormant for their slices: `role_repo::{count_active_holders, revoke}` (no natural consumer yet —
+deletion blocks on the TOTAL holder set via `holder_names`, and grant/revocation lives on the users
+screen) and `Role.{created_at, updated_at}`, `Permission.{action, created_at}` (Phase B reads them).
+The requirement is met: the count is below 56 with NO `#[allow(dead_code)]` /
+`#[allow(unused_imports)]` attributes — `grep -rn 'allow(dead_code)\|allow(unused_imports)' src/` stays
+empty. New surface written and consumed at birth (no new warnings): `Nav`, `NavEntry`, `NAV_ENTRIES`,
+`Nav::visible`/`group_visible`, the `nav` field on the 13 page structs, and the 7 new tests.
+
+#### S7 part 2 numbers and live probe (2026-09-20)
+`cargo test` 604 → **611 passed / 0 failed** (+7: the two kernel drift tests, the two dashboard AC21
+tests plus the full-permission test, the suggestions test, the password-notice test — 6 names above,
+7 counted: `ac21_every_sidebar_entry_declares_a_catalog_permission`,
+`ac21_the_nav_view_shows_exactly_the_readable_entries`,
+`ac21_a_limited_principal_sees_exactly_the_entries_it_may_read`,
+`ac21_the_full_permission_principal_sees_every_entry`,
+`ac21_the_sidebar_shows_the_signed_in_user_next_to_logout`,
+`ac21_the_suggestions_block_hides_from_a_principal_that_cannot_refresh_it`,
+`the_password_page_says_why_it_confines_a_flagged_session`). `scripts/e2e.sh -k identity` 4 passed,
+`-k parties` 9 passed / 1 skipped (the opt-in screenshot probe, not a failure).
+
+Live probe with the real binary (throwaway DB, `ROYA_ADMIN_PASSWORD` set): admin login → the sidebar
+renders every entry once (`data-nav` census: accounts, customers, dashboard, password, products,
+purchases, roles, sales, suppliers, users — each 1) and the user block shows `Admin`/`admin` above
+`Cerrar sesión`. A limited principal built THROUGH THE SCREENS (role `nav_probe` created by
+`POST /web/roles`, its matrix set to `purchases.read` + `suppliers.read` by `POST /web/roles/matrix`,
+user `navlimit` created by `POST /web/users`, the role assigned by `POST /web/users/roles`, the forced
+change lifted by the real `/password` flow): `GET /` → 403 (no `dashboard.read`) whose refusal card
+keeps exactly the three entries it may read; `GET /purchases` and `GET /suppliers` → 200 with the same
+three entries; `data-nav` census on its pages: password, purchases, suppliers — and NOTHING else; the
+group census shows only `operation`, `catalogue`, `account` (no empty `cash` heading); the Sugerido
+block is ABSENT from its `/purchases` while the administrator's still renders (2 matches); clicking a
+hidden entry is not even offered (no `data-nav="sales"`/`customers`/`products`/`accounts`/`users`
+/`roles`/`dashboard` in its markup) and the direct URLs stay refused (`/sales`, `/users`,
+`/products` → 403; the supplier drawer → 403 naming `purchases.costs.read`). The administrator still
+answers 200 everywhere. Probe scratch removed.
+
+#### S7 part 2 CORRECTION ROUND (2026-09-20): the nav promise the route refused — MAJOR, plus the dormant-ledger NIT
+The verification of the delivered S7 part 2 found (M1, MAJOR): the `accounts` nav entry (href
+`/#accounts`) mapped to `finance.read` while that href opens the `/` route, whose gate is
+`dashboard.read` — a principal holding `finance.read` without `dashboard.read` SAW the entry and got
+a 403 clicking it. The old drift test did not see it because it only trusted the table (key declared,
+code in the catalog), never the route the href opens.
+
+**The rule (written in spec.md, Navigation):** a nav entry declares EVERY permission it needs — the
+gate of the route its href opens, plus the data-owner permission of any block its label names (the
+same shape the double-gated drawers and the suggestions block use); less shows a screen the route
+refuses, more hides a screen the principal may read.
+
+**How each entry applies it:** `dashboard`/`sales`/`purchases`/`products`/`suppliers`/`customers`/
+`users`/`roles` keep their single code (the gate of the route their href opens, no named blocks);
+`accounts` now carries `dashboard.read` (the `/` route's gate) AND `finance.read` (the accounts
+block's data owner), and the dashboard renders the accounts block conditionally on `finance.read`
+(`show_accounts` in `web.rs`, `{% if show_accounts %}` around the card in `dashboard.html` — the
+block IS separable, a distinct card, so the balances need no inseparable justification; the rest of
+the page stays behind `dashboard.read`, the gate its route declares); `password` declares no codes,
+unchanged. `NavEntry.permission` became `permissions: &'static [&'static str]` and `Nav::from_parts`
+requires every declared code — the sidebar macro still gates by construction (`nav.visible(key)`),
+no special cases.
+
+**The invariant that replaced the table-trusting test:** for every nav entry, a principal holding
+exactly the permissions that entry declares gets 200 on that entry's href —
+`ac21_a_principal_holding_exactly_what_an_entry_declares_opens_its_href` (authz.rs), one test, every
+entry, driven against the real router with the hrefs parsed from the sidebar partial itself. Each
+declared code must also be load-bearing: the declared set minus that code either gets the route's 403
+or misses the block the label names (test-side marker: `accounts` → `id="accounts"`; no other entry's
+label names a block, so any extra code on them has nothing to point at). `password` needs no
+exclusion-with-reason: it declares no codes and is verified the same way with the permissionless
+signed-in principal. The static direction of the old test survives as
+`ac21_the_sidebar_renders_exactly_the_declared_entries_with_catalog_codes` (keys both ways + catalog
+membership), which is declaration drift, not behavioral truth.
+
+**Mutation table (both directions, observed FAILING, then restored):**
+
+| Mutation | Observed failure |
+| --- | --- |
+| M-A: `accounts` declares `[finance.read]` only — LESS than its route requires | `nav entry "accounts" declares ["finance.read"] but GET /#accounts refuses the exact principal — 403 vs 200` (exactly 2026-09-20's bug) |
+| M-B: `accounts` declares `[dashboard.read, finance.read, sales.read]` — one code it does not need | `nav entry "accounts" declares sales.read but the href opens and the named block still renders without it: sales.read is over-declared and hides nothing` |
+
+**NIT (dormant-ledger honesty):** the ledger mapped `role_repo::{count_active_holders, revoke}` to
+Phase B, whose audit-column work does not consume them. Corrected in the S2 dormant table and the S7
+closing ledger state: they are the S2 trait surface exercised by tests (`revoke`: single-grant removal
+surfacing the AC14 guard; `count_active_holders`: the AC15 holder count) with NO known consumer —
+production grant/revocation lives on the users screen through `replace_user_roles`, deletion blocks on
+`holder_names` plus the RESTRICT FK, and Phase B's audit columns will NOT consume them. The ODD log
+(odd/tasks/identity-rbac.md) carries the same correction.
+
+**Correction-round numbers:** `cargo test` 611 → **613 passed / 0 failed** (−1:
+`ac21_every_sidebar_entry_declares_a_catalog_permission` replaced; +3:
+`ac21_a_principal_holding_exactly_what_an_entry_declares_opens_its_href`,
+`ac21_the_sidebar_renders_exactly_the_declared_entries_with_catalog_codes`,
+`ac21_the_two_code_accounts_entry_shows_only_to_principals_holding_both` — the raw two-code HTML
+fragments print under `--nocapture`). `cargo check --all-targets` 0 errors, **55 warnings** (57 raw
+`warning:` lines − the 2 per-target summaries; delta 0 vs the S7 close), no `#[allow]` added (grep
+empty). `scripts/e2e.sh -k identity` 4 passed; `-k parties` 9 passed / 1 skipped (the opt-in
+screenshot probe, not a failure). Two-code probe through the real router: `finance.read` only → GET /
+403, no `data-nav="accounts"`; `dashboard.read` only → GET 200, entry AND block absent; both codes →
+GET 200, anchor and `id="accounts"` card present.
+
 ### S7 — enforcement: purchases, suppliers, identity, dashboard
-- [ ] T22: `Require<P>` per action, nav gating, dashboard and identity screens gated.
-- [ ] T23: tests for AC10 and AC21, and the full-surface exposure guard.
+- [x] T22: `Require<P>` per action (part 1), nav gating (part 2), dashboard and identity screens gated
+      (part 1 covered the last department handlers; the password page was already reachable and the
+      dashboard was gated in S5).
+- [x] T23: tests for AC10 (parts 1), AC21 (part 2), and the full-surface exposure guard: every route's
+      read permission is now ALSO the nav mapping's code, the identity screens carry their entries, and
+      the part 1 grep of registered handlers is joined by the sidebar's own drift tests.
+
+#### S7 closing ledger state
+Dormant with NO known consumer: `role_repo::{count_active_holders, revoke}` (see the corrected S2
+row above — Phase B's audit columns will not consume them); dormant for Phase B proper:
+`Role.{created_at, updated_at}`, `Permission.{action, created_at}`. The S2 requirement (the count back
+at or below 56 by the end of S7, no `#[allow]` as the mechanism) is CLOSED at 55.
 
 ### S8 — Phase A close
 - [ ] T24: browser slice (`e2e/tests/test_identity.py`) for AC22, wired into the harness login step.
@@ -964,10 +1138,13 @@ deferred to S7)**.
 - **S7 part 1 (`feat/enforcement-purchases-suppliers`, writer round 2026-09-20) is DONE but has NO
   work-unit commit yet: the writer does not commit; the parent owns git state — commit it as one work
   unit. The pause map below still reads as of after S6; on top of it, S7 part 1 landed the 51
-  purchases/suppliers gates with their mutation-validated tests (see the S7 part 1 sections above);
-  what remains of S7 is S7 part 2: nav gating (AC21 — the principal plumbed into every page struct),
-  the dashboard and identity screens' nav exposure, and the full-surface exposure guard grep, plus
-  this ledger's closing re-measure.**
+  purchases/suppliers gates with their mutation-validated tests (see the S7 part 1 sections above).
+  **S7 part 2 (`feat/nav-gating`, writer round 2026-09-20) is ALSO DONE, in the same uncommitted
+  state: nav gating (AC21 — the principal plumbed into the 13 page structs, the sidebar rendering only
+  the readable entries), the signed-in user in the sidebar, the suggestion-block alignment, the
+  declared-order rule in the spec, the drift tests, and the ledger closed at 55 warnings (≤ 56 met,
+  no `#[allow]`). The whole S7 is now ready for its independent verification and its work-unit
+  commit(s).**
 - The remote branch `feat/roles-administration` still exists on `origin` although its PR #48 is
   already merged into `origin/main` (verified with `git branch -a` on 2026-09-19). Decided: leave it
   un-deleted for now; deleting it is the owner's call, it holds nothing unmerged.

@@ -92,7 +92,8 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
 - [x] S4 — Administración de roles y matriz de permisos (T16–T17)
 - [ ] S5 — Enforcement: finanzas e inventario (T18–T19)
 - [x] S6 — Enforcement: ventas y clientes (T20–T21; nav gating queda para S7)
-- [ ] S7 — Enforcement: compras, proveedores, identidad y dashboard (T22–T23)
+- [x] S7 — Enforcement: compras, proveedores, identidad y dashboard (T22–T23; parte 1 compras/proveedores
+      2026-09-20, parte 2 nav gating y cierre del ledger 2026-09-20, ver S7 parte 2 en Progreso)
 - [ ] S8 — Cierre de Fase A: slice de navegador + README + specs (T24–T25)
 - [ ] Fase B — Auditoría del actor por departamento (T26–T31)
 
@@ -734,6 +735,12 @@ S7 por diseño del brief)**.
 - Al reanudar: `mem_context` + `mem_search` por proyecto/feature, releer
   `odd/tasks/identity-rbac.md` y el change folder; la próxima tarea sin terminar es S7 (T22).
 
+  **Actualización S7 parte 2 (2026-09-20, misma ronda):** T22/T23 cerrados — nav gating AC21 entregado
+  (13 structs de página con `nav`, el macro del sidebar gatea por construcción, usuario logueado en la
+  barra, sugerencias condicionales, regla del orden declarado en la spec, drift tests), y el ledger
+  cerrado en **55 warnings** (≤ 56, sin `#[allow]`). Falta el commit de unidad de trabajo de S7 parte 1
+  y parte 2 (el orquestador maneja el git) y la verificación independiente de S7 antes del PR.
+
 ### S5 — ronda de corrección (verificación independiente: COMMIT WITH NOTED RISK, 2026-09-19)
 Un MAJOR de cobertura y dos NITs. Texto + tests; ninguna anotación cambió de valor.
 
@@ -912,3 +919,113 @@ necesitaron.
 4. Re-measure del ledger: los dormidos que quedan son `Principal.{username,display_name,must_change_password}`,
    `role_repo::{count_active_holders,revoke}` y los timestamps de `Role`/`Permission`; el objetivo es **≤56 sin
    `#[allow]`**, y esta slice debería bajarlo por primera vez desde S4.
+
+### S7 parte 2 — nav gating, la barra que dice la verdad y el cierre del ledger (T22/T23 resto; ronda de
+### writer, 2026-09-20)
+Branch `feat/nav-gating` desde `main` actualizado (checkout ya montado por el orquestador). Superficies
+usadas: `authz.rs`, los nueve módulos de rutas de página (`web.rs` ×2 structs, `inventory_web.rs`,
+`sales_web.rs` ×2, `customers_web.rs`, `purchases_web.rs` ×2, `suppliers_web.rs`, `users_web.rs`,
+`roles_web.rs`, `identity_web.rs`), `templates/{base,password,purchases}.html`,
+`templates/partials/sidebar.html`, los tres docs.
+
+- **La vista de nav vive en el kernel** (`security/authz.rs`): `NavEntry` + `NAV_ENTRIES` — la ÚNICA tabla
+  que decide el mapeo entrada → permiso (una fila por entrada: clave, el código del catálogo que la ruta
+  declara, y el grupo del sidebar; `password` lleva sin código porque la alcanza toda sesión confinada
+  incluida) — y `Nav` (`for_principal`, el fallback anónimo fail-closed para el rechazo sin principal,
+  `visible(key)` y `group_visible(group)`). Las TRECE structs de página que extienden `base.html` llevan
+  el campo `nav`; el login sigue pisando el bloque del sidebar y no necesita principal. El macro
+  `nav_item` de la partial gatea TODA entrada por construcción (`{% if nav.visible(key) %}`): una
+  entrada nueva no puede renderizarse sin gate, y los encabezados de grupo se ocultan si el grupo queda
+  vacío (un principal limitado nunca ve un título sin entradas).
+- **La barra muestra el usuario logueado** (la postergación de S3-ii): nombre para mostrar + username
+  junto al control de salir, y la página de contraseña dice por qué confina — la sesión marcada ve «Tu
+  sesión está confinada: debés cambiar tu contraseña antes de continuar», la limpia no. Con eso,
+  `Principal.{username, display_name, must_change_password}` queda leído en producción y el pin
+  `_PIN_IDENTITY_FIELDS` sale de `authz.rs`.
+- **El ítem de UX de las sugerencias (juicio de la verificación de S7-i): renderizado condicional, la
+  gate del fragmento queda en pie.** La página `/purchases` renderiza el bloque Sugerido sólo si el
+  principal sostiene `inventory.read` — la MISMA gate que ya llevan el fragmento y el API — y salta la
+  lectura del servicio cuando no la sostiene. Elegido sobre alinear la gate del fragmento con la página
+  porque cambiar una ruta es re-decidir un permiso (prohibido por el brief) y el dato es derivado del
+  stock, así que la gate de `inventory.read` era la correcta y la equivocada era la página: un principal
+  con sólo `purchases.read` ya no ve datos que su propio botón de refresco le rechazaría. El roster de
+  proveedores del diálogo de creación queda como la consecuencia deliberada registrada en la parte 1.
+- **La regla del orden declarado, escrita en la spec** (spec.md, Rules): los extractores corren en orden
+  de declaración y el PRIMERO que falla nombra el rechazo; el read de la pantalla propia va primero y el
+  read del dueño del dato (costos) segundo — cambiar el orden cambia qué código lee el operador y es un
+  cambio de gate, no un refactor.
+- **Tests: +7** (dos de drift en el kernel — claves de la partial contra `NAV_ENTRIES` en ambas
+  direcciones + membresía en el catálogo, y la vista muestra exactamente lo legible, unitaria —; tres de
+  ruta en `web.rs`: principal limitado ve exactamente sus entradas sin encabezados vacíos, el principal
+  full-permission ve todas exactamente una vez, el bloque de usuario junto al logout; la de sugerencias
+  en `purchases_web.rs`; la del aviso de confinamiento en `identity_web.rs`). Dos tests preexistentes
+  tocados con la MISMA intención y una aserción más fuerte:
+  `ac10_a_full_page_request_without_the_permission_gets_the_html_refusal` (kernel) y
+  `ac10_a_plain_browser_mutation_refusal_is_the_html_page` (inventory) afirmaban que el rechazo
+  renderiza `data-nav="dashboard"` — lo contrario exacto de la regla nueva para un probe sin permisos o
+  de sólo inventario; pasaron a `data-nav="password"` (siempre visible) y `data-nav="products"`, que
+  además prueba que el nav del rechazo refleja al principal.
+- **Tabla de mutaciones** (cada mutación observada FALLANDO, restaurada; el diff final conserva
+  todas las gates): M1 quitar la gate `nav.visible` de la entrada `sales` → falla el test del principal
+  limitado (`the entry sales must be hidden`); M2 mapear `products` a `SuppliersRead::CODE` → el mismo
+  test falla en la dirección legible (`the readable entry products must render`); M3 agregar
+  `nav_item("reports")` sin fila declarada → falla el drift test (`sidebar entry "reports" has no
+  declared nav mapping`); M4 quitar `{% if show_suggestions %}` → falla el test del bloque Sugerido.
+- Números: `cargo test` 604 → **611 passed / 0 failed**; `cargo check --all-targets` 0 errores,
+  **55 warnings** (57 líneas crudas − 2 resúmenes; delta −1, la PRIMERA baja desde S4: los tres campos
+  de identidad de `Principal` se graduaron); grep de allows **vacío**; `scripts/e2e.sh -k identity`
+  4 passed, `-k parties` 9 passed / 1 skipped (probe opt-in). Sonda en vivo con el binario real (base
+  desechable): admin → las diez entradas exactamente una vez + bloque de usuario; principal limitado
+  construido POR LAS PANTALLAS (rol `nav_probe` + matriz `purchases.read`/`suppliers.read` + usuario
+  `navlimit` + asignación + `/password` real) → sus páginas muestran sólo `purchases`, `suppliers` y
+  `password`, sin encabezado `cash` vacío, sin bloque Sugerido (el admin lo conserva), y los clics
+  prohibidos ni se ofrecen ni responden por URL directa (`/sales`, `/users`, `/products` 403; drawer de
+  proveedor 403 nombrando `purchases.costs.read`); el admin sigue 200 en todo. Basura eliminada.
+- **Re-measure del ledger (cierre de S7):** 56 → **55 warnings**, sin `#[allow]` — el requisito del S2
+  (≤ 56 al cerrar S7) queda CERRADO. Graduado: `Principal.{username, display_name, must_change_password}`.
+  Dormidos: `role_repo::{count_active_holders, revoke}` (consumidor conocido: NINGUNO — ver la ronda de
+  corrección abajo) y `Role.{created_at, updated_at}`, `Permission.{action, created_at}` (Fase B los lee).
+
+## Ronda de corrección de S7-ii (2026-09-20): la entrada de nav que prometía una pantalla que su ruta rechazaba
+
+- **MAJOR:** la entrada `accounts` (href `/#accounts`) mapeaba a `finance.read`, pero ese href abre la
+  ruta `/`, cuya gate es `dashboard.read`: un principal con `finance.read` sin `dashboard.read` VEÍA la
+  entrada y se comía un 403 al hacer clic. El drift test viejo no lo vio porque sólo confiaba en la
+  tabla (clave declarada, código en el catálogo), nunca en la ruta que el href abre.
+- **La regla (escrita en spec.md, Navigation):** una entrada de nav declara TODOS los permisos que
+  necesita — la gate de la ruta que su href abre, más el permiso dueño del dato de todo bloque que su
+  etiqueta nombre (la misma forma de los drawers doble-gateados y del bloque de sugerencias). De menos:
+  le muestra al operador una pantalla que la ruta rechaza; de más: le esconde una pantalla que el
+  principal puede leer.
+- **Cómo aplica cada entrada:** `accounts` lleva ahora `dashboard.read` (gate de la ruta `/`) Y
+  `finance.read` (dueño del bloque de cuentas), y el dashboard renderiza el bloque condicionalmente con
+  `finance.read` (`show_accounts` en `web.rs`, `{% if show_accounts %}` en `dashboard.html` — el bloque
+  ES separable, una tarjeta propia, así que no hubo que justificar nada inseparable; el resto de la
+  página queda detrás de `dashboard.read`, la gate de su ruta). Las otras ocho entradas conservan su
+  código único (la gate de la ruta que su href abre, sin bloques nombrados); `password` sin códigos,
+  sin cambios. `NavEntry.permission` pasó a `permissions: &'static [&'static str]` y `Nav::from_parts`
+  exige todos los códigos declarados — el macro sigue gateando por construcción, sin casos especiales.
+- **El invariante que reemplazó al test que confiaba en la tabla:** por cada entrada de nav, un
+  principal que sostiene exactamente los permisos que la entrada declara obtiene 200 en el href que la
+  entrada abre — `ac21_a_principal_holding_exactly_what_an_entry_declares_opens_its_href`, un test,
+  todas las entradas, contra el router real con los hrefs parseados de la partial misma. Cada código
+  declarado además debe ser load-bearing: el set declarado menos ese código o recibe el 403 de la ruta
+  o pierde el bloque que la etiqueta nombra (marcador de test: `accounts` → `id="accounts"`; ninguna
+  otra entrada nombra un bloque). `password` no necesita exclusión con motivo: declara nada y se
+  verifica igual, con el principal sin permisos pero logueado. La dirección estática del test viejo
+  sobrevive como `ac21_the_sidebar_renders_exactly_the_declared_entries_with_catalog_codes`.
+- **Tabla de mutaciones (dos direcciones, observadas FALLANDO, restauradas):** M-A `accounts` con sólo
+  `[finance.read]` → falla con `GET /#accounts refuses the exact principal (403 vs 200)`; M-B `accounts`
+  con `[dashboard.read, finance.read, sales.read]` → falla con `sales.read is over-declared and hides
+  nothing`.
+- **NIT del ledger:** el ledger mapeaba `role_repo::{count_active_holders, revoke}` a Fase B, cuyo
+  trabajo (columnas de auditoría) no los consume. Corregido en la tabla S2 y en el cierre del ledger S7:
+  son la superficie del trait de S2 ejercida por tests (`revoke`: revocación de una sola asignación que
+  surfacea la guardia AC14; `count_active_holders`: el conteo AC15) SIN consumidor conocido — la
+  asignación/revocación en producción vive en la pantalla de usuarios vía `replace_user_roles`, el
+  borrado bloquea por `holder_names` más el RESTRICT, y Fase B no los va a consumir.
+- **Números:** `cargo test` 611 → **613 passed / 0 failed** (−1 reemplazado, +3 nuevos); `cargo check
+  --all-targets` 0 errores, **55 warnings** (57 crudas − 2 resúmenes; delta 0), grep de allows vacío;
+  `scripts/e2e.sh -k identity` 4 passed, `-k parties` 9 passed / 1 skipped (sonda opt-in). Sonda del
+  ítem de dos códigos: sólo `finance.read` → GET / 403 sin la entrada; sólo `dashboard.read` → 200 con
+  la entrada y el bloque ausentes; ambos códigos → 200 con la entrada y el bloque presentes.

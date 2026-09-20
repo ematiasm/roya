@@ -105,6 +105,50 @@
   is `403` and writes nothing, in the shape the caller reads: JSON `{"error": ...}` for `/api/*` and for
   HTMX requests (the global `htmx:responseError` handler renders it as the `#notice` box), and a minimal
   HTML page for a full-page HTML request. The message reaches the operator, so it is written in Spanish.
+- **The declared order rule (double-gated drawers).** A handler that renders two owners' data declares TWO
+  `Require<P>` extractors — the product drawer (`/web/products/detail/{id}`: `inventory.read` AND
+  `purchases.costs.read`) and the supplier drawer (`/web/suppliers/{id}/detail`: `suppliers.read` AND
+  `purchases.costs.read`). The extractors run in DECLARATION ORDER, and the first one to fail produces
+  the refusal: which permission the refusal names is therefore decided by the declared order, not by the
+  handler's code. The order is part of the gate's contract: the drawer's own-screen read is declared
+  first (it is the cheaper, more common miss) and the data-owner's read second, so a principal missing
+  either gets named for the one it lacks, in declaration order. A change of order changes which code an
+  operator reads in the refusal and is a gate change, not a refactor.
+- **Navigation (AC21).** The sidebar renders only the entries the principal may read, and an entry
+  declares EVERY permission it needs: the gate of the route its href opens, plus the data-owner
+  permission of any page block its label names (the same shape the double-gated drawers and the
+  suggestions block already use). A nav entry that declares LESS shows its operator a screen the
+  route refuses — the mismatch the 2026-09-20 correction round fixed: `accounts` mapped the
+  `/#accounts` entry to `finance.read` while that href opens the `/` route, which declares
+  `dashboard.read`, so a principal holding `finance.read` without `dashboard.read` SAW the entry and
+  got a 403 clicking it. A nav that declares MORE hides a screen the principal may read. The mapping
+  entry → permissions lives in ONE place (`authz::NAV_ENTRIES`, one row per entry: key, the catalog
+  codes the entry needs, and the sidebar group); a row may declare no codes for the entries every
+  signed-in operator may see (`/password`, the one page a confined session must always reach).
+  `accounts` is the worked example of the rule: its href `/#accounts` opens the `/` route (gate
+  `dashboard.read`) and its label names the dashboard's accounts block, whose data owner is
+  `finance.read` — so the entry carries BOTH codes, and the dashboard renders the accounts block
+  conditionally on `finance.read` (the block is a separable card, so the balances need no
+  inseparable-from-the-page justification; the rest of the dashboard stays behind `dashboard.read`,
+  the gate its own route declares). Every full-page handler builds the sidebar's nav view (`Nav`)
+  from its request's principal; the full-page refusal builds the same view from the extensions, so
+  the shell around a 403 obeys the same rule and an under-permissioned principal keeps only the
+  navigation it may use. The drift tests mirror the permission catalog's: the sidebar partial's
+  rendered keys must all be declared (a new entry without a declared mapping fails a test), a
+  declared entry must render (no row that decides nothing), and each declared code must be a catalog
+  permission. The behavioral truth does NOT trust that table: **for every nav entry, a principal
+  holding exactly the permissions that entry declares gets 200 on that entry's href** — one test
+  (`ac21_a_principal_holding_exactly_what_an_entry_declares_opens_its_href`) drives the real router
+  for every entry, and each declared code must be load-bearing: a principal holding the declared set
+  MINUS that code either gets the route's 403 (the code gates the route) or misses the block the
+  label names (the code owns the block's data); a code for which neither holds is over-declared and
+  the test fails. The one entry this invariant does not reach by permission arithmetic is `password`,
+  which declares no code and needs none: it is verified the same way with the permissionless
+  (still signed-in) principal. Behaviorally: a limited principal sees
+  exactly the entries it may read (no empty group headings either), the bootstrap administrator sees all,
+  and the hidden action stays refused at the handler when called directly. The sidebar also shows the
+  signed-in user's display name and username next to the logout control, and the password page says why
+  it is confining a flagged session.
 - **Protected role and last administrator.** The database refuses: deleting a `is_system` role, changing
   its code, deleting its `role_permissions` rows, deactivating the last active user holding it, and
   deleting the last grant of that role to an active user. The interface reports the refusal in Spanish and
@@ -229,7 +273,8 @@
   (revoke, `204`). No REST CRUD for users or roles in v1: the interface is the requirement, and a second
   surface would double the review load.
 - Navigation: the sidebar renders the entries the principal may read, plus the current user's display name
-  and a logout control.
+  and a logout control. The mapping entry → permission is `authz::NAV_ENTRIES` (one place, drift-tested;
+  see the Navigation rule).
 
 ## Acceptance criteria
 - [ ] AC1: with an empty database the application seeds exactly one `admin` user holding the protected

@@ -15,7 +15,7 @@ use crate::models::{PaymentMethod, TransactionKind};
 use crate::repositories::AccountRepository;
 use crate::routes::AppState;
 use crate::security::authz::{
-    DashboardRead, FinanceMethodsManage, FinanceRead, FinanceWrite, Require,
+    DashboardRead, FinanceMethodsManage, FinanceRead, FinanceWrite, Nav, Require,
 };
 
 // S5 enforcement mapping (dashboard + finance HTML/HTMX): the dashboard reads
@@ -38,7 +38,17 @@ struct DashboardTemplate {
     today: String,
     methods: Vec<PaymentMethod>,
     accounts_without_methods: AccountsWithoutMethods,
+    /// Whether the acting principal may see the accounts block: the block's
+    /// data is a finance read (`finance.read`, the gate `/web/accounts` and
+    /// the account API carry), and the `accounts` nav entry names the block —
+    /// so the dashboard renders it conditionally on the same code, the way
+    /// the suggestions block does in purchases_web.rs. The rest of the page
+    /// stays the dashboard's own screen (`dashboard.read`); the account
+    /// balances are a separable card, so nothing is left implicit here.
+    show_accounts: bool,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -51,6 +61,8 @@ struct AccountDetailTemplate {
     unassigned: Vec<PaymentMethod>,
     has_methods: bool,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -120,6 +132,7 @@ where
 async fn dashboard(
     State(state): State<AppState>,
     _: Require<DashboardRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
 ) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
     let total_balance = state.account_service.total_balance().await?;
@@ -133,7 +146,9 @@ async fn dashboard(
         today,
         methods,
         accounts_without_methods,
+        show_accounts: principal.has_permission::<FinanceRead>(),
         nav_key: "dashboard",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?))
 }
@@ -141,6 +156,7 @@ async fn dashboard(
 async fn account_detail(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, AppError> {
@@ -158,6 +174,7 @@ async fn account_detail(
         unassigned,
         has_methods,
         nav_key: "accounts",
+        nav: Nav::for_principal(&principal),
     };
     let html = tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -687,6 +704,233 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{page:.400}");
+    }
+
+    // -- S7 part 2 (AC21): the sidebar tells the truth -------------------------
+
+    /// A principal holding only `dashboard.read` + `inventory.read` sees the
+    /// dashboard and products entries (plus the password entry every signed-in
+    /// operator keeps) and NOTHING else — in particular no entry whose page
+    /// would refuse it, and no empty group heading. Both directions: what is
+    /// readable is shown, what is not is absent from the markup entirely.
+    #[tokio::test]
+    async fn ac21_a_limited_principal_sees_exactly_the_entries_it_may_read() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["dashboard.read", "inventory.read"],
+        )
+        .await
+        .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = send_as(
+            app.clone(),
+            "GET",
+            "/",
+            Some(&test_support::cookie_for(&probe)),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        for key in ["dashboard", "products", "password"] {
+            assert!(
+                html.contains(&format!("data-nav=\"{key}\"")),
+                "the readable entry {key} must render: {html:.600}"
+            );
+        }
+        for key in [
+            "sales",
+            "purchases",
+            "suppliers",
+            "customers",
+            "accounts",
+            "users",
+            "roles",
+        ] {
+            assert!(
+                !html.contains(&format!("data-nav=\"{key}\"")),
+                "the entry {key} must be hidden from this principal: {html:.600}"
+            );
+        }
+        // No empty group headings: operation and catalogue have entries, cash
+        // (finance.read) and the identity rows do not.
+        assert!(html.contains("data-nav-group=\"operation\""), "{html:.600}");
+        assert!(html.contains("data-nav-group=\"catalogue\""), "{html:.600}");
+        assert!(!html.contains("data-nav-group=\"cash\""), "{html:.600}");
+        assert!(!html.contains("Usuarios"), "{html:.600}");
+        assert!(!html.contains("Finanzas"), "{html:.600}");
+    }
+
+    /// The full-permission principal (the shared fixture holds the whole
+    /// catalog) sees every entry the sidebar declares — the administrator
+    /// never loses a screen.
+    #[tokio::test]
+    async fn ac21_the_full_permission_principal_sees_every_entry() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let (status, html) = send_as(app.clone(), "GET", "/", Some(test_support::TEST_COOKIE), None, &[], String::new()).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        for key in [
+            "dashboard",
+            "sales",
+            "purchases",
+            "products",
+            "suppliers",
+            "customers",
+            "accounts",
+            "users",
+            "roles",
+            "password",
+        ] {
+            assert_eq!(
+                count_key(&html, &format!("data-nav=\"{key}\"")),
+                1,
+                "the full-permission principal must see {key} exactly once: {html:.600}"
+            );
+        }
+    }
+
+    /// The signed-in user's name renders next to the logout control: the
+    /// display name and the username, from the request's principal.
+    #[tokio::test]
+    async fn ac21_the_sidebar_shows_the_signed_in_user_next_to_logout() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let (status, html) = send_as(app.clone(), "GET", "/", Some(test_support::TEST_COOKIE), None, &[], String::new()).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("data-sidebar-user"),
+            "the sidebar must carry the signed-in user block: {html:.600}"
+        );
+        assert!(
+            html.contains("Test Admin") && html.contains("test-admin"),
+            "the display name and the username must render: {html:.600}"
+        );
+        assert!(
+            html.contains("action=\"/logout\""),
+            "the logout control stays: {html:.600}"
+        );
+    }
+
+    /// The one two-code entry: `accounts` declares `dashboard.read` (the gate
+    /// of the `/` route its href opens) AND `finance.read` (the data owner of
+    /// the accounts block its label names). A principal holding only ONE of
+    /// the two codes must NOT see the entry: the finance-only principal is
+    /// refused the page outright (its 403 shell keeps only what it may read),
+    /// and the dashboard-only principal opens the page but the accounts block
+    /// hides with it. Holding BOTH, the entry and the block render. The raw
+    /// fragments are printed so a human can read the actual markup.
+    #[tokio::test]
+    async fn ac21_the_two_code_accounts_entry_shows_only_to_principals_holding_both() {
+        let state = test_state().await;
+        let finance_only = test_support::seed_session_with_permissions(&state.pool, &["finance.read"])
+            .await
+            .unwrap();
+        let dashboard_only =
+            test_support::seed_session_with_permissions(&state.pool, &["dashboard.read"])
+                .await
+                .unwrap();
+        let both = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["dashboard.read", "finance.read"],
+        )
+        .await
+        .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // One code (finance.read): the href's route refuses the principal, and
+        // the refusal's shell must not promise the entry either.
+        let (status, page) = send_as(
+            app.clone(),
+            "GET",
+            "/",
+            Some(&test_support::cookie_for(&finance_only)),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{page:.400}");
+        assert!(
+            !page.contains("data-nav=\"accounts\""),
+            "a finance.read-only principal must not see the accounts entry: {page:.600}"
+        );
+        println!(
+            "[fragment] finance.read only -> GET / answers 403; the refusal shell carries \
+             no accounts anchor (data-nav=\"accounts\" absent)"
+        );
+
+        // The other code (dashboard.read): the page opens, the accounts block
+        // hides (web.rs renders it conditionally on finance.read), the entry
+        // hides with it.
+        let (status, page) = send_as(
+            app.clone(),
+            "GET",
+            "/",
+            Some(&test_support::cookie_for(&dashboard_only)),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page:.400}");
+        assert!(
+            !page.contains("data-nav=\"accounts\""),
+            "a dashboard.read-only principal must not see the accounts entry: {page:.600}"
+        );
+        assert!(
+            !page.contains("id=\"accounts\""),
+            "a dashboard.read-only principal must not see the accounts block: {page:.600}"
+        );
+        println!(
+            "[fragment] dashboard.read only -> GET / answers 200; sidebar anchor and accounts \
+             card (id=\"accounts\") both absent"
+        );
+
+        // Both codes: the entry renders, and with it the block it names.
+        let (status, page) = send_as(
+            app,
+            "GET",
+            "/",
+            Some(&test_support::cookie_for(&both)),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page:.400}");
+        assert!(
+            page.contains("data-nav=\"accounts\""),
+            "a principal holding both codes must see the accounts entry: {page:.600}"
+        );
+        assert!(
+            page.contains("id=\"accounts\""),
+            "a principal holding both codes must see the accounts block: {page:.600}"
+        );
+        println!(
+            "[fragment] both codes -> GET / answers 200; sidebar anchor:\n{}\ncard div:\n{}",
+            around(&page, "data-nav=\"accounts\""),
+            around(&page, "id=\"accounts\"")
+        );
+    }
+
+    fn count_key(html: &str, needle: &str) -> usize {
+        html.matches(needle).count()
+    }
+
+    /// The raw HTML around one marker, for the report a human reads.
+    fn around(html: &str, needle: &str) -> String {
+        let at = html
+            .find(needle)
+            .unwrap_or_else(|| panic!("marker {needle:?} absent"));
+        let start = at.saturating_sub(120);
+        let end = (at + 420).min(html.len());
+        let window = &html[start..end];
+        let first = window.find('<').unwrap_or(0);
+        window[first..].to_string()
     }
 
     async fn send(
