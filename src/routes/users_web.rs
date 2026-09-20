@@ -536,7 +536,13 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        test_support::seed_session(&pool).await.unwrap();
+        // Fixture wiring (S5): the permissionless variant. The shared principal
+        // this screen's tests build on holds NO roles — the refusal fixtures
+        // and the read-only principal depend on that premise, and the
+        // happy-path tests grant their own permission sets through
+        // app_with_permissions. The full-permission seed (seed_session) is for
+        // the department fixtures, not this one.
+        test_support::seed_session_without_roles(&pool).await.unwrap();
         pool
     }
 

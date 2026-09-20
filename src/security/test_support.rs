@@ -10,10 +10,10 @@ use axum::http::request::Builder;
 use sqlx::SqlitePool;
 
 use crate::error::AppResult;
-use crate::models::{NewSession, NewUser};
+use crate::models::{NewRole, NewSession, NewUser, NewUserRole};
 use crate::repositories::{
-    SessionRepository, SqliteRoleRepository, SqliteSessionRepository, SqliteUserRepository,
-    UserRepository,
+    PermissionRepository, RoleRepository, SessionRepository, SqlitePermissionRepository,
+    SqliteRoleRepository, SqliteSessionRepository, SqliteUserRepository, UserRepository,
 };
 use crate::security::password::PasswordHasher;
 use crate::security::session::{hash_token, mint_token, SessionPolicy, SESSION_COOKIE};
@@ -62,7 +62,32 @@ const _: () = assert!(test_cookie_name_matches_production());
 /// uses (`security::session::hash_token`). Goes through the real
 /// `SqliteUserRepository` / `SqliteSessionRepository` write path, never raw
 /// SQL. Returns the inserted session id.
+///
+/// Since S5 the user holds every permission in the catalog through a real
+/// role grant, so the department routes' `Require<P>` is satisfied for the
+/// shared fixture. The role is a custom one (`probe_all`) holding all 23
+/// codes, granted through the real `SqliteRoleRepository` write path — the
+/// same grant shape the bootstrap performs (`roles.grant` with
+/// `granted_by` = the user itself, idempotent). Deliberately NOT the
+/// protected `admin` role: the identity screens' fixtures bootstrap the one
+/// protected administrator themselves (AC14's arithmetic counts protected
+/// holders), so a second protected holder seeded here would collide with
+/// them. A test that must hold a GIVEN set — or none — builds its own: see
+/// [`seed_session_without_roles`] and [`seed_session_with_permissions`].
 pub async fn seed_session(pool: &SqlitePool) -> AppResult<i64> {
+    let session_id = seed_session_without_roles(pool).await?;
+    let user_id = user_id(pool).await?;
+    let codes: Vec<&str> = crate::security::authz::PERMISSIONS.to_vec();
+    grant_role_with_codes(pool, "probe_all", "Probe All", user_id, &codes).await?;
+    Ok(session_id)
+}
+
+/// The permissionless variant of [`seed_session`]: the same user and live
+/// session with NO roles, so the resolved principal holds no permission at
+/// all. The kernel's union/no-roles tests and the identity screens' refusal
+/// fixtures build on it — `seed_session` grants the protected role, so a
+/// fixture that needs a principal LACKING permissions must use this one.
+pub async fn seed_session_without_roles(pool: &SqlitePool) -> AppResult<i64> {
     let policy = SessionPolicy::new(TEST_TTL_HOURS, false);
     let now = crate::services::identity::Clock::now(&crate::services::identity::SystemClock);
     let users = SqliteUserRepository::new(pool.clone());
@@ -85,6 +110,128 @@ pub async fn seed_session(pool: &SqlitePool) -> AppResult<i64> {
         })
         .await?;
     Ok(session.id)
+}
+
+/// One extra session whose user holds exactly `permissions` (a custom role
+/// granted through the real grant path), returning the raw token — the cookie
+/// value a test puts on its own requests, so a suite can drive a
+/// read-only/forbidden principal NEXT TO the shared full-permission one.
+pub async fn seed_session_with_permissions(
+    pool: &SqlitePool,
+    permissions: &[&str],
+) -> AppResult<String> {
+    let policy = SessionPolicy::new(TEST_TTL_HOURS, false);
+    let now = crate::services::identity::Clock::now(&crate::services::identity::SystemClock);
+    let users = SqliteUserRepository::new(pool.clone());
+    let sessions = SqliteSessionRepository::new(pool.clone());
+    let user = users
+        .create(&NewUser {
+            // A per-call suffix: a test can seed more than one probe principal
+            // in the same pool (e.g. one read-only, one holding the permission
+            // under test), and usernames are unique case-insensitively.
+            username: probe_username().to_string(),
+            display_name: "Test Probe".to_string(),
+            password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+            must_change_password: false,
+        })
+        .await?;
+    let codes: Vec<&str> = permissions.to_vec();
+    grant_role_with_codes(pool, &probe_role_code(), "Probe Set", user.id, &codes).await?;
+    let token = mint_token()?;
+    sessions
+        .insert(&NewSession {
+            token_hash: hash_token(&token),
+            user_id: user.id,
+            expires_at: policy.expires_at(now),
+            last_seen_at: now,
+            user_agent: None,
+        })
+        .await?;
+    Ok(token)
+}
+
+/// Create a custom role, load its permission matrix from the catalog codes,
+/// and grant it to one user — the real repository write path, never raw SQL,
+/// with the ids resolved in one statement (`set_role_permissions`). Returns
+/// the role id. The role code must be free in the test database (fresh pool
+/// per test). A requested code missing from the seeded catalog is an internal
+/// test error, never a silent empty matrix.
+async fn grant_role_with_codes(
+    pool: &SqlitePool,
+    role_code: &str,
+    role_name: &str,
+    user_id: i64,
+    codes: &[&str],
+) -> AppResult<i64> {
+    let roles = SqliteRoleRepository::new(pool.clone());
+    let permissions_repo = SqlitePermissionRepository::new(pool.clone());
+    let role = roles
+        .create(&NewRole {
+            code: role_code.to_string(),
+            name: role_name.to_string(),
+            description: None,
+        })
+        .await?;
+    let mut permission_ids = Vec::with_capacity(codes.len());
+    for code in codes.iter() {
+        let id: i64 = sqlx::query_scalar("SELECT id FROM permissions WHERE code = ?")
+            .bind(code)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| {
+                crate::error::AppError::Internal(format!(
+                    "test requested unknown permission {code}"
+                ))
+            })?;
+        permission_ids.push(id);
+    }
+    permissions_repo
+        .set_role_permissions(role.id, &permission_ids)
+        .await?;
+    roles
+        .grant(&NewUserRole {
+            user_id,
+            role_id: role.id,
+            granted_by: user_id,
+        })
+        .await?;
+    Ok(role.id)
+}
+
+/// The `Cookie` header value for a minted token, so tests driving the
+/// [`seed_session_with_permissions`] principal build it in one place.
+pub fn cookie_for(token: &str) -> String {
+    format!("{SESSION_COOKIE}={token}")
+}
+
+/// A fresh username for each probe principal (see
+/// [`seed_session_with_permissions`]): the counter is process-local and every
+/// test pool is fresh, so plain monotonic suffixes never collide.
+fn probe_username() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("test_probe_{n}")
+}
+
+/// A fresh role code for each probe principal, for the same reason the
+/// usernames are unique: two probes in one pool must not share a row.
+fn probe_role_code() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("probe_set_{n}")
+}
+
+/// The shared test user's id, read through the real repository (the grant
+/// path needs it; keep the read out of the callers).
+async fn user_id(pool: &SqlitePool) -> AppResult<i64> {
+    let users = SqliteUserRepository::new(pool.clone());
+    let user = users
+        .find_by_username(TEST_USERNAME)
+        .await?
+        .ok_or_else(|| crate::error::AppError::Internal(
+            "the shared test user is missing".to_string(),
+        ))?;
+    Ok(user.id)
 }
 
 /// Add the test session cookie to a request builder, so the built request is
@@ -203,6 +350,25 @@ mod tests {
             .unwrap_or_else(|| panic!("seeded session {session_id} must resolve"));
         assert_eq!(resolved.user.username, TEST_USERNAME);
         assert!(resolved.user.is_active, "seeded user is active");
+        // S5: the seeded principal holds the protected `admin` role — the same
+        // grant the bootstrap path performs — so every department `Require<P>`
+        // is satisfied for the shared fixture. Membership is read through the
+        // real effective-permission resolution the middleware uses.
+        let effective = service
+            .effective_permissions(&SqlitePermissionRepository::new(pool.clone()), resolved.user.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            effective.len(),
+            23,
+            "the seeded test principal must hold the whole catalog"
+        );
+        assert!(
+            effective.contains(
+                <crate::security::authz::InventoryRead as crate::security::authz::Permission>::CODE
+            ),
+            "the seeded principal must hold the department permissions"
+        );
         // The resolved session row is part of the production read: the fields
         // S3's session list and revocation screens render (and the ones the
         // middleware's expiry check reads) survive the round-trip.

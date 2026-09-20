@@ -460,6 +460,75 @@ entregadas; los dormidos que restan de la lista de S4 (`count_active_holders`, `
 esta pantalla y quedan anotados en el ledger para el re-measure de S7. La deuda explícita de
 navegador sigue: la navegación de `HX-Redirect` sin probarse en navegador (S8).
 
+### S5 — enforcement de finanzas e inventario (T18–T19; ronda de writer, 2026-09-19)
+Branch `feat/enforcement-finance-inventory` desde `main` actualizado (checkout ya montado por el
+orquestador). Trabajo hecho dentro de las superficies autorizadas (`api.rs`, `web.rs`,
+`inventory_api.rs`, `inventory_web.rs`, `test_support.rs`, `authz.rs`, los docs):
+
+- **El helper compartido ahora sostiene TODOS los permisos, pero NO vía el rol protegido.**
+  `test_support::seed_session` otorga al usuario de prueba un rol propio (`probe_all`) con los 23
+  códigos, por el mismo camino real de grant que usa el bootstrap (`roles.grant`, `granted_by` = el
+  propio usuario, idempotente). Desviación del brief registrado con motivo: la letra decía «sostiene
+  el rol `admin` protegido», pero sembrar un SEGUNDO holder protegido choca de frente con los
+  fixtures de las pantallas de identidad — `identity_web`/`identity_api` bootstrapean al único
+  administrador protegido ellos mismos (bootstrap_admin ve 1 holder y NO crea al admin → los logins
+  contestan 401: 8 tests en rojo), y los fixtures de `users_web`/`roles_web` documentan a propósito
+  que el administrador de bootstrap quede como ÚNICO holder protegido para que la aritmética de AC14
+  sea observable. Medición con mutaciones del fixture, ambas variantes:
+  - grant del rol protegido `admin` → 28 fallas: identity_api (2), identity_web (6), roles_web (5),
+    users_web (8), authz (7→0 tras apuntarlos al seed sin roles).
+  - rol propio con 23 códigos (implementado) → 11 fallas: SOLO users_web (6) y roles_web (5), todas
+    por la misma premisa de fixture (el usuario compartido deja de estar sin permisos).
+  El usuario aprobó la variante implementada (Opción 1) y su argumento: sembrar el rol protegido
+  en el usuario de test cambia la semántica que los tests de identidad están verificando; un rol
+  propio con los 23 códigos por el mismo grant no la toca y deja al bootstrap como único titular
+  protegido.
+- **Corrección de fixtures autorizada (wiring ONLY):** `test_pool()` de `users_web.rs` y
+  `roles_web.rs` pasó a `seed_session_without_roles` — sin tocar ninguna aserción, status esperado
+  ni chequeo de cuerpo, sin renombrar ningún test. Es exactamente la premisa que esas pantallas
+  venían usando desde S3/S4; los caminos felices siguen otorgando sus conjuntos por
+  `app_with_permissions`.
+- **Nuevos helpers** en `test_support`: `seed_session_without_roles` (el fixture sin permisos que el
+  núcleo y las pantallas de identidad necesitan), `seed_session_with_permissions(pool, codes)` (un
+  principal adicional con un conjunto EXACTO de permisos, usernames/roles únicos por llamada) y
+  `cookie_for(token)`. El test de plumbing del helper extiende sus aserciones: el principal compartido
+  resuelve 23 códigos por la resolución efectiva real del middleware.
+- **`authz.rs`: 3 fixtures del núcleo apuntados a `seed_session_without_roles`** (cambio de call-site,
+  no de aserciones): `guarded_app` (los tests de AC10/AC11 ejercitan exactamente QUÉ roles sostiene el
+  principal), `a_missing_principal_fails_closed` y el test del repositorio de roles (cuenta cero
+  holders de `admin`).
+- **Las 46 rutas de ambos departamentos anotadas** (10 finance API + 9 finance web + 17 inventory
+  API + 17 inventory web; tabla completa y decisiones en `tasks.md`, sección S5). Sin guard
+  router-level en ningún módulo (mezclan capacidades); el drawer de producto usa DOS extractores
+  (`inventory.read` + `purchases.costs.read`) porque renderiza datos de dos dueños.
+- **16 tests nuevos** de enforcement (AC10 sobre los handlers reales): lecturas permitidas con
+  rechazos por código en las tres formas (JSON para `/api/*`, JSON para HTMX vía el notice, HTML de
+  página completa), escritura-cero tras rechazo (un movimiento de stock y una transacción), el
+  gate de lectura del drawer por `purchases.costs.read`, holder-con-permiso con estado normal, y
+  el orden de los portones (anónimo → 401 JSON / 303 a `/login`, nunca el 403 de permisos).
+- **Evidencia de mutación** (los tests muerden): quitar `Require<InventoryWrite>` de
+  `web_create_product` rompe su test de rechazo HTMX; quitar `Require<FinanceWrite>` de
+  `create_transaction` rompe el test de rechazo JSON. Restaurados, ambos vuelven a verde.
+- Números finales tras la corrección autorizada: `cargo test` 544 → **560 passed / 0 failed**
+  (+16 enforcement tests; los 11 fixtures volvieron a verde con wiring only); `cargo check
+  --all-targets` 0 errores, **56 warnings — [corregido en la ronda de verificación: el "58 contra
+  58" que se anotó acá era un artefacto del método: contaba las dos líneas de resumen
+  (`generated N warnings` por target); el conteo real, líneas de lint menos resúmenes, es 56 en la
+  rama y en `main`, y el 56 del brief estaba bien]**; grep de allows vacío;
+  `scripts/e2e.sh -k identity` 4 passed; **`-k filters` 7 passed y `-k products` 13 passed /
+  1 skipped** (el skip es el probe de screenshots opt-in, no un fallo): el enforcement quedó
+  delante de esas pantallas y el harness (login del admin de bootstrap) no necesitó debilitar nada.
+- **Sonda en vivo con el binario real** (base descartable, `ROYA_ADMIN_PASSWORD` seteada):
+  login del administrador 303; `GET /` 200; `GET /products` 200; `GET /web/accounts` 200;
+  `POST /web/accounts` 303 (mutación OK); `POST /api/transactions` 201. Caso negativo end-to-end:
+  usuario `probe` creado por pantalla + rol `vendedor` asignado + cambio de contraseña (sale del
+  confinamiento) → `GET /products` 200 (sostiene `inventory.read`), `POST /web/accounts` **403 HTML**
+  («Acción no permitida» / «finance.methods.manage»), `POST /api/products` **403 JSON**
+  («Se necesita el permiso «inventory.write»…»), `POST /web/products` con HTMX 403,
+  `PUT /api/accounts/1/payment-methods` 403, `GET /api/accounts` 403; el admin sigue 200.
+  Basura de la sonda eliminada (scratch de /tmp).
+- Sidebar sin tocar (S7), `e2e/` sin tocar, rutas de ventas/clientes/compras/proveedores sin tocar.
+
 ### S2 — núcleo RBAC (T9–T12)
 - Migración `create_identity_rbac`: 23 permisos con inserts guardados, `admin` protegido con el catálogo
   completo, y las matrices de `vendedor`/`cajero`/`deposito` exactas al spec. Corrección clave sobre la
@@ -630,3 +699,81 @@ resueltos así (sin commits: el orquestador maneja el git):
   (1..28 + 29): ambos extremos idénticos (23 filas, descripciones corregidas); drift probado fallando
   con una descripción cambiada de un solo lado (falla nombrando el código y las dos cadenas) y
   restaurado en verde; `scripts/e2e.sh -k identity` 4 passed.
+
+## DÓNDE SE FRENA EL FEATURE (post-S5, 2026-09-19) y cómo se retoma
+El orquestador frena el feature después de esta slice. Estado al frenar:
+
+**Entregado (Fase A):** S1a (núcleo del kernel), S1b (portón + login/logout + plumbing de test),
+S2 (núcleo RBAC: catálogo, guardas, `Require<P>`, resolución efectiva por middleware, drift test),
+S3-i (cambio de contraseña obligatorio), S3-ii (administración de usuarios + ronda de corrección),
+S4 (administración de roles + matriz + ronda de corrección), **S5 (enforcement de finanzas e
+inventario — esta slice; ocultamiento del nav deferido a S7 por diseño del brief)**.
+
+**Falta (en orden, un PR por slice):**
+1. **S6 — enforcement de ventas y clientes** (T20–T21): `Require<P>` por acción; el nav gating
+   sigue siendo de S7; tests de AC10/AC21 sobre los handlers reales.
+2. **S7 — enforcement de compras, proveedores, identidad y dashboard** (T22–T23): la ÚLTIMA slice
+   de enforcement; incluye el ocultamiento del sidebar por permiso (AC21 — exige enchufar el
+   `Principal` en cada struct de página, la razón por la que S5/S6 no tocaron el nav) y el
+   re-measure del ledger (`cargo check --all-targets` de vuelta a ≤ 56 sin `#[allow]` como
+   mecanismo).
+3. **S8 — cierre de Fase A** (T24–T25): la slice de navegador para AC22 y las dos deudas de
+   navegador arrastradas desde S1b/S3 — la expiración de sesión con `HX-Redirect` en pleno HTMX y
+   el formulario HTMX rechazado por permisos, sin probarse todavía en un navegador real — más
+   README (sección no-auth, tabla de módulos, migraciones, variables), `env.example`, el promote
+   de `openspec/specs/identity/spec.md` y el archivado del change folder.
+4. **Fase B — auditoría del actor por departamento** (T26–T31): `created_by`/`updated_by` y su
+   visualización, departamento por departamento, cerrando con la sección de auditoría de la spec.
+
+**Pendientes concretos de humano al frenar:**
+- La rama remota `feat/roles-administration` sigue en `origin` aunque su PR #48 ya está mergeado
+  en `origin/main` (verificado con `git branch -a` el 2026-09-19). Decisión registrada: queda SIN
+  borrar; borrarla es decisión del dueño, no tiene nada sin mergear.
+- Esta slice NO tiene commit de unidad de trabajo todavía: el writer no commitea; el orquestador
+  maneja el git — commitear `feat/enforcement-finance-inventory` como una unidad antes de
+  retargetear cualquier PR.
+- Al reanudar: `mem_context` + `mem_search` por proyecto/feature, releer
+  `odd/tasks/identity-rbac.md` y el change folder; la próxima tarea sin terminar es S6 (T20).
+
+### S5 — ronda de corrección (verificación independiente: COMMIT WITH NOTED RISK, 2026-09-19)
+Un MAJOR de cobertura y dos NITs. Texto + tests; ninguna anotación cambió de valor.
+
+1. **MAJOR (cobertura): dos gates sin test que las muerda.** Quitar `Require<InventoryWrite>` de
+   `web_edit_product` y `Require<DashboardRead>` del dashboard dejaba la suite ENTERA verde — los
+   tests de la primera ronda sólo llegaban a `/web/products` POST, `/web/stock-movements` y
+   `/web/product-costs`. Cerrado con tests de rechazo por permiso para cada handler que la primera
+   ronda no pinneó, cada uno en la forma que su caller lee. Ninguna anotación necesitó corrección:
+   edit/ciclo de vida/baja/categoría son mutaciones de producto (`inventory.write`) y el dashboard
+   lee `dashboard.read`. Tests nuevos (6): `the_product_edit_gate_...`, `the_product_activate_gate_...`,
+   `the_product_deactivate_gate_...` (además prueba que `is_active` no se voltea),
+   `the_product_delete_gate_..._writes_nothing` (forma de página completa + conteo de filas),
+   `the_category_gate_...` (conteo de filas) y `the_dashboard_gate_refuses_a_principal_without_it
+   _and_opens_with_it` (probe con sólo `inventory.read` → 403 HTML nombrando la gate; probe con
+   `dashboard.read` → 200).
+   **Tabla de mutaciones de la ronda** (cada gate quitado, su test observado FALLANDO, restaurado;
+   el diff final de la ronda es tests-only):
+   | # | Anotación quitada | Test que falló | Falla observada |
+   | --- | --- | --- | --- |
+   | M1 | `web_edit_product`: `Require<InventoryWrite>` | `the_product_edit_gate_...` | 200 con fragmento de lista (el edit corrió) en vez de 403 |
+   | M2 | `web_activate_product`: `Require<InventoryWrite>` | `the_product_activate_gate_...` | 200 en vez de 403 |
+   | M3 | `web_deactivate_product`: `Require<InventoryWrite>` | `the_product_deactivate_gate_...` | 200 en vez de 403 |
+   | M4 | `web_delete_product`: `Require<InventoryWrite>` | `the_product_delete_gate_..._writes_nothing` | **303** (la baja corrió de verdad y redirigió) en vez de 403 |
+   | M5 | `web_create_category`: `Require<InventoryWrite>` | `the_category_gate_...` | 200 en vez de 403 |
+   | M6 | `web_create_movement`: `Require<InventoryStockWrite>` | `ac10_an_inventory_read_only_principal_is_refused_the_htmx_mutations` (primera ronda) | **404 «product 1 not found»** — el handler corrió en vez del gate |
+   | M7 | `dashboard`: `Require<DashboardRead>` | `the_dashboard_gate_refuses_a_principal_without_it_and_opens_with_it` | 200 en vez de 403 |
+   Ningún test dejó de morder.
+2. **NIT (conteo del ledger): el método de la primera pasada contaba las dos líneas de resumen
+   (`generated N warnings` por target), reportando 58.** El conteo real — líneas de lint `warning:`
+   menos resúmenes — es **56 en la rama y en `main`**: el brief y la nota de S4 estaban bien todo el
+   tiempo. La sección del ledger en `tasks.md` quedó reescrita con el método y el número corregidos,
+   y todos los objetivos «≤ 58» pasaron a «≤ 56». Delta de la ronda: 0.
+3. **NIT (sobre-gating documentado a medias): un principal con SÓLO `finance.methods.manage` es
+   rechazado de `GET /api/payment-methods`** — el catálogo de los medios que administra. Quedó
+   escrito en las decisiones de mapeo como consecuencia conocida fail-closed: hoy ninguna matriz
+   sembrada separa los códigos, y si una matriz futura los separa, la forma correcta es un OR de
+   los dos códigos en esa única lectura, no un tipo nuevo del kernel.
+
+Números de la ronda: `cargo test` 560 → **566 passed / 0 failed** (+6, todos mutation-visibles);
+`cargo check --all-targets` 0 errores, **56 warnings** (método corregido: sin líneas de resumen);
+grep de allows vacío; `scripts/e2e.sh -k identity` 4 passed, `-k products` 13 passed / 1 skipped
+(probe opt-in). `git diff --stat` de la ronda: 2 archivos, +238 (sólo tests).
