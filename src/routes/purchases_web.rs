@@ -88,6 +88,10 @@ struct PurchasePageTemplate {
     oob_picker: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    /// Audit display names for the record body the page includes: resolved in
+    /// the wiring layer (AC20).
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -109,6 +113,10 @@ struct PurchaseDetailPartial {
     oob_picker: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    /// The purchase's creator and its last editor, as display names the
+    /// wiring layer resolved (never the ids).
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
 }
 
 #[derive(Template)]
@@ -221,16 +229,29 @@ struct PurchaseRecordContext {
     record: PurchaseRecord,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    /// Audit display names: the purchase's creator and its last editor (a
+    /// header edit, a line change, the confirm or the cancel), resolved here
+    /// in the wiring layer (AC20: the service never reads identity).
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
 }
 
 async fn record_context(state: &AppState, purchase_id: i64) -> AppResult<PurchaseRecordContext> {
     let record = state.purchases_service.get_record(purchase_id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut actor_ids = vec![record.purchase.created_by];
+    actor_ids.extend(record.purchase.updated_by);
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let name_for = |id: i64| names.get(&id).cloned();
+    let created_by_name = name_for(record.purchase.created_by);
+    let updated_by_name = record.purchase.updated_by.and_then(name_for);
     Ok(PurchaseRecordContext {
         record,
         method_options,
         today,
+        created_by_name,
+        updated_by_name,
     })
 }
 
@@ -240,6 +261,8 @@ fn render_record(context: PurchaseRecordContext, oob_picker: bool) -> AppResult<
         oob_picker,
         method_options: context.method_options,
         today: context.today,
+        created_by_name: context.created_by_name,
+        updated_by_name: context.updated_by_name,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -416,6 +439,8 @@ async fn purchase_record_page(
         oob_picker: false,
         method_options: context.method_options,
         today: context.today,
+        created_by_name: context.created_by_name,
+        updated_by_name: context.updated_by_name,
         nav_key: "purchases",
         nav: Nav::for_principal(&principal),
     };
@@ -568,12 +593,13 @@ fn parse_payment_type(raw: &str) -> AppResult<PaymentType> {
 async fn web_create_purchase(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreatePurchaseForm>,
 ) -> AppResult<Response> {
     let purchase = state
         .purchases_service
-        .create_draft(NewPurchase {
+        .create_draft(principal.user_id, NewPurchase {
             supplier_id: form.supplier_id,
             payment_type: parse_payment_type(&form.payment_type)?,
             purchase_date: parse_date_or_today(&form.purchase_date)?,
@@ -598,15 +624,17 @@ async fn web_create_purchase(
 async fn web_add_line(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
 ) -> AppResult<Response> {
-    web_add_line_impl(state, headers, id, form).await
+    web_add_line_impl(state, principal.user_id, headers, id, form).await
 }
 
 async fn web_add_line_impl(
     state: AppState,
+    actor: i64,
     headers: HeaderMap,
     id: i64,
     form: AddLineForm,
@@ -625,7 +653,7 @@ async fn web_add_line_impl(
     };
     state
         .purchases_service
-        .add_line(id, product_id, qty, unit_cost)
+        .add_line(actor, id, product_id, qty, unit_cost)
         .await?;
     if is_htmx(&headers) {
         return changed_with_picker(&state, id, true).await;
@@ -638,15 +666,17 @@ async fn web_add_line_impl(
 async fn web_add_line_collection(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<AddLineForm>,
 ) -> AppResult<Response> {
-    web_add_line_impl(state, headers, form.purchase_id, form).await
+    web_add_line_impl(state, principal.user_id, headers, form.purchase_id, form).await
 }
 
 async fn web_update_line(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Path((purchase_id, line_id)): Path<(i64, i64)>,
     Form(form): Form<UpdateLineForm>,
@@ -655,7 +685,7 @@ async fn web_update_line(
     let unit_cost = parse_required_decimal(&form.unit_cost, "unit_cost")?;
     state
         .purchases_service
-        .update_line(line_id, qty, unit_cost)
+        .update_line(principal.user_id, line_id, qty, unit_cost)
         .await?;
     if is_htmx(&headers) {
         return changed(&state, purchase_id).await;
@@ -666,9 +696,10 @@ async fn web_update_line(
 async fn web_remove_line(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path((purchase_id, line_id)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
-    state.purchases_service.remove_line(line_id).await?;
+    state.purchases_service.remove_line(principal.user_id, line_id).await?;
     changed(&state, purchase_id).await
 }
 
@@ -791,6 +822,7 @@ async fn web_cancel_purchase_collection(
 async fn web_update_purchase_header(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<UpdatePurchaseHeaderForm>,
@@ -800,6 +832,7 @@ async fn web_update_purchase_header(
     state
         .purchases_service
         .update_draft(
+            principal.user_id,
             id,
             crate::models::UpdatePurchaseDraft {
                 purchase_date,
@@ -825,6 +858,7 @@ async fn web_update_purchase_header(
 async fn web_seed_from_suggestion(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<SeedSuggestionForm>,
 ) -> AppResult<Response> {
@@ -846,7 +880,7 @@ async fn web_seed_from_suggestion(
     }
     let purchase = state
         .purchases_service
-        .create_draft(NewPurchase {
+        .create_draft(principal.user_id, NewPurchase {
             supplier_id: item.supplier_id,
             payment_type: parse_payment_type(&form.payment_type)?,
             purchase_date: parse_date_or_today(&form.purchase_date)?,
@@ -858,6 +892,7 @@ async fn web_seed_from_suggestion(
     state
         .purchases_service
         .add_line(
+            principal.user_id,
             purchase.id,
             item.product.id,
             item.suggested_qty,
@@ -1159,7 +1194,7 @@ mod tests {
             .unwrap();
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Record Supplier".into(),
                 phone: None,
                 notes: None,
@@ -1168,7 +1203,7 @@ mod tests {
             .unwrap();
         let purchase = state
             .purchases_service
-            .create_draft(NewPurchase {
+            .create_draft(audit_actor(&state).await, NewPurchase {
                 supplier_id: supplier.id,
                 payment_type,
                 purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
@@ -1183,7 +1218,7 @@ mod tests {
             .unwrap();
         let line = state
             .purchases_service
-            .add_line(purchase.id, product.id, Decimal::from(2), None)
+            .add_line(audit_actor(&state).await, purchase.id, product.id, Decimal::from(2), None)
             .await
             .unwrap();
         let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
@@ -1391,7 +1426,7 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(crate::models::NewSupplier {
+            .create_supplier(audit_actor(&state).await, crate::models::NewSupplier {
                 name: "Redirect Sup".into(),
                 phone: None,
                 notes: None,
@@ -1425,7 +1460,7 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(crate::models::NewSupplier {
+            .create_supplier(audit_actor(&state).await, crate::models::NewSupplier {
                 name: "Plain Sup".into(),
                 phone: None,
                 notes: None,

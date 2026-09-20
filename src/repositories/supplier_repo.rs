@@ -12,6 +12,8 @@ fn row_to_supplier(row: sqlx::sqlite::SqliteRow) -> Supplier {
         phone: row.get("phone"),
         notes: row.get("notes"),
         is_active: active == 1,
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -30,13 +32,18 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 
 #[async_trait]
 pub trait SupplierRepository: Send + Sync {
-    async fn create(&self, input: &NewSupplier) -> AppResult<Supplier>;
+    /// `actor` is the acting user's id the service resolved from its request;
+    /// it becomes the row's `created_by` and nothing the request itself can
+    /// supply names it.
+    async fn create(&self, actor: i64, input: &NewSupplier) -> AppResult<Supplier>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Supplier>>;
     async fn find_by_name(&self, name: &str) -> AppResult<Option<Supplier>>;
     async fn list(&self) -> AppResult<Vec<Supplier>>;
-    /// Update name/phone/notes (service guarantees cleaned values).
-    async fn update(&self, id: i64, patch: &UpdateSupplier) -> AppResult<Supplier>;
-    async fn set_active(&self, id: i64, active: bool) -> AppResult<Supplier>;
+    /// Update name/phone/notes (service guarantees cleaned values); the edit
+    /// stamps `updated_by` with the acting user.
+    async fn update(&self, id: i64, actor: i64, patch: &UpdateSupplier) -> AppResult<Supplier>;
+    /// The activate/deactivate toggle is an edit: `updated_by` carries it.
+    async fn set_active(&self, id: i64, actor: i64, active: bool) -> AppResult<Supplier>;
     /// DELETE is RESTRICTed by cost rows (and, later, purchases).
     async fn delete(&self, id: i64) -> AppResult<bool>;
     async fn exists(&self, id: i64) -> AppResult<bool>;
@@ -55,15 +62,16 @@ impl SqliteSupplierRepository {
 
 #[async_trait]
 impl SupplierRepository for SqliteSupplierRepository {
-    async fn create(&self, input: &NewSupplier) -> AppResult<Supplier> {
+    async fn create(&self, actor: i64, input: &NewSupplier) -> AppResult<Supplier> {
         let row = sqlx::query(
-            r#"INSERT INTO suppliers (name, phone, notes)
-               VALUES (?, ?, ?)
-               RETURNING id, name, phone, notes, is_active, created_at, updated_at"#,
+            r#"INSERT INTO suppliers (name, phone, notes, created_by)
+               VALUES (?, ?, ?, ?)
+               RETURNING id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.name)
         .bind(input.phone.clone())
         .bind(input.notes.clone())
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -72,7 +80,7 @@ impl SupplierRepository for SqliteSupplierRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Supplier>> {
         let row = sqlx::query(
-            r#"SELECT id, name, phone, notes, is_active, created_at, updated_at
+            r#"SELECT id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at
                FROM suppliers WHERE id = ?"#,
         )
         .bind(id)
@@ -83,7 +91,7 @@ impl SupplierRepository for SqliteSupplierRepository {
 
     async fn find_by_name(&self, name: &str) -> AppResult<Option<Supplier>> {
         let row = sqlx::query(
-            r#"SELECT id, name, phone, notes, is_active, created_at, updated_at
+            r#"SELECT id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at
                FROM suppliers WHERE name = ?"#,
         )
         .bind(name)
@@ -94,7 +102,7 @@ impl SupplierRepository for SqliteSupplierRepository {
 
     async fn list(&self) -> AppResult<Vec<Supplier>> {
         let rows = sqlx::query(
-            r#"SELECT id, name, phone, notes, is_active, created_at, updated_at
+            r#"SELECT id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at
                FROM suppliers ORDER BY id"#,
         )
         .fetch_all(&self.pool)
@@ -102,7 +110,7 @@ impl SupplierRepository for SqliteSupplierRepository {
         Ok(rows.into_iter().map(row_to_supplier).collect())
     }
 
-    async fn update(&self, id: i64, patch: &UpdateSupplier) -> AppResult<Supplier> {
+    async fn update(&self, id: i64, actor: i64, patch: &UpdateSupplier) -> AppResult<Supplier> {
         let existing = self
             .find_by_id(id)
             .await?
@@ -121,13 +129,15 @@ impl SupplierRepository for SqliteSupplierRepository {
         let row = sqlx::query(
             r#"UPDATE suppliers
                SET name = ?, phone = ?, notes = ?,
+                   updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
-               RETURNING id, name, phone, notes, is_active, created_at, updated_at"#,
+               RETURNING id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(name)
         .bind(phone)
         .bind(notes)
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -135,15 +145,17 @@ impl SupplierRepository for SqliteSupplierRepository {
         Ok(row_to_supplier(row))
     }
 
-    async fn set_active(&self, id: i64, active: bool) -> AppResult<Supplier> {
+    async fn set_active(&self, id: i64, actor: i64, active: bool) -> AppResult<Supplier> {
         let row = sqlx::query(
             r#"UPDATE suppliers
                SET is_active = ?,
+                   updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
-               RETURNING id, name, phone, notes, is_active, created_at, updated_at"#,
+               RETURNING id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(if active { 1i64 } else { 0i64 })
+        .bind(actor)
         .bind(id)
         .fetch_optional(&self.pool)
         .await

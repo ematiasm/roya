@@ -10,6 +10,11 @@
     {% if let Some(notes) = supplier.notes %}
     <div class="text-[13px] text-muted">{{ notes }}</div>
     {% endif %}
+    {# Audit attribution (slice S12): the SUPPLIER row's creator and last
+       editor, rendered as display names the wiring layer resolved. Labelled
+       for what it is — the supplier record's attribution, not the balance or
+       the purchases below — so neither can be misread as this person's work. #}
+    <div class="text-[13px] text-muted" data-supplier-actor>Proveedor registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
 
     <div class="my-2 text-2xl font-bold">{{ balance }} <span class="text-[13px] text-muted">outstanding across Confirmed purchases</span></div>
 

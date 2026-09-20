@@ -83,6 +83,13 @@ struct SupplierDetailPartial {
     products: Vec<Product>,
     method_options: Vec<PaymentMethodWithAccount>,
     today: String,
+    /// Audit display names: the SUPPLIER row's creator and its last editor
+    /// (an edit or the activate/deactivate toggle), resolved here in the
+    /// wiring layer (AC20: the service never reads identity). The label in
+    /// the fragment says what it attributes so the balance and the purchases
+    /// below cannot be misread as this person's work.
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
 }
 
 /// Prefilled edit form for the row-level ✎ button: the list rows carry only
@@ -254,6 +261,12 @@ async fn supplier_detail_html(state: &AppState, id: i64) -> AppResult<Html<Strin
     let products = state.inventory_service.products.list().await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut actor_ids = vec![supplier.created_by];
+    actor_ids.extend(supplier.updated_by);
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let name_for = |id: i64| names.get(&id).cloned();
+    let created_by_name = name_for(supplier.created_by);
+    let updated_by_name = supplier.updated_by.and_then(name_for);
     let html = SupplierDetailPartial {
         supplier,
         balance,
@@ -261,6 +274,8 @@ async fn supplier_detail_html(state: &AppState, id: i64) -> AppResult<Html<Strin
         products,
         method_options,
         today,
+        created_by_name,
+        updated_by_name,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -329,12 +344,13 @@ pub struct PaySupplierForm {
 async fn web_create_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<SupplierForm>,
 ) -> AppResult<Response> {
     state
         .supplier_service
-        .create_supplier(NewSupplier {
+        .create_supplier(principal.user_id, NewSupplier {
             name: form.name,
             phone: clean_opt(&form.phone),
             notes: clean_opt(&form.notes),
@@ -349,12 +365,14 @@ async fn web_create_supplier(
 async fn web_update_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<EditSupplierForm>,
 ) -> AppResult<Response> {
     state
         .supplier_service
         .update_supplier(
+            principal.user_id,
             form.id,
             UpdateSupplier {
                 name: Some(form.name),
@@ -372,18 +390,20 @@ async fn web_update_supplier(
 async fn web_activate_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    state.supplier_service.set_active(id, true).await?;
+    state.supplier_service.set_active(principal.user_id, id, true).await?;
     list_response(&state, "supplier-changed").await
 }
 
 async fn web_deactivate_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    state.supplier_service.set_active(id, false).await?;
+    state.supplier_service.set_active(principal.user_id, id, false).await?;
     list_response(&state, "supplier-changed").await
 }
 
@@ -399,6 +419,7 @@ async fn web_delete_supplier(
 async fn web_record_cost(
     State(state): State<AppState>,
     _: Require<PurchasesCostsWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<RecordCostForm>,
 ) -> AppResult<Response> {
@@ -406,7 +427,7 @@ async fn web_record_cost(
     let date = parse_date_or_today(&form.date)?;
     state
         .supplier_service
-        .record_cost(form.product_id, form.supplier_id, cost, date)
+        .record_cost(principal.user_id, form.product_id, form.supplier_id, cost, date)
         .await?;
     if is_htmx(&headers) {
         // Drawer submissions target `#supplier-drawer-body`: answer the fresh
@@ -649,7 +670,7 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Web Detail Supplier".into(),
                 phone: Some("555-0100".into()),
                 notes: Some("drawer notes".into()),
@@ -658,7 +679,7 @@ mod tests {
             .unwrap();
         let other = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Unrelated Supplier".into(),
                 phone: None,
                 notes: None,
@@ -689,7 +710,7 @@ mod tests {
         // must not move the balance.
         let confirmed = state
             .purchases_service
-            .create_draft(NewPurchase {
+            .create_draft(audit_actor(&state).await, NewPurchase {
                 supplier_id: supplier.id,
                 payment_type: PaymentType::Credit,
                 purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
@@ -701,7 +722,7 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .add_line(confirmed.id, product.id, Decimal::from(2), Some(Decimal::from(10)))
+            .add_line(audit_actor(&state).await, confirmed.id, product.id, Decimal::from(2), Some(Decimal::from(10)))
             .await
             .unwrap();
         state
@@ -711,7 +732,7 @@ mod tests {
             .unwrap();
         let draft = state
             .purchases_service
-            .create_draft(NewPurchase {
+            .create_draft(audit_actor(&state).await, NewPurchase {
                 supplier_id: supplier.id,
                 payment_type: PaymentType::Credit,
                 purchase_date: NaiveDate::from_ymd_opt(2024, 5, 3).unwrap(),
@@ -723,13 +744,13 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .add_line(draft.id, product.id, Decimal::from(5), Some(Decimal::from(10)))
+            .add_line(audit_actor(&state).await, draft.id, product.id, Decimal::from(5), Some(Decimal::from(10)))
             .await
             .unwrap();
         // Another supplier's purchase must not leak into this detail.
         let foreign = state
             .purchases_service
-            .create_draft(NewPurchase {
+            .create_draft(audit_actor(&state).await, NewPurchase {
                 supplier_id: other.id,
                 payment_type: PaymentType::Credit,
                 purchase_date: NaiveDate::from_ymd_opt(2024, 5, 4).unwrap(),
@@ -741,7 +762,7 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .add_line(foreign.id, product.id, Decimal::from(1), Some(Decimal::from(7)))
+            .add_line(audit_actor(&state).await, foreign.id, product.id, Decimal::from(1), Some(Decimal::from(7)))
             .await
             .unwrap();
         state
@@ -788,7 +809,7 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Web Edit Supplier".into(),
                 phone: Some("555-0100".into()),
                 notes: Some("edit notes".into()),
@@ -843,7 +864,7 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Web Cost Supplier".into(),
                 phone: None,
                 notes: None,
@@ -999,7 +1020,7 @@ mod tests {
 
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Web Pay Supplier".into(),
                 phone: None,
                 notes: None,
@@ -1029,7 +1050,7 @@ mod tests {
         // One Confirmed Credit purchase: 3 × 25 = 75 due.
         let purchase = state
             .purchases_service
-            .create_draft(NewPurchase {
+            .create_draft(audit_actor(&state).await, NewPurchase {
                 supplier_id: supplier.id,
                 payment_type: PaymentType::Credit,
                 purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
@@ -1041,7 +1062,7 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .add_line(
+            .add_line(audit_actor(&state).await, 
                 purchase.id,
                 product.id,
                 Decimal::from(3),
@@ -1493,7 +1514,7 @@ mod tests {
             .unwrap();
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Holder Supplier".into(),
                 phone: None,
                 notes: None,
@@ -1523,7 +1544,7 @@ mod tests {
         // One Confirmed credit purchase: 3 × 25 = 75 due.
         let purchase = state
             .purchases_service
-            .create_draft(NewPurchase {
+            .create_draft(audit_actor(&state).await, NewPurchase {
                 supplier_id: supplier.id,
                 payment_type: crate::models::PaymentType::Credit,
                 purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
@@ -1535,7 +1556,7 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .add_line(purchase.id, product.id, Decimal::from(3), Some(Decimal::from(25)))
+            .add_line(audit_actor(&state).await, purchase.id, product.id, Decimal::from(3), Some(Decimal::from(25)))
             .await
             .unwrap();
         state.purchases_service.confirm(audit_actor(&state).await, purchase.id, None).await.unwrap();
@@ -1636,7 +1657,7 @@ mod tests {
         // Delete a supplier with no rows: its normal list answer.
         let empty = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor(&state).await, NewSupplier {
                 name: "Empty Supplier".into(),
                 phone: None,
                 notes: None,
