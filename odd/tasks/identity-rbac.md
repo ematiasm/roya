@@ -102,6 +102,9 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
         (2026-09-20, ver S10 en Progreso; el gemelo de flujo de venta/compra entró en este slice
         porque `created_by NOT NULL` en `stock_movements` es la plomería inter-departamentos de
         sus movimientos)
+  - [x] T28 (S11) — ventas/clientes: migración 32 + plomería del actor + display + tests AC18–AC19
+        (2026-09-20, ver S11 en Progreso; la tabla `customers`, que la lista original nunca asignó,
+        aterrizó aquí con el departamento que la posee, y `sale_lines` hereda el actor de su venta)
 
 ## Progress
 - 2026-09-18: reconocimiento del repo (sin auth, convención de departamentos, invariantes),
@@ -1274,4 +1277,89 @@ movimiento registrado por el formulario del drawer → detalle renderizando "Reg
 `stock_movements.created_by = admin` (no el centinela); gemelo de flujo de venta: confirmación de
 venta Cash como admin → los dos movimientos reason=Sale llevan `created_by = admin`; base de la
 sonda termina con `PRAGMA foreign_key_check` vacío.
+
+## Progreso S11 (T28, tercer slice de Fase B) — 2026-09-20
+
+Rama `feat/audit-sales-customers`, creada desde `main` con S9 y S10 entregados. Writer delegado;
+el patrón de S9/S10 se copió sin inventar un tercer patrón. Decisión de alcance: la lista original
+de tareas nunca asignó `customers` a un slice, así que la tabla aterrizó aquí con el departamento
+que la posee (la venta ya la referenciaba obligatoriamente desde K2); la lista de la Fase B lo
+dice ahora.
+
+**Entregado:** `migrations/20240101000032_add_audit_sales_customers.sql` — rebuild controlado
+(marcador `-- no-transaction`, `PRAGMA foreign_keys = OFF/ON`, centinela condicional, backfill por
+`INSERT ... SELECT`) de `sales`, `sale_payments`, `customer_receipts` y `customers` con
+`created_by NOT NULL` + `updated_by NULL`, ambas FK RESTRICT a `users`. `sale_lines` no lleva
+columnas: hereda el actor de su venta, como las filas de unión del plan, y la migración lo dice en
+su comentario. La definición VIVA de cada tabla es la que produjo la cadena: `sales` es la de la
+migración 21 (customer_id obligatorio), `sale_payments` lleva el `method_id` de la 12, los links
+de transacción de la 19 y el receipt_id de la 23, y `customers` conserva sus CHECKs, el índice
+parcial único del walk-in y los TRES triggers del walk-in — que mueren con el DROP y se recrean
+declaration-for-declaration. Particularidad aprendida en esta migración: los triggers de la
+migración 23 sobre `sale_payments` referencian `sales` y `customer_receipts` por nombre, y SQLite
+valida todo el schema en cada ALTER TABLE RENAME, así que se dropean al inicio y se recrean AL
+FINAL (después de que ambas tablas reconstruidas llevan su nombre final). El centinela: la
+migración REUTILIZA el de la 30 (en toda base construida por la cadena existe, porque la 12 siembra
+los métodos y la 30 siempre encuentra filas que atribuir); el INSERT guardado es DEFENSIVO, y el
+comentario del archivo dice cuál de los dos caminos hace. Ambos caminos testeados.
+
+**Plomería:** el actor viaja explícito como argumento ruta (`Principal.user_id`) → servicio →
+repositorio: crear/editar cliente, activar/desactivar (es una edición: `updated_by` lo lleva),
+crear borrador, editar header, confirmar, cancelar (ambos setean `updated_by` de la venta), todo
+pago (el row lleva el actor del request que lo registró: el pago cash del confirm, el pago suelto,
+y CADA pago agrupado de una cobranza) y el recibo de cobranza (el actor de la request de cobro).
+Los flujos de venta/cobranza ya threadaban el actor para finanzas e inventario (S9/S10); aquí se
+EXTENDIÓ el mismo argumento, no hay segundo camino. Los repos de ventas/clientes siguen sin leer
+tablas de identidad (AC20); los nombres de display se resuelven en la capa de wiring
+(`routes/mod.rs::audit_actor_names`).
+
+**Display:** el detalle de venta (`partials/sale_detail.html`) muestra "Registrado por" /
+"Actualizado por" (la creación, y la última edición: un edit de encabezado, el confirm o el
+cancel); el estado de cuenta del cliente muestra "Cliente registrado por" / "Actualizado por" —
+etiquetado para lo que es (la atribución de la FILA del cliente, no del estado de cuenta), la
+misma corrección de lectura que S10 hizo en el fragmento de stock. Español en la copia, clases
+Tailwind ya existentes. Nunca un id crudo.
+
+**Tests nuevos (7):** `ac18_the_sale_records_two_different_actors_and_its_payment_the_flows_actor`
+(venta real: Alice crea, Bob edita/confirmA, Alice paga y cancela — el pago lleva el actor de su
+request y el refund link reatribuye `updated_by`),
+`ac18_a_customer_records_two_different_actors` (crear/renombrar/activar/desactivar),
+`ac18_the_collection_flow_receipt_and_its_payments_carry_the_flows_actor` (el gemelo S9/S10: el
+recibo y CADA pago agrupado llevan el actor de la request de cobro, distinto del creador de la
+venta), `ac19_the_upgrade_attributes_every_sales_and_customer_row_to_the_system_sentinel`
+(upgrade demostrado: filas legacy en las cuatro tablas, ids preservados, cero sin atribuir,
+centinela único reutilizado, `created_by NOT NULL` en las cuatro, fk_check vacío, el trigger del
+walk-in sobrevive, y el DELETE del centinela rechazado),
+`ac19_the_sales_migration_recreates_a_missing_sentinel` (camino defensivo), y los dos displays con
+dos principales y conteos exactos: `audit_the_sale_record_shows_the_actor_display_name` y
+`audit_the_customer_statement_shows_the_actor_display_name`.
+
+**Mutaciones validadas** (cada guard roto y su test como testigo): `sales.created_by` (bind
+dropped → NOT NULL aborta el create), `sales.updated_by` en `set_confirmed` (bind dropped → el
+test espera `Some(bob)` y recibe `None`), `sale_payments.created_by` (bind dropped → FK falla),
+`set_payment_refund_transaction` `updated_by` (bind dropped), `customers.created_by` /
+`updated_by` (binds dropped), `customer_receipts.created_by` (bind dropped → FK falla), el actor
+del flujo (reemplazado por 0 → FK falla), el backfill de la migración a NULL (la migración aborta
+con NOT NULL) y los dos displays (la línea del template eliminada → conteo 0 ≠ 1).
+
+**Auditoría de preservación de constraints** (antes/después de la migración 32, comparado
+objeto por objeto en `sqlite_master` y con `PRAGMA table_info/foreign_key_list/index_list`):
+columnas (excluyendo las audit), FKs, índices, triggers y CHECKs — SAME en las cuatro tablas;
+única diferencia declarada: el orden de columnas de `sale_payments` (el `method_id` que la
+migración 12 agregó con ALTER TABLE al final vuelve a su posición natural; la app nunca usa
+INSERT posicional ni SELECT *). Cada CHECK/FK probado en runtime insertando lo que prohíbe:
+status y payment_type CHECK, customer_id FK, receipt_no UNIQUE, walk-in UNIQUE parcial, is_walkin
+CHECK, los tres triggers del walk-in, y el trigger de la migración 23 (pago bajo receipt de otro
+cliente) en INSERT y UPDATE.
+
+**Números:** baseline `cargo test` **631 passed / 0 failed**; cierre **638 passed / 0 failed**
+(631 + 7 nuevos). `cargo check --all-targets` 0 errores, ledger en **55 warnings** (57 crudas −
+2 resúmenes, igual que el cierre de S10); `grep allow(dead_code)|allow(unused_imports)` src/ →
+nada. `scripts/e2e.sh -k parties`: **9 passed / 1 skipped** (la sonda de screenshot opt-in, igual
+que el baseline); `-k identity`: **7 passed**; cero cambios en `e2e/`. Sonda en vivo con el
+binario real (DATABASE_URL propio, bootstrap del admin): cliente creado por la web, venta a
+crédito confirmada, cobro parcial por el drawer → detalle de venta renderizando "Registrado por
+Admin • Actualizado por Admin", estado de cuenta renderizando "Cliente registrado por Admin";
+`sale_payments` y `customer_receipts` con `created_by = admin`; base de la sonda termina con
+`PRAGMA foreign_key_check` vacío y exactamente un centinela.
 

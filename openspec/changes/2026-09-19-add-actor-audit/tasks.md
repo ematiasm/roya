@@ -27,8 +27,13 @@ then archives its own scope.
       for their finance rows into the inventory `record_movement` call. See the slice's section in
       `odd/tasks/identity-rbac.md` for the demonstrated upgrade sequence, the mutation table and the
       verification numbers.)
-- [ ] T28 (S11): audit for sales and customer receipts (`sales`, `sale_lines` inherits, `sale_payments`,
+- [x] T28 (S11): audit for sales and customer receipts (`sales`, `sale_lines` inherits, `sale_payments`,
       `customer_receipts`) — the sale's payment rows carry the same actor as the flow's request.
+      (2026-09-20: delivered on `feat/audit-sales-customers`; migration 32 reuses the sentinel and its
+      guarded insert is defensive only, `sale_lines` inherits the sale's actor, and the `customers`
+      table — which the original task list never assigned — lands here with the department that
+      owns it. See the slice's section in `odd/tasks/identity-rbac.md` for the demonstrated upgrade
+      sequence, the constraint-preservation audit, the mutation table and the verification numbers.)
 - [ ] T29 (S12): audit for purchases, suppliers and supplier costs (`purchases`, `purchase_lines`
       inherits, `purchase_payments`, `suppliers`, `product_supplier_costs`).
 - [ ] T30 (S13): audit for the identity tables themselves (`users`, `roles`, `permissions`) and the
