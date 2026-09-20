@@ -27,6 +27,11 @@ use crate::models::{
 };
 use crate::routes::AppState;
 
+// S6 enforcement (AC10): the entity and its derived receivable are read with
+// `customers.read`, the entity is mutated with `customers.write`, and money
+// in — the receipt collect, grouping several invoices — is `customers.collect`.
+use crate::security::authz::{CustomersCollect, CustomersRead, CustomersWrite, Require};
+
 // ---------------------------------------------------------------------------
 // Request DTOs (JSON, English names)
 // ---------------------------------------------------------------------------
@@ -155,6 +160,7 @@ async fn customer_view(state: &AppState, customer: Customer) -> AppResult<Custom
 
 async fn list_customers(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Query(query): Query<ListCustomersQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let customers = customer_views(&state, query.only_active.unwrap_or(false)).await?;
@@ -165,6 +171,7 @@ async fn list_customers(
 /// so the interface can warn without blocking (AC15).
 async fn create_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     Json(payload): Json<NewCustomer>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let created = state.customer_service.create_customer(payload).await?;
@@ -173,6 +180,7 @@ async fn create_customer(
 
 async fn get_customer(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<serde_json::Value>> {
     let customer = state.customer_service.get_customer(id).await?;
@@ -182,6 +190,7 @@ async fn get_customer(
 
 async fn update_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateCustomerRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -206,6 +215,7 @@ async fn update_customer(
 
 async fn activate_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<serde_json::Value>> {
     let customer = state.customer_service.activate_customer(id).await?;
@@ -215,6 +225,7 @@ async fn activate_customer(
 
 async fn deactivate_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<serde_json::Value>> {
     let customer = state.customer_service.deactivate_customer(id).await?;
@@ -224,6 +235,7 @@ async fn deactivate_customer(
 
 async fn delete_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     Path(id): Path<i64>,
 ) -> AppResult<StatusCode> {
     state.customer_service.delete_customer(id).await?;
@@ -232,8 +244,15 @@ async fn delete_customer(
 
 /// Statement with the ageing breakdown and the chronological ledger, composed
 /// with the customer the module owns.
+// The statement renders THAT customer's own documents (sales, payments,
+// receipts) as the receivable ledger: the module owns the customer's account
+// view, so the single gate is `customers.read`. The cost is written into the
+// S6 mapping table: a customers.read-only principal sees the sale documents of
+// that customer (number/date/total) — data the receivable is meaningless
+// without — but never the sales list or other customers' sales.
 async fn customer_statement(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Path(id): Path<i64>,
     Query(query): Query<AsOfQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -251,6 +270,7 @@ async fn customer_statement(
 /// that balance.
 async fn customer_ageing(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Query(query): Query<AsOfQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let as_of = query.as_of.unwrap_or_else(today);
@@ -286,6 +306,7 @@ async fn customer_ageing(
 /// unbounded receipt dump: the customer is mandatory.
 async fn list_receipts(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Query(query): Query<ReceiptListQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let customer_id = query
@@ -298,6 +319,7 @@ async fn list_receipts(
 
 async fn get_receipt(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<serde_json::Value>> {
     let detail = state.customer_receipt_service.get_receipt(id).await?;
@@ -309,6 +331,7 @@ async fn get_receipt(
 /// caller cannot group a payment under someone else's document.
 async fn collect_receipt(
     State(state): State<AppState>,
+    _: Require<CustomersCollect>,
     Json(payload): Json<CreateReceiptRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let detail = state
@@ -994,5 +1017,338 @@ mod tests {
         let (_, ana_detail) = get(&app, &format!("/api/sales/{ana_sale}")).await;
         assert_eq!(ana_detail["payments"].as_array().unwrap().len(), 1);
         assert_eq!(dec(&ana_detail["due"]), dec(&json!("20")));
+    }
+
+    // -- S6 enforcement (AC10): the permission gates on the real handlers ------
+
+    /// Like [`request`], but with an explicit cookie: `None` means the truly
+    /// anonymous request; a minted token drives a probe principal.
+    async fn request_as(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let payload = match body {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                v.to_string()
+            }
+            None => String::new(),
+        };
+        let resp = app
+            .clone()
+            .oneshot(builder.body(Body::from(payload)).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, json)
+    }
+
+    /// One confirmed credit sale (50 owed) behind the shared principal, so a
+    /// limited probe can be refused collecting against it.
+    async fn seeded_receivable(app: &axum::Router) -> (i64, i64, i64) {
+        let product = seed_product(app, "S6-CUST-P").await;
+        seed_stock(app, product).await;
+        let customer = seed_customer(app, "Ana S6", Some("100"), Some(30)).await;
+        let sale = credit_sale(app, customer, product, "5", "2024-06-01").await;
+        (customer, sale, product)
+    }
+
+    /// A principal holding ONLY `customers.read` reads everything — the list,
+    /// the ageing, the statement, the receipts — and is refused every entity
+    /// mutation (`customers.write`) and every collection (`customers.collect`).
+    #[tokio::test]
+    async fn ac10_a_customers_read_only_principal_reads_and_is_refused_the_writes() {
+        let state = test_state(true).await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let (customer, _sale, _product) = seeded_receivable(&app).await;
+        let probe = test_support::seed_session_with_permissions(&pool, &["customers.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+
+        // The reads the probe is allowed.
+        let (st, _) = request_as(&app, "GET", "/api/customers", Some(&cookie), None).await;
+        assert_eq!(st, StatusCode::OK, "customers.read must open the list");
+        let (st, _) = request_as(&app, "GET", "/api/customers/ageing", Some(&cookie), None).await;
+        assert_eq!(st, StatusCode::OK, "customers.read must open the ageing");
+        let (st, _) = request_as(
+            &app,
+            "GET",
+            &format!("/api/customers/{customer}/statement"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "customers.read must open the statement");
+        let (st, _) = request_as(
+            &app,
+            "GET",
+            &format!("/api/customer-receipts?customer_id={customer}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "customers.read must open the receipts");
+
+        // Entity mutations: customers.write.
+        let (st, v) = request_as(
+            &app,
+            "POST",
+            "/api/customers",
+            Some(&cookie),
+            Some(json!({ "name": "Denied Write" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("customers.write"),
+            "the refusal must name customers.write: {v}"
+        );
+        let (st, v) = request_as(
+            &app,
+            "PUT",
+            &format!("/api/customers/{customer}"),
+            Some(&cookie),
+            Some(json!({ "name": "Hacked" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("customers.write"),
+            "the refusal must name customers.write: {v}"
+        );
+        for action in ["activate", "deactivate"] {
+            let (st, v) = request_as(
+                &app,
+                "POST",
+                &format!("/api/customers/{customer}/{action}"),
+                Some(&cookie),
+                Some(json!({})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{action}: {v}");
+            assert!(
+                v["error"].as_str().unwrap_or_default().contains("customers.write"),
+                "{action} must name customers.write: {v}"
+            );
+        }
+        let (st, v) =
+            request_as(&app, "DELETE", &format!("/api/customers/{customer}"), Some(&cookie), None)
+                .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("customers.write"),
+            "the refusal must name customers.write: {v}"
+        );
+
+        // The collection: its own tier, customers.collect.
+        let (st, v) = request_as(
+            &app,
+            "POST",
+            "/api/customer-receipts",
+            Some(&cookie),
+            Some(json!({
+                "customer_id": customer, "method_id": 1,
+                "amount": "10", "date": "2024-06-02"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("customers.collect"),
+            "the refusal must name customers.collect: {v}"
+        );
+    }
+
+    /// The refusal writes nothing: the refused collect leaves no receipt row
+    /// and no payment/transaction behind, and a refused delete leaves the
+    /// customers table (and the receivable) untouched.
+    #[tokio::test]
+    async fn ac10_a_customers_refusal_writes_nothing() {
+        let state = test_state(true).await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let (customer, _sale, _product) = seeded_receivable(&app).await;
+        let acc = seed_account(&app, "cajaCust").await;
+        let cash = allow_cash(&pool, acc).await;
+        let probe = test_support::seed_session_with_permissions(
+            &pool,
+            &["customers.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+
+        let customers_before: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM customers").fetch_one(&pool).await.unwrap();
+        let (st, v) = request_as(
+            &app,
+            "POST",
+            "/api/customers",
+            Some(&cookie),
+            Some(json!({ "name": "Denied Write" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let customers_after: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM customers").fetch_one(&pool).await.unwrap();
+        assert_eq!(customers_after, customers_before, "a refused create must write nothing");
+
+        let (st, v) =
+            request_as(&app, "DELETE", &format!("/api/customers/{customer}"), Some(&cookie), None)
+                .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let (st, v) = request_as(
+            &app,
+            "GET",
+            &format!("/api/customers/{customer}"),
+            Some(test_support::TEST_COOKIE),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the customer must survive the refused delete: {v}");
+
+        let receipts_before: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM customer_receipts").fetch_one(&pool).await.unwrap();
+        let (st, v) = request_as(
+            &app,
+            "POST",
+            "/api/customer-receipts",
+            Some(&cookie),
+            Some(json!({
+                "customer_id": customer, "method_id": cash,
+                "amount": "10", "date": "2024-06-02"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("customers.collect"),
+            "the refusal must name customers.collect: {v}"
+        );
+        let receipts_after: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM customer_receipts").fetch_one(&pool).await.unwrap();
+        assert_eq!(receipts_after, receipts_before, "a refused collect must write nothing");
+    }
+
+    /// A principal holding the permissions gets the normal answers: the
+    /// entity round trip and a real collection against the receivable.
+    #[tokio::test]
+    async fn ac10_the_customers_holding_principal_gets_the_normal_answer() {
+        let state = test_state(true).await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let (customer, _sale, _product) = seeded_receivable(&app).await;
+        let acc = seed_account(&app, "cajaHold").await;
+        let cash = allow_cash(&pool, acc).await;
+        let holder = test_support::seed_session_with_permissions(
+            &pool,
+            &["customers.read", "customers.write", "customers.collect"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&holder);
+
+        // Create and update: customers.write answers its normal codes.
+        let (st, v) = request_as(
+            &app,
+            "POST",
+            "/api/customers",
+            Some(&cookie),
+            Some(json!({ "name": "Beto Holder" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "create: {v}");
+        let (st, v) = request_as(
+            &app,
+            "PUT",
+            &format!("/api/customers/{customer}"),
+            Some(&cookie),
+            Some(json!({ "phone": "555-9999" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "update: {v}");
+
+        // Collect: customers.collect answers its normal 201 and the balance drops.
+        let (st, v) = request_as(
+            &app,
+            "POST",
+            "/api/customer-receipts",
+            Some(&cookie),
+            Some(json!({
+                "customer_id": customer, "method_id": cash,
+                "amount": "20", "date": "2024-06-02"
+            })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "collect: {v}");
+        let (_, v) = request_as(
+            &app,
+            "GET",
+            &format!("/api/customers/{customer}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
+        assert_eq!(dec(&v["balance"]), dec(&json!("30")), "the collect must drop the balance: {v}");
+    }
+
+    /// The gate order must not change: an anonymous request gets the JSON
+    /// unauthorized gate, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_json_gate_not_the_permission_refusal() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let (st, v) = request_as(&app, "GET", "/api/customers", None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        assert_eq!(v["error"], "unauthorized");
+    }
+
+    /// The read gates are real too: a principal WITHOUT `customers.read` (it
+    /// holds an unrelated permission, so this is not a broken fixture) is
+    /// refused every customers read, receipts included.
+    #[tokio::test]
+    async fn the_read_gates_refuse_a_principal_without_the_read_permission() {
+        let state = test_state(true).await;
+        let pool = state.pool.clone();
+        let app = crate::routes::router(state);
+        let (customer, _sale, _product) = seeded_receivable(&app).await;
+        let probe = test_support::seed_session_with_permissions(&pool, &["sales.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+
+        for uri in [
+            "/api/customers",
+            "/api/customers/ageing",
+            &format!("/api/customers/{customer}"),
+            &format!("/api/customers/{customer}/statement"),
+            &format!("/api/customer-receipts?customer_id={customer}"),
+        ] {
+            let (st, v) = request_as(&app, "GET", uri, Some(&cookie), None).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{uri}: {v}");
+            assert!(
+                v["error"].as_str().unwrap_or_default().contains("customers.read"),
+                "{uri} must name customers.read: {v}"
+            );
+        }
+
+        // One receipt read: an unknown id still refuses the permission first.
+        let (st, v) = request_as(&app, "GET", "/api/customer-receipts/999999", Some(&cookie), None).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("customers.read"),
+            "{v}"
+        );
     }
 }

@@ -41,6 +41,11 @@ use crate::models::{
     SaleDetail, UpdateCustomer,
 };
 use crate::routes::AppState;
+use crate::security::authz::{CustomersCollect, CustomersRead, CustomersWrite, Require};
+
+// S6 enforcement (AC10): the entity and its derived receivable are read with
+// `customers.read`, the entity is mutated with `customers.write`, and money
+// in — the collect form grouping invoices — is `customers.collect`.
 
 // ---------------------------------------------------------------------------
 // Views + Askama templates
@@ -228,7 +233,10 @@ async fn list_response(state: &AppState, warning: Option<String>) -> AppResult<R
 // Pages + fragments
 // ---------------------------------------------------------------------------
 
-async fn customers_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn customers_page(
+    State(state): State<AppState>,
+    _: Require<CustomersRead>,
+) -> Result<Html<String>, AppError> {
     let customers = customer_rows(&state).await?;
     let tmpl = CustomersTemplate {
         title: "Roya — Customers".to_string(),
@@ -249,8 +257,12 @@ async fn customers_page(State(state): State<AppState>) -> Result<Html<String>, A
     ))
 }
 
+// The statement page is the customer's own account view (statement,
+// documents, receipts): the module owns it, so the single gate is
+// `customers.read` — see the note on `customer_statement` in `customers_api.rs`.
 async fn customer_statement_page(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     let customer = state.customer_service.get_customer(id).await?;
@@ -278,12 +290,16 @@ async fn customer_statement_page(
     ))
 }
 
-async fn web_customer_list(State(state): State<AppState>) -> AppResult<Response> {
+async fn web_customer_list(
+    State(state): State<AppState>,
+    _: Require<CustomersRead>,
+) -> AppResult<Response> {
     list_response(&state, None).await
 }
 
 async fn web_customer_detail(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     detail_html(&state, id).await
@@ -291,6 +307,7 @@ async fn web_customer_detail(
 
 async fn web_customer_edit_form(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     let customer = state.customer_service.get_customer(id).await?;
@@ -327,6 +344,7 @@ async fn detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
 
 async fn web_customer_receipts(
     State(state): State<AppState>,
+    _: Require<CustomersRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
@@ -400,6 +418,7 @@ pub struct CollectForm {
 
 async fn web_create_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     headers: HeaderMap,
     Form(form): Form<CreateCustomerForm>,
 ) -> AppResult<Response> {
@@ -443,6 +462,7 @@ async fn web_create_customer(
 
 async fn web_update_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     headers: HeaderMap,
     Form(form): Form<EditCustomerForm>,
 ) -> AppResult<Response> {
@@ -474,6 +494,7 @@ async fn web_update_customer(
 
 async fn web_activate_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
@@ -492,6 +513,7 @@ async fn web_activate_customer(
 
 async fn web_deactivate_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
@@ -510,6 +532,7 @@ async fn web_deactivate_customer(
 
 async fn web_delete_customer(
     State(state): State<AppState>,
+    _: Require<CustomersWrite>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
@@ -531,6 +554,7 @@ async fn web_delete_customer(
 /// receipt id.
 async fn web_collect_receipt(
     State(state): State<AppState>,
+    _: Require<CustomersCollect>,
     headers: HeaderMap,
     Form(form): Form<CollectForm>,
 ) -> AppResult<Response> {
@@ -616,6 +640,25 @@ mod tests {
             .header("cookie", test_support::TEST_COOKIE)
             .body(Body::empty())
             .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Like [`get_html`], but with an explicit cookie: `None` means the truly
+    /// anonymous request (the shared TEST_COOKIE belongs to the
+    /// full-permission principal).
+    async fn get_html_as(
+        app: axum::Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
@@ -1117,5 +1160,269 @@ mod tests {
 
         let (status, _) = get_html(app, "/web/customers/edit-form/999999").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // -- S6 enforcement (AC10): the permission gates on the real handlers ------
+
+    /// Like [`post_form`], but with an explicit cookie and optional headers:
+    /// an empty `HX-Request` set means the plain browser post the full-page
+    /// refusal shape needs.
+    async fn post_form_as(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A principal holding ONLY `customers.read` opens the reads and is
+    /// refused every web mutation, each naming its own code.
+    #[tokio::test]
+    async fn ac10_a_customers_read_only_principal_is_refused_the_web_mutations() {
+        let state = test_state().await;
+        let fixture = seed_fixture(&state).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        // The reads the probe is allowed: the page, the statement page, the
+        // fragments and the edit form.
+        for uri in [
+            "/customers".to_string(),
+            format!("/customers/{}", fixture.customer),
+            "/web/customers".to_string(),
+            format!("/web/customers/detail/{}", fixture.customer),
+            format!("/web/customers/{}/receipts", fixture.customer),
+            format!("/web/customers/edit-form/{}", fixture.customer),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {html:.200}");
+        }
+
+        // Entity mutations over HTMX: the JSON refusal naming customers.write.
+        for (uri, body) in [
+            ("/web/customers", "name=Denied+Write"),
+            (
+                "/web/customers/edit",
+                &format!("customer_id={}&name=Hacked", fixture.customer),
+            ),
+            (
+                "/web/customers/activate",
+                &format!("customer_id={}", fixture.customer),
+            ),
+            (
+                "/web/customers/deactivate",
+                &format!("customer_id={}", fixture.customer),
+            ),
+            (
+                "/web/customers/delete",
+                &format!("customer_id={}", fixture.customer),
+            ),
+        ] {
+            let (status, body) = post_form_as(
+                app.clone(),
+                uri,
+                body,
+                &[("HX-Request", "true")],
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert!(
+                body.contains("customers.write"),
+                "{uri} must name customers.write: {body}"
+            );
+        }
+
+        // The collect form is its own tier: customers.collect.
+        let (status, body) = post_form_as(
+            app,
+            "/web/customer-receipts",
+            &format!(
+                "customer_id={}&method_id={}&amount=10&date=2024-05-03",
+                fixture.customer, fixture.cash
+            ),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body.contains("customers.collect"),
+            "the refusal must name customers.collect: {body}"
+        );
+    }
+
+    /// The refusal writes nothing: a refused delete (full-page shape) leaves
+    /// the customers table intact and a refused collect leaves no receipt row.
+    #[tokio::test]
+    async fn ac10_the_customers_web_refusal_writes_nothing() {
+        let state = test_state().await;
+        let fixture = seed_fixture(&state).await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["customers.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let customers_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customers")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/customers/delete",
+            &format!("customer_id={}", fixture.customer),
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.300}");
+        assert!(
+            body.contains("Acción no permitida"),
+            "the refusal must speak Spanish: {body:.300}"
+        );
+        assert!(
+            body.contains("customers.write"),
+            "the refusal must name customers.write: {body:.300}"
+        );
+        let customers_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customers")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(customers_after, customers_before, "a refused delete must write nothing");
+
+        let receipts_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customer_receipts")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = post_form_as(
+            app,
+            "/web/customer-receipts",
+            &format!(
+                "customer_id={}&method_id={}&amount=10&date=2024-05-03",
+                fixture.customer, fixture.cash
+            ),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let receipts_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customer_receipts")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(receipts_after, receipts_before, "a refused collect must write nothing");
+    }
+
+    /// A principal holding the permissions gets the normal answers: the
+    /// creation answers its HTMX list and the collect answers the detail.
+    #[tokio::test]
+    async fn ac10_the_customers_web_holding_principal_gets_the_normal_answer() {
+        let state = test_state().await;
+        let fixture = seed_fixture(&state).await;
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["customers.read", "customers.write", "customers.collect"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&holder);
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/customers",
+            "name=Beto+Holder",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.300}");
+        assert!(body.contains("Beto Holder"), "the list must include the new customer");
+
+        let (status, body) = post_form_as(
+            app,
+            "/web/customer-receipts",
+            &format!(
+                "customer_id={}&method_id={}&amount=10&date=2024-05-03",
+                fixture.customer, fixture.cash
+            ),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.300}");
+        assert!(body.contains("Ana Web"), "the detail fragment must answer");
+    }
+
+    /// The read gates are real too: a principal WITHOUT `customers.read` (it
+    /// holds an unrelated permission, so this is not a broken fixture) is
+    /// refused every customers page and fragment with the full-page refusal
+    /// card.
+    #[tokio::test]
+    async fn the_read_gates_refuse_a_principal_without_the_read_permission() {
+        let state = test_state().await;
+        let fixture = seed_fixture(&state).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        for uri in [
+            "/customers",
+            &format!("/customers/{}", fixture.customer),
+            "/web/customers",
+            &format!("/web/customers/detail/{}", fixture.customer),
+            &format!("/web/customers/edit-form/{}", fixture.customer),
+            &format!("/web/customers/{}/receipts", fixture.customer),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
+            assert!(
+                html.contains("Acción no permitida") && html.contains("customers.read"),
+                "{uri} must refuse naming customers.read: {html:.300}"
+            );
+        }
+    }
+
+    /// The gate order must not change: an anonymous request gets the login
+    /// redirect, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let (status, _) =
+            post_form_as(app.clone(), "/web/customers", "name=Anonymous", &[], None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/customers")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     }
 }

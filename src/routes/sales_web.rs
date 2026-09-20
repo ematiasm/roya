@@ -21,7 +21,14 @@ use crate::models::{
     DebtSummary, PaymentType, SaleDetail, SaleListFilter, SaleRecord, SaleStatus, UpdateSaleDraft,
 };
 use crate::routes::AppState;
+use crate::security::authz::{CustomersCollect, Require, SalesCancel, SalesCreate, SalesRead};
 use crate::services::sales::DEBT_BANNER_LIMIT;
+
+// S6 enforcement (AC10): reads are `sales.read`; the draft lifecycle (create,
+// edit, lines, confirm) is `sales.create` — the catalog has no `sales.write`,
+// so recording a sale IS editing the draft; cancelling is its own tier
+// `sales.cancel`; money received on a confirmed sale is the collection
+// capability `customers.collect`, not `sales.create` (see `web_record_payment`).
 
 // ---------------------------------------------------------------------------
 // Askama templates
@@ -224,6 +231,7 @@ async fn changed_with_picker(
 
 async fn sales_page(
     State(state): State<AppState>,
+    _: Require<SalesRead>,
     Query(query): Query<SaleListQuery>,
 ) -> Result<Html<String>, AppError> {
     let sales = state
@@ -311,6 +319,7 @@ fn parse_optional_date(raw: &str) -> Option<NaiveDate> {
 
 async fn web_sale_list(
     State(state): State<AppState>,
+    _: Require<SalesRead>,
     Query(query): Query<SaleListQuery>,
 ) -> Result<Html<String>, AppError> {
     let sales = state
@@ -320,7 +329,10 @@ async fn web_sale_list(
     render_list(sales, "All sales")
 }
 
-async fn web_sale_debt(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn web_sale_debt(
+    State(state): State<AppState>,
+    _: Require<SalesRead>,
+) -> Result<Html<String>, AppError> {
     let debt = state.sales_service.debt_summary(DEBT_BANNER_LIMIT).await?;
     render_debt(debt)
 }
@@ -329,6 +341,7 @@ async fn web_sale_debt(State(state): State<AppState>) -> Result<Html<String>, Ap
 /// its draft state, and the single header action slot mirrors the status.
 async fn sale_record_page(
     State(state): State<AppState>,
+    _: Require<SalesRead>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     let context = record_context(&state, id).await?;
@@ -364,6 +377,7 @@ async fn sale_record_page(
 
 async fn web_sale_detail(
     State(state): State<AppState>,
+    _: Require<SalesRead>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     render_record(record_context(&state, id).await?, false)
@@ -455,6 +469,7 @@ pub struct UpdateSaleHeaderForm {
 
 async fn web_create_sale(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     headers: HeaderMap,
     Form(form): Form<CreateSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -502,11 +517,24 @@ async fn web_create_sale(
     Ok(Redirect::to(&location).into_response())
 }
 
+// Both registered handlers — the path endpoint and the collection adapter —
+// declare their own real `Require<P>` and call the shared ungated impl below,
+// so removing either gate compiles and fails exactly the test that pins it.
 async fn web_add_line(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
+) -> Result<axum::response::Response, AppError> {
+    add_line_impl(state, headers, id, form).await
+}
+
+async fn add_line_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: AddLineForm,
 ) -> Result<axum::response::Response, AppError> {
     let qty = parse_required_decimal(&form.qty, "qty")?;
     let unit_price = parse_opt_decimal(&form.unit_price, "unit_price")?;
@@ -532,6 +560,7 @@ async fn web_add_line(
 
 async fn web_update_line(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     headers: HeaderMap,
     Path((sale_id, line_id)): Path<(i64, i64)>,
     Form(form): Form<UpdateLineForm>,
@@ -550,6 +579,7 @@ async fn web_update_line(
 
 async fn web_remove_line(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     Path((sale_id, line_id)): Path<(i64, i64)>,
 ) -> Result<axum::response::Response, AppError> {
     state.sales_service.remove_line(line_id).await?;
@@ -558,9 +588,19 @@ async fn web_remove_line(
 
 async fn web_confirm_sale(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<ConfirmSaleForm>,
+) -> Result<axum::response::Response, AppError> {
+    confirm_sale_impl(state, headers, id, form).await
+}
+
+async fn confirm_sale_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: ConfirmSaleForm,
 ) -> Result<axum::response::Response, AppError> {
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
     state.sales_service.confirm(id, method_id).await?;
@@ -570,11 +610,24 @@ async fn web_confirm_sale(
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
 
+// The drawer payment form and its `/api` twin share the capability: money
+// received against an owed balance is a collection — `customers.collect` —
+// not `sales.create`. See the note on `record_payment` in `sales_api.rs`.
 async fn web_record_payment(
     State(state): State<AppState>,
+    _: Require<CustomersCollect>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
+) -> Result<axum::response::Response, AppError> {
+    record_payment_impl(state, headers, id, form).await
+}
+
+async fn record_payment_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: RecordPaymentForm,
 ) -> Result<axum::response::Response, AppError> {
     let amount = parse_required_decimal(&form.amount, "amount")?;
     let date = parse_date_or_today(&form.date)?;
@@ -590,9 +643,19 @@ async fn web_record_payment(
 
 async fn web_cancel_sale(
     State(state): State<AppState>,
+    _: Require<SalesCancel>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<CancelSaleForm>,
+) -> Result<axum::response::Response, AppError> {
+    cancel_sale_impl(state, headers, id, form).await
+}
+
+async fn cancel_sale_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: CancelSaleForm,
 ) -> Result<axum::response::Response, AppError> {
     let reason = if form.reason.trim().is_empty() {
         None
@@ -610,6 +673,7 @@ async fn web_cancel_sale(
 /// payment type stay fixed at creation, as the service enforces.
 async fn web_update_sale_header(
     State(state): State<AppState>,
+    _: Require<SalesCreate>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<UpdateSaleHeaderForm>,
@@ -645,40 +709,47 @@ async fn web_update_sale_header(
 
 // HTMX posts the literal `hx-post` URL and never reads the form `action`
 // property, so typed-id forms cannot interpolate a path segment. These
-// adapters take the sale id from the submitted body and delegate to the
-// path-based handlers above, keeping both URL shapes working (mirrors
-// `purchases_web`).
+// adapters take the sale id from the submitted body and share the ungated
+// `*_impl` bodies with the path-based handlers above, keeping both URL shapes
+// working (mirrors `purchases_web`).
 
+// Both registered handlers — the path endpoint and the adapter — declare
+// their own real `Require<P>` and call the shared ungated impl, so removing
+// either gate compiles and fails exactly the test that pins it.
 async fn web_add_line_collection(
     state: State<AppState>,
+    _: Require<SalesCreate>,
     headers: HeaderMap,
     Form(form): Form<AddLineForm>,
 ) -> Result<axum::response::Response, AppError> {
-    web_add_line(state, headers, Path(form.sale_id), Form(form)).await
+    add_line_impl(state.0, headers, form.sale_id, form).await
 }
 
 async fn web_confirm_sale_collection(
     state: State<AppState>,
+    _: Require<SalesCreate>,
     headers: HeaderMap,
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    web_confirm_sale(state, headers, Path(form.sale_id), Form(form)).await
+    confirm_sale_impl(state.0, headers, form.sale_id, form).await
 }
 
 async fn web_record_payment_collection(
     state: State<AppState>,
+    _: Require<CustomersCollect>,
     headers: HeaderMap,
     Form(form): Form<RecordPaymentForm>,
 ) -> Result<axum::response::Response, AppError> {
-    web_record_payment(state, headers, Path(form.sale_id), Form(form)).await
+    record_payment_impl(state.0, headers, form.sale_id, form).await
 }
 
 async fn web_cancel_sale_collection(
     state: State<AppState>,
+    _: Require<SalesCancel>,
     headers: HeaderMap,
     Form(form): Form<CancelSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    web_cancel_sale(state, headers, Path(form.sale_id), Form(form)).await
+    cancel_sale_impl(state.0, headers, form.sale_id, form).await
 }
 
 pub fn router() -> Router<AppState> {
@@ -760,6 +831,25 @@ mod tests {
             .header("cookie", test_support::TEST_COOKIE)
             .body(Body::empty())
             .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Like [`get_html`], but with an explicit cookie: `None` means the truly
+    /// anonymous request (the shared TEST_COOKIE belongs to the
+    /// full-permission principal).
+    async fn get_html_as(
+        app: axum::Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
@@ -1735,5 +1825,434 @@ mod tests {
             "a failed resolution adds no line"
         );
         assert_eq!(after.total, before.total);
+    }
+
+    // -- S6 enforcement (AC10): the permission gates on the real handlers ------
+
+    /// Like [`post_form`], but with an explicit cookie and optional headers:
+    /// an empty `HX-Request` set means the plain browser post the full-page
+    /// refusal shape needs.
+    async fn post_form_as(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A principal holding ONLY `sales.read` opens the reads and is refused
+    /// every web mutation, each in the shape its caller reads and naming its
+    /// own code: the draft lifecycle `sales.create`, cancelling
+    /// `sales.cancel`, and money received `customers.collect`.
+    #[tokio::test]
+    async fn ac10_a_sales_read_only_principal_is_refused_the_web_mutations_in_both_shapes() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        // The reads the probe is allowed: the page, the record and the fragments.
+        for uri in [
+            "/sales".to_string(),
+            format!("/sales/{}", fixture.sale_id),
+            "/web/sales".to_string(),
+            "/web/sales/debt".to_string(),
+            format!("/web/sales/{}", fixture.sale_id),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {html:.200}");
+        }
+
+        // Creating a sale over HTMX: JSON naming the recording gate.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/sales",
+            &format!("customer_id={}&payment_type=Cash", fixture.sale_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body.contains("sales.create"),
+            "the HTMX refusal must name sales.create: {body}"
+        );
+
+        // The same create as a plain browser post: the HTML refusal card.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/sales",
+            "customer_id=1&payment_type=Cash",
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
+        assert!(
+            body.contains("Acción no permitida"),
+            "the refusal must speak Spanish: {body:.400}"
+        );
+        assert!(
+            body.contains("sales.create"),
+            "the refusal must name the missing permission: {body:.400}"
+        );
+
+        // The record actions: lines and header are the recording gate...
+        for (uri, body) in [
+            (
+                format!("/web/sales/{}/lines", fixture.sale_id),
+                format!("product_id={}&qty=1", fixture.product_id),
+            ),
+            (
+                format!("/web/sales/{}/header", fixture.sale_id),
+                "notes=hacked".to_string(),
+            ),
+        ] {
+            let (status, body) = post_form_as(
+                app.clone(),
+                &uri,
+                &body,
+                &[("HX-Request", "true")],
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert!(
+                body.contains("sales.create"),
+                "{uri} must name sales.create: {body}"
+            );
+        }
+
+        // ...confirm is the recording tier...
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/sales/{}/confirm", fixture.sale_id),
+            "method_id=",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("sales.create"), "{body}");
+
+        // Line edit and removal are the recording gate too, each in its own
+        // method (the web routes register POST for the line edit, DELETE for
+        // the removal) so a swapped extractor on either endpoint fails exactly
+        // one assertion.
+        for (method, uri, body) in [
+            (
+                "POST",
+                format!("/web/sales/{}/lines/{}", fixture.sale_id, fixture.line_id),
+                "qty=9&unit_price=9",
+            ),
+            (
+                "DELETE",
+                format!("/web/sales/{}/lines/{}", fixture.sale_id, fixture.line_id),
+                "",
+            ),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .header("cookie", &cookie)
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+            let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("sales.create"),
+                "{method} {uri} must name sales.create: {text}"
+            );
+        }
+
+        // ...the payment is the collection tier...
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/sales/{}/payments", fixture.sale_id),
+            &format!("method_id={}&amount=5&date=2024-05-03", fixture.method_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body.contains("customers.collect"),
+            "the refusal must name customers.collect: {body}"
+        );
+
+        // ...and the cancel is its own tier.
+        let (status, body) = post_form_as(
+            app,
+            &format!("/web/sales/{}/cancel", fixture.sale_id),
+            "reason=",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("sales.cancel"), "{body}");
+    }
+
+    /// The refusal writes nothing: the refused confirmation keeps the draft,
+    /// the refused payment writes no payment row, and a refused creation
+    /// leaves the sales table where it was.
+    #[tokio::test]
+    async fn ac10_the_sales_web_refusal_writes_nothing() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["sales.read", "customers.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let sales_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sales")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/sales",
+            "customer_id=1&payment_type=Cash",
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.200}");
+        let sales_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sales")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(sales_after, sales_before, "a refused create must write nothing");
+
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/sales/{}/confirm", fixture.sale_id),
+            "method_id=",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let after = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.sale.status,
+            crate::models::SaleStatus::Draft,
+            "a refused confirm must not flip the status"
+        );
+
+        state
+            .sales_service
+            .confirm(fixture.sale_id, None)
+            .await
+            .unwrap();
+        let payments_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = post_form_as(
+            app,
+            &format!("/web/sales/{}/payments", fixture.sale_id),
+            &format!("method_id={}&amount=5&date=2024-05-03", fixture.method_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let payments_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(payments_after, payments_before, "a refused payment must write nothing");
+    }
+
+    /// A principal holding the permissions gets the normal answers: the
+    /// creation redirects to the new record and the record actions answer
+    /// their fragments.
+    #[tokio::test]
+    async fn ac10_the_sales_web_holding_principal_gets_the_normal_answer() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &[
+                "sales.read",
+                "sales.create",
+                "sales.cancel",
+                "customers.read",
+                "customers.collect",
+            ],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&holder);
+        let app = crate::routes::router(state.clone());
+
+        let (status, _body) = post_form_as(
+            app.clone(),
+            "/web/sales",
+            &format!("customer_id={}&payment_type=Cash&sale_date=2024-05-02", fixture.sale_id),
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "the creation redirects to the record");
+
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/sales/{}/confirm", fixture.sale_id),
+            "method_id=",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.300}");
+
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/sales/{}/payments", fixture.sale_id),
+            &format!("method_id={}&amount=10&date=2024-05-03", fixture.method_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.300}");
+
+        let (status, _body) = post_form_as(
+            app,
+            &format!("/web/sales/{}/cancel", fixture.sale_id),
+            "reason=customer return",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The old collection endpoints (id in the body) are separate gated
+    /// boundaries: the adapter declares its own gate and the delegated call is
+    /// a plain function call, so removing the ADAPTER's gate is exactly what
+    /// this test pins (the path endpoints pin the inner handlers above).
+    #[tokio::test]
+    async fn the_sales_collection_adapters_carry_their_own_gate() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["sales.read", "customers.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        let cases = [
+            (
+                "/web/sales/lines",
+                format!("sale_id={}&product_id={}&qty=1", fixture.sale_id, fixture.product_id),
+                "sales.create",
+            ),
+            (
+                "/web/sales/confirm",
+                format!("sale_id={}&method_id=", fixture.sale_id),
+                "sales.create",
+            ),
+            (
+                "/web/sales/payments",
+                format!("sale_id={}&method_id={}&amount=5&date=2024-05-03", fixture.sale_id, fixture.method_id),
+                "customers.collect",
+            ),
+            (
+                "/web/sales/cancel",
+                format!("sale_id={}&reason=", fixture.sale_id),
+                "sales.cancel",
+            ),
+        ];
+        for (uri, body, code) in cases {
+            let (status, body) = post_form_as(
+                app.clone(),
+                uri,
+                &body,
+                &[("HX-Request", "true")],
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert!(body.contains(code), "{uri} must name {code}: {body}");
+        }
+    }
+
+    /// The read gates are real too: a principal WITHOUT `sales.read` (it holds
+    /// an unrelated permission, so this is not a broken fixture) is refused
+    /// every sales page and fragment with the full-page refusal card.
+    #[tokio::test]
+    async fn the_read_gates_refuse_a_principal_without_the_read_permission() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        for uri in [
+            "/sales",
+            &format!("/sales/{}", fixture.sale_id),
+            "/web/sales",
+            "/web/sales/debt",
+            &format!("/web/sales/{}", fixture.sale_id),
+        ] {
+            let (status, html) = get_html_as(app.clone(), uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
+            assert!(
+                html.contains("Acción no permitida") && html.contains("sales.read"),
+                "{uri} must refuse naming sales.read: {html:.300}"
+            );
+        }
+    }
+
+    /// The gate order must not change: an anonymous request gets the login
+    /// redirect, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let (status, _) = post_form_as(app.clone(), "/web/sales", "customer_id=1", &[], None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        // get_html always carries the shared cookie, so the anonymous GET is
+        // built by hand here.
+        let req = Request::builder().method("GET").uri("/sales").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     }
 }
