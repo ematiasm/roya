@@ -30,6 +30,48 @@ pub const TEST_SESSION_TOKEN: &str = "test-session-token-roya-identity";
 /// plumbing test's round-trip through the real cookie parser.
 pub const TEST_COOKIE: &str = "roya_session=test-session-token-roya-identity";
 
+/// The migration's sentinel account username (migration 30): the system actor
+/// every pre-existing row and migration-time seed is attributed to.
+pub const AUDIT_SYSTEM_USERNAME: &str = "sistema";
+
+/// The id of the migration-created sentinel account. Test call sites that only
+/// need A valid acting user resolve it through the real repository read; the
+/// audit attribution tests create dedicated users instead, because the point
+/// there is telling two actors apart.
+pub async fn audit_actor_id(pool: &SqlitePool) -> AppResult<i64> {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+        .bind(AUDIT_SYSTEM_USERNAME)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| {
+            crate::error::AppError::Internal(
+                "the migration's system sentinel user is missing: migrations must run first"
+                    .to_string(),
+            )
+        })
+}
+
+/// Insert one dedicated audit-actor user through the real repository write
+/// path (active, placeholder hash — these tests exercise attribution, not
+/// credentials). Returns the user id, so a test can assert that the audited
+/// row carries exactly this actor and not another one.
+pub async fn seed_audit_user(
+    pool: &SqlitePool,
+    username: &str,
+    display_name: &str,
+) -> AppResult<i64> {
+    let users = SqliteUserRepository::new(pool.clone());
+    let user = users
+        .create(&NewUser {
+            username: username.to_string(),
+            display_name: display_name.to_string(),
+            password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+            must_change_password: false,
+        })
+        .await?;
+    Ok(user.id)
+}
+
 /// The fixed username `seed_session` creates (matches the users-table CHECK
 /// shape: 3-64 lowercase chars with dots/underscores/hyphens in the middle).
 pub const TEST_USERNAME: &str = "test-admin";

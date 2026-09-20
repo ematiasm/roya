@@ -204,12 +204,13 @@ async fn remove_line(
 async fn record_payment(
     State(state): State<AppState>,
     _: Require<CustomersCollect>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<RecordPaymentRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let payment = state
         .sales_service
-        .record_payment(id, payload.method_id, payload.amount, payload.date)
+        .record_payment(principal.user_id, id, payload.method_id, payload.amount, payload.date)
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(payment))))
 }
@@ -222,22 +223,24 @@ async fn record_payment(
 async fn confirm_sale(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<ConfirmSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let detail = state.sales_service.confirm(id, payload.method_id).await?;
+    let detail = state.sales_service.confirm(principal.user_id, id, payload.method_id).await?;
     Ok(Json(serde_json::json!(detail)))
 }
 
 async fn cancel_sale(
     State(state): State<AppState>,
     _: Require<SalesCancel>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<CancelSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let detail = state
         .sales_service
-        .cancel(id, payload.reason)
+        .cancel(principal.user_id, id, payload.reason)
         .await?;
     Ok(Json(serde_json::json!(detail)))
 }
@@ -407,10 +410,11 @@ mod tests {
             return mid;
         }
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO payment_methods (name, account_id, is_active) \
-             SELECT name, ?, is_active FROM payment_methods WHERE id = ? RETURNING id",
+            "INSERT INTO payment_methods (name, account_id, is_active, created_by) \
+             SELECT name, ?, is_active, ? FROM payment_methods WHERE id = ? RETURNING id",
         )
         .bind(account_id)
+        .bind(test_support::audit_actor_id(pool).await.unwrap())
         .bind(mid)
         .fetch_one(pool)
         .await

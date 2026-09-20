@@ -10,9 +10,15 @@ then archives its own scope.
 
 ## Phase B — audit
 
-- [ ] T26 (S9): audit migration for finance tables (`accounts`, `transactions`, `payment_methods`),
+- [x] T26 (S9): audit migration for finance tables (`accounts`, `transactions`, `payment_methods`),
       actor plumbing from `Principal`, "Registrado por"/"Actualizado por" display, tests for
-      AC18–AC19 on the finance surface.
+      AC18–AC19 on the finance surface. (2026-09-20: delivered on `feat/audit-finance`; the
+      cross-department call sites of `TransactionService` entered this slice because
+      `created_by NOT NULL` on `transactions` is the inter-department plumbing itself —
+      `SalesService`/`PurchasesService` confirm/cancel/pay flows and the collection flow pass the
+      request's actor down. The pre-existing rows' actor is the migration-created `sistema`
+      sentinel, per the rule above; see the slice's section in `odd/tasks/identity-rbac.md` for
+      the demonstrated upgrade sequence, the mutation table and the verification numbers.)
 - [ ] T27 (S10): audit for inventory tables (`categories`, `products`, `product_barcodes` inherits,
       `stock_movements`) — the movement's actor is the request's principal even when the movement is
       produced by a sale or purchase confirm.

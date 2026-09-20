@@ -440,6 +440,7 @@ async fn web_record_cost(
 async fn web_pay_supplier(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<PaySupplierForm>,
 ) -> AppResult<Response> {
@@ -447,7 +448,7 @@ async fn web_pay_supplier(
     let date = parse_date_or_today(&form.date)?;
     state
         .purchases_service
-        .pay_supplier(form.supplier_id, form.method_id, amount, date)
+        .pay_supplier(principal.user_id, form.supplier_id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
         // Drawer submissions target `#supplier-drawer-body`: answer the fresh
@@ -500,6 +501,14 @@ mod tests {
 
     use crate::routes::AppState;
     use crate::security::test_support;
+
+    /// A valid acting user for the mechanical call sites: the migration's
+    /// sentinel account (the system actor pre-existing rows are attributed to).
+    /// The audit-attribution tests seed their own users instead, because there
+    /// the point is telling two actors apart.
+    async fn audit_actor(state: &AppState) -> i64 {
+        test_support::audit_actor_id(&state.pool).await.unwrap()
+    }
 
     async fn test_state() -> AppState {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -695,7 +704,7 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .confirm(confirmed.id, None)
+            .confirm(audit_actor(&state).await, confirmed.id, None)
             .await
             .unwrap();
         let draft = state
@@ -735,7 +744,7 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .confirm(foreign.id, None)
+            .confirm(audit_actor(&state).await, foreign.id, None)
             .await
             .unwrap();
 
@@ -955,10 +964,10 @@ mod tests {
         // A funded account with an owning Cash method: paying posts an Expense,
         // so with overdraft blocked the account needs money before the handover.
         // The name "Caja" makes `ensure_defaults_for_account` assign Cash.
-        let account = state.account_service.create("Caja").await.unwrap();
+        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
         state
             .payment_method_service
-            .ensure_defaults_for_account(account.id, "Caja")
+            .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
             .await
             .unwrap();
         let cash = state
@@ -972,7 +981,9 @@ mod tests {
             .id;
         state
             .transaction_service
+
             .create(
+                audit_actor(&state).await,
                 account.id,
                 TransactionKind::Income,
                 Decimal::from(1000),
@@ -1034,7 +1045,7 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-            .confirm(purchase.id, None)
+            .confirm(audit_actor(&state).await, purchase.id, None)
             .await
             .unwrap();
 
@@ -1446,10 +1457,10 @@ mod tests {
 
         let state = test_state().await;
         // The funded account with its owning Cash method, so a payment can run.
-        let account = state.account_service.create("Caja").await.unwrap();
+        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
         state
             .payment_method_service
-            .ensure_defaults_for_account(account.id, "Caja")
+            .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
             .await
             .unwrap();
         let cash = state
@@ -1463,7 +1474,9 @@ mod tests {
             .id;
         state
             .transaction_service
+
             .create(
+                audit_actor(&state).await,
                 account.id,
                 TransactionKind::Income,
                 Decimal::from(1000),
@@ -1517,7 +1530,7 @@ mod tests {
             .add_line(purchase.id, product.id, Decimal::from(3), Some(Decimal::from(25)))
             .await
             .unwrap();
-        state.purchases_service.confirm(purchase.id, None).await.unwrap();
+        state.purchases_service.confirm(audit_actor(&state).await, purchase.id, None).await.unwrap();
 
         let holder = test_support::seed_session_with_permissions(
             &state.pool,

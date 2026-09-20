@@ -172,6 +172,41 @@ async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, String)
     send(app, "POST", uri, Some("application/json"), false, body.to_string()).await
 }
 
+/// PUT/POST JSON as ANOTHER principal: the cookie value comes from the caller
+/// (see `seed_session_with_permissions`), so a test can drive a second user
+/// next to the shared fixture session.
+async fn send_json_with_cookie(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    body: Value,
+    cookie: &str,
+) -> (StatusCode, String) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("cookie", cookie)
+        .header("content-type", "application/json");
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// A JSON mutation as a given principal.
+async fn post_json_with_cookie(
+    app: &Router,
+    uri: &str,
+    body: Value,
+    cookie: &str,
+) -> (StatusCode, String) {
+    send_json_with_cookie(app, "PUT", uri, body, cookie).await
+}
+
 fn json_body(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("expected JSON, got {body:.400}: {e}"))
 }
@@ -2896,11 +2931,14 @@ async fn money_invariant_catches_broken_refund_link() {
     check_payment_links_are_traceable(&pool).await.unwrap();
 
     // Point the refund at a real transaction with a different (absent) reference.
+    // The raw row is a fixture the suite plants directly, so the actor is the
+    // migration's sentinel account, not any operator's principal.
     let bogus: (i64,) = sqlx::query_as(
-        "INSERT INTO transactions (account_id, kind, amount, description, reference, date) \
-         VALUES (?, 'Income', '1', 'bogus', NULL, '2024-05-01') RETURNING id",
+        "INSERT INTO transactions (account_id, kind, amount, description, reference, date, created_by) \
+         VALUES (?, 'Income', '1', 'bogus', NULL, '2024-05-01', ?) RETURNING id",
     )
     .bind(account)
+    .bind(test_support::audit_actor_id(&pool).await.unwrap())
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -5271,4 +5309,339 @@ async fn search_matches_ignore_accents_and_case() {
     assert!(list.contains("Café"), "the catalogue must find Café by CAFÉ: {list}");
 }
 
+// ---------------------------------------------------------------------------
+// AC18 (finance audit, M5 Phase B slice S9): the actor the interface renders
+// ---------------------------------------------------------------------------
 
+/// The finance detail view shows the actor as a DISPLAY NAME, never an id:
+/// the account header names who registered it, each history row names its
+/// movement's actor, and an edit adds "Actualizado por" without erasing the
+/// creator. Two principals drive the flow so the two names are distinct —
+/// the shared session user creates the account, a second probe session edits
+/// the transaction.
+#[tokio::test]
+async fn audit_finance_detail_view_shows_the_actor_display_name() {
+    let (app, pool) = test_app().await;
+    let method = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "AuditWallet", &[method]).await;
+
+    // The shared session user ("Test Admin") records a transaction.
+    let (status, resp) = post_form(
+        &app,
+        "/web/transactions",
+        &format!(
+            "account_id={account}&type=Income&amount=250&description=venta&date=2024-05-01",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+
+    // A second principal (display name "Test Probe") edits the same movement.
+    let probe_token = test_support::seed_session_with_permissions(&pool, &["finance.write"])
+        .await
+        .unwrap();
+    let tx_id: i64 = sqlx::query_scalar("SELECT id FROM transactions WHERE account_id = ?")
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (status, resp) = post_json_with_cookie(
+        &app,
+        &format!("/api/transactions/{tx_id}"),
+        serde_json::json!({ "amount": "300" }),
+        &test_support::cookie_for(&probe_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+
+    let (status, page) = get(&app, &format!("/accounts/{account}")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    // The name appears in TWO places (the account header and the movement
+    // row), so a single missing render cannot satisfy the count.
+    assert_eq!(
+        page.matches("Registrado por Test Admin").count(),
+        2,
+        "the account header AND the movement row show the creator's display name: {page}"
+    );
+    // The editor renders once — on the movement row — because the account
+    // itself has no edit path yet (its `updated_by` is still NULL).
+    assert_eq!(
+        page.matches("Actualizado por Test Probe").count(),
+        1,
+        "the edit names its editor on the movement row: {page}"
+    );
+    assert!(
+        !page.contains("Registrado por 1"),
+        "the interface never renders a raw user id: {page}"
+    );
+}
+
+/// The migration's sentinel account is a system account, not a back door: an
+/// attempt to LOG IN as `sistema` with any password answers the same generic
+/// failure any bad credential gets, with no session and nothing that would
+/// distinguish it from an unknown username. The comparison half proves the
+/// path is the inactive-user path: a deactivated (roleless) account's failed
+/// login is byte-for-byte the same shape.
+#[tokio::test]
+async fn audit_the_system_sentinel_cannot_log_in_like_any_inactive_account() {
+    let (app, pool) = test_app().await;
+
+    // The control: one ordinary roleless account, deactivated the way the
+    // users screen does it.
+    let teller = test_support::seed_audit_user(&pool, "teller", "Teller").await.unwrap();
+    sqlx::query("UPDATE users SET is_active = 0 WHERE id = ?")
+        .bind(teller)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let sessions_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Three attempts as the sentinel: a plausible password, a paste of its
+    // display name, and pure garbage. Every one is the SAME generic refusal.
+    for password in ["Sistema (anterior al registro)", "admin", "x"] {
+        let resp = post_form(
+            &app,
+            "/login",
+            &format!("username=sistema&password={password}"),
+        )
+        .await;
+        let (status, body) = resp;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "the sentinel must not log in with any password: {body}"
+        );
+        assert!(
+            body.contains("Usuario o contraseña incorrectos"),
+            "the refusal is the generic one, not a special case: {body}"
+        );
+    }
+
+    // The same shape for the deactivated control account.
+    let resp = post_form(&app, "/login", "username=teller&password=whatever").await;
+    let (status, body) = resp;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an inactive user's failed login: {body}"
+    );
+    assert!(
+        body.contains("Usuario o contraseña incorrectos"),
+        "same generic message: {body}"
+    );
+
+    // No attempt minted a session, and the refusal never wrote one.
+    let sessions_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sessions_after.0, sessions_before.0, "no session was created");
+}
+
+// ---------------------------------------------------------------------------
+// AC19 (finance audit, M5 Phase B slice S9): the upgrade sequence, proven on a
+// database that has business rows and no users — the upgrade case of a real
+// installation — and the FK refusal that holds every actor row in place.
+// ---------------------------------------------------------------------------
+
+/// A pool with the migration chain stopped just before the audit migration
+/// (the pre-30 schema is real) plus legacy business data, planted the way
+/// pre-audit code wrote it: no user anywhere in the database.
+async fn upgraded_pool_with_legacy_rows() -> (axum::Router, sqlx::SqlitePool) {
+    let opts = sqlx::sqlite::SqliteConnectOptions::from_str("sqlite::memory:")
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run_to(20240101000029, &pool).await.unwrap();
+
+    let account_id: (i64,) = sqlx::query_as(
+        "INSERT INTO accounts (name, cached_balance) VALUES ('legacy', '0') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO transactions (account_id, kind, amount, description, date) \
+         VALUES (?, 'Income', '10', 'legacy movement', '2024-01-01')",
+    )
+    .bind(account_id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO payment_methods (name) VALUES ('Legacy Method')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = test_support::app_state(pool.clone());
+    (crate::routes::router(state.clone()), pool)
+}
+
+#[tokio::test]
+async fn ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel() {
+    let (app, pool) = upgraded_pool_with_legacy_rows().await;
+    let migrator = sqlx::migrate!("./migrations");
+    migrator.run(&pool).await.unwrap();
+
+    // The sentinel exists: inactive, roleless, unusable credential, and it
+    // is NOT an administrator the bootstrap would collide with.
+    let sentinel: (i64, i64, i64) = sqlx::query_as(
+        "SELECT id, is_active, must_change_password FROM users WHERE username = 'sistema'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sentinel.1, 0, "the sentinel account is inactive");
+    let sentinel_roles: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM user_roles WHERE user_id = ?",
+    )
+    .bind(sentinel.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sentinel_roles.0, 0, "the sentinel holds no role");
+
+    // Every pre-existing row points at the sentinel and nothing was lost.
+    let accounts: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FROM accounts WHERE created_by = ?",
+    )
+    .bind(sentinel.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(accounts.0, accounts.1, "no row lost, all attributed");
+    assert_eq!(accounts.0, 1, "the legacy account survived");
+    let transactions: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FROM transactions WHERE created_by = ?",
+    )
+    .bind(sentinel.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(transactions.0, transactions.1, "no row lost, all attributed");
+    assert_eq!(transactions.0, 1, "the legacy movement survived");
+    let methods: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FROM payment_methods WHERE created_by = ?",
+    )
+    .bind(sentinel.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(methods.0, methods.1, "no row lost, all attributed");
+    assert_eq!(methods.0, 6, "the five seeds plus the legacy one survived");
+
+    // `created_by` is NOT NULL afterwards: a write that omits the actor
+    // is refused by the database, which is what makes every future insert
+    // explicit.
+    let refused = sqlx::query("INSERT INTO accounts (name) VALUES ('no-actor')")
+        .execute(&pool)
+        .await;
+    assert!(refused.is_err(), "created_by is NOT NULL after the rebuild");
+
+    // The service keeps working: a write through the real web route lands,
+    // attributed to the acting user like every future row. The session is
+    // seeded after the migration (the same way a real install starts).
+    test_support::seed_session(&pool).await.unwrap();
+    let method = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "post-migration", &[method]).await;
+    let session_user: (i64,) = sqlx::query_as("SELECT id FROM users WHERE username = ?")
+        .bind(test_support::TEST_USERNAME)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let created_by: (i64,) = sqlx::query_as("SELECT created_by FROM accounts WHERE id = ?")
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(created_by.0, session_user.0, "the route's actor, not a fresh one");
+}
+
+
+/// The upgrade's second half: the bootstrap still creates the ONE real
+/// administrator through its ordinary creation path (never the recovery
+/// path), grants the protected role, and the sentinel stays what it was.
+#[tokio::test]
+async fn ac19_the_bootstrap_creates_exactly_one_active_administrator_after_the_upgrade() {
+    // The state the upgrade ends on: the whole chain has already run, the
+    // legacy rows are attributed, and the application is about to start.
+    let (app, pool) = upgraded_pool_with_legacy_rows().await;
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let _app = app;
+    // The shared identity service construction (light hasher): the same
+    // bootstrap path production runs at startup.
+    let state = test_support::app_state(pool.clone());
+
+    let outcome = state
+        .identity_service
+        .bootstrap_admin(Some("upgrade pw 123"))
+        .await
+        .unwrap();
+    assert!(outcome.created, "the bootstrap created the administrator");
+    assert!(outcome.generated_password.is_none(), "the env password is used as-is");
+
+    let admins: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM users u \
+         JOIN user_roles ur ON ur.user_id = u.id \
+         JOIN roles r ON r.id = ur.role_id \
+         WHERE u.is_active = 1 AND r.is_system = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(admins.0, 1, "exactly one active administrator exists");
+
+    let sentinel: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM users WHERE username = 'sistema' AND is_active = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sentinel.0, 0, "the sentinel account is not an administrator");
+
+    // A second bootstrap run is the ordinary no-op: the active protected
+    // holder already exists.
+    let again = state
+        .identity_service
+        .bootstrap_admin(Some("another pw 123"))
+        .await
+        .unwrap();
+    assert!(!again.created, "the bootstrap no-ops once an admin exists");
+}
+
+
+/// AC19: the audit foreign key holds a user row in place. Deleting the
+/// sentinel — referenced by every attributed row — is refused (the same
+/// `ON DELETE RESTRICT` the identity grant trail already relies on), so
+/// history cannot lose its actor.
+#[tokio::test]
+async fn ac19_deleting_the_system_actor_is_refused_by_the_audit_foreign_key() {
+    let (_s, pool) = upgraded_pool_with_legacy_rows().await;
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let sentinel = test_support::audit_actor_id(&pool).await.unwrap();
+
+    let refused = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(sentinel)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        "the audit FK refuses the deletion: {refused}"
+    );
+
+    // The row survives: history still explains itself.
+    let still_there: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(still_there.0, 1);
+}

@@ -750,6 +750,7 @@ where
 
     pub async fn confirm(
         &self,
+        actor: i64,
         sale_id: i64,
         cash_method_id: Option<i64>,
     ) -> AppResult<SaleDetail> {
@@ -903,6 +904,7 @@ where
             let income = self
                 .transactions
                 .create_with_reference(
+                    actor,
                     account_id,
                     crate::models::TransactionKind::Income,
                     total,
@@ -934,12 +936,13 @@ where
     /// on a single sale and keeps working exactly as before.
     pub async fn record_payment(
         &self,
+        actor: i64,
         sale_id: i64,
         method_id: i64,
         amount: Decimal,
         date: NaiveDate,
     ) -> AppResult<SalePayment> {
-        self.record_payment_with_receipt(sale_id, method_id, amount, date, None)
+        self.record_payment_with_receipt(actor, sale_id, method_id, amount, date, None)
             .await
     }
 
@@ -949,6 +952,7 @@ where
     /// `transaction_id`; the receipt never posts a movement of its own.
     pub async fn record_payment_with_receipt(
         &self,
+        actor: i64,
         sale_id: i64,
         method_id: i64,
         amount: Decimal,
@@ -986,6 +990,7 @@ where
         let income = self
             .transactions
             .create_with_reference(
+                actor,
                 account_id,
                 crate::models::TransactionKind::Income,
                 amount,
@@ -1026,6 +1031,7 @@ where
 
     pub async fn cancel(
         &self,
+        actor: i64,
         sale_id: i64,
         reason: Option<String>,
     ) -> AppResult<SaleDetail> {
@@ -1118,6 +1124,7 @@ where
             let refund = self
                 .transactions
                 .create_with_reference(
+                    actor,
                     pay.account_id,
                     crate::models::TransactionKind::Expense,
                     pay.amount,
@@ -1150,8 +1157,19 @@ mod tests {
         SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
     };
     use crate::services::{CustomerService, InventoryService, TransactionService};
+    use crate::security::test_support;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+
+    /// A valid acting user for the mechanical call sites: the migration's
+    /// sentinel account (the system actor pre-existing rows are attributed to).
+    /// The audit-attribution tests below seed their own users instead, because
+    /// there the point is telling two actors apart.
+    async fn audit_actor(s: &Svc) -> i64 {
+        test_support::audit_actor_id(&s.transactions.accounts.pool)
+            .await
+            .unwrap()
+    }
 
     /// The seeded walk-in is the first row in every fresh test database.
     const WALKIN_ID: i64 = 1;
@@ -1309,7 +1327,11 @@ mod tests {
     }
 
     async fn seed_account(s: &Svc, name: &str) -> crate::models::Account {
-        s.transactions.accounts.create(name).await.unwrap()
+        s.transactions
+            .accounts
+            .create(audit_actor(s).await, name)
+            .await
+            .unwrap()
     }
 
     async fn cash_method(s: &Svc) -> i64 {
@@ -1331,7 +1353,10 @@ mod tests {
     }
 
     async fn allow(s: &Svc, account_id: i64, method_id: i64) {
-        s.payment_methods.set_method_account(method_id, Some(account_id)).await.unwrap()
+        s.payment_methods
+            .set_method_account(audit_actor(s).await, method_id, Some(account_id))
+            .await
+            .unwrap()
     }
 
     async fn walkin_of(s: &Svc) -> crate::models::Customer {
@@ -1463,7 +1488,7 @@ mod tests {
         assert!(sale.sale_number.is_none());
         s.add_line(sale.id, prod.id, dec("3"), None).await.unwrap();
 
-        let detail = s.confirm(sale.id, Some(cash)).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
         let number = detail.sale.sale_number.clone().unwrap();
         assert_eq!(number, "2024-SALE-000001");
         assert_eq!(detail.total, dec("30"));
@@ -1505,7 +1530,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
-        let detail = s.confirm(sale.id, None).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
         assert!(detail.sale.sale_number.is_some());
         assert_eq!(detail.total, dec("24"));
         assert_eq!(detail.paid, Decimal::ZERO);
@@ -1535,8 +1560,8 @@ mod tests {
             "2",
         )
         .await;
-        s.confirm(sale.id, None).await.unwrap();
-        s.record_payment(sale.id, cash, dec("10"), sale_date())
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("10"), sale_date())
             .await
             .unwrap();
 
@@ -1590,9 +1615,9 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
-        s.confirm(sale.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
 
-        s.record_payment(
+        s.record_payment(audit_actor(&s).await, 
             sale.id,
             cash,
             dec("15"),
@@ -1608,7 +1633,7 @@ mod tests {
 
         // Overpay rejected (15 + 30 > 40).
         let err = s
-            .record_payment(
+            .record_payment(audit_actor(&s).await, 
                 sale.id,
                 cash,
                 dec("30"),
@@ -1620,7 +1645,7 @@ mod tests {
         assert_eq!(tx_count(&pool).await, 1);
 
         // Pay remainder -> Paid.
-        s.record_payment(
+        s.record_payment(audit_actor(&s).await, 
             sale.id,
             cash,
             dec("25"),
@@ -1672,7 +1697,7 @@ mod tests {
 
         // Unknown method on Cash confirm => 404.
         s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
-        let err = s.confirm(sale.id, Some(999_999)).await.unwrap_err();
+        let err = s.confirm(audit_actor(&s).await, sale.id, Some(999_999)).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
 
         // Unknown method on payment => 404.
@@ -1688,9 +1713,9 @@ mod tests {
             .await
             .unwrap();
         s.add_line(csale.id, prod.id, dec("1"), None).await.unwrap();
-        s.confirm(csale.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, csale.id, None).await.unwrap();
         let err = s
-            .record_payment(csale.id, 999_999, dec("5"), sale_date())
+            .record_payment(audit_actor(&s).await, csale.id, 999_999, dec("5"), sale_date())
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
@@ -1719,10 +1744,10 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
-        s.confirm(sale.id, Some(cash)).await.unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
 
         // Double confirm => 400/409.
-        let err = s.confirm(sale.id, Some(cash)).await.unwrap_err();
+        let err = s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap_err();
         assert!(
             matches!(err, AppError::Validation(_) | AppError::Conflict(_)),
             "got {err:?}"
@@ -1772,13 +1797,13 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("4"), None).await.unwrap(); // total 40
-        let confirmed = s.confirm(sale.id, Some(cash)).await.unwrap();
+        let confirmed = s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
         let number = confirmed.sale.sale_number.clone().unwrap();
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("6"));
         assert_eq!(tx_count(&pool).await, 1);
 
         let cancelled = s
-            .cancel(sale.id, Some("devuelve".into()))
+            .cancel(audit_actor(&s).await, sale.id, Some("devuelve".into()))
             .await
             .unwrap();
         assert_eq!(cancelled.sale.status, crate::models::SaleStatus::Cancelled);
@@ -1821,11 +1846,12 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
-        s.confirm(sale.id, Some(cash)).await.unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
         // Drain account: Income 20, then Expense 20 => balance 0.
         s.transactions
             .create(
+                audit_actor(&s).await,
                 acc.id,
                 crate::models::TransactionKind::Expense,
                 dec("20"),
@@ -1835,7 +1861,7 @@ mod tests {
             .await
             .unwrap();
         // Cancel would refund 20 => balance -20, must fail with allow_negative=false.
-        let err = s.cancel(sale.id, None).await.unwrap_err();
+        let err = s.cancel(audit_actor(&s).await, sale.id, None).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // No stock re-entry, no extra refund.
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
@@ -1861,9 +1887,10 @@ mod tests {
             .await
             .unwrap();
         s2.add_line(sale2.id, prod2.id, dec("2"), None).await.unwrap();
-        s2.confirm(sale2.id, Some(cash2)).await.unwrap();
+        s2.confirm(audit_actor(&s2).await, sale2.id, Some(cash2)).await.unwrap();
         s2.transactions
             .create(
+                audit_actor(&s2).await,
                 acc2.id,
                 crate::models::TransactionKind::Expense,
                 dec("20"),
@@ -1872,7 +1899,7 @@ mod tests {
             )
             .await
             .unwrap();
-        s2.cancel(sale2.id, None).await.unwrap();
+        s2.cancel(audit_actor(&s2).await, sale2.id, None).await.unwrap();
         assert_eq!(s2.inventory.stock(prod2.id).await.unwrap(), dec("10"));
     }
 
@@ -1898,7 +1925,7 @@ mod tests {
             .unwrap();
         s.add_line(sale.id, svc_prod.id, dec("2"), None).await.unwrap();
         let before = movement_count(&pool).await;
-        let detail = s.confirm(sale.id, Some(cash)).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
         assert_eq!(detail.total, dec("60"));
         // No stock movements for service lines.
         assert_eq!(movement_count(&pool).await, before);
@@ -1939,8 +1966,8 @@ mod tests {
             .unwrap();
         s.add_line(b.id, prod.id, dec("1"), None).await.unwrap();
 
-        let da = s.confirm(a.id, Some(cash)).await.unwrap();
-        let db = s.confirm(b.id, Some(cash)).await.unwrap();
+        let da = s.confirm(audit_actor(&s).await, a.id, Some(cash)).await.unwrap();
+        let db = s.confirm(audit_actor(&s).await, b.id, Some(cash)).await.unwrap();
         assert_ne!(
             da.sale.sale_number.unwrap(),
             db.sale.sale_number.unwrap()
@@ -1961,7 +1988,7 @@ mod tests {
         s.add_line(c.id, prod.id, dec("1"), None).await.unwrap();
         let moves_before = movement_count(&pool).await;
         let tx_before = tx_count(&pool).await;
-        let cancelled = s.cancel(c.id, None).await.unwrap();
+        let cancelled = s.cancel(audit_actor(&s).await, c.id, None).await.unwrap();
         assert_eq!(cancelled.sale.status, crate::models::SaleStatus::Cancelled);
         assert!(cancelled.sale.sale_number.is_none());
         assert_eq!(movement_count(&pool).await, moves_before);
@@ -1988,7 +2015,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("10"), None).await.unwrap();
-        let err = s.confirm(sale.id, Some(cash)).await.unwrap_err();
+        let err = s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // Still Draft, no number.
         let d = s.get_detail(sale.id).await.unwrap();
@@ -2029,7 +2056,7 @@ mod tests {
             .unwrap();
         s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
         // Missing method => 400.
-        let err = s.confirm(sale.id, None).await.unwrap_err();
+        let err = s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(err.to_string().contains("requires a payment method"), "got {err}");
         // Credit must not carry a method either.
@@ -2045,7 +2072,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(credit.id, prod.id, dec("1"), None).await.unwrap();
-        let err = s.confirm(credit.id, Some(cash)).await.unwrap_err();
+        let err = s.confirm(audit_actor(&s).await, credit.id, Some(cash)).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
@@ -2072,7 +2099,7 @@ mod tests {
         let moves_before = movement_count(&pool).await;
         let tx_before = tx_count(&pool).await;
         let err = s
-            .confirm(sale.id, Some(cash))
+            .confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -2107,8 +2134,8 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
-        s.confirm(sale.id, None).await.unwrap();
-        s.record_payment(
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, 
             sale.id,
             cash,
             dec("15"),
@@ -2116,7 +2143,7 @@ mod tests {
         )
         .await
         .unwrap();
-        s.record_payment(
+        s.record_payment(audit_actor(&s).await, 
             sale.id,
             transfer,
             dec("25"),
@@ -2154,10 +2181,10 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
-        s.confirm(sale.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
         let tx_before = tx_count(&pool).await;
         let err = s
-            .record_payment(sale.id, qr, dec("5"), sale_date())
+            .record_payment(audit_actor(&s).await, sale.id, qr, dec("5"), sale_date())
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -2189,7 +2216,7 @@ mod tests {
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
 
-        let detail = s.confirm(sale.id, Some(cash)).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
         let number = detail.sale.sale_number.clone().unwrap();
 
         let payments = s.sales.list_payments(sale.id).await.unwrap();
@@ -2231,11 +2258,11 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
-        let detail = s.confirm(sale.id, None).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
         let number = detail.sale.sale_number.clone().unwrap();
 
         let paid = s
-            .record_payment(
+            .record_payment(audit_actor(&s).await, 
                 sale.id,
                 cash,
                 dec("15"),
@@ -2257,7 +2284,7 @@ mod tests {
         assert_eq!(income.kind, crate::models::TransactionKind::Income);
         assert_eq!(income.reference.as_deref(), Some(number.as_str()));
 
-        s.cancel(sale.id, Some("refund".into())).await.unwrap();
+        s.cancel(audit_actor(&s).await, sale.id, Some("refund".into())).await.unwrap();
 
         let payments = s.sales.list_payments(sale.id).await.unwrap();
         assert_eq!(payments.len(), 1);
@@ -2303,11 +2330,11 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
-        let detail = s.confirm(sale.id, None).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
         let number = detail.sale.sale_number.clone().unwrap();
 
         let first = s
-            .record_payment(
+            .record_payment(audit_actor(&s).await, 
                 sale.id,
                 cash,
                 dec("15"),
@@ -2316,7 +2343,7 @@ mod tests {
             .await
             .unwrap();
         let second = s
-            .record_payment(
+            .record_payment(audit_actor(&s).await, 
                 sale.id,
                 cash,
                 dec("25"),
@@ -2364,7 +2391,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
-        let detail = s.confirm(sale.id, Some(cash)).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
         let number = detail.sale.sale_number.clone().unwrap();
         let tx_id = s.sales.list_payments(sale.id).await.unwrap()[0]
             .transaction_id
@@ -2374,7 +2401,7 @@ mod tests {
         // on it, so editing it leaves `reference` (and the payment link) intact.
         let updated = s
             .transactions
-            .update(tx_id, None, None, Some("edited by hand".into()), None)
+            .update(audit_actor(&s).await, tx_id, None, None, Some("edited by hand".into()), None)
             .await
             .unwrap();
         assert_eq!(updated.description, "edited by hand");
@@ -2405,7 +2432,7 @@ mod tests {
             .await
             .unwrap();
         s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
-        s.confirm(sale.id, Some(cash)).await.unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
         let tx_id = s.sales.list_payments(sale.id).await.unwrap()[0]
             .transaction_id
             .unwrap();
@@ -2514,7 +2541,7 @@ mod tests {
         let txs_before = tx_count(&pool).await;
         let sequence_before = sale_sequence_last(&pool).await;
 
-        let err = s.confirm(sale.id, None).await.unwrap_err();
+        let err = s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         let detail = s.get_detail(sale.id).await.unwrap();
@@ -2554,7 +2581,7 @@ mod tests {
             Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
             "due_date must default to sale_date + payment_days (2024-05-02 + 30)"
         );
-        s.confirm(first.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, first.id, None).await.unwrap();
 
         // Projected 30 + 80 = 110 > 100 => 400 with the projection.
         let second = draft_with_line(
@@ -2567,7 +2594,7 @@ mod tests {
         )
         .await;
         let movements_before = movement_count(&pool).await;
-        let err = s.confirm(second.id, None).await.unwrap_err();
+        let err = s.confirm(audit_actor(&s).await, second.id, None).await.unwrap_err();
         match err {
             AppError::Validation(msg) => {
                 assert!(
@@ -2605,7 +2632,7 @@ mod tests {
         )
         .await;
 
-        let detail = s.confirm(sale.id, None).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
         assert_eq!(detail.sale.status, crate::models::SaleStatus::Confirmed);
         let debt = s.customer_balance(customer.id).await.unwrap();
         assert_eq!(debt, dec("60"));
@@ -2629,7 +2656,7 @@ mod tests {
                 "99",
             )
             .await;
-            let detail = s.confirm(sale.id, None).await.unwrap();
+            let detail = s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
             assert_eq!(
                 detail.sale.status,
                 crate::models::SaleStatus::Confirmed,
@@ -2710,24 +2737,24 @@ mod tests {
         // Debt 60, within the limit.
         let first =
             draft_with_line(&s, customer.id, PaymentType::Credit, due, prod.id, "6").await;
-        s.confirm(first.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, first.id, None).await.unwrap();
 
         // Paying 40 leaves 20 of debt, so another 70 fits (90 <= 100).
-        s.record_payment(first.id, cash, dec("40"), sale_date())
+        s.record_payment(audit_actor(&s).await, first.id, cash, dec("40"), sale_date())
             .await
             .unwrap();
         let second =
             draft_with_line(&s, customer.id, PaymentType::Credit, due, prod.id, "7").await;
-        s.confirm(second.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, second.id, None).await.unwrap();
 
         // Cancelling the first sale removes its remaining 20 => debt 70.
-        s.cancel(first.id, Some("tri".into())).await.unwrap();
+        s.cancel(audit_actor(&s).await, first.id, Some("tri".into())).await.unwrap();
         assert_eq!(s.customer_balance(customer.id).await.unwrap(), dec("70"));
 
         // Boundary: projected debt exactly equal to the limit is allowed.
         let boundary =
             draft_with_line(&s, customer.id, PaymentType::Credit, due, prod.id, "3").await;
-        let detail = s.confirm(boundary.id, None).await.unwrap();
+        let detail = s.confirm(audit_actor(&s).await, boundary.id, None).await.unwrap();
         assert_eq!(detail.sale.status, crate::models::SaleStatus::Confirmed);
         assert_eq!(s.customer_balance(customer.id).await.unwrap(), dec("100"));
     }
@@ -2783,18 +2810,18 @@ mod tests {
             draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit, due, prod.id, "5").await;
         let second =
             draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit, due, prod.id, "3").await;
-        s.confirm(first.id, None).await.unwrap();
-        s.confirm(second.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, first.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, second.id, None).await.unwrap();
 
         // A cash sale for the same customer never contributes.
         let cash_sale =
             draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Cash, None, prod.id, "7").await;
-        s.confirm(cash_sale.id, Some(cash)).await.unwrap();
+        s.confirm(audit_actor(&s).await, cash_sale.id, Some(cash)).await.unwrap();
 
         assert_eq!(s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(), dec("80"));
 
         // A payment reduces the balance for that customer only.
-        s.record_payment(
+        s.record_payment(audit_actor(&s).await, 
             first.id,
             cash,
             dec("20"),
@@ -2822,14 +2849,14 @@ mod tests {
 
         let sale =
             draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit, due, prod.id, "4").await; // 40
-        s.confirm(sale.id, None).await.unwrap();
-        s.record_payment(sale.id, cash, dec("15"), sale_date())
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("15"), sale_date())
             .await
             .unwrap();
         assert_eq!(s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(), dec("25"));
 
         // Fully paid: the sale contributes zero.
-        s.record_payment(sale.id, cash, dec("25"), sale_date())
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("25"), sale_date())
             .await
             .unwrap();
         assert_eq!(
@@ -2838,7 +2865,7 @@ mod tests {
         );
 
         // Cancelled: nothing on either side, and the payments are still on file.
-        s.cancel(sale.id, Some("k3".into())).await.unwrap();
+        s.cancel(audit_actor(&s).await, sale.id, Some("k3".into())).await.unwrap();
         assert_eq!(
             s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
             Decimal::ZERO
@@ -2885,7 +2912,7 @@ mod tests {
                 "1",
             )
             .await;
-            s.confirm(sale.id, None).await.unwrap();
+            s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
         }
 
         // A credit sale with no due date counts as current.
@@ -2965,9 +2992,9 @@ mod tests {
             "4",
         )
         .await;
-        s.confirm(a1.id, None).await.unwrap();
-        s.confirm(a2.id, None).await.unwrap();
-        s.record_payment(
+        s.confirm(audit_actor(&s).await, a1.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, a2.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, 
             a2.id,
             cash,
             dec("10"),
@@ -2987,7 +3014,7 @@ mod tests {
             "4",
         )
         .await;
-        s.confirm(b1.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, b1.id, None).await.unwrap();
 
         // Carla: fully paid, so she must not appear.
         let c1 = draft_on(
@@ -3000,8 +3027,8 @@ mod tests {
             "1",
         )
         .await;
-        s.confirm(c1.id, None).await.unwrap();
-        s.record_payment(c1.id, cash, dec("10"), base_date)
+        s.confirm(audit_actor(&s).await, c1.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, c1.id, cash, dec("10"), base_date)
             .await
             .unwrap();
 
@@ -3052,8 +3079,8 @@ mod tests {
             "10",
         )
         .await;
-        s.confirm(big.id, None).await.unwrap();
-        s.record_payment(
+        s.confirm(audit_actor(&s).await, big.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, 
             big.id,
             cash,
             dec("30"),
@@ -3061,7 +3088,7 @@ mod tests {
         )
         .await
         .unwrap();
-        s.record_payment(
+        s.record_payment(audit_actor(&s).await, 
             big.id,
             cash,
             dec("20"),
@@ -3081,8 +3108,8 @@ mod tests {
             "5",
         )
         .await;
-        s.confirm(small.id, None).await.unwrap();
-        s.record_payment(
+        s.confirm(audit_actor(&s).await, small.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, 
             small.id,
             cash,
             dec("50"),
@@ -3102,8 +3129,8 @@ mod tests {
             "2",
         )
         .await;
-        s.confirm(gone.id, None).await.unwrap();
-        s.record_payment(
+        s.confirm(audit_actor(&s).await, gone.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, 
             gone.id,
             cash,
             dec("5"),
@@ -3111,7 +3138,7 @@ mod tests {
         )
         .await
         .unwrap();
-        s.cancel(gone.id, Some("k3".into())).await.unwrap();
+        s.cancel(audit_actor(&s).await, gone.id, Some("k3".into())).await.unwrap();
 
         let statement = s
             .customer_statement(CREDIT_CUSTOMER_ID, as_of)
@@ -3185,14 +3212,14 @@ mod tests {
         )
         .await;
         let n1 = s
-            .confirm(first.id, None)
+            .confirm(audit_actor(&s).await, first.id, None)
             .await
             .unwrap()
             .sale
             .sale_number
             .unwrap();
         let n2 = s
-            .confirm(second.id, None)
+            .confirm(audit_actor(&s).await, second.id, None)
             .await
             .unwrap()
             .sale
@@ -3201,7 +3228,7 @@ mod tests {
         assert!(n1 < n2, "document order follows the generated numbers");
 
         // Two payments against the first sale on the same date: creation order.
-        s.record_payment(
+        s.record_payment(audit_actor(&s).await, 
             first.id,
             cash,
             dec("7"),
@@ -3209,7 +3236,7 @@ mod tests {
         )
         .await
         .unwrap();
-        s.record_payment(
+        s.record_payment(audit_actor(&s).await, 
             first.id,
             cash,
             dec("3"),
@@ -3256,7 +3283,7 @@ mod tests {
             "1",
         )
         .await;
-        s.confirm(sale.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
 
         let on_due = s.customer_ageing(CREDIT_CUSTOMER_ID, due).await.unwrap();
         assert_eq!(on_due.current, dec("10"));
@@ -3312,7 +3339,7 @@ mod tests {
                 matching = sale.id;
             }
         }
-        s.confirm(matching, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, matching, None).await.unwrap();
 
         s.sales.reset_reads();
         let details = s
@@ -3349,7 +3376,7 @@ mod tests {
                 "1",
             )
             .await;
-            s.confirm(sale.id, None).await.unwrap();
+            s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
         }
 
         s.sales.reset_reads();
@@ -3369,5 +3396,30 @@ mod tests {
             "the banner must not scale with history: {before} reads for the full list, {after} for the banner"
         );
         assert_eq!(after, 3, "the banner reads in three batched queries");
+    }
+
+    /// AC18, the flow half of the finance audit: the Income a confirmed sale
+    /// produces carries the CONFIRMING request's actor, not a fresh one, and
+    /// stays distinct from the account's own creator.
+    #[tokio::test]
+    async fn ac18_the_sale_flow_income_carries_the_flows_actor() {
+        let (s, pool) = svc().await;
+        let creator = test_support::seed_audit_user(&pool, "audit-alice", "Alice").await.unwrap();
+        let operator = test_support::seed_audit_user(&pool, "audit-bob", "Bob").await.unwrap();
+
+        let acc = s.transactions.accounts.create(creator, "flowwallet").await.unwrap();
+        assert_eq!(acc.created_by, creator, "the account's creator is Alice");
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let prod = seed_product(&s, "FLOW", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let customer = seed_customer(&s, "flow-walkin", None, None).await;
+        let sale = draft_with_line(&s, customer.id, PaymentType::Cash, None, prod.id, "1").await;
+
+        let _detail = s.confirm(operator, sale.id, Some(cash)).await.unwrap();
+        let rows = s.transactions.transactions.list_by_account(acc.id).await.unwrap();
+        let income = rows.iter().find(|tx| tx.is_income()).unwrap();
+        assert_eq!(income.created_by, operator, "the flow's actor, not a fresh one");
+        assert_ne!(income.created_by, acc.created_by, "distinct from the account's creator");
     }
 }

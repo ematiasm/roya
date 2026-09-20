@@ -15,8 +15,10 @@ pub mod users_web;
 pub mod web;
 
 use axum::{http::StatusCode, response::IntoResponse, Json, Router};
-use sqlx::SqlitePool;
+use sqlx::{Row as _, SqlitePool};
 use tower_http::services::ServeDir;
+
+use crate::error::AppResult;
 
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
@@ -254,6 +256,55 @@ impl AppState {
             enforce_credit_limit,
         }
     }
+}
+
+/// Resolve the display names of the audit actors a finance view renders
+/// (M5 Phase B). A department may not read identity tables and may not take the
+/// identity service as a dependency (AC20 — the grep in `security/authz.rs`
+/// scans the department routes and repositories), and the spec's interface rule
+/// says the views show the actor as a name, never as an id. So the resolution
+/// lives here in the wiring layer — this module is where `AppState` is
+/// composed and the one place the boundary test explicitly allows to touch
+/// identity — and the finance handlers receive display names alongside the
+/// audit ids. An id that resolves to nothing cannot be rendered by the
+/// validated data paths (every `created_by` is a live FK); the fallback exists
+/// so a concurrent deactivation degrades to an explicit marker instead of a
+/// blank row.
+pub async fn audit_actor_names(
+    pool: &SqlitePool,
+    actor_ids: &[i64],
+) -> AppResult<std::collections::BTreeMap<i64, String>> {
+    // The callers collect ids straight from validated rows, so the list is
+    // small and the ids are integers; dedupe keeps the statement small.
+    let distinct: Vec<i64> = {
+        let mut seen = std::collections::BTreeSet::new();
+        actor_ids.iter().copied().filter(|id| seen.insert(*id)).collect()
+    };
+    let mut names: std::collections::BTreeMap<i64, String> = Default::default();
+    if distinct.is_empty() {
+        return Ok(names);
+    }
+    let mut sql = String::from("SELECT id, display_name FROM users WHERE id IN (");
+    for (index, _) in distinct.iter().enumerate() {
+        if index > 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+    }
+    sql.push(')');
+    // The statement contains only `?` placeholders; every value arrives bound
+    // as an integer collected from validated rows, nothing is interpolated.
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+    for id in &distinct {
+        query = query.bind(*id);
+    }
+    let rows = query.fetch_all(pool).await?;
+    for row in rows {
+        let id: i64 = row.try_get(0)?;
+        let display_name: String = row.try_get(1)?;
+        names.insert(id, display_name);
+    }
+    Ok(names)
 }
 
 pub fn router(state: AppState) -> Router {

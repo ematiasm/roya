@@ -332,11 +332,13 @@ async fn get_receipt(
 async fn collect_receipt(
     State(state): State<AppState>,
     _: Require<CustomersCollect>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateReceiptRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     let detail = state
         .customer_receipt_service
         .collect(
+            principal.user_id,
             payload.customer_id,
             payload.method_id,
             payload.amount,
@@ -501,10 +503,11 @@ mod tests {
             return cash;
         }
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO payment_methods (name, account_id, is_active) \
-             SELECT name, ?, is_active FROM payment_methods WHERE id = ? RETURNING id",
+            "INSERT INTO payment_methods (name, account_id, is_active, created_by) \
+             SELECT name, ?, is_active, ? FROM payment_methods WHERE id = ? RETURNING id",
         )
         .bind(account_id)
+        .bind(test_support::audit_actor_id(pool).await.unwrap())
         .bind(cash)
         .fetch_one(pool)
         .await

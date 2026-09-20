@@ -51,11 +51,32 @@ struct DashboardTemplate {
     nav: Nav,
 }
 
+/// One history row of the account detail view with its audit actors resolved
+/// to display names (M5 Phase B): the finance department returns ids; the
+/// wiring layer resolves them (see `audit_actor_names` in routes/mod.rs), so
+/// the interface shows a name and never an id.
+struct TransactionRow {
+    tx: crate::models::Transaction,
+    /// Display name of the user that created the movement; `None` only when
+    /// the id resolves to nothing (a concurrent deactivation).
+    created_by_name: Option<String>,
+    /// Display name of the last editor, when the movement was edited at all.
+    updated_by_name: Option<String>,
+}
+
 #[derive(Template)]
 #[template(path = "account_detail.html")]
 struct AccountDetailTemplate {
     account: crate::models::AccountWithBalance,
-    transactions: Vec<crate::models::Transaction>,
+    transactions: Vec<TransactionRow>,
+    /// Display name of the account's creator ("Registrado por"). Every
+    /// account has one (`created_by` is NOT NULL); it renders even when the
+    /// actor is the migration's sentinel, whose display name says exactly
+    /// what happened.
+    account_created_by_name: Option<String>,
+    /// Display name of the last editor ("Actualizado por"), only rendered
+    /// when the account has been edited.
+    account_updated_by_name: Option<String>,
     allow_negative: bool,
     methods: Vec<PaymentMethod>,
     unassigned: Vec<PaymentMethod>,
@@ -166,9 +187,30 @@ async fn account_detail(
     let methods = state.payment_method_service.catalog_for_account(id).await?;
     let unassigned = state.payment_method_service.unassigned().await?;
     let has_methods = !methods.is_empty();
+    // The audit actors are resolved HERE, in the wiring layer, because a
+    // department may not read identity tables (AC20) and the view must show a
+    // name, never an id. One statement covers the account header and every
+    // history row.
+    let mut actor_ids: Vec<i64> = detail.transactions.iter().map(|tx| tx.created_by).collect();
+    actor_ids.extend(detail.transactions.iter().filter_map(|tx| tx.updated_by));
+    actor_ids.push(detail.created_by);
+    actor_ids.extend(detail.updated_by);
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let name_for = |id: i64| names.get(&id).cloned();
+    let transactions = detail
+        .transactions
+        .iter()
+        .map(|tx| TransactionRow {
+            created_by_name: name_for(tx.created_by),
+            updated_by_name: tx.updated_by.and_then(name_for),
+            tx: tx.clone(),
+        })
+        .collect();
     let tmpl = AccountDetailTemplate {
+        account_created_by_name: name_for(detail.created_by),
+        account_updated_by_name: detail.updated_by.and_then(name_for),
         account: acc_with_balance,
-        transactions: detail.transactions.clone(),
+        transactions,
         allow_negative: state.allow_negative,
         methods,
         unassigned,
@@ -267,17 +309,21 @@ pub struct CreateTransactionForm {
 async fn web_create_account(
     State(state): State<AppState>,
     _: Require<FinanceMethodsManage>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreateAccountForm>,
 ) -> Result<axum::response::Response, AppError> {
     // Ticked methods join the new account: unassigned ones are assigned, ones
     // owned elsewhere are duplicated by name (never stolen). No ticks means a
-    // method-less account, which the list flags with a warning.
-    let acc = state.account_service.create(&form.name).await?;
+    // method-less account, which the list flags with a warning. Every write
+    // carries the acting user (M5 Phase B): the account and the methods it
+    // gains record the same request's actor.
+    let actor = principal.user_id;
+    let acc = state.account_service.create(actor, &form.name).await?;
     for method_id in &form.method_ids {
         state
             .payment_method_service
-            .assign_or_duplicate(acc.id, *method_id)
+            .assign_or_duplicate(actor, acc.id, *method_id)
             .await?;
     }
     // If HTMX, return updated fragments
@@ -307,13 +353,14 @@ async fn web_create_account(
 async fn web_update_payment_methods(
     State(state): State<AppState>,
     _: Require<FinanceMethodsManage>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Form(form): Form<UpdatePaymentMethodsForm>,
 ) -> Result<axum::response::Response, AppError> {
     state.account_service.require_exists(id).await?;
     state
         .payment_method_service
-        .replace_account_methods(id, &form.method_ids)
+        .replace_account_methods(principal.user_id, id, &form.method_ids)
         .await?;
     Ok(Redirect::to(&format!("/accounts/{id}")).into_response())
 }
@@ -321,6 +368,7 @@ async fn web_update_payment_methods(
 async fn web_create_transaction(
     State(state): State<AppState>,
     _: Require<FinanceWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreateTransactionForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -339,7 +387,7 @@ async fn web_create_transaction(
 
     state
         .transaction_service
-        .create(form.account_id, kind, amount, form.description, date)
+        .create(principal.user_id, form.account_id, kind, amount, form.description, date)
         .await?;
 
     if is_htmx(&headers) {

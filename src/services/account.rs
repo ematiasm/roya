@@ -26,7 +26,9 @@ where
         }
     }
 
-    pub async fn create(&self, name: &str) -> AppResult<Account> {
+    /// `actor` is the audit actor: the acting user's id from the request's
+    /// `Principal` (M5 Phase B). The account row records it as `created_by`.
+    pub async fn create(&self, actor: i64, name: &str) -> AppResult<Account> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err(AppError::Validation("account name cannot be empty".into()));
@@ -36,7 +38,7 @@ where
                 "account name must be <= 64 chars".into(),
             ));
         }
-        self.accounts.create(trimmed).await
+        self.accounts.create(actor, trimmed).await
     }
 
     /// 404 when the account does not exist; used by the payment-method routes.
@@ -68,6 +70,8 @@ where
             id: acc.id,
             name: acc.name,
             balance: acc.balance,
+            created_by: acc.created_by,
+            updated_by: acc.updated_by,
             created_at: acc.created_at,
             transactions: txs,
         })
@@ -75,5 +79,44 @@ where
 
     pub async fn total_balance(&self) -> AppResult<Decimal> {
         self.accounts.total_balance().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repositories::{SqliteAccountRepository, SqliteTransactionRepository};
+    use crate::security::test_support;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    /// AC18 on the account surface: the account records the acting user's id
+    /// (`created_by`, NOT NULL) and no editor until one edits it.
+    #[tokio::test]
+    async fn ac18_an_account_records_its_creator() {
+        let pool = test_pool().await;
+        let s = AccountService::new(
+            SqliteAccountRepository::new(pool.clone()),
+            SqliteTransactionRepository::new(pool.clone()),
+        );
+        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice").await.unwrap();
+
+        let acc = s.create(alice, "Caja").await.unwrap();
+        assert_eq!(acc.created_by, alice, "the account records its creator");
+        assert_eq!(acc.updated_by, None);
     }
 }

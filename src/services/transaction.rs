@@ -47,25 +47,32 @@ where
     }
 
     /// Manual transaction entry point (no document reference). Kept as the
-    /// 5-argument form so manual callers keep working; delegates to
-    /// `create_with_reference`.
+    /// 6-argument form so manual callers keep working; delegates to
+    /// `create_with_reference`. `actor` is the audit actor: the acting user's
+    /// id from the request's `Principal` (M5 Phase B) — the movement records
+    /// who recorded it.
     pub async fn create(
         &self,
+        actor: i64,
         account_id: i64,
         kind: TransactionKind,
         amount: Decimal,
         description: Option<String>,
         date: NaiveDate,
     ) -> AppResult<Transaction> {
-        self.create_with_reference(account_id, kind, amount, description, None, date)
+        self.create_with_reference(actor, account_id, kind, amount, description, None, date)
             .await
     }
 
     /// Create a transaction, optionally stamped with an opaque source `reference`
     /// (the document number written by sales/purchases). Finance only stores the
-    /// string; it never knows about the document that produced it.
+    /// string; it never knows about the document that produced it. `actor` is
+    /// the audit actor of the ORIGINATING request: a movement produced inside a
+    /// document flow carries that flow's acting user, never a fresh actor
+    /// (AC18) — the flow passes it down, finance never invents one.
     pub async fn create_with_reference(
         &self,
+        actor: i64,
         account_id: i64,
         kind: TransactionKind,
         amount: Decimal,
@@ -99,7 +106,7 @@ where
         }
 
         self.transactions
-            .create(account_id, kind, amount, &desc, reference.as_deref(), date)
+            .create(actor, account_id, kind, amount, &desc, reference.as_deref(), date)
             .await
     }
 
@@ -119,6 +126,7 @@ where
 
     pub async fn update(
         &self,
+        actor: i64,
         id: i64,
         kind: Option<TransactionKind>,
         amount: Option<Decimal>,
@@ -176,7 +184,7 @@ where
             }
         }
 
-        self.transactions.update(&existing).await
+        self.transactions.update(&existing, actor).await
     }
 
     pub async fn delete(&self, id: i64) -> AppResult<()> {
@@ -216,6 +224,7 @@ where
 mod tests {
     use super::*;
     use crate::repositories::{SqliteAccountRepository, SqliteTransactionRepository};
+    use crate::security::test_support;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
 
@@ -426,9 +435,11 @@ mod tests {
     #[tokio::test]
     async fn delete_linked_transaction_is_conflict_and_keeps_row_and_payment() {
         let (s, pool) = svc().await;
-        let acc = s.accounts.create("Caja").await.unwrap();
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let acc = s.accounts.create(actor, "Caja").await.unwrap();
         let sale_tx = s
             .create_with_reference(
+                actor,
                 acc.id,
                 TransactionKind::Expense,
                 dec("10"),
@@ -440,6 +451,7 @@ mod tests {
             .unwrap();
         let purchase_tx = s
             .create_with_reference(
+                actor,
                 acc.id,
                 TransactionKind::Expense,
                 dec("20"),
@@ -484,10 +496,12 @@ mod tests {
 
     #[tokio::test]
     async fn delete_unlinked_transaction_still_works() {
-        let (s, _pool) = svc().await;
-        let acc = s.accounts.create("Caja").await.unwrap();
+        let (s, pool) = svc().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let acc = s.accounts.create(actor, "Caja").await.unwrap();
         let tx = s
             .create_with_reference(
+                actor,
                 acc.id,
                 TransactionKind::Expense,
                 dec("5"),
@@ -500,5 +514,78 @@ mod tests {
 
         s.delete(tx.id).await.unwrap();
         assert!(s.transactions.find_by_id(tx.id).await.unwrap().is_none());
+    }
+
+    // -- audit attribution (M5 Phase B, slice S9, AC18) --------------------------
+
+    /// AC18 on the finance surface: a movement records who created it, and an
+    /// edit records the editor WITHOUT erasing the creator. Two dedicated
+    /// users make the assertion meaningful: the row must carry the editor's
+    /// id on `updated_by` and the creator's id on `created_by`.
+    #[tokio::test]
+    async fn ac18_create_and_update_store_two_different_actors() {
+        let (s, pool) = svc().await;
+        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice").await.unwrap();
+        let bob = test_support::seed_audit_user(&pool, "audit-bob", "Bob").await.unwrap();
+
+        let acc = s.accounts.create(alice, "Caja").await.unwrap();
+        assert_eq!(acc.created_by, alice, "the account records its creator");
+        assert_eq!(acc.updated_by, None);
+
+        // The movement is recorded by Bob (the flow's request actor).
+        let tx = s
+            .create_with_reference(
+                bob,
+                acc.id,
+                TransactionKind::Income,
+                dec("10"),
+                Some("ingreso".into()),
+                None,
+                d(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx.created_by, bob, "the movement records the acting user");
+        assert_eq!(tx.updated_by, None, "an unedited movement has no editor");
+
+        // Alice edits it: `updated_by` carries HER, `created_by` keeps Bob.
+        let updated = s
+            .update(alice, tx.id, None, Some(dec("12")), None, None)
+            .await
+            .unwrap();
+        assert_eq!(updated.created_by, bob, "the creator attribution survives the edit");
+        assert_eq!(updated.updated_by, Some(alice), "the edit records the editor");
+    }
+
+    /// AC18: a movement produced INSIDE another document flow carries the
+    /// flow's request actor, not a fresh one. Finance is the table's owner;
+    /// the flow passes its acting user down, and the test proves the stored
+    /// id is the flow's, distinct from the account's creator.
+    #[tokio::test]
+    async fn ac18_a_flow_created_row_carries_the_flows_actor() {
+        let (s, pool) = svc().await;
+        let creator = test_support::seed_audit_user(&pool, "flow-account", "Account Op").await.unwrap();
+        let operator = test_support::seed_audit_user(&pool, "flow-payment", "Paying Op").await.unwrap();
+
+        let acc = s.accounts.create(creator, "Caja").await.unwrap();
+        // A manual Expense (the flow's own write path) carries the flow's
+        // actor, which here differs from the account's creator.
+        let tx = s
+            .create_with_reference(
+                operator,
+                acc.id,
+                TransactionKind::Expense,
+                dec("5"),
+                Some("2024-SALE-000001".into()),
+                Some("2024-SALE-000001".into()),
+                d(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tx.created_by, operator, "the flow's actor, not a fresh one");
+        assert_ne!(tx.created_by, acc.created_by, "the two actors are distinguishable");
+        let stored = s.transactions.find_by_id(tx.id).await.unwrap().unwrap();
+        assert_eq!(stored.created_by, operator);
+        assert_eq!(stored.updated_by, None);
     }
 }
