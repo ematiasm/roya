@@ -1106,7 +1106,17 @@ row above — Phase B's audit columns will not consume them); dormant for Phase 
 at or below 56 by the end of S7, no `#[allow]` as the mechanism) is CLOSED at 55.
 
 ### S8 — Phase A close
-- [ ] T24: browser slice (`e2e/tests/test_identity.py`) for AC22, wired into the harness login step.
+- [x] T24: browser slice (`e2e/tests/test_identity.py`) for AC22, wired into the harness login step.
+      (S8 part 1, writer round on `test/identity-browser-slice`: the four AC22 cases are now browser
+      tests — login and the cookie flags were the S1b slice, and this round added the forced password
+      change confinement, the session-expiry mid-HTMX navigation, and the permission-denied HTMX form
+      reaching the notice box with no swap. FINDING: htmx 1.9.12 DOES honour `HX-Redirect` on the
+      guard's `401` — observed in the browser as a real navigation to `/login` with the form visible.
+      The session row is expired directly in the throwaway database
+      (`helpers.expire_session_in_database`), the suite's one deliberate non-HTTP step: expiry is not
+      an action the interface offers. The limited principal (role `solo_consulta` holding exactly
+      `sales.read`) is built through the roles and users screens; no Rust file, template or migration
+      was touched.)
 - [ ] T25: README (no-auth section, module table, migrations, environment), `env.example`, and
       `openspec/specs/identity/spec.md` promoted; the change folder archived for Phase A.
 

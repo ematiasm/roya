@@ -6,8 +6,8 @@ nothing.
 
 ## The two layers, and the boundary between them
 ```
-Rust suite        cargo test         314 tests, about 5 s
-Browser suite     scripts/e2e.sh     34 tests, about 20 s
+Rust suite        cargo test         613 tests, about 14 s
+Browser suite     scripts/e2e.sh     62 tests, about 90 s
 ```
 
 **The Rust suite** covers the server: business rules, guards, derived state, error mapping, the rendered
@@ -22,6 +22,13 @@ defect shipped where **the server response was correct and the interface still s
 browser suite, and must not be approximated by a slower Rust test that checks an attribute and calls it
 verified. Equally, the browser suite must not duplicate business rules that the Rust suite already proves:
 that would make the slower layer the one people skip.
+
+The identity gate is the worked example (AC22, in `e2e/tests/test_identity.py`): login, the forced
+password change, session expiry during an HTMX request and a permission-denied HTMX form are browser
+cases. The Rust suite proves each refusal's headers and status in-process; what only a browser can
+assert is that htmx 1.9.12 performs the `HX-Redirect` navigation into the login page mid-request, that
+the confinement bounces a URL the operator typed by hand, and that a refused form reaches the operator
+as the notice box while the DOM never swaps as if it had succeeded.
 
 ## Harness contract
 - One command: `scripts/e2e.sh`.
