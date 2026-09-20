@@ -20,6 +20,21 @@ use crate::repositories::{
     StockMovementRepository,
 };
 use crate::routes::AppState;
+use crate::security::authz::{
+    InventoryRead, InventoryStockWrite, InventoryWrite, PurchasesCostsRead, PurchasesCostsWrite,
+    Require,
+};
+
+// S5 enforcement mapping (products screen). The screen mixes capabilities, so
+// every handler declares its own extractor — reads `inventory.read`, product
+// and category mutations `inventory.write`, stock movements
+// `inventory.stock.write`. The per-supplier cost surface keeps the codes of
+// the module that OWNS the data even though the form lives in the product
+// drawer: cost record/preferred → `purchases.costs.write`, and the drawer
+// fragment itself renders those cost rows, so its read requires
+// `purchases.costs.read` on top of `inventory.read` (the seeded `deposito`
+// role holds both; a principal with only `inventory.read` gets the refusal
+// instead of cost rows it is not allowed to see).
 
 // ---------------------------------------------------------------------------
 // Askama templates
@@ -201,6 +216,7 @@ fn triggered_after_settle(resp: axum::response::Response, event: &str) -> axum::
 
 async fn products_page(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Query(q): Query<WebProductFilter>,
 ) -> Result<Html<String>, AppError> {
     let (query, category_id) = q.parsed();
@@ -249,6 +265,7 @@ impl WebProductFilter {
 
 async fn web_product_list(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Query(q): Query<WebProductFilter>,
 ) -> Result<Html<String>, AppError> {
     let (query, category_id) = q.parsed();
@@ -262,7 +279,10 @@ async fn web_product_list(
     Ok(Html(html))
 }
 
-async fn web_low_stock(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn web_low_stock(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+) -> Result<Html<String>, AppError> {
     let items = state.inventory_service.low_stock().await?;
     let html = StockListPartial { items }
         .render()
@@ -270,7 +290,10 @@ async fn web_low_stock(State(state): State<AppState>) -> Result<Html<String>, Ap
     Ok(Html(html))
 }
 
-async fn web_negative_stock(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn web_negative_stock(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+) -> Result<Html<String>, AppError> {
     let items = state.inventory_service.negative_stock().await?;
     let html = StockListPartial { items }
         .render()
@@ -288,6 +311,7 @@ pub struct CategoryOptionsQuery {
 
 async fn web_category_options(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Query(q): Query<CategoryOptionsQuery>,
 ) -> Result<Html<String>, AppError> {
     let cats = state.inventory_service.categories.list().await?;
@@ -308,7 +332,10 @@ async fn web_category_options(
     Ok(Html(html))
 }
 
-async fn web_product_options(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn web_product_options(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+) -> Result<Html<String>, AppError> {
     let products = state.inventory_service.products.list().await?;
     let mut html = String::new();
     for p in products {
@@ -347,6 +374,7 @@ pub struct ProductSearchQuery {
 /// derivation live in the inventory service; the route only renders.
 async fn web_product_search(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Query(params): Query<ProductSearchQuery>,
 ) -> Result<Html<String>, AppError> {
     let raw = if params.q.trim().is_empty() {
@@ -371,6 +399,8 @@ async fn web_product_search(
 /// the path, matching the wiring guard the smoke suite enforces.
 async fn web_product_detail(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
+    _: Require<PurchasesCostsRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     product_detail_html(&state, id).await
@@ -588,6 +618,7 @@ fn parse_opt_i64(s: &str) -> AppResult<Option<i64>> {
 
 async fn web_create_category(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     headers: HeaderMap,
     Form(form): Form<CreateCategoryForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -607,6 +638,7 @@ async fn web_create_category(
 
 async fn web_create_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     headers: HeaderMap,
     Form(form): Form<CreateProductForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -696,6 +728,7 @@ async fn web_create_product(
 
 async fn web_create_movement(
     State(state): State<AppState>,
+    _: Require<InventoryStockWrite>,
     headers: HeaderMap,
     Form(form): Form<CreateMovementForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -755,6 +788,7 @@ async fn web_create_movement(
 /// plain browser the redirect.
 async fn web_edit_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     headers: HeaderMap,
     Query(filter): Query<WebProductFilter>,
     Form(form): Form<EditProductForm>,
@@ -853,6 +887,7 @@ async fn web_edit_product(
 /// today; the satellite's newer-date rule rejects older ones with 400.
 async fn web_record_product_cost(
     State(state): State<AppState>,
+    _: Require<PurchasesCostsWrite>,
     headers: HeaderMap,
     Form(form): Form<RecordProductCostForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -892,6 +927,7 @@ async fn web_record_product_cost(
 /// clears the previous preferred row and rejects unknown cost pairs (404).
 async fn web_set_preferred_cost(
     State(state): State<AppState>,
+    _: Require<PurchasesCostsWrite>,
     headers: HeaderMap,
     Form(form): Form<PreferredCostForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -922,6 +958,7 @@ async fn web_set_preferred_cost(
 /// its `hx-on::after-request`), a plain browser gets the redirect.
 async fn web_activate_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -934,6 +971,7 @@ async fn web_activate_product(
 
 async fn web_deactivate_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -946,6 +984,7 @@ async fn web_deactivate_product(
 
 async fn web_delete_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -1042,6 +1081,440 @@ mod tests {
             .header("cookie", test_support::TEST_COOKIE)
             .body(Body::empty())
             .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    // -- S5 enforcement (AC10): the permission gate on the real handlers ------
+
+    /// A principal holding ONLY `inventory.read` is refused the product
+    /// mutations in the shape each caller reads: an HTMX form gets the JSON
+    /// the global notice box renders, a plain browser post gets the full-page
+    /// refusal. The probe is a second session built for exactly this set.
+    #[tokio::test]
+    async fn ac10_an_inventory_read_only_principal_is_refused_the_htmx_mutations() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        // Create product over HTMX: JSON refusal naming the gate.
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/products",
+            "sku=HTMX-DENIED&name=x&kind=Product&unit=un&sale_price=10",
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html}");
+        let json: serde_json::Value = serde_json::from_str(&html).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.write"),
+            "the HTMX refusal must name inventory.write: {json}"
+        );
+
+        // Stock movement over HTMX: its own gate, named as such.
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/stock-movements",
+            "product_id=1&type=In&qty=2",
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html}");
+        let json: serde_json::Value = serde_json::from_str(&html).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.stock.write"),
+            "the HTMX refusal must name inventory.stock.write: {json}"
+        );
+
+        // Editing a per-supplier cost is gated by the module that owns the
+        // data: purchases.costs.write, even though the form lives in the
+        // product drawer.
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/product-costs",
+            "product_id=1&supplier_id=1&cost=5",
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html}");
+        let json: serde_json::Value = serde_json::from_str(&html).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("purchases.costs.write"),
+            "the HTMX refusal must name purchases.costs.write: {json}"
+        );
+    }
+
+    /// A plain browser post (no HX-Request) gets the full-page refusal card,
+    /// extending the shell, in Spanish, naming the missing permission.
+    #[tokio::test]
+    async fn ac10_a_plain_browser_mutation_refusal_is_the_html_page() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/products",
+            "sku=PAGE-DENIED&name=x&kind=Product&unit=un&sale_price=10",
+            &[],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html:.400}");
+        assert!(
+            html.contains("Acción no permitida"),
+            "the refusal must speak Spanish: {html:.400}"
+        );
+        assert!(
+            html.contains("inventory.write"),
+            "the refusal must name the missing permission: {html:.400}"
+        );
+        assert!(
+            html.contains("data-nav=\"dashboard\""),
+            "the refusal page must keep the navigation shell: {html:.400}"
+        );
+    }
+
+    /// The drawer fragment renders per-supplier cost rows, so its read needs
+    /// `purchases.costs.read` ON TOP of `inventory.read`: an inventory-only
+    /// principal gets the refusal, and the read-only principal that also holds
+    /// the cost read sees the drawer normally.
+    #[tokio::test]
+    async fn the_drawer_read_requires_the_cost_read_permission_beyond_inventory_read() {
+        let state = test_state().await;
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "DRAWER-GATE".into(),
+                name: "drawer gate prod".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(10),
+                cost_price: Decimal::from(5),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+        let uri = format!("/web/products/detail/{}", product.id);
+
+        // inventory.read alone: refused — the fragment would have rendered
+        // cost rows the principal may not see.
+        let inventory_only =
+            test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+                .await
+                .unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("cookie", test_support::cookie_for(&inventory_only))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Both reads held: the drawer answers.
+        let reader = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["inventory.read", "purchases.costs.read"],
+        )
+        .await
+        .unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("cookie", test_support::cookie_for(&reader))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A principal holding the permission gets its normal status: create and
+    /// move stock over HTMX with the exact set the actions need.
+    #[tokio::test]
+    async fn ac10_the_holding_principal_gets_the_normal_answer() {
+        let state = test_state().await;
+        let token = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["inventory.read", "inventory.write", "inventory.stock.write"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&token);
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/products",
+            "sku=WEB-HOLDER&name=Holder+Prod&kind=Product&unit=un&sale_price=10&track_stock=1&min_stock=2&max_stock=50",
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("WEB-HOLDER"),
+            "the create must answer the refreshed list: {html:.400}"
+        );
+    }
+
+    /// The gate runs FIRST: an anonymous request keeps the deny-by-default
+    /// login redirect, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
+        let app = crate::routes::router(test_state().await);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/products")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get("Location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            location == "/login" || location.starts_with("/login?next="),
+            "anonymous navigation must hit the login gate first, got {location}"
+        );
+    }
+
+    // -- S5 correction round (T19): the gates the first round's tests did not
+    //    reach. Each product/category mutation handler is pinned by its own
+    //    refusal test against an inventory.read-only principal, and each gate
+    //    is mutation-validated: removing its annotation makes its test fail
+    //    (the round's table in tasks.md). The shared principal keeps proving
+    //    the happy paths; the probe is a second session built for this set.
+
+    async fn inventory_read_only_probe(state: &AppState) -> String {
+        let token =
+            test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+                .await
+                .unwrap();
+        test_support::cookie_for(&token)
+    }
+
+    /// The drawer's inline edit (the first refusal round did not reach this
+    /// handler): an inventory.read-only principal is refused in the HTMX JSON
+    /// shape, and nothing about the product changes.
+    #[tokio::test]
+    async fn the_product_edit_gate_refuses_an_inventory_read_only_principal() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "EDIT-GATE").await;
+        let cookie = inventory_read_only_probe(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let body = format!(
+            "id={}&sku=EDIT-GATE-HACKED&name=Renamed+by+an+under-permissioned+principal&kind=Product&unit=un&sale_price=10&cost_price=5",
+            product.id
+        );
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/products/edit",
+            &body,
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html}");
+        let json: serde_json::Value = serde_json::from_str(&html).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.write"),
+            "the HTMX refusal must name inventory.write: {json}"
+        );
+
+        // The refusal writes nothing: the product keeps its stored name.
+        let after = state.inventory_service.get_product(product.id).await.unwrap();
+        assert_eq!(after.name, "prod EDIT-GATE");
+        assert_eq!(after.sku, "EDIT-GATE");
+    }
+
+    /// Activate is a product mutation: refused, HTMX JSON shape.
+    #[tokio::test]
+    async fn the_product_activate_gate_refuses_an_inventory_read_only_principal() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "ACT-GATE").await;
+        let cookie = inventory_read_only_probe(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/products/activate",
+            &format!("product_id={}", product.id),
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html}");
+        let json: serde_json::Value = serde_json::from_str(&html).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.write"),
+            "the HTMX refusal must name inventory.write: {json}"
+        );
+    }
+
+    /// Deactivate is the same lifecycle gate, pinned separately so a swapped
+    /// extractor on either endpoint fails exactly one test.
+    #[tokio::test]
+    async fn the_product_deactivate_gate_refuses_an_inventory_read_only_principal() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "DEACT-GATE").await;
+        let cookie = inventory_read_only_probe(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/products/deactivate",
+            &format!("product_id={}", product.id),
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html}");
+        let json: serde_json::Value = serde_json::from_str(&html).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.write"),
+            "the HTMX refusal must name inventory.write: {json}"
+        );
+        let after = state.inventory_service.get_product(product.id).await.unwrap();
+        assert!(after.is_active, "a refused deactivate must not flip the flag");
+    }
+
+    /// Delete as a plain browser post: the full-page refusal card, and the
+    /// row-count proof that the refusal writes nothing.
+    #[tokio::test]
+    async fn the_product_delete_gate_refuses_an_inventory_read_only_principal_and_writes_nothing() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "DEL-GATE").await;
+        let cookie = inventory_read_only_probe(&state).await;
+        let app = crate::routes::router(state.clone());
+        let products_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM products")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/products/delete",
+            &format!("product_id={}", product.id),
+            &[],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html:.400}");
+        assert!(
+            html.contains("Acción no permitida"),
+            "the refusal must speak Spanish: {html:.400}"
+        );
+        assert!(
+            html.contains("inventory.write"),
+            "the refusal must name the missing permission: {html:.400}"
+        );
+
+        let products_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM products")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            products_after, products_before,
+            "a refused delete must write nothing"
+        );
+    }
+
+    /// Category creation is an inventory.write mutation, not a read.
+    #[tokio::test]
+    async fn the_category_gate_refuses_an_inventory_read_only_principal() {
+        let state = test_state().await;
+        let cookie = inventory_read_only_probe(&state).await;
+        let app = crate::routes::router(state.clone());
+        let categories_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM categories")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/categories",
+            "name=Denied+Cat",
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html}");
+        let json: serde_json::Value = serde_json::from_str(&html).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.write"),
+            "the HTMX refusal must name inventory.write: {json}"
+        );
+
+        let categories_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM categories")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            categories_after, categories_before,
+            "a refused category create must write nothing"
+        );
+    }
+
+    async fn post_form_with_cookie(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+        cookie: &str,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", cookie);
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();

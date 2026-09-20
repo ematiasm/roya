@@ -13,6 +13,15 @@ use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
 };
 use crate::routes::AppState;
+use crate::security::authz::{
+    InventoryRead, InventoryStockWrite, InventoryWrite, Require,
+};
+
+// S5 enforcement mapping (inventory JSON API): reads → `inventory.read`,
+// product/category/barcode mutations → `inventory.write`, stock movements →
+// `inventory.stock.write`. Every handler declares its own extractor: the
+// module mixes read/write/stock-write on the same paths, so a router-level
+// guard would over-gate the reads.
 
 // ---------------------------------------------------------------------------
 // Request DTOs (JSON, English names)
@@ -127,6 +136,7 @@ pub struct MovementListQuery {
 
 async fn list_categories(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let cats = state.inventory_service.categories.list().await?;
     Ok(Json(serde_json::json!({ "categories": cats })))
@@ -134,6 +144,7 @@ async fn list_categories(
 
 async fn create_category(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     Json(payload): Json<CreateCategoryRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let cat = state
@@ -145,6 +156,7 @@ async fn create_category(
 
 async fn get_category(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let cat = state
@@ -158,6 +170,7 @@ async fn get_category(
 
 async fn update_category(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateCategoryRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
@@ -170,6 +183,7 @@ async fn update_category(
 
 async fn delete_category(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<StatusCode> {
     state.inventory_service.delete_category(id).await?;
@@ -182,6 +196,7 @@ async fn delete_category(
 
 async fn list_products(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Query(q): Query<ProductListQuery>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let products = match q.category_id {
@@ -193,6 +208,7 @@ async fn list_products(
 
 async fn create_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     Json(payload): Json<CreateProductRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let input = NewProduct {
@@ -215,6 +231,7 @@ async fn create_product(
 
 async fn get_product(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let product = state.inventory_service.get_product(id).await?;
@@ -223,6 +240,7 @@ async fn get_product(
 
 async fn update_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateProductRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
@@ -251,6 +269,7 @@ async fn update_product(
 
 async fn delete_product(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<StatusCode> {
     state.inventory_service.delete_product(id).await?;
@@ -259,6 +278,7 @@ async fn delete_product(
 
 async fn get_stock(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let ps = state.inventory_service.product_stock(id).await?;
@@ -267,6 +287,7 @@ async fn get_stock(
 
 async fn list_barcodes(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     state.inventory_service.get_product(id).await?;
@@ -276,6 +297,7 @@ async fn list_barcodes(
 
 async fn add_barcode(
     State(state): State<AppState>,
+    _: Require<InventoryWrite>,
     Path(id): Path<i64>,
     Json(payload): Json<AddBarcodeRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
@@ -289,6 +311,7 @@ async fn add_barcode(
 
 async fn list_movements(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
     Query(q): Query<MovementListQuery>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let movements = match q.product_id {
@@ -309,6 +332,7 @@ async fn list_movements(
 
 async fn create_movement(
     State(state): State<AppState>,
+    _: Require<InventoryStockWrite>,
     Json(payload): Json<CreateMovementRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let input = NewMovement {
@@ -325,6 +349,7 @@ async fn create_movement(
 
 async fn low_stock(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let items = state.inventory_service.low_stock().await?;
     Ok(Json(serde_json::json!({ "low_stock": items })))
@@ -332,6 +357,7 @@ async fn low_stock(
 
 async fn negative_stock(
     State(state): State<AppState>,
+    _: Require<InventoryRead>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let items = state.inventory_service.negative_stock().await?;
     Ok(Json(serde_json::json!({ "negative_stock": items })))
@@ -389,6 +415,208 @@ mod tests {
         // S1b part 1: seed the fixed test session every request will authenticate with.
         test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, allow_stock)
+    }
+
+    async fn send_json(
+        app: axum::Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let req = builder
+            .body(Body::from(
+                body.map(|b| b.to_string()).unwrap_or_default(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    // -- S5 enforcement (AC10): the permission gate on the real handlers ------
+
+    /// A principal holding ONLY `inventory.read` can read the catalogue and is
+    /// refused every mutation, in the JSON shape `/api/*` callers read. The
+    /// seeded shared principal keeps working because it holds everything; the
+    /// probe is a second session built for exactly this set.
+    #[tokio::test]
+    async fn ac10_an_inventory_read_only_principal_reads_and_is_refused_the_writes() {
+        let state = test_state(true).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+            .await
+            .unwrap();
+        let probe_cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        // The read the probe is allowed: the catalogue answers normally.
+        let (st, _) = send_json(
+            app.clone(),
+            "GET",
+            "/api/products",
+            Some(&probe_cookie),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "inventory.read must open the reads");
+
+        // Product mutation: the JSON refusal names the missing code.
+        let (st, v) = send_json(
+            app.clone(),
+            "POST",
+            "/api/products",
+            Some(&probe_cookie),
+            Some(product_body("DENIED-1")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.write"),
+            "the refusal must name inventory.write: {v}"
+        );
+
+        // Stock movement: a DIFFERENT gate, named as such.
+        let (st, v) = send_json(
+            app.clone(),
+            "POST",
+            "/api/stock-movements",
+            Some(&probe_cookie),
+            Some(movement_body(1, "2", "In", "Initial")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert!(
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("inventory.stock.write"),
+            "the refusal must name inventory.stock.write: {v}"
+        );
+    }
+
+    /// The refusal writes nothing: the probe's refused movement leaves the
+    /// movements table and the derived stock exactly where they were.
+    #[tokio::test]
+    async fn ac10_an_inventory_refusal_writes_nothing() {
+        let state = test_state(true).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+            .await
+            .unwrap();
+        let probe_cookie = test_support::cookie_for(&probe);
+        // The full-permission principal sets the stage.
+        let app = crate::routes::router(state.clone());
+        let (_, v) = send_json(app.clone(), "POST", "/api/products", Some(test_support::TEST_COOKIE), Some(product_body("NOWRITE"))).await;
+        let pid = v["id"].as_i64().unwrap();
+        let (st, _) = send_json(
+            app.clone(),
+            "POST",
+            "/api/stock-movements",
+            Some(test_support::TEST_COOKIE),
+            Some(movement_body(pid, "7", "In", "Initial")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+
+        let movements_before: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM stock_movements")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let (st, before) = send_json(
+            app.clone(),
+            "GET",
+            &format!("/api/products/{pid}/stock"),
+            Some(&probe_cookie),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        let (st, v) = send_json(
+            app.clone(),
+            "POST",
+            "/api/stock-movements",
+            Some(&probe_cookie),
+            Some(movement_body(pid, "3", "In", "Purchase")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+        let movements_after: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM stock_movements")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            movements_after, movements_before,
+            "a refused request must write no movement"
+        );
+        let (st, after) = send_json(
+            app.clone(),
+            "GET",
+            &format!("/api/products/{pid}/stock"),
+            Some(&probe_cookie),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            after["stock"], before["stock"],
+            "the derived stock must not move"
+        );
+    }
+
+    /// A principal holding the permission gets its normal status on the very
+    /// same endpoints: the gate is about the SET, not the route.
+    #[tokio::test]
+    async fn ac10_the_holding_principal_gets_the_normal_answer() {
+        let state = test_state(true).await;
+        let token = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["inventory.read", "inventory.write", "inventory.stock.write"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&token);
+        let app = crate::routes::router(state.clone());
+
+        let (st, v) = send_json(app.clone(), "POST", "/api/products", Some(&cookie), Some(product_body("HOLDER-1"))).await;
+        assert_eq!(st, StatusCode::CREATED, "{v}");
+        let pid = v["id"].as_i64().unwrap();
+        let (st, _) = send_json(
+            app.clone(),
+            "POST",
+            "/api/stock-movements",
+            Some(&cookie),
+            Some(movement_body(pid, "5", "In", "Initial")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+    }
+
+    /// The gate runs FIRST: an anonymous request keeps the deny-by-default
+    /// refusal (401 JSON), never the permission refusal — the order of the
+    /// two gates is part of the contract.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state.clone());
+        let (st, v) = send_json(app.clone(), "GET", "/api/products", None, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        assert_eq!(v["error"].as_str(), Some("unauthorized"), "{v}");
     }
 
     async fn post_json(app: axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {

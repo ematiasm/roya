@@ -14,6 +14,16 @@ use crate::error::{AppError, AppResult};
 use crate::models::{PaymentMethod, TransactionKind};
 use crate::repositories::AccountRepository;
 use crate::routes::AppState;
+use crate::security::authz::{
+    DashboardRead, FinanceMethodsManage, FinanceRead, FinanceWrite, Require,
+};
+
+// S5 enforcement mapping (dashboard + finance HTML/HTMX): the dashboard reads
+// `dashboard.read`; finance reads `finance.read`; transaction mutations
+// `finance.write`; the account/method allowlist and account creation
+// `finance.methods.manage` (seeded description: "Administrar cuentas y medios
+// de pago" — the detail page itself is a finance READ and stays open to
+// read-only operators; the handler, not the markup, is the enforcement).
 
 // ---------------------------------------------------------------------------
 // Askama templates
@@ -109,6 +119,7 @@ where
 
 async fn dashboard(
     State(state): State<AppState>,
+    _: Require<DashboardRead>,
 ) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
     let total_balance = state.account_service.total_balance().await?;
@@ -129,6 +140,7 @@ async fn dashboard(
 
 async fn account_detail(
     State(state): State<AppState>,
+    _: Require<FinanceRead>,
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, AppError> {
@@ -237,6 +249,7 @@ pub struct CreateTransactionForm {
 
 async fn web_create_account(
     State(state): State<AppState>,
+    _: Require<FinanceMethodsManage>,
     headers: HeaderMap,
     Form(form): Form<CreateAccountForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -276,6 +289,7 @@ async fn web_create_account(
 
 async fn web_update_payment_methods(
     State(state): State<AppState>,
+    _: Require<FinanceMethodsManage>,
     Path(id): Path<i64>,
     Form(form): Form<UpdatePaymentMethodsForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -289,6 +303,7 @@ async fn web_update_payment_methods(
 
 async fn web_create_transaction(
     State(state): State<AppState>,
+    _: Require<FinanceWrite>,
     headers: HeaderMap,
     Form(form): Form<CreateTransactionForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -334,6 +349,7 @@ async fn web_create_transaction(
 
 async fn web_delete_transaction(
     State(state): State<AppState>,
+    _: Require<FinanceWrite>,
     Path(id): Path<i64>,
 ) -> Result<axum::response::Response, AppError> {
     state.transaction_service.delete(id).await?;
@@ -346,7 +362,10 @@ async fn web_delete_transaction(
 }
 
 // HTMX fragment: account list
-async fn web_account_list(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn web_account_list(
+    State(state): State<AppState>,
+    _: Require<FinanceRead>,
+) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
     let total = state.account_service.total_balance().await?;
     let html = AccountListPartial {
@@ -369,6 +388,7 @@ pub struct TxListQuery {
 
 async fn web_transaction_list(
     State(state): State<AppState>,
+    _: Require<FinanceRead>,
     Query(q): Query<TxListQuery>,
 ) -> Result<Html<String>, AppError> {
     let filter = crate::models::TransactionFilter {
@@ -388,7 +408,10 @@ async fn web_transaction_list(
 }
 
 // HTMX fragment: account options
-async fn web_account_options(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+async fn web_account_options(
+    State(state): State<AppState>,
+    _: Require<FinanceRead>,
+) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
     let html = AccountOptionsPartial { accounts }
         .render()
@@ -445,6 +468,225 @@ mod tests {
         // S1b part 1: seed the fixed test session every request will authenticate with.
         test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, true)
+    }
+
+    // -- S5 enforcement (AC10): the permission gate on the real handlers ------
+
+    /// Same as [`send`], but with an explicit cookie: `None` means the truly
+    /// anonymous request the deny-by-default tests need (the shared
+    /// TEST_COOKIE belongs to the full-permission principal).
+    async fn send_as(
+        app: Router,
+        method: &str,
+        uri: &str,
+        cookie: Option<&str>,
+        content_type: Option<&str>,
+        extra_headers: &[(&str, &str)],
+        body: String,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        if let Some(ct) = content_type {
+            builder = builder.header("content-type", ct);
+        }
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder.body(Body::from(body)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// A principal holding ONLY `finance.read` is refused the finance web
+    /// mutations in the shape each caller reads: an HTMX form gets the JSON
+    /// the global notice box renders, a plain browser post gets the full-page
+    /// refusal card.
+    #[tokio::test]
+    async fn ac10_a_finance_read_only_principal_is_refused_the_web_mutations_in_both_shapes() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["finance.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        // Creating an account over HTMX: JSON naming the allowlist gate.
+        let (status, body) = send_as(
+            app.clone(),
+            "POST",
+            "/web/accounts",
+            Some(&cookie),
+            Some(FORM),
+            &[("HX-Request", "true")],
+            "name=Denied+HTMX".to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("finance.methods.manage"),
+            "the HTMX refusal must name finance.methods.manage: {json}"
+        );
+
+        // The same create as a plain browser post: the HTML refusal card.
+        let (status, body) = send_as(
+            app.clone(),
+            "POST",
+            "/web/accounts",
+            Some(&cookie),
+            Some(FORM),
+            &[],
+            "name=Denied+Page".to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
+        assert!(
+            body.contains("Acción no permitida"),
+            "the refusal must speak Spanish: {body:.400}"
+        );
+        assert!(
+            body.contains("finance.methods.manage"),
+            "the refusal must name the missing permission: {body:.400}"
+        );
+
+        // Recording a transaction over HTMX: its own gate, finance.write.
+        let (status, body) = send_as(
+            app.clone(),
+            "POST",
+            "/web/transactions",
+            Some(&cookie),
+            Some(FORM),
+            &[("HX-Request", "true")],
+            "account_id=1&type=Income&amount=10&date=2024-01-15".to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("finance.write"),
+            "the HTMX refusal must name finance.write: {json}"
+        );
+    }
+
+    /// A principal holding the permission gets its normal status: the
+    /// dashboard opens with `dashboard.read` and the transaction form answers
+    /// its HTMX fragment with `finance.write`.
+    #[tokio::test]
+    async fn ac10_the_holding_principal_gets_the_normal_answer() {
+        let state = test_state().await;
+        let token = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["dashboard.read", "finance.read", "finance.write"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&token);
+        let app = crate::routes::router(state.clone());
+
+        let (status, page) = send_as(app.clone(), "GET", "/", Some(&cookie), None, &[], String::new()).await;
+        assert_eq!(status, StatusCode::OK, "{page:.400}");
+
+        // Stage an account as the shared full-permission principal, then the
+        // holder records the transaction.
+        let (status, _) = send(
+            app.clone(),
+            "POST",
+            "/api/accounts",
+            Some("application/json"),
+            serde_json::json!({"name": "Holder Web"}).to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let account = account_id(&state.pool, "Holder Web").await;
+        let (status, body) = send_as(
+            app.clone(),
+            "POST",
+            "/web/transactions",
+            Some(&cookie),
+            Some(FORM),
+            &[("HX-Request", "true")],
+            format!("account_id={account}&type=Income&amount=30&date=2024-01-15"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+    }
+
+    /// The gate runs FIRST: an anonymous request keeps the deny-by-default
+    /// login redirect, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
+        let app = crate::routes::router(test_state().await);
+        let (status, _) = send_as(app.clone(), "GET", "/", None, None, &[], String::new()).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, _) = send_as(
+            app.clone(),
+            "GET",
+            "/accounts/1",
+            None,
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "every page, same gate");
+    }
+
+    /// The dashboard's own gate, pinned by the correction round: a principal
+    /// WITHOUT `dashboard.read` gets the full-page refusal naming it, and the
+    /// principal that holds it answers 200. (An inventory-only probe, so the
+    /// refusal is this page's gate and not a broken fixture.)
+    #[tokio::test]
+    async fn the_dashboard_gate_refuses_a_principal_without_it_and_opens_with_it() {
+        let state = test_state().await;
+        let reader = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+            .await
+            .unwrap();
+        let holder = test_support::seed_session_with_permissions(&state.pool, &["dashboard.read"])
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = send_as(
+            app.clone(),
+            "GET",
+            "/",
+            Some(&test_support::cookie_for(&reader)),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
+        assert!(
+            body.contains("Acción no permitida"),
+            "the refusal must speak Spanish: {body:.400}"
+        );
+        assert!(
+            body.contains("dashboard.read"),
+            "the refusal must name the missing permission: {body:.400}"
+        );
+
+        let (status, page) = send_as(
+            app,
+            "GET",
+            "/",
+            Some(&test_support::cookie_for(&holder)),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page:.400}");
     }
 
     async fn send(

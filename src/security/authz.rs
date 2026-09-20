@@ -382,10 +382,13 @@ mod tests {
     /// The kernel's test router: the production middleware over two guarded
     /// handlers, built exactly the way `routes::router` builds the real one.
     /// The guarded handlers live here, in the kernel's own test module, so no
-    /// department route gets annotated before its enforcement slice.
+    /// department route gets annotated before its enforcement slice. It seeds
+    /// the PERMISSIONLESS variant of the shared fixture: these tests exercise
+    /// exactly which roles the principal holds, so the automatic protected-role
+    /// grant of `seed_session` would defeat every refusal assertion here.
     async fn guarded_app(roles: &[&str]) -> (axum::Router, AppState) {
         let p = pool().await;
-        test_support::seed_session(&p).await.unwrap();
+        test_support::seed_session_without_roles(&p).await.unwrap();
         let state = test_support::app_state(p);
         // Grant the requested roles to the shared test user, through the real
         // repository write path (self-granted: only the test user exists).
@@ -672,7 +675,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_principal_fails_closed() {
         let p = pool().await;
-        test_support::seed_session(&p).await.unwrap();
+        test_support::seed_session_without_roles(&p).await.unwrap();
         let state = test_support::app_state(p);
         let app = axum::Router::new()
             .route("/kernel-gated", get(gated_page_handler))
@@ -734,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn the_role_repository_reads_roles_counts_holders_and_replaces_grants() {
         let p = pool().await;
-        test_support::seed_session(&p).await.unwrap();
+        test_support::seed_session_without_roles(&p).await.unwrap();
         let repo = SqliteRoleRepository::new(p.clone());
 
         // find_by_code and find_by_id agree, and the row fields survive.
