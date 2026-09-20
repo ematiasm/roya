@@ -299,8 +299,16 @@ pub fn forbidden_response(parts: &Parts, message: String) -> Response {
         return AppError::Forbidden(message).into_response();
     }
     match (ForbiddenTemplate {
-        message,
         nav_key: String::new(),
+        // The shell obeys the same nav rule every page renders: the entries
+        // this principal may read, or the anonymous fallback when the
+        // extensions carry no principal (the fail-closed path).
+        nav: parts
+            .extensions
+            .get::<Principal>()
+            .map(Nav::for_principal)
+            .unwrap_or_else(Nav::anonymous),
+        message,
     })
     .render()
     {
@@ -310,16 +318,138 @@ pub fn forbidden_response(parts: &Parts, message: String) -> Response {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The sidebar's nav view (S7 part 2, AC21)
+// ---------------------------------------------------------------------------
+
+/// One sidebar entry: its template key, EVERY permission code the entry
+/// needs (the gate of the route its href opens, plus the data-owner
+/// permission of any block its label names — an entry that names less shows
+/// its operator a screen the route refuses, one that names more hides a
+/// screen the principal may read), and the sidebar group it renders in.
+/// An empty list means the entry needs no permission (every signed-in
+/// operator may see it). This table is the single place that decides the
+/// mapping entry → permissions; the drift tests below fail when a sidebar
+/// entry has no declared row, a row's code is not in the compiled catalog,
+/// or a principal holding exactly the row's codes is refused the href the
+/// entry opens.
+#[derive(Debug)]
+struct NavEntry {
+    key: &'static str,
+    permissions: &'static [&'static str],
+    group: &'static str,
+}
+
+const NAV_ENTRIES: &[NavEntry] = &[
+    NavEntry { key: "dashboard", permissions: &[DashboardRead::CODE], group: "operation" },
+    NavEntry { key: "sales", permissions: &[SalesRead::CODE], group: "operation" },
+    NavEntry { key: "purchases", permissions: &[PurchasesRead::CODE], group: "operation" },
+    NavEntry { key: "products", permissions: &[InventoryRead::CODE], group: "catalogue" },
+    NavEntry { key: "suppliers", permissions: &[SuppliersRead::CODE], group: "catalogue" },
+    NavEntry { key: "customers", permissions: &[CustomersRead::CODE], group: "catalogue" },
+    // The accounts entry opens `/#accounts`, which is the `/` route's
+    // dashboard section: the route itself declares `dashboard.read`, and the
+    // entry's label names the accounts block, whose data owner is
+    // `finance.read`. The entry carries BOTH, and the dashboard renders the
+    // accounts block conditionally on `finance.read` (web.rs) — the same
+    // shape the suggestions block uses in purchases_web.rs.
+    NavEntry { key: "accounts", permissions: &[DashboardRead::CODE, FinanceRead::CODE], group: "cash" },
+    NavEntry { key: "users", permissions: &[IdentityUsersRead::CODE], group: "account" },
+    NavEntry { key: "roles", permissions: &[IdentityRolesManage::CODE], group: "account" },
+    // No permission gates the password page: every signed-in operator — a
+    // confined session included — must always be able to reach it.
+    NavEntry { key: "password", permissions: &[], group: "account" },
+];
+
+/// What the sidebar renders for one signed-in request: the acting user's name
+/// next to the logout control, and the entries the principal may read. Built by
+/// every full-page handler from the request's principal; the permission
+/// refusal builds it from the request extensions so the refusal's shell obeys
+/// the same rule. Template code never decides visibility: it asks `visible`.
+#[derive(Debug, Clone)]
+pub struct Nav {
+    pub display_name: String,
+    pub username: String,
+    pub must_change_password: bool,
+    visible_keys: std::collections::BTreeSet<&'static str>,
+    visible_groups: std::collections::BTreeSet<&'static str>,
+}
+
+impl Nav {
+    /// The nav view of one principal: an entry is visible exactly when the
+    /// principal holds every permission the mapping declares for it.
+    pub fn for_principal(principal: &Principal) -> Self {
+        Self::from_parts(
+            principal.display_name.clone(),
+            principal.username.clone(),
+            principal.must_change_password,
+            &principal.permissions,
+        )
+    }
+
+    /// The degraded view for a page rendered where no principal exists (the
+    /// fail-closed refusal path): the shell renders, the always-visible entry
+    /// stays, and nothing else is promised.
+    pub fn anonymous() -> Self {
+        Self::from_parts(String::new(), String::new(), false, &Default::default())
+    }
+
+    fn from_parts(
+        display_name: String,
+        username: String,
+        must_change_password: bool,
+        permissions: &std::collections::BTreeSet<String>,
+    ) -> Self {
+        let mut visible_keys: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        let mut visible_groups: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        for entry in NAV_ENTRIES {
+            let allowed = entry.permissions.is_empty()
+                // A no-permission entry is for every signed-in operator.
+                || entry.permissions.iter().all(|code| permissions.contains(*code));
+            if allowed {
+                visible_keys.insert(entry.key);
+                visible_groups.insert(entry.group);
+            }
+        }
+        Self {
+            display_name,
+            username,
+            must_change_password,
+            visible_keys,
+            visible_groups,
+        }
+    }
+
+    /// `true` when the principal may read the entry's screen. The mapping
+    /// table is the only decision; an undeclared key is hidden (and the
+    /// drift test fails on it), never shown.
+    pub fn visible(&self, key: &str) -> bool {
+        self.visible_keys.contains(key)
+    }
+
+    /// `true` when at least one entry of the group is visible, so the sidebar
+    /// never renders an empty group heading.
+    pub fn group_visible(&self, group: &str) -> bool {
+        self.visible_groups.contains(group)
+    }
+}
+
 /// The full-page refusal card. Extends `base.html`, so the app shell — the
-/// navigation the principal may still use — renders around the refusal.
-/// (Navigation gating by permission is S5–S7; until then the sidebar shows
-/// every entry and the handler, not the markup, is what refuses.)
+/// navigation the principal may still use — renders around the refusal, and
+/// the sidebar shows exactly the entries that principal may read (the same
+/// nav view every page renders; the refusal hides nothing extra and promises
+/// nothing extra).
 #[derive(Template)]
 #[template(path = "forbidden.html")]
 struct ForbiddenTemplate {
     /// The sidebar partial's active-entry key; empty so the refusal marks no
     /// entry as current (the shell renders, nothing is highlighted).
     nav_key: String,
+    /// The sidebar's nav view: built from the principal when one is in the
+    /// extensions, the anonymous fallback on the fail-closed path.
+    nav: Nav,
     message: String,
 }
 
@@ -327,24 +457,18 @@ struct ForbiddenTemplate {
 // consumers slice by slice (S5-S7 annotate the department handlers). Until
 // then only the kernel's tests construct `Require`, so the bin target would
 // report the extractor, its refusal shapes and the principal reads behind it
-// as dead code. The const below pins the surface the way the census above
-// pins the catalog — live references, no `#[allow]` markers — and keeps every
+// as dead code. The consts below pin the surface the way the census above
+// pins the catalog — live references, no `#[allow]` markers — and keep every
 // signature compiling: a later slice that changes one of them breaks the
-// build here first.
+// build here first. The principal's identity fields left this list with S7
+// part 2: the sidebar renders `display_name`/`username` and the password page
+// reads `must_change_password`, so they are production-read now.
 static _PIN_REQUIRE_CONSTRUCTED: Require<DashboardRead> = Require {
     _marker: std::marker::PhantomData,
 };
 static _PIN_HAS: fn(&Principal, &str) -> bool = Principal::has;
 static _PIN_HAS_MARKER: fn(&Principal) -> bool = Principal::has_permission::<DashboardRead>;
 static _PIN_REFUSAL: fn(&Parts, String) -> Response = forbidden_response;
-static _PIN_IDENTITY_FIELDS: fn(&Principal) -> (&i64, &String, &String, bool) = |p| {
-    (
-        &p.user_id,
-        &p.username,
-        &p.display_name,
-        p.must_change_password,
-    )
-};
 
 // ---------------------------------------------------------------------------
 // AC10 / AC11 / AC12 / AC20: the kernel's own tests
@@ -492,7 +616,7 @@ mod tests {
             "the refusal must name the missing permission: {html}"
         );
         assert!(
-            html.contains("data-nav=\"dashboard\""),
+            html.contains("data-nav=\"password\""),
             "the refusal page must keep the navigation: {html}"
         );
         assert!(
@@ -987,6 +1111,315 @@ mod tests {
                 .unwrap();
             assert!(row.is_some(), "catalog code {code} must exist in the database");
         }
+    }
+
+    // -- AC21: the nav mapping is declared, and the nav tells the truth ----------
+
+    /// The keys the sidebar partial actually renders (every `nav_item("key"`
+    /// call in `templates/partials/sidebar.html`). Extracted from the file so
+    /// the comparison is against the markup a principal receives, not a
+    /// parallel list that could drift from it.
+    fn sidebar_nav_item_keys() -> Vec<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/partials/sidebar.html");
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let needle = "nav_item(\"";
+        let mut keys = Vec::new();
+        let mut cursor = 0;
+        while let Some(found) = content[cursor..].find(needle) {
+            let start = cursor + found + needle.len();
+            let rest = &content[start..];
+            let end = rest
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated nav_item key in sidebar.html"));
+            keys.push(rest[..end].to_string());
+            cursor = start + end;
+        }
+        keys
+    }
+
+    /// The mapping's static drift discipline, carried over from the
+    /// permission catalog: every sidebar entry's key is declared in
+    /// `NAV_ENTRIES` and vice versa, and every declared code is a catalog
+    /// permission. This is the DECLARATION half only — the behavioral truth
+    /// (that the declared codes actually open the href) lives in the
+    /// invariant test below, which drives the real router.
+    #[test]
+    fn ac21_the_sidebar_renders_exactly_the_declared_entries_with_catalog_codes() {
+        let declared: std::collections::BTreeSet<&str> = NAV_ENTRIES
+            .iter()
+            .map(|entry| entry.key)
+            .chain(["__never_a_sidebar_key__"])
+            .collect();
+        for key in sidebar_nav_item_keys() {
+            assert!(
+                declared.contains(key.as_str()),
+                "sidebar entry {key:?} has no declared nav mapping: add it to \
+                 NAV_ENTRIES in authz.rs with every permission its href and \
+                 named blocks need"
+            );
+        }
+        // The template direction of the same drift: a declared entry with no
+        // sidebar item is a mapping row that decides nothing.
+        let rendered_keys = sidebar_nav_item_keys();
+        let rendered: std::collections::BTreeSet<&str> = rendered_keys
+            .iter()
+            .map(String::as_str)
+            .collect();
+        for entry in NAV_ENTRIES {
+            assert!(
+                rendered.contains(entry.key),
+                "nav mapping declares {entry:?} but the sidebar partial never renders it"
+            );
+        }
+        for entry in NAV_ENTRIES {
+            for code in entry.permissions {
+                assert!(
+                    PERMISSIONS.contains(code),
+                    "nav mapping for {:?} names {} which is not a catalog permission",
+                    entry.key,
+                    code
+                );
+            }
+        }
+    }
+
+    /// The (key, href) pairs the sidebar partial actually renders, extracted
+    /// from `templates/partials/sidebar.html` so the invariant below probes
+    /// the href a real click opens, not a parallel list that could drift.
+    fn sidebar_nav_items() -> Vec<(String, String)> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/partials/sidebar.html");
+        let content =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let needle = "nav_item(\"";
+        let mut items = Vec::new();
+        let mut cursor = 0;
+        while let Some(found) = content[cursor..].find(needle) {
+            let start = cursor + found + needle.len();
+            let rest = &content[start..];
+            let key_end = rest
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated nav_item key in sidebar.html"));
+            let key = &rest[..key_end];
+            let after_key = &rest[key_end + 1..];
+            // The href follows the key after exactly `, "`.
+            let href_needle = ", \"";
+            let href_at = after_key
+                .find(href_needle)
+                .unwrap_or_else(|| panic!("nav_item {key} has no href in sidebar.html"));
+            let href_rest = &after_key[href_at + href_needle.len()..];
+            let href_end = href_rest
+                .find('"')
+                .unwrap_or_else(|| panic!("unterminated nav_item href in sidebar.html"));
+            items.push((key.to_string(), href_rest[..href_end].to_string()));
+            cursor = start + key_end + 1 + href_at + href_needle.len() + href_end;
+        }
+        items
+    }
+
+    /// The HTML marker of the page block an entry's label names, when one
+    /// exists. `accounts` labels the dashboard's accounts card (`/#accounts`
+    /// is the `/` route's section); the block's data owner is `finance.read`,
+    /// and the dashboard renders the card conditionally on that code — the
+    /// invariant uses the marker to prove the second code is load-bearing.
+    /// No other entry's label names a block, so an extra code on any of them
+    /// has nothing to point at and the invariant fails it as over-declared.
+    fn named_block_marker(key: &str) -> Option<&'static str> {
+        match key {
+            "accounts" => Some("id=\"accounts\""),
+            _ => None,
+        }
+    }
+
+    /// The invariant that replaced the table-trusting drift test: **for every
+    /// nav entry, a principal holding exactly the permissions that entry
+    /// declares gets 200 on that entry's href.** One test, every entry,
+    /// present and future: it fails when an entry declares too little (the
+    /// href refuses the exact-declared principal — 2026-09-20's `accounts`
+    /// mismatch, `finance.read` alone against a `dashboard.read` route) and
+    /// when it declares too much: every declared code must be load-bearing,
+    /// meaning a principal holding the declared set MINUS that code either
+    /// gets the route's 403 (the code gates the route) or misses the page
+    /// block the entry's label names (`named_block_marker`). A code for which
+    /// neither holds is over-declared — it hides the entry from a principal
+    /// who may read everything it promises.
+    #[tokio::test]
+    async fn ac21_a_principal_holding_exactly_what_an_entry_declares_opens_its_href() {
+        let items = sidebar_nav_items();
+        for entry in NAV_ENTRIES {
+            let href = items
+                .iter()
+                .find(|(key, _)| key == entry.key)
+                .map(|(_, href)| href.clone())
+                .unwrap_or_else(|| panic!("the sidebar never renders {:?}", entry.key));
+            let db = pool().await;
+            test_support::seed_session(&db).await.unwrap();
+            let declared: Vec<&str> = entry.permissions.to_vec();
+            let exact = test_support::seed_session_with_permissions(&db, &declared)
+                .await
+                .unwrap();
+            // One probe per declared code, holding the set minus that code:
+            // seeded up front because the app state takes the pool over.
+            let mut minus_one = Vec::new();
+            for code in entry.permissions {
+                let reduced: Vec<&str> = declared
+                    .iter()
+                    .copied()
+                    .filter(|held| *held != *code)
+                    .collect();
+                let token =
+                    test_support::seed_session_with_permissions(&db, &reduced)
+                        .await
+                        .unwrap();
+                minus_one.push((code, token));
+            }
+            let state = test_support::app_state(db);
+            let app = crate::routes::router(state);
+
+            // Direction one: the exact-declared principal opens the href.
+            let (status, html) = get_page(&app, &href, &test_support::cookie_for(&exact)).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "nav entry {:?} declares {:?} but GET {href} refuses the exact principal",
+                entry.key,
+                declared
+            );
+            if let Some(marker) = named_block_marker(entry.key) {
+                assert!(
+                    html.contains(marker),
+                    "nav entry {:?} promises the block {marker:?} but the page it opens \
+                     does not render it: {html:.600}",
+                    entry.key
+                );
+            }
+
+            // Direction two: every declared code is load-bearing.
+            for (code, token) in minus_one {
+                let (status, html) =
+                    get_page(&app, &href, &test_support::cookie_for(&token)).await;
+                if status != StatusCode::OK {
+                    // The code gates the route: without it the href refuses.
+                    continue;
+                }
+                match named_block_marker(entry.key) {
+                    Some(marker) => assert!(
+                        !html.contains(marker),
+                        "nav entry {:?} declares {code} but the href opens and the \
+                         named block still renders without it: {code} is \
+                         over-declared and hides nothing",
+                        entry.key
+                    ),
+                    None => panic!(
+                        "nav entry {:?} declares {code} but the href opens without \
+                         it and its label names no block: {code} is over-declared \
+                         and hides a screen the principal may read",
+                        entry.key
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The visible set is computed, not asserted: for any principal, the
+    /// entries it sees are exactly the declared entries whose permission it
+    /// holds, plus the no-permission ones. Both directions covered: a
+    /// limited principal sees few (and never an entry it may not read), the
+    /// full-catalog principal sees all.
+    #[test]
+    fn ac21_the_nav_view_shows_exactly_the_readable_entries() {
+        let catalog: std::collections::BTreeSet<String> =
+            PERMISSIONS.iter().map(|c| c.to_string()).collect();
+        let all_keys = |permissions: &std::collections::BTreeSet<String>| -> Vec<&'static str> {
+            NAV_ENTRIES
+                .iter()
+                .filter(|entry| {
+                    entry.permissions.is_empty()
+                        || entry.permissions.iter().all(|c| permissions.contains(*c))
+                })
+                .map(|entry| entry.key)
+                .collect()
+        };
+
+        // The permissionless principal: only the no-permission entries.
+        let none = Nav::for_principal(&principal_with(std::collections::BTreeSet::new()));
+        assert_eq!(
+            visible_keys(&none),
+            all_keys(&std::collections::BTreeSet::new())
+        );
+
+        // One entry's declared set at a time: the view shows exactly the
+        // entries whose declared set the principal now holds — the entry
+        // itself, plus any entry whose codes it subsumes (e.g. holding
+        // `accounts`' two codes shows the dashboard entry too), and nothing
+        // the set does not cover.
+        for entry in NAV_ENTRIES {
+            if entry.permissions.is_empty() {
+                continue;
+            }
+            let set: std::collections::BTreeSet<String> =
+                entry.permissions.iter().map(|c| c.to_string()).collect();
+            let view = Nav::for_principal(&principal_with(set.clone()));
+            assert_eq!(
+                visible_keys(&view),
+                all_keys(&set),
+                "holding {:?} must show exactly the entries it covers",
+                entry.permissions
+            );
+        }
+
+        // The full catalog: every declared entry.
+        let admin = Nav::for_principal(&principal_with(catalog));
+        for entry in NAV_ENTRIES {
+            assert!(admin.visible(entry.key), "the full catalog must show {entry:?}");
+        }
+    }
+
+    fn principal_with(permissions: std::collections::BTreeSet<String>) -> Principal {
+        let user = User {
+            id: 7,
+            username: "nav-probe".into(),
+            display_name: "Nav Probe".into(),
+            is_active: true,
+            must_change_password: false,
+            last_login_at: None,
+            created_at: chrono::Utc::now().naive_utc(),
+            updated_at: chrono::Utc::now().naive_utc(),
+        };
+        Principal::from_user(&user, permissions)
+    }
+
+    fn visible_keys(nav: &Nav) -> Vec<&'static str> {
+        NAV_ENTRIES
+            .iter()
+            .filter(|entry| nav.visible(entry.key))
+            .map(|entry| entry.key)
+            .collect()
+    }
+
+    /// GET one page of the real router with one cookie, as a browser does.
+    async fn get_page(
+        app: &axum::Router,
+        uri: &str,
+        cookie: &str,
+    ) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
     // -- AC20: departments never touch identity -----------------------------------

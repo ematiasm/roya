@@ -32,7 +32,8 @@ use crate::routes::AppState;
 // mapping and its judgement calls are recorded in
 // openspec/changes/2026-09-18-add-identity-module/tasks.md (S7 section).
 use crate::security::authz::{
-    PurchasesCostsRead, PurchasesCostsWrite, PurchasesCreate, Require, SuppliersRead, SuppliersWrite,
+    Nav, PurchasesCostsRead, PurchasesCostsWrite, PurchasesCreate, Require, SuppliersRead,
+    SuppliersWrite,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,8 @@ pub struct SupplierView {
 struct SuppliersTemplate {
     suppliers: Vec<SupplierView>,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -187,11 +190,13 @@ async fn list_response(state: &AppState, event: &str) -> AppResult<Response> {
 async fn suppliers_page(
     State(state): State<AppState>,
     _: Require<SuppliersRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
 ) -> Result<Html<String>, AppError> {
     let suppliers = supplier_views(&state).await?;
     let tmpl = SuppliersTemplate {
         suppliers,
         nav_key: "suppliers",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,

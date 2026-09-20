@@ -39,7 +39,7 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::models::{Permission, Role, RoleWithHolders};
 use crate::routes::AppState;
-use crate::security::authz::{IdentityRolesManage, Principal, Require};
+use crate::security::authz::{IdentityRolesManage, Nav, Principal, Require};
 
 // ---------------------------------------------------------------------------
 // Views + Askama templates
@@ -50,6 +50,8 @@ use crate::security::authz::{IdentityRolesManage, Principal, Require};
 struct RolesTemplate {
     roles: Vec<RoleWithHolders>,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -139,11 +141,13 @@ async fn list_response(state: &AppState) -> AppResult<Response> {
 async fn roles_page(
     State(state): State<AppState>,
     _: Require<IdentityRolesManage>,
+    principal: axum::Extension<crate::security::authz::Principal>,
 ) -> Result<Html<String>, AppError> {
     let roles = state.identity_service.list_roles_with_holders().await?;
     let tmpl = RolesTemplate {
         roles,
         nav_key: "roles",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(render(tmpl)?))
 }

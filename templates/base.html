@@ -14,7 +14,9 @@
        without it. Default content = the sidebar partial, so every existing
        page is unchanged; the login page (S1b part 2) overrides the block as
        empty — an anonymous visitor on the login card must not see the whole
-       app navigation or the logout button. #}
+       app navigation or the logout button. Every page struct that renders
+       this block carries `nav_key` (the active entry) and `nav` (the S7
+       part 2 nav view the sidebar gates its entries with). #}
     {% block sidebar %}
     {% include "partials/sidebar.html" %}
     {% endblock %}

@@ -21,8 +21,8 @@ use crate::repositories::{
 };
 use crate::routes::AppState;
 use crate::security::authz::{
-    InventoryRead, InventoryStockWrite, InventoryWrite, PurchasesCostsRead, PurchasesCostsWrite,
-    Require,
+    InventoryRead, InventoryStockWrite, InventoryWrite, Nav, PurchasesCostsRead,
+    PurchasesCostsWrite, Require,
 };
 
 // S5 enforcement mapping (products screen). The screen mixes capabilities, so
@@ -50,6 +50,8 @@ struct ProductsTemplate {
     /// Current filter values, so the form reflects a bookmarkable `/products?q=…`.
     filter_q: String,
     filter_category: String,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -217,6 +219,7 @@ fn triggered_after_settle(resp: axum::response::Response, event: &str) -> axum::
 async fn products_page(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Query(q): Query<WebProductFilter>,
 ) -> Result<Html<String>, AppError> {
     let (query, category_id) = q.parsed();
@@ -232,6 +235,7 @@ async fn products_page(
         nav_key: "products",
         filter_q: query,
         filter_category: q.category_id.as_deref().unwrap_or("").trim().to_string(),
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -1191,8 +1195,8 @@ mod tests {
             "the refusal must name the missing permission: {html:.400}"
         );
         assert!(
-            html.contains("data-nav=\"dashboard\""),
-            "the refusal page must keep the navigation shell: {html:.400}"
+            html.contains("data-nav=\"products\""),
+            "the refusal page must keep the navigation shell, and the nav must \n             show what this principal may read (inventory.read, not dashboard): {html:.400}"
         );
     }
 

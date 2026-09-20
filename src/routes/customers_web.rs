@@ -41,7 +41,7 @@ use crate::models::{
     SaleDetail, UpdateCustomer,
 };
 use crate::routes::AppState;
-use crate::security::authz::{CustomersCollect, CustomersRead, CustomersWrite, Require};
+use crate::security::authz::{CustomersCollect, CustomersRead, CustomersWrite, Nav, Require};
 
 // S6 enforcement (AC10): the entity and its derived receivable are read with
 // `customers.read`, the entity is mutated with `customers.write`, and money
@@ -75,6 +75,8 @@ struct CustomersTemplate {
     over_limit: bool,
     drawer_open: bool,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -236,6 +238,7 @@ async fn list_response(state: &AppState, warning: Option<String>) -> AppResult<R
 async fn customers_page(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
 ) -> Result<Html<String>, AppError> {
     let customers = customer_rows(&state).await?;
     let tmpl = CustomersTemplate {
@@ -251,6 +254,7 @@ async fn customers_page(
         over_limit: false,
         drawer_open: false,
         nav_key: "customers",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -263,6 +267,7 @@ async fn customers_page(
 async fn customer_statement_page(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     let customer = state.customer_service.get_customer(id).await?;
@@ -284,6 +289,7 @@ async fn customer_statement_page(
         over_limit,
         drawer_open: true,
         nav_key: "customers",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,

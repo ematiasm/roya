@@ -28,7 +28,9 @@ use crate::routes::AppState;
 // `*_impl` bodies so each registered boundary carries its own real gate. The
 // mapping and its judgement calls are recorded in
 // openspec/changes/2026-09-18-add-identity-module/tasks.md (S7 section).
-use crate::security::authz::{InventoryRead, PurchasesCancel, PurchasesCreate, PurchasesRead, Require};
+use crate::security::authz::{
+    InventoryRead, Nav, PurchasesCancel, PurchasesCreate, PurchasesRead, Require,
+};
 
 // ---------------------------------------------------------------------------
 // Views + Askama templates
@@ -60,6 +62,14 @@ struct PurchasesTemplate {
     filter_number: String,
     filter_from: String,
     filter_to: String,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
+    /// Whether the acting principal may refresh the reorder suggestions
+    /// (`inventory.read`, the gate the suggestions fragment and API carry).
+    /// When false the page renders no Sugerido block at all — the coherent
+    /// half of the old consequence where a `purchases.read`-only principal
+    /// saw suggestions it could not refresh.
+    show_suggestions: bool,
 }
 
 /// The `/purchases/{id}` record page. The page-header values are struct fields,
@@ -79,6 +89,8 @@ struct PurchasePageTemplate {
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -258,24 +270,36 @@ async fn changed_with_picker(
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-/// The purchases page is a single `purchases.read` gate. Deliberate
-/// consequence, same contract as S6's cross-capability dependency: the page
-/// server-renders the reorder suggestions (stock-derived, `inventory.read`
-/// data) and the supplier roster (`suppliers.read` data) its create dialog
-/// needs, so a purchases-only principal sees that embedded context; the
-/// suggestion fragment and the supplier screens themselves refuse it. Seeded
-/// purchase holders (deposito, admin) hold both, so no natural operator is
-/// hit; an AND of the codes is the documented future shape, not a new kernel
-/// type.
+/// The purchases page is a single `purchases.read` gate. The supplier roster
+/// (`suppliers.read` data) stays server-rendered for the create dialog — the
+/// recorded deliberate consequence: a purchases-only principal sees the
+/// roster it needs to record a purchase, and the supplier screens themselves
+/// refuse it. The reorder suggestions are the coherent half: the block now
+/// renders only when the principal holds `inventory.read`, the same gate the
+/// suggestions fragment and API carry, so a purchases-only principal sees no
+/// Sugerido block it could not refresh (S7 part 2 closed the consequence the
+/// part 1 review recorded).
 async fn purchases_page(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Query(query): Query<PurchaseListQuery>,
 ) -> Result<Html<String>, AppError> {
     let purchases = purchase_views(&state, &query.to_filter()).await?;
-    let suggestions = state.purchases_service.suggestions().await?;
-    let has_suggestions =
-        !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
+    // The suggestion block renders only when the principal may refresh it:
+    // the fragment (`/web/purchases/suggestions`) and the API twin are gated
+    // `inventory.read` because the suggestion is stock-derived data, so the
+    // server-rendered block obeys the same gate. A purchases-only principal
+    // sees the purchases list without the Sugerido section, never a block
+    // that answers 403 on refresh.
+    let show_suggestions = principal.has_permission::<InventoryRead>();
+    let (suggestions, has_suggestions) = if show_suggestions {
+        let suggestions = state.purchases_service.suggestions().await?;
+        let has = !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
+        (suggestions, has)
+    } else {
+        (PurchaseSuggestions::default(), false)
+    };
     let suppliers = state.supplier_service.list_suppliers().await?;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = PurchasesTemplate {
@@ -293,6 +317,8 @@ async fn purchases_page(
         filter_number: query.number.trim().to_string(),
         filter_from: query.from.trim().to_string(),
         filter_to: query.to.trim().to_string(),
+        nav: Nav::for_principal(&principal),
+        show_suggestions,
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -363,6 +389,7 @@ fn parse_optional_date_filter(raw: &str) -> Option<NaiveDate> {
 async fn purchase_record_page(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     let context = record_context(&state, id).await?;
@@ -390,6 +417,7 @@ async fn purchase_record_page(
         method_options: context.method_options,
         today: context.today,
         nav_key: "purchases",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -2162,6 +2190,48 @@ mod tests {
                 "{uri} must refuse naming {code}: {html:.300}"
             );
         }
+    }
+
+    // -- S7 part 2: the page and its fragment can no longer disagree ----------
+
+    /// The old consequence (the S7 part 1 review's UX item): a
+    /// `purchases.read`-only principal saw the reorder suggestions
+    /// server-rendered into `/purchases` and was refused them on refresh,
+    /// because the fragment and the API are gated `inventory.read`. Now the
+    /// page renders the Sugerido block only when the principal holds that
+    /// same gate: no block that answers 403 on its own refresh button.
+    #[tokio::test]
+    async fn ac21_the_suggestions_block_hides_from_a_principal_that_cannot_refresh_it() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = get_html_as(app.clone(), "/purchases", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("id=\"suggestion-section\""),
+            "the Sugerido block must not render for a principal the suggestions \
+             fragment would refuse: {html:.600}"
+        );
+        assert!(!html.contains("Sugerido"), "{html:.600}");
+
+        // The same page for a principal holding BOTH codes: the block is back.
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "inventory.read"],
+        )
+        .await
+        .unwrap();
+        let (status, html) =
+            get_html_as(app, "/purchases", Some(&test_support::cookie_for(&holder))).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("id=\"suggestion-section\"") && html.contains("Sugerido"),
+            "a principal that may refresh the suggestions must see the block: {html:.600}"
+        );
     }
 
     /// A principal holding ONLY `purchases.read` opens the reads and is

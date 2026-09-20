@@ -33,7 +33,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::{Role, UserWithRoles};
 use crate::routes::AppState;
 use crate::security::authz::{
-    IdentityRolesManage, IdentityUsersManage, IdentityUsersRead, Principal, Require,
+    IdentityRolesManage, IdentityUsersManage, IdentityUsersRead, Nav, Principal, Require,
 };
 
 // ---------------------------------------------------------------------------
@@ -56,6 +56,8 @@ struct UsersTemplate {
     /// markup hides the button on their row; the handler refuses anyway.
     acting_user_id: i64,
     nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
 }
 
 #[derive(Template)]
@@ -146,6 +148,7 @@ async fn users_page(
         can_manage_roles: principal.has_permission::<IdentityRolesManage>(),
         acting_user_id: principal.user_id,
         nav_key: "users",
+        nav: Nav::for_principal(&principal),
     };
     Ok(Html(render(tmpl)?))
 }
