@@ -23,6 +23,12 @@ use crate::models::{
     PurchaseSuggestions,
 };
 use crate::routes::AppState;
+// S7 enforcement: every registered handler declares the permission its action
+// needs (AC10); the collection adapters and the path handlers share ungated
+// `*_impl` bodies so each registered boundary carries its own real gate. The
+// mapping and its judgement calls are recorded in
+// openspec/changes/2026-09-18-add-identity-module/tasks.md (S7 section).
+use crate::security::authz::{InventoryRead, PurchasesCancel, PurchasesCreate, PurchasesRead, Require};
 
 // ---------------------------------------------------------------------------
 // Views + Askama templates
@@ -252,8 +258,18 @@ async fn changed_with_picker(
 // Page + fragments
 // ---------------------------------------------------------------------------
 
+/// The purchases page is a single `purchases.read` gate. Deliberate
+/// consequence, same contract as S6's cross-capability dependency: the page
+/// server-renders the reorder suggestions (stock-derived, `inventory.read`
+/// data) and the supplier roster (`suppliers.read` data) its create dialog
+/// needs, so a purchases-only principal sees that embedded context; the
+/// suggestion fragment and the supplier screens themselves refuse it. Seeded
+/// purchase holders (deposito, admin) hold both, so no natural operator is
+/// hit; an AND of the codes is the documented future shape, not a new kernel
+/// type.
 async fn purchases_page(
     State(state): State<AppState>,
+    _: Require<PurchasesRead>,
     Query(query): Query<PurchaseListQuery>,
 ) -> Result<Html<String>, AppError> {
     let purchases = purchase_views(&state, &query.to_filter()).await?;
@@ -340,9 +356,13 @@ fn parse_optional_date_filter(raw: &str) -> Option<NaiveDate> {
 
 /// `/purchases/{id}`: a real page inside the shell. The label is the purchase
 /// number or its draft state, and the single header action slot mirrors the
-/// status.
+/// status. Deliberate single-gate consequence (same contract as S6's customer
+/// statement): the record renders only THAT purchase's own data, so the gate
+/// is `purchases.read` alone — a purchases-only principal never reaches the
+/// purchases list or another supplier's documents.
 async fn purchase_record_page(
     State(state): State<AppState>,
+    _: Require<PurchasesRead>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     let context = record_context(&state, id).await?;
@@ -378,6 +398,7 @@ async fn purchase_record_page(
 
 async fn web_purchase_list(
     State(state): State<AppState>,
+    _: Require<PurchasesRead>,
     Query(query): Query<PurchaseListQuery>,
 ) -> AppResult<Response> {
     let view = purchase_views(&state, &query.to_filter()).await?;
@@ -386,13 +407,20 @@ async fn web_purchase_list(
 
 async fn web_purchase_detail(
     State(state): State<AppState>,
+    _: Require<PurchasesRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     let html = render_record(record_context(&state, id).await?, false)?.0;
     Ok(Html(html).into_response())
 }
 
-async fn web_purchase_suggestions(State(state): State<AppState>) -> AppResult<Html<String>> {
+/// The suggestions fragment is stock-derived data (the list the reorder
+/// panel renders): `inventory.read`, the same gate as its JSON twin. The
+/// judgement call and its cost are recorded in the S7 mapping.
+async fn web_purchase_suggestions(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+) -> AppResult<Html<String>> {
     let suggestions = state.purchases_service.suggestions().await?;
     let has_suggestions =
         !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
@@ -511,6 +539,7 @@ fn parse_payment_type(raw: &str) -> AppResult<PaymentType> {
 
 async fn web_create_purchase(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Form(form): Form<CreatePurchaseForm>,
 ) -> AppResult<Response> {
@@ -540,9 +569,19 @@ async fn web_create_purchase(
 
 async fn web_add_line(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
+) -> AppResult<Response> {
+    web_add_line_impl(state, headers, id, form).await
+}
+
+async fn web_add_line_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: AddLineForm,
 ) -> AppResult<Response> {
     let qty = parse_required_decimal(&form.qty, "qty")?;
     let unit_cost = parse_opt_decimal(&form.unit_cost, "unit_cost")?;
@@ -569,15 +608,17 @@ async fn web_add_line(
 /// Collection adapter: the typed-id form posts the purchase id in the body and
 /// delegates to the path-based handler, so both URL shapes keep working.
 async fn web_add_line_collection(
-    state: State<AppState>,
+    State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Form(form): Form<AddLineForm>,
 ) -> AppResult<Response> {
-    web_add_line(state, headers, Path(form.purchase_id), Form(form)).await
+    web_add_line_impl(state, headers, form.purchase_id, form).await
 }
 
 async fn web_update_line(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Path((purchase_id, line_id)): Path<(i64, i64)>,
     Form(form): Form<UpdateLineForm>,
@@ -596,6 +637,7 @@ async fn web_update_line(
 
 async fn web_remove_line(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     Path((purchase_id, line_id)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
     state.purchases_service.remove_line(line_id).await?;
@@ -604,9 +646,19 @@ async fn web_remove_line(
 
 async fn web_confirm_purchase(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<ConfirmPurchaseForm>,
+) -> AppResult<Response> {
+    web_confirm_purchase_impl(state, headers, id, form).await
+}
+
+async fn web_confirm_purchase_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: ConfirmPurchaseForm,
 ) -> AppResult<Response> {
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
     state.purchases_service.confirm(id, method_id).await?;
@@ -617,18 +669,29 @@ async fn web_confirm_purchase(
 }
 
 async fn web_confirm_purchase_collection(
-    state: State<AppState>,
+    State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Form(form): Form<ConfirmPurchaseForm>,
 ) -> AppResult<Response> {
-    web_confirm_purchase(state, headers, Path(form.purchase_id), Form(form)).await
+    web_confirm_purchase_impl(state, headers, form.purchase_id, form).await
 }
 
 async fn web_record_payment(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
+) -> AppResult<Response> {
+    web_record_payment_impl(state, headers, id, form).await
+}
+
+async fn web_record_payment_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: RecordPaymentForm,
 ) -> AppResult<Response> {
     let amount = parse_required_decimal(&form.amount, "amount")?;
     let date = parse_date_or_today(&form.date)?;
@@ -643,18 +706,29 @@ async fn web_record_payment(
 }
 
 async fn web_record_payment_collection(
-    state: State<AppState>,
+    State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Form(form): Form<RecordPaymentForm>,
 ) -> AppResult<Response> {
-    web_record_payment(state, headers, Path(form.purchase_id), Form(form)).await
+    web_record_payment_impl(state, headers, form.purchase_id, form).await
 }
 
 async fn web_cancel_purchase(
     State(state): State<AppState>,
+    _: Require<PurchasesCancel>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<CancelPurchaseForm>,
+) -> AppResult<Response> {
+    web_cancel_purchase_impl(state, headers, id, form).await
+}
+
+async fn web_cancel_purchase_impl(
+    state: AppState,
+    headers: HeaderMap,
+    id: i64,
+    form: CancelPurchaseForm,
 ) -> AppResult<Response> {
     state
         .purchases_service
@@ -667,17 +741,19 @@ async fn web_cancel_purchase(
 }
 
 async fn web_cancel_purchase_collection(
-    state: State<AppState>,
+    State(state): State<AppState>,
+    _: Require<PurchasesCancel>,
     headers: HeaderMap,
     Form(form): Form<CancelPurchaseForm>,
 ) -> AppResult<Response> {
-    web_cancel_purchase(state, headers, Path(form.purchase_id), Form(form)).await
+    web_cancel_purchase_impl(state, headers, form.purchase_id, form).await
 }
 
 /// Edit the draft header in place (dates, invoice, notes); the supplier and the
 /// payment type stay fixed at creation, as the service enforces.
 async fn web_update_purchase_header(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Path(id): Path<i64>,
     Form(form): Form<UpdatePurchaseHeaderForm>,
@@ -706,8 +782,12 @@ async fn web_update_purchase_header(
 /// Seed a Draft pedido from one suggested low-stock product: the service
 /// re-derives the suggestion (chosen supplier, qty, satellite cost) so the form
 /// never decides business values.
+/// One draft pedido seeded from one suggested product: the suggestion is
+/// re-derived by the service (a service composition, never a permission
+/// grant), and the document it creates is a purchase — `purchases.create`.
 async fn web_seed_from_suggestion(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Form(form): Form<SeedSuggestionForm>,
 ) -> AppResult<Response> {
@@ -1998,5 +2078,463 @@ mod tests {
             detail.contains("prod WEB-SUG") && detail.contains("48"),
             "seeded line should show the product name and suggested qty: {detail:.400}"
         );
+    }
+
+    // -- S7 enforcement (AC10): the permission gates on the real handlers ------
+
+    /// Like [`get_html`], but with an explicit cookie: `None` means the truly
+    /// anonymous request (the shared TEST_COOKIE belongs to the
+    /// full-permission principal).
+    async fn get_html_as(
+        app: axum::Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Like [`post_form`], but with an explicit cookie and optional headers:
+    /// an empty `HX-Request` set means the plain browser post the full-page
+    /// refusal shape needs. Returns the full body so refusals can be asserted.
+    async fn post_form_as(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The read gates are real too: a principal WITHOUT `purchases.read` (it
+    /// holds an unrelated permission, so this is not a broken fixture) is
+    /// refused every purchases page and fragment with the full-page refusal
+    /// card. The suggestions fragment names the stock-derived gate instead.
+    #[tokio::test]
+    async fn the_read_gates_refuse_a_principal_without_the_read_permission() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        for (uri, code) in [
+            ("/purchases".to_string(), "purchases.read"),
+            (format!("/purchases/{}", fixture.purchase_id), "purchases.read"),
+            ("/web/purchases".to_string(), "purchases.read"),
+            (
+                format!("/web/purchases/{}", fixture.purchase_id),
+                "purchases.read",
+            ),
+            (
+                "/web/purchases/suggestions".to_string(),
+                "inventory.read",
+            ),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
+            assert!(
+                html.contains("Acción no permitida") && html.contains(code),
+                "{uri} must refuse naming {code}: {html:.300}"
+            );
+        }
+    }
+
+    /// A principal holding ONLY `purchases.read` opens the reads and is
+    /// refused every web mutation, each in the shape its caller reads and
+    /// naming its own code: the draft lifecycle `purchases.create`, paying
+    /// `purchases.create` (the payment is a purchase-side movement), and
+    /// cancelling `purchases.cancel`.
+    #[tokio::test]
+    async fn ac10_a_purchases_read_only_principal_is_refused_the_web_mutations() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        // The reads the probe is allowed: the page, the record and the fragments.
+        for uri in [
+            "/purchases".to_string(),
+            format!("/purchases/{}", fixture.purchase_id),
+            "/web/purchases".to_string(),
+            format!("/web/purchases/{}", fixture.purchase_id),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {html:.200}");
+        }
+
+        // Creating a purchase over HTMX: JSON naming the recording gate.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/purchases",
+            &format!("supplier_id={}&payment_type=Cash", fixture.supplier_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body.contains("purchases.create"),
+            "the HTMX refusal must name purchases.create: {body}"
+        );
+
+        // The same create as a plain browser post: the HTML refusal card.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/purchases",
+            &format!("supplier_id={}&payment_type=Cash", fixture.supplier_id),
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
+        assert!(
+            body.contains("Acción no permitida") && body.contains("purchases.create"),
+            "the refusal must speak Spanish and name the gate: {body:.400}"
+        );
+
+        // Seeding from a suggestion creates a purchase: purchases.create.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/purchases/from-suggestion",
+            "product_id=1&payment_type=Cash",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("purchases.create"), "{body}");
+
+        // The record actions: lines and header are the recording gate.
+        for (uri, body) in [
+            (
+                format!("/web/purchases/{}/lines", fixture.purchase_id),
+                format!("product_id={}&qty=1", fixture.product_id),
+            ),
+            (
+                format!("/web/purchases/{}/header", fixture.purchase_id),
+                "notes=hacked".to_string(),
+            ),
+            (
+                format!("/web/purchases/{}/confirm", fixture.purchase_id),
+                "method_id=".to_string(),
+            ),
+            (
+                format!("/web/purchases/{}/payments", fixture.purchase_id),
+                format!("method_id={}&amount=5&date=2024-05-03", fixture.method_id),
+            ),
+        ] {
+            let (status, body) = post_form_as(
+                app.clone(),
+                &uri,
+                &body,
+                &[("HX-Request", "true")],
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert!(
+                body.contains("purchases.create"),
+                "{uri} must name purchases.create: {body}"
+            );
+        }
+
+        // Line edit and removal, each in its own method (the web routes
+        // register POST for the edit, DELETE for the removal).
+        for (method, uri, body) in [
+            (
+                "POST",
+                format!(
+                    "/web/purchases/{}/lines/{}",
+                    fixture.purchase_id, fixture.line_id
+                ),
+                "qty=9&unit_cost=9",
+            ),
+            (
+                "DELETE",
+                format!(
+                    "/web/purchases/{}/lines/{}",
+                    fixture.purchase_id, fixture.line_id
+                ),
+                "",
+            ),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .header("HX-Request", "true")
+                .header("cookie", &cookie)
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri}");
+            let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                text.contains("purchases.create"),
+                "{method} {uri} must name purchases.create: {text}"
+            );
+        }
+
+        // The cancel is its own tier.
+        let (status, body) = post_form_as(
+            app,
+            &format!("/web/purchases/{}/cancel", fixture.purchase_id),
+            "reason=",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("purchases.cancel"), "{body}");
+    }
+
+    /// The old collection endpoints (id in the body) are separate gated
+    /// boundaries: the adapter declares its own gate and the delegated call is
+    /// a plain function call through the ungated `*_impl` body, so removing
+    /// the ADAPTER's gate is exactly what this test pins (the path endpoints
+    /// pin the inner handlers above).
+    #[tokio::test]
+    async fn the_purchases_collection_adapters_carry_their_own_gate() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "suppliers.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        let cases = [
+            (
+                "/web/purchases/lines",
+                format!(
+                    "purchase_id={}&product_id={}&qty=1",
+                    fixture.purchase_id, fixture.product_id
+                ),
+                "purchases.create",
+            ),
+            (
+                "/web/purchases/confirm",
+                format!("purchase_id={}&method_id=", fixture.purchase_id),
+                "purchases.create",
+            ),
+            (
+                "/web/purchases/payments",
+                format!(
+                    "purchase_id={}&method_id={}&amount=5&date=2024-05-03",
+                    fixture.purchase_id, fixture.method_id
+                ),
+                "purchases.create",
+            ),
+            (
+                "/web/purchases/cancel",
+                format!("purchase_id={}&reason=", fixture.purchase_id),
+                "purchases.cancel",
+            ),
+        ];
+        for (uri, body, code) in cases {
+            let (status, body) = post_form_as(
+                app.clone(),
+                uri,
+                &body,
+                &[("HX-Request", "true")],
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert!(body.contains(code), "{uri} must name {code}: {body}");
+        }
+    }
+
+    /// The refusal writes nothing: the refused creation leaves the purchases
+    /// table where it was, the refused confirmation keeps the draft, and the
+    /// refused payment writes no payment row.
+    #[tokio::test]
+    async fn ac10_the_purchases_web_refusal_writes_nothing() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "suppliers.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let purchases_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchases")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/purchases",
+            &format!("supplier_id={}&payment_type=Cash", fixture.supplier_id),
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.200}");
+        let purchases_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchases")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(purchases_after, purchases_before, "a refused create must write nothing");
+
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/purchases/{}/confirm", fixture.purchase_id),
+            "method_id=",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.purchase.status,
+            crate::models::PurchaseStatus::Draft,
+            "a refused confirm must not flip the status"
+        );
+
+        state
+            .purchases_service
+            .confirm(fixture.purchase_id, None)
+            .await
+            .unwrap();
+        let payments_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchase_payments")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = post_form_as(
+            app,
+            &format!("/web/purchases/{}/payments", fixture.purchase_id),
+            &format!("method_id={}&amount=5&date=2024-05-03", fixture.method_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let payments_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchase_payments")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(payments_after, payments_before, "a refused payment must write nothing");
+    }
+
+    /// A principal holding the permissions gets the normal answers: the
+    /// creation redirects to the new record, the seeded suggestion creates a
+    /// draft, and the record actions answer their fragments.
+    #[tokio::test]
+    async fn ac10_the_purchases_web_holding_principal_gets_the_normal_answer() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &[
+                "purchases.read",
+                "purchases.create",
+                "purchases.cancel",
+                "suppliers.read",
+                "purchases.costs.read",
+                "inventory.read",
+            ],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&holder);
+        let app = crate::routes::router(state.clone());
+
+        // Create: the plain form path redirects to the record.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/purchases",
+            &format!(
+                "supplier_id={}&payment_type=Cash&purchase_date=2024-05-02",
+                fixture.supplier_id
+            ),
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{body:.200}");
+
+        // Confirm, payment and cancel: their normal HTMX fragments.
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/purchases/{}/confirm", fixture.purchase_id),
+            "method_id=",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.300}");
+
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/purchases/{}/payments", fixture.purchase_id),
+            &format!("method_id={}&amount=10&date=2024-05-03", fixture.method_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.300}");
+
+        let (status, _body) = post_form_as(
+            app,
+            &format!("/web/purchases/{}/cancel", fixture.purchase_id),
+            "reason=wrong order",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The gate order must not change: an anonymous request gets the login
+    /// redirect, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let (status, _) = get_html_as(app.clone(), "/purchases", None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let (status, _) = get_html_as(app, "/web/purchases", None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
     }
 }

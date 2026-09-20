@@ -826,3 +826,89 @@ todas las probes que los tests necesitaron.
   `customers.write`), `POST /api/sales` 403 `sales.create`, `POST /api/customer-receipts` 403
   `customers.collect`, `DELETE /api/customers/1` 403 `customers.write` — y el admin sigue en 200.
   `git diff --stat` de la ronda: 4 archivos fuente, +1601/−10, más los dos documentos.
+
+### S7 parte 1 — enforcement de compras y proveedores (T22 parte; ronda de writer, 2026-09-20)
+Branch `feat/enforcement-purchases-suppliers` desde `main` actualizado (checkout ya montado por el
+orquestador). Superficies usadas: `purchases_api.rs`, `purchases_web.rs`, `suppliers_web.rs` y
+`tasks.md` (openspec) más este ledger. `authz.rs`, `test_support.rs`, `models.rs`, `error.rs` y los
+servicios NO cambiaron: `seed_session_with_permissions` sostuvo todas las probes que los tests
+necesitaron.
+
+- **Las 51 gates anotadas** (40 rutas: 21 handlers purchases/suppliers API + 18 purchases web +
+  12 suppliers web; tabla completa y decisiones en `tasks.md`, sección S7 part 1). Per-handler, sin
+  guard router-level; los 4 adapters de colección de purchases web comparten cuerpos `*_impl` SIN gate
+  (mismo refactor de S6) y cada handler registrado declara su propia gate real.
+- **Los cuatro juicios del brief decididos y escritos:** pago a un proveedor = `purchases.create`
+  (movimiento del lado de compras; `suppliers.write` es el tier de la ENTIDAD proveedor; el costo para
+  el tier de proveedores queda escrito — quien administra proveedores pero no registra compras ve la
+  tarjeta de pago y es rechazado al enviar); drawer de proveedor = gate doble `suppliers.read` AND
+  `purchases.costs.read` (los mismos costos que el drawer de producto de S5: un dataset, un par de
+  permisos; el POST de costos conserva `purchases.costs.write`); sugerencias de resurtido =
+  `inventory.read` (dato derivado del stock; el costo — un principal purchases.read-only ve las
+  sugerencias incrustadas en `/purchases` pero le rechazan el fragmento — queda escrito); crear el
+  pedido desde la sugerencia = `purchases.create` (la sugerencia se re-deriva dentro del handler como
+  composición de servicio, nunca un grant). Confirmar compra = `purchases.create` aunque incruste el
+  pago del contado; página/fragmentos de compra = `purchases.read` solo (los documentos propios, forma
+  del estado de cuenta de S6). Ninguna matriz sembrada separa los pares de códigos (ningún rol sembrado
+  sostiene `suppliers.write`), así que ningún operador natural pisa los costos (fail-closed
+  documentado, mismo contrato que S5/S6).
+- **17 tests nuevos** (AC10 sobre los handlers reales): por módulo — probe de solo-lectura que lee todo
+  y es rechazada en cada mutación nombrando su código (JSON para `/api/*` y HTMX, HTML de página
+  completa para el POST de navegador), un probe SIN el permiso de lectura (con un permiso NO
+  relacionado, no el conjunto vacío) que pinnea las gates de lectura — incluido el caso del drawer en
+  suppliers_web —, un holder que obtiene sus estados normales, pruebas de no-escritura (conteos de
+  `purchases`, `suppliers`, `product_supplier_costs`, `purchase_payments` y status que no se voltea),
+  y el test de orden de gates (anónimo → login redirect / 401 JSON, nunca 403 de permiso).
+- **51/51 gates mordieron una por una** (método: quitar UNA gate, observar el test FALLANDO, restaurar;
+  el diff final conserva todas las anotaciones). Detalle por clúster en `tasks.md`. Sin gate sin
+  mordida ni justificación forzada: los cuatro juicios sobrevivieron la revisión de mutaciones sin
+  cambios.
+- Números de la ronda: `cargo test` 587 → **604 passed / 0 failed** (+17); `cargo check --all-targets`
+  0 errores, **56 warnings** (delta 0, método del ledger; la primera pasada expuso un `unused import:
+  PaymentType` en el test nuevo de suppliers_web, arreglado quitando el import — sin atributos);
+  grep de allows vacío; `scripts/e2e.sh -k identity` 4 passed, `-k parties` 9 passed / 1 skipped
+  (probe opt-in de screenshots). Probe en vivo con el binario real (DB desechable,
+  `ROYA_ADMIN_PASSWORD` set): anónimo 303 a `/login?next=%2Fpurchases` y 401 JSON en
+  `/api/purchases`; admin → login 303, `GET /purchases` 200, `GET /suppliers` 200,
+  `POST /web/suppliers` 303 (el proveedor quedó creado); usuario real `compras1` creado y asignado POR
+  LAS PANTALLAS (`POST /web/users` 303, rol `compras_lectura` creado por pantalla con matriz
+  `purchases.read` + `suppliers.read` por `/web/roles/matrix`, asignado por `/web/users/roles`),
+  confinado → `/password` lo desbloquea; después: drawer `/web/suppliers/1/detail` 403 HTML nombrando
+  `purchases.costs.read`, `POST /api/purchases` 403 `purchases.create`,
+  `POST /api/purchases/1/cancel` 403 `purchases.cancel`, `POST /web/suppliers` 403 HTML
+  `suppliers.write` (y NADA escrito: la lista del admin no muestra «Proveedor Negado»),
+  `POST /api/product-supplier-costs` 403 `purchases.costs.write`, `POST /api/supplier-payments` 403
+  `purchases.create` — y el admin sigue en 200.
+- **Queda abierto para S7 parte 2:** nav gating (AC21: el principal en cada struct de página), el
+  dashboard y las pantallas de identidad, el grep de exposición de superficie completa, y la
+  re-medición de cierre del ledger.
+
+### S7-i — compras y proveedores: verificado (SAFE TO COMMIT)
+- Censo del verificador: **51 gates sobre 40 rutas** (21+18+12), **cero handlers registrados sin gate**; S5/S6 intactos
+  (`git diff` solo nombra los tres archivos de rutas y los dos docs).
+- Refactor `*_impl`: los cuatro cuerpos son privados, cada uno se llama exactamente dos veces y solo desde sus dos
+  wrappers registrados; ninguna ruta los nombra. El adapter con la anotación borrada hace fallar su propio test (400 en
+  vez de 403 = el handler corrió).
+- Muestra de mutaciones elegida por el verificador: **8/8** (una lectura por módulo, `purchases.create`,
+  `purchases.cancel`, `purchases.costs.write`, un adapter delegado y el segundo extractor del drawer). Ningún gate
+  sobrevivió a su borrado.
+- Juicios: **A** (pagar = `purchases.create`) es el mejor encaje disponible, no solo defendible: la alternativa
+  (`OR` con `suppliers.write`) dejaría mover dinero a quien solo edita la entidad. **B** el `AND` del drawer queda
+  pinneado en las dos direcciones por su test, pero el orden de los extractores decide qué mensaje sale: se promueve a
+  **regla escrita** en S7-ii. **D** correcto: los valores se re-derivan en el handler, así que un principal que solo
+  crea compras no puede falsificar montos.
+- **MINOR heredado a S7-ii (UX, no confidencialidad):** `/web/purchases/suggestions` exige `inventory.read`, pero
+  `/purchases` renderiza esa misma data server-side para quien tiene `purchases.read`. Consecuencia real: un principal
+  de solo `purchases.read` **ve** las sugerencias y recibe 403 al refrescar el fragmento — pantalla incoherente. S7-ii
+  decide: renderizar el bloque condicionalmente (ya tiene el principal en la plantilla) o alinear el gate del fragmento
+  con el de la página.
+- **NIT documentado:** la separación de niveles del juicio A no la alcanza ninguna matriz sembrada (hoy nadie tiene
+  `suppliers.write`), así que es razonada y fail-closed, no probada con un operador real.
+
+### Agenda de S7-ii (cierre del ledger)
+1. Nav gating (AC21) + nombre del usuario logueado: pasar el `Principal` a las 14 structs de página y al sidebar.
+2. El ítem de UX de las sugerencias de arriba.
+3. Promover a regla escrita el orden de extractores del gate doble (el primero decide el mensaje).
+4. Re-measure del ledger: los dormidos que quedan son `Principal.{username,display_name,must_change_password}`,
+   `role_repo::{count_active_holders,revoke}` y los timestamps de `Role`/`Permission`; el objetivo es **≤56 sin
+   `#[allow]`**, y esta slice debería bajarlo por primera vez desde S4.
