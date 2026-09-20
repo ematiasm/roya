@@ -25,6 +25,15 @@ use crate::models::{
 };
 use crate::repositories::{ProductRepository, ProductSupplierCostRepository};
 use crate::routes::AppState;
+// S7 enforcement: every registered handler declares the permission its action
+// needs (AC10). The drawer detail carries a double gate — it renders
+// per-supplier cost rows, the same data the S5 product drawer gates
+// `purchases.costs.read`, so one dataset never answers two permissions. The
+// mapping and its judgement calls are recorded in
+// openspec/changes/2026-09-18-add-identity-module/tasks.md (S7 section).
+use crate::security::authz::{
+    PurchasesCostsRead, PurchasesCostsWrite, PurchasesCreate, Require, SuppliersRead, SuppliersWrite,
+};
 
 // ---------------------------------------------------------------------------
 // Views + Askama templates
@@ -172,7 +181,13 @@ async fn list_response(state: &AppState, event: &str) -> AppResult<Response> {
 // Page + fragment
 // ---------------------------------------------------------------------------
 
-async fn suppliers_page(State(state): State<AppState>) -> Result<Html<String>, AppError> {
+/// The page is names-only (cost rows live in the drawer), so the page and the
+/// list fragment carry `suppliers.read` alone; the drawer — the surface that
+/// renders the per-supplier costs — is where the costs gate joins in.
+async fn suppliers_page(
+    State(state): State<AppState>,
+    _: Require<SuppliersRead>,
+) -> Result<Html<String>, AppError> {
     let suppliers = supplier_views(&state).await?;
     let tmpl = SuppliersTemplate {
         suppliers,
@@ -183,7 +198,10 @@ async fn suppliers_page(State(state): State<AppState>) -> Result<Html<String>, A
     ))
 }
 
-async fn web_supplier_list(State(state): State<AppState>) -> AppResult<Response> {
+async fn web_supplier_list(
+    State(state): State<AppState>,
+    _: Require<SuppliersRead>,
+) -> AppResult<Response> {
     let suppliers = supplier_views(&state).await?;
     Ok(render_list(suppliers).await?.into_response())
 }
@@ -193,8 +211,18 @@ async fn web_supplier_list(State(state): State<AppState>) -> AppResult<Response>
 /// repository), the pay context (account-owning methods, same source as the
 /// customer collect form), the record-cost context (product list + today) and
 /// that supplier's purchases, each linking to its record.
+///
+/// Double gate, the S5 product drawer's shape: the fragment renders the
+/// supplier's per-supplier cost data, so it needs `suppliers.read` AND
+/// `purchases.costs.read` — the same data reached from the product drawer
+/// answers to the same code. The cost, recorded deliberately: a
+/// suppliers-only principal reads the list but is refused the drawer; the
+/// drawer's purchases card renders that supplier's own documents (the S6
+/// statement-mirror) without a `purchases.read` gate.
 async fn web_supplier_detail(
     State(state): State<AppState>,
+    _: Require<SuppliersRead>,
+    _: Require<PurchasesCostsRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     supplier_detail_html(&state, id).await
@@ -236,6 +264,7 @@ async fn supplier_detail_html(state: &AppState, id: i64) -> AppResult<Html<Strin
 
 async fn web_supplier_edit_form(
     State(state): State<AppState>,
+    _: Require<SuppliersRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     let supplier = state.supplier_service.get_supplier(id).await?;
@@ -294,6 +323,7 @@ pub struct PaySupplierForm {
 
 async fn web_create_supplier(
     State(state): State<AppState>,
+    _: Require<SuppliersWrite>,
     headers: HeaderMap,
     Form(form): Form<SupplierForm>,
 ) -> AppResult<Response> {
@@ -313,6 +343,7 @@ async fn web_create_supplier(
 
 async fn web_update_supplier(
     State(state): State<AppState>,
+    _: Require<SuppliersWrite>,
     headers: HeaderMap,
     Form(form): Form<EditSupplierForm>,
 ) -> AppResult<Response> {
@@ -335,6 +366,7 @@ async fn web_update_supplier(
 
 async fn web_activate_supplier(
     State(state): State<AppState>,
+    _: Require<SuppliersWrite>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     state.supplier_service.set_active(id, true).await?;
@@ -343,6 +375,7 @@ async fn web_activate_supplier(
 
 async fn web_deactivate_supplier(
     State(state): State<AppState>,
+    _: Require<SuppliersWrite>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     state.supplier_service.set_active(id, false).await?;
@@ -351,6 +384,7 @@ async fn web_deactivate_supplier(
 
 async fn web_delete_supplier(
     State(state): State<AppState>,
+    _: Require<SuppliersWrite>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     state.supplier_service.delete_supplier(id).await?;
@@ -359,6 +393,7 @@ async fn web_delete_supplier(
 
 async fn web_record_cost(
     State(state): State<AppState>,
+    _: Require<PurchasesCostsWrite>,
     headers: HeaderMap,
     Form(form): Form<RecordCostForm>,
 ) -> AppResult<Response> {
@@ -390,11 +425,16 @@ async fn web_record_cost(
 
 /// Pay a supplier across their Confirmed purchases, oldest debt first (the
 /// supplier-side mirror of `web_collect_receipt`, without a grouping receipt:
-/// suppliers have no such document). The amount and date parse like the
-/// record-cost form, and the account is derived from the method inside
-/// `pay_supplier`.
+/// suppliers have no such document). Judgement call (S7 mapping): the
+/// payment is a purchase-side movement — it writes `purchase_payments` rows
+/// against purchases and posts the Expense — so the gate is the recording
+/// tier `purchases.create`, NOT `suppliers.write`. The cost to the suppliers
+/// tier is written in the mapping: a principal that manages suppliers but
+/// cannot record purchases sees the pay card (its read gates hold) and is
+/// refused on submit; no seeded matrix separates the pair.
 async fn web_pay_supplier(
     State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
     headers: HeaderMap,
     Form(form): Form<PaySupplierForm>,
 ) -> AppResult<Response> {
@@ -1044,5 +1084,567 @@ mod tests {
             trigger.contains("supplier-paid"),
             "drawer answer must fire supplier-paid, got {trigger:?}"
         );
+    }
+
+    // -- S7 enforcement (AC10): the permission gates on the real handlers ------
+
+    /// Like [`get_html`], but with an explicit cookie: `None` means the truly
+    /// anonymous request (the shared TEST_COOKIE belongs to the
+    /// full-permission principal).
+    async fn get_html_as(
+        app: axum::Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// Like [`post_form`], but returning the full body with an explicit
+    /// cookie and optional headers: an empty `HX-Request` set means the plain
+    /// browser post the full-page refusal shape needs.
+    async fn post_form_as(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+        extra_headers: &[(&str, &str)],
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded");
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::from(body.to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The read gates are real too: a principal WITHOUT `suppliers.read` (it
+    /// holds an unrelated permission, so this is not a broken fixture) is
+    /// refused the page, the list fragment and the edit form with the
+    /// full-page refusal card.
+    #[tokio::test]
+    async fn the_read_gates_refuse_a_principal_without_the_read_permission() {
+        let (state, supplier_id, _product_id) = cost_fixture_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        for uri in [
+            "/suppliers".to_string(),
+            "/web/suppliers".to_string(),
+            format!("/web/suppliers/{supplier_id}/edit-form"),
+            format!("/web/suppliers/{supplier_id}/detail"),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
+            assert!(
+                html.contains("Acción no permitida") && html.contains("suppliers.read"),
+                "{uri} must refuse naming suppliers.read: {html:.300}"
+            );
+        }
+    }
+
+    /// The drawer carries the double gate (the S5 product drawer's shape):
+    /// the per-supplier costs it renders are the SAME data the product drawer
+    /// gates `purchases.costs.read`, so one dataset never answers two
+    /// permissions. A suppliers-only principal is refused naming the costs
+    /// gate; a costs-only principal naming `suppliers.read`; a principal
+    /// holding both reads it like `deposito` does.
+    #[tokio::test]
+    async fn the_supplier_drawer_carries_the_double_gate_like_the_product_drawer() {
+        let (state, supplier_id, _product_id) = cost_fixture_state().await;
+        let app = crate::routes::router(state.clone());
+        let uri = format!("/web/suppliers/{supplier_id}/detail");
+
+        // suppliers.read only: the costs gate refuses, HTMX JSON shape.
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["suppliers.read"])
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri(&uri)
+            .header("HX-Request", "true")
+            .header("cookie", test_support::cookie_for(&probe))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("purchases.costs.read"),
+            "the drawer must refuse a suppliers-only principal naming the costs gate: {json}"
+        );
+
+        // purchases.costs.read only: the suppliers gate refuses.
+        let probe =
+            test_support::seed_session_with_permissions(&state.pool, &["purchases.costs.read"])
+                .await
+                .unwrap();
+        let (status, html) = get_html_as(app.clone(), &uri, Some(&test_support::cookie_for(&probe))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html:.200}");
+        assert!(
+            html.contains("Acción no permitida") && html.contains("suppliers.read"),
+            "the drawer must refuse a costs-only principal naming suppliers.read: {html:.300}"
+        );
+
+        // Both gates held: the drawer opens, like the seeded deposito.
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["suppliers.read", "purchases.costs.read"],
+        )
+        .await
+        .unwrap();
+        let (status, html) = get_html_as(app, &uri, Some(&test_support::cookie_for(&probe))).await;
+        assert_eq!(status, StatusCode::OK, "{html:.200}");
+        assert!(
+            html.contains("supplier-detail-inner"),
+            "the drawer must open for a principal holding both gates: {html:.300}"
+        );
+    }
+
+    /// A principal holding ONLY the read permissions opens the reads and is
+    /// refused every web mutation, each naming its own code: supplier entity
+    /// writes `suppliers.write`, the per-supplier cost record
+    /// `purchases.costs.write` (the same code the product drawer uses), and a
+    /// supplier payment `purchases.create` — the payment is a purchase-side
+    /// movement, the S7 judgement call recorded in the mapping.
+    #[tokio::test]
+    async fn ac10_a_suppliers_read_only_principal_is_refused_the_web_mutations() {
+        let (state, supplier_id, product_id) = cost_fixture_state().await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["suppliers.read", "purchases.costs.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        // The reads the probe is allowed: the page, the fragment, the drawer
+        // and the edit form.
+        for uri in [
+            "/suppliers".to_string(),
+            "/web/suppliers".to_string(),
+            format!("/web/suppliers/{supplier_id}/detail"),
+            format!("/web/suppliers/{supplier_id}/edit-form"),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {html:.200}");
+        }
+
+        // Creating a supplier over HTMX: JSON naming the entity gate.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/suppliers",
+            "name=Denied Supplier",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body.contains("suppliers.write"),
+            "the HTMX refusal must name suppliers.write: {body}"
+        );
+
+        // The same create as a plain browser post: the HTML refusal card.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/suppliers",
+            "name=Denied Supplier",
+            &[],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
+        assert!(
+            body.contains("Acción no permitida") && body.contains("suppliers.write"),
+            "the refusal must speak Spanish and name the gate: {body:.400}"
+        );
+
+        // Edit, activate, deactivate and delete: the entity gate, each in the
+        // shape its caller reads.
+        for (uri, body) in [
+            ("/web/suppliers/edit".to_string(), format!("id={supplier_id}&name=hacked")),
+            (
+                format!("/web/suppliers/{supplier_id}/activate"),
+                String::new(),
+            ),
+            (
+                format!("/web/suppliers/{supplier_id}/deactivate"),
+                String::new(),
+            ),
+        ] {
+            let (status, body) = post_form_as(
+                app.clone(),
+                &uri,
+                &body,
+                &[("HX-Request", "true")],
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {body}");
+            assert!(
+                body.contains("suppliers.write"),
+                "{uri} must name suppliers.write: {body}"
+            );
+        }
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/web/suppliers/{supplier_id}").as_str())
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("suppliers.write"),
+            "the delete refusal must name suppliers.write"
+        );
+
+        // The per-supplier cost record: the costs write tier, from the drawer.
+        let body = format!("product_id={product_id}&supplier_id={supplier_id}&cost=10&date=2024-05-01");
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/supplier-costs",
+            &body,
+            &[("HX-Request", "true"), ("HX-Target", "supplier-drawer-body")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body.contains("purchases.costs.write"),
+            "the refusal must name purchases.costs.write: {body}"
+        );
+
+        // Paying a supplier is a purchase-side movement: purchases.create,
+        // NOT suppliers.write (the S7 judgement call).
+        let body = format!("supplier_id={supplier_id}&method_id=1&amount=5&date=2024-05-03");
+        let (status, body) = post_form_as(
+            app,
+            "/web/supplier-payments",
+            &body,
+            &[("HX-Request", "true"), ("HX-Target", "supplier-drawer-body")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(
+            body.contains("purchases.create"),
+            "the refusal must name purchases.create: {body}"
+        );
+    }
+
+    /// The refusal writes nothing: the refused supplier create leaves the
+    /// suppliers table where it was, the refused cost records no satellite
+    /// row, and a refused delete keeps the row.
+    #[tokio::test]
+    async fn ac10_the_suppliers_web_refusal_writes_nothing() {
+        let (state, supplier_id, product_id) = cost_fixture_state().await;
+        let probe = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["suppliers.read", "purchases.costs.read"],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let suppliers_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM suppliers")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/suppliers",
+            "name=Denied Supplier",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.200}");
+        let suppliers_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM suppliers")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(suppliers_after, suppliers_before, "a refused create must write nothing");
+
+        let costs_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM product_supplier_costs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let body = format!("product_id={product_id}&supplier_id={supplier_id}&cost=10&date=2024-05-01");
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/supplier-costs",
+            &body,
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        let costs_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM product_supplier_costs")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(costs_after, costs_before, "a refused cost must write nothing");
+
+        // A refused delete keeps the supplier row.
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/web/suppliers/{supplier_id}").as_str())
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let still: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM suppliers WHERE id = ?")
+            .bind(supplier_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(still.0, 1, "a refused delete must keep the supplier row");
+    }
+
+    /// A principal holding the permissions gets the normal answers: supplier
+    /// CRUD, the cost record through the drawer, the supplier-level payment
+    /// reducing the balance in place, and the delete of an unused supplier.
+    #[tokio::test]
+    async fn ac10_the_suppliers_web_holding_principal_gets_the_normal_answer() {
+        use crate::models::{NewProduct, NewPurchase, NewSupplier, ProductKind, TransactionKind};
+        use chrono::NaiveDate;
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        // The funded account with its owning Cash method, so a payment can run.
+        let account = state.account_service.create("Caja").await.unwrap();
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(account.id, "Caja")
+            .await
+            .unwrap();
+        let cash = state
+            .payment_method_service
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash")
+            .expect("Cash is seeded")
+            .id;
+        state
+            .transaction_service
+            .create(
+                account.id,
+                TransactionKind::Income,
+                Decimal::from(1000),
+                Some("seed".into()),
+                NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Holder Supplier".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let product = state
+            .inventory_service
+            .create_product(NewProduct {
+                sku: "HOLDER-SUP-P".into(),
+                name: "prod HOLDER-SUP-P".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::ZERO),
+                max_stock: Some(Decimal::from(100)),
+                location: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        // One Confirmed credit purchase: 3 × 25 = 75 due.
+        let purchase = state
+            .purchases_service
+            .create_draft(NewPurchase {
+                supplier_id: supplier.id,
+                payment_type: crate::models::PaymentType::Credit,
+                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
+                supplier_invoice_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .add_line(purchase.id, product.id, Decimal::from(3), Some(Decimal::from(25)))
+            .await
+            .unwrap();
+        state.purchases_service.confirm(purchase.id, None).await.unwrap();
+
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &[
+                "suppliers.read",
+                "suppliers.write",
+                "purchases.costs.read",
+                "purchases.costs.write",
+                "purchases.create",
+            ],
+        )
+        .await
+        .unwrap();
+        let cookie = test_support::cookie_for(&holder);
+        let app = crate::routes::router(state.clone());
+
+        // Create + edit + lifecycle: their normal answers.
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/suppliers",
+            "name=Holder Supplier 2",
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.200}");
+        let (status, body) = post_form_as(
+            app.clone(),
+            "/web/suppliers/edit",
+            &format!("id={}&name=Holder Supplier Renamed", supplier.id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.200}");
+        for uri in [
+            format!("/web/suppliers/{}/activate", supplier.id),
+            format!("/web/suppliers/{}/deactivate", supplier.id),
+        ] {
+            let (status, body) = post_form_as(
+                app.clone(),
+                &uri,
+                "",
+                &[("HX-Request", "true")],
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body:.200}");
+        }
+
+        // Record a cost from the drawer: fresh detail + the trigger.
+        // A later date keeps the satellite's newer-date rule satisfied (the
+        // confirmed purchase's line already set a current cost at 2024-05-02).
+        let body = format!(
+            "product_id={}&supplier_id={}&cost=12.50&date=2024-05-05",
+            product.id, supplier.id
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/supplier-costs")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("HX-Target", "supplier-drawer-body")
+            .header("cookie", &cookie)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(status, StatusCode::OK, "{body:.200}");
+        assert!(body.contains("supplier-detail-inner"), "{body:.200}");
+
+        // Pay 30 of the 75 due from the drawer: the balance drops in place.
+        let body = format!(
+            "supplier_id={}&method_id={cash}&amount=30&date=2024-06-20",
+            supplier.id
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/supplier-payments")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("HX-Target", "supplier-drawer-body")
+            .header("cookie", &cookie)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert_eq!(status, StatusCode::OK, "{body:.200}");
+        assert!(body.contains(">45 <"), "the balance must drop to 45: {body:.400}");
+
+        // Delete a supplier with no rows: its normal list answer.
+        let empty = state
+            .supplier_service
+            .create_supplier(NewSupplier {
+                name: "Empty Supplier".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/web/suppliers/{}", empty.id).as_str())
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The gate order must not change: an anonymous request gets the login
+    /// redirect, never the permission refusal.
+    #[tokio::test]
+    async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
+        let (state, _supplier_id, _product_id) = cost_fixture_state().await;
+        let app = crate::routes::router(state);
+        let (status, _) = get_html_as(app.clone(), "/suppliers", None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        // An HTMX anonymous request is the 401 + HX-Redirect shape, so the
+        // plain browser post is the one that answers the login redirect.
+        let (status, _) = post_form_as(
+            app,
+            "/web/suppliers",
+            "name=Anonymous",
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
     }
 }
