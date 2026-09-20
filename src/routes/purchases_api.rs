@@ -147,15 +147,19 @@ async fn list_suppliers(
 async fn create_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateSupplierRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let supplier = state
         .supplier_service
-        .create_supplier(NewSupplier {
-            name: payload.name,
-            phone: payload.phone,
-            notes: payload.notes,
-        })
+        .create_supplier(
+            principal.user_id,
+            NewSupplier {
+                name: payload.name,
+                phone: payload.phone,
+                notes: payload.notes,
+            },
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(supplier))))
 }
@@ -172,12 +176,14 @@ async fn get_supplier(
 async fn update_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateSupplierRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let supplier = state
         .supplier_service
         .update_supplier(
+            principal.user_id,
             id,
             UpdateSupplier {
                 name: payload.name,
@@ -192,18 +198,20 @@ async fn update_supplier(
 async fn activate_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let supplier = state.supplier_service.set_active(id, true).await?;
+    let supplier = state.supplier_service.set_active(principal.user_id, id, true).await?;
     Ok(Json(serde_json::json!(supplier)))
 }
 
 async fn deactivate_supplier(
     State(state): State<AppState>,
     _: Require<SuppliersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let supplier = state.supplier_service.set_active(id, false).await?;
+    let supplier = state.supplier_service.set_active(principal.user_id, id, false).await?;
     Ok(Json(serde_json::json!(supplier)))
 }
 
@@ -253,11 +261,18 @@ async fn list_costs(
 async fn record_cost(
     State(state): State<AppState>,
     _: Require<PurchasesCostsWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<RecordCostRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let cost = state
         .supplier_service
-        .record_cost(payload.product_id, payload.supplier_id, payload.cost, payload.date)
+        .record_cost(
+            principal.user_id,
+            payload.product_id,
+            payload.supplier_id,
+            payload.cost,
+            payload.date,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(cost))))
 }
@@ -288,11 +303,12 @@ async fn purchase_suggestions(
 async fn create_purchase(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreatePurchaseRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let purchase = state
         .purchases_service
-        .create_draft(NewPurchase {
+        .create_draft(principal.user_id, NewPurchase {
             supplier_id: payload.supplier_id,
             payment_type: payload.payment_type,
             purchase_date: payload.purchase_date,
@@ -317,12 +333,14 @@ async fn get_purchase(
 async fn update_purchase(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdatePurchaseRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     state
         .purchases_service
         .update_draft(
+            principal.user_id,
             id,
             UpdatePurchaseDraft {
                 supplier_id: payload.supplier_id,
@@ -341,12 +359,19 @@ async fn update_purchase(
 async fn add_line(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<AddLineRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let line = state
         .purchases_service
-        .add_line(id, payload.product_id, payload.qty, payload.unit_cost)
+        .add_line(
+            principal.user_id,
+            id,
+            payload.product_id,
+            payload.qty,
+            payload.unit_cost,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(line))))
 }
@@ -354,12 +379,13 @@ async fn add_line(
 async fn update_line(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(line_id): Path<i64>,
     Json(payload): Json<UpdateLineRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let line = state
         .purchases_service
-        .update_line(line_id, payload.qty, payload.unit_cost)
+        .update_line(principal.user_id, line_id, payload.qty, payload.unit_cost)
         .await?;
     Ok(Json(serde_json::json!(line)))
 }
@@ -367,9 +393,10 @@ async fn update_line(
 async fn remove_line(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(line_id): Path<i64>,
 ) -> crate::error::AppResult<StatusCode> {
-    state.purchases_service.remove_line(line_id).await?;
+    state.purchases_service.remove_line(principal.user_id, line_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

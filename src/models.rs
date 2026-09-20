@@ -789,6 +789,11 @@ pub struct Supplier {
     pub phone: Option<String>,
     pub notes: Option<String>,
     pub is_active: bool,
+    /// Audit actor (M5 Phase B, slice S12): who created the supplier and who
+    /// last edited it (an edit or the activate/deactivate toggle). The
+    /// interface resolves it to a display name; it never shows the id.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -807,6 +812,12 @@ pub struct ProductSupplierCost {
     pub is_preferred: bool,
     /// The supplier's own code for this product, stored as TEXT.
     pub supplier_sku: Option<String>,
+    /// Audit actor (M5 Phase B, slice S12): the acting user of the request
+    /// that recorded the cost — a confirm flow stamps the confirming
+    /// request's actor, never a fresh one (AC18) — and, when the row was
+    /// later shifted, refreshed or preferred, that later request's actor.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -916,6 +927,12 @@ pub struct Purchase {
     pub supplier_invoice_no: Option<String>,
     pub notes: String,
     pub cancel_reason: Option<String>,
+    /// Audit actor (M5 Phase B, slice S12): who created the purchase and who
+    /// last edited it (a header edit, a line change, the confirm or the
+    /// cancel). A line adds no columns of its own: it inherits the purchase's
+    /// actor.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
     pub confirmed_at: Option<chrono::NaiveDateTime>,
@@ -953,6 +970,13 @@ pub struct PurchasePayment {
     pub transaction_id: Option<i64>,
     /// Refund transaction created when the purchase was cancelled, if any.
     pub refund_transaction_id: Option<i64>,
+    /// Audit actor (M5 Phase B, slice S12): the acting user of the request
+    /// that recorded the payment — for a cash confirm, the confirming
+    /// request's actor; for a supplier payment, the payment request's actor —
+    /// never a fresh one (AC18). `updated_by` is the user who linked a refund
+    /// to it, when the purchase was cancelled.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
 }
 

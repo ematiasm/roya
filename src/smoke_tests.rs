@@ -6280,3 +6280,572 @@ async fn audit_the_customer_statement_shows_the_actor_display_name() {
         "the interface never renders a raw user id: {page}"
     );
 }
+
+
+
+// ---------------------------------------------------------------------------
+// AC19 (purchases/suppliers audit, M5 Phase B slice S12): the upgrade sequence
+// on the four rebuilt tables — a database built with the migrations up to 32,
+// business rows in suppliers/product_supplier_costs/purchases/purchase_payments
+// and no user beyond the sentinel.
+// ---------------------------------------------------------------------------
+
+/// A pool with the migration chain stopped just after the sales/customers
+/// audit (the pre-33 purchases/suppliers schema is real) plus legacy business
+/// rows planted the way pre-audit code wrote them: no created_by column
+/// exists to fill.
+async fn upgraded_pool_with_legacy_purchases_and_supplier_rows()
+    -> ((i64, i64, i64, i64), sqlx::SqlitePool) {
+    let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run_to(20240101000032, &pool).await.unwrap();
+
+    // The sentinel exists by now (the seeded payment methods made migration 30
+    // attribute something): the finance rows the audit needs are real.
+    let sentinel: (i64,) =
+        sqlx::query_as("SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let users_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users_before.0, 1, "no user beyond the sentinel before the upgrade");
+
+    // A product for the cost satellite (migration 31 already gave products
+    // their audit columns, so the plant carries the sentinel).
+    let product_id: (i64,) = sqlx::query_as(
+        "INSERT INTO products (sku, name, kind, unit, sale_price, cost_price, track_stock, created_by) \
+         VALUES ('LEGACY-P', 'legacy product', 'Product', 'un', '10', '5', 0, ?) RETURNING id",
+    )
+    .bind(sentinel.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let supplier_id: (i64,) = sqlx::query_as(
+        "INSERT INTO suppliers (name, phone, notes, is_active) \
+         VALUES ('Legacy Supplier', '555', 'legacy', 1) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let cost_id: (i64,) = sqlx::query_as(
+        "INSERT INTO product_supplier_costs \
+         (product_id, supplier_id, current_cost, current_cost_updated_at) \
+         VALUES (?, ?, '7.50', '2024-05-01') RETURNING id",
+    )
+    .bind(product_id.0)
+    .bind(supplier_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let account_id: (i64,) = sqlx::query_as(
+        "INSERT INTO accounts (name, created_by) VALUES ('legacy purchase wallet', ?) RETURNING id",
+    )
+    .bind(sentinel.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let purchase_id: (i64,) = sqlx::query_as(
+        "INSERT INTO purchases (purchase_number, supplier_id, status, payment_type, purchase_date, due_date) \
+         VALUES ('2024-PURCH-000001', ?, 'Confirmed', 'Credit', '2024-05-02', '2024-06-01') RETURNING id",
+    )
+    .bind(supplier_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) \
+         VALUES (?, ?, '2', '7.50')",
+    )
+    .bind(purchase_id.0)
+    .bind(product_id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let payment_id: (i64,) = sqlx::query_as(
+        "INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date) \
+         VALUES (?, ?, 1, '5', '2024-05-10') RETURNING id",
+    )
+    .bind(purchase_id.0)
+    .bind(account_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    (
+        (supplier_id.0, cost_id.0, purchase_id.0, payment_id.0),
+        pool,
+    )
+}
+
+/// The upgrade attributes every pre-existing row of the four tables to the
+/// sentinel it REUSES, loses no row and no id, and leaves `created_by` NOT NULL
+/// on all four — a future write that omits the actor is refused by the
+/// database. The rebuilt tables keep their backstops: the name/number/pair
+/// UNIQUEs, the CHECKs, the RESTRICT foreign keys and the partial unique
+/// preferred index all still refuse what they refused before.
+#[tokio::test]
+async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_system_sentinel() {
+    let (legacy, pool) = upgraded_pool_with_legacy_purchases_and_supplier_rows().await;
+    let (supplier_id, cost_id, purchase_id, payment_id) = legacy;
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let sentinel = test_support::audit_actor_id(&pool).await.unwrap();
+
+    // Rows preserved, ids preserved, zero unattributed: every legacy row is
+    // exactly where it was, pointing at the reused sentinel.
+    for (table, id) in [
+        ("suppliers", supplier_id),
+        ("product_supplier_costs", cost_id),
+        ("purchases", purchase_id),
+        ("purchase_payments", payment_id),
+    ] {
+        let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ? AND created_by = ?"
+        )))
+        .bind(id)
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0, 1,
+            "{table}: the legacy row survived with its id, attributed to the reused sentinel"
+        );
+    }
+    for table in ["suppliers", "product_supplier_costs", "purchases", "purchase_payments"] {
+        let unattributed: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE created_by IS NULL OR created_by != ?"
+        )))
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unattributed.0, 0, "{table}: no row lost its actor");
+    }
+
+    // Exactly one sentinel: the REUSE path never duplicated the account.
+    let sentinels: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE username = 'sistema' COLLATE NOCASE")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sentinels.0, 1, "the reuse path never created a second sentinel");
+
+    // `created_by` is NOT NULL on all four rebuilt tables: a write that omits
+    // the actor is refused by the database.
+    for (table, sql) in [
+        ("suppliers", "INSERT INTO suppliers (name) VALUES ('no-actor')"),
+        (
+            "purchases",
+            "INSERT INTO purchases (supplier_id, status, payment_type, purchase_date) \
+             VALUES (1, 'Draft', 'Cash', '2024-01-01')",
+        ),
+        (
+            "purchase_payments",
+            "INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date) \
+             VALUES (1, 1, 1, '1', '2024-01-01')",
+        ),
+        (
+            "product_supplier_costs",
+            "INSERT INTO product_supplier_costs \
+             (product_id, supplier_id, current_cost, current_cost_updated_at) \
+             VALUES (1, 1, '1', '2024-01-01')",
+        ),
+    ] {
+        let refused = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .execute(&pool)
+            .await;
+        assert!(
+            refused.is_err(),
+            "{table}: created_by is NOT NULL after the rebuild"
+        );
+    }
+
+    // The rebuilt tables keep their live constraints: a runtime probe for each
+    // declaration the originals carried.
+    // suppliers: the UNIQUE name and the is_active CHECK.
+    let dup_name = sqlx::query("INSERT INTO suppliers (name, created_by) VALUES ('Legacy Supplier', 1)")
+        .execute(&pool)
+        .await;
+    assert!(
+        dup_name.is_err(),
+        "suppliers: the UNIQUE name survived the rebuild"
+    );
+    let bad_active =
+        sqlx::query("INSERT INTO suppliers (name, is_active, created_by) VALUES ('bad-active', 2, 1)")
+            .execute(&pool)
+            .await;
+    assert!(
+        bad_active.is_err(),
+        "suppliers: the is_active CHECK survived the rebuild"
+    );
+    // product_supplier_costs: the (product, supplier) UNIQUE pair, the CHECK on
+    // is_preferred and the partial unique one-preferred index.
+    let dup_pair = sqlx::query(
+        "INSERT INTO product_supplier_costs \
+         (product_id, supplier_id, current_cost, current_cost_updated_at, created_by) \
+         VALUES (1, 1, '9', '2024-06-01', ?)",
+    )
+    .bind(sentinel)
+    .execute(&pool)
+    .await;
+    assert!(
+        dup_pair.is_err(),
+        "product_supplier_costs: the (product, supplier) UNIQUE pair survived"
+    );
+    let second_supplier: (i64,) = sqlx::query_as(
+        "INSERT INTO suppliers (name, created_by) VALUES ('legacy supplier two', ?) RETURNING id",
+    )
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let bad_preferred = sqlx::query(
+        "UPDATE product_supplier_costs SET is_preferred = 2 WHERE id = ?",
+    )
+    .bind(cost_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        bad_preferred.is_err(),
+        "product_supplier_costs: the is_preferred CHECK survived"
+    );
+    sqlx::query("UPDATE product_supplier_costs SET is_preferred = 1 WHERE id = ?")
+        .bind(cost_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A second preferred row for the SAME product hits the partial unique
+    // index (the product keeps at most one preferred supplier, now rebuilt).
+    sqlx::query(
+        "INSERT INTO product_supplier_costs \
+         (product_id, supplier_id, current_cost, current_cost_updated_at, created_by) \
+         VALUES (1, ?, '9', '2024-06-01', ?)",
+    )
+    .bind(second_supplier.0)
+    .bind(sentinel)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second_preferred = sqlx::query(
+        "UPDATE product_supplier_costs SET is_preferred = 1 \
+         WHERE product_id = 1 AND supplier_id = ?",
+    )
+    .bind(second_supplier.0)
+    .execute(&pool)
+    .await;
+    assert!(
+        second_preferred.is_err(),
+        "product_supplier_costs: the one-preferred-per-product partial unique index survived"
+    );
+    // purchases: the status/payment_type CHECKs and the UNIQUE purchase_number.
+    let bad_status = sqlx::query(
+        "INSERT INTO purchases (supplier_id, status, payment_type, purchase_date, created_by) \
+         VALUES (1, 'Shipped', 'Cash', '2024-01-01', ?)",
+    )
+    .bind(sentinel)
+    .execute(&pool)
+    .await;
+    assert!(
+        bad_status.is_err(),
+        "purchases: the status CHECK survived the rebuild"
+    );
+    let bad_payment_type = sqlx::query(
+        "INSERT INTO purchases (supplier_id, status, payment_type, purchase_date, created_by) \
+         VALUES (1, 'Draft', 'Barter', '2024-01-01', ?)",
+    )
+    .bind(sentinel)
+    .execute(&pool)
+    .await;
+    assert!(
+        bad_payment_type.is_err(),
+        "purchases: the payment_type CHECK survived the rebuild"
+    );
+    let dup_number = sqlx::query(
+        "INSERT INTO purchases (purchase_number, supplier_id, status, payment_type, purchase_date, created_by) \
+         VALUES ('2024-PURCH-000001', 1, 'Draft', 'Cash', '2024-01-01', ?)",
+    )
+    .bind(sentinel)
+    .execute(&pool)
+    .await;
+    assert!(
+        dup_number.is_err(),
+        "purchases: the UNIQUE purchase_number survived the rebuild"
+    );
+    // purchase_payments: the RESTRICT purchase/account/method references.
+    let unknown_purchase = sqlx::query(
+        "INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, created_by) \
+         VALUES (99999, 1, 1, '1', '2024-01-01', ?)",
+    )
+    .bind(sentinel)
+    .execute(&pool)
+    .await;
+    assert!(
+        unknown_purchase.is_err(),
+        "purchase_payments: the purchase FK survived the rebuild"
+    );
+    let delete_referenced_supplier =
+        sqlx::query("DELETE FROM suppliers WHERE id = ?")
+            .bind(supplier_id)
+            .execute(&pool)
+            .await;
+    assert!(
+        delete_referenced_supplier.is_err(),
+        "suppliers: the RESTRICT from purchases/cost rows survived the rebuild"
+    );
+
+    // The re-enabled foreign keys find the same graph that existed before:
+    // no violation anywhere.
+    let violations: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+
+    // The RESTRICT audit foreign key holds the sentinel in place for these
+    // tables too: deleting it is refused and the row survives.
+    let refused = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(sentinel)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        "the audit FK refuses the deletion: {refused}"
+    );
+    let still_there: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(still_there.0, 1);
+}
+
+/// The defensive path: migration 33 REUSES the sentinel migration 30 created
+/// and only creates one if it is somehow absent. This test makes it absent —
+/// every table that references the sentinel is emptied and the account deleted
+/// after migration 32 — plants legacy purchases/suppliers rows (the only ones
+/// of the four that can exist without any user: a purchase needs a supplier,
+/// and neither references a user), and runs the rest of the chain.
+#[tokio::test]
+async fn ac19_the_purchases_migration_recreates_a_missing_sentinel() {
+    let pool = upgraded_pool_with_legacy_purchases_and_supplier_rows().await.1;
+    // Make the sentinel absent: empty the tables that reference it (RESTRICT
+    // refuses a direct delete), children of the business rows first.
+    sqlx::query("DELETE FROM purchase_payments").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM purchase_lines").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM product_supplier_costs").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM purchases").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM suppliers").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM sale_payments").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM sale_lines").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM customer_receipts").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM sales").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM transactions").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM payment_methods").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM accounts").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM stock_movements").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM product_barcodes").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM products").execute(&pool).await.unwrap();
+    // The category tree is self-referencing: unparent first, then erase.
+    sqlx::query("UPDATE categories SET parent_id = NULL").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM categories").execute(&pool).await.unwrap();
+    // Customers reference the sentinel too (migration 32), and the walk-in
+    // trigger refuses its deletion, so the trigger goes first.
+    sqlx::query("DROP TRIGGER IF EXISTS trg_customers_walkin_no_delete").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM customers").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM users").execute(&pool).await.unwrap();
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before.0, 0, "the sentinel is gone when migration 33 runs");
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before.0, 0, "the sentinel is gone when migration 33 runs");
+
+    // The legacy rows this path can attribute: a supplier and a purchase on
+    // it. Neither references a user before migration 33 runs, so both survive
+    // the erasure and give the migration something to attribute.
+    let (supplier_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO suppliers (name, phone, notes, is_active) \
+         VALUES ('Defensive Supplier', '555', NULL, 1) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (purchase_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO purchases (purchase_number, supplier_id, status, payment_type, purchase_date, due_date) \
+         VALUES ('2024-PURCH-000009', ?, 'Confirmed', 'Credit', '2024-05-02', '2024-06-01') RETURNING id",
+    )
+    .bind(supplier_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let sentinel = test_support::audit_actor_id(&pool).await.unwrap();
+    for (table, id) in [("suppliers", supplier_id), ("purchases", purchase_id)] {
+        let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ? AND created_by = ?"
+        )))
+        .bind(id)
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0, 1,
+            "{table}: the defensive sentinel exists and owns the legacy row"
+        );
+    }
+    // The defensive sentinel is the same shape migration 30's is: inactive,
+    // roleless, unusable credential.
+    let sentinel_row: (i64, i64) = sqlx::query_as(
+        "SELECT is_active, must_change_password FROM users WHERE id = ?",
+    )
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sentinel_row.0, 0, "the recreated sentinel is inactive");
+    let roles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = ?")
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(roles.0, 0, "the recreated sentinel holds no role");
+}
+
+// ---------------------------------------------------------------------------
+// AC18 (purchases/suppliers audit, slice S12): the display, at the wiring layer.
+// ---------------------------------------------------------------------------
+
+/// The purchase record page shows the actor as a DISPLAY NAME, never an id:
+/// the shared session user creates the draft and its line, a second probe
+/// user confirms it, and the page renders both names — "Registrado por" for
+/// the creator and "Actualizado por" for the confirming edit.
+#[tokio::test]
+async fn audit_the_purchase_record_shows_the_actor_display_name() {
+    let (app, pool) = test_app().await;
+    let supplier = create_supplier_via_web(&app, &pool, "Audit Purchase Supplier").await;
+    let product = create_product_via_web(&app, &pool, "AUD-PURCH-P", "0", "100").await;
+
+    // A Credit draft needs a due date; the confirm then carries no method.
+    let body = format!(
+        "supplier_id={supplier}&payment_type=Credit&purchase_date=2024-05-02&due_date=2024-06-02&supplier_invoice_no=&notes="
+    );
+    let (status, resp) = post_form(&app, "/web/purchases", &body).await;
+    assert_eq!(status, StatusCode::OK, "create purchase draft: {resp:.400}");
+    let purchase_id = purchase_id_by_supplier(&pool, supplier).await;
+
+    let (status, resp) = post_form(
+        &app,
+        &format!("/web/purchases/{purchase_id}/lines"),
+        &format!("product_id={product}&qty=2&unit_cost=7.50"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add line: {resp:.400}");
+
+    // A second principal (display name "Test Probe") holds the purchase
+    // permission and confirms the draft.
+    let probe_token = test_support::seed_session_with_permissions(
+        &pool,
+        &["purchases.read", "purchases.create"],
+    )
+    .await
+    .unwrap();
+    let (status, body) = post_form_with_cookie(
+        &app,
+        &format!("/web/purchases/{purchase_id}/confirm"),
+        "method_id=",
+        &test_support::cookie_for(&probe_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    let (status, page) = get(&app, &format!("/purchases/{purchase_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page.matches("Registrado por Test Admin").count(),
+        1,
+        "the purchase names its creator: {page:.600}"
+    );
+    assert_eq!(
+        page.matches("Actualizado por Test Probe").count(),
+        1,
+        "the confirm names its editor: {page:.600}"
+    );
+    assert!(
+        !page.contains("Registrado por 1"),
+        "the interface never renders a raw user id: {page}"
+    );
+}
+
+/// The supplier drawer shows the SUPPLIER row's attribution as a display
+/// name, labelled "Proveedor registrado por" so the balance and the purchases
+/// below cannot be misread as this person's work.
+#[tokio::test]
+async fn audit_the_supplier_detail_shows_the_actor_display_name() {
+    let (app, pool) = test_app().await;
+    let supplier = create_supplier_via_web(&app, &pool, "Audit Drawer Supplier").await;
+
+    // A second principal (display name "Test Probe") edits the supplier.
+    let probe_token =
+        test_support::seed_session_with_permissions(&pool, &["suppliers.read", "suppliers.write"])
+            .await
+            .unwrap();
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/suppliers/edit",
+        &format!("id={supplier}&name=Renamed+Supplier&phone=555&notes="),
+        &test_support::cookie_for(&probe_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    let (status, page) = get(&app, &format!("/web/suppliers/{supplier}/detail")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page.matches("Proveedor registrado por Test Admin").count(),
+        1,
+        "the drawer names the supplier's creator: {page:.600}"
+    );
+    assert_eq!(
+        page.matches("Actualizado por Test Probe").count(),
+        1,
+        "the edit names its editor: {page:.600}"
+    );
+    assert!(
+        !page.contains("Proveedor registrado por 1"),
+        "the interface never renders a raw user id: {page}"
+    );
+}
+
+/// Helper: the newest purchase for a supplier id, resolved through the
+/// supplier-side read the drawer already uses.
+async fn purchase_id_by_supplier(pool: &sqlx::SqlitePool, supplier_id: i64) -> i64 {
+    let row: (i64,) = sqlx::query_as(
+        "SELECT id FROM purchases WHERE supplier_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(supplier_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    row.0
+}

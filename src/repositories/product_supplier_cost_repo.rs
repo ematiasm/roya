@@ -25,6 +25,8 @@ fn row_to_cost(row: sqlx::sqlite::SqliteRow) -> ProductSupplierCost {
         previous_cost_updated_at: row.get("previous_cost_updated_at"),
         is_preferred: preferred == 1,
         supplier_sku: row.get("supplier_sku"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -47,8 +49,12 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 #[async_trait]
 pub trait ProductSupplierCostRepository: Send + Sync {
     /// First cost for a (product, supplier) pair: current only, no previous.
+    /// `actor` is the acting user's id the service resolved from its request;
+    /// it becomes the row's `created_by` and nothing the request itself can
+    /// supply names it.
     async fn create_cost(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
         cost: Decimal,
@@ -59,6 +65,7 @@ pub trait ProductSupplierCostRepository: Send + Sync {
     /// new cost actually differs from the current one.
     async fn shift_cost(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
         cost: Decimal,
@@ -69,6 +76,7 @@ pub trait ProductSupplierCostRepository: Send + Sync {
     /// survives for the derived alert.
     async fn refresh_cost_date(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
         when: NaiveDate,
@@ -82,10 +90,11 @@ pub trait ProductSupplierCostRepository: Send + Sync {
     /// product atomically (partial unique index allows at most one).
     async fn set_preferred(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
     ) -> AppResult<ProductSupplierCost>;
-    async fn clear_preferred(&self, product_id: i64) -> AppResult<()>;
+    async fn clear_preferred(&self, actor: i64, product_id: i64) -> AppResult<()>;
     async fn count_by_supplier(&self, supplier_id: i64) -> AppResult<i64>;
 }
 
@@ -104,6 +113,7 @@ impl SqliteProductSupplierCostRepository {
 impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
     async fn create_cost(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
         cost: Decimal,
@@ -111,14 +121,15 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
     ) -> AppResult<ProductSupplierCost> {
         let row = sqlx::query(
             r#"INSERT INTO product_supplier_costs
-               (product_id, supplier_id, current_cost, current_cost_updated_at)
-               VALUES (?, ?, ?, ?)
-               RETURNING id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at"#,
+               (product_id, supplier_id, current_cost, current_cost_updated_at, created_by)
+               VALUES (?, ?, ?, ?, ?)
+               RETURNING id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at"#,
         )
         .bind(product_id)
         .bind(supplier_id)
         .bind(cost.to_string())
         .bind(when)
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -127,6 +138,7 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
 
     async fn shift_cost(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
         cost: Decimal,
@@ -136,12 +148,14 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
             r#"UPDATE product_supplier_costs
                SET previous_cost = current_cost,
                    previous_cost_updated_at = current_cost_updated_at,
-                   current_cost = ?, current_cost_updated_at = ?
+                   current_cost = ?, current_cost_updated_at = ?,
+                   updated_by = ?
                WHERE product_id = ? AND supplier_id = ?
-               RETURNING id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at"#,
+               RETURNING id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at"#,
         )
         .bind(cost.to_string())
         .bind(when)
+        .bind(actor)
         .bind(product_id)
         .bind(supplier_id)
         .fetch_optional(&self.pool)
@@ -156,17 +170,19 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
 
     async fn refresh_cost_date(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
         when: NaiveDate,
     ) -> AppResult<ProductSupplierCost> {
         let row = sqlx::query(
             r#"UPDATE product_supplier_costs
-               SET current_cost_updated_at = ?
+               SET current_cost_updated_at = ?, updated_by = ?
                WHERE product_id = ? AND supplier_id = ?
-               RETURNING id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at"#,
+               RETURNING id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at"#,
         )
         .bind(when)
+        .bind(actor)
         .bind(product_id)
         .bind(supplier_id)
         .fetch_optional(&self.pool)
@@ -185,7 +201,7 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
         supplier_id: i64,
     ) -> AppResult<Option<ProductSupplierCost>> {
         let row = sqlx::query(
-            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at
+            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at
                FROM product_supplier_costs
                WHERE product_id = ? AND supplier_id = ?"#,
         )
@@ -198,7 +214,7 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<ProductSupplierCost>> {
         let row = sqlx::query(
-            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at
+            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at
                FROM product_supplier_costs WHERE id = ?"#,
         )
         .bind(id)
@@ -209,7 +225,7 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
 
     async fn list_by_product(&self, product_id: i64) -> AppResult<Vec<ProductSupplierCost>> {
         let rows = sqlx::query(
-            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at
+            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at
                FROM product_supplier_costs
                WHERE product_id = ? ORDER BY id"#,
         )
@@ -221,7 +237,7 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
 
     async fn list_by_supplier(&self, supplier_id: i64) -> AppResult<Vec<ProductSupplierCost>> {
         let rows = sqlx::query(
-            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at
+            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at
                FROM product_supplier_costs
                WHERE supplier_id = ? ORDER BY id"#,
         )
@@ -233,23 +249,28 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
 
     async fn set_preferred(
         &self,
+        actor: i64,
         product_id: i64,
         supplier_id: i64,
     ) -> AppResult<ProductSupplierCost> {
         // Two statements inside one transaction: clear first, then set, so the
         // partial unique index never sees two preferred rows for the product.
+        // Both writes stamp `updated_by`: the demoted row and the promoted one
+        // were each last changed by this request.
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            r#"UPDATE product_supplier_costs SET is_preferred = 0
+            r#"UPDATE product_supplier_costs SET is_preferred = 0, updated_by = ?
                WHERE product_id = ? AND is_preferred = 1"#,
         )
+        .bind(actor)
         .bind(product_id)
         .execute(&mut *tx)
         .await?;
         let res = sqlx::query(
-            r#"UPDATE product_supplier_costs SET is_preferred = 1
+            r#"UPDATE product_supplier_costs SET is_preferred = 1, updated_by = ?
                WHERE product_id = ? AND supplier_id = ?"#,
         )
+        .bind(actor)
         .bind(product_id)
         .bind(supplier_id)
         .execute(&mut *tx)
@@ -262,7 +283,7 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
             )));
         }
         let row = sqlx::query(
-            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_at
+            r#"SELECT id, product_id, supplier_id, current_cost, current_cost_updated_at, previous_cost, previous_cost_updated_at, is_preferred, supplier_sku, created_by, updated_by, created_at
                FROM product_supplier_costs
                WHERE product_id = ? AND supplier_id = ?"#,
         )
@@ -275,11 +296,12 @@ impl ProductSupplierCostRepository for SqliteProductSupplierCostRepository {
         Ok(row_to_cost(row))
     }
 
-    async fn clear_preferred(&self, product_id: i64) -> AppResult<()> {
+    async fn clear_preferred(&self, actor: i64, product_id: i64) -> AppResult<()> {
         sqlx::query(
-            r#"UPDATE product_supplier_costs SET is_preferred = 0
+            r#"UPDATE product_supplier_costs SET is_preferred = 0, updated_by = ?
                WHERE product_id = ? AND is_preferred = 1"#,
         )
+        .bind(actor)
         .bind(product_id)
         .execute(&self.pool)
         .await?;

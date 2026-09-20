@@ -53,6 +53,8 @@ fn row_to_purchase(row: sqlx::sqlite::SqliteRow) -> Purchase {
         supplier_invoice_no: row.get("supplier_invoice_no"),
         notes: row.get("notes"),
         cancel_reason: row.get("cancel_reason"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         confirmed_at: row.get("confirmed_at"),
@@ -84,6 +86,8 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> PurchasePayment {
         date: row.get("date"),
         transaction_id: row.get("transaction_id"),
         refund_transaction_id: row.get("refund_transaction_id"),
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
     }
 }
@@ -105,7 +109,10 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 
 #[async_trait]
 pub trait PurchaseRepository: Send + Sync {
-    async fn create_purchase(&self, input: &NewPurchase) -> AppResult<Purchase>;
+    /// `actor` is the acting user's id the service resolved from its request;
+    /// it becomes the row's `created_by` and nothing the request itself can
+    /// supply names it.
+    async fn create_purchase(&self, actor: i64, input: &NewPurchase) -> AppResult<Purchase>;
     async fn find_purchase(&self, id: i64) -> AppResult<Option<Purchase>>;
     async fn find_purchase_by_number(&self, number: &str) -> AppResult<Option<Purchase>>;
     async fn list_purchases(&self) -> AppResult<Vec<Purchase>>;
@@ -116,12 +123,23 @@ pub trait PurchaseRepository: Send + Sync {
         &self,
         filter: &PurchaseListFilter,
     ) -> AppResult<Vec<Purchase>>;
-    /// Update Draft header fields (service guarantees Draft status).
-    async fn update_draft(&self, id: i64, patch: &UpdatePurchaseDraft) -> AppResult<Purchase>;
-    /// Transition Draft -> Confirmed with assigned number.
-    async fn set_confirmed(&self, id: i64, purchase_number: &str) -> AppResult<Purchase>;
-    /// Transition Draft/Confirmed -> Cancelled.
-    async fn set_cancelled(&self, id: i64, reason: Option<&str>) -> AppResult<Purchase>;
+    /// Update Draft header fields (service guarantees Draft status); the edit
+    /// stamps `updated_by` with the acting user.
+    async fn update_draft(&self, id: i64, actor: i64, patch: &UpdatePurchaseDraft) -> AppResult<Purchase>;
+    /// Transition Draft -> Confirmed with assigned number; the confirming
+    /// request is an edit of the document and stamps `updated_by`.
+    async fn set_confirmed(&self, id: i64, actor: i64, purchase_number: &str) -> AppResult<Purchase>;
+    /// Transition Draft/Confirmed -> Cancelled; the cancelling request stamps
+    /// `updated_by`.
+    async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Purchase>;
+    /// Stamp a purchase's `updated_by`/`updated_at` after a line change: the
+    /// line inherits the purchase's actor (no columns of its own), but the
+    /// document was just edited and the edit is attributed to the request.
+    /// The statement updates whatever id it is given, so the restriction to
+    /// drafts lives in the caller — stated here rather than enforced in SQL,
+    /// because a `WHERE status = 'Draft'` would turn a future misuse into a
+    /// silent no-op instead of a visible edit on the wrong document.
+    async fn touch_draft(&self, id: i64, actor: i64) -> AppResult<Purchase>;
 
     async fn create_line(
         &self,
@@ -137,9 +155,11 @@ pub trait PurchaseRepository: Send + Sync {
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
     /// Create the payment row and link it to the finance transaction it produced
-    /// (`transaction_id`); NULL only for historical rows.
+    /// (`transaction_id`); NULL only for historical rows. The payment carries
+    /// the acting user of the request that produced it (AC18).
     async fn create_payment(
         &self,
+        actor: i64,
         purchase_id: i64,
         account_id: i64,
         method_id: i64,
@@ -151,6 +171,7 @@ pub trait PurchaseRepository: Send + Sync {
     /// payment row it refunds. The original `transaction_id` is left untouched.
     async fn set_payment_refund_transaction(
         &self,
+        actor: i64,
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<PurchasePayment>;
@@ -196,7 +217,7 @@ impl SqlitePurchaseRepository {
 
 #[async_trait]
 impl PurchaseRepository for SqlitePurchaseRepository {
-    async fn create_purchase(&self, input: &NewPurchase) -> AppResult<Purchase> {
+    async fn create_purchase(&self, actor: i64, input: &NewPurchase) -> AppResult<Purchase> {
         let invoice = input.supplier_invoice_no.clone().and_then(|s| {
             let t = s.trim().to_string();
             if t.is_empty() {
@@ -208,9 +229,9 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         let notes = input.notes.clone().unwrap_or_default();
         let row = sqlx::query(
             r#"INSERT INTO purchases
-               (supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes)
-               VALUES (?, 'Draft', ?, ?, ?, ?, ?)
-               RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               (supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, created_by)
+               VALUES (?, 'Draft', ?, ?, ?, ?, ?, ?)
+               RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(input.supplier_id)
         .bind(input.payment_type.to_string())
@@ -218,6 +239,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .bind(input.due_date)
         .bind(invoice)
         .bind(notes)
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -226,7 +248,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
 
     async fn find_purchase(&self, id: i64) -> AppResult<Option<Purchase>> {
         let row = sqlx::query(
-            r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM purchases WHERE id = ?"#,
+            r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM purchases WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -236,7 +258,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
 
     async fn find_purchase_by_number(&self, number: &str) -> AppResult<Option<Purchase>> {
         let row = sqlx::query(
-            r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM purchases WHERE purchase_number = ?"#,
+            r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM purchases WHERE purchase_number = ?"#,
         )
         .bind(number)
         .fetch_optional(&self.pool)
@@ -248,7 +270,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         #[cfg(test)]
         self.tick();
         let rows = sqlx::query(
-            r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at FROM purchases ORDER BY id"#,
+            r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM purchases ORDER BY id"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -262,7 +284,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         #[cfg(test)]
         self.tick();
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT p.id, p.purchase_number, p.supplier_id, p.status, p.payment_type, p.purchase_date, p.due_date, p.supplier_invoice_no, p.notes, p.cancel_reason, p.created_at, p.updated_at, p.confirmed_at, p.cancelled_at FROM purchases p",
+            "SELECT p.id, p.purchase_number, p.supplier_id, p.status, p.payment_type, p.purchase_date, p.due_date, p.supplier_invoice_no, p.notes, p.cancel_reason, p.created_by, p.updated_by, p.created_at, p.updated_at, p.confirmed_at, p.cancelled_at FROM purchases p",
         );
         let has_filter = filter.status.is_some()
             || filter.supplier_ids.is_some()
@@ -305,7 +327,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         Ok(rows.into_iter().map(row_to_purchase).collect())
     }
 
-    async fn update_draft(&self, id: i64, patch: &UpdatePurchaseDraft) -> AppResult<Purchase> {
+    async fn update_draft(&self, id: i64, actor: i64, patch: &UpdatePurchaseDraft) -> AppResult<Purchase> {
         let existing = self
             .find_purchase(id)
             .await?
@@ -335,8 +357,9 @@ impl PurchaseRepository for SqlitePurchaseRepository {
             r#"UPDATE purchases
                SET supplier_id = ?, payment_type = ?, purchase_date = ?, due_date = ?,
                    supplier_invoice_no = ?, notes = ?,
+                   updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(supplier_id)
         .bind(payment_type.to_string())
@@ -344,6 +367,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .bind(due_date)
         .bind(supplier_invoice_no)
         .bind(notes)
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -351,15 +375,17 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         Ok(row_to_purchase(row))
     }
 
-    async fn set_confirmed(&self, id: i64, purchase_number: &str) -> AppResult<Purchase> {
+    async fn set_confirmed(&self, id: i64, actor: i64, purchase_number: &str) -> AppResult<Purchase> {
         let row = sqlx::query(
             r#"UPDATE purchases
                SET purchase_number = ?, status = 'Confirmed',
                    confirmed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                   updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(purchase_number)
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -367,7 +393,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         Ok(row_to_purchase(row))
     }
 
-    async fn set_cancelled(&self, id: i64, reason: Option<&str>) -> AppResult<Purchase> {
+    async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Purchase> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -380,10 +406,27 @@ impl PurchaseRepository for SqlitePurchaseRepository {
             r#"UPDATE purchases
                SET status = 'Cancelled', cancel_reason = ?,
                    cancelled_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                   updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ? RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(clean)
+        .bind(actor)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(row_to_purchase(row))
+    }
+
+    async fn touch_draft(&self, id: i64, actor: i64) -> AppResult<Purchase> {
+        let row = sqlx::query(
+            r#"UPDATE purchases
+               SET updated_by = ?,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ? RETURNING id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
+        )
+        .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -466,6 +509,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
 
     async fn create_payment(
         &self,
+        actor: i64,
         purchase_id: i64,
         account_id: i64,
         method_id: i64,
@@ -474,9 +518,9 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         transaction_id: Option<i64>,
     ) -> AppResult<PurchasePayment> {
         let row = sqlx::query(
-            r#"INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, transaction_id)
-               VALUES (?, ?, ?, ?, ?, ?)
-               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
+            r#"INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, transaction_id, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at"#,
         )
         .bind(purchase_id)
         .bind(account_id)
@@ -484,6 +528,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .bind(amount.to_string())
         .bind(date)
         .bind(transaction_id)
+        .bind(actor)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -492,14 +537,18 @@ impl PurchaseRepository for SqlitePurchaseRepository {
 
     async fn set_payment_refund_transaction(
         &self,
+        actor: i64,
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<PurchasePayment> {
         let row = sqlx::query(
-            r#"UPDATE purchase_payments SET refund_transaction_id = ? WHERE id = ?
-               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at"#,
+            r#"UPDATE purchase_payments
+               SET refund_transaction_id = ?, updated_by = ?
+               WHERE id = ?
+               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at"#,
         )
         .bind(refund_transaction_id)
+        .bind(actor)
         .bind(payment_id)
         .fetch_one(&self.pool)
         .await
@@ -511,8 +560,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         #[cfg(test)]
         self.tick();
         let rows = sqlx::query(
-            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_at
-               FROM purchase_payments WHERE purchase_id = ? ORDER BY id"#,
+            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at FROM purchase_payments WHERE purchase_id = ? ORDER BY id"#,
         )
         .bind(purchase_id)
         .fetch_all(&self.pool)

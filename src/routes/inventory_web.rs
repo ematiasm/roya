@@ -951,6 +951,7 @@ async fn web_edit_product(
 async fn web_record_product_cost(
     State(state): State<AppState>,
     _: Require<PurchasesCostsWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<RecordProductCostForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -966,7 +967,7 @@ async fn web_record_product_cost(
     };
     state
         .supplier_service
-        .record_cost(form.product_id, form.supplier_id, cost, date)
+        .record_cost(principal.user_id, form.product_id, form.supplier_id, cost, date)
         .await?;
     if is_htmx(&headers) {
         let from_drawer = headers
@@ -991,12 +992,13 @@ async fn web_record_product_cost(
 async fn web_set_preferred_cost(
     State(state): State<AppState>,
     _: Require<PurchasesCostsWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<PreferredCostForm>,
 ) -> Result<axum::response::Response, AppError> {
     state
         .supplier_service
-        .set_preferred(form.product_id, form.supplier_id)
+        .set_preferred(principal.user_id, form.product_id, form.supplier_id)
         .await?;
     if is_htmx(&headers) {
         let from_drawer = headers
@@ -1834,7 +1836,7 @@ mod tests {
             .unwrap();
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor_id(&state).await, NewSupplier {
                 name: "Detail Sup".into(),
                 phone: None,
                 notes: None,
@@ -1843,7 +1845,7 @@ mod tests {
             .unwrap();
         state
             .supplier_service
-            .record_cost(
+            .record_cost(audit_actor_id(&state).await, 
                 product.id,
                 supplier.id,
                 Decimal::from_str("12.50").unwrap(),
@@ -1853,7 +1855,7 @@ mod tests {
             .unwrap();
         state
             .supplier_service
-            .set_preferred(product.id, supplier.id)
+            .set_preferred(audit_actor_id(&state).await, product.id, supplier.id)
             .await
             .unwrap();
 
@@ -2136,7 +2138,7 @@ mod tests {
         let product = seed_tracked_product(&state, "COST-WEB").await;
         let supplier = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor_id(&state).await, NewSupplier {
                 name: "Cost Sup".into(),
                 phone: None,
                 notes: None,
@@ -2198,7 +2200,7 @@ mod tests {
         let product = seed_tracked_product(&state, "PREF-WEB").await;
         let a = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor_id(&state).await, NewSupplier {
                 name: "Pref A".into(),
                 phone: None,
                 notes: None,
@@ -2207,7 +2209,7 @@ mod tests {
             .unwrap();
         let b = state
             .supplier_service
-            .create_supplier(NewSupplier {
+            .create_supplier(audit_actor_id(&state).await, NewSupplier {
                 name: "Pref B".into(),
                 phone: None,
                 notes: None,
@@ -2217,7 +2219,7 @@ mod tests {
         for (sid, cost) in [(a.id, "9"), (b.id, "8")] {
             state
                 .supplier_service
-                .record_cost(
+                .record_cost(audit_actor_id(&state).await, 
                     product.id,
                     sid,
                     Decimal::from_str(cost).unwrap(),

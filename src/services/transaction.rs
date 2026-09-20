@@ -408,27 +408,31 @@ mod tests {
 
     /// Raw fixture: link a transaction to a synthetic purchase payment.
     async fn link_purchase_payment(pool: &sqlx::SqlitePool, tx_id: i64, account_id: i64) {
-        let supplier_id: (i64,) =
-            sqlx::query_as("INSERT INTO suppliers (name) VALUES ('fixture supplier') RETURNING id")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let supplier_id: (i64,) = sqlx::query_as(
+            "INSERT INTO suppliers (name, created_by) VALUES ('fixture supplier', ?) RETURNING id",
+        )
+        .bind(crate::security::test_support::audit_actor_id(pool).await.unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap();
         let purchase_id: (i64,) = sqlx::query_as(
-            "INSERT INTO purchases (supplier_id, status, payment_type, purchase_date) \
-             VALUES (?, 'Confirmed', 'Credit', '2024-05-01') RETURNING id",
+            "INSERT INTO purchases (supplier_id, status, payment_type, purchase_date, created_by) \
+             VALUES (?, 'Confirmed', 'Credit', '2024-05-01', ?) RETURNING id",
         )
         .bind(supplier_id.0)
+        .bind(crate::security::test_support::audit_actor_id(pool).await.unwrap())
         .fetch_one(pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO purchase_payments \
-             (purchase_id, account_id, method_id, amount, date, transaction_id) \
-             VALUES (?, ?, 1, '20', '2024-05-01', ?)",
+             (purchase_id, account_id, method_id, amount, date, transaction_id, created_by) \
+             VALUES (?, ?, 1, '20', '2024-05-01', ?, ?)",
         )
         .bind(purchase_id.0)
         .bind(account_id)
         .bind(tx_id)
+        .bind(crate::security::test_support::audit_actor_id(pool).await.unwrap())
         .execute(pool)
         .await
         .unwrap();

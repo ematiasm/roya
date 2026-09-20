@@ -34,8 +34,13 @@ then archives its own scope.
       table — which the original task list never assigned — lands here with the department that
       owns it. See the slice's section in `odd/tasks/identity-rbac.md` for the demonstrated upgrade
       sequence, the constraint-preservation audit, the mutation table and the verification numbers.)
-- [ ] T29 (S12): audit for purchases, suppliers and supplier costs (`purchases`, `purchase_lines`
-      inherits, `purchase_payments`, `suppliers`, `product_supplier_costs`).
+- [x] T29 (S12): audit for purchases, suppliers and supplier costs (`purchases`, `purchase_lines`
+      inherits, `purchase_payments`, `suppliers`, `product_supplier_costs`). (2026-09-20: delivered
+      on `feat/audit-purchases-suppliers`; migration 33 reuses the sentinel and its guarded insert
+      is defensive only, `purchase_lines` inherits the purchase's actor, and a line change stamps
+      the draft's `updated_by` — the document was edited. See the slice's section in
+      `odd/tasks/identity-rbac.md` for the demonstrated upgrade sequence, the
+      constraint-preservation audit, the mutation table and the verification numbers.)
 - [ ] T30 (S13): audit for the identity tables themselves (`users`, `roles`, `permissions`) and the
       grant trail display (`user_roles.granted_by/granted_at` already shipped; surface it readably).
 - [ ] T31 (S14): closing verification — `cargo test` green with the audit tests mutation-validated,
