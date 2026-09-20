@@ -96,6 +96,8 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
       2026-09-20, parte 2 nav gating y cierre del ledger 2026-09-20, ver S7 parte 2 en Progreso)
 - [ ] S8 — Cierre de Fase A: slice de navegador + README + specs (T24–T25)
 - [ ] Fase B — Auditoría del actor por departamento (T26–T31)
+  - [x] T26 (S9) — finanzas: migración 30 + plomería del actor + display + tests AC18–AC19
+        (2026-09-20, ver S9 en Progreso; T27–T31 copian el patrón)
 
 ## Progress
 - 2026-09-18: reconocimiento del repo (sin auth, convención de departamentos, invariantes),
@@ -1116,3 +1118,88 @@ está construido queda a la vista, no enterrado en un archivo.
   columna `created_by`/`updated_by` en migraciones ni código (verificado por grep). Continúa en
   `openspec/changes/2026-09-19-add-actor-audit/` (S9–S14, T26–T31); su cierre extiende la spec de
   identity con las reglas de auditoría y AC18–AC19 y archiva su propio folder.
+
+## Progreso S9 (T26, primer slice de Fase B) — 2026-09-20
+
+Rama `feat/audit-finance`. Writer delegado; el corte previo a la implementación detectó tres
+hallazgos que el orquestador resolvió:
+
+1. **Superficies extendidas:** `created_by NOT NULL` en `transactions` ES la plomería
+   inter-departamentos, así que los call sites de los flujos (`sales.rs`/`purchases.rs`
+   `confirm`/`cancel`/`record_payment`/`pay_supplier`/`collect` y sus rutas) entran en S9, no en
+   S11; más los cinco fixtures de INSERT crudo (`sales_api`, `purchases_api`, `customers_api`,
+   `customer_receipt_repo`, `smoke_tests`). El churning de ~120 call sites de test fue mecánico.
+2. **El actor de las filas pre-existentes cambió de admin-placeholder a cuenta centinela
+   `sistema`** (decisión del usuario): la migración crea su propio actor — inactivo, sin roles,
+   credencial malformada (un PHC inválido, que `verify` rechaza: comportamiento testeado en
+   `security/password.rs`) — y le atribuye TODA fila pre-existente, semillas incluidas. Con eso
+   el problema de orden desaparece (la migración no depende del bootstrap), el bootstrap crea el
+   admin por su camino normal en instalación nueva, y la atribución dice "Sistema" en vez de
+   inventarle a una persona filas que no creó. Consecuencia ratificada: `sistema` aparece en la
+   lista de usuarios como cuenta inactiva — tres tests de `identity.rs` ajustaron sus conteos.
+   Alternativa rechazada en la spec del change folder (backfill al admin de bootstrap: inventaba
+   una atribución personal, hacía muerto el camino de creación del bootstrap y acoplaba la
+   migración al bootstrap).
+3. **La brecha de `-- no-transaction`:** la primera versión de la migración no llevaba el marcador
+   en la primera línea y le faltaba el `PRAGMA foreign_keys = OFF`; sqlx la corría dentro de una
+   transacción, el pragma era no-op y el DROP TABLA cascadaaba RESTRICT. Demostrado con una sonda
+   statement-por-statement y corregido; el patrón quedó idéntico a la migración 24.
+
+**Entregado:** `migrations/20240101000030_add_audit_finance.sql` (rebuild controlado de
+`accounts`, `transactions`, `payment_methods` con `created_by NOT NULL` + `updated_by NULL`, ambas
+FK RESTRICT a `users`; centinela insertado solo si hay filas que atribuir). El actor viaja
+explícito como argumento: ruta (`Principal.user_id`) → servicio → repositorio, sin estado
+ambiente; una fila producida dentro de un flujo lleva el actor del request origen (el Income de
+una venta, los refunds de una cancelación, los pagos de compras y cobros de clientes). Los
+nombres de display se resuelven en la capa de wiring (`routes/mod.rs::audit_actor_names`), el
+único lugar que el grep AC20 permite tocar identidad: los repos de finanzas no la leen y las
+vistas nunca muestran ids ("Registrado por"/"Actualizado por" en `account_detail.html`).
+
+**Tests nuevos (9):** `ac18_an_account_records_its_creator`,
+`ac18_create_and_update_store_two_different_actors` (dos usuarios distintos),
+`ac18_a_flow_created_row_carries_the_flows_actor`,
+`ac18_method_creation_and_reassignment_store_the_actors`,
+`ac18_the_sale_flow_income_carries_the_flows_actor` (venta real confirmando),
+`ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel`,
+`ac19_the_bootstrap_creates_exactly_one_active_administrator_after_the_upgrade`,
+`ac19_deleting_the_system_actor_is_refused_by_the_audit_foreign_key` (los tres últimos en
+`smoke_tests.rs`, porque el scan AC20 cubre el archivo entero de cada departamento),
+`audit_finance_detail_view_shows_the_actor_display_name` (browser-suite-level en Rust, con dos
+principales y conteo de nombres para que la mutación no pase vacuosa).
+
+**Mutaciones validadas** (cada guard roto y un test roto como testigo):
+`transactions.created_by` (bind roto → FK falla), `transactions.updated_by` (bind roto → el test
+espera `Some(bob)` y recibe `None`), `accounts.created_by` (NOT NULL falla),
+`payment_methods.created_by`/`updated_by` (ambos), backfill a NULL (la migración misma aborta con
+NOT NULL en `accounts_new`), FK RESTRICT→CASCADE (el delete del sentinel pasa y el test
+`unwrap_err()` ve un `Ok`), centinela no insertado (la migración aborta), display del nombre
+(conteo 1≠2 en la sonda de render).
+
+**Números:** `cargo test` **622 passed / 0 failed** (613 + 9 nuevos); `cargo check --all-targets`
+0 errores y ledger en **55 warnings** (57 crudas − 2 resúmenes, igual que el cierre de Fase A);
+`grep allow(dead_code)|allow(unused_imports)` src/ → nada. `scripts/e2e.sh -k confirmation`
+**4 passed**, `-k filters` **7 passed** (la slice que toca finanzas: crea cuenta + movimientos por
+la UI del dashboard). `-k identity`: **5 passed / 2 failed** — los dos fallos son del locator
+no acotado de la suite de navegador (`#user-list button[aria-label="Asignar roles"]` ahora
+coincide también con la fila de `sistema`), consecuencia directa del diseño ratificado; el fix es
+acotar el locator a la fila del usuario creado, en `e2e/` (fuera de las superficies del writer).
+La sonda en vivo con el binario real: login del bootstrap (camino de creación), cuenta y
+movimiento creados por la API, y el detalle renderizado mostrando "Registrado por Admin"; la
+página de usuarios muestra `Sistema (anterior al registro)` como Inactivo.
+
+**Cierre de S9 (ronda 2, 2026-09-20):** el orquestador autorizó el fix de `e2e/` (superficies
+`e2e/tests/test_identity.py`, `e2e/helpers.py`, `e2e/conftest.py`): el localizador del helper
+`_assign_role_through_the_screen` quedó acotado a la fila del usuario creado
+(`#user-list-inner > div > div` filtrado por `has_text=username` — había un nivel intermedio
+`#user-list-inner`, así que el primer intento con `#user-list > div > div` matcheaba el contenedor
+entero); el comportamiento de la pantalla NO cambió: asignar roles a una cuenta inactiva es
+legítimo. Test nuevo `audit_the_system_sentinel_cannot_log_in_like_any_inactive_account`: tres
+intentos de login como `sistema` (contraseña plausible, su display name, basura) contestan el 401
+genérico sin cookie, y la mitad comparativa prueba que la forma es la del usuario inactivo (una
+cuenta sin roles desactivada falla byte-a-byte igual); ningún intento crea sesión. Mutación de
+verificación: `is_active=1` en el centinela NO cambia el resultado del login — la verificación de
+la credencial malformada falla primero (defensa en dos capas independientes; el test pina el
+comportamiento, no una sola guard). **Números de cierre:** `cargo test` **623 passed / 0 failed**
+(613 + 10 nuevos); `scripts/e2e.sh` completa **62 passed / 4 skipped** (idéntico al baseline de
+`main`, cero fallos nuevos); ledger en **55 warnings** (57 crudas − 2 resúmenes), sin
+`#[allow]`.

@@ -12,16 +12,38 @@ these rules. The design's "Audit" section is the source.
   `product_supplier_costs`, `purchases`, `purchase_payments`, `roles`, `permissions`, and
   `created_by`/`updated_by` on `users` themselves (self-referencing, nullable for the bootstrap
   administrator).
-- Existing rows are backfilled to the bootstrap administrator; `created_by` is then enforced
-  `NOT NULL`.
+- Every row that exists when a department's audit migration runs predates the audit, and no user
+  may exist yet (migrations run before the application's bootstrap creates the administrator), so
+  the migration creates its OWN actor: an inactive, roleless account named `sistema` whose stored
+  hash is deliberately malformed (the verifier treats an unparseable hash as a failed verification,
+  a behaviour pinned by a test in `security/password.rs`), and attributes every pre-existing row
+  to it. The migration is therefore independent of the bootstrap: it runs before it, in either
+  order, and on a fresh install the bootstrap still creates the administrator through its ordinary
+  creation path, so exactly one active administrator exists afterwards, holding the protected role.
+  The sentinel is inserted only when there is something to attribute; the interface shows it as the
+  display name "Sistema (anterior al registro)" in the users list, where it explains the
+  attribution instead of hiding it.
+  **Assumption, written down because it is one:** rows that predate the audit were not created by
+  any person the system knew, so a person's name on them would be an invented attribution — this
+  is the honest-attribution rule of Phase B. The rejected alternative was backfilling to the
+  bootstrap administrator: it would (a) attribute system-seeded and historical rows to a person who
+  did not create them, (b) turn the bootstrap's recovery path into the only one a fresh install
+  ever runs, leaving the creation path dead in production, and (c) couple the migration to the
+  bootstrap having run. A synthetic generic "system" account with a real-credential-shaped hash
+  was considered for the same reasons and rejected for the same reasons; the malformed-hash
+  sentinel keeps the account unusable as a login, which is the property that matters.
 - Lines and join rows (`sale_lines`, `purchase_lines`, `product_barcodes`, `role_permissions`)
   inherit the actor of their parent document and get no columns of their own.
 
 ## Rules
 
 - **Every insert into an audited table writes `created_by = principal.user_id`;** every update sets
-  `updated_by`. The column is written by the owning module from the `Principal` the kernel resolves
-  per request; no department reads identity tables or takes the identity service as a dependency.
+  `updated_by`. The actor travels explicitly as an argument — route (the `Principal` the kernel
+  resolves per request) → service → repository — with no global and no request-local: the owning
+  module passes the acting user's id down, and a mutation produced by another document carries the
+  SAME actor as the originating request. No department reads identity tables or takes the identity
+  service as a dependency; the display names the views render are resolved in the wiring layer
+  (`routes/mod.rs`), which the AC20 boundary scan explicitly permits to touch identity.
 - **A document created inside a flow carries the acting principal of the originating request**: a
   sale's payment, a purchase's payment, a movement produced by a sale — a flow never invents a
   different actor.

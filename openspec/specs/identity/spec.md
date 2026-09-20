@@ -2,9 +2,11 @@
 
 > Provenance: promoted from `openspec/changes/2026-09-18-add-identity-module/` (Phase A) on
 > delivery, 2026-09-23, and verified claim by claim against the code and the migration chain. The
-> audit of the actor on every business table is **planned, not built** — it lives in
-> `openspec/changes/2026-09-19-add-actor-audit/`; the only actor shipped today is the grant trail on
-> `user_roles`. Behaviour stated here is verified by the test suites, not by a reviewed upstream
+> audit of the actor on every business table is **in progress, per department**, and this spec states
+> the departments that ship today: the finance tables carry it (see "What the actor audit covers
+> today"). The remaining departments are planned in
+> `openspec/changes/2026-09-19-add-actor-audit/`, and this section is updated as each one lands rather
+> than describing the end state ahead of the code. Behaviour stated here is verified by the test suites, not by a reviewed upstream
 > proposal.
 
 ## Purpose
@@ -79,9 +81,10 @@ catalog below are one contract: the route table in this spec is the operator-fac
 - `user_id NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `role_id NOT NULL REFERENCES roles(id)
   ON DELETE RESTRICT`, `granted_by NOT NULL REFERENCES users(id) ON DELETE RESTRICT`, `granted_at
   NOT NULL`, unique `(user_id, role_id)`.
-- This grant trail — who granted, and when — is the actor record that ships today. The audit
-  columns on the business tables (`created_by`/`updated_by`) do **not** exist yet: they are Phase B,
-  planned in `openspec/changes/2026-09-19-add-actor-audit/`.
+- The grant trail — who granted, and when — is the actor record this capability owns. Beyond it,
+  the audit columns ship per department: `accounts`, `transactions` and `payment_methods` carry
+  `created_by`/`updated_by` today (see "What the actor audit covers today"), and the other
+  departments are planned in `openspec/changes/2026-09-19-add-actor-audit/`.
 
 ## Derived reads
 - `effective_permissions(user) = UNION of the permissions of the user's roles`, resolved per
@@ -255,9 +258,22 @@ knowingly: granting `identity.users.manage` means handing over the credentials o
 non-protected account; granting `identity.roles.manage` means handing over the instance itself.
 
 ### What the actor audit covers today
-`user_roles` records `granted_by` and `granted_at` for every role grant. Business tables record no
-actor: no `created_by`/`updated_by` column exists anywhere outside this capability's own tables.
-That half is Phase B (see the provenance note).
+`user_roles` records `granted_by` and `granted_at` for every role grant, and every mutation of
+`accounts`, `transactions` and `payment_methods` records its actor in `created_by` (NOT NULL,
+`ON DELETE RESTRICT` to `users`) and `updated_by`, written from the request's principal — never from
+anything the request itself can supply — and shown as a name in the account views.
+
+Rows that predate the audit — the five seeded payment methods and any historical business row — are
+attributed to the inactive, roleless sentinel account `sistema` ("Sistema (anterior al registro)"),
+which the migration creates when there is something to attribute. It is deliberate that this is
+**not** the bootstrap administrator: those rows were not created by a person the system knew, and
+attributing them to one would invent history. The sentinel consumes `users.id = 1` on a fresh
+install because the seeded payment methods are rows the audit must attribute; it cannot log in (an
+unusable credential and an inactive state, two independent guards) and appears in the users list as
+an inactive account, which is where the attribution is explained rather than hidden.
+
+Every remaining department's tables record no actor yet: the audit there is Phase B (see the
+provenance note).
 
 ### Boundaries
 Identity performs SQL only against identity tables; no department queries identity tables or
