@@ -1029,3 +1029,40 @@ usadas: `authz.rs`, los nueve módulos de rutas de página (`web.rs` ×2 structs
   `scripts/e2e.sh -k identity` 4 passed, `-k parties` 9 passed / 1 skipped (sonda opt-in). Sonda del
   ítem de dos códigos: sólo `finance.read` → GET / 403 sin la entrada; sólo `dashboard.read` → 200 con
   la entrada y el bloque ausentes; ambos códigos → 200 con la entrada y el bloque presentes.
+
+## S8 part 1 — browser slice AC22 (rama `test/identity-browser-slice`)
+
+Slice del navegador que cierra la parte AC22 pendiente: los otros tres comportamientos que el
+criterio exige (cambio de contraseña forzado, expiración de sesión en pleno HTMX y formulario
+HTMX con permiso denegado) pasaron de aserciones de encabezado o deuda explícita a pruebas de
+comportamiento en `e2e/tests/test_identity.py`. Sin cambios de Rust, plantillas ni migraciones.
+
+- **Cambio de contraseña forzado (AC16/AC22):** el usuario se crea por la pantalla real de
+  usuarios (que marca `must_change_password`; la lista muestra la insignia), el rol Vendedor se
+  asigna por el diálogo de roles de la misma pantalla. El primer inicio de sesión real cae
+  confinado en `/password`, un URL tipeado a mano (`/products`) rebota de vuelta al formulario —
+  lo que un test de encabezado no puede probar: sólo una navegación es una navegación —, el
+  cambio correcto aterriza en el dashboard, y la misma sesión después alcanza la pantalla que
+  antes no podía.
+- **Expiración de sesión en pleno HTMX (deuda de S1b):** el test hace su propio login por el
+  formulario, la fila de sesión se expira del lado del servidor (la base desechable es del
+  harness; el digest es el mismo sha256/base64url que guarda `security/session.rs`,
+  `helpers.expire_session_in_database`, único paso deliberado no-HTTP de la suite), y al cliquear
+  «↻ Actualizar» en `/users` el navegador **navega de verdad** a `/login` con el formulario
+  visible. La respuesta observada: `401` con `HX-Redirect: /login`.
+- **Formulario HTMX con permiso denegado (AC22):** rol `solo_consulta` con exactamente
+  `sales.read`, armado por las pantallas reales (matriz en `/roles`, asignación por el cuadro
+  «Roles» en `/users`); el usuario limitado cambia su propia contraseña primero (creado marcado),
+  abre `/sales` y envía «Create Draft». La negación llega como el aviso de la app
+  (`Create sale failed — Se necesita el permiso «sales.create» para esta acción`, el manejador
+  global `htmx:responseError`) y el DOM nunca se intercambia como si hubiera tenido éxito: la
+  ruta de éxito contesta `HX-Redirect` al registro nuevo, así que una URL que no se movió es la
+  prueba.
+
+**Respuesta a la pregunta del `HX-Redirect`:** htmx 1.9.12 SÍ lo honra sobre el `401` que envía
+el guard (`src/security/guard.rs`); la navegación se observó como cambio de URL del navegador y
+presencia del formulario de login (la clase de aserción que sólo el navegador puede hacer).
+
+**Números:** `scripts/e2e.sh -k identity` **7 passed** (4 previos intactos + 3 nuevos);
+`scripts/e2e.sh` completo **62 passed / 4 skipped** (sondas opt-in), ninguna slice previa
+regresó; `cargo test` **613 passed / 0 failed** (sin tocar Rust).
