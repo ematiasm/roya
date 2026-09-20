@@ -69,6 +69,17 @@ different accounts over time. The customer, the credit rules and the receivable 
 - No configuration of its own; it inherits `ALLOW_NEGATIVE_STOCK` from inventory and
   `ALLOW_NEGATIVE_BALANCE` from finance.
 
+## Authorization
+Every sales route requires the permission its action declares, enforced by the security kernel — the
+route → permission table in `identity/spec.md` is the authority. The cross-capability pair fails
+closed: a payment on a sale is `customers.collect` (money received against an owed balance is a
+collection), so a principal holding `sales.create` without `customers.collect` cannot pay the sale
+it recorded, and no seeded matrix separates the pair. The sale-debt report is `sales.read` (it is
+unpaid SALES, not customer data), and confirming a cash sale stays `sales.create` even though it
+embeds the tender. The customer statement, reached from the customers department, is a single
+`customers.read` gate — not an AND with `sales.read` — so a `customers.read`-only principal sees
+that customer's own sale documents without holding `sales.read`.
+
 ## Verification
 `src/services/sales.rs` (AC1–AC7 plus triangulation), `src/routes/sales_api.rs`,
 `src/routes/sales_web.rs`, and the cash sale, credit sale and cancellation flows in

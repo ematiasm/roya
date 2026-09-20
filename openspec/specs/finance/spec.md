@@ -55,6 +55,14 @@ from the method at pay/collect time, so an invalid combination is impossible by 
   single method select rendered `"Name — AccountName"`.
 - Configuration: `ALLOW_NEGATIVE_BALANCE` (default `false`), `DATABASE_URL`, `PORT`, `RUST_LOG`.
 
+## Authorization
+Every finance route requires the permission its action declares, enforced by the security kernel —
+the route → permission table in `identity/spec.md` is the authority. Two consequences are
+recorded deliberately: account creation and the payment-method allowlist are the `finance.methods.manage`
+tier, not `finance.write` (the ledger structure is account management), and a principal holding only
+`finance.methods.manage` is fail-closed refused `GET /api/payment-methods` — the catalog of the very
+methods it may administer. No seeded matrix separates the codes, so no natural operator is hit.
+
 ## Verification
 `src/services/transaction.rs`, `src/services/finance_methods.rs`, `src/routes/api.rs` and the
 money invariants in `src/smoke_tests.rs`, which assert that each account's reported balance equals

@@ -1066,3 +1066,53 @@ presencia del formulario de login (la clase de aserción que sólo el navegador 
 **Números:** `scripts/e2e.sh -k identity` **7 passed** (4 previos intactos + 3 nuevos);
 `scripts/e2e.sh` completo **62 passed / 4 skipped** (sondas opt-in), ninguna slice previa
 regresó; `cargo test` **613 passed / 0 failed** (sin tocar Rust).
+
+## S8 part 2 — el cierre de Fase A (slice S8 parte 2, 2026-09-23)
+
+Cierre documental de la Fase A: lo propuesto pasa a ser la verdad en tiempo presente y lo que NO
+está construido queda a la vista, no enterrado en un archivo.
+
+- **Promoción:** `openspec/specs/identity/spec.md` es ahora la spec de la capacidad (M5) en tiempo
+  presente — entidades, lecturas derivadas, reglas tal como embarcan, configuración e interfaz,
+  con la tabla completa ruta → permiso como contrato operador-facing. Cada afirmación se verificó
+  contra el código (grep de los `Require<...>` por módulo de rutas: la extracción de las 148 rutas
+  coincidió fila por fila con las tablas de mapeo de S5/S6/S7 del change folder; cero discrepancias),
+  incluida la sonda de los triggers de migración 28 y del catálogo sembrado de migración 27/29.
+- **Specs de departamento:** `finance`, `inventory`, `sales`, `purchases`, `customers` ganaron una
+  sección Authorization: toda ruta exige el permiso que su acción declara, con la tabla de la spec
+  identity como autoridad, más las dos consecuencias documentadas (los pares
+  cross-capability y las direcciones fail-closed de cada módulo).
+- **Invariantes:** `openspec/specs/README.md` ganó la fila M5, la aclaración de que identity es un
+  peer que no es departamento (invariante 1) y el invariante 12: kernel transversal, el handler
+  declara el permiso y el kernel contesta; ningún departamento lee tablas de identity ni toma
+  `IdentityService` como dependencia.
+- **README.md:** lista de features con identidad/RBAC y el estado honesto de la auditoría (el actor
+  por tabla de negocio es Fase B, no construido), árbol de proyecto con `src/security/` y los
+  módulos de ruta nuevos, migraciones 27–29, conteo del suite de navegador (62 tests + 4 sondas
+  opt-in) y el párrafo de Navigation actualizado al gating AC21 (grupo Account incluido). La
+  sección «No auth» ya había sido reescrita en S1b-iii; se verificó contra lo que embarca y se
+  extendió con RBAC. La tabla de variables de entorno y `env.example` ya estaban correctas:
+  verificadas, no reescritas.
+- **Archivo:** la parte de Fase B (T26–T31, las columnas de actor) se llevó intacta a
+  `openspec/changes/2026-09-19-add-actor-audit/` (proposal, spec, tasks) y el resto del folder
+  `2026-09-18-add-identity-module/` se movió a `openspec/changes/archive/` con `mv` (git lo maneja
+  el padre), con T25 tildado y una línea que apunta al folder de Fase B.
+- **Números:** `cargo test` **613 passed / 0 failed** (el slice no mueve el suite: documentación
+  solamente); `scripts/e2e.sh` **62 passed / 4 skipped** (sondas opt-in), sin cambios en `e2e/`.
+
+## Estado de cierre de la Fase A
+
+- **Entregado:** S1a (kernel), S1b (portón + login/logout + plumbing de tests), S2 (core RBAC),
+  S3 (cambio de contraseña forzado + administración de usuarios con la regla de tiers), S4
+  (administración de roles y matriz + ronda de corrección), S5 (enforcement finanzas + inventario),
+  S6 (enforcement ventas + clientes), S7 (enforcement compras/proveedores/identity/dashboard +
+  nav gating AC21), S8 (browser slice AC22 + este cierre documental).
+- **Conteos:** 613 tests de Rust / 0 fallos; 62 tests de navegador / 4 sondas opt-in skipped.
+- **Ledger:** cerrado en **55 warnings** (`cargo check --all-targets`, 57 crudas − 2 resúmenes por
+  target; el requisito S2 era ≤ 56 sin `#[allow]` como mecanismo). Dormant sin consumidor conocido:
+  `role_repo::{count_active_holders, revoke}`; dormant para Fase B propia:
+  `Role.{created_at, updated_at}`, `Permission.{action, created_at}`.
+- **Lo que NO está construido (Fase B):** el actor en las tablas de negocio — no existe ninguna
+  columna `created_by`/`updated_by` en migraciones ni código (verificado por grep). Continúa en
+  `openspec/changes/2026-09-19-add-actor-audit/` (S9–S14, T26–T31); su cierre extiende la spec de
+  identity con las reglas de auditoría y AC18–AC19 y archiva su propio folder.

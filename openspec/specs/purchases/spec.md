@@ -72,6 +72,17 @@ Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount
   raise/lower badge, and the drawer detail with the pay-supplier form (`POST /web/supplier-payments`)
   and the record-cost form.
 
+## Authorization
+Every purchases and suppliers route requires the permission its action declares, enforced by the
+security kernel — the route → permission table in `identity/spec.md` is the authority. Two
+consequences are recorded deliberately: a payment to a supplier is `purchases.create`, not
+`suppliers.write` (the payment is a purchase-side money movement; entity editing must not hand over
+money movements — a `suppliers.write`-only principal sees the pay card in the drawer it may open and
+is refused on submit), and the reorder suggestions are `inventory.read` (stock-derived data, not a
+purchase document), so the `/purchases` page renders its Sugerido block conditionally on that read.
+The purchase record page itself is a single `purchases.read` gate: the line costs and payments it
+renders are purchases data.
+
 ## Verification
 `src/services/purchases.rs` and `src/services/suppliers.rs` (AC1–AC14 and the cost-rule cases),
 `src/routes/purchases_api.rs`, `src/routes/purchases_web.rs`, `src/routes/suppliers_web.rs`, and the

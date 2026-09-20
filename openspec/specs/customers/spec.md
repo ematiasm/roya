@@ -92,6 +92,16 @@ statement page with the ageing breakdown, the receivable sales, the payment hist
   customer_receipts SET customer_id`, or `REPLACE INTO sales` cascading its payments. None of these is
   reachable from a route or a repository, only from direct SQL.
 
+## Authorization
+Every customers route requires the permission its action declares, enforced by the security kernel —
+the route → permission table in `identity/spec.md` is the authority. The collection is the
+cross-capability pair, and it fails closed: a payment on a sale is `customers.collect`, not
+`sales.create`, so a principal holding `sales.create` without `customers.collect` cannot register a
+payment on the sale it recorded; the collect is `customers.collect` while the receipt reads are
+`customers.read`, the same gate the statement uses. The customer statement and detail fragments are
+a single `customers.read` gate: a read-only principal sees THAT customer's own sale documents
+(number/date/total), never the sales list or another customer's sales.
+
 ## Verification
 `src/services/customers.rs`, `src/services/customer_receipts.rs` and the receivable reads in
 `src/services/sales.rs`, with route coverage in `src/routes/customers_api.rs` and
