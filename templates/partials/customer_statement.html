@@ -20,6 +20,13 @@
   {% if let Some(notes) = c.notes %}
   <div class="text-[13px] text-muted">{{ notes }}</div>
   {% endif %}
+  {# Audit attribution (slice S11): the CUSTOMER row's creator and last editor,
+     rendered as display names the wiring layer resolved. Labelled for what it
+     is — the customer record's attribution, not the statement's — so the
+     documents below cannot be misread as this person's work. #}
+  {% if let Some(who) = created_by_name %}
+  <div class="text-[13px] text-muted" data-customer-actor>Cliente registrado por {{ who }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
+  {% endif %}
   {% endif %}
 
   {% if let Some(st) = statement %}

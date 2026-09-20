@@ -129,16 +129,21 @@ where
         }
 
         // One receipt groups one payment per covered sale. The receipt itself posts
-        // no movement; every grouped payment posts its own through SalesService.
+        // no movement; every grouped payment posts its own through SalesService. The
+        // receipt carries the collection request's actor, the same one every grouped
+        // payment and its finance row get (AC18).
         let receipt = self
             .receipts
-            .create(&NewReceipt {
-                customer_id,
-                account_id,
-                method_id,
-                date,
-                notes,
-            })
+            .create(
+                actor,
+                &NewReceipt {
+                    customer_id,
+                    account_id,
+                    method_id,
+                    date,
+                    notes,
+                },
+            )
             .await?;
         for allocation in &plan {
             self.sales
@@ -441,16 +446,19 @@ mod tests {
     async fn seed_customer(s: &ReceiptSvc, name: &str) -> i64 {
         s.sales
             .customers
-            .create_customer(NewCustomer {
+            .create_customer(
+                audit_actor(s).await,
+                NewCustomer {
                 name: name.into(),
                 phone: None,
                 address: None,
                 tax_id: None,
                 notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+                    is_walkin: false,
+                    credit_limit: None,
+                    payment_days: None,
+                },
+            )
             .await
             .unwrap()
             .customer
@@ -497,7 +505,7 @@ mod tests {
     ) -> SaleDetail {
         let sale = s
             .sales
-            .create_draft(NewSale {
+            .create_draft(audit_actor(s).await, NewSale {
                 customer_id,
                 payment_type: PaymentType::Credit,
                 sale_date,
@@ -748,7 +756,7 @@ mod tests {
         // A receipt may never apply more to a sale than the sale still owes.
         let receipt = s
             .receipts
-            .create(&NewReceipt {
+            .create(audit_actor(&s).await, &NewReceipt {
                 customer_id: customer,
                 account_id: account,
                 method_id: cash,
@@ -831,7 +839,7 @@ mod tests {
         // An unreferenced receipt is deletable; a second delete is a 404.
         let empty = s
             .receipts
-            .create(&NewReceipt {
+            .create(audit_actor(&s).await, &NewReceipt {
                 customer_id: customer,
                 account_id: account,
                 method_id: cash,
@@ -846,6 +854,44 @@ mod tests {
             s.delete_receipt(empty.id).await.unwrap_err(),
             AppError::NotFound(_)
         ));
+    }
+
+    /// AC18 (receipts audit, M5 Phase B slice S11): a collection carries the
+    /// acting user of ITS request into the receipt document and into EVERY
+    /// grouped payment — the S9/S10 twin of the flow-actor tests — never the
+    /// sale's creator and never a fresh one.
+    #[tokio::test]
+    async fn ac18_the_collection_flow_receipt_and_its_payments_carry_the_flows_actor() {
+        let (s, pool) = svc().await;
+        let collector = test_support::seed_audit_user(&pool, "coll-bob", "Bob").await.unwrap();
+
+        let product = seed_product(&s, "COLL-AUD", "10").await;
+        let customer = seed_customer(&s, "coll-customer").await;
+        let account = seed_account(&s, "coll-wallet").await;
+        let cash = method_id(&s, "Cash").await;
+        allow(&s, account, cash).await;
+
+        // The sale is confirmed by the mechanical sentinel actor (its creator);
+        // the collection is Bob's request, so the receipt and its payments name
+        // HIM and stay distinguishable from the sale's creator.
+        let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
+        assert_ne!(sale.sale.created_by, collector, "the two actors are distinguishable");
+
+        let detail = s
+            .collect(collector, customer, cash, dec("30"), d(2024, 6, 20), None)
+            .await
+            .unwrap();
+
+        assert_eq!(detail.receipt.created_by, collector, "the collection request's actor");
+        assert_eq!(detail.receipt.updated_by, None, "the receipt has no edit path");
+        for payment in &detail.allocations {
+            assert_eq!(
+                payment.created_by, collector,
+                "every grouped payment carries the collection request's actor"
+            );
+            assert_ne!(payment.created_by, sale.sale.created_by, "not the sale's creator");
+            assert_eq!(payment.updated_by, None, "a fresh payment has no editor");
+        }
     }
 
     // -- Allocation order and shape ---------------------------------------------
@@ -1367,7 +1413,7 @@ mod tests {
         let ana_sale_two = credit_sale(&s, ana, product, "2", d(2024, 6, 10)).await;
         let beto_receipt = s
             .receipts
-            .create(&NewReceipt {
+            .create(audit_actor(&s).await, &NewReceipt {
                 customer_id: beto,
                 account_id: account,
                 method_id: cash,
@@ -1378,7 +1424,7 @@ mod tests {
             .unwrap();
         let ana_receipt = s
             .receipts
-            .create(&NewReceipt {
+            .create(audit_actor(&s).await, &NewReceipt {
                 customer_id: ana,
                 account_id: account,
                 method_id: cash,
@@ -1390,13 +1436,14 @@ mod tests {
 
         // Direct SQL insert of a mismatched pair is aborted.
         let err = sqlx::query(
-            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
-             VALUES (?, ?, ?, '10', '2024-06-20', ?)",
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id, created_by) \
+             VALUES (?, ?, ?, '10', '2024-06-20', ?, ?)",
         )
         .bind(ana_sale.sale.id)
         .bind(account)
         .bind(cash)
         .bind(beto_receipt.id)
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap_err();
@@ -1409,23 +1456,25 @@ mod tests {
         // A matching pair is accepted, and a payment with a NULL receipt_id is
         // unaffected.
         sqlx::query(
-            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
-             VALUES (?, ?, ?, '10', '2024-06-20', ?)",
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id, created_by) \
+             VALUES (?, ?, ?, '10', '2024-06-20', ?, ?)",
         )
         .bind(ana_sale.sale.id)
         .bind(account)
         .bind(cash)
         .bind(ana_receipt.id)
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
-             VALUES (?, ?, ?, '5', '2024-06-20', NULL)",
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id, created_by) \
+             VALUES (?, ?, ?, '5', '2024-06-20', NULL, ?)",
         )
         .bind(ana_sale.sale.id)
         .bind(account)
         .bind(cash)
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap();
@@ -1459,13 +1508,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id) \
-             VALUES (?, ?, ?, '7', '2024-06-20', ?)",
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id, created_by) \
+             VALUES (?, ?, ?, '7', '2024-06-20', ?, ?)",
         )
         .bind(ana_sale_two.sale.id)
         .bind(account)
         .bind(cash)
         .bind(ana_receipt.id)
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap();
@@ -1507,7 +1557,7 @@ mod tests {
         let ana_sale = credit_sale(&s, ana, product, "3", d(2024, 6, 1)).await; // 30
         let beto_receipt = s
             .receipts
-            .create(&NewReceipt {
+            .create(audit_actor(&s).await, &NewReceipt {
                 customer_id: beto,
                 account_id: account,
                 method_id: cash,
@@ -1547,7 +1597,7 @@ mod tests {
         // The same call with a receipt of the sale's own customer still works.
         let ana_receipt = s
             .receipts
-            .create(&NewReceipt {
+            .create(audit_actor(&s).await, &NewReceipt {
                 customer_id: ana,
                 account_id: account,
                 method_id: cash,

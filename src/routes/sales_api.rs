@@ -109,6 +109,7 @@ async fn sale_debt(
 async fn create_sale(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateSaleRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let customer_id = payload
@@ -116,14 +117,17 @@ async fn create_sale(
         .ok_or_else(|| AppError::Validation("customer_id is required".into()))?;
     let sale = state
         .sales_service
-        .create_draft(crate::models::NewSale {
-            customer_id,
-            payment_type: payload.payment_type,
-            sale_date: payload.sale_date,
-            due_date: payload.due_date,
-            receipt_no: payload.receipt_no,
-            notes: payload.notes,
-        })
+        .create_draft(
+            principal.user_id,
+            crate::models::NewSale {
+                customer_id,
+                payment_type: payload.payment_type,
+                sale_date: payload.sale_date,
+                due_date: payload.due_date,
+                receipt_no: payload.receipt_no,
+                notes: payload.notes,
+            },
+        )
         .await?;
     let detail = state.sales_service.get_detail(sale.id).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(detail))))
@@ -141,6 +145,7 @@ async fn get_sale(
 async fn update_sale(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
@@ -148,6 +153,7 @@ async fn update_sale(
         .sales_service
         .update_draft(
             id,
+            principal.user_id,
             UpdateSaleDraft {
                 sale_date: payload.sale_date,
                 due_date: payload.due_date,
@@ -429,11 +435,13 @@ mod tests {
         payment_days: Option<i64>,
     ) -> i64 {
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO customers (name, credit_limit, payment_days) VALUES (?, ?, ?) RETURNING id",
+            "INSERT INTO customers (name, credit_limit, payment_days, created_by) \
+             VALUES (?, ?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(limit)
         .bind(payment_days)
+        .bind(test_support::audit_actor_id(pool).await.unwrap())
         .fetch_one(pool)
         .await
         .unwrap();

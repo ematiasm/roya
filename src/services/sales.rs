@@ -228,7 +228,10 @@ where
 
     // -- Draft ---------------------------------------------------------------
 
-    pub async fn create_draft(&self, input: NewSale) -> AppResult<Sale> {
+    /// Create a Draft sale. `actor` is the acting user's id the route resolves
+    /// from its `Principal`; it becomes the row's `created_by` and nothing the
+    /// request itself can supply names it.
+    pub async fn create_draft(&self, actor: i64, input: NewSale) -> AppResult<Sale> {
         // Unknown customer => 404; the row is never created.
         let customer = self.customers.get_customer(input.customer_id).await?;
         let notes = Self::clean_notes(&input.notes)?;
@@ -245,10 +248,10 @@ where
         };
         // The name is a snapshot of the customer as it is today; later corrections
         // to the customer never rewrite this sale.
-        self.sales.create_sale(&clean, &customer.name).await
+        self.sales.create_sale(actor, &clean, &customer.name).await
     }
 
-    pub async fn update_draft(&self, id: i64, patch: UpdateSaleDraft) -> AppResult<Sale> {
+    pub async fn update_draft(&self, id: i64, actor: i64, patch: UpdateSaleDraft) -> AppResult<Sale> {
         let sale = self
             .sales
             .find_sale(id)
@@ -292,7 +295,7 @@ where
             }),
             notes: patch.notes.map(|s| s.trim().to_string()),
         };
-        self.sales.update_draft(id, &norm).await
+        self.sales.update_draft(id, actor, &norm).await
     }
 
     pub async fn add_line(
@@ -920,6 +923,7 @@ where
                 .await?;
             self.sales
                 .create_payment(
+                    actor,
                     sale_id,
                     account_id,
                     method_id,
@@ -931,7 +935,7 @@ where
                 .await?;
         }
 
-        let confirmed = self.sales.set_confirmed(sale_id, &sale_number).await?;
+        let confirmed = self.sales.set_confirmed(sale_id, actor, &sale_number).await?;
         self.detail_for(confirmed).await
     }
 
@@ -1006,6 +1010,7 @@ where
             .await?;
         self.sales
             .create_payment(
+                actor,
                 sale_id,
                 account_id,
                 method_id,
@@ -1052,7 +1057,7 @@ where
             // Draft -> Cancelled: no-op, no stock/finance.
             let cancelled = self
                 .sales
-                .set_cancelled(sale_id, reason.as_deref())
+                .set_cancelled(sale_id, actor, reason.as_deref())
                 .await?;
             return self.detail_for(cancelled).await;
         }
@@ -1143,13 +1148,13 @@ where
                 )
                 .await?;
             self.sales
-                .set_payment_refund_transaction(pay.id, refund.id)
+                .set_payment_refund_transaction(actor, pay.id, refund.id)
                 .await?;
         }
 
         let cancelled = self
             .sales
-            .set_cancelled(sale_id, reason.as_deref())
+            .set_cancelled(sale_id, actor, reason.as_deref())
             .await?;
         self.detail_for(cancelled).await
     }
@@ -1245,16 +1250,19 @@ mod tests {
         );
         let customers = CustomerService::new(SqliteCustomerRepository::new(pool.clone()));
         customers
-            .create_customer(NewCustomer {
+            .create_customer(
+                test_support::audit_actor_id(&pool).await.unwrap(),
+                NewCustomer {
                 name: "Credit Customer".into(),
                 phone: None,
                 address: None,
                 tax_id: None,
                 notes: None,
                 is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+                    credit_limit: None,
+                    payment_days: None,
+                },
+            )
             .await
             .unwrap();
         let s = SalesService::new(
@@ -1390,16 +1398,19 @@ mod tests {
         payment_days: Option<i64>,
     ) -> crate::models::Customer {
         s.customers
-            .create_customer(NewCustomer {
-                name: name.into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: limit.map(dec),
-                payment_days,
-            })
+            .create_customer(
+                audit_actor(s).await,
+                NewCustomer {
+                    name: name.into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: limit.map(dec),
+                    payment_days,
+                },
+            )
             .await
             .unwrap()
             .customer
@@ -1414,7 +1425,7 @@ mod tests {
         qty: &str,
     ) -> crate::models::Sale {
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id,
                 payment_type,
                 sale_date: sale_date(),
@@ -1464,7 +1475,7 @@ mod tests {
         let prod = seed_product(&s, "RED-1", "10").await;
         seed_stock(&s, prod.id, "10").await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1490,7 +1501,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1534,7 +1545,7 @@ mod tests {
         let prod = seed_product(&s, "AC3", "12").await;
         seed_stock(&s, prod.id, "10").await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -1619,7 +1630,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -1688,7 +1699,7 @@ mod tests {
 
         // Unknown product on add_line => 404.
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1717,7 +1728,7 @@ mod tests {
 
         // Unknown method on payment => 404.
         let csale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -1748,7 +1759,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1780,6 +1791,7 @@ mod tests {
         let err = s
             .update_draft(
                 sale.id,
+                audit_actor(&s).await,
                 UpdateSaleDraft {
                     notes: Some("Otro".into()),
                     ..Default::default()
@@ -1801,7 +1813,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1850,7 +1862,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1891,7 +1903,7 @@ mod tests {
         let cash2 = method_by_name(&s2, "Cash").await;
         allow(&s2, acc2.id, cash2).await;
         let sale2 = s2
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1928,7 +1940,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1957,7 +1969,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let a = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1969,7 +1981,7 @@ mod tests {
             .unwrap();
         s.add_line(a.id, prod.id, dec("1"), None).await.unwrap();
         let b = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -1990,7 +2002,7 @@ mod tests {
 
         // Draft -> Cancelled is a no-op for stock/finance.
         let c = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2019,7 +2031,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2059,7 +2071,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2076,7 +2088,7 @@ mod tests {
         assert!(err.to_string().contains("requires a payment method"), "got {err}");
         // Credit must not carry a method either.
         let credit = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2100,7 +2112,7 @@ mod tests {
         // Cash belongs to no account: it cannot confirm.
         let cash = cash_method(&s).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2138,7 +2150,7 @@ mod tests {
         allow(&s, acc_a.id, cash).await;
         allow(&s, acc_b.id, transfer).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2185,7 +2197,7 @@ mod tests {
         allow(&s, acc.id, cash).await;
         // QR belongs to no account, so it cannot pay.
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2219,7 +2231,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2262,7 +2274,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2334,7 +2346,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: CREDIT_CUSTOMER_ID,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2395,7 +2407,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2436,7 +2448,7 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: WALKIN_ID,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2472,7 +2484,7 @@ mod tests {
     async fn k2_ac2_unknown_customer_is_404_and_name_is_snapshotted() {
         let (s, _) = svc().await;
         let err = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: 99999,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2486,7 +2498,7 @@ mod tests {
 
         let customer = seed_customer(&s, "Ana", None, None).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: customer.id,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2507,7 +2519,7 @@ mod tests {
         let (s, _) = svc().await;
         let customer = seed_customer(&s, "Ana", None, None).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: customer.id,
                 payment_type: PaymentType::Cash,
                 sale_date: sale_date(),
@@ -2521,6 +2533,7 @@ mod tests {
         s.customers
             .update_customer(
                 customer.id,
+                audit_actor(&s).await,
                 crate::models::UpdateCustomer {
                     name: Some("Ana Pérez".into()),
                     ..Default::default()
@@ -2687,7 +2700,7 @@ mod tests {
         let (s, _) = svc().await;
         let term_customer = seed_customer(&s, "Term", None, Some(15)).await;
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: term_customer.id,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2705,7 +2718,7 @@ mod tests {
 
         // An explicit date wins over the term.
         let explicit = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: term_customer.id,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2723,7 +2736,7 @@ mod tests {
         // No term and no date => 400 at creation.
         let no_term = seed_customer(&s, "No Term", None, None).await;
         let err = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id: no_term.id,
                 payment_type: PaymentType::Credit,
                 sale_date: sale_date(),
@@ -2788,7 +2801,7 @@ mod tests {
         qty: &str,
     ) -> crate::models::Sale {
         let sale = s
-            .create_draft(NewSale {
+            .create_draft(audit_actor(&s).await, NewSale {
                 customer_id,
                 payment_type,
                 sale_date: date,
@@ -2932,11 +2945,12 @@ mod tests {
 
         // A credit sale with no due date counts as current.
         let (no_due_id,): (i64,) = sqlx::query_as(
-            r#"INSERT INTO sales (sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date)
-               VALUES ('2024-SALE-000900', 'Confirmed', 'Credit', ?, 'Credit Customer', '2024-01-01', NULL)
+            r#"INSERT INTO sales (sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, created_by)
+               VALUES ('2024-SALE-000900', 'Confirmed', 'Credit', ?, 'Credit Customer', '2024-01-01', NULL, ?)
                RETURNING id"#,
         )
         .bind(CREDIT_CUSTOMER_ID)
+        .bind(audit_actor(&s).await)
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -3469,5 +3483,79 @@ mod tests {
             "distinct from the product's creator"
         );
         assert_eq!(sale_move.updated_by, None, "an append-only movement has no editor");
+    }
+
+    /// AC18 (sales audit, M5 Phase B slice S11): the sale records TWO different
+    /// actors — the draft's creator and, after a header edit and the confirm,
+    /// the last editor — and the payment row it creates carries the acting
+    /// user of the request that recorded it, never a fresh one. A cancel
+    /// re-attributes the payment's `updated_by` to the cancelling request.
+    #[tokio::test]
+    async fn ac18_the_sale_records_two_different_actors_and_its_payment_the_flows_actor() {
+        let (s, pool) = svc().await;
+        let creator = test_support::seed_audit_user(&pool, "sale-alice", "Alice").await.unwrap();
+        let editor = test_support::seed_audit_user(&pool, "sale-bob", "Bob").await.unwrap();
+
+        let prod = seed_product(&s, "SALE-AUD", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "sale-audit-wallet").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let customer = seed_customer(&s, "sale-audit-customer", None, None).await;
+
+        // Alice creates the draft: the row names her and no editor yet.
+        let sale = s
+            .create_draft(creator, NewSale {
+                customer_id: customer.id,
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(sale.created_by, creator, "the draft's creator");
+        assert_eq!(sale.updated_by, None, "a fresh draft has no editor");
+        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+
+        // Bob edits the header: the same document now names its last editor,
+        // and the creator is untouched.
+        let edited = s
+            .update_draft(sale.id, editor, UpdateSaleDraft {
+                notes: Some("edited".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(edited.created_by, creator);
+        assert_eq!(edited.updated_by, Some(editor));
+
+        // Bob confirms: the same edit tier, so updated_by stays Bob.
+        let confirmed = s.confirm(editor, sale.id, None).await.unwrap();
+        assert_eq!(confirmed.sale.created_by, creator);
+        assert_eq!(confirmed.sale.updated_by, Some(editor));
+
+        // Alice records a payment: the payment row (the S9/S10 twin of the
+        // finance/inventory flow tests) carries the recording request's actor,
+        // not the sale's creator and not a fresh one.
+        let payment = s
+            .record_payment(creator, sale.id, cash, dec("10"), sale_date())
+            .await
+            .unwrap();
+        assert_eq!(payment.created_by, creator, "the flow's actor");
+        assert_ne!(payment.created_by, editor, "distinct from the confirming user");
+        assert_eq!(payment.updated_by, None, "a fresh payment has no editor");
+        let stored = s.sales.list_payments(sale.id).await.unwrap();
+        assert_eq!(stored[0].created_by, creator, "the stored row keeps it");
+
+        // Alice cancels: the refund links the payment rows carry HER actor in
+        // updated_by, like the refund Expense she caused.
+        let cancelled = s.cancel(creator, sale.id, Some("audit".into())).await.unwrap();
+        assert_eq!(cancelled.sale.created_by, creator);
+        assert_eq!(cancelled.sale.updated_by, Some(creator));
+        let payments = s.sales.list_payments(sale.id).await.unwrap();
+        assert_eq!(payments[0].updated_by, Some(creator), "the refund link names its writer");
+        assert_eq!(payments[0].created_by, creator, "the creator never changes");
     }
 }

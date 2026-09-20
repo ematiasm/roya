@@ -74,6 +74,10 @@ struct CustomersTemplate {
     warning: Option<String>,
     over_limit: bool,
     drawer_open: bool,
+    /// Audit display names (M5 Phase B, slice S11): the selected customer's
+    /// creator and last editor, resolved in this wiring layer.
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -100,6 +104,9 @@ struct CustomerDetailPartial {
     method_options: Vec<PaymentMethodWithAccount>,
     today: String,
     over_limit: bool,
+    /// Audit display names: the customer's creator and its last editor.
+    created_by_name: Option<String>,
+    updated_by_name: Option<String>,
 }
 
 #[derive(Template)]
@@ -182,6 +189,21 @@ fn over_limit(customer: &Customer, balance: Decimal) -> bool {
         .unwrap_or(false)
 }
 
+/// Resolve the selected customer's audit display names in this wiring layer
+/// (AC20: the department never reads identity tables; the resolution lives in
+/// the routes' shared helper).
+async fn customer_actor_names(
+    state: &AppState,
+    customer: &Customer,
+) -> AppResult<(Option<String>, Option<String>)> {
+    let mut actor_ids = vec![customer.created_by];
+    actor_ids.extend(customer.updated_by);
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let created = names.get(&customer.created_by).cloned();
+    let updated = customer.updated_by.and_then(|id| names.get(&id).cloned());
+    Ok((created, updated))
+}
+
 /// Every active/inactive customer with the derived receivable folded in.
 /// `ageing_all` only returns customers with a non-zero balance, so absent
 /// entries are a zero balance with an empty ageing.
@@ -253,6 +275,8 @@ async fn customers_page(
         warning: None,
         over_limit: false,
         drawer_open: false,
+        created_by_name: None,
+        updated_by_name: None,
         nav_key: "customers",
         nav: Nav::for_principal(&principal),
     };
@@ -276,6 +300,7 @@ async fn customer_statement_page(
     let debt_sales = state.sales_service.customer_debt_sales(id).await?;
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
+    let (created_by_name, updated_by_name) = customer_actor_names(&state, &customer).await?;
     let tmpl = CustomersTemplate {
         title: format!("Roya — Statement: {}", customer.name),
         customers: customer_rows(&state).await?,
@@ -288,6 +313,8 @@ async fn customer_statement_page(
         warning: None,
         over_limit,
         drawer_open: true,
+        created_by_name,
+        updated_by_name,
         nav_key: "customers",
         nav: Nav::for_principal(&principal),
     };
@@ -334,6 +361,7 @@ async fn detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
     let debt_sales = state.sales_service.customer_debt_sales(id).await?;
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
+    let (created_by_name, updated_by_name) = customer_actor_names(&state, &customer).await?;
     let html = CustomerDetailPartial {
         statement: Some(statement),
         selected: Some(customer),
@@ -342,6 +370,8 @@ async fn detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
         method_options,
         today: today().to_string(),
         over_limit,
+        created_by_name,
+        updated_by_name,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -425,21 +455,25 @@ pub struct CollectForm {
 async fn web_create_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CreateCustomerForm>,
 ) -> AppResult<Response> {
     let result = state
         .customer_service
-        .create_customer(NewCustomer {
-            name: form.name,
-            phone: clean_opt(&form.phone),
-            address: clean_opt(&form.address),
-            tax_id: clean_opt(&form.tax_id),
-            notes: clean_opt(&form.notes),
-            is_walkin: false,
-            credit_limit: parse_opt_decimal(&form.credit_limit, "credit_limit")?,
-            payment_days: parse_opt_i64(&form.payment_days, "payment_days")?,
-        })
+        .create_customer(
+            principal.user_id,
+            NewCustomer {
+                name: form.name,
+                phone: clean_opt(&form.phone),
+                address: clean_opt(&form.address),
+                tax_id: clean_opt(&form.tax_id),
+                notes: clean_opt(&form.notes),
+                is_walkin: false,
+                credit_limit: parse_opt_decimal(&form.credit_limit, "credit_limit")?,
+                payment_days: parse_opt_i64(&form.payment_days, "payment_days")?,
+            },
+        )
         .await?;
     // The name is not unique: report the existing matches as a warning, never a
     // rejection (AC15).
@@ -469,6 +503,7 @@ async fn web_create_customer(
 async fn web_update_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<EditCustomerForm>,
 ) -> AppResult<Response> {
@@ -478,6 +513,7 @@ async fn web_update_customer(
         .customer_service
         .update_customer(
             form.customer_id,
+            principal.user_id,
             UpdateCustomer {
                 name: Some(form.name),
                 phone: Some(clean_opt(&form.phone)),
@@ -501,12 +537,13 @@ async fn web_update_customer(
 async fn web_activate_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
     state
         .customer_service
-        .activate_customer(form.customer_id)
+        .activate_customer(principal.user_id, form.customer_id)
         .await?;
     if is_htmx(&headers) {
         let mut resp = list_response(&state, None).await?;
@@ -520,12 +557,13 @@ async fn web_activate_customer(
 async fn web_deactivate_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
     state
         .customer_service
-        .deactivate_customer(form.customer_id)
+        .deactivate_customer(principal.user_id, form.customer_id)
         .await?;
     if is_htmx(&headers) {
         let mut resp = list_response(&state, None).await?;
@@ -759,29 +797,35 @@ mod tests {
             .unwrap();
         let customer = state
             .customer_service
-            .create_customer(NewCustomer {
-                name: "Ana Web".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: Some(Decimal::from(40)),
-                payment_days: Some(30),
-            })
+            .create_customer(
+                audit_actor(&state).await,
+                NewCustomer {
+                    name: "Ana Web".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: Some(Decimal::from(40)),
+                    payment_days: Some(30),
+                },
+            )
             .await
             .unwrap()
             .customer;
         let sale = state
             .sales_service
-            .create_draft(NewSale {
-                customer_id: customer.id,
-                payment_type: PaymentType::Credit,
-                sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
-                receipt_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&state).await,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Credit,
+                    sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         state

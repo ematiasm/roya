@@ -207,6 +207,31 @@ async fn post_json_with_cookie(
     send_json_with_cookie(app, "PUT", uri, body, cookie).await
 }
 
+/// POST a form as ANOTHER principal: the cookie value comes from the caller
+/// (see `seed_session_with_permissions`), so a test can drive a second user
+/// through the HTMX form endpoints next to the shared fixture session.
+async fn post_form_with_cookie(
+    app: &Router,
+    uri: &str,
+    body: &str,
+    cookie: &str,
+) -> (StatusCode, String) {
+    let builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("cookie", cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("HX-Request", "true");
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
 fn json_body(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("expected JSON, got {body:.400}: {e}"))
 }
@@ -339,11 +364,13 @@ async fn seed_customer(
     payment_days: Option<i64>,
 ) -> i64 {
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO customers (name, credit_limit, payment_days) VALUES (?, ?, ?) RETURNING id",
+        "INSERT INTO customers (name, credit_limit, payment_days, created_by) \
+         VALUES (?, ?, ?, ?) RETURNING id",
     )
     .bind(name)
     .bind(credit_limit)
     .bind(payment_days)
+    .bind(test_support::audit_actor_id(pool).await.unwrap())
     .fetch_one(pool)
     .await
     .unwrap();
@@ -5850,4 +5877,406 @@ async fn ac19_the_inventory_migration_recreates_a_missing_sentinel() {
         .await
         .unwrap();
     assert_eq!(roles.0, 0, "the recreated sentinel holds no role");
+}
+
+// ---------------------------------------------------------------------------
+// AC19 (sales/customers audit, M5 Phase B slice S11): the upgrade sequence on
+// the four rebuilt tables — a database built with the migrations up to 31,
+// business rows in customers/sales/sale_payments/customer_receipts and no user
+// beyond the sentinel.
+// ---------------------------------------------------------------------------
+
+/// A pool with the migration chain stopped just after the inventory audit (the
+/// pre-32 sales/customers schema is real) plus legacy business rows planted
+/// the way pre-audit code wrote them: no created_by column exists to fill.
+async fn upgraded_pool_with_legacy_sales_and_customer_rows()
+    -> ((i64, i64, i64, i64), sqlx::SqlitePool) {
+    let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run_to(20240101000031, &pool).await.unwrap();
+
+    // The sentinel exists by now (the seeded payment methods made migration 30
+    // attribute something): the finance rows the audit needs are real.
+    let sentinel: (i64,) =
+        sqlx::query_as("SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let users_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(users_before.0, 1, "no user beyond the sentinel before the upgrade");
+
+    let account_id: (i64,) = sqlx::query_as(
+        "INSERT INTO accounts (name, created_by) VALUES ('legacy wallet', ?) RETURNING id",
+    )
+    .bind(sentinel.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let customer_id: (i64,) = sqlx::query_as(
+        "INSERT INTO customers (name, is_walkin, is_active) \
+         VALUES ('Legacy Client', 0, 1) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let sale_id: (i64,) = sqlx::query_as(
+        "INSERT INTO sales (sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date) \
+         VALUES ('2024-SALE-000001', 'Confirmed', 'Credit', ?, 'Legacy Client', '2024-05-02', '2024-06-01') \
+         RETURNING id",
+    )
+    .bind(customer_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) \
+         SELECT ?, id, '1', '10' FROM products LIMIT 1",
+    )
+    .bind(sale_id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let payment_id: (i64,) = sqlx::query_as(
+        "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date) \
+         VALUES (?, ?, 1, '5', '2024-05-10') RETURNING id",
+    )
+    .bind(sale_id.0)
+    .bind(account_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let receipt_id: (i64,) = sqlx::query_as(
+        "INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes) \
+         VALUES (?, ?, 1, '2024-06-20', NULL) RETURNING id",
+    )
+    .bind(customer_id.0)
+    .bind(account_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    (
+        (customer_id.0, sale_id.0, payment_id.0, receipt_id.0),
+        pool,
+    )
+}
+
+/// The upgrade attributes every pre-existing row of the four tables to the
+/// sentinel it REUSES, loses no row and no id, and leaves `created_by` NOT NULL
+/// on all four — a future write that omits the actor is refused by the
+/// database. The RESTRICT audit foreign key holds the sentinel in place.
+#[tokio::test]
+async fn ac19_the_upgrade_attributes_every_sales_and_customer_row_to_the_system_sentinel() {
+    let (legacy, pool) = upgraded_pool_with_legacy_sales_and_customer_rows().await;
+    let (customer_id, sale_id, payment_id, receipt_id) = legacy;
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let sentinel = test_support::audit_actor_id(&pool).await.unwrap();
+
+    // Rows preserved, ids preserved, zero unattributed: every legacy row is
+    // exactly where it was, pointing at the reused sentinel.
+    for (table, id) in [
+        ("customers", customer_id),
+        ("sales", sale_id),
+        ("sale_payments", payment_id),
+        ("customer_receipts", receipt_id),
+    ] {
+        let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ? AND created_by = ?"
+        )))
+        .bind(id)
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0, 1,
+            "{table}: the legacy row survived with its id, attributed to the reused sentinel"
+        );
+    }
+    for table in ["customers", "sales", "sale_payments", "customer_receipts"] {
+        let unattributed: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE created_by IS NULL OR created_by != ?"
+        )))
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unattributed.0, 0, "{table}: no row lost its actor");
+    }
+    // The seeded walk-in predates the audit too, so it points at the sentinel.
+    let walkin_attributed: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM customers WHERE is_walkin = 1 AND created_by = ?",
+    )
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(walkin_attributed.0, 1, "the seeded walk-in is attributed");
+
+    // Exactly one sentinel: the REUSE path never duplicated the account.
+    let sentinels: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE username = 'sistema' COLLATE NOCASE")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sentinels.0, 1, "the reuse path never created a second sentinel");
+
+    // `created_by` is NOT NULL on all four rebuilt tables: a write that omits
+    // the actor is refused by the database.
+    for (table, sql) in [
+        ("customers", "INSERT INTO customers (name) VALUES ('no-actor')"),
+        (
+            "sales",
+            "INSERT INTO sales (status, payment_type, customer_id, sale_date) \
+             VALUES ('Draft', 'Cash', 1, '2024-01-01')",
+        ),
+        (
+            "sale_payments",
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date) \
+             VALUES (1, 1, 1, '1', '2024-01-01')",
+        ),
+        (
+            "customer_receipts",
+            "INSERT INTO customer_receipts (customer_id, account_id, method_id, date) \
+             VALUES (1, 1, 1, '2024-01-01')",
+        ),
+    ] {
+        let refused = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .execute(&pool)
+            .await;
+        assert!(
+            refused.is_err(),
+            "{table}: created_by is NOT NULL after the rebuild"
+        );
+    }
+
+    // The re-enabled foreign keys find the same graph that existed before, and
+    // the walk-in backstops survived the customers rebuild: the three triggers
+    // still refuse the erase.
+    let violations: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+    let refused_deactivate = sqlx::query("UPDATE customers SET is_active = 0 WHERE is_walkin = 1")
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(
+        refused_deactivate.to_string().contains("cannot be deactivated"),
+        "the walk-in deactivation trigger survived the rebuild: {refused_deactivate}"
+    );
+
+    // The RESTRICT audit foreign key holds the sentinel in place for these
+    // tables too: deleting it is refused and the row survives.
+    let refused = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(sentinel)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        "the audit FK refuses the deletion: {refused}"
+    );
+    let still_there: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(still_there.0, 1);
+}
+
+/// The defensive path: migration 32 REUSES the sentinel migration 30 created
+/// and only creates one if it is somehow absent. This test makes it absent —
+/// every table that references the sentinel is emptied and the account deleted
+/// after migration 31 — plants legacy sales/customers rows (the only two of the
+/// four that can exist without any user: a payment row and a receipt need an
+/// account, and an account needs a user to attribute itself to), and runs the
+/// rest of the chain.
+#[tokio::test]
+async fn ac19_the_sales_migration_recreates_a_missing_sentinel() {
+    let pool = upgraded_pool_with_legacy_sales_and_customer_rows().await.1;
+    // Make the sentinel absent: empty the tables that reference it (RESTRICT
+    // refuses a direct delete), children of the business rows first.
+    sqlx::query("DELETE FROM sale_payments").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM sale_lines").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM customer_receipts").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM sales").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM transactions").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM payment_methods").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM accounts").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM stock_movements").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM products").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM categories").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM users").execute(&pool).await.unwrap();
+    let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before.0, 0, "the sentinel is gone when migration 32 runs");
+
+    // The legacy rows this path can attribute: a customer and its sale. Neither
+    // references a user before migration 32 runs, so both survive the erasure
+    // and give the migration something to attribute.
+    let (customer_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO customers (name, is_walkin, is_active) \
+         VALUES ('Defensive Client', 0, 1) RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (sale_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO sales (sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date) \
+         VALUES ('2024-SALE-000009', 'Confirmed', 'Credit', ?, 'Defensive Client', '2024-05-02', '2024-06-01') \
+         RETURNING id",
+    )
+    .bind(customer_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let sentinel = test_support::audit_actor_id(&pool).await.unwrap();
+    for (table, id) in [("customers", customer_id), ("sales", sale_id)] {
+        let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ? AND created_by = ?"
+        )))
+        .bind(id)
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.0, 1,
+            "{table}: the defensive sentinel exists and owns the legacy row"
+        );
+    }
+    // The defensive sentinel is the same shape migration 30's is: inactive,
+    // roleless, unusable credential.
+    let sentinel_row: (i64, i64) = sqlx::query_as(
+        "SELECT is_active, must_change_password FROM users WHERE id = ?",
+    )
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sentinel_row.0, 0, "the recreated sentinel is inactive");
+    let roles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = ?")
+        .bind(sentinel)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(roles.0, 0, "the recreated sentinel holds no role");
+}
+
+// ---------------------------------------------------------------------------
+// AC18 (sales/customers audit, slice S11): the display, at the wiring layer.
+// ---------------------------------------------------------------------------
+
+/// The sale record page shows the actor as a DISPLAY NAME, never an id: the
+/// shared session user creates the draft, a second probe user confirms it, and
+/// the page renders both names — "Registrado por" for the creator and
+/// "Actualizado por" for the confirming edit.
+#[tokio::test]
+async fn audit_the_sale_record_shows_the_actor_display_name() {
+    let (app, pool) = test_app().await;
+    let customer = seed_customer(&pool, "Audit Sale Client", None, Some(30)).await;
+    let product = create_product_via_web(&app, &pool, "AUD-SALE-P", "0", "100").await;
+    record_stock_via_web(&app, product, "10").await;
+    let sale_id =
+        create_sale_draft_for_customer(&app, customer, "Credit", "").await;
+    add_sale_line_via_web(&app, sale_id, product, "1").await;
+
+    // A second principal (display name "Test Probe") holds the draft-lifecycle
+    // permission and confirms the sale.
+    let probe_token =
+        test_support::seed_session_with_permissions(&pool, &["sales.read", "sales.create"])
+            .await
+            .unwrap();
+    let (status, body) = post_form_with_cookie(
+        &app,
+        &format!("/web/sales/{sale_id}/confirm"),
+        "method_id=",
+        &test_support::cookie_for(&probe_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    let (status, page) = get(&app, &format!("/sales/{sale_id}")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page.matches("Registrado por Test Admin").count(),
+        1,
+        "the sale names its creator: {page:.600}"
+    );
+    assert_eq!(
+        page.matches("Actualizado por Test Probe").count(),
+        1,
+        "the confirm names its editor: {page:.600}"
+    );
+    assert!(
+        !page.contains("Registrado por 1"),
+        "the interface never renders a raw user id: {page}"
+    );
+}
+
+/// The customer statement shows the CUSTOMER row's attribution as a display
+/// name, labelled "Cliente registrado por" so the documents below cannot be
+/// misread as this person's work.
+#[tokio::test]
+async fn audit_the_customer_statement_shows_the_actor_display_name() {
+    let (app, pool) = test_app().await;
+    // The customer is created through the web form, so its actor is the shared
+    // session user (the raw fixture seeds the sentinel, which is for upgrade
+    // tests, not for a display test that must name a person).
+    let (status, resp) = post_form(&app, "/web/customers", "name=Audit+Statement+Client").await;
+    assert_eq!(status, StatusCode::OK, "{resp:.400}");
+    let customer = customer_id_by_name(&pool, "Audit Statement Client").await;
+
+    // A second principal (display name "Test Probe") edits the customer.
+    let probe_token = test_support::seed_session_with_permissions(
+        &pool,
+        &["customers.read", "customers.write"],
+    )
+    .await
+    .unwrap();
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/customers/edit",
+        &format!("customer_id={customer}&name=Renamed+Client&phone=&address=&tax_id=&notes=&credit_limit=&payment_days="),
+        &test_support::cookie_for(&probe_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    let (status, page) = get(&app, &format!("/customers/{customer}")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        page.matches("Cliente registrado por Test Admin").count(),
+        1,
+        "the statement names the customer's creator: {page:.600}"
+    );
+    assert_eq!(
+        page.matches("Actualizado por Test Probe").count(),
+        1,
+        "the edit names its editor: {page:.600}"
+    );
+    assert!(
+        !page.contains("Cliente registrado por 1"),
+        "the interface never renders a raw user id: {page}"
+    );
 }

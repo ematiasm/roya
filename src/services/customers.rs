@@ -101,8 +101,10 @@ where
     /// Create a customer. A name is not unique (two people can share one), so the
     /// result carries any existing exact-name matches for the caller to warn
     /// about without blocking. The walk-in is seeded by migration and cannot be
-    /// created a second time.
-    pub async fn create_customer(&self, input: NewCustomer) -> AppResult<CustomerCreateResult> {
+    /// created a second time. `actor` is the acting user's id from the request
+    /// (`Principal.user_id`): it is the row's `created_by`, and nothing the
+    /// request itself can supply names it.
+    pub async fn create_customer(&self, actor: i64, input: NewCustomer) -> AppResult<CustomerCreateResult> {
         let clean = Self::clean_input(&input)?;
         if clean.is_walkin {
             if let Some(existing) = self.customers.find_walkin().await? {
@@ -114,14 +116,14 @@ where
         }
         // Look the name up before inserting so the new row is not its own match.
         let name_matches = self.customers.find_by_name(&clean.name).await?;
-        let customer = self.customers.create(&clean).await?;
+        let customer = self.customers.create(actor, &clean).await?;
         Ok(CustomerCreateResult {
             customer,
             name_matches,
         })
     }
 
-    pub async fn update_customer(&self, id: i64, patch: UpdateCustomer) -> AppResult<Customer> {
+    pub async fn update_customer(&self, id: i64, actor: i64, patch: UpdateCustomer) -> AppResult<Customer> {
         self.get_customer(id).await?;
 
         let mut clean = UpdateCustomer::default();
@@ -146,7 +148,7 @@ where
         if let Some(days) = patch.payment_days {
             clean.payment_days = Some(Self::clean_payment_days(days)?);
         }
-        self.customers.update(id, &clean).await
+        self.customers.update(id, actor, &clean).await
     }
 
     pub async fn get_customer(&self, id: i64) -> AppResult<Customer> {
@@ -161,20 +163,21 @@ where
     }
 
     /// Deactivate keeps the row and its history. The walk-in can never be
-    /// deactivated because cash sales default to it.
-    pub async fn deactivate_customer(&self, id: i64) -> AppResult<Customer> {
+    /// deactivated because cash sales default to it. The toggle is an edit, so
+    /// `updated_by` records the acting user like every other update.
+    pub async fn deactivate_customer(&self, actor: i64, id: i64) -> AppResult<Customer> {
         let customer = self.get_customer(id).await?;
         if customer.is_walkin {
             return Err(AppError::Validation(
                 "walk-in customer cannot be deactivated".into(),
             ));
         }
-        self.customers.set_active(id, false).await
+        self.customers.set_active(id, actor, false).await
     }
 
-    pub async fn activate_customer(&self, id: i64) -> AppResult<Customer> {
+    pub async fn activate_customer(&self, actor: i64, id: i64) -> AppResult<Customer> {
         self.get_customer(id).await?;
-        self.customers.set_active(id, true).await
+        self.customers.set_active(id, actor, true).await
     }
 
     /// Deleting a customer with sales is refused by the RESTRICT foreign key
@@ -204,6 +207,7 @@ mod tests {
     use super::*;
     use crate::models::{Customer, NewCustomer, UpdateCustomer};
     use crate::repositories::SqliteCustomerRepository;
+    use crate::security::test_support;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::SqlitePool;
     use std::str::FromStr;
@@ -233,12 +237,20 @@ mod tests {
         (s, pool)
     }
 
+    /// A valid acting user for the mechanical call sites: the migration's
+    /// sentinel account (the system actor pre-existing rows are attributed to).
+    /// The audit-attribution tests below seed their own users instead, because
+    /// there the point is telling two actors apart.
+    async fn audit_actor(s: &Svc) -> i64 {
+        test_support::audit_actor_id(&s.customers.pool).await.unwrap()
+    }
+
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
     }
 
     async fn new_customer(s: &Svc, name: &str) -> Customer {
-        s.create_customer(NewCustomer {
+        s.create_customer(audit_actor(&s).await, NewCustomer {
             name: name.into(),
             phone: None,
             address: None,
@@ -280,7 +292,7 @@ mod tests {
 
         // A second walk-in cannot be created.
         let err = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Otro mostrador".into(),
                 phone: None,
                 address: None,
@@ -304,7 +316,7 @@ mod tests {
         );
 
         // The walk-in cannot be deactivated...
-        let err = s.deactivate_customer(w.id).await.unwrap_err();
+        let err = s.deactivate_customer(audit_actor(&s).await, w.id).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(s.get_customer(w.id).await.unwrap().is_active);
 
@@ -350,7 +362,7 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(s.get_customer(c.id).await.is_ok(), "the row survives");
 
-        let off = s.deactivate_customer(c.id).await.unwrap();
+        let off = s.deactivate_customer(audit_actor(&s).await, c.id).await.unwrap();
         assert!(!off.is_active);
         assert_eq!(s.get_customer(c.id).await.unwrap().name, "Con historial");
         assert!(s
@@ -367,7 +379,7 @@ mod tests {
             .any(|x| x.id == c.id));
 
         // Reactivation keeps the customer usable.
-        assert!(s.activate_customer(c.id).await.unwrap().is_active);
+        assert!(s.activate_customer(audit_actor(&s).await, c.id).await.unwrap().is_active);
         assert!(s
             .list_customers(true)
             .await
@@ -395,7 +407,7 @@ mod tests {
         let (s, _pool) = svc().await;
 
         let first = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "  Juan Pérez  ".into(),
                 phone: None,
                 address: None,
@@ -411,7 +423,7 @@ mod tests {
         assert_eq!(first.customer.name, "Juan Pérez", "the name is trimmed");
 
         let second = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Juan Pérez".into(),
                 phone: None,
                 address: None,
@@ -445,7 +457,7 @@ mod tests {
 
         // The seeded walk-in is reported as a match too, without blocking.
         let third = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Consumidor final".into(),
                 phone: None,
                 address: None,
@@ -468,7 +480,7 @@ mod tests {
         let (s, _pool) = svc().await;
         for bad in ["", "   ", "\t\n"] {
             let err = s
-                .create_customer(NewCustomer {
+                .create_customer(audit_actor(&s).await, NewCustomer {
                     name: bad.into(),
                     phone: None,
                     address: None,
@@ -483,7 +495,7 @@ mod tests {
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         }
         let err = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "n".repeat(129),
                 phone: None,
                 address: None,
@@ -498,7 +510,7 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         let created = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "  Límite exacto  ".into(),
                 phone: None,
                 address: None,
@@ -520,7 +532,7 @@ mod tests {
     async fn tri_optional_fields_are_trimmed_bounded_and_clearable() {
         let (s, _pool) = svc().await;
         let created = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Campos".into(),
                 phone: Some("  555-1234  ".into()),
                 address: Some("  Calle 1  ".into()),
@@ -542,7 +554,7 @@ mod tests {
 
         // Whitespace-only optional values are stored as NULL.
         let blank = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Blancos".into(),
                 phone: Some("   ".into()),
                 address: Some("".into()),
@@ -568,7 +580,7 @@ mod tests {
             (None, None, None, Some("x".repeat(513))),
         ] {
             let err = s
-                .create_customer(NewCustomer {
+                .create_customer(audit_actor(&s).await, NewCustomer {
                     name: "Largos".into(),
                     phone,
                     address,
@@ -587,6 +599,7 @@ mod tests {
         let patched = s
             .update_customer(
                 created.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     name: Some("  Campos 2  ".into()),
                     phone: Some(None),
@@ -605,6 +618,7 @@ mod tests {
         let patched = s
             .update_customer(
                 created.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     credit_limit: Some(Some(dec("2000"))),
                     payment_days: Some(Some(15)),
@@ -621,7 +635,7 @@ mod tests {
     async fn tri_negative_limit_and_term_are_rejected() {
         let (s, _pool) = svc().await;
         let err = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Negativo".into(),
                 phone: None,
                 address: None,
@@ -635,7 +649,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Negativo".into(),
                 phone: None,
                 address: None,
@@ -653,6 +667,7 @@ mod tests {
         let patched = s
             .update_customer(
                 ok.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     credit_limit: Some(Some(Decimal::ZERO)),
                     payment_days: Some(Some(0)),
@@ -667,6 +682,7 @@ mod tests {
         let err = s
             .update_customer(
                 ok.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     credit_limit: Some(Some(dec("-1"))),
                     ..Default::default()
@@ -686,7 +702,7 @@ mod tests {
     async fn tri_name_lookup_is_exact_and_case_sensitive() {
         let (s, _pool) = svc().await;
         let stored = s
-            .create_customer(NewCustomer {
+            .create_customer(audit_actor(&s).await, NewCustomer {
                 name: "Pedro Gómez".into(),
                 phone: None,
                 address: None,
@@ -703,7 +719,7 @@ mod tests {
         // Different case and partial names are not duplicate warnings.
         for name in ["pedro gómez", "Pedro"] {
             let r = s
-                .create_customer(NewCustomer {
+                .create_customer(audit_actor(&s).await, NewCustomer {
                     name: name.into(),
                     phone: None,
                     address: None,
@@ -732,7 +748,7 @@ mod tests {
         let (s, _pool) = svc().await;
         let on = new_customer(&s, "Activo").await;
         let off = new_customer(&s, "Inactivo").await;
-        s.deactivate_customer(off.id).await.unwrap();
+        s.deactivate_customer(audit_actor(&s).await, off.id).await.unwrap();
 
         let active = s.list_customers(true).await.unwrap();
         assert!(active.iter().any(|c| c.id == on.id));
@@ -750,17 +766,17 @@ mod tests {
             AppError::NotFound(_)
         ));
         assert!(matches!(
-            s.update_customer(999_999, UpdateCustomer::default())
+            s.update_customer(999_999, audit_actor(&s).await, UpdateCustomer::default())
                 .await
                 .unwrap_err(),
             AppError::NotFound(_)
         ));
         assert!(matches!(
-            s.deactivate_customer(999_999).await.unwrap_err(),
+            s.deactivate_customer(audit_actor(&s).await, 999_999).await.unwrap_err(),
             AppError::NotFound(_)
         ));
         assert!(matches!(
-            s.activate_customer(999_999).await.unwrap_err(),
+            s.activate_customer(audit_actor(&s).await, 999_999).await.unwrap_err(),
             AppError::NotFound(_)
         ));
         assert!(matches!(
@@ -781,10 +797,11 @@ mod tests {
         // Re-run the seed statement exactly as the migration wrote it: the guard
         // must leave the single existing walk-in untouched.
         sqlx::query(
-            r#"INSERT INTO customers (name, is_walkin, credit_limit, payment_days)
-               SELECT 'Consumidor final', 1, NULL, NULL
+            r#"INSERT INTO customers (name, is_walkin, credit_limit, payment_days, created_by)
+               SELECT 'Consumidor final', 1, NULL, NULL, ?
                WHERE NOT EXISTS (SELECT 1 FROM customers WHERE is_walkin = 1)"#,
         )
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap();
@@ -804,8 +821,9 @@ mod tests {
     async fn tri_database_backstop_refuses_a_second_walkin() {
         let (s, pool) = svc().await;
         let err = sqlx::query(
-            r#"INSERT INTO customers (name, is_walkin) VALUES ('Impostor', 1)"#,
+            r#"INSERT INTO customers (name, is_walkin, created_by) VALUES ('Impostor', 1, ?)"#,
         )
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap_err();
@@ -835,6 +853,7 @@ mod tests {
         let renamed = s
             .update_customer(
                 third.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     name: Some("Homónimo".into()),
                     ..Default::default()
@@ -899,7 +918,7 @@ mod tests {
         let (s, _pool) = svc().await;
         let walkin = seeded_walkin(&s).await;
 
-        let err = s.deactivate_customer(walkin.id).await.unwrap_err();
+        let err = s.deactivate_customer(audit_actor(&s).await, walkin.id).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert_eq!(
             err.to_string(),
@@ -922,7 +941,7 @@ mod tests {
         let (s, _pool) = svc().await;
 
         let deactivated = new_customer(&s, "Se desactiva").await;
-        let off = s.deactivate_customer(deactivated.id).await.unwrap();
+        let off = s.deactivate_customer(audit_actor(&s).await, deactivated.id).await.unwrap();
         assert!(!off.is_active);
         assert!(!s.get_customer(deactivated.id).await.unwrap().is_active);
 
@@ -964,6 +983,7 @@ mod tests {
         let updated = s
             .update_customer(
                 walkin.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     name: Some("Consumidor final".into()),
                     credit_limit: Some(Some(dec("2000"))),
@@ -1048,6 +1068,7 @@ mod tests {
         let updated = s
             .update_customer(
                 regular.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     name: Some("Actualizado".into()),
                     phone: Some(Some("555-9999".into())),
@@ -1070,6 +1091,51 @@ mod tests {
         assert!(!updated.is_walkin && updated.is_active);
     }
 
+        /// AC18 (customers audit, M5 Phase B slice S11): a customer records TWO
+    /// different actors — its creator and, after a rename, its last editor —
+    /// and the walk-in protection is untouched by the new columns.
+    #[tokio::test]
+    async fn ac18_a_customer_records_two_different_actors() {
+        let (s, pool) = svc().await;
+        let creator = test_support::seed_audit_user(&pool, "cust-alice", "Alice").await.unwrap();
+        let editor = test_support::seed_audit_user(&pool, "cust-bob", "Bob").await.unwrap();
+
+        let customer = s
+            .create_customer(creator, NewCustomer {
+                name: "Audited".into(),
+                phone: None,
+                address: None,
+                tax_id: None,
+                notes: None,
+                is_walkin: false,
+                credit_limit: None,
+                payment_days: None,
+            })
+            .await
+            .unwrap()
+            .customer;
+        assert_eq!(customer.created_by, creator, "the creator");
+        assert_eq!(customer.updated_by, None, "a fresh row has no editor");
+
+        let updated = s
+            .update_customer(customer.id, editor, UpdateCustomer {
+                name: Some("Audited II".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.created_by, creator, "the creator is untouched by an edit");
+        assert_eq!(updated.updated_by, Some(editor), "the editor");
+
+        // The activation toggle is an edit too, so it carries the same rule.
+        let off = s.deactivate_customer(editor, customer.id).await.unwrap();
+        assert_eq!(off.created_by, creator);
+        assert_eq!(off.updated_by, Some(editor));
+        let on = s.activate_customer(creator, customer.id).await.unwrap();
+        assert_eq!(on.created_by, creator);
+        assert_eq!(on.updated_by, Some(creator), "the toggle names its own actor");
+    }
+
     /// REPLACE conflict resolution cannot remove or replace the walk-in: with
     /// `recursive_triggers` on, the BEFORE DELETE trigger fires for the rows
     /// REPLACE deletes too.
@@ -1080,10 +1146,11 @@ mod tests {
 
         // INSERT OR REPLACE.
         let err = sqlx::query(
-            "INSERT OR REPLACE INTO customers (id, name, is_walkin, is_active) \
-             VALUES (?, 'Replaced', 0, 1)",
+            "INSERT OR REPLACE INTO customers (id, name, is_walkin, is_active, created_by) \
+             VALUES (?, 'Replaced', 0, 1, ?)",
         )
         .bind(walkin.id)
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap_err();
@@ -1093,8 +1160,9 @@ mod tests {
 
         // REPLACE INTO promoting a different row onto the walk-in slot.
         let err = sqlx::query(
-            "REPLACE INTO customers (name, is_walkin) VALUES ('Second walkin', 1)",
+            "REPLACE INTO customers (name, is_walkin, created_by) VALUES ('Second walkin', 1, ?)",
         )
+        .bind(audit_actor(&s).await)
         .execute(&pool)
         .await
         .unwrap_err();
@@ -1169,6 +1237,7 @@ mod tests {
         let renamed = s
             .update_customer(
                 regular.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     name: Some("Válido renombrado".into()),
                     phone: Some(Some("555".into())),
@@ -1178,7 +1247,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(renamed.name, "Válido renombrado");
-        let off = s.deactivate_customer(regular.id).await.unwrap();
+        let off = s.deactivate_customer(audit_actor(&s).await, regular.id).await.unwrap();
         assert!(!off.is_active);
         s.delete_customer(regular.id).await.unwrap();
         assert!(matches!(
@@ -1190,6 +1259,7 @@ mod tests {
         let edited = s
             .update_customer(
                 walkin.id,
+                audit_actor(&s).await,
                 UpdateCustomer {
                     name: Some("Consumidor final de mostrador".into()),
                     phone: Some(Some("555-0100".into())),

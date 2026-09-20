@@ -71,12 +71,17 @@
   {% if let Some(r) = record.sale.receipt_no %}
     <div class="text-[13px] text-muted">receipt {{ r }}</div>
   {% endif %}
+  {# Audit attribution (slice S11): the sale's creator and its last editor (a
+     header edit, the confirm or the cancel), rendered as display names the
+     wiring layer resolved. #}
+  <div class="text-[13px] text-muted" data-sale-actor>Registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
   {% if !record.sale.notes.is_empty() %}
     <div class="text-[13px] text-muted">{{ record.sale.notes }}</div>
   {% endif %}
   {% if let Some(c) = record.sale.cancel_reason %}
     <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-cancel-reason>Cancelled: {{ c }}</div>
   {% endif %}
+
 
   {% call record_money(record) %}
 

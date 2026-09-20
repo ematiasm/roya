@@ -868,22 +868,24 @@ mod tests {
         // `customer_id` is NOT NULL by design: resolve the seeded walk-in
         // instead of hardcoding its id.
         let sale_id: (i64,) = sqlx::query_as(
-            "INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date) \
+            "INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date, created_by) \
              VALUES ('Confirmed', 'Cash', \
-                     (SELECT id FROM customers WHERE is_walkin = 1), 'fixture', '2024-01-15') \
+                     (SELECT id FROM customers WHERE is_walkin = 1), 'fixture', '2024-01-15', ?) \
              RETURNING id",
         )
+        .bind(test_support::audit_actor_id(&pool).await.unwrap())
         .fetch_one(&pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO sale_payments \
-             (sale_id, account_id, method_id, amount, date, transaction_id) \
-             VALUES (?, ?, 1, '12.50', '2024-01-15', ?)",
+             (sale_id, account_id, method_id, amount, date, transaction_id, created_by) \
+             VALUES (?, ?, 1, '12.50', '2024-01-15', ?, ?)",
         )
         .bind(sale_id.0)
         .bind(acc)
         .bind(tx_id)
+        .bind(test_support::audit_actor_id(&pool).await.unwrap())
         .execute(&pool)
         .await
         .unwrap();

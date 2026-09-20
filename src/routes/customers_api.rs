@@ -172,9 +172,13 @@ async fn list_customers(
 async fn create_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<NewCustomer>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let created = state.customer_service.create_customer(payload).await?;
+    let created = state
+        .customer_service
+        .create_customer(principal.user_id, payload)
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(created))))
 }
 
@@ -191,6 +195,7 @@ async fn get_customer(
 async fn update_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateCustomerRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
@@ -198,6 +203,7 @@ async fn update_customer(
         .customer_service
         .update_customer(
             id,
+            principal.user_id,
             UpdateCustomer {
                 name: payload.name,
                 phone: payload.phone,
@@ -216,9 +222,13 @@ async fn update_customer(
 async fn activate_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let customer = state.customer_service.activate_customer(id).await?;
+    let customer = state
+        .customer_service
+        .activate_customer(principal.user_id, id)
+        .await?;
     let view = customer_view(&state, customer).await?;
     Ok(Json(serde_json::json!(view)))
 }
@@ -226,9 +236,13 @@ async fn activate_customer(
 async fn deactivate_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let customer = state.customer_service.deactivate_customer(id).await?;
+    let customer = state
+        .customer_service
+        .deactivate_customer(principal.user_id, id)
+        .await?;
     let view = customer_view(&state, customer).await?;
     Ok(Json(serde_json::json!(view)))
 }
