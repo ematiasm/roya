@@ -1699,6 +1699,145 @@ mod tests {
         );
     }
 
+    /// Cost-freshness T4: a draft line whose cost rose above the product's
+    /// stored cost renders the stale-cost warning with BOTH numbers, as a
+    /// sub-row underneath the line row (never inside it, so the line row's
+    /// text order stays product · qty · cost, which the browser suite
+    /// asserts as-is). The same response that adds a line swaps only
+    /// `#purchase-record-money`, so the warning must ride that fragment.
+    #[tokio::test]
+    async fn web_purchase_record_draft_flags_a_rising_line_cost_on_the_fragment() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        // The fixture's line sits at the product's stored cost (10); push the
+        // line's cost above it to reach the warning's condition.
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(">stale cost<"),
+            "a rising line cost must be flagged on the record page: {html:.800}"
+        );
+        assert!(
+            html.contains("line cost $12.00"),
+            "the warning must show the line's cost: {html:.800}"
+        );
+        assert!(
+            html.contains("stored $10.00"),
+            "the warning must show the stored cost it is behind: {html:.800}"
+        );
+
+        // Placement: the line row itself keeps its text order — the warning is
+        // a separate sub-row after it, still inside the lines table.
+        let line_row = row_with_id(&html, &format!("purchase-line-{}", fixture.line_id));
+        assert!(
+            !line_row.contains("stale cost"),
+            "the warning must not sit inside the line row: {line_row}"
+        );
+        let after_line_row = &html[html.find(line_row).unwrap() + line_row.len()..];
+        let table_end = after_line_row
+            .find("</tbody>")
+            .expect("the lines table must close");
+        assert!(
+            after_line_row[..table_end].contains(">stale cost<"),
+            "the warning must render as a sub-row right below its line: {}",
+            &after_line_row[..table_end]
+        );
+
+        // Adding a line swaps only `#purchase-record-money`: the warning must
+        // travel inside that fragment, so a newly added stale line is flagged
+        // by the very response that adds it. The second product keeps the
+        // first line's warning on screen (one product, one line per purchase).
+        let second = seed_extra_product(&state, "COST-RISE", None).await;
+        let (status, _, added) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            &format!(
+                "product=record&qty=1&unit_cost=15&product_id={}",
+                second.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+        assert!(
+            added.contains(">stale cost<"),
+            "the add-line response must carry the warning: {added:.800}"
+        );
+        assert!(
+            added.contains("line cost $15.00") && added.contains("stored $10.00"),
+            "the fragment must show both numbers: {added:.800}"
+        );
+    }
+
+    /// Cost-freshness T4 triangulation: an equal cost is not stale, so the
+    /// draft renders no warning at all.
+    #[tokio::test]
+    async fn web_purchase_record_draft_hides_the_cost_warning_when_costs_are_equal() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            !html.contains("stale cost"),
+            "an equal cost is not stale: {html:.800}"
+        );
+    }
+
+    /// Cost-freshness T4 triangulation: the warning is draft-only. The action
+    /// that follows it only exists while the purchase is editable, and the
+    /// product drawer already carries the permanent badge for a confirmed
+    /// purchase, so a confirmed document renders no warning even with a
+    /// genuinely rising line cost.
+    #[tokio::test]
+    async fn web_purchase_record_confirmed_purchase_hides_the_rising_cost_warning() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            !html.contains("stale cost"),
+            "a confirmed purchase must not carry the draft-only warning: {html:.800}"
+        );
+    }
+
     /// Triangulation for the status gate: the template is presentation only.
     /// Posting the hidden draft actions directly at a confirmed purchase still
     /// reaches the service, which refuses them (400) and leaves the document

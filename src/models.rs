@@ -1083,6 +1083,21 @@ pub struct StaleLineCostView {
     pub stored_cost: Decimal,
 }
 
+impl StaleLineCostView {
+    /// Display form of the line's cost, mirroring `StaleCostView`'s display
+    /// methods: a raw `Decimal` renders with its stored scale (e.g. `12.000`
+    /// next to `10.00`), and `money_display` is this project's single money
+    /// formatting, so both numbers of the gap render consistently.
+    pub fn line_cost_display(&self) -> String {
+        crate::models::money_display(self.line_cost)
+    }
+
+    /// Display form of the stored cost, same rule as above.
+    pub fn stored_cost_display(&self) -> String {
+        crate::models::money_display(self.stored_cost)
+    }
+}
+
 /// One purchase line resolved for `/purchases/{id}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseLineView {
