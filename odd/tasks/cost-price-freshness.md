@@ -218,10 +218,11 @@ costos por proveedor (diferido desde F1).
       campo en `ProductDetailPartial`) y `templates/partials/product_detail.html`
       (badge). Confirmado: **no** hay que tocar `src/services/inventory.rs` ni
       `src/services/suppliers.rs`.
-- [ ] T1 — **Señal B, derivación y badge.** `reference_cost` en
-      `product_detail_html` (`src/routes/inventory_web.rs:460-498`) + campo nuevo
-      en `ProductDetailPartial` (`:126-142`) + el badge en la Card B de
-      `templates/partials/product_detail.html` (`:179-243`). Tests de ruta.
+- [x] T1 — **Señal B, derivación y badge.** → `c123678`. La condición quedó en
+      Rust con las tres compuertas (hay referencia, el costo guardado no es 0, y
+      los dos difieren), el badge en la Card B, y ningún token de clase nuevo. Cinco
+      tests de ruta, incluido el que discrimina: con un proveedor preferido más
+      caro y uno no preferido más barato, gana el preferido.
 - [ ] T2 — **Señal B, e2e.** Los tres casos: difiere, coincide, y sin costo de
       referencia (`reference_cost` es `None`). Más el caso `cost_price = 0`, que
       se trata como "sin costo" y no como una diferencia.
@@ -273,3 +274,19 @@ costos por proveedor (diferido desde F1).
   `cargo test` 777 passed, `cargo check --all-targets` 0 errores.
 - T1–T8 fijadas. Se arranca por la Señal B (el badge): es la más chica, no depende
   de la Señal A, y es la que cubre al operador que confirma sin mirar el aviso.
+- **T1 cerrada** → `c123678`. `cargo test` 782 passed (777 + 5), 0 errores, solo
+  los dos archivos permitidos. La verificación independiente confirmó las tres
+  compuertas, que `reference_cost` se reusa sin reimplementar la regla, que el test
+  de preferido-vs-más-barato realmente discrimina, y que todos los tokens de clase
+  existen en `static/tailwind.css`.
+- **Seguimiento que dejó esa verificación (no bloqueante)**: abrir el drawer corre
+  `list_by_product` **dos veces** — una directa en `product_detail_html` para las
+  filas, y otra adentro de `reference_cost`. Es una query indexada de más, en un
+  camino que no es caliente (abrir un drawer). Arreglarlo bien es extraer un
+  `reference_cost_from(costs: &[ProductSupplierCost])` puro en `suppliers.rs` y
+  pasarle los costos ya fetcheados. **Toca `suppliers.rs`, así que no se cuela
+  acá**: merece su propio review. Queda anotado para decidir si entra en una slice
+  propia o se deja como deuda declarada.
+- **Nit cosmético a limpiar**: el comentario del template dice `(cost-freshness S1)`
+  y el documento numera la slice como T1. Alinearlo cuando se vuelva a tocar ese
+  template, no vale un write propio.
