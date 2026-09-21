@@ -189,6 +189,9 @@ pub trait SaleRepository: Send + Sync {
         refund_transaction_id: i64,
     ) -> AppResult<SalePayment>;
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>>;
+    /// One payment by id — the documents drawer's per-payment read. `None`
+    /// for an id that does not exist; the service decides what that means.
+    async fn find_payment(&self, id: i64) -> AppResult<Option<SalePayment>>;
     /// The payments one customer receipt groups (its allocations), by id. The SQL
     /// for `sale_payments` stays here, in the sales module that owns the table, so
     /// the receipt repository can expose the read without querying a sales table.
@@ -684,6 +687,19 @@ impl SaleRepository for SqliteSaleRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_payment).collect())
+    }
+
+    async fn find_payment(&self, id: i64) -> AppResult<Option<SalePayment>> {
+        #[cfg(test)]
+        self.tick();
+        let row = sqlx::query(
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at
+               FROM sale_payments WHERE id = ?"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_payment))
     }
 
     async fn list_payments_by_receipt(&self, receipt_id: i64) -> AppResult<Vec<SalePayment>> {
@@ -1569,6 +1585,34 @@ mod tests {
             .expect("payment of the draft");
         assert_eq!(draft_payment.reference, format!("Draft #{draft}"));
         assert_eq!(draft_payment.party, "Díaz");
+    }
+
+    /// The first read-by-id of one sale payment: found carries every stored
+    /// column back, absent is `None` — never an error — and the whole read is
+    /// ONE query (the drawer's per-payment read must stay that cheap).
+    #[tokio::test]
+    async fn find_payment_reads_one_payment_in_one_query() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        let payment_id = seed_payment(&pool, sale, "10", d(2024, 5, 10), actor, None).await;
+
+        repo.reset_reads();
+        let found = repo.find_payment(payment_id).await.unwrap().expect("payment exists");
+        assert_eq!(found.id, payment_id);
+        assert_eq!(found.sale_id, sale);
+        assert_eq!(found.amount, dec("10"));
+        assert_eq!(found.date, d(2024, 5, 10));
+        assert_eq!(found.created_by, actor);
+        assert_eq!(found.refund_transaction_id, None);
+        assert_eq!(found.receipt_id, None);
+        assert_eq!(repo.read_count(), 1);
+
+        // An unknown id is `None`, and it still costs exactly one query.
+        repo.reset_reads();
+        assert!(repo.find_payment(999_999).await.unwrap().is_none());
+        assert_eq!(repo.read_count(), 1);
     }
 
     /// The receipt allocations fold: one receipt's total is the exact sum of

@@ -46,4 +46,45 @@
     {% include "partials/document_list.html" %}
   </div>
 </div>
+
+{# The documents drawer shell, the same pattern the customers/suppliers/
+   products drawers use: a fixed right panel whose body the row buttons swap
+   the detail fragment into (`#document-drawer-body`). No backdrop, like the
+   siblings. #}
+<div id="document-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
+  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+    <span class="text-sm font-semibold">Documento</span>
+    <div class="flex items-center gap-2">
+      <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/documents">Todos los documentos</a>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closeDocumentDrawer()" aria-label="Close detail">✕</button>
+    </div>
+  </div>
+  <div id="document-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
+</div>
+
+<script>
+  function openDocumentDrawer() {
+    var drawer = document.getElementById('document-drawer');
+    if (drawer) {
+      drawer.classList.remove('hidden');
+      drawer.classList.add('flex');
+    }
+  }
+  function closeDocumentDrawer() {
+    var drawer = document.getElementById('document-drawer');
+    if (drawer) {
+      drawer.classList.add('hidden');
+      drawer.classList.remove('flex');
+    }
+    var body = document.getElementById('document-drawer-body');
+    if (body) body.innerHTML = '';
+  }
+  document.addEventListener('keydown', function (evt) {
+    if (evt.key !== 'Escape') return;
+    closeDocumentDrawer();
+  });
+  document.body.addEventListener('htmx:afterSwap', function (evt) {
+    if (evt.detail.target && evt.detail.target.id === 'document-drawer-body') openDocumentDrawer();
+  });
+</script>
 {% endblock %}

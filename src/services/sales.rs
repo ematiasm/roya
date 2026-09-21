@@ -390,6 +390,16 @@ where
         self.detail_for(sale).await
     }
 
+    /// One sale payment by id — the documents drawer's per-payment read, so
+    /// the route never touches a repository. An unknown id is the standard
+    /// `NotFound`, naming the family.
+    pub async fn find_payment(&self, id: i64) -> AppResult<SalePayment> {
+        self.sales
+            .find_payment(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("sale payment {id} not found")))
+    }
+
     /// Record-page view for `/sales/{id}`: resolves product, account and method
     /// names through the existing inventory and finance read paths, so the
     /// route never runs SQL of its own and never prints an internal key.
@@ -3557,5 +3567,34 @@ mod tests {
         let payments = s.sales.list_payments(sale.id).await.unwrap();
         assert_eq!(payments[0].updated_by, Some(creator), "the refund link names its writer");
         assert_eq!(payments[0].created_by, creator, "the creator never changes");
+    }
+
+    /// `find_payment` is the read-by-id the documents drawer uses: found
+    /// returns the stored payment, absent is the standard `NotFound` error.
+    #[tokio::test]
+    async fn find_payment_returns_the_stored_row_or_not_found() {
+        let (s, _pool) = svc().await;
+        let cash = cash_method(&s).await;
+        let wallet = seed_account(&s, "findpay wallet").await;
+        allow(&s, wallet.id, cash).await;
+        let prod = seed_product(&s, "FINDPAY", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let sale = draft_with_line(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit, Some(sale_date()), prod.id, "2").await;
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        let recorded = s
+            .record_payment(audit_actor(&s).await, sale.id, cash, dec("5"), sale_date())
+            .await
+            .unwrap();
+
+        let found = s.find_payment(recorded.id).await.unwrap();
+        assert_eq!(found.id, recorded.id);
+        assert_eq!(found.sale_id, sale.id);
+        assert_eq!(found.amount, dec("5"));
+
+        let missing = s.find_payment(999_999).await;
+        assert!(
+            matches!(&missing, Err(AppError::NotFound(msg)) if msg.contains("payment")),
+            "an unknown payment must be NotFound naming the family: {missing:?}"
+        );
     }
 }

@@ -1,0 +1,84 @@
+{# The documents drawer body: ONE partial for all six families. The route (in
+   `documents_web.rs`) fills the sections per family — the fact list, the
+   optional tables, the optional parent summary, the optional notice and the
+   links — so six near-identical per-family templates cannot drift; every
+   display name is resolved in the route before this template runs. The
+   operator-facing copy below (section titles, the parent block, "Abrir") is
+   Spanish like the record pages the drawer mirrors, while the page chrome
+   stays English like the sibling list pages: that split is deliberate. This
+   slice renders no action buttons; the actions land in the next slice. #}
+<div id="document-detail-inner" class="flex flex-col gap-4">
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="mb-1 flex flex-wrap items-center gap-2">
+      <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ kind_label }}</span>
+      <span class="text-sm font-semibold">{{ title }}</span>
+    </div>
+    <div class="mb-3 text-[13px] text-muted">{{ status_line }}</div>
+
+    <div class="flex flex-col gap-1.5">
+      {% for fact in facts %}
+      <div class="flex items-baseline justify-between gap-3">
+        <span class="text-[13px] text-muted">{{ fact.label }}</span>
+        <span class="text-[13px] font-medium text-right">{{ fact.value }}</span>
+      </div>
+      {% endfor %}
+    </div>
+
+    {% for table in tables %}
+    <div class="mt-4">
+      <div class="mb-1.5 font-bold text-[13px] text-muted">{{ table.title }} ({{ table.rows.len() }})</div>
+      <table class="w-full text-[13px]">
+        <thead>
+          <tr class="text-left text-muted">
+            {% for header in table.headers %}<th class="px-2 py-1 font-medium">{{ header }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in table.rows %}
+          <tr class="border-t border-border">
+            {% for cell in row.cells %}
+            {% if loop.first && row.href.is_some() %}
+            <td class="px-2 py-1.5"><a href="{{ row.href.as_ref().unwrap() }}" class="underline underline-offset-2">{{ cell }}</a></td>
+            {% else %}
+            <td class="px-2 py-1.5 tabular-nums">{{ cell }}</td>
+            {% endif %}
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endfor %}
+  </section>
+
+  {% if let Some(p) = parent %}
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="mb-1 flex flex-wrap items-center gap-2">
+      <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ p.label }}</span>
+      <span class="text-sm font-semibold">{{ p.title }}</span>
+    </div>
+    <div class="mb-3 text-[13px] text-muted">{{ p.status_line }}</div>
+    <div class="flex flex-col gap-1.5">
+      {% for fact in p.facts %}
+      <div class="flex items-baseline justify-between gap-3">
+        <span class="text-[13px] text-muted">{{ fact.label }}</span>
+        <span class="text-[13px] font-medium text-right">{{ fact.value }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    <a class="mt-3 inline-block rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="{{ p.href }}">Abrir</a>
+  </section>
+  {% endif %}
+
+  {% if let Some(n) = notice %}
+  <section class="rounded-2xl border border-border bg-surface p-4 text-[13px] text-muted">{{ n }}</section>
+  {% endif %}
+
+  {% if !links.is_empty() %}
+  <section class="flex flex-wrap gap-2">
+    {% for link in links %}
+    <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="{{ link.href }}">{{ link.label }}</a>
+    {% endfor %}
+  </section>
+  {% endif %}
+</div>

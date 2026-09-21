@@ -1127,6 +1127,26 @@ impl DocumentKind {
         }
     }
 
+    /// Parse a `token()`; `None` for an unknown or empty token. The drawer
+    /// route's `{kind}` path segment is the consumer: the URL segment resolves
+    /// back to exactly one family or the request is a 404.
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.token() == token)
+    }
+
+    /// The catalog code that READS this family — the single mapping the page
+    /// (`permitted_kinds`), the drawer route's per-family narrowing and the
+    /// kernel agreement test must share, so a family can never open under a
+    /// code the owning tier did not choose.
+    pub fn read_code(&self) -> &'static str {
+        match self {
+            Self::Sale | Self::SalePayment => "sales.read",
+            Self::Purchase | Self::PurchasePayment => "purchases.read",
+            Self::StockMovement => "inventory.read",
+            Self::Receipt => "customers.read",
+        }
+    }
+
     /// The Spanish label a row and a filter option show: "Venta",
     /// "Pago de venta", "Compra", "Pago de compra", "Movimiento de stock",
     /// "Recibo de cliente".
@@ -1822,6 +1842,34 @@ mod tests {
                 DocumentKind::Receipt,
             ]
         );
+    }
+
+    /// The tokens round-trip through `parse`: every family parses back from
+    /// its own token, and an unknown or empty token names no family. The
+    /// drawer route's `{kind}` segment depends on this exact contract.
+    #[test]
+    fn document_kind_parse_round_trips_and_rejects_unknowns() {
+        for kind in DocumentKind::ALL {
+            assert_eq!(DocumentKind::parse(kind.token()), Some(*kind));
+        }
+        assert_eq!(DocumentKind::parse(""), None);
+        assert_eq!(DocumentKind::parse("nope"), None);
+    }
+
+    /// The read-code mapping: each family answers the code its OWNING tier
+    /// reads with — the sale document and its payment by `sales.read`, the
+    /// purchase document and its payment by `purchases.read`, movements by
+    /// `inventory.read`, receipts by `customers.read`. The page's narrowing
+    /// and the drawer route must agree with this single mapping, so a drift
+    /// here would silently open a family under another tier's code.
+    #[test]
+    fn document_kind_read_code_maps_every_family_to_its_owning_tier() {
+        assert_eq!(DocumentKind::Sale.read_code(), "sales.read");
+        assert_eq!(DocumentKind::SalePayment.read_code(), "sales.read");
+        assert_eq!(DocumentKind::Purchase.read_code(), "purchases.read");
+        assert_eq!(DocumentKind::PurchasePayment.read_code(), "purchases.read");
+        assert_eq!(DocumentKind::StockMovement.read_code(), "inventory.read");
+        assert_eq!(DocumentKind::Receipt.read_code(), "customers.read");
     }
 
     /// `query(limit)` carries the bounds through unchanged; the family list is
