@@ -277,6 +277,85 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// The any-of gate (PermissionSet / RequireAny)
+// ---------------------------------------------------------------------------
+
+/// A set of catalog permission codes that grants a route when the principal
+/// holds ANY ONE of them — the any-of gate a page like `/documents` needs,
+/// where four department read permissions each open part of the same screen
+/// and the route itself must admit any one of them. The tuple of marker
+/// types carries the codes the same way `Require<P>` carries one: the
+/// compiler, not a string comparison at the call site, ties the set to the
+/// catalog markers.
+///
+/// Implemented for tuple arities 2–4 only. No arity-1: a single permission
+/// already has `Require<P>`, and an any-of gate over one code is just that
+/// extractor with a costlier message. No arity-5+: no route has needed it;
+/// one line in the macro invocation below adds the arity the day one does.
+pub trait PermissionSet {
+    const CODES: &'static [&'static str];
+}
+
+macro_rules! permission_set {
+    ($($ty:ident),+) => {
+        impl<$($ty: Permission),+> PermissionSet for ($($ty,)+) {
+            const CODES: &'static [&'static str] = &[$($ty::CODE),+];
+        }
+    };
+}
+permission_set!(A, B);
+permission_set!(A, B, C);
+permission_set!(A, B, C, D);
+
+/// The any-of per-handler authorization declaration: an argument of type
+/// `RequireAny<(SalesRead, PurchasesRead, InventoryRead, CustomersRead)>`
+/// runs the handler when the principal holds at least ONE of the declared
+/// codes, and answers the same `403` shape `Require<P>` does otherwise,
+/// naming every code it would have accepted (AC10). Mirrors `Require<P>`
+/// exactly: zero-sized and bodyless (it composes with later extractors),
+/// fail closed when the principal extension is absent, refusal writes
+/// nothing because the extractor runs before any handler code.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequireAny<S: PermissionSet> {
+    /// Keeps `S` in the type without storing anything; the extractor is
+    /// zero-sized at runtime.
+    _marker: std::marker::PhantomData<S>,
+}
+
+impl<S, T> FromRequestParts<T> for RequireAny<S>
+where
+    T: Send + Sync,
+    S: PermissionSet,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &T) -> Result<Self, Self::Rejection> {
+        // Fail closed when the principal is absent (a route registered
+        // outside the deny-by-default gate): identical to holding none —
+        // and holding none satisfies no any-of set either.
+        let granted = parts
+            .extensions
+            .get::<Principal>()
+            .is_some_and(|principal| S::CODES.iter().any(|code| principal.has(code)));
+        if granted {
+            Ok(Self {
+                _marker: std::marker::PhantomData,
+            })
+        } else {
+            let listed = S::CODES
+                .iter()
+                .map(|code| format!("«{code}»"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(forbidden_response(
+                parts,
+                format!("Se necesita alguno de los permisos {listed} para esta acción"),
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The refusal shape (AC10)
 // ---------------------------------------------------------------------------
 
@@ -322,43 +401,63 @@ pub fn forbidden_response(parts: &Parts, message: String) -> Response {
 // The sidebar's nav view (S7 part 2, AC21)
 // ---------------------------------------------------------------------------
 
-/// One sidebar entry: its template key, EVERY permission code the entry
-/// needs (the gate of the route its href opens, plus the data-owner
-/// permission of any block its label names — an entry that names less shows
-/// its operator a screen the route refuses, one that names more hides a
-/// screen the principal may read), and the sidebar group it renders in.
-/// An empty list means the entry needs no permission (every signed-in
-/// operator may see it). This table is the single place that decides the
-/// mapping entry → permissions; the drift tests below fail when a sidebar
-/// entry has no declared row, a row's code is not in the compiled catalog,
-/// or a principal holding exactly the row's codes is refused the href the
-/// entry opens.
+/// How a nav entry's declared codes decide its visibility. Two semantics
+/// only: an entry either needs every code it names (`All`, the shape every
+/// existing row uses) or at least one of them (`Any`, the shape the
+/// upcoming `/documents` entry will use, openable by any one of four read
+/// permissions). The variants carry the same `&'static [&'static str]` list
+/// shape the drift tests already verify against the catalog.
+#[derive(Debug, Clone, Copy)]
+pub enum NavVisibility {
+    /// Every code must be held. An empty list is the "every signed-in
+    /// operator" entry (the password page): vacuously true.
+    All(&'static [&'static str]),
+    /// At least one code must be held. An empty list can never be satisfied
+    /// — an any-of gate over nothing denies, deny by default.
+    Any(&'static [&'static str]),
+}
+
+/// One sidebar entry: its template key, the permission codes the entry
+/// needs under the visibility semantics above — `All` needs EVERY code (the
+/// gate of the route its href opens, plus the data-owner permission of any
+/// block its label names — an entry that names less shows its operator a
+/// screen the route refuses, one that names more hides a screen the
+/// principal may read), `Any` needs at least one (a screen several
+/// departments' permissions each open a part of) — and the sidebar group it
+/// renders in. An empty `All` list means the entry needs no permission
+/// (every signed-in operator may see it); an empty `Any` list is a deny.
+/// This table is the single place that decides the mapping entry →
+/// permissions; the drift tests below fail when a sidebar entry has no
+/// declared row, a row's code is not in the compiled catalog, or a principal
+/// holding exactly the row's codes is refused the href the entry opens.
 #[derive(Debug)]
 struct NavEntry {
     key: &'static str,
-    permissions: &'static [&'static str],
+    visibility: NavVisibility,
     group: &'static str,
 }
 
 const NAV_ENTRIES: &[NavEntry] = &[
-    NavEntry { key: "dashboard", permissions: &[DashboardRead::CODE], group: "operation" },
-    NavEntry { key: "sales", permissions: &[SalesRead::CODE], group: "operation" },
-    NavEntry { key: "purchases", permissions: &[PurchasesRead::CODE], group: "operation" },
-    NavEntry { key: "products", permissions: &[InventoryRead::CODE], group: "catalogue" },
-    NavEntry { key: "suppliers", permissions: &[SuppliersRead::CODE], group: "catalogue" },
-    NavEntry { key: "customers", permissions: &[CustomersRead::CODE], group: "catalogue" },
+    NavEntry { key: "dashboard", visibility: NavVisibility::All(&[DashboardRead::CODE]), group: "operation" },
+    NavEntry { key: "sales", visibility: NavVisibility::All(&[SalesRead::CODE]), group: "operation" },
+    NavEntry { key: "purchases", visibility: NavVisibility::All(&[PurchasesRead::CODE]), group: "operation" },
+    NavEntry { key: "products", visibility: NavVisibility::All(&[InventoryRead::CODE]), group: "catalogue" },
+    NavEntry { key: "suppliers", visibility: NavVisibility::All(&[SuppliersRead::CODE]), group: "catalogue" },
+    NavEntry { key: "customers", visibility: NavVisibility::All(&[CustomersRead::CODE]), group: "catalogue" },
     // The accounts entry opens `/#accounts`, which is the `/` route's
     // dashboard section: the route itself declares `dashboard.read`, and the
     // entry's label names the accounts block, whose data owner is
     // `finance.read`. The entry carries BOTH, and the dashboard renders the
     // accounts block conditionally on `finance.read` (web.rs) — the same
     // shape the suggestions block uses in purchases_web.rs.
-    NavEntry { key: "accounts", permissions: &[DashboardRead::CODE, FinanceRead::CODE], group: "cash" },
-    NavEntry { key: "users", permissions: &[IdentityUsersRead::CODE], group: "account" },
-    NavEntry { key: "roles", permissions: &[IdentityRolesManage::CODE], group: "account" },
+    NavEntry { key: "accounts", visibility: NavVisibility::All(&[DashboardRead::CODE, FinanceRead::CODE]), group: "cash" },
+    NavEntry { key: "users", visibility: NavVisibility::All(&[IdentityUsersRead::CODE]), group: "account" },
+    NavEntry { key: "roles", visibility: NavVisibility::All(&[IdentityRolesManage::CODE]), group: "account" },
     // No permission gates the password page: every signed-in operator — a
-    // confined session included — must always be able to reach it.
-    NavEntry { key: "password", permissions: &[], group: "account" },
+    // confined session included — must always be able to reach it. The empty
+    // `All` list is vacuously true: that entry is the one visible to every
+    // signed-in principal.
+    NavEntry { key: "password", visibility: NavVisibility::All(&[]), group: "account" },
 ];
 
 /// What the sidebar renders for one signed-in request: the acting user's name
@@ -376,8 +475,9 @@ pub struct Nav {
 }
 
 impl Nav {
-    /// The nav view of one principal: an entry is visible exactly when the
-    /// principal holds every permission the mapping declares for it.
+    /// The nav view of one principal: an entry is visible exactly when its
+    /// declared visibility is satisfied — every code held for an `All` entry
+    /// (vacuously true when empty), at least one held for an `Any` entry.
     pub fn for_principal(principal: &Principal) -> Self {
         Self::from_parts(
             principal.display_name.clone(),
@@ -400,14 +500,44 @@ impl Nav {
         must_change_password: bool,
         permissions: &std::collections::BTreeSet<String>,
     ) -> Self {
+        Self::from_entries(
+            display_name,
+            username,
+            must_change_password,
+            permissions,
+            NAV_ENTRIES,
+        )
+    }
+
+    /// The nav view over one entry list — the production path passes
+    /// `NAV_ENTRIES`; the kernel's truth-table test passes synthetic entries
+    /// so the `NavVisibility` semantics are observable without declaring a
+    /// row for them. An `All` entry is visible exactly when the principal
+    /// holds every declared code (vacuously true when the list is empty); an
+    /// `Any` entry exactly when it holds at least one (never true when the
+    /// list is empty).
+    fn from_entries(
+        display_name: String,
+        username: String,
+        must_change_password: bool,
+        permissions: &std::collections::BTreeSet<String>,
+        entries: &[NavEntry],
+    ) -> Self {
         let mut visible_keys: std::collections::BTreeSet<&'static str> =
             std::collections::BTreeSet::new();
         let mut visible_groups: std::collections::BTreeSet<&'static str> =
             std::collections::BTreeSet::new();
-        for entry in NAV_ENTRIES {
-            let allowed = entry.permissions.is_empty()
-                // A no-permission entry is for every signed-in operator.
-                || entry.permissions.iter().all(|code| permissions.contains(*code));
+        for entry in entries {
+            let allowed = match entry.visibility {
+                NavVisibility::All(codes) => {
+                    codes.is_empty()
+                        // A no-permission entry is for every signed-in operator.
+                        || codes.iter().all(|code| permissions.contains(*code))
+                }
+                NavVisibility::Any(codes) => {
+                    codes.iter().any(|code| permissions.contains(*code))
+                }
+            };
             if allowed {
                 visible_keys.insert(entry.key);
                 visible_groups.insert(entry.group);
@@ -469,6 +599,31 @@ static _PIN_REQUIRE_CONSTRUCTED: Require<DashboardRead> = Require {
 static _PIN_HAS: fn(&Principal, &str) -> bool = Principal::has;
 static _PIN_HAS_MARKER: fn(&Principal) -> bool = Principal::has_permission::<DashboardRead>;
 static _PIN_REFUSAL: fn(&Parts, String) -> Response = forbidden_response;
+// The any-of surface has no production consumer yet: `RequireAny` and the
+// `PermissionSet` trait were added for the `/documents` route, which lands
+// in a later task together with its nav entry and template item (the ac21
+// invariant test drives the real router, so neither may land early). Until
+// then only the kernel's tests construct them, so the pins below keep the
+// surface compiling the same way the pins above keep `Require`'s — live
+// references to the type, the field and the trait, no `#[allow]` markers.
+// The `#[used]` attribute is what keeps the pin itself a live root: a bare
+// underscore-prefixed static is exempt from the dead-code report but no
+// longer feeds liveness to what it references, so the plain pin form the
+// older slices could rely on would leave `RequireAny`, `PermissionSet` and
+// the unused `NavVisibility::Any` variant reported dead by the bin target.
+// The `NavVisibility::Any` pin is the variant's consumer of record until
+// the `/documents` nav entry (the first `Any` row) declares it.
+#[used]
+static _PIN_REQUIRE_ANY_CONSTRUCTED: RequireAny<(SalesRead, PurchasesRead, InventoryRead, CustomersRead)> =
+    RequireAny {
+        _marker: std::marker::PhantomData,
+    };
+#[used]
+static _PIN_PERMISSION_SET: fn() -> &'static [&'static str] = || {
+    <(SalesRead, PurchasesRead, InventoryRead, CustomersRead) as PermissionSet>::CODES
+};
+#[used]
+static _PIN_NAV_ANY_VARIANT: NavVisibility = NavVisibility::Any(&[]);
 
 // ---------------------------------------------------------------------------
 // AC10 / AC11 / AC12 / AC20: the kernel's own tests
@@ -1183,7 +1338,7 @@ mod tests {
             );
         }
         for entry in NAV_ENTRIES {
-            for code in entry.permissions {
+            for code in entry_codes(entry) {
                 assert!(
                     PERMISSIONS.contains(code),
                     "nav mapping for {:?} names {} which is not a catalog permission",
@@ -1264,14 +1419,19 @@ mod tests {
                 .unwrap_or_else(|| panic!("the sidebar never renders {:?}", entry.key));
             let db = pool().await;
             test_support::seed_session(&db).await.unwrap();
-            let declared: Vec<&str> = entry.permissions.to_vec();
+            // Every declared row is `All` today (asserted by
+            // `nav_migration_preserves_every_rows_all_semantics`), so the
+            // exact-declared set and the minus-one probes below read the
+            // all-of semantics; the invariant grows an any-of direction the
+            // day a row declares one.
+            let declared: Vec<&str> = entry_codes(entry).to_vec();
             let exact = test_support::seed_session_with_permissions(&db, &declared)
                 .await
                 .unwrap();
             // One probe per declared code, holding the set minus that code:
             // seeded up front because the app state takes the pool over.
             let mut minus_one = Vec::new();
-            for code in entry.permissions {
+            for code in entry_codes(entry) {
                 let reduced: Vec<&str> = declared
                     .iter()
                     .copied()
@@ -1343,9 +1503,14 @@ mod tests {
         let all_keys = |permissions: &std::collections::BTreeSet<String>| -> Vec<&'static str> {
             NAV_ENTRIES
                 .iter()
-                .filter(|entry| {
-                    entry.permissions.is_empty()
-                        || entry.permissions.iter().all(|c| permissions.contains(*c))
+                .filter(|entry| match entry.visibility {
+                    NavVisibility::All(codes) => {
+                        codes.is_empty()
+                            || codes.iter().all(|c| permissions.contains(*c))
+                    }
+                    NavVisibility::Any(codes) => {
+                        codes.iter().any(|c| permissions.contains(*c))
+                    }
                 })
                 .map(|entry| entry.key)
                 .collect()
@@ -1364,17 +1529,17 @@ mod tests {
         // `accounts`' two codes shows the dashboard entry too), and nothing
         // the set does not cover.
         for entry in NAV_ENTRIES {
-            if entry.permissions.is_empty() {
+            if entry_codes(entry).is_empty() {
                 continue;
             }
             let set: std::collections::BTreeSet<String> =
-                entry.permissions.iter().map(|c| c.to_string()).collect();
+                entry_codes(entry).iter().map(|c| c.to_string()).collect();
             let view = Nav::for_principal(&principal_with(set.clone()));
             assert_eq!(
                 visible_keys(&view),
                 all_keys(&set),
                 "holding {:?} must show exactly the entries it covers",
-                entry.permissions
+                entry_codes(entry)
             );
         }
 
@@ -1382,6 +1547,17 @@ mod tests {
         let admin = Nav::for_principal(&principal_with(catalog));
         for entry in NAV_ENTRIES {
             assert!(admin.visible(entry.key), "the full catalog must show {entry:?}");
+        }
+    }
+
+    /// The declared codes regardless of the variant, for the drift checks
+    /// that only care that each name is a catalog permission. Lives here in
+    /// the test module because only tests collapse the two variants this way:
+    /// production code (`Nav::from_entries`) needs the variant itself to
+    /// decide the semantics, not just the list.
+    fn entry_codes(entry: &NavEntry) -> &'static [&'static str] {
+        match entry.visibility {
+            NavVisibility::All(codes) | NavVisibility::Any(codes) => codes,
         }
     }
 
@@ -1432,6 +1608,242 @@ mod tests {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    // -- The any-of gate (PermissionSet / RequireAny / NavVisibility) --------------
+
+    /// A synthetic entry builder for the visibility truth table: private to the
+    /// kernel's tests, so no NAV_ENTRIES row has to exist to prove the
+    /// mechanism (a declared `Any` row must wait for the sidebar entry that
+    /// renders it — the ac21 declaration test would fail it).
+    fn probe_entry(visibility: NavVisibility) -> NavEntry {
+        NavEntry { key: "probe", visibility, group: "probe-group" }
+    }
+
+    /// The truth table `Nav::from_parts` implements through `NavVisibility`:
+    /// `All` is vacuously true when its list is empty (the password entry,
+    /// every signed-in operator) and false unless every code is held;
+    /// `Any` is false when its list is empty (an any-of gate over nothing
+    /// must deny — there is nothing to hold, deny by default) and true when
+    /// at least one declared code is held. Synthetic entries drive the
+    /// private entry list `Nav::from_entries` exposes for exactly this test.
+    #[test]
+    fn nav_visibility_truth_table_in_from_parts() {
+        let codes: &[&str] = &["sales.read", "customers.read"];
+        let held = |values: &[&str]| -> std::collections::BTreeSet<String> {
+            values.iter().map(|c| c.to_string()).collect()
+        };
+        let nav_for =
+            |visibility: NavVisibility, held: &std::collections::BTreeSet<String>| {
+                Nav::from_entries(
+                    "Probe".to_string(),
+                    "probe".to_string(),
+                    false,
+                    held,
+                    &[probe_entry(visibility)],
+                )
+            };
+
+        // All: every code, vacuously true when the list is empty.
+        assert!(
+            nav_for(NavVisibility::All(codes), &held(&["sales.read", "customers.read"]))
+                .visible("probe"),
+            "All with both codes held must be visible"
+        );
+        assert!(
+            !nav_for(NavVisibility::All(codes), &held(&["sales.read"])).visible("probe"),
+            "All missing one code must be hidden"
+        );
+        assert!(
+            nav_for(NavVisibility::All(&[]), &held(&[])).visible("probe"),
+            "All with an empty list is the every-signed-in-operator entry"
+        );
+
+        // Any: at least one code, never true when the list is empty.
+        assert!(
+            nav_for(NavVisibility::Any(codes), &held(&["sales.read"])).visible("probe"),
+            "Any with the first code held must be visible"
+        );
+        assert!(
+            nav_for(NavVisibility::Any(codes), &held(&["customers.read"])).visible("probe"),
+            "Any with the other code held must be visible"
+        );
+        assert!(
+            !nav_for(NavVisibility::Any(codes), &held(&[])).visible("probe"),
+            "Any with no code held must be hidden"
+        );
+        assert!(
+            !nav_for(NavVisibility::Any(&[]), &held(&[])).visible("probe"),
+            "Any with an empty list can never be satisfied"
+        );
+
+        // The group follows the same entries: a group is visible exactly when
+        // one of its entries is visible, and a name no entry declared is not.
+        let groups = Nav::from_entries(
+            "Probe".to_string(),
+            "probe".to_string(),
+            false,
+            &held(&["sales.read"]),
+            &[
+                probe_entry(NavVisibility::Any(codes)),
+                NavEntry {
+                    key: "empty",
+                    visibility: NavVisibility::Any(&[]),
+                    group: "empty-group",
+                },
+            ],
+        );
+        assert!(groups.group_visible("probe-group"));
+        assert!(!groups.group_visible("empty-group"));
+        assert!(!groups.group_visible("never-declared"));
+    }
+
+    /// The migration's behavior-preservation proof: every existing row keeps
+    /// the all-of semantics it had before `NavVisibility` existed. Declared
+    /// rows are all `All`, and only the password entry declares no code; for
+    /// each row the principal holding exactly the declared codes sees it and
+    /// the principal holding one code fewer does not (for the password entry,
+    /// whose empty list is vacuous, the permissionless principal sees it).
+    #[test]
+    fn nav_migration_preserves_every_rows_all_semantics() {
+        for entry in NAV_ENTRIES {
+            let codes = match &entry.visibility {
+                NavVisibility::All(codes) => *codes,
+                NavVisibility::Any(_) => panic!(
+                    "nav entry {:?} declares Any: a declared row whose sidebar item \
+                     and route do not exist yet would fail the ac21 declaration test",
+                    entry.key
+                ),
+            };
+            if entry.key == "password" {
+                assert!(
+                    codes.is_empty(),
+                    "the password entry stays the no-permission one"
+                );
+                assert!(
+                    Nav::for_principal(&principal_with(Default::default())).visible("password"),
+                    "the permissionless principal must still see the password entry"
+                );
+                continue;
+            }
+            assert!(
+                !codes.is_empty(),
+                "nav entry {:?} declares no code", entry.key
+            );
+            let held: std::collections::BTreeSet<String> =
+                codes.iter().map(|c| c.to_string()).collect();
+            assert!(
+                Nav::for_principal(&principal_with(held.clone())).visible(entry.key),
+                "holding exactly {:?} must show {:?}", codes, entry.key
+            );
+            for dropped in codes.iter().copied() {
+                let reduced: std::collections::BTreeSet<String> = held
+                    .iter()
+                    .filter(|c| c.as_str() != dropped)
+                    .cloned()
+                    .collect();
+                assert!(
+                    !Nav::for_principal(&principal_with(reduced)).visible(entry.key),
+                    "holding {:?} minus {dropped} must hide {:?}", codes, entry.key
+                );
+            }
+        }
+    }
+
+    /// The any-of extractor's test router, built exactly the way
+    /// `guarded_app` builds its kernel router: the production middleware over
+    /// guarded handlers defined here, so no department route gets annotated
+    /// before its enforcement slice. The shared fixture seeds the
+    /// permissionless user; each probe principal comes from
+    /// `seed_session_with_permissions`, holding exactly the codes named.
+    async fn any_of_app() -> (axum::Router, AppState) {
+        let p = pool().await;
+        test_support::seed_session_without_roles(&p).await.unwrap();
+        let state = test_support::app_state(p);
+        let app = axum::Router::new()
+            .route("/any", get(any_of_gated_handler))
+            .route("/all", get(all_of_gated_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state.clone());
+        (app, state)
+    }
+
+    async fn any_of_gated_handler(
+        _: RequireAny<(SalesRead, PurchasesRead, InventoryRead, CustomersRead)>,
+    ) -> &'static str {
+        "handler-ran"
+    }
+
+    /// The all-of control: the same shape the AC10 handlers gate with, so the
+    /// test can prove the any-of gate is really a different gate — a
+    /// principal the any-of route admits that this one refuses.
+    async fn all_of_gated_handler(_: Require<SalesRead>) -> &'static str {
+        "handler-ran"
+    }
+
+    #[tokio::test]
+    async fn any_of_extractor_grants_when_any_declared_code_is_held() {
+        let (app, state) = any_of_app().await;
+
+        // Exactly sales.read: both gates open — the control proves the any-of
+        // route is not accidentally looser for a principal both gates admit.
+        let sales = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let (status, body) = get_page(&app, "/any", &test_support::cookie_for(&sales)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "sales.read is one of the declared codes: {body:.600}"
+        );
+        assert_eq!(body, "handler-ran");
+        let (status, body) = get_page(&app, "/all", &test_support::cookie_for(&sales)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "handler-ran");
+
+        // Exactly customers.read: the any-of gate opens what the all-of
+        // control refuses — the two gates are really different.
+        let customers =
+            test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+                .await
+                .unwrap();
+        let (status, body) =
+            get_page(&app, "/any", &test_support::cookie_for(&customers)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "customers.read is one of the declared codes: {body:.600}"
+        );
+        assert_eq!(body, "handler-ran");
+        let (status, body) =
+            get_page(&app, "/all", &test_support::cookie_for(&customers)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body.contains("Se necesita el permiso «sales.read» para esta acción"),
+            "the control's refusal must name its own single code: {body:.600}"
+        );
+
+        // No permission at all: the any-of gate refuses and names every code
+        // it would have accepted, in the catalog order the tuple declares.
+        let none = test_support::seed_session_with_permissions(&state.pool, &[])
+            .await
+            .unwrap();
+        let (status, body) = get_page(&app, "/any", &test_support::cookie_for(&none)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            body.contains(
+                "Se necesita alguno de los permisos «sales.read», «purchases.read», \
+                 «inventory.read», «customers.read» para esta acción",
+            ),
+            "the any-of refusal must name every declared code: {body:.600}"
+        );
+        assert!(
+            !body.contains("handler-ran"),
+            "the handler must never run on a refusal"
+        );
     }
 
     // -- AC20: departments never touch identity -----------------------------------
