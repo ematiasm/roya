@@ -76,11 +76,25 @@ stored price alone.
 
 ## The readonly field is courtesy
 
-In both forms, when a product has a markup the price input renders `readonly` showing the price
-the server last derived, with a hint that it is recalculated on save. The `readonly` attribute is
-courtesy only — the handler is the enforcement: the server ignores the submitted price whenever a
-markup is set. The field cannot lie meaningfully, which is why it is allowed to look like the
-source of truth.
+The two web forms do not behave the same, and the courtesy is arranged differently in each. In the
+drawer (`templates/partials/product_detail.html`), the server renders the price input `readonly`
+when the product has a stored markup, shows the stored price, and carries the hint that it is
+recalculated from the cost on save. In the create modal (`templates/products.html`) there is no
+stored product — no derived value to show and no hint — so the price input's `readonly` state is
+set entirely by a small client-side script that locks the field the moment a markup is typed.
+
+The `readonly` attribute is courtesy only — the handler is the enforcement: the server ignores the
+submitted price whenever a markup is set. The field cannot lie meaningfully, which is why it is
+allowed to look like the source of truth.
+
+A concrete example of why the state is courtesy rather than enforcement: the modal's script
+initially survived the form's `reset()`, because a reset restores values and fires no `input`
+event, so after creating a product with a markup the price field stayed readonly with the markup
+field already empty again. The next manual create could not be typed into and submitted an empty
+price, which the handler rejected with a 400 that htmx ignores — a silent dead end. Commit
+`e76882a` fixed it by making the sync listen for the form's reset and defer itself one tick (the
+reset event fires before the browser restores the values); the regression test was validated by
+reintroducing the defect and watching it fail.
 
 The number only moves on save, deliberately: the price shown while editing is the price that is
 currently stored — what the last save decided — not a live prediction of what this edit will

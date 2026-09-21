@@ -48,9 +48,11 @@ extends the existing inventory capability; no existing rule was changed or remov
 
 - No new routes. `POST /api/products` accepts an optional `markup_pct`; `PUT /api/products/{id}`
   accepts it clearable via `double_option`.
-- Web: both the create modal and the product drawer gained a "Markup %" input. When a product has
-  a markup the price input renders `readonly` showing the price the server last derived, with a
-  hint that it is recalculated on save; the `readonly` attribute is courtesy only — the handler is
+- Web: both the create modal and the product drawer gained a "Markup %" input. In the product
+  drawer, when a product has a markup the price input renders `readonly` server-side showing the
+  stored price, with a hint that it is recalculated on save; in the create modal there is no
+  stored product, so the price input's `readonly` state is toggled by a small client-side script,
+  with no derived value and no hint. The `readonly` attribute is courtesy only — the handler is
   the enforcement. Prices render through `money_display` (at-or-below-2 scale shown at exactly two
   decimals).
 
@@ -84,9 +86,20 @@ extends the existing inventory capability; no existing rule was changed or remov
 ## Verification
 
 - `src/services/inventory.rs`: derivation, guards, midpoint rounding test (`10.005 → 10.01`),
-  effective-price cases, manual-price exactness, clear-keeps-price, product-vs-service divergence.
+  effective-price cases, manual-price exactness, clear-keeps-price, patching cost re-derives
+  (`patching_cost_price_recomputes_the_derived_price`), product-vs-service divergence, and the
+  overflow hardening (`an_overflowing_markup_derivation_is_a_validation_error_not_a_panic`,
+  `an_overflowing_cost_derivation_is_a_validation_error_not_a_panic`).
 - `src/routes/inventory_api.rs`: REST round-trip of `markup_pct` on create and update, `null`
-  clears, patching cost re-derives.
+  clears, an absent key leaves the markup unchanged.
+- `src/repositories/product_repo.rs`: a malformed stored `markup_pct` reads back as "no markup",
+  not 0% (AC6, `malformed_stored_markup_pct_reads_back_as_none_not_zero`).
+- `src/services/sales.rs`: history is unaffected —
+  `a_sale_line_keeps_the_price_it_snapshotted_when_the_products_markup_moves` asserts both halves
+  (the product's price moved, the sale line's did not).
 - `src/smoke_tests.rs`: the first smoke post to `/web/products/edit` — save with the stale
   readonly price, save with a changed markup.
-- `e2e/tests/test_products.py`: three browser tests over the drawer flow.
+- `e2e/tests/test_products.py`: five browser tests over the drawer flow — the original three plus
+  the two reset/editability regressions added by `e76882a`
+  (`test_second_create_after_a_markup_create_is_not_poisoned_by_the_reset`,
+  `test_drawer_markup_field_toggles_the_price_editability_live`).

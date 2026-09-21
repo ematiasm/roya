@@ -124,23 +124,33 @@ Spec
   `suppliers.rs`, `customer_receipts.rs`, `product_repo.rs` y varios route tests).
 
 ## Acceptance criteria
-- [ ] `products.markup_pct TEXT NULL` existe; NULL = sin margen, precio manual.
+- [x] `products.markup_pct TEXT NULL` existe; NULL = sin margen, precio manual.
       Las 3 filas existentes quedan en NULL sin que ningún precio cambie.
-- [ ] Con `markup_pct` cargado, `sale_price` se deriva como
+      → probado sobre una **copia** de `roya.db` (nunca el original, md5 intacto):
+      estaba en migración 34 sin la columna; aplicada la 35 queda `TEXT notnull=0`
+      sin backfill, y los 3 productos conservan `sale_price`/`cost_price`
+      byte-idénticos (`YERBA500 100/80`, `AGUA 200/100`, `CC1500 5000/0`).
+- [x] Con `markup_pct` cargado, `sale_price` se deriva como
       `cost_price × (1 + markup_pct/100)` y se persiste.
-- [ ] Con `markup_pct = NULL`, `sale_price` sigue siendo manual y editable.
-- [ ] `cost_price = 0` (o NULL) con margen cargado **no** calcula: conserva el
+- [x] Con `markup_pct = NULL`, `sale_price` sigue siendo manual y editable.
+- [x] `cost_price = 0` (o NULL) con margen cargado **no** calcula: conserva el
       precio y falla con `AppError::Validation`, sin escribir un precio 0.
-- [ ] `markup_pct` fuera de rango (precio resultante ≤ 0, o `≤ -100`) se rechaza
+      La mitad "o NULL" es insatisfacible por esquema: la columna es
+      `NOT NULL DEFAULT '0'` y la API mapea un costo ausente a `ZERO`, así que
+      cae en la misma guarda.
+- [x] `markup_pct` fuera de rango (precio resultante ≤ 0, o `≤ -100`) se rechaza
       con `AppError::Validation` en el estilo del repo (inglés, minúscula, sin
       punto final).
-- [ ] Un valor corrupto en `markup_pct` se lee como `None`, no como 0%.
-- [ ] En la UI, con margen cargado el precio es de solo lectura y el guardado
+- [x] Un valor corrupto en `markup_pct` se lee como `None`, no como 0%.
+- [x] En la UI, con margen cargado el precio es de solo lectura y el guardado
       funciona (el gate `sale_price is required` no lo bloquea).
-- [ ] El precio derivado renderiza con 2 decimales (`$13.50`, no `$13.5`).
-- [ ] `openspec/specs/inventory/spec.md` refleja la columna y la regla derivada.
-- [ ] `cargo test` verde y `cargo check --all-targets` sin errores.
-- [ ] `scripts/e2e.sh -k products` verde.
+- [x] El precio derivado renderiza con 2 decimales (`$13.50`, no `$13.5`).
+- [x] `openspec/specs/inventory/spec.md` refleja la columna y la regla derivada.
+- [x] `cargo test` verde y `cargo check --all-targets` sin errores.
+- [x] `scripts/e2e.sh -k products` verde.
+- [x] **Extra que la verificación final exigió**: el historial no se mueve
+      cuando el precio se re-deriva, pineado por un test que aserta las dos
+      mitades (el precio del producto se movió, el de la línea no).
 
 ## Applicable checks
 - `cargo test` (runner del repo), `cargo check --all-targets`
@@ -150,24 +160,26 @@ Spec
 ## Tasks
 - [x] T1 — Migración `20240101000035_add_product_markup.sql` + header comment.
 - [x] T2 — Modelo: `markup_pct` en `Product`/`NewProduct`/`UpdateProduct` + churn
-      de los literales de fixture (35 sitios, 14 archivos).
+      de los literales de fixture (35 literales en 13 archivos en el commit de
+      persistencia; hoy quedan 30 en 12 porque 3 pasaron a tener valor real).
 - [x] T3 — Repo: columna en los 8 statements + `row_to_product` + parser
       dedicado que preserva `None` + bind del patch. → `942e328`
 - [x] T4 — Servicio: derivación en `validate_product`, bounds del markup, guard
       de costo 0, merge en `update_product` antes de derivar, y redondeo a
       centavos del valor derivado (el proyecto no tenía `round_dp`).
 - [x] T5 — API: DTOs y mapeo en `inventory_api.rs`. → `1327a10`
-- [ ] T6 — UI web: gates condicionales en los dos handlers + inputs de margen y
+- [x] T6 — UI web: gates condicionales en los dos handlers + inputs de margen y
       precio readonly en los dos templates.
-- [ ] T7 — Formato de display del dinero en templates (el redondeo del valor
-      almacenado es parte de T4): hoy imprimen `Decimal` por `Display`, así que
-      un derivado puede renderizar `$13.5` en vez de `$13.50`.
-- [ ] T8 — E2E y smoke: cubrir el hueco — **ningún smoke test postea
-      `/web/products/edit`** hoy (solo el route test de
-      `src/routes/inventory_web.rs:1906` y e2e).
-- [ ] T9 — Spec: change folder OpenSpec + promoción de la spec de inventory.
-- [ ] T10 — Verificación final: `cargo test`, `cargo check --all-targets`,
-      `scripts/e2e.sh -k products`.
+- [x] T7 — Formato de display del dinero en templates (el redondeo del valor
+      almacenado es parte de T4): `money_display` normaliza la escala hacia
+      arriba a 2 decimales y **nunca redondea** hacia abajo. → `2df6687`
+- [x] T8 — E2E y smoke: cubierto el hueco — el primer smoke test que postea
+      `/web/products/edit`, más tres tests de navegador. → `d58ec31`
+- [x] T9 — Spec: change folder OpenSpec + promoción de la spec de inventory.
+      → `e595a8d`
+- [x] T10 — Verificación final: encontró un bug real, dos imprecisiones en la
+      spec y dos afirmaciones mal contadas. Cerrado en `e76882a` (el bug del
+      reset) y `6496535` (overflow + test de historial).
 
 ## Progress
 - Baseline: `cargo test` → 745 passed antes de T1.
@@ -205,5 +217,44 @@ Spec
   `0.00` se rechaza, pero un `Service` lo acepta, porque la regla preexistente
   permite servicio gratis (`sale_price >= 0`). Es consistente con la spec; queda
   como decisión visible, no como accidente.
-- Baseline real de la suite: 745 → 758 (T4–T5) → 764 (hardening). El documento
-  decía 745 "antes de T1" y el baseline previo a la feature era 745.
+- Baseline real de la suite: 745 → 758 (T4–T5) → 764 (hardening) → 772 (T6–T7)
+  → 774 (T8) → 777 (T10).
+- T6–T7 → `2df6687`. `cargo test` 772. Ningún assert existente tocado y ningún
+  token de clase nuevo, así que no hizo falta rebuild de Tailwind. La
+  verificación independiente encontró que **el gate del edit no tenía ningún
+  test** (solo el de create): agregado en `web_edit_gate_depends_on_the_markup_like_creation`.
+  También marcó que el hint del drawer prometía una recalculación viva que no
+  existe, porque la derivación es server-side: la copia ahora dice que el precio
+  se recalcula **al guardar**.
+- T8 → `d58ec31`. e2e `16 passed, 1 skipped`. `create_product` de `helpers.py`
+  gana `markup_pct` opcional que viaja en el body solo cuando se pasa, así que
+  ningún caller existente cambia en el cable.
+- T9 → `e595a8d`. El design confronta la tensión con la invariante 3 en vez de
+  esquivarla: `sale_price` no es un cache de una derivación sino el precio que
+  el operador aprobó, escrito por la misma escritura validada que sus partes, así
+  que en reposo no puede contradecirlas — que es la propiedad que la invariante
+  protege, y justo lo que el total del recibo eliminado no cumplía porque se
+  escribía en otro momento que lo que resumía. Costo aceptado y declarado: la
+  consistencia es una invariante de servicio, no un CHECK de base.
+- **T10 (verificación final) NO dio verde limpio, y eso fue lo valioso.**
+  Encontró un bug alcanzable que ninguna verificación por slice vio:
+  en el modal de alta, el `reset()` del form restaura valores pero no dispara
+  `input`, así que el precio quedaba `readonly` y sin `required` después de un
+  alta con margen. La siguiente alta manual no se podía tipear y devolvía un 400
+  que htmx ignora: callejón sin salida silencioso. Cerrado en `e76882a`, con el
+  listener de `reset` diferido, y el test de regresión **validado reintroduciendo
+  el bug** y viéndolo fallar en `to_be_editable()`, como exige la spec del repo.
+- T10 también cerró dos cosas que yo había dado por buenas sin test: el panic
+  por overflow de `rust_decimal` (el markup no tiene cota, así que un valor
+  enorme era un 500 alcanzable; ahora las tres operaciones usan las formas
+  `checked` y comparten un camino de error, sin inventar una cota de producto) y
+  la afirmación "el historial no se mueve", que solo se sostenía leyendo código.
+  → `6496535`.
+- Correcciones a mis propios números, todas detectadas por verificación
+  independiente: eran **35 literales en 13 archivos**, no 35 en 14; el grueso del
+  diff **no** es churn de fixtures sino documentos y tests (el churn son 30 líneas
+  de ~2008, un 1,5 %); y la spec canónica había quedado sin la regla de display
+  y con dos frases imprecisas sobre la API y el modal.
+- Pendiente declarado y fuera de alcance: que `cost_price` no esté viejo es la
+  feature hermana (`odd/tasks/cost-price-freshness.md`), y normalizar la escala
+  de dinero en los sitios de costo de proveedor quedó diferido.
