@@ -218,7 +218,33 @@ costos por proveedor (diferido desde F1).
       campo en `ProductDetailPartial`) y `templates/partials/product_detail.html`
       (badge). Confirmado: **no** hay que tocar `src/services/inventory.rs` ni
       `src/services/suppliers.rs`.
-- [ ] T1+ — (a definir con el mapa ya obtenido)
+- [ ] T1 — **Señal B, derivación y badge.** `reference_cost` en
+      `product_detail_html` (`src/routes/inventory_web.rs:460-498`) + campo nuevo
+      en `ProductDetailPartial` (`:126-142`) + el badge en la Card B de
+      `templates/partials/product_detail.html` (`:179-243`). Tests de ruta.
+- [ ] T2 — **Señal B, e2e.** Los tres casos: difiere, coincide, y sin costo de
+      referencia (`reference_cost` es `None`). Más el caso `cost_price = 0`, que
+      se trata como "sin costo" y no como una diferencia.
+- [ ] T3 — **Señal A, modelo y servicio.** La comparación en `PurchaseLineView`
+      (`src/models.rs:1076-1095`) poblada en `record_from_detail`
+      (`src/services/purchases.rs:428-448`, donde el producto ya se fetchea). Sin
+      query nueva. Tests de servicio.
+- [ ] T4 — **Señal A, el aviso.** Render dentro de `record_money`
+      (`templates/partials/purchase_detail.html:33-49`), por fila. Ajustar **a
+      propósito** el regex de `e2e/tests/test_picker.py:214`.
+- [ ] T5 — **Señal A, el botón.** Handler nuevo en `src/routes/purchases_web.rs`
+      que llama `inventory_service.update_product` con un patch de solo
+      `cost_price`, gateado `InventoryWrite`, más el form struct y la
+      registración en `router()` (`:930-971`). Tests de ruta. El guard de wiring
+      de smoke lo va a probar solo.
+- [ ] T6 — **Señal A, e2e del flujo.** Aviso → botón → `cost_price` actualizado →
+      `sale_price` recalculado cuando hay markup.
+- [ ] T7 — **Spec.** Change folder OpenSpec + promoción de `inventory`. La spec de
+      **purchases no cambia** (AC10 intacto).
+- [ ] T8 — **Verificación final independiente**: `cargo test`,
+      `cargo check --all-targets`, `scripts/e2e.sh -k purchases` y `-k products`.
+      La verificación de F1 encontró un bug alcanzable que las verificaciones por
+      slice no vieron, así que esta no se saltea.
 
 ## Progress
 - Documento creado con las decisiones 1 y 2 (botón único escritor, cascada
@@ -240,3 +266,10 @@ costos por proveedor (diferido desde F1).
 - Hallazgo que cambia expectativas: **editar línea no tiene UI**, así que el aviso
   solo aparece al agregar. Y `e2e/tests/test_purchases.py` no existe.
 - Próximo paso: mergear F1, ramificar F2 desde `main`, y fijar T1+.
+- **F1 mergeada a `main`** como `40ad8f7` (merge commit, sin pushear). `main`
+  quedó con el árbol exactamente igual al que se validó (`git diff main
+  feat/product-markup-pricing` vacío).
+- **F2 ramificada desde `main`**: `feat/cost-price-freshness`. Baseline:
+  `cargo test` 777 passed, `cargo check --all-targets` 0 errores.
+- T1–T8 fijadas. Se arranca por la Señal B (el badge): es la más chica, no depende
+  de la Señal A, y es la que cubre al operador que confirma sin mirar el aviso.
