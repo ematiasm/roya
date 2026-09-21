@@ -467,6 +467,22 @@ async fn web_purchase_detail(
     Ok(Html(html).into_response())
 }
 
+/// `DELETE /web/purchases/{id}`: the documents drawer's draft delete — the
+/// mirror of the sale flow. The same house shape as the other HTMX writes:
+/// an empty 200 whose `HX-Trigger` tells the listening pages to re-read the
+/// feed; the business outcome lives in the service, the route only answers.
+async fn web_delete_draft(
+    State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
+    Path(id): Path<i64>,
+) -> AppResult<Response> {
+    state.purchases_service.delete_draft(id).await?;
+    let mut resp = Html("".to_string()).into_response();
+    resp.headers_mut()
+        .insert("HX-Trigger", "purchase-changed".parse().unwrap());
+    Ok(resp)
+}
+
 /// The suggestions fragment is stock-derived data (the list the reorder
 /// panel renders): `inventory.read`, the same gate as its JSON twin. The
 /// judgement call and its cost are recorded in the S7 mapping.
@@ -937,7 +953,7 @@ pub fn router() -> Router<AppState> {
             "/web/purchases/cancel",
             post(web_cancel_purchase_collection),
         )
-        .route("/web/purchases/{id}", get(web_purchase_detail))
+        .route("/web/purchases/{id}", get(web_purchase_detail).delete(web_delete_draft))
         .route("/web/purchases/{id}/lines", post(web_add_line))
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}",
@@ -2667,5 +2683,110 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER);
         let (status, _) = get_html_as(app, "/web/purchases", None).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    // -- DELETE /web/purchases/{id}: the documents drawer's draft delete -------
+
+    /// DELETE carries no body; the interesting answer is the status plus the
+    /// `HX-Trigger` the documents page listens for.
+    async fn send_delete(
+        app: axum::Router,
+        uri: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String, Option<String>) {
+        let mut builder = Request::builder().method("DELETE").uri(uri);
+        if let Some(cookie) = cookie {
+            builder = builder.header("cookie", cookie);
+        }
+        let req = builder.body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let trigger = resp
+            .headers()
+            .get("HX-Trigger")
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string(), trigger)
+    }
+
+    #[tokio::test]
+    async fn web_delete_draft_purchase_answers_200_with_the_purchase_changed_trigger() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body, trigger) = send_delete(
+            app,
+            &format!("/web/purchases/{}", fixture.purchase_id),
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            trigger.as_deref(),
+            Some("purchase-changed"),
+            "the documents page listens for purchase-changed"
+        );
+        let err = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::AppError::NotFound(_)),
+            "the deleted draft must be gone: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_delete_draft_refuses_a_confirmed_purchase_with_400() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body, _) = send_delete(
+            app,
+            &format!("/web/purchases/{}", fixture.purchase_id),
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn web_delete_draft_requires_purchases_create() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+
+        let (status, _, _) = send_delete(
+            app,
+            &format!("/web/purchases/{}", fixture.purchase_id),
+            Some(&test_support::cookie_for(&probe)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .is_ok());
     }
 }

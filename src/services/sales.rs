@@ -412,13 +412,21 @@ where
         let mut lines = Vec::with_capacity(detail.lines.len());
         for line in detail.lines {
             let product = self.inventory.get_product(line.product_id).await?;
+            // The same predicate confirm and cancel use to decide whether a
+            // line moves stock; resolved from the product this read already
+            // fetched for the display names, so a preview built from the view
+            // cannot drift from what those flows will do.
+            let tracks_stock =
+                product.kind == ProductKind::Product && product.track_stock;
             lines.push(SaleLineView {
                 id: line.id,
                 product_name: product.name,
                 product_sku: product.sku,
+                product_id: line.product_id,
                 qty: line.qty,
                 unit_price: line.unit_price,
                 subtotal: line.subtotal(),
+                tracks_stock,
             });
         }
 
@@ -1167,6 +1175,41 @@ where
             .set_cancelled(sale_id, actor, reason.as_deref())
             .await?;
         self.detail_for(cancelled).await
+    }
+
+    /// The documents drawer's draft delete. A draft is the ONE deletable
+    /// state: it never touched stock, money or a customer's debt —
+    /// `record_payment` refuses anything not Confirmed, and the stock
+    /// movement and the ledger entry are both created by `confirm` — so
+    /// nothing dangles when it goes; only its own CASCADE children die with
+    /// it. A confirmed (or cancelled) document is ANULLED through `cancel`
+    /// instead: deleting one would strand its ledger entries and stock
+    /// history.
+    ///
+    /// No `actor` parameter, deliberately: nothing survives to stamp — the
+    /// row and its lines are gone — and the control is the route's permission
+    /// plus the fact that a draft never moved stock, money or debt.
+    pub async fn delete_draft(&self, id: i64) -> AppResult<()> {
+        let sale = self
+            .sales
+            .find_sale(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("sale {id} not found")))?;
+        if sale.status != crate::models::SaleStatus::Draft {
+            return Err(AppError::Validation(format!(
+                "sale {id} is {}: only a draft can be deleted",
+                sale.status
+            )));
+        }
+        let deleted = self.sales.delete_draft(id).await?;
+        if !deleted {
+            // A concurrent confirm won the race: the document is no longer a
+            // draft, so the honest answer is the same refusal as above.
+            return Err(AppError::Validation(format!(
+                "sale {id} is no longer a draft: only a draft can be deleted"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -3596,5 +3639,98 @@ mod tests {
             matches!(&missing, Err(AppError::NotFound(msg)) if msg.contains("payment")),
             "an unknown payment must be NotFound naming the family: {missing:?}"
         );
+    }
+
+    // -- delete_draft (the documents drawer's draft delete) --------------------
+
+    async fn draft_with_one_tracked_line(s: &Svc, sku: &str) -> crate::models::Sale {
+        draft_with_line_typed(s, sku, PaymentType::Cash).await
+    }
+
+    /// The confirmed-refusal test uses CREDIT: a cash confirm demands the
+    /// method's account, and the refusal under test is about STATE, not about
+    /// payment setup.
+    async fn draft_with_line_typed(
+        s: &Svc,
+        sku: &str,
+        payment_type: PaymentType,
+    ) -> crate::models::Sale {
+        let actor = audit_actor(s).await;
+        let product = seed_product(s, sku, "10").await;
+        let sale = s
+            .create_draft(
+                actor,
+                NewSale {
+                    // Credit cannot go to the walk-in: the seeded credit
+                    // customer takes those.
+                    customer_id: match payment_type {
+                        PaymentType::Credit => CREDIT_CUSTOMER_ID,
+                        PaymentType::Cash => WALKIN_ID,
+                    },
+                    payment_type,
+                    sale_date: sale_date(),
+                    // Credit requires a due date; Cash requires none.
+                    due_date: match payment_type {
+                        PaymentType::Credit => Some(sale_date()),
+                        PaymentType::Cash => None,
+                    },
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(sale.id, product.id, dec("2"), None).await.unwrap();
+        sale
+    }
+
+    /// A draft is the one deletable state: the row and its lines go, and a
+    /// later read is the standard NotFound.
+    #[tokio::test]
+    async fn delete_draft_removes_a_draft_and_get_detail_then_404s() {
+        let (s, _pool) = svc().await;
+        let sale = draft_with_one_tracked_line(&s, "DEL-S").await;
+
+        s.delete_draft(sale.id).await.unwrap();
+        let err = s.get_detail(sale.id).await.unwrap_err();
+        assert!(
+            matches!(&err, AppError::NotFound(msg) if msg.contains("sale")),
+            "the deleted draft must be NotFound naming the family: {err:?}"
+        );
+    }
+
+    /// The service refuses a confirmed document NAMING the state; the SQL
+    /// backstop is proven separately at the repository level.
+    #[tokio::test]
+    async fn delete_draft_refuses_a_confirmed_sale_with_a_validation_naming_the_state() {
+        let (s, _pool) = svc().await;
+        let actor = audit_actor(&s).await;
+        let sale = draft_with_line_typed(&s, "DEL-C", PaymentType::Credit).await;
+        // A credit confirm takes NO method (the payment comes later).
+        s.confirm(actor, sale.id, None).await.unwrap();
+
+        let err = s.delete_draft(sale.id).await.unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("Confirmed"),
+                    "the refusal must name the state: {msg}"
+                );
+                assert!(
+                    msg.contains("draft"),
+                    "the refusal must say only a draft can be deleted: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The document survives the refused delete.
+        assert!(s.get_detail(sale.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_draft_of_an_unknown_sale_is_not_found() {
+        let (s, _pool) = svc().await;
+        let err = s.delete_draft(999_999).await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
     }
 }

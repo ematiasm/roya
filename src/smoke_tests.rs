@@ -1375,6 +1375,22 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
             concrete_ids_are_defects: false,
             external_selectors: vec![],
         },
+        // The drawer fragments render the action block (draft delete +
+        // annul/discard), so their hx-delete/hx-post targets are probed with
+        // the real verbs too. The drawer carries the id it renders, so
+        // concrete ids are its shape, not a defect.
+        GuardedPage {
+            label: "documents drawer (draft sale)",
+            path: format!("/web/documents/detail/sale/{}", fixture.sale),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "documents drawer (purchase)",
+            path: format!("/web/documents/detail/purchase/{}", fixture.purchase),
+            concrete_ids_are_defects: false,
+            external_selectors: vec![],
+        },
         GuardedPage {
             label: "purchases",
             path: "/purchases".to_string(),
@@ -8081,3 +8097,153 @@ async fn run_migrations_up_to_33(pool: &SqlitePool) {
     sqlx::migrate!("./migrations").run_to(20240101000033, pool).await.unwrap();
 }
 
+
+// The /documents drawer actions: the two end-to-end flows the action block
+// offers. Everything runs through the real web endpoints, the way the
+// operator's browser would.
+
+/// Delete a draft from the drawer's route: the feed stops listing it and the
+/// database holds neither the sale nor its lines afterwards.
+#[tokio::test]
+async fn documents_drawer_delete_removes_a_draft_and_the_feed_stops_listing_it() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "DRAW-D", "1", "50").await;
+    let buyer = seed_customer(&pool, "Drawer Delete Buyer", None, None).await;
+    let sale =
+        create_sale_draft_on_date(&app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
+    add_sale_line_via_web(&app, sale, product, "2").await;
+
+    // The draft is in the feed before the delete.
+    let (_, feed) = get(&app, "/web/documents").await;
+    assert!(
+        feed.contains(&format!("Draft #{sale}")),
+        "the draft must be listed before the delete: {feed:.600}"
+    );
+
+    // DELETE through the drawer's target, with the header the page listens for.
+    let req = test_support::with_cookie(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/web/sales/{sale}")),
+    )
+    .body(Body::empty())
+    .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let trigger = resp
+        .headers()
+        .get("HX-Trigger")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(
+        trigger.as_deref(),
+        Some("sale-changed"),
+        "the delete must tell the page to re-read the feed"
+    );
+
+    // The feed no longer lists it and the tables hold nothing for the id.
+    let (_, feed) = get(&app, "/web/documents").await;
+    assert!(
+        !feed.contains(&format!("Draft #{sale}")),
+        "the deleted draft must leave the feed: {feed:.600}"
+    );
+    let (sales,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sales WHERE id = ?")
+        .bind(sale)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (lines,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?")
+        .bind(sale)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(sales, 0, "the sale row must be gone");
+    assert_eq!(lines, 0, "the lines must be gone with the draft");
+}
+
+/// The annulment flow: a confirmed sale is annulled through the EXISTING
+/// cancel collection endpoint with a reason, the answer triggers
+/// `sale-changed`, and the designed inverse is observable — the sale is
+/// Cancelled, a refund Expense exists on the paying account and one
+/// `In · Sale-return` movement restores the stock.
+#[tokio::test]
+async fn documents_drawer_annul_flows_through_the_existing_cancel_endpoint() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "DRAW-A", "1", "50").await;
+    record_stock_via_web(&app, product, "10").await;
+    let cash = method_id(&pool, "Cash").await;
+    // The migration's Cash method starts unassigned: creating the wallet with
+    // `method_ids` assigns it, exactly how the neighbouring flows seed it.
+    let _wallet = create_account_via_web(&app, &pool, "DrawerAnnulWallet", &[cash]).await;
+    let buyer = seed_customer(&pool, "Drawer Annul Buyer", None, None).await;
+    let sale =
+        create_sale_draft_on_date(&app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
+    add_sale_line_via_web(&app, sale, product, "2").await;
+    confirm_sale_via_web(&app, sale, None).await;
+    let (status, resp) = pay_sale_via_web(&app, sale, cash, "5").await;
+    assert_eq!(status, StatusCode::OK, "seed payment: {resp}");
+    let sale_number = sale_detail(&app, sale).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+
+    // POST the cancel collection endpoint with a reason, exactly as the
+    // drawer's action form does.
+    let body = format!("sale_id={sale}&reason=annulled from the drawer");
+    let req = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/sales/cancel")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true"),
+    )
+    .body(Body::from(body))
+    .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let trigger = resp
+        .headers()
+        .get("HX-Trigger")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(trigger.as_deref(), Some("sale-changed"));
+
+    // The document is annulled.
+    let detail = sale_detail(&app, sale).await;
+    assert_eq!(
+        detail["sale"]["status"].as_str(),
+        Some("Cancelled"),
+        "{}",
+        detail
+    );
+
+    // One refund Expense on the paying account.
+    let (account,): (i64,) =
+        sqlx::query_as("SELECT account_id FROM payment_methods WHERE id = ?")
+            .bind(cash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let refunds: Vec<Value> = transactions_for(&app, account)
+        .await
+        .into_iter()
+        .filter(|t| t["kind"].as_str() == Some("Expense"))
+        .collect();
+    assert!(
+        refunds
+            .iter()
+            .any(|t| t["amount"].as_str() == Some("5")
+                || t["amount"].as_f64() == Some(5.0)),
+        "one Expense refund of 5 must exist: {refunds:?}"
+    );
+
+    // One In · Sale-return movement for the tracked line.
+    let (movements,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM stock_movements \
+         WHERE product_id = ? AND type = 'In' AND reason = 'Sale-return' AND reference = ?",
+    )
+    .bind(product)
+    .bind(&sale_number)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(movements, 1, "the tracked line's return movement must exist");
+}

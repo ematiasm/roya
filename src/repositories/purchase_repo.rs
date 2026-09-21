@@ -154,6 +154,17 @@ pub trait PurchaseRepository: Send + Sync {
         -> AppResult<PurchaseLine>;
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
+    /// Delete a DRAFT purchase and let its lines die by CASCADE. The `status =
+    /// 'Draft'` in the WHERE is the load-bearing backstop: even if a caller
+    /// ever relaxed the service's state guard, a Confirmed or Cancelled row
+    /// cannot be removed by this statement — it answers `false` instead, so
+    /// the caller can refuse honestly. A draft is the only deletable state by
+    /// construction (no payments — nothing but a Confirmed document takes
+    /// them — no stock movement, no ledger entry, no supplier debt), so
+    /// nothing dangles. This is a WRITE, not a read: the test read counter
+    /// stays untouched.
+    async fn delete_draft(&self, id: i64) -> AppResult<bool>;
+
     /// Create the payment row and link it to the finance transaction it produced
     /// (`transaction_id`); NULL only for historical rows. The payment carries
     /// the acting user of the request that produced it (AC18).
@@ -517,6 +528,18 @@ impl PurchaseRepository for SqlitePurchaseRepository {
 
     async fn delete_line(&self, id: i64) -> AppResult<bool> {
         let res = sqlx::query(r#"DELETE FROM purchase_lines WHERE id = ?"#)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn delete_draft(&self, id: i64) -> AppResult<bool> {
+        // `AND status = 'Draft'` is the backstop that makes deleting a
+        // confirmed (or cancelled) document impossible even if the service
+        // check were relaxed: the WHERE simply matches nothing and the answer
+        // is `false`.
+        let res = sqlx::query(r#"DELETE FROM purchases WHERE id = ? AND status = 'Draft'"#)
             .bind(id)
             .execute(&self.pool)
             .await?;
@@ -1307,5 +1330,192 @@ mod tests {
         repo.reset_reads();
         assert!(repo.find_payment(999_999).await.unwrap().is_none());
         assert_eq!(repo.read_count(), 1);
+    }
+
+    // -- delete_draft (the documents drawer's draft delete) --------------------
+
+    /// One purchase with an EXPLICIT status, seeded through raw SQL: the delete
+    /// tests must be able to pin a Confirmed row WITHOUT the service's guard,
+    /// because the point is proving the SQL backstop (`WHERE status = 'Draft'`)
+    /// is load-bearing on its own, not that the service refuses politely.
+    async fn seed_purchase_with_status(
+        pool: &SqlitePool,
+        status: &str,
+        supplier: &str,
+        date: NaiveDate,
+        actor: i64,
+    ) -> i64 {
+        let supplier_id = seed_supplier(pool, supplier, actor).await;
+        sqlx::query_scalar(
+            r#"INSERT INTO purchases (supplier_id, status, payment_type, purchase_date, created_by)
+               VALUES (?, ?, 'Cash', ?, ?)
+               RETURNING id"#,
+        )
+        .bind(supplier_id)
+        .bind(status)
+        .bind(date)
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn count(pool: &SqlitePool, sql: &'static str, id: i64) -> i64 {
+        sqlx::query_scalar(sql)
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// A draft delete removes the draft and its lines (CASCADE) and NOTHING
+    /// else: another draft seeded beside it keeps its row and its line.
+    #[tokio::test]
+    async fn delete_draft_deletes_a_draft_with_its_lines_and_leaves_others_alive() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let product = product_id(&pool, actor).await;
+
+        let draft = seed_purchase_with_status(
+            &pool,
+            "Draft",
+            "Delete Supplier",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) VALUES (?, ?, '1', '5')",
+            )
+            .bind(draft)
+            .bind(product)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let other = seed_purchase_with_status(
+            &pool,
+            "Draft",
+            "Keep Supplier",
+            d(2024, 5, 3),
+            actor,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) VALUES (?, ?, '3', '5')",
+        )
+        .bind(other)
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(repo.delete_draft(draft).await.unwrap());
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", draft).await,
+            0,
+            "the draft row must be gone"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchase_lines WHERE purchase_id = ?",
+                draft
+            )
+            .await,
+            0,
+            "the draft's lines must be gone with it"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", other).await,
+            1,
+            "the other document must survive"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchase_lines WHERE purchase_id = ?",
+                other
+            )
+            .await,
+            1,
+            "the other document's lines must survive"
+        );
+    }
+
+    /// THE backstop proof: the repository is called DIRECTLY on a Confirmed
+    /// purchase — no service guard in the way — and still refuses, because the
+    /// `WHERE status = 'Draft'` in the statement is what makes deleting a
+    /// confirmed document impossible even if the service check were relaxed.
+    #[tokio::test]
+    async fn delete_draft_called_directly_on_a_confirmed_purchase_returns_false_and_the_row_survives() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let product = product_id(&pool, actor).await;
+
+        let confirmed = seed_purchase_with_status(
+            &pool,
+            "Confirmed",
+            "Confirmed Supplier",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) VALUES (?, ?, '1', '5')",
+        )
+        .bind(confirmed)
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(!repo.delete_draft(confirmed).await.unwrap());
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", confirmed).await,
+            1,
+            "a confirmed purchase must survive a direct repository delete attempt"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchase_lines WHERE purchase_id = ?",
+                confirmed
+            )
+            .await,
+            1,
+            "the confirmed purchase's lines must survive too"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_draft_on_a_cancelled_purchase_returns_false_and_the_row_survives() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let cancelled = seed_purchase_with_status(
+            &pool,
+            "Cancelled",
+            "Cancelled Supplier",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+
+        assert!(!repo.delete_draft(cancelled).await.unwrap());
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", cancelled).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_draft_on_an_unknown_id_returns_false() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        assert!(!repo.delete_draft(999_999).await.unwrap());
     }
 }

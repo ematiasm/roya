@@ -736,9 +736,18 @@ pub struct SaleLineView {
     pub id: i64,
     pub product_name: String,
     pub product_sku: String,
+    /// The line's product id: the only key a caller needs to resolve the
+    /// product's CURRENT state (active flag, stock settings) beyond the names
+    /// resolved here.
+    pub product_id: i64,
     pub qty: Decimal,
     pub unit_price: Decimal,
     pub subtotal: Decimal,
+    /// The same predicate `confirm` and `cancel` use to decide whether a line
+    /// moves stock (`product.kind == Product && product.track_stock`), filled
+    /// from the very product read that resolves the name — so any preview
+    /// built from this view cannot drift from what those flows will do.
+    pub tracks_stock: bool,
 }
 
 /// One sale payment resolved for `/sales/{id}`.
@@ -1026,9 +1035,18 @@ pub struct PurchaseLineView {
     pub id: i64,
     pub product_name: String,
     pub product_sku: String,
+    /// The line's product id: the only key a caller needs to resolve the
+    /// product's CURRENT state (active flag, stock settings) beyond the names
+    /// resolved here.
+    pub product_id: i64,
     pub qty: Decimal,
     pub unit_cost: Decimal,
     pub subtotal: Decimal,
+    /// The same predicate `confirm` and `cancel` use to decide whether a line
+    /// moves stock (`product.kind == Product && product.track_stock`), filled
+    /// from the very product read that resolves the name — so any preview
+    /// built from this view cannot drift from what those flows will do.
+    pub tracks_stock: bool,
 }
 
 /// One purchase payment resolved for `/purchases/{id}`.
