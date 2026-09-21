@@ -41,8 +41,19 @@ then archives its own scope.
       the draft's `updated_by` — the document was edited. See the slice's section in
       `odd/tasks/identity-rbac.md` for the demonstrated upgrade sequence, the
       constraint-preservation audit, the mutation table and the verification numbers.)
-- [ ] T30 (S13): audit for the identity tables themselves (`users`, `roles`, `permissions`) and the
+- [x] T30 (S13): audit for the identity tables themselves (`users`, `roles`, `permissions`) and the
       grant trail display (`user_roles.granted_by/granted_at` already shipped; surface it readably).
+      (Delivered on `feat/audit-identity-tables`, migration 20240101000034. With it, every table the
+      original audit list named is audited: the twelve business tables of T26–T29 plus
+      `users`/`roles`/`permissions` here. `role_permissions` carries no columns of its own — the
+      join-row rule: a matrix row inherits its role's actor, and the matrix edit stamps the role's
+      `updated_by` — and `user_roles` keeps its own `granted_by`/`granted_at` trail, which the users
+      screen finally renders ("«rol»: otorgado por «nombre» el «fecha»"). `users` is ALTERed, not
+      rebuilt (nullable self-referencing audit columns: NULL = the system, rendered as "el
+      sistema"); `roles`/`permissions` are rebuilt with the seven guard triggers dropped and
+      recreated byte-identically. See the slice's section in `odd/tasks/identity-rbac.md` for the
+      demonstrated upgrade sequence, the constraint-preservation audit, the mutation table and the
+      verification numbers.)
 - [ ] T31 (S14): closing verification — `cargo test` green with the audit tests mutation-validated,
       `openspec/specs/identity/spec.md` extended with the audit rules and AC18–AC19, and this
       change's folder archived.

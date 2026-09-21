@@ -30,7 +30,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{Role, UserWithRoles};
+use crate::models::{Role, User, UserWithRoles};
 use crate::routes::AppState;
 use crate::security::authz::{
     IdentityRolesManage, IdentityUsersManage, IdentityUsersRead, Nav, Principal, Require,
@@ -40,10 +40,36 @@ use crate::security::authz::{
 // Views + Askama templates
 // ---------------------------------------------------------------------------
 
+/// One grant with its display names resolved (slice S13): the roles list
+/// carries the machine names the assignment form uses; the trail renders who
+/// granted and when, in the established display idiom (names, never ids).
+/// `granted_on` is the recorded instant formatted for the list (the date
+/// part); the template cannot format a timestamp itself.
+pub struct GrantRowView {
+    pub role_name: String,
+    pub granted_by_label: String,
+    pub granted_on: String,
+}
+
+/// One users-list row with the audit attribution resolved (slice S13): the
+/// row's creator/last editor and, for each granted role, who granted it and
+/// when. The wiring layer resolves every id to a display name here — the one
+/// layer the AC20 boundary scan allows to read identity — so the template
+/// renders names, never ids. NULL audit columns mean "the system" (the
+/// migration's sentinel, the bootstrap administrator) and render as the
+/// honest Spanish label, never as a blank or a raw id.
+pub struct UserRowView {
+    pub user: User,
+    pub roles: Vec<Role>,
+    pub grants: Vec<GrantRowView>,
+    pub created_by_label: String,
+    pub updated_by_label: Option<String>,
+}
+
 #[derive(Template)]
 #[template(path = "users.html")]
 struct UsersTemplate {
-    users: Vec<UserWithRoles>,
+    users: Vec<UserRowView>,
     /// Whether the principal may act on credentials (`identity.users.manage`):
     /// decides which actions the markup offers. The handlers refuse regardless.
     can_manage: bool,
@@ -63,7 +89,7 @@ struct UsersTemplate {
 #[derive(Template)]
 #[template(path = "partials/user_list.html")]
 struct UserListPartial {
-    users: Vec<UserWithRoles>,
+    users: Vec<UserRowView>,
     can_manage: bool,
     can_manage_roles: bool,
     acting_user_id: i64,
@@ -102,12 +128,65 @@ fn render<T: Template>(template: T) -> AppResult<String> {
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-async fn user_rows(state: &AppState) -> AppResult<Vec<UserWithRoles>> {
-    state.identity_service.list_users_with_roles().await
+async fn user_rows(state: &AppState) -> AppResult<Vec<UserRowView>> {
+    let users = state.identity_service.list_users_with_roles().await?;
+    Ok(resolve_user_rows(state, users).await?)
+}
+
+/// Resolve the audit attribution of the users list: every actor id (the row's
+/// creator/editor and every grant's granter) to a display name, in ONE wiring
+/// query. NULL means the system did it — the sentinel, the bootstrap
+/// administrator — and renders as the honest Spanish label ("el sistema").
+/// The grant instant is shown as its date part; the interface never renders a
+/// raw id.
+async fn resolve_user_rows(
+    state: &AppState,
+    users: Vec<UserWithRoles>,
+) -> AppResult<Vec<UserRowView>> {
+    let mut actor_ids: Vec<i64> = Vec::new();
+    for row in &users {
+        actor_ids.extend(row.user.created_by);
+        actor_ids.extend(row.user.updated_by);
+        for grant in &row.grants {
+            actor_ids.push(grant.granted_by);
+        }
+    }
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    // created_by/updated_by: NULL means the system performed it — the honest
+    // label, not a blank. granted_by is a live foreign key (NOT NULL), so a
+    // miss here is only the concurrent-deactivation window the shared read
+    // documents: the established explicit marker, never a raw id.
+    let system_label = |id: Option<i64>| -> String {
+        id.and_then(|actor| names.get(&actor).cloned())
+            .unwrap_or_else(|| "el sistema".to_string())
+    };
+    let resolved = |id: i64| -> String {
+        names.get(&id).cloned().unwrap_or_else(|| "—".to_string())
+    };
+    let mut rows = Vec::with_capacity(users.len());
+    for row in users {
+        let grants = row
+            .grants
+            .iter()
+            .map(|grant| GrantRowView {
+                role_name: grant.role.name.clone(),
+                granted_by_label: resolved(grant.granted_by),
+                granted_on: grant.granted_at.format("%Y-%m-%d").to_string(),
+            })
+            .collect();
+        rows.push(UserRowView {
+            created_by_label: system_label(row.user.created_by),
+            updated_by_label: row.user.updated_by.and_then(|actor| names.get(&actor).cloned()),
+            user: row.user,
+            roles: row.roles,
+            grants,
+        });
+    }
+    Ok(rows)
 }
 
 fn render_list(
-    users: Vec<UserWithRoles>,
+    users: Vec<UserRowView>,
     can_manage: bool,
     can_manage_roles: bool,
     acting_user_id: i64,
@@ -206,7 +285,12 @@ async fn web_create_user(
 ) -> AppResult<Response> {
     state
         .identity_service
-        .create_user(&form.username, &form.display_name, &form.password)
+        .create_user(
+            principal.user_id,
+            &form.username,
+            &form.display_name,
+            &form.password,
+        )
         .await?;
     if is_htmx(&headers) {
         let mut resp = list_response(
@@ -232,7 +316,7 @@ async fn web_activate_user(
 ) -> AppResult<Response> {
     state
         .identity_service
-        .set_user_active(form.user_id, true)
+        .set_user_active(principal.user_id, form.user_id, true)
         .await?;
     if is_htmx(&headers) {
         let mut resp = list_response(
@@ -258,7 +342,7 @@ async fn web_deactivate_user(
 ) -> AppResult<Response> {
     state
         .identity_service
-        .set_user_active(form.user_id, false)
+        .set_user_active(principal.user_id, form.user_id, false)
         .await?;
     if is_htmx(&headers) {
         let mut resp = list_response(
@@ -470,7 +554,7 @@ async fn web_user_roles_form(
     Path(id): Path<i64>,
     _: Require<IdentityRolesManage>,
 ) -> AppResult<Html<String>> {
-    let users = user_rows(&state).await?;
+    let users = state.identity_service.list_users_with_roles().await?;
     let user = users
         .into_iter()
         .find(|u| u.user.id == id)
@@ -486,7 +570,7 @@ async fn web_user_password_form(
     Path(id): Path<i64>,
     _: Require<IdentityUsersManage>,
 ) -> AppResult<Html<String>> {
-    let users = user_rows(&state).await?;
+    let users = state.identity_service.list_users_with_roles().await?;
     let user = users
         .into_iter()
         .find(|u| u.user.id == id)
@@ -558,10 +642,13 @@ mod tests {
         let pool = test_pool().await;
         let state = test_support::app_state(pool.clone());
         if !permissions.is_empty() {
-            sqlx::query("INSERT INTO roles (code, name) VALUES ('usuarios', 'Usuarios')")
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO roles (code, name, created_by) VALUES ('usuarios', 'Usuarios', \
+                 (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             for code in permissions {
                 sqlx::query(
                     "INSERT INTO role_permissions (role_id, permission_id) \
@@ -729,9 +816,10 @@ mod tests {
             "identity.roles.manage",
         ])
         .await;
+        let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
         let target = state
             .identity_service
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(actor_id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let permissions =
@@ -913,7 +1001,7 @@ mod tests {
         // screen; the same deactivation then succeeds.
         let created = state
             .identity_service
-            .create_user("second", "Second", "initial password 1")
+            .create_user(admin_id, "second", "Second", "initial password 1")
             .await
             .unwrap();
         let resp = send(
@@ -1002,9 +1090,10 @@ mod tests {
             "identity.roles.manage",
         ])
         .await;
+        let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
         let target = state
             .identity_service
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(actor_id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let permissions =
@@ -1072,6 +1161,7 @@ mod tests {
     async fn a_users_manage_principal_is_refused_the_role_set_endpoint_at_the_gate() {
         let (app, state) = app_with_permissions(&["identity.users.read", "identity.users.manage"])
             .await;
+        let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
         state
             .identity_service
             .bootstrap_admin(Some(ADMIN_PASSWORD))
@@ -1079,7 +1169,7 @@ mod tests {
             .unwrap();
         let created = state
             .identity_service
-            .create_user("protege", "Protege", "initial password 1")
+            .create_user(actor_id, "protege", "Protege", "initial password 1")
             .await
             .unwrap();
         let admin_role_id: i64 =
@@ -1186,7 +1276,7 @@ mod tests {
         let admin_id = boot.user.unwrap().id;
         let teller = state
             .identity_service
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin_id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
 
@@ -1289,9 +1379,10 @@ mod tests {
             "identity.roles.manage",
         ])
         .await;
+        let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
         let target = state
             .identity_service
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(actor_id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let permissions =

@@ -418,9 +418,11 @@ where
             // instead: reactivate and set the new credential.
             let id = existing.user.id;
             let credential = self.bootstrap_credential(env_password)?;
-            self.users.update_password_hash(id, &credential.password_hash).await?;
-            self.users.set_must_change_password(id, credential.must_change).await?;
-            self.users.set_active(id, true).await?;
+            // The recovery is the SYSTEM's work: the audit columns stay NULL
+            // ("the system"), never attributed to a person who did not act.
+            self.users.update_password_hash(id, &credential.password_hash, None).await?;
+            self.users.set_must_change_password(id, credential.must_change, None).await?;
+            self.users.set_active(id, true, None).await?;
             self.grant_protected_role(id).await?;
             let user = self
                 .users
@@ -434,6 +436,9 @@ where
             });
         }
         let credential = self.bootstrap_credential(env_password)?;
+        // created_by = None: the bootstrap administrator is created by the
+        // system, not by an operator — the schema stores NULL and the
+        // interface renders that honestly (slice S13).
         let user = self
             .users
             .create(&crate::models::NewUser {
@@ -441,7 +446,7 @@ where
                 display_name: BOOTSTRAP_ADMIN_DISPLAY_NAME.into(),
                 password_hash: credential.password_hash,
                 must_change_password: credential.must_change,
-            })
+            }, None)
             .await?;
         self.grant_protected_role(user.id).await?;
         Ok(BootstrapOutcome {
@@ -667,8 +672,8 @@ where
             ));
         }
         let new_hash = self.hasher.hash(new_password)?;
-        self.users.update_password_hash(user_id, &new_hash).await?;
-        self.users.set_must_change_password(user_id, false).await?;
+        self.users.update_password_hash(user_id, &new_hash, Some(user_id)).await?;
+        self.users.set_must_change_password(user_id, false, Some(user_id)).await?;
         self.clear_attempts(&key);
         self.users
             .find_by_id(user_id)
@@ -708,8 +713,11 @@ where
     /// (the same posture as the bootstrap's generated one), so the target's
     /// first session is confined to the change form until it is replaced.
     /// Nothing is written on any refusal: the checks run before the hash.
+    /// `actor_id` is the request's principal: the new row's `created_by`
+    /// (slice S13).
     pub async fn create_user(
         &self,
+        actor_id: i64,
         username: &str,
         display_name: &str,
         password: &str,
@@ -736,12 +744,15 @@ where
         }
         let hash = self.hasher.hash(password)?;
         self.users
-            .create(&NewUser {
-                username: username.into(),
-                display_name: display_name.into(),
-                password_hash: hash,
-                must_change_password: true,
-            })
+            .create(
+                &NewUser {
+                    username: username.into(),
+                    display_name: display_name.into(),
+                    password_hash: hash,
+                    must_change_password: true,
+                },
+                Some(actor_id),
+            )
             .await
     }
 
@@ -750,8 +761,10 @@ where
     /// deactivation guard trigger refuses when this is the last active
     /// holder of a protected role; the repository maps that refusal to the
     /// Spanish conflict the interface explains, so the operator never sees
-    /// the trigger string.
-    pub async fn set_user_active(&self, user_id: i64, active: bool) -> AppResult<User> {
+    /// the trigger string. `actor_id` is the request's principal: the
+    /// toggle is an edit of the target's row, so it stamps the target's
+    /// `updated_by` (slice S13).
+    pub async fn set_user_active(&self, actor_id: i64, user_id: i64, active: bool) -> AppResult<User> {
         let existing = self
             .users
             .find_by_id(user_id)
@@ -761,7 +774,7 @@ where
             // Idempotent: nothing to write and nothing to revoke.
             return Ok(existing);
         }
-        self.users.set_active(user_id, active).await?;
+        self.users.set_active(user_id, active, Some(actor_id)).await?;
         if !active {
             self.revoke_all_sessions(user_id).await?;
         }
@@ -821,8 +834,8 @@ where
             }
         }
         let hash = self.hasher.hash(new_password)?;
-        self.users.update_password_hash(target_id, &hash).await?;
-        self.users.set_must_change_password(target_id, true).await?;
+        self.users.update_password_hash(target_id, &hash, Some(actor_id)).await?;
+        self.users.set_must_change_password(target_id, true, Some(actor_id)).await?;
         // No revocation: the target's live sessions stay valid but are
         // confined to the change form by the flag gate from their very next
         // request — they can change it right there.
@@ -905,7 +918,12 @@ where
         let mut out = Vec::new();
         for user in self.users.list().await? {
             let roles = self.roles.list_for_user(user.id).await?;
-            out.push(UserWithRoles { user, roles });
+            // The grant trail (slice S13): the `user_roles` columns the RBAC
+            // slice has recorded since S2, now surfaced. Same read family as
+            // `list_for_user` — both are identity tables, the boundary the
+            // service owns.
+            let grants = self.roles.list_grants_for_user(user.id).await?;
+            out.push(UserWithRoles { user, roles, grants });
         }
         Ok(out)
     }
@@ -956,6 +974,8 @@ where
     /// written on any refusal: every check runs before the insert. The code
     /// is immutable in practice (no rename surface exists — a machine name is
     /// not a relabel), so the shape rule is the one chance to get it right.
+    /// `actor_id` is the request's principal: the new row's `created_by`
+    /// (slice S13) — a role created through the screen names its author.
     pub async fn create_role<P: PermissionRepository>(
         &self,
         permissions: &P,
@@ -986,17 +1006,20 @@ where
             return Err(AppError::Validation(ROLE_DESCRIPTION_MESSAGE.into()));
         }
         self.roles
-            .create(&NewRole {
-                code: code.into(),
-                name: name.into(),
-                // An empty description is no description, not an empty string
-                // the interface renders as blank noise.
-                description: if description.is_empty() {
-                    None
-                } else {
-                    Some(description.into())
+            .create(
+                &NewRole {
+                    code: code.into(),
+                    name: name.into(),
+                    // An empty description is no description, not an empty string
+                    // the interface renders as blank noise.
+                    description: if description.is_empty() {
+                        None
+                    } else {
+                        Some(description.into())
+                    },
                 },
-            })
+                actor_id,
+            )
             .await
     }
 
@@ -1006,7 +1029,8 @@ where
     /// match creation; nothing is written on a refusal. The protected role's
     /// LABEL stays editable on purpose: the triggers lock its code, deletion
     /// and matrix, and the interface keeps those actions hidden — the label
-    /// is how the operator describes the role to other operators.
+    /// is how the operator describes the role to other operators. The edit
+    /// stamps the role's `updated_by` with the actor (slice S13).
     pub async fn update_role<P: PermissionRepository>(
         &self,
         permissions: &P,
@@ -1030,7 +1054,12 @@ where
             return Err(AppError::Validation(ROLE_DESCRIPTION_MESSAGE.into()));
         }
         self.roles
-            .update_details(role_id, name, if description.is_empty() { None } else { Some(description) })
+            .update_details(
+                role_id,
+                name,
+                if description.is_empty() { None } else { Some(description) },
+                actor_id,
+            )
             .await?;
         self.roles
             .find_by_id(role_id)
@@ -1186,7 +1215,10 @@ where
                 return Err(AppError::Forbidden(MATRIX_SELF_LOCKOUT_MESSAGE.into()));
             }
         }
-        permissions.set_role_permissions(role_id, &unique).await
+        // The matrix edit attributes itself to the acting principal: the
+        // permission repository stamps the role's `updated_by` in the same
+        // transaction (slice S13).
+        permissions.set_role_permissions(role_id, &unique, actor_id).await
     }
 
     // -- mass revocation -------------------------------------------------------------
@@ -1380,6 +1412,11 @@ mod tests {
         async fn delete(&self, id: i64) -> AppResult<()> {
             self.inner.delete(id).await
         }
+        async fn list_grants_for_user(&self, user_id: i64)
+            -> AppResult<Vec<crate::models::RoleGrant>>
+        {
+            self.inner.list_grants_for_user(user_id).await
+        }
         async fn replace_user_roles(
             &self,
             user_id: i64,
@@ -1388,16 +1425,17 @@ mod tests {
         ) -> AppResult<Vec<Role>> {
             self.inner.replace_user_roles(user_id, role_ids, granted_by).await
         }
-        async fn create(&self, input: &NewRole) -> AppResult<Role> {
-            self.inner.create(input).await
+        async fn create(&self, input: &NewRole, created_by: i64) -> AppResult<Role> {
+            self.inner.create(input, created_by).await
         }
         async fn update_details(
             &self,
             id: i64,
             name: &str,
             description: Option<&str>,
+            updated_by: i64,
         ) -> AppResult<()> {
-            self.inner.update_details(id, name, description).await
+            self.inner.update_details(id, name, description, updated_by).await
         }
         async fn holder_names(&self, role_id: i64) -> AppResult<Vec<String>> {
             self.inner.holder_names(role_id).await
@@ -1424,6 +1462,7 @@ mod tests {
             &self,
             _role_id: i64,
             _permission_ids: &[i64],
+            _updated_by: i64,
         ) -> AppResult<()> {
             Ok(())
         }
@@ -1500,16 +1539,19 @@ mod tests {
         let hash = s.hasher.hash(password).unwrap();
         let user = s
             .users
-            .create(&NewUser {
-                username: username.into(),
-                display_name: username.into(),
-                password_hash: hash,
-                must_change_password: false,
-            })
+            .create(
+                &NewUser {
+                    username: username.into(),
+                    display_name: username.into(),
+                    password_hash: hash,
+                    must_change_password: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         if !active {
-            s.users.set_active(user.id, false).await.unwrap();
+            s.users.set_active(user.id, false, None).await.unwrap();
         }
         user
     }
@@ -1563,6 +1605,10 @@ mod tests {
             s.hasher.verify("env password 123", &stored.password_hash),
             "the env password must be the stored credential"
         );
+        // S13: the bootstrap administrator is the system's work — NULL on both
+        // audit columns, honestly, never attributed to a person.
+        assert_eq!(stored.user.created_by, None, "created by the system");
+        assert_eq!(stored.user.updated_by, None);
     }
 
     #[tokio::test]
@@ -1745,12 +1791,15 @@ mod tests {
         // A second administrator makes the refused deactivation succeed ...
         let second = s
             .users
-            .create(&NewUser {
-                username: "second-admin".into(),
-                display_name: "Second".into(),
-                password_hash: "placeholder-not-a-real-argon2-hash".into(),
-                must_change_password: false,
-            })
+            .create(
+                &NewUser {
+                    username: "second-admin".into(),
+                    display_name: "Second".into(),
+                    password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                    must_change_password: false,
+                },
+                Some(admin_id),
+            )
             .await
             .unwrap();
         let admin_role = s.roles.find_by_code("admin").await.unwrap().unwrap();
@@ -1762,7 +1811,7 @@ mod tests {
             })
             .await
             .unwrap();
-        s.users.set_active(admin_id, false).await.unwrap();
+        s.users.set_active(admin_id, false, None).await.unwrap();
         assert!(!s.users.find_by_id(admin_id).await.unwrap().unwrap().is_active);
         // ... and the first administrator's grant can now be removed too.
         s.roles.revoke(admin_id, admin_role.id).await.unwrap();
@@ -1779,12 +1828,15 @@ mod tests {
         let (s, pool, _clock) = svc().await;
         let users = SqliteUserRepository::new(pool.clone());
         let created = users
-            .create(&NewUser {
-                username: "admin".into(),
-                display_name: "Admin".into(),
-                password_hash: "placeholder-not-a-real-argon2-hash".into(),
-                must_change_password: false,
-            })
+            .create(
+                &NewUser {
+                    username: "admin".into(),
+                    display_name: "Admin".into(),
+                    password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                    must_change_password: false,
+                },
+                None,
+            )
             .await
             .unwrap();
 
@@ -1816,8 +1868,9 @@ mod tests {
         // SQL (the flag is writable at INSERT time; the trigger refuses to
         // flip it afterwards).
         sqlx::query(
-            r#"INSERT INTO roles (code, name, description, is_system)
-               VALUES ('dueno', 'Dueño', 'El dueño del local.', 1)"#,
+            r#"INSERT INTO roles (code, name, description, is_system, created_by)
+               VALUES ('dueno', 'Dueño', 'El dueño del local.', 1,
+                       (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))"#,
         )
         .execute(&pool)
         .await
@@ -1885,7 +1938,7 @@ mod tests {
             })
             .await
             .unwrap();
-        s.users.set_active(holder.id, false).await.unwrap();
+        s.users.set_active(holder.id, false, Some(partner.id)).await.unwrap();
         assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
     }
 
@@ -2138,7 +2191,7 @@ mod tests {
 
         // Deactivate the owner: the live session must be refused from now on,
         // with exactly the outcome an unknown token gets.
-        s.users.set_active(outcome.user.id, false).await.unwrap();
+        s.users.set_active(outcome.user.id, false, None).await.unwrap();
         let inactive = s.resolve_session(&outcome.token).await.unwrap();
         let unknown = s.resolve_session("no such token").await.unwrap();
         assert!(inactive.is_none(), "deactivated owner's session must be refused");
@@ -2743,24 +2796,27 @@ mod tests {
     #[tokio::test]
     async fn admin_create_user_validates_the_rules_and_flags_the_target() {
         let (s, _pool, _clock) = svc().await;
+        // The actor is a real user: the happy path records it as the row's
+        // creator (slice S13).
+        let admin = seed_user(&s, "creator", "the right password", true).await;
 
         // Username shape (the service speaks Spanish; nothing is written).
         for bad in ["AB", "ok!", "-lead", "trail-", "a"] {
             let err = s
-                .create_user(bad, "Ok name", "initial password 1")
+                .create_user(admin.id, bad, "Ok name", "initial password 1")
                 .await
                 .unwrap_err();
             assert!(matches!(err, AppError::Validation(_)), "{bad}: {err:?}");
         }
         // Display name rule.
         let err = s
-            .create_user("teller", "", "initial password 1")
+            .create_user(admin.id, "teller", "", "initial password 1")
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
         // Initial password rule.
         let err = s
-            .create_user("teller", "Teller", "short")
+            .create_user(admin.id, "teller", "Teller", "short")
             .await
             .unwrap_err();
         let msg = validation_text(err);
@@ -2769,17 +2825,19 @@ mod tests {
         // The happy path: the target owes the change (the acting
         // administrator chose the credential).
         let user = s
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         assert_eq!(user.username, "teller");
         assert_eq!(user.display_name, "Teller");
         assert!(user.is_active);
         assert!(user.must_change_password);
+        // S13: the row names the acting administrator as its creator.
+        assert_eq!(user.created_by, Some(admin.id));
 
         // Uniqueness is case-insensitive (the NOCASE index, pre-checked).
         let err = s
-            .create_user("TELLER", "Other", "initial password 1")
+            .create_user(admin.id, "TELLER", "Other", "initial password 1")
             .await
             .unwrap_err();
         let msg = conflict_text(err);
@@ -2787,10 +2845,11 @@ mod tests {
         assert!(msg.contains("teller"), "the refusal names the taken name: {msg}");
 
         // Every refusal above wrote nothing: exactly one user beyond the
-        // pre-existing rows exists. The pre-existing rows are migration 30's
-        // sentinel account (`sistema`, inactive, roleless — Phase B's system
-        // actor for rows that predate the audit), so the list is two long.
-        assert_eq!(s.users.list().await.unwrap().len(), 2);
+        // pre-existing rows and the acting administrator exists. The
+        // pre-existing rows are migration 30's sentinel account (`sistema`,
+        // inactive, roleless — Phase B's system actor for rows that predate
+        // the audit), so the list is three long.
+        assert_eq!(s.users.list().await.unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -2804,13 +2863,13 @@ mod tests {
             .user
             .unwrap();
         let target = s
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let login = s.login("teller", "initial password 1").await.unwrap();
 
         // Deactivating an ordinary user works and drops their live session.
-        s.set_user_active(target.id, false).await.unwrap();
+        s.set_user_active(admin.id, target.id, false).await.unwrap();
         assert!(!s.users.find_by_id(target.id).await.unwrap().unwrap().is_active);
         assert!(
             s.resolve_session(&login.token).await.unwrap().is_none(),
@@ -2818,14 +2877,14 @@ mod tests {
         );
 
         // Re-activation works; deactivating twice is idempotent.
-        s.set_user_active(target.id, true).await.unwrap();
-        let again = s.set_user_active(target.id, true).await.unwrap();
+        s.set_user_active(admin.id, target.id, true).await.unwrap();
+        let again = s.set_user_active(admin.id, target.id, true).await.unwrap();
         assert!(again.is_active);
 
         // The last active protected-role holder is refused with the mapped
         // Spanish message — never the trigger string, never a 500.
         let err = s
-            .set_user_active(admin.id, false)
+            .set_user_active(target.id, admin.id, false)
             .await
             .unwrap_err();
         let msg = conflict_text(err);
@@ -2839,7 +2898,7 @@ mod tests {
 
         // A second administrator makes the same deactivation succeed.
         let second = s
-            .create_user("second", "Second", "initial password 1")
+            .create_user(admin.id, "second", "Second", "initial password 1")
             .await
             .unwrap();
         let admin_role = s.roles.find_by_code("admin").await.unwrap().unwrap();
@@ -2851,7 +2910,7 @@ mod tests {
             })
             .await
             .unwrap();
-        s.set_user_active(admin.id, false).await.unwrap();
+        s.set_user_active(second.id, admin.id, false).await.unwrap();
         assert!(!s.users.find_by_id(admin.id).await.unwrap().unwrap().is_active);
         assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
     }
@@ -2866,7 +2925,7 @@ mod tests {
             .user
             .unwrap();
         let target = s
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let permissions = SqlitePermissionRepository::new(pool.clone());
@@ -2923,7 +2982,7 @@ mod tests {
             .user
             .unwrap();
         let target = s
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let permissions = SqlitePermissionRepository::new(pool.clone());
@@ -2977,7 +3036,7 @@ mod tests {
         s.assign_roles(&permissions, admin.id, target.id, &[admin_role.id])
             .await
             .unwrap();
-        s.set_user_active(admin.id, false).await.unwrap();
+        s.set_user_active(target.id, admin.id, false).await.unwrap();
         let err = s
             .assign_roles(&permissions, admin.id, target.id, &[])
             .await
@@ -2987,7 +3046,7 @@ mod tests {
         assert_eq!(held_role_codes(&s, target.id).await, vec!["admin"]);
 
         // The second holder returns and the same removal succeeds.
-        s.set_user_active(admin.id, true).await.unwrap();
+        s.set_user_active(admin.id, admin.id, true).await.unwrap();
         s.assign_roles(&permissions, admin.id, target.id, &[])
             .await
             .unwrap();
@@ -3004,7 +3063,7 @@ mod tests {
             .user
             .unwrap();
         let target = s
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let permissions = SqlitePermissionRepository::new(pool.clone());
@@ -3050,7 +3109,10 @@ mod tests {
     ) -> User {
         let user = seed_user(s, username, "the actor password", true).await;
         let code = format!("tier_{username}");
-        sqlx::query("INSERT INTO roles (code, name) VALUES (?, ?)")
+        sqlx::query(
+            "INSERT INTO roles (code, name, created_by) VALUES (?, ?, \
+             (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
+        )
             .bind(&code)
             .bind(username)
             .execute(pool)
@@ -3132,7 +3194,7 @@ mod tests {
 
         // (e) the ordinary target: the users tier still resets it.
         let teller = s
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         s.admin_reset_password(&permissions, gestor.id, teller.id, "temp password 55")
@@ -3232,12 +3294,15 @@ mod tests {
             .user
             .unwrap();
         let target = s
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let permissions = SqlitePermissionRepository::new(pool.clone());
         for i in 0..120 {
-            sqlx::query("INSERT INTO roles (code, name) VALUES (?, ?)")
+            sqlx::query(
+            "INSERT INTO roles (code, name, created_by) VALUES (?, ?, \
+             (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
+        )
                 .bind(format!("tmp{i}"))
                 .bind(format!("Temporal {i}"))
                 .execute(&pool)
@@ -3293,7 +3358,7 @@ mod tests {
             .user
             .unwrap();
         let target = service
-            .create_user("teller", "Teller", "initial password 1")
+            .create_user(admin.id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
         let vendedor = service
@@ -3369,8 +3434,9 @@ mod tests {
             &self,
             role_id: i64,
             permission_ids: &[i64],
+            updated_by: i64,
         ) -> AppResult<()> {
-            self.inner.set_role_permissions(role_id, permission_ids).await
+            self.inner.set_role_permissions(role_id, permission_ids, updated_by).await
         }
         async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<crate::models::Permission>> {
             self.calls.lock().unwrap().push(ids.to_vec());
@@ -3508,7 +3574,7 @@ mod tests {
         let others = seed_user(&service, "external", "initial password 1", true).await;
         let visor = service
             .roles
-            .create(&crate::models::NewRole { code: "visor".into(), name: "Visor".into(), description: None })
+            .create(&crate::models::NewRole { code: "visor".into(), name: "Visor".into(), description: None }, holder.id)
             .await
             .unwrap();
         service
@@ -3521,7 +3587,7 @@ mod tests {
         // The actor holds visor whose matrix carries the tier (seeded raw
         // through the real repo write path).
         SqlitePermissionRepository::new(pool.clone())
-            .set_role_permissions(visor.id, &[roles_manage])
+            .set_role_permissions(visor.id, &[roles_manage], holder.id)
             .await
             .unwrap();
 
@@ -3592,11 +3658,11 @@ mod tests {
         // different role, never the one being edited.
         let manager = service
             .roles
-            .create(&crate::models::NewRole { code: "gestor".into(), name: "Gestor".into(), description: None })
+            .create(&crate::models::NewRole { code: "gestor".into(), name: "Gestor".into(), description: None }, others.id)
             .await
             .unwrap();
         SqlitePermissionRepository::new(pool.clone())
-            .set_role_permissions(manager.id, &[roles_manage])
+            .set_role_permissions(manager.id, &[roles_manage], others.id)
             .await
             .unwrap();
         service
@@ -3606,11 +3672,11 @@ mod tests {
             .unwrap();
         let target_role = service
             .roles
-            .create(&crate::models::NewRole { code: "libre".into(), name: "Libre".into(), description: None })
+            .create(&crate::models::NewRole { code: "libre".into(), name: "Libre".into(), description: None }, others.id)
             .await
             .unwrap();
         SqlitePermissionRepository::new(pool.clone())
-            .set_role_permissions(target_role.id, &[roles_manage, users_read])
+            .set_role_permissions(target_role.id, &[roles_manage, users_read], others.id)
             .await
             .unwrap();
         service

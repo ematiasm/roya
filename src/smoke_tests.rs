@@ -6849,3 +6849,620 @@ async fn purchase_id_by_supplier(pool: &sqlx::SqlitePool, supplier_id: i64) -> i
     .unwrap();
     row.0
 }
+
+// ---------------------------------------------------------------------------
+// S13 (identity audit, M5 Phase B): the actor on `users`, `roles` and
+// `permissions`, and the grant trail (`user_roles.granted_by`/`granted_at`)
+// finally surfaced. AC18/AC19 on the identity surface, over the HTTP paths
+// the screens drive.
+// ---------------------------------------------------------------------------
+
+/// The audit columns of one user row, read straight from the database.
+async fn user_audit(pool: &SqlitePool, username: &str) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as("SELECT created_by, updated_by FROM users WHERE username = ? COLLATE NOCASE")
+        .bind(username)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The audit columns of one role row, read straight from the database.
+async fn role_audit(pool: &SqlitePool, code: &str) -> (Option<i64>, Option<i64>) {
+    sqlx::query_as("SELECT created_by, updated_by FROM roles WHERE code = ?")
+        .bind(code)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The id of the migration's sentinel account (the Phase B system actor).
+async fn sentinel_id(pool: &SqlitePool) -> i64 {
+    test_support::audit_actor_id(pool).await.unwrap()
+}
+
+/// The grant trail row of one (username, role code) pair.
+async fn grant_trail_row(pool: &SqlitePool, username: &str, role_code: &str) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT ur.granted_by, u.id FROM user_roles ur \
+         JOIN users u ON u.id = ur.user_id \
+         JOIN roles r ON r.id = ur.role_id \
+         WHERE u.username = ? COLLATE NOCASE AND r.code = ?",
+    )
+    .bind(username)
+    .bind(role_code)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// AC18 (users): a user created by one actor and edited by another carries
+/// both — the creation records `created_by` on the row the screen made, the
+/// activation toggle and the administrator password reset stamp the TARGET's
+/// `updated_by` with the acting administrator. The bootstrap-created rows
+/// (sentinel, bootstrap administrator) carry NULL, the honest "the system"
+/// value the interface renders as such.
+#[tokio::test]
+async fn ac18_a_user_records_two_different_actors_and_the_system_rows_stay_null() {
+    let (app, pool) = test_app().await;
+
+    // The shared fixture user (Test Admin) creates a user through the screen.
+    let (status, body) = post_form(
+        &app,
+        "/web/users",
+        "username=teller&display_name=Teller&password=initial password 1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    // A second principal (Test Probe) holds the users tier: it toggles the
+    // target's activation, then resets the target's password.
+    let probe_cookie = test_support::cookie_for(
+        &test_support::seed_session_with_permissions(
+            &pool,
+            &["identity.users.read", "identity.users.manage"],
+        )
+        .await
+        .unwrap(),
+    );
+    let target_id: i64 =
+        sqlx::query_scalar("SELECT id FROM users WHERE username = 'teller'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/users/deactivate",
+        &format!("user_id={target_id}"),
+        &probe_cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+    // The toggle is an edit: its own stamp is asserted HERE, before the
+    // reset's write could mask it (the reset is by the same actor, so the
+    // final column alone cannot tell the two writes apart).
+    let probe_id = probe_id_by_suffix(&pool).await;
+    let (_, toggled_by) = user_audit(&pool, "teller").await;
+    assert_eq!(toggled_by, Some(probe_id), "the activation toggle records its actor");
+    // A third principal (the second probe) performs the administrator reset:
+    // a DIFFERENT actor, so the reset's own stamp is observable against the
+    // toggle's.
+    let reset_cookie = test_support::cookie_for(
+        &test_support::seed_session_with_permissions(
+            &pool,
+            &["identity.users.read", "identity.users.manage"],
+        )
+        .await
+        .unwrap(),
+    );
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/users/password",
+        &format!("user_id={target_id}&new_password=temp password 34"),
+        &reset_cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    // The actor columns: created by Test Admin's principal, edited last by
+    // the probe (both the toggle and the reset are edits of the target).
+    let fixture_id = user_id_by_username_smoke(&pool, test_support::TEST_USERNAME).await;
+    let (created_by, updated_by) = user_audit(&pool, "teller").await;
+    assert_eq!(created_by, Some(fixture_id), "the creation records the acting principal");
+    // The LAST edit is the reset, by the second probe — the column keeps the
+    // latest editor, exactly what the display shows.
+    let resetter_id = probe_id_by_suffix(&pool).await;
+    assert_eq!(updated_by, Some(resetter_id), "the reset records the acting administrator");
+
+    // The sentinel is the system's work: NULL, honestly, on both audit
+    // columns. (The bootstrap administrator's NULLs are asserted at the
+    // service level, in the AC1 bootstrap tests.)
+    let (sentinel_created, sentinel_updated) = user_audit(&pool, "sistema").await;
+    assert_eq!(sentinel_created, None, "the sentinel has no creator and the schema says so");
+    assert_eq!(sentinel_updated, None);
+
+    // The RESTRICT foreign keys hold: deleting a user whose id another
+    // user's audit columns name is refused.
+    let refused = sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(fixture_id)
+        .execute(&pool)
+        .await;
+    assert!(
+        refused.is_err(),
+        "users.created_by is ON DELETE RESTRICT like every audited table"
+    );
+}
+
+/// AC18 (roles): a role created by one actor and re-permissioned by another —
+/// the details edit and the matrix replacement both stamp the role's
+/// `updated_by` with whoever made them. The seeded roles are the migration's
+/// work: attributed to the sentinel, `updated_by` NULL.
+#[tokio::test]
+async fn ac18_a_role_records_two_different_actors_and_the_seeds_carry_the_sentinel() {
+    let (app, pool) = test_app().await;
+
+    // The shared fixture user (Test Admin) creates a role through the screen.
+    let (status, body) = post_form(
+        &app,
+        "/web/roles",
+        "code=auditado&name=Auditado&description=Creado+para+la+prueba",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    // A second principal (Test Probe) edits the role's details: the row's
+    // `updated_by` becomes the editor, asserted BEFORE the next write so the
+    // details edit's own stamp is what the assertion observes.
+    let details_cookie = test_support::cookie_for(
+        &test_support::seed_session_with_permissions(&pool, &["identity.roles.manage"])
+            .await
+            .unwrap(),
+    );
+    let role_id: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = 'auditado'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/roles/edit",
+        &format!("role_id={role_id}&name=Auditado+II&description="),
+        &details_cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+    let details_editor = probe_id_by_suffix(&pool).await;
+    let (created_by, updated_by) = role_audit(&pool, "auditado").await;
+    let fixture_id = user_id_by_username_smoke(&pool, test_support::TEST_USERNAME).await;
+    assert_eq!(created_by, Some(fixture_id), "the create records its author");
+    assert_eq!(
+        updated_by,
+        Some(details_editor),
+        "the details edit records its editor"
+    );
+
+    // A third principal (the second probe) re-permissions the role: the
+    // matrix replacement stamps the role's `updated_by` in the same
+    // transaction as the matrix change.
+    let matrix_cookie = test_support::cookie_for(
+        &test_support::seed_session_with_permissions(&pool, &["identity.roles.manage"])
+            .await
+            .unwrap(),
+    );
+    let dashboard: i64 =
+        sqlx::query_scalar("SELECT id FROM permissions WHERE code = 'dashboard.read'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/roles/matrix",
+        &format!("role_id={role_id}&permission_ids={dashboard}"),
+        &matrix_cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+    let matrix_editor = probe_id_by_suffix(&pool).await;
+    assert_ne!(
+        matrix_editor, details_editor,
+        "precondition: the two probes are different users"
+    );
+    let (_, updated_by) = role_audit(&pool, "auditado").await;
+    assert_eq!(
+        updated_by,
+        Some(matrix_editor),
+        "the matrix edit records its editor (the stamp lives in the matrix transaction)"
+    );
+
+    // The four seeded roles carry the migration's sentinel as their creator
+    // and no editor: the seeds were nobody's screen work.
+    let sentinel = sentinel_id(&pool).await;
+    for code in ["admin", "vendedor", "cajero", "deposito"] {
+        let (seeded_created, seeded_updated) = role_audit(&pool, code).await;
+        assert_eq!(
+            seeded_created,
+            Some(sentinel),
+            "{code}: the pre-existing role is attributed to the sentinel"
+        );
+        assert_eq!(seeded_updated, None, "{code}: the seed was never edited");
+    }
+    // Same for the seeded catalog: every one of the 23 rows.
+    let unattributed: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM permissions WHERE created_by IS NULL OR created_by != ?",
+    )
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unattributed.0, 0, "every seeded permission is attributed");
+}
+
+/// The grant trail display (slice S13): the users screen renders, for each
+/// granted role, who granted it and when — the `user_roles` data the RBAC
+/// slice has carried since S2 — plus the rows' own audit attribution with
+/// NULL shown honestly as the system. Names, never ids.
+#[tokio::test]
+async fn audit_the_users_screen_shows_the_grant_trail_and_the_actor_names() {
+    let (app, pool) = test_app().await;
+
+    // Test Admin creates the target through the screen...
+    let (status, body) = post_form(
+        &app,
+        "/web/users",
+        "username=caja1&display_name=Caja+Uno&password=initial password 1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    // ...and Test Probe grants the target the vendedor role through the
+    // assignment endpoint, then edits the target (deactivation) so both
+    // attributions are distinct.
+    let probe_token = test_support::seed_session_with_permissions(
+        &pool,
+        &["identity.users.read", "identity.users.manage", "identity.roles.manage"],
+    )
+    .await
+    .unwrap();
+    let probe_cookie = test_support::cookie_for(&probe_token);
+    use crate::repositories::role_repo::RoleRepository;
+    let vendedor = crate::repositories::SqliteRoleRepository::new(pool.clone())
+        .find_by_code("vendedor")
+        .await
+        .unwrap()
+        .unwrap();
+    let target_id: i64 =
+        sqlx::query_scalar("SELECT id FROM users WHERE username = 'caja1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let actor_id = user_id_by_username_smoke(&pool, test_support::TEST_USERNAME).await;
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/users/roles",
+        &format!("user_id={target_id}&role_ids={}", vendedor.id),
+        &probe_cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+    let (status, body) = post_form_with_cookie(
+        &app,
+        "/web/users/deactivate",
+        &format!("user_id={target_id}"),
+        &probe_cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    // The trail is in the database first: the granter is the probing
+    // principal, not the creator.
+    let (granted_by, _) = grant_trail_row(&pool, "caja1", "vendedor").await;
+    assert_ne!(granted_by, actor_id, "the grant records the granting actor");
+    assert_eq!(
+        granted_by,
+        probe_id_by_suffix(&pool).await,
+        "the grant trail carries the granting actor"
+    );
+
+    // The page: names, never ids.
+    let (status, page) = get(&app, "/users").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert_eq!(
+        page.matches("Vendedor: otorgado por Test Probe el ").count(),
+        1,
+        "the trail names the granting actor: {page:.900}"
+    );
+    assert_eq!(
+        page.matches("Creado por Test Admin").count(),
+        1,
+        "the created user names its creator: {page:.900}"
+    );
+    assert_eq!(
+        page.matches("Actualizado por Test Probe").count(),
+        1,
+        "the edit names its editor: {page:.900}"
+    );
+    // The system-created rows (sentinel, bootstrap-era accounts): the honest
+    // label, not a blank and not an id.
+    let system_rows = page.matches("Creado por el sistema").count();
+    assert!(
+        system_rows >= 2,
+        "the sentinel and the shared fixture account are the system's work: {page:.900}"
+    );
+    assert!(
+        !page.contains("Creado por 1") && !page.contains("otorgado por 1"),
+        "the interface never renders a raw user id: {page:.900}"
+    );
+}
+
+/// The roles screen names the roles' authors (slice S13): the seeds render
+/// the sentinel's display name; the screen-created role names its author.
+#[tokio::test]
+async fn audit_the_roles_screen_shows_the_role_authors() {
+    let (app, _pool) = test_app().await;
+
+    let (status, body) = post_form(
+        &app,
+        "/web/roles",
+        "code=supervisor&name=Supervisor&description=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+    let (status, page) = get(&app, "/roles").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert_eq!(
+        page.matches("Creado por Sistema (anterior al registro)").count(),
+        4,
+        "the four seeds name the sentinel: {page:.900}"
+    );
+    assert!(
+        page.matches("Creado por Test Admin").count() >= 1,
+        "the screen-created role names its author: {page:.900}"
+    );
+    assert!(
+        !page.contains("Creado por 1"),
+        "the interface never renders a raw user id: {page:.900}"
+    );
+}
+
+/// AC19 (identity tables): the upgrade attributes the pre-existing roles and
+/// permissions to the sentinel it reuses, leaves the users rows' audit
+/// columns NULL (the honest "created by the system"), preserves every row and
+/// id, and leaves the foreign-key graph clean. The guard triggers recreated
+/// by the rebuild still bite immediately after the migration.
+#[tokio::test]
+async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() {
+    // Build the database with migrations up to 33: identity rows exist (the
+    // four seeded roles, the 23 permissions, the sentinel) plus business rows
+    // with their audit columns already attributed.
+    let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .pragma("recursive_triggers", "1");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    run_migrations_up_to_33(&pool).await;
+
+    // Pre-34 identity state: a legacy role and user created by direct SQL —
+    // exactly the shape the chain produces (no audit columns yet).
+    sqlx::query(
+        "INSERT INTO roles (code, name, description) VALUES ('legacy', 'Legacy', NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (username, display_name, password_hash) \
+         VALUES ('legacy-op', 'Legacy Op', 'placeholder-not-a-real-argon2-hash')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let legacy_user: i64 =
+        sqlx::query_scalar("SELECT id FROM users WHERE username = 'legacy-op'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let legacy_role: i64 =
+        sqlx::query_scalar("SELECT id FROM roles WHERE code = 'legacy'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO user_roles (user_id, role_id, granted_by) VALUES (?, ?, ?)",
+    )
+    .bind(legacy_user)
+    .bind(legacy_role)
+    .bind(legacy_user)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let sentinel = sentinel_id(&pool).await;
+
+    // Every pre-existing role and permission is attributed to the sentinel.
+    for sql in [
+        "SELECT COUNT(*) FROM roles WHERE created_by IS NULL OR created_by != ?",
+        "SELECT COUNT(*) FROM permissions WHERE created_by IS NULL OR created_by != ?",
+    ] {
+        let row: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(sql.to_string()))
+            .bind(sentinel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(row.0, 0, "no pre-existing identity row lost its attribution: {sql}");
+    }
+    // The legacy role and user kept their ids and now carry the sentinel.
+    let attributed: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM roles WHERE id = ? AND created_by = ? AND updated_by IS NULL",
+    )
+    .bind(legacy_role)
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(attributed.0, 1, "the legacy role survived with its id, attributed");
+    let attributed: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM permissions WHERE id > 0 AND created_by = ?",
+    )
+    .bind(sentinel)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(attributed.0, 23, "the whole catalog is attributed");
+
+    // users: NULL means the system — the sentinel and the legacy operator
+    // predate the audit and no person created them.
+    let unattributed_users: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM users WHERE created_by IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unattributed_users.0, 0,
+        "every pre-existing user is the system's work: NULL is the honest value"
+    );
+
+    // The rebuild preserved the identity rows the interface renders: four
+    // seeded roles plus the legacy one.
+    let roles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roles")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(roles.0, 5, "no role was lost in the rebuild");
+
+    // The upgrade leaves a consistent graph.
+    let violations: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+
+    // The recreated guard triggers bite immediately: the five refusal
+    // families of the identity guarantees, after the migration, with the
+    // triggers' own text.
+    for (sql, refusal) in [
+        (
+            "DELETE FROM roles WHERE id = ?",
+            "protected role cannot be deleted",
+        ),
+        (
+            "UPDATE roles SET code = 'raiz' WHERE id = ?",
+            "protected role code cannot change",
+        ),
+        (
+            "DELETE FROM role_permissions WHERE role_id = ?",
+            "protected role permissions cannot be removed",
+        ),
+        (
+            "UPDATE roles SET is_system = 0 WHERE id = ?",
+            "protected status is decided at seed time and cannot change",
+        ),
+    ] {
+        let admin_role: i64 =
+            sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let err = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .bind(admin_role)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        match err {
+            sqlx::Error::Database(db) => assert_eq!(
+                db.message(),
+                refusal,
+                "the recreated trigger must refuse: {sql}"
+            ),
+            other => panic!("expected the guard trigger for {sql}, got {other:?}"),
+        }
+    }
+    // The last-administrator arithmetic on users: the legacy operator holds
+    // the protected role; deactivate, delete the row, remove the grant — all
+    // refused while it is the only active holder.
+    sqlx::query(
+        "INSERT INTO user_roles (user_id, role_id, granted_by) \
+         VALUES (?, (SELECT id FROM roles WHERE code = 'admin'), ?)",
+    )
+    .bind(legacy_user)
+    .bind(legacy_user)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (sql, refusal) in [
+        (
+            "UPDATE users SET is_active = 0 WHERE id = ?",
+            "cannot deactivate the last active user holding a protected role",
+        ),
+        (
+            "DELETE FROM users WHERE id = ?",
+            "cannot delete the last active user holding a protected role",
+        ),
+    ] {
+        let err = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
+            .bind(legacy_user)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        match err {
+            sqlx::Error::Database(db) => assert_eq!(db.message(), refusal, "{sql}"),
+            other => panic!("expected the guard trigger for {sql}, got {other:?}"),
+        }
+    }
+    let admin_role: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let err = sqlx::query("DELETE FROM user_roles WHERE user_id = ? AND role_id = ?")
+        .bind(legacy_user)
+        .bind(admin_role)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    match err {
+        sqlx::Error::Database(db) => assert_eq!(
+            db.message(),
+            "cannot remove the last grant of a protected role to an active user",
+        ),
+        other => panic!("expected the grant guard, got {other:?}"),
+    }
+
+    // The session and receipt triggers survived untouched.
+    let (status, page) = get(&crate::routes::router(crate::routes::AppState::new(pool.clone(), false, true)), "/login").await;
+    assert_eq!(status, StatusCode::OK, "{page:.200}");
+}
+
+/// Helper: a user's id by username, through the real table.
+async fn user_id_by_username_smoke(pool: &SqlitePool, username: &str) -> i64 {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = ? COLLATE NOCASE")
+        .bind(username)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Helper: the id of the latest `seed_session_with_permissions` probe user
+/// (the display name is fixed at "Test Probe").
+async fn probe_id_by_suffix(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT id FROM users WHERE display_name = 'Test Probe' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Run migrations up to 33 only: the pre-slice-13 state the upgrade test
+/// starts from (sqlx's migrator stops at the version, exactly like the S12
+/// upgrade fixture did).
+async fn run_migrations_up_to_33(pool: &SqlitePool) {
+    sqlx::migrate!("./migrations").run_to(20240101000033, pool).await.unwrap();
+}
+

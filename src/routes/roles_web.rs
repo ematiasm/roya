@@ -45,10 +45,21 @@ use crate::security::authz::{IdentityRolesManage, Nav, Principal, Require};
 // Views + Askama templates
 // ---------------------------------------------------------------------------
 
+/// One roles-list row with the audit attribution resolved (slice S13): who
+/// created the role and who last edited it (a details edit or a matrix
+/// edit), names only — the wiring layer resolves the ids, the one layer the
+/// AC20 boundary scan allows to read identity.
+pub struct RoleRowView {
+    pub role: Role,
+    pub holders: Vec<String>,
+    pub created_by_label: String,
+    pub updated_by_label: Option<String>,
+}
+
 #[derive(Template)]
 #[template(path = "roles.html")]
 struct RolesTemplate {
-    roles: Vec<RoleWithHolders>,
+    roles: Vec<RoleRowView>,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -57,7 +68,7 @@ struct RolesTemplate {
 #[derive(Template)]
 #[template(path = "partials/role_list.html")]
 struct RoleListPartial {
-    roles: Vec<RoleWithHolders>,
+    roles: Vec<RoleRowView>,
 }
 
 /// One permission row of the matrix, with the held flag precomputed (Askama
@@ -129,8 +140,38 @@ fn module_groups(catalog: Vec<Permission>, held_ids: &[i64]) -> Vec<ModuleGroup>
     groups
 }
 
+/// Resolve the roles list's audit attribution (slice S13): the seeded roles
+/// name the migration's sentinel; a screen-created role names its author, and
+/// an edit (details or matrix) names the editor. Names, never ids; NULL
+/// `updated_by` keeps the established "no editor yet" omission.
+async fn resolve_role_rows(
+    state: &AppState,
+    roles: Vec<RoleWithHolders>,
+) -> AppResult<Vec<RoleRowView>> {
+    let mut actor_ids: Vec<i64> = Vec::new();
+    for row in &roles {
+        actor_ids.push(row.role.created_by);
+        actor_ids.extend(row.role.updated_by);
+    }
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let mut rows = Vec::with_capacity(roles.len());
+    for row in roles {
+        rows.push(RoleRowView {
+            created_by_label: names
+                .get(&row.role.created_by)
+                .cloned()
+                .unwrap_or_else(|| "—".to_string()),
+            updated_by_label: row.role.updated_by.and_then(|actor| names.get(&actor).cloned()),
+            role: row.role,
+            holders: row.holders,
+        });
+    }
+    Ok(rows)
+}
+
 async fn list_response(state: &AppState) -> AppResult<Response> {
     let roles = state.identity_service.list_roles_with_holders().await?;
+    let roles = resolve_role_rows(&state, roles).await?;
     Ok(Html(render(RoleListPartial { roles })?).into_response())
 }
 
@@ -141,9 +182,10 @@ async fn list_response(state: &AppState) -> AppResult<Response> {
 async fn roles_page(
     State(state): State<AppState>,
     _: Require<IdentityRolesManage>,
-    principal: axum::Extension<crate::security::authz::Principal>,
+    principal: axum::Extension<Principal>,
 ) -> Result<Html<String>, AppError> {
     let roles = state.identity_service.list_roles_with_holders().await?;
+    let roles = resolve_role_rows(&state, roles).await?;
     let tmpl = RolesTemplate {
         roles,
         nav_key: "roles",
@@ -488,10 +530,13 @@ mod tests {
         let pool = test_pool().await;
         let state = test_support::app_state(pool.clone());
         if !permissions.is_empty() {
-            sqlx::query("INSERT INTO roles (code, name) VALUES ('operador', 'Operador')")
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO roles (code, name, created_by) VALUES ('operador', 'Operador', \
+                 (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
             for code in permissions {
                 sqlx::query(
                     "INSERT INTO role_permissions (role_id, permission_id) \
@@ -751,7 +796,7 @@ mod tests {
         // refusal names them).
         let created = state
             .identity_service
-            .create_user("caja1", "Caja Uno", "initial password 1")
+            .create_user(actor_id, "caja1", "Caja Uno", "initial password 1")
             .await
             .unwrap();
         state
@@ -1143,14 +1188,14 @@ mod tests {
         let permissions = SqlitePermissionRepository::new(state.pool.clone());
         let vendedor = state.identity_service.role_list().await.unwrap().into_iter()
             .find(|r| r.code == "vendedor").unwrap();
-        let created = state
-            .identity_service
-            .create_user("caja1", "Caja Uno", "initial password 1")
-            .await
-            .unwrap();
         let actor_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
             .bind(test_support::TEST_USERNAME)
             .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let created = state
+            .identity_service
+            .create_user(actor_id, "caja1", "Caja Uno", "initial password 1")
             .await
             .unwrap();
         state
@@ -1239,7 +1284,7 @@ mod tests {
             .unwrap();
         let created = state
             .identity_service
-            .create_user("visor-holder", "V", "initial password 1")
+            .create_user(actor_id, "visor-holder", "V", "initial password 1")
             .await
             .unwrap();
         SqliteRoleRepository::new(state.pool.clone())
@@ -1253,8 +1298,13 @@ mod tests {
         // Give visor the tier first, then remove it: the actor does not hold
         // the role, so the edit is legitimate and must succeed.
         let permissions = SqlitePermissionRepository::new(state.pool.clone());
+        let actor_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+            .bind(test_support::TEST_USERNAME)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         permissions
-            .set_role_permissions(visor_id, &[roles_manage, dashboard])
+            .set_role_permissions(visor_id, &[roles_manage, dashboard], actor_id)
             .await
             .unwrap();
         let resp = send(
@@ -1332,8 +1382,13 @@ mod tests {
         let visor_id = role_id_by_code(&state.pool, "visor").await;
         let dashboard = permission_id_by_code(&state.pool, "dashboard.read").await;
         let permissions = SqlitePermissionRepository::new(state.pool.clone());
+        let actor_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+            .bind(test_support::TEST_USERNAME)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         permissions
-            .set_role_permissions(visor_id, &[dashboard])
+            .set_role_permissions(visor_id, &[dashboard], actor_id)
             .await
             .unwrap();
 

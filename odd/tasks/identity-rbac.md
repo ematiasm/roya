@@ -108,6 +108,11 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
   - [x] T29 (S12) — compras/proveedores: migración 33 + plomería del actor + display + tests AC18–AC19
         (2026-09-20, ver S12 en Progreso; `purchase_lines` hereda el actor de su compra, y un
         cambio de línea estampa `updated_by` del borrador)
+  - [x] T30 (S13) — identidad: migración 34 + plomería del actor + huella de otorgamiento + tests
+        AC18–AC19
+        (2026-09-21, ver S13 en Progreso; `users` por ALTER con NULL = sistema, `roles`/
+        `permissions` por rebuild con las 7 guardas recreadas byte-idénticas, `role_permissions`
+        hereda, `user_roles` ya traía su huella y ahora se muestra)
 
 ## Progress
 - 2026-09-18: reconocimiento del repo (sin auth, convención de departamentos, invariantes),
@@ -1458,3 +1463,119 @@ registrado, compra Credit confirmada y pagada por la API → `suppliers`/`produc
 renderizando "Registrado por Admin • Actualizado por Admin", drawer de proveedor renderizando
 "Proveedor registrado por Admin"; base de la sonda termina con `PRAGMA foreign_key_check` vacío,
 exactamente un centinela y ningún usuario más.
+
+## Progreso S13 (T30, quinto y último slice de contenido de Fase B) — 2026-09-21
+
+Rama `feat/audit-identity-tables`, creada desde `main` con las cuatro slices anteriores entregadas.
+Writer delegado; el patrón de S9–S12 se copió sin inventar un quinto patrón, con las DOS
+diferencias que este slice traía: (1) `users` es la tabla más referenciada del schema y sus
+columnas de auditoría no pueden ser NOT NULL con honestidad (el centinela no tiene creador y el
+admin lo crea el sistema), y (2) `roles`/`permissions` cargan las siete guardas de identidad de la
+migración 28, que son LA garantía de que siempre existe un administrador.
+
+**Entregado:** `migrations/20240101000034_add_audit_identity_tables.sql` (`-- no-transaction`,
+`PRAGMA foreign_keys = OFF/ON`, centinela reutilizado con insert guardado defensivo, backfill por
+`INSERT ... SELECT`). Tres rutas, justificadas en el comentario del archivo:
+
+- **`users`: ALTER TABLE ADD COLUMN** — `created_by`/`updated_by` NULL con FK RESTRICT a sí misma.
+  SQLite lo permite con default NULL, así que la tabla más dependida del schema NO se reconstruye.
+  El NULL es el valor honesto para el centinela y el admin bootstrap: la pantalla lo renderiza
+  como "el sistema", nunca en blanco ni un id. La decisión de alcance (ratificada por el
+  orchestrator: opción A) es que NO hay ruta nueva de edición de nombre: las columnas las escriben
+  los caminos que existen — creación (`created_by` = principal del request), toggle de
+  activación, reset del administrador (sobre el objetivo), cambio de contraseña propio en
+  `/password` (sobre sí mismo) — y `touch_last_login` (login) NO escribe auditoría: "Actualizado
+  por" sigue significando "quien cambió el usuario por última vez", no "quien entró por última
+  vez". Ambas columnas tienen escritores reales; ninguna quedó muerta.
+- **`roles` y `permissions`: rebuild controlado** — `created_by NOT NULL` + `updated_by NULL` con
+  FK RESTRICT. NOT NULL es la regla honesta (doctrine: la regla cross-row vive en la base, y AC19
+  exige NOT NULL), y SQLite no permite ALTERarla a la existencia. Las siete guardas de identidad
+  se dropean EXPLÍCITAS antes del rebuild y se recrean byte-idénticas al final (copiadas de la 28,
+  `IF NOT EXISTS` incluido); las suites de rechazo de `role_repo` corren cada pool a través de la
+  migración, así que la re-prueba es automática además de manual.
+- **`permissions.updated_by`** queda NULL por diseño y para siempre: el catálogo no se escribe en
+  runtime; la columna existe por uniformidad del schema, no porque exista un editor. El modelo
+  Rust `Permission` NO lleva las columnas (nadie las lee en la app; llevarlas sería un warning de
+  dead code y un mentidor en la pantalla).
+
+**Plomería:** el actor viaja explícito ruta (`Principal.user_id`) → servicio → repositorio.
+Usuarios: crear (actor → `created_by`), activar/desactivar (actor → `updated_by` del objetivo),
+reset del admin (actor → `updated_by` del objetivo; el binomio hash+flag escribe ambos stamps),
+cambio propio en `/password` (actor = uno mismo). El bootstrap escribe None (sistema) en su
+creación y en su recuperación. Roles: crear (actor → `created_by`), editar detalles (actor →
+`updated_by`), y el cambio de matriz estampa `updated_by` del rol EN LA MISMA transacción del
+cambio (`permission_repo::set_role_permissions`), con el actor del request que lo hizo. Los doubles
+de test (`FixedPermissions`, `CountingFindByIds`, `CountingMatrixLookups`) se actualizaron con las
+firmas.
+
+**Display:** la lista de usuarios muestra por fila "Creado por …" / "· Actualizado por …"
+(`data-user-actor`) y la huella de otorgamiento por rol otorgado: "«Rol»: otorgado por «nombre» el
+«YYYY-MM-DD»" (`data-grant-trail`) — los `user_roles` que el RBAC traía desde S2 y nunca se
+vieron. La lista de roles muestra "Creado por …" / "· Actualizado por …" por fila
+(`data-role-actor`). Nombres, nunca ids: la resolución vive en la capa de wiring
+(`routes/mod.rs::audit_actor_names`), ahora con `UserRowView`/`GrantRowView` (users) y
+`RoleRowView` (roles). El NULL de `users` se renderiza "el sistema"; el centinela aparece con su
+nombre completo ("Creado por Sistema (anterior al registro)").
+
+**Tests nuevos (7):** `ac18_a_user_records_two_different_actors_and_the_system_rows_stay_null`
+(Test Admin crea, probe A desactiva — aserto intermedio para que el toggle sea observable —,
+probe B resetea; centinela y admin con NULL en ambas columnas; el DELETE RESTRICT del creador
+refusado), `ac18_a_role_records_two_different_actors_and_the_seeds_carry_the_sentinel` (create
+por Test Admin, detalles por probe A con aserto intermedio, matriz por probe B; las cuatro seeds
+con el centinela y las 23 filas del catálogo atribuidas),
+`audit_the_users_screen_shows_the_grant_trail_and_the_actor_names` (huella renderizada
+"Vendedor: otorgado por Test Probe el …", creador/editor por nombre, "Creado por el sistema" ≥ 2,
+cero ids crudos), `audit_the_roles_screen_shows_the_role_authors` (4 semillas con el centinela,
+el rol de pantalla con su autor), `ac19_the_upgrade_attributes_the_identity_rows_to_the_system_
+sentinel` (upgrade demostrado: filas legacy de identidad + negocio, preservadas con id, roles y
+permisos atribuidos al centinela, `users` NULL = sistema, fk_check vacío, y las CINCO familias
+de rechazo de las guardas re-probadas inmediatamente después de la migración con el texto crudo
+del trigger), `a_user_named_in_another_users_created_by_cannot_be_deleted` y
+`list_grants_for_user_returns_the_recorded_grant_trail_in_role_order` (repositorio). La semántica
+NULL del admin bootstrap se afirma en el test AC1 del servicio.
+
+**Mutaciones validadas** (cada guard roto → su test testigo fallando → restaurado): binds
+dropeados en `users.create.created_by` (aserto `created_by = Some(...)`: None ≠ Some), en
+`users.set_active.updated_by` (aserto intermedio del toggle), en el PAR
+`update_password_hash`+`set_must_change_password` del reset (con probe A del toggle y probe B del
+reset, la columna mantiene A en vez de B), en `roles.create.created_by` (la migración NOT NULL
+aborta la pantalla), en `roles.update_details.updated_by` (aserto del editor de detalles), en el
+stamp `updated_by` de `set_role_permissions` (aserto del editor de matriz), el backfill de la
+migración a NULL (la migración aborta con `NOT NULL constraint failed: roles_new.created_by`),
+las dos líneas de display de `user_list.html` y la de `role_list.html` (conteos 0 ≠ esperado), y
+la etiqueta del NULL ("el sistema" → "desconocido": el aserto de pantalla falla). Todas las
+mutaciones fueron revertidas y `cargo test` volvió a 652/0 tras cada restauración.
+
+**Auditoría de preservación de constraints** (migración 34, antes/después, comparado en
+`sqlite_master` y con `PRAGMA table_info/foreign_key_list`): `roles` y `permissions` mantienen
+CHECKs (`roles_code_shape`/`name`/`description`/`is_system_flag`), UNIQUE code, AUTOINCREMENT,
+`idx_roles_is_system` y los FKs de `role_permissions`/`user_roles` — todo byte-identical salvo las
+dos columnas nuevas; los 13 triggers del schema quedaron byte-idénticos (incluidos los 7 de
+identidad y los de sesiones, walk-in y receipts, que no se tocan); `users`,
+`role_permissions`, `user_roles`, `sessions` y `accounts` no cambiaron (users solo creció por el
+ALTER). Sondas runtime post-rebuild: cada CHECK muerde (`roles_code_shape` en 3 variantes,
+`roles_name_shape`, `roles_description_shape`, `roles_is_system_flag`), los UNIQUE code mueren,
+`roles.created_by`/`permissions.created_by` NOT NULL refusan el insert sin actor, y el DELETE del
+centinela es refusado por el FK RESTRICT. Las cinco familias de rechazo de identidad
+(protected delete / code rename / matrix removal / flag flip / last-holder deactivate+delete /
+last-grant removal) devuelven el texto crudo del trigger después de la migración.
+
+**Archivo fuera de superficie (ratificado):** `src/repositories/session_repo.rs` — su
+`row_to_user` y el SELECT de `resolve_valid` leen la fila `users` completa y `User` ganó las dos
+columnas de auditoría; el mínimo ripple fue añadir `u.created_by/u.updated_by` al SELECT y al
+mapper. Sin cambio de comportamiento. El orchestrator lo agregó a las superficies en su segunda
+mensagem.
+
+**Números:** baseline `cargo test` **645 passed / 0 failed**; cierre **652 passed / 0 failed**
+(645 + 7 nuevos). `cargo check --all-targets` 0 errores, ledger en **55 warnings** (57 crudas − 2
+resúmenes, igual que el cierre de S12); `grep allow(dead_code)|allow(unused_imports)` src/ → nada
+nuevo. `scripts/e2e.sh -k identity`: **7 passed**; `-k parties`: **9 passed / 1 skipped** (la
+sonda de screenshot opt-in, igual que el baseline); cero cambios en `e2e/`. Sonda en vivo con el
+binario real (DATABASE_URL propio, `ROYA_ADMIN_PASSWORD`): login del admin, usuario `caja2` y rol
+`cobranza` creados por la pantalla, grant por el endpoint de asignación → `users.created_by = 2`
+(admin), `roles.created_by = 2` para `cobranza` y centinela para las semillas,
+`user_roles.granted_by = 2` con `granted_at` escrito; la pantalla de usuarios renderiza
+"Cobranza: otorgado por Admin el 2026-09-21" y "Creado por Admin" en la fila de `caja2`,
+"Creado por el sistema" en las filas del centinela y del admin, la pantalla de roles muestra
+"Creado por Sistema (anterior al registro)" ×4 y "Creado por Admin" ×1; cero ids crudos; la base
+de la sonda termina con `PRAGMA foreign_key_check` vacío.

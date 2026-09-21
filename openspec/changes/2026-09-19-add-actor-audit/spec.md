@@ -55,7 +55,12 @@ these rules. The design's "Audit" section is the source.
 ## Interface
 
 - Detail views of the audited documents gain the actor rows; no new screen, no new route.
-- The users list already exists; no surface change beyond the display names.
+- The users list already exists; no surface change beyond the display names — plus the grant
+  trail it finally renders (slice S13): for each granted role, who granted it and when, the
+  `user_roles` columns the RBAC slice has recorded since S2. Rendered inside the existing list
+  rows, in the established display idiom: names, never ids; NULL audit columns on `users` render
+  as "el sistema" (the sentinel and the bootstrap administrator are the system's work), never a
+  blank and never an id.
 
 ## Acceptance criteria
 

@@ -52,8 +52,12 @@ pub trait PermissionRepository: Send + Sync {
     /// The permission codes one role holds.
     async fn codes_for_role(&self, role_id: i64) -> AppResult<Vec<String>>;
     /// Replace a role's whole permission set (S4's matrix editor; refused by
-    /// the guard trigger for the protected role).
-    async fn set_role_permissions(&self, role_id: i64, permission_ids: &[i64])
+    /// the guard trigger for the protected role). `updated_by` is the acting
+    /// principal: a matrix edit is an edit of the ROLE's authorisation, so the
+    /// same transaction stamps the role's `updated_by` (slice S13) — the
+    /// join rows themselves carry no actor of their own, they inherit the
+    /// role's.
+    async fn set_role_permissions(&self, role_id: i64, permission_ids: &[i64], updated_by: i64)
         -> AppResult<()>;
     /// The catalog rows whose ids exist, resolved in ONE statement — the
     /// matrix form's whole submitted set, the same contract
@@ -119,6 +123,7 @@ impl PermissionRepository for SqlitePermissionRepository {
         &self,
         role_id: i64,
         permission_ids: &[i64],
+        updated_by: i64,
     ) -> AppResult<()> {
         let mut tx = self.pool.begin().await?;
         // Per-row deletes so the protected-role guard trigger fires for the
@@ -151,6 +156,19 @@ impl PermissionRepository for SqlitePermissionRepository {
             .await
             .map_err(map_db_err)?;
         }
+        // The matrix edit is the role being re-permissioned: the role row
+        // records who did it, in the same transaction as the matrix change,
+        // so an attribution can never exist without the edit it names.
+        sqlx::query(
+            r#"UPDATE roles
+               SET updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ?"#,
+        )
+        .bind(updated_by)
+        .bind(role_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
         tx.commit().await?;
         Ok(())
     }
