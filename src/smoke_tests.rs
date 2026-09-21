@@ -7776,6 +7776,246 @@ async fn documents_page_limit_is_disclosed_when_the_feed_is_cut() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The /documents drawer: GET /web/documents/detail/{kind}/{id}. Every family
+// below is seeded through the same web-flow helpers the neighbouring tests
+// use; nothing is inserted by hand except the two ids the routes do not
+// return (the movement's and the receipt's), read back from the pool.
+// ---------------------------------------------------------------------------
+
+/// One fixture with every family in it: a confirmed credit sale with a
+/// payment, a completed receipt collecting it, a stock movement, and a
+/// confirmed cash purchase (its confirm creates the purchase payment).
+struct DrawerFixture {
+    sale: i64,
+    sale_payment: i64,
+    sale_number: String,
+    receipt: i64,
+    movement: i64,
+    purchase: i64,
+    purchase_payment: i64,
+    purchase_number: String,
+    product: i64,
+    account: i64,
+}
+
+async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
+    let cash = method_id(pool, "Cash").await;
+    let account = create_account_via_web(app, pool, "DrawerWallet", &[cash]).await;
+    let product = create_product_via_web(app, pool, "DRAWER-P", "1", "50").await;
+    record_stock_via_web(app, product, "10").await;
+    let buyer = seed_customer(pool, "DrawerBuyer", None, None).await;
+
+    // Confirmed credit sale + its payment (the SALE-PAYMENTS family).
+    let sale = create_sale_draft_on_date(app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
+    add_sale_line_via_web(app, sale, product, "2").await;
+    confirm_sale_via_web(app, sale, None).await;
+    let sale_number = sale_detail(app, sale).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+    let (status, resp) = pay_sale_via_web(app, sale, cash, "10").await;
+    assert_eq!(status, StatusCode::OK, "pay sale: {resp}");
+    let payments = sale_detail(app, sale).await["payments"].as_array().cloned().unwrap();
+    let sale_payment = payments[0]["id"].as_i64().expect("sale payment id");
+
+    // The receipt that collects the payment (the RECEIPTS family).
+    let (status, resp) = post_form(
+        app,
+        "/web/customer-receipts",
+        &format!("customer_id={buyer}&method_id={cash}&amount=10&date=2024-05-11"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed receipt: {resp}");
+    let receipt: i64 = sqlx::query_scalar(
+        "SELECT id FROM customer_receipts WHERE customer_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(buyer)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    // One explicit stock movement (the STOCK family).
+    let (status, resp) = post_form(
+        app,
+        "/web/stock-movements",
+        &format!("product_id={product}&type=In&qty=5&reason=Adjust&reference=drawer-fix&date=2024-05-12"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed movement: {resp}");
+    let movement: i64 = sqlx::query_scalar(
+        "SELECT id FROM stock_movements WHERE reference = 'drawer-fix' ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    // Confirmed cash purchase: its confirm writes the purchase payment.
+    let supplier = create_supplier_via_web(app, pool, "DrawerSupplier").await;
+    let purchase = create_purchase_draft_on_date(app, supplier, "2024-05-14").await;
+    add_purchase_line_via_web(app, purchase, product, "1").await;
+    // A supplier payment after the credit confirm: the purchase payment this
+    // test reads back.
+    let (status, resp) = post_form(
+        app,
+        "/web/purchases/confirm",
+        &format!("purchase_id={purchase}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm purchase: {resp}");
+    let (status, resp) = post_form(
+        app,
+        &format!("/web/purchases/{purchase}/payments"),
+        &format!("method_id={cash}&amount=5&date=2024-05-15"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pay purchase: {resp}");
+    let detail = purchase_detail(app, purchase).await;
+    let purchase_number = detail["purchase"]["purchase_number"]
+        .as_str()
+        .expect("confirmed purchase number")
+        .to_string();
+    let purchase_payment = detail["payments"][0]["id"].as_i64().expect("purchase payment id");
+
+    DrawerFixture {
+        sale,
+        sale_payment,
+        sale_number,
+        receipt,
+        movement,
+        purchase,
+        purchase_payment,
+        purchase_number,
+        product,
+        account,
+    }
+}
+
+/// The drawer renders for EVERY family with its decisive facts, an unknown
+/// kind token is a 404 and so is a known family with no such document.
+#[tokio::test]
+async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
+    let (app, pool) = test_app().await;
+    let f = seed_drawer_fixture(&app, &pool).await;
+
+    // Sale: identifier, customer, lines with product and SKU, totals, actors
+    // and the link to the owning page.
+    let (status, body) = get(&app, &format!("/web/documents/detail/sale/{}", f.sale)).await;
+    assert_eq!(status, StatusCode::OK, "sale drawer: {body:.400}");
+    assert!(body.contains(&f.sale_number), "{body:.800}");
+    assert!(body.contains("DrawerBuyer"), "{body:.800}");
+    assert!(body.contains("product DRAWER-P"), "{body:.800}");
+    assert!(body.contains("DRAWER-P"), "{body:.800}");
+    assert!(body.contains("Registrado por"), "{body:.800}");
+    assert!(body.contains("Test Admin"), "{body:.800}");
+    assert!(body.contains(&format!("/sales/{}", f.sale)), "{body:.800}");
+
+    // Sale payment: the payment's own amount, account, method and ledger
+    // transaction, plus the parent sale's summary as a sub-block.
+    let (status, body) = get(&app, &format!("/web/documents/detail/sale_payment/{}", f.sale_payment)).await;
+    assert_eq!(status, StatusCode::OK, "sale payment drawer: {body:.400}");
+    assert!(body.contains("10"), "{body:.800}");
+    assert!(body.contains("DrawerWallet"), "{body:.800}");
+    assert!(body.contains("Cash"), "{body:.800}");
+    assert!(body.contains(&f.sale_number), "{body:.800}");
+    assert!(body.contains(&format!("/sales/{}", f.sale)), "{body:.800}");
+    assert!(body.contains("/accounts/"), "{body:.800}");
+
+    // Purchase: supplier name and the link to the owning page.
+    let (status, body) = get(&app, &format!("/web/documents/detail/purchase/{}", f.purchase)).await;
+    assert_eq!(status, StatusCode::OK, "purchase drawer: {body:.400}");
+    assert!(body.contains(&f.purchase_number), "{body:.800}");
+    assert!(body.contains("DrawerSupplier"), "{body:.800}");
+    assert!(body.contains(&format!("/purchases/{}", f.purchase)), "{body:.800}");
+
+    // Purchase payment: amount and parent purchase summary.
+    let (status, body) = get(&app, &format!("/web/documents/detail/purchase_payment/{}", f.purchase_payment)).await;
+    assert_eq!(status, StatusCode::OK, "purchase payment drawer: {body:.400}");
+    assert!(body.contains(&f.purchase_number), "{body:.800}");
+    assert!(body.contains("DrawerWallet"), "{body:.800}");
+    assert!(body.contains(&format!("/purchases/{}", f.purchase)), "{body:.800}");
+
+    // Stock movement: product, reason, the product's current derived stock,
+    // and the append-only sentence the action slice relies on.
+    let (status, body) = get(&app, &format!("/web/documents/detail/stock_movement/{}", f.movement)).await;
+    assert_eq!(status, StatusCode::OK, "movement drawer: {body:.400}");
+    assert!(body.contains("product DRAWER-P"), "{body:.800}");
+    assert!(body.contains("Stock actual"), "{body:.800}");
+    assert!(body.contains("append-only"), "{body:.800}");
+    assert!(body.contains(&format!("/products#product-{}", f.product)), "{body:.800}");
+
+    // Receipt: customer, account, total and the allocations table with the
+    // sale number it applied.
+    let (status, body) = get(&app, &format!("/web/documents/detail/receipt/{}", f.receipt)).await;
+    assert_eq!(status, StatusCode::OK, "receipt drawer: {body:.400}");
+    assert!(body.contains("DrawerBuyer"), "{body:.800}");
+    assert!(body.contains("DrawerWallet"), "{body:.800}");
+    assert!(body.contains(&f.sale_number), "{body:.800}");
+    assert!(body.contains(&format!("/customers/")), "{body:.800}");
+    assert!(body.contains(&format!("/sales/{}", f.sale)), "{body:.800}");
+
+    // An unknown kind token is a 404 naming the token, not a panic or a
+    // silent empty fragment.
+    let (status, body) = get(&app, "/web/documents/detail/nonsense/1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown kind: {body:.400}");
+    assert!(body.contains("nonsense"), "{body:.400}");
+
+    // A known family with an unknown id is a 404 naming the family.
+    let (status, body) = get(&app, "/web/documents/detail/sale/999999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown sale: {body:.400}");
+}
+
+/// Per-family narrowing: the drawer obeys the same rule the rows obey — a
+/// principal never opens another tier's document. A `sales.read`-only
+/// principal gets the sale and sale-payment drawers but a 403 for the
+/// purchase, purchase-payment, movement and receipt drawers; a
+/// `customers.read`-only principal gets only the receipt drawer.
+#[tokio::test]
+async fn documents_drawer_refuses_families_the_principal_cannot_read() {
+    let (app, pool) = test_app().await;
+    let f = seed_drawer_fixture(&app, &pool).await;
+
+    let sales = test_support::seed_session_with_permissions(&pool, &["sales.read"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&sales);
+    for (kind, id, expected) in [
+        ("sale", f.sale, StatusCode::OK),
+        ("sale_payment", f.sale_payment, StatusCode::OK),
+        ("purchase", f.purchase, StatusCode::FORBIDDEN),
+        ("purchase_payment", f.purchase_payment, StatusCode::FORBIDDEN),
+        ("stock_movement", f.movement, StatusCode::FORBIDDEN),
+        ("receipt", f.receipt, StatusCode::FORBIDDEN),
+    ] {
+        let (status, body) =
+            get_fragment_with_cookie(&app, &format!("/web/documents/detail/{kind}/{id}"), &cookie).await;
+        assert_eq!(status, expected, "{kind} as sales.read: {body:.400}");
+        if expected == StatusCode::FORBIDDEN {
+            assert!(
+                body.contains("Se necesita el permiso"),
+                "{kind} refusal names the code: {body:.400}"
+            );
+        }
+    }
+
+    let customers = test_support::seed_session_with_permissions(&pool, &["customers.read"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&customers);
+    for (kind, id, expected) in [
+        ("sale", f.sale, StatusCode::FORBIDDEN),
+        ("sale_payment", f.sale_payment, StatusCode::FORBIDDEN),
+        ("purchase", f.purchase, StatusCode::FORBIDDEN),
+        ("purchase_payment", f.purchase_payment, StatusCode::FORBIDDEN),
+        ("stock_movement", f.movement, StatusCode::FORBIDDEN),
+        ("receipt", f.receipt, StatusCode::OK),
+    ] {
+        let (status, body) =
+            get_fragment_with_cookie(&app, &format!("/web/documents/detail/{kind}/{id}"), &cookie).await;
+        assert_eq!(status, expected, "{kind} as customers.read: {body:.400}");
+    }
+}
+
 /// The row of exactly one document family that carries `needle` in its markup
 /// (reference, party, date line or pill), reading the rendered rows by their
 /// `data-document-kind` marker so a number quoted on a DIFFERENT family's row

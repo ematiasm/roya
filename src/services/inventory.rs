@@ -390,6 +390,16 @@ where
             .ok_or_else(|| AppError::NotFound(format!("product {id} not found")))
     }
 
+    /// One stock movement by id — the documents drawer's per-movement read.
+    /// A thin wrapper over the repository's own `find_by_id`; an unknown id is
+    /// the standard `NotFound`, naming the family.
+    pub async fn get_movement(&self, id: i64) -> AppResult<StockMovement> {
+        self.movements
+            .find_by_id(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("stock movement {id} not found")))
+    }
+
     // -- picker reads (N4) --------------------------------------------------
 
     /// Upper bound for one picker search: enough choices without dumping the
@@ -1481,5 +1491,30 @@ mod tests {
         assert_eq!(mv.updated_by, None, "an append-only movement has no editor");
         let stored = s.movements.find_by_id(mv.id).await.unwrap().unwrap();
         assert_eq!(stored.created_by, operator);
+    }
+
+    /// `get_movement` is the read-by-id the documents drawer uses: found
+    /// returns the stored movement, absent is the standard `NotFound` error,
+    /// never a panic and never an empty default.
+    #[tokio::test]
+    async fn get_movement_returns_the_stored_row_or_not_found() {
+        let s = svc(true).await;
+        let p = s.create_product(actor(&s).await, product_input("GETMV")).await.unwrap();
+        let recorded = s
+            .record_movement(actor(&s).await, movement(p.id, "5", MovementType::In))
+            .await
+            .unwrap();
+
+        let found = s.get_movement(recorded.id).await.unwrap();
+        assert_eq!(found.id, recorded.id);
+        assert_eq!(found.product_id, p.id);
+        assert_eq!(found.qty, dec("5"));
+        assert_eq!(found.movement_type, MovementType::In);
+
+        let missing = s.get_movement(999_999).await;
+        assert!(
+            matches!(&missing, Err(AppError::NotFound(msg)) if msg.contains("movement")),
+            "an unknown movement must be NotFound naming the family: {missing:?}"
+        );
     }
 }

@@ -725,8 +725,11 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
   (`q`, matched against the document number/reference and the counterpart's name). The filter is
   addressable (`/documents?group=…&q=…`) and Back restores the list it was applied to
 - Every row carries the document's date, family, identifier, counterpart, status/detail, its amount
-  or stock quantity, and the acting user's display name; `Open` links to the page that owns the
-  document (`/sales/{id}`, `/purchases/{id}`, `/customers/{id}`), and a stock movement opens the
+  or stock quantity, and the acting user's display name; clicking the identifier opens a side drawer
+  (`GET /web/documents/detail/{kind}/{id}`) with the document's full information, narrowed per
+  family the same way the rows are (a principal cannot open another tier's document — the refusal
+  names the read code it lacks); `Open` links to the page that owns the document (`/sales/{id}`,
+  `/purchases/{id}`, `/customers/{id}`), and a stock movement opens the
   products list at that product's row, because there is no product record page
 - The feed shows the newest 200 documents and states when the cap cut the history instead of
   pretending the history ended

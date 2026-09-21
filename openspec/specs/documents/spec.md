@@ -76,11 +76,66 @@ Every row carries the family, its identifier (the document number, or `Draft #id
 none; `Recibo #id` for a receipt), the counterpart (customer, supplier or product), the date, a
 status/detail line (the document status; `Pago`; `Cobro`; `In · Purchase` for a movement), the money
 amount or — for stock, the only family whose magnitude is not money — the quantity, and the acting
-user's display name. `Open` links to the page that owns the document: `/sales/{id}`, `/purchases/{id}`,
-`/customers/{id}`. A stock movement links to the products list at that product's row, because no
-product record page exists: `/products` is the list and the product detail is an HTMX drawer
-fragment. Every link is gated by the same code that made the row visible, so no row points at a page
-its reader would be refused.
+user's display name. The identifier is a button that opens the drawer (below); `Open` links to the
+page that owns the document: `/sales/{id}`, `/purchases/{id}`, `/customers/{id}`. A stock movement
+links to the products list at that product's row, because no product record page exists: `/products`
+is the list and the product detail is an HTMX drawer fragment. Every link is gated by the same code
+that made the row visible, so no row points at a page its reader would be refused.
+
+## The drawer (read-only slice)
+Clicking a row's identifier opens the side drawer the sibling list pages use: a fixed right panel
+(`#document-drawer`) whose body the row's `hx-get` swaps into (`#document-drawer-body`). Escape
+closes it and empties the body; there is no backdrop; `base.html` is untouched. The fragment is
+`GET /web/documents/detail/{kind}/{id}`, where `{kind}` is the family's URL token — parsed by
+`DocumentKind::parse`, so an unknown token is a 404 naming the token, and a known family with no
+such document is a 404 naming it.
+
+The drawer renders through ONE partial (`partials/document_detail.html`) for all six families: the
+route assembles a generic payload — a title (the identifier), a status line, a list of
+`(label, value)` facts, optional tables, an optional parent summary, an optional notice sentence
+and a list of links — so six near-identical per-family templates cannot drift. The operator-facing
+copy (fact labels like "Registrado por", "Total", "Pagado", "Saldo"; section titles like
+"Líneas", "Pagos", "Asignaciones") is Spanish like the record pages the drawer mirrors, while the
+page chrome stays English like the sibling list pages. Every display name is resolved in the route
+layer before the template runs: actor names only through `routes::audit_actor_names` (AC20 holds —
+no file of this capability reads an identity table), product/account/method names through the same
+service reads the record pages use, the parent payment view matched by id, and the ledger
+transactions through `TransactionService::get`. Money is summed in Rust by the owning services;
+the drawer invents no new total.
+
+What each family shows:
+- **Sale** — number (or `Draft #id`), status, customer, payment type, dates, receipt no., notes,
+  cancel reason, total/paid/due/payment status, actor names, and the lines (product, SKU, qty,
+  unit price, subtotal) and payments (date, account, method, amount) tables; link to `/sales/{id}`.
+- **Purchase** — the mirror with supplier and supplier invoice, and unit costs; link to
+  `/purchases/{id}`.
+- **SalePayment** — the payment's own amount, date, account and method (matched from the parent
+  record's resolved payment views), the finance `Income` it produced and the refund `Expense` when
+  the sale was cancelled (each shown as kind · amount · date and linked to `/accounts/{account_id}`
+  — the drawer links to the ledger, it never invents an account-name read), the receipt that
+  grouped it when one did (linked to `/customers/{customer_id}`), plus the parent sale's summary as
+  a sub-block (number, status, total, paid, due) with its own link.
+- **PurchasePayment** — the mirror with purchase-family links.
+- **StockMovement** — product (name + SKU), type, reason, quantity, reference, date, actor, and the
+  product's current derived stock; a plain sentence states that the movement is append-only history
+  (no edit, no delete), the guarantee the drawer's action slice builds on; link to
+  `/products#product-{product_id}`.
+- **Receipt** — customer, date, account, method, notes, total (derived from its allocations), actor,
+  and the allocations table where each row names its sale and links to `/sales/{sale_id}`; link to
+  `/customers/{customer_id}`.
+
+Per-family narrowing: the drawer obeys the same rule the rows obey. A family whose `read_code` the
+principal lacks is refused with the standard 403 in the same voice as the extractor's ("Se necesita
+el permiso «sales.read» para ver este documento"), and the mapping it quotes is
+`DocumentKind::read_code` — the single family→code mapping the list's `permitted_kinds`, the drawer
+route and the kernel agreement test share. Nothing a request supplies can widen it: the kind comes
+from the URL, and the URL's token decides nothing the principal's codes have not already decided.
+
+The index itself still owns no table and writes nothing: the drawer's reads ride the repositories
+and services that own each family (including the only two reads it added — one payment by id in
+`sale_repo.rs` and `purchase_repo.rs`, both one query), and no drawer action exists yet. The
+drawer's action buttons (cancel/discard with their impact warnings, draft delete) land in the next
+slice; this slice renders the drawer read-only and says so rather than pretending it is final.
 
 ## Filters
 - **Type** (`group`): one of the four options, or absent for all of them. The requested option is

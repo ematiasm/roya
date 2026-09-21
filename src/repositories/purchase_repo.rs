@@ -176,6 +176,9 @@ pub trait PurchaseRepository: Send + Sync {
         refund_transaction_id: i64,
     ) -> AppResult<PurchasePayment>;
     async fn list_payments(&self, purchase_id: i64) -> AppResult<Vec<PurchasePayment>>;
+    /// One payment by id — the documents drawer's per-payment read. `None`
+    /// for an id that does not exist; the service decides what that means.
+    async fn find_payment(&self, id: i64) -> AppResult<Option<PurchasePayment>>;
 
     /// The PURCHASES family of the documents index: the stored purchase
     /// projected to the feed's facts, with its derived total summed in Rust
@@ -579,6 +582,18 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_payment).collect())
+    }
+
+    async fn find_payment(&self, id: i64) -> AppResult<Option<PurchasePayment>> {
+        #[cfg(test)]
+        self.tick();
+        let row = sqlx::query(
+            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at FROM purchase_payments WHERE id = ?"#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_payment))
     }
 
     async fn list_document_rows(&self, query: &DocumentQuery) -> AppResult<Vec<DocumentRow>> {
@@ -1263,5 +1278,34 @@ mod tests {
             .expect("payment of the draft");
         assert_eq!(draft_payment.reference, format!("Draft #{draft}"));
         assert_eq!(draft_payment.party, "Importadora Norte");
+    }
+
+    /// The first read-by-id of one purchase payment: found carries every
+    /// stored column back, absent is `None` — never an error — and the whole
+    /// read is ONE query (the drawer's per-payment read must stay cheap).
+    #[tokio::test]
+    async fn find_payment_reads_one_payment_in_one_query() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let purchase =
+            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
+                .await;
+        let payment_id = seed_payment(&pool, purchase, "10", d(2024, 5, 10), actor).await;
+
+        repo.reset_reads();
+        let found = repo.find_payment(payment_id).await.unwrap().expect("payment exists");
+        assert_eq!(found.id, payment_id);
+        assert_eq!(found.purchase_id, purchase);
+        assert_eq!(found.amount, dec("10"));
+        assert_eq!(found.date, d(2024, 5, 10));
+        assert_eq!(found.created_by, actor);
+        assert_eq!(found.refund_transaction_id, None);
+        assert_eq!(repo.read_count(), 1);
+
+        // An unknown id is `None`, and it still costs exactly one query.
+        repo.reset_reads();
+        assert!(repo.find_payment(999_999).await.unwrap().is_none());
+        assert_eq!(repo.read_count(), 1);
     }
 }
