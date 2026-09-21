@@ -58,13 +58,25 @@
              added line brings its own warning with the `#purchase-record-money`
              swap. Draft renders 5 header cells (the remove column is
              Draft-only), hence the colspan. Badge and numbers reuse the
-             product drawer's stale-cost styling — no new Tailwind classes. #}
+             product drawer's stale-cost styling — no new Tailwind classes.
+
+             Cost-freshness T5: the warning ACTS. The button posts the line id
+             (and nothing else — the product and the cost are resolved
+             server-side from the stored line) to the apply-cost route, which
+             is gated `inventory.write` because it writes a product: a
+             purchases-only operator sees the button and gets the forbidden
+             page on click, a visible refusal rather than a silent one. Same
+             visual language as the remove button, no new Tailwind classes. #}
           {% if record.purchase.status.to_string() == "Draft" %}{% if let Some(stale) = line.stale_cost %}
           <tr class="border-b border-border/60">
             <td colspan="5" class="py-2.5 pr-3">
               <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
                 <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">stale cost</span>
                 <span class="text-[13px] text-muted">line cost ${{ stale.line_cost_display() }} • stored ${{ stale.stored_cost_display() }}</span>
+                <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                        hx-post="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}/apply-cost"
+                        hx-target="#purchase-record" hx-swap="innerHTML"
+                        title="Apply this line's cost to the product">Apply to product</button>
               </div>
             </td>
           </tr>
