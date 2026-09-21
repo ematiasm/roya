@@ -233,18 +233,29 @@ costos por proveedor (diferido desde F1).
       pasando, y eso es correcto: mostraría los mismos valores dinámicos).
       `scripts/e2e.sh -k products`: 22 passed, 1 skipped (el probe opt-in).
       `cargo test`: 782, sin moverse.
-- [ ] T3 — **Señal A, modelo y servicio.** La comparación en `PurchaseLineView`
-      (`src/models.rs:1076-1095`) poblada en `record_from_detail`
-      (`src/services/purchases.rs:428-448`, donde el producto ya se fetchea). Sin
-      query nueva. Tests de servicio.
-- [ ] T4 — **Señal A, el aviso.** Render dentro de `record_money`
-      (`templates/partials/purchase_detail.html:33-49`), por fila. Ajustar **a
-      propósito** el regex de `e2e/tests/test_picker.py:214`.
+- [x] T3 — **Señal A, modelo y servicio.** → `d55ed00`. La comparación en
+      `PurchaseLineView` poblada en `record_from_detail`, sin query nueva (el
+      producto ya se fetcheaba para nombre y SKU). Cinco tests de servicio, y la
+      verificación confirmó que todos corren por el constructor real y no
+      construyen la vista a mano. `cargo test` 787.
+- [x] T4 — **Señal A, el aviso.** → `1ac6555`. Render como **fila propia debajo**
+      de la fila de la línea, dentro de `record_money`, solo en Draft con la misma
+      compuerta que el botón de borrar. `colspan` 5, que es el número de celdas de
+      cabecera que el Draft renderiza. `cargo test` 790, e2e `-k picker` 8 passed.
+      **El regex de `test_picker.py:214` NO se tocó, y fue la decisión correcta**:
+      asume adyacencia entre producto y cantidad, así que el aviso va después del
+      subtotal y el assert sigue siendo real. Metido entre esas celdas lo habría
+      roto por una razón de layout. Verificado con hash de blob: idéntico en
+      worktree, `d55ed00` y HEAD.
 - [ ] T5 — **Señal A, el botón.** Handler nuevo en `src/routes/purchases_web.rs`
       que llama `inventory_service.update_product` con un patch de solo
       `cost_price`, gateado `InventoryWrite`, más el form struct y la
       registración en `router()` (`:930-971`). Tests de ruta. El guard de wiring
       de smoke lo va a probar solo.
+      **Pendiente que arrastra de T4**: el comentario del test positivo dice que
+      afirma el fragmento scopeado, pero el body HTTP de agregar línea es el
+      partial entero y el scopeo real lo hace el `hx-select` del cliente. Afirmar
+      `#purchase-record-money` contiene el aviso, en vez del body completo.
 - [ ] T6 — **Señal A, e2e del flujo.** Aviso → botón → `cost_price` actualizado →
       `sale_price` recalculado cuando hay markup.
 - [ ] T7 — **Spec.** Change folder OpenSpec + promoción de `inventory`. La spec de
@@ -313,5 +324,24 @@ costos por proveedor (diferido desde F1).
   nivel de ruta y cubierto desde el navegador. La rama
   `feat/cost-price-freshness` está pusheada a `origin` y trackea la remota; el
   remoto quedó con la protección respetada (no se tocó `main`).
-- Sigue la **Señal A** (T3–T6): el aviso efímero en la línea del draft y el botón
-  que aplica el costo.
+- Sigue la **Señal A** (T5–T6): el botón que aplica el costo y el e2e del flujo.
+- **T3 cerrada** → `d55ed00`. 787 passed. Hubo un incidente a reportar: el writer
+  **falló sin producir reporte** y dejó tres bindings de test sin usar que subían
+  los warnings de 55 a 58. Nada se dio por bueno: se revisó el diff, se sacaron los
+  bindings, y la verificación independiente confirmó las dos compuertas, que los
+  cinco tests discriminan, que corren por el constructor real, y —lo que más
+  importaba— que **`PurchaseLineView` no llega a ninguna respuesta JSON**: la API de
+  compras serializa `PurchaseDetail`, así que el campo nuevo no cambia ningún
+  payload. AC10 intacto.
+- **T4 cerrada** → `1ac6555`. 790 passed, 55 warnings (baseline), e2e `-k picker` 8.
+  La verificación confirmó el encuadre del aviso (dentro de `record_money`, en el
+  loop, después de la fila, `colspan` 5 contra 5 cabeceras de Draft), la compuerta
+  Draft idéntica a la del botón de borrar, y los 23 tokens de clase presentes en
+  `static/tailwind.css` (con método conciente del escape: `.py-2\.5` no lo
+  encuentra un grep ingenuo). **Se reveló que strict TDD no se aplicó en esta
+  slice** — el template cambió antes que los tests — así que no hay evidencia de
+  fase roja; se reportó en vez de inventarla.
+- Dos hallazgos de la verificación de T4 que quedan como deuda chica: el comentario
+  del test positivo sobreafirma el scopeo (anotado dentro de T5), y el aviso deja
+  dos líneas de borde en una fila marcada (cosmético, se decidió no tocar la fila
+  existente).
