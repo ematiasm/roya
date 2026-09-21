@@ -39,8 +39,9 @@ The operator thinks in four options, and they PARTITION the six families: `Docum
 the sale document, `Purchases` the purchase document, `Stock` the movements, and `Payments` the three
 payment families together (sale payments, purchase payments and collection receipts). A partition,
 not an overlap: a row is listed under exactly one option, so expanding two selected options can never
-list the same row twice, and `DocumentKind::group` has no ambiguity to resolve. The index itself
-accepts the six families and reads each one once, in declaration order, whatever the option list did.
+list the same row twice, and no family maps to more than one option, so there is no ambiguity to
+resolve. The index accepts the six families and reads each one once, in declaration order, whatever
+the option list did.
 
 ## The feed
 - **Order**: date descending, then id descending, then family — a total order, so the merge is

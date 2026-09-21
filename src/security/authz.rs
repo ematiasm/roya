@@ -1610,38 +1610,60 @@ mod tests {
             .iter()
             .find(|entry| entry.key == "documents")
             .expect("the documents nav row must exist for the any-of route");
-        assert_eq!(entry_codes(entry), documents_route_declared_codes());
+        let declared = entry_codes(entry);
+        let gates = documents_route_declared_codes();
+        assert!(
+            !gates.is_empty(),
+            "src/routes/documents_web.rs declares no RequireAny<(…)> gate"
+        );
+        for (line, codes) in &gates {
+            assert_eq!(
+                codes, &declared,
+                "src/routes/documents_web.rs line {line} declares a RequireAny<(…)> of {codes:?}, \
+                 but the documents nav row declares {declared:?}: the two routes must not drift apart"
+            );
+        }
     }
 
-    /// The code list `src/routes/documents_web.rs` actually declares in its
-    /// `RequireAny<(…)>` gate, read from the source the same way the sidebar
+    /// The code lists `src/routes/documents_web.rs` actually declares in its
+    /// `RequireAny<(…)>` gates, read from the source the same way the sidebar
     /// extraction reads the partial: so the tie the test above asserts is
     /// against the route's own bytes, not a parallel list that could drift.
-    fn documents_route_declared_codes() -> Vec<&'static str> {
+    /// Every gate in the file is returned with its 1-based line, so a drift
+    /// in ANY handler (the page and the fragment declare the same tuple
+    /// today) is named at its own source line, not just the first one.
+    fn documents_route_declared_codes() -> Vec<(usize, Vec<&'static str>)> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/documents_web.rs");
         let content = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let needle = "RequireAny<(";
-        let at = content
-            .find(needle)
-            .unwrap_or_else(|| panic!("documents_web.rs declares no RequireAny<(…)> gate"));
-        let rest = &content[at + needle.len()..];
-        let end = rest
-            .find(")>")
-            .unwrap_or_else(|| panic!("unterminated RequireAny tuple in documents_web.rs"));
-        rest[..end]
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(|name| match name {
-                "SalesRead" => SalesRead::CODE,
-                "PurchasesRead" => PurchasesRead::CODE,
-                "InventoryRead" => InventoryRead::CODE,
-                "CustomersRead" => CustomersRead::CODE,
-                other => panic!(
-                    "documents_web.rs names {other} in its RequireAny tuple, which is not \
-                     one of the four read codes the documents nav row promises"
-                ),
+        let mut gates = content.match_indices(needle).peekable();
+        if gates.peek().is_none() {
+            panic!("documents_web.rs declares no RequireAny<(…)> gate");
+        }
+        gates
+            .map(|(at, _)| {
+                let line = content[..at].matches('\n').count() + 1;
+                let rest = &content[at + needle.len()..];
+                let end = rest
+                    .find(")>")
+                    .unwrap_or_else(|| panic!("unterminated RequireAny tuple in documents_web.rs"));
+                let codes = rest[..end]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(|name| match name {
+                        "SalesRead" => SalesRead::CODE,
+                        "PurchasesRead" => PurchasesRead::CODE,
+                        "InventoryRead" => InventoryRead::CODE,
+                        "CustomersRead" => CustomersRead::CODE,
+                        other => panic!(
+                            "documents_web.rs names {other} in its RequireAny tuple, which is not \
+                             one of the four read codes the documents nav row promises"
+                        ),
+                    })
+                    .collect::<Vec<_>>();
+                (line, codes)
             })
             .collect()
     }
