@@ -177,6 +177,14 @@ requests (the global `htmx:responseError` handler renders it as the `#notice` bo
 HTML page for a full-page HTML request. The message reaches the operator, so it is written in
 Spanish.
 
+The same rule has an any-of form for a screen several tiers each open a part of: a handler that
+declares `RequireAny<S>` (a `PermissionSet`, tuples of two to four catalog markers) runs when the
+principal holds AT LEAST ONE of the set's codes, and the refusal names every code it would have
+accepted. The one consumer today is the documents index (`/documents`, `/web/documents`), whose
+content then narrows per tier: the route admits any of the four read codes and the page renders only
+the families those codes own. An any-of gate over an empty set denies — deny by default holds for the
+new form too.
+
 ### The declared order rule (double-gated drawers)
 A handler that renders two owners' data declares TWO `Require<P>` extractors — the product drawer
 (`/web/products/detail/{id}`: `inventory.read` AND `purchases.costs.read`) and the supplier drawer
@@ -204,6 +212,19 @@ against the real router), and each declared code must be load-bearing — the de
 code either gets the route's 403 or misses the block the label names. The sidebar also shows the
 signed-in user's display name and username next to the logout control, and the password page says
 why it is confining a flagged session.
+
+A row declares its semantics: `All(codes)` needs every code (the shape every per-department entry
+uses, and the `password` entry's empty list is the one entry every signed-in operator may see), while
+`Any(codes)` needs at least one — the shape the documents entry uses, because four departments' read
+tiers each open part of the same screen and no single one of them is the gate. The invariant proves
+each semantics on its own terms: for an `All` row every declared code must be load-bearing (the code
+minus that code either gets the route's 403 or misses the named block), and for an `Any` row the
+opposite direction is the promise — the exact-declared set opens the href, the EMPTY set is refused
+both the href and the fragment route the filter form fetches, and every single declared code alone
+opens the href and renders its own part of the screen and not another code's. A code whose single
+principal renders nothing is over-declared there for the same reason its twin is under `All`. One
+more test ties the row to the route: the codes an `Any` row declares must be exactly the codes its
+`RequireAny` gate accepts, so neither side can drift into hiding a screen the route would open.
 
 ### Protected role and last administrator
 The database refuses, through triggers in the guard migration: deleting a `is_system` role,
@@ -611,6 +632,16 @@ service still requires the current password).
 | `/web/roles/delete` | POST | `identity.roles.manage` |
 | `/web/roles/matrix` | POST | `identity.roles.manage` |
 
+### Documents — `src/routes/documents_web.rs`
+
+| Route | Method | Permission |
+| --- | --- | --- |
+| `/documents` | GET | ANY OF `sales.read`, `purchases.read`, `inventory.read`, `customers.read` (`RequireAny`) |
+| `/web/documents` | GET | ANY OF `sales.read`, `purchases.read`, `inventory.read`, `customers.read` (`RequireAny`) |
+
+The content of both routes narrows per tier (see `documents/spec.md`): the gate admits any one read
+code, and the page renders only the families that code owns.
+
 Mapping decisions the operator should know (all deliberate, fail-closed):
 - **Account creation and method allowlisting are `finance.methods.manage`, not `finance.write`**:
   the ledger structure is the manage tier. Known consequence: a principal holding ONLY
@@ -640,6 +671,14 @@ Mapping decisions the operator should know (all deliberate, fail-closed):
   `sales.read` (unpaid SALES, not customer data).
 - The drawer fragments carry the double gate; the declared order rule above decides which code the
   refusal names.
+- **The documents index is an any-of gate, and each tier sees only its own families**: one of
+  `sales.read`, `purchases.read`, `inventory.read`, `customers.read` opens `/documents`, and the page
+  then shows only what that code reads — a `sales.read`-only principal sees the sale documents and
+  their payments and never the purchases, the stock movements or the receipts. Consequence: an
+  operator whose matrix mixes tiers sees the union of them, which is the intended behaviour (the
+  screen is an index of what they may already read elsewhere, not a new grant). Payments are split by
+  their parent document's tier: `sale_payments` follow `sales.read`, `purchase_payments` follow
+  `purchases.read`, and a collection receipt follows `customers.read`.
 
 ## Verification
 `src/security/` (the kernel's own tests, including the catalog drift test and the AC21 nav
