@@ -6,8 +6,8 @@ nothing.
 
 ## The two layers, and the boundary between them
 ```
-Rust suite        cargo test         652 tests, about 14 s
-Browser suite     scripts/e2e.sh     62 tests, about 90 s
+Rust suite        cargo test         735 tests, about 14 s
+Browser suite     scripts/e2e.sh     68 tests, about 100 s
 ```
 
 **The Rust suite** covers the server: business rules, guards, derived state, error mapping, the rendered
