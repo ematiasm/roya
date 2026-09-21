@@ -53,7 +53,9 @@ Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount
 - A product may appear only once per purchase, for the same reason as sales.
 - **Cancelling** a confirmed purchase returns the goods to the supplier (`Out`, reason
   `Purchase-return`) and refunds the money paid as an `Income` per payment. Unlike the sales refund,
-  this is money *entering* the account, so it cannot overdraft and needs no balance guard.
+  this is money *entering* the account, so it cannot overdraft and needs no balance guard. The
+  partial-annulment refusal still applies: if any payment already carries a `refund_transaction_id`,
+  the annulment was partially applied by an earlier attempt and is refused, not doubled.
 - **Supplier payment.** One handover of money is allocated oldest debt first (`due_date`, then
   `purchase_date`, then id) across the supplier's Confirmed credit purchases, one payment per covered
   purchase, each still posting its own `Expense` with `reference = purchase_number`. Suppliers have no
