@@ -13,7 +13,7 @@ pub mod transaction;
 pub use account::AccountService;
 pub use customer_receipts::CustomerReceiptService;
 pub use customers::CustomerService;
-pub use documents::{DocumentFeed, DocumentService};
+pub use documents::DocumentService;
 pub use finance_methods::PaymentMethodService;
 pub use identity::IdentityService;
 pub use inventory::InventoryService;

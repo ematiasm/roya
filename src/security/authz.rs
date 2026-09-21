@@ -441,6 +441,14 @@ const NAV_ENTRIES: &[NavEntry] = &[
     NavEntry { key: "dashboard", visibility: NavVisibility::All(&[DashboardRead::CODE]), group: "operation" },
     NavEntry { key: "sales", visibility: NavVisibility::All(&[SalesRead::CODE]), group: "operation" },
     NavEntry { key: "purchases", visibility: NavVisibility::All(&[PurchasesRead::CODE]), group: "operation" },
+    // `documents` is the first any-of row: four departments' read tiers each
+    // open part of the same screen — sales.read the sale documents,
+    // purchases.read the purchases, inventory.read the stock movements,
+    // customers.read the collection receipts — so ANY one code opens the
+    // screen, and the page itself narrows the content per tier. The route's
+    // `RequireAny` names the same four codes; the kernel's drift tests tie
+    // the nav row and the route together.
+    NavEntry { key: "documents", visibility: NavVisibility::Any(&[SalesRead::CODE, PurchasesRead::CODE, InventoryRead::CODE, CustomersRead::CODE]), group: "operation" },
     NavEntry { key: "products", visibility: NavVisibility::All(&[InventoryRead::CODE]), group: "catalogue" },
     NavEntry { key: "suppliers", visibility: NavVisibility::All(&[SuppliersRead::CODE]), group: "catalogue" },
     NavEntry { key: "customers", visibility: NavVisibility::All(&[CustomersRead::CODE]), group: "catalogue" },
@@ -599,31 +607,6 @@ static _PIN_REQUIRE_CONSTRUCTED: Require<DashboardRead> = Require {
 static _PIN_HAS: fn(&Principal, &str) -> bool = Principal::has;
 static _PIN_HAS_MARKER: fn(&Principal) -> bool = Principal::has_permission::<DashboardRead>;
 static _PIN_REFUSAL: fn(&Parts, String) -> Response = forbidden_response;
-// The any-of surface has no production consumer yet: `RequireAny` and the
-// `PermissionSet` trait were added for the `/documents` route, which lands
-// in a later task together with its nav entry and template item (the ac21
-// invariant test drives the real router, so neither may land early). Until
-// then only the kernel's tests construct them, so the pins below keep the
-// surface compiling the same way the pins above keep `Require`'s — live
-// references to the type, the field and the trait, no `#[allow]` markers.
-// The `#[used]` attribute is what keeps the pin itself a live root: a bare
-// underscore-prefixed static is exempt from the dead-code report but no
-// longer feeds liveness to what it references, so the plain pin form the
-// older slices could rely on would leave `RequireAny`, `PermissionSet` and
-// the unused `NavVisibility::Any` variant reported dead by the bin target.
-// The `NavVisibility::Any` pin is the variant's consumer of record until
-// the `/documents` nav entry (the first `Any` row) declares it.
-#[used]
-static _PIN_REQUIRE_ANY_CONSTRUCTED: RequireAny<(SalesRead, PurchasesRead, InventoryRead, CustomersRead)> =
-    RequireAny {
-        _marker: std::marker::PhantomData,
-    };
-#[used]
-static _PIN_PERMISSION_SET: fn() -> &'static [&'static str] = || {
-    <(SalesRead, PurchasesRead, InventoryRead, CustomersRead) as PermissionSet>::CODES
-};
-#[used]
-static _PIN_NAV_ANY_VARIANT: NavVisibility = NavVisibility::Any(&[]);
 
 // ---------------------------------------------------------------------------
 // AC10 / AC11 / AC12 / AC20: the kernel's own tests
@@ -1396,18 +1379,54 @@ mod tests {
         }
     }
 
+    /// For an `Any` entry, what one declared code must render and what it must
+    /// NOT: the proof that the code opens its own part of the screen instead of
+    /// merely the page. A missing row fails the invariant, so every future
+    /// any-of entry has to state what each code buys.
+    fn any_of_entry_markers(key: &str, code: &str) -> Option<(&'static str, &'static str)> {
+        match (key, code) {
+            (
+                "documents",
+                "sales.read",
+            ) => Some((r#"data-document-group="sales""#, r#"data-document-group="purchases""#)),
+            (
+                "documents",
+                "purchases.read",
+            ) => Some((r#"data-document-group="purchases""#, r#"data-document-group="sales""#)),
+            (
+                "documents",
+                "inventory.read",
+            ) => Some((r#"data-document-group="stock""#, r#"data-document-group="sales""#)),
+            (
+                "documents",
+                "customers.read",
+            ) => Some((r#"data-document-group="payments""#, r#"data-document-group="sales""#)),
+            _ => None,
+        }
+    }
+
     /// The invariant that replaced the table-trusting drift test: **for every
     /// nav entry, a principal holding exactly the permissions that entry
     /// declares gets 200 on that entry's href.** One test, every entry,
     /// present and future: it fails when an entry declares too little (the
     /// href refuses the exact-declared principal — 2026-09-20's `accounts`
     /// mismatch, `finance.read` alone against a `dashboard.read` route) and
-    /// when it declares too much: every declared code must be load-bearing,
-    /// meaning a principal holding the declared set MINUS that code either
-    /// gets the route's 403 (the code gates the route) or misses the page
-    /// block the entry's label names (`named_block_marker`). A code for which
-    /// neither holds is over-declared — it hides the entry from a principal
-    /// who may read everything it promises.
+    /// when it declares too much. The load-bearing direction depends on the
+    /// semantics the row declares:
+    ///
+    /// - an `All` entry keeps the minus-one probe loop verbatim: every
+    ///   declared code must be load-bearing, meaning a principal holding the
+    ///   declared set MINUS that code either gets the route's 403 (the code
+    ///   gates the route) or misses the page block the entry's label names
+    ///   (`named_block_marker`). A code for which neither holds is
+    ///   over-declared — it hides the entry from a principal who may read
+    ///   everything it promises.
+    /// - an `Any` entry (the first is `documents`) promises the opposite: one
+    ///   code is SUFFICIENT. So the probes are the exact-declared set, the
+    ///   empty set (which must open nothing, on the page and on the fragment
+    ///   route the browser's filter form fetches) and every single code
+    ///   alone, each of which must render its own part of the screen and
+    ///   none of what `any_of_entry_markers` says it must not.
     #[tokio::test]
     async fn ac21_a_principal_holding_exactly_what_an_entry_declares_opens_its_href() {
         let items = sidebar_nav_items();
@@ -1419,76 +1438,212 @@ mod tests {
                 .unwrap_or_else(|| panic!("the sidebar never renders {:?}", entry.key));
             let db = pool().await;
             test_support::seed_session(&db).await.unwrap();
-            // Every declared row is `All` today (asserted by
-            // `nav_migration_preserves_every_rows_all_semantics`), so the
-            // exact-declared set and the minus-one probes below read the
-            // all-of semantics; the invariant grows an any-of direction the
-            // day a row declares one.
-            let declared: Vec<&str> = entry_codes(entry).to_vec();
-            let exact = test_support::seed_session_with_permissions(&db, &declared)
-                .await
-                .unwrap();
-            // One probe per declared code, holding the set minus that code:
-            // seeded up front because the app state takes the pool over.
-            let mut minus_one = Vec::new();
-            for code in entry_codes(entry) {
-                let reduced: Vec<&str> = declared
-                    .iter()
-                    .copied()
-                    .filter(|held| *held != *code)
-                    .collect();
-                let token =
-                    test_support::seed_session_with_permissions(&db, &reduced)
+            match entry.visibility {
+                NavVisibility::All(codes) => {
+                    let declared: Vec<&str> = codes.to_vec();
+                    let exact = test_support::seed_session_with_permissions(&db, &declared)
                         .await
                         .unwrap();
-                minus_one.push((code, token));
-            }
-            let state = test_support::app_state(db);
-            let app = crate::routes::router(state);
+                    // One probe per declared code, holding the set minus that code:
+                    // seeded up front because the app state takes the pool over.
+                    let mut minus_one = Vec::new();
+                    for code in codes {
+                        let reduced: Vec<&str> = declared
+                            .iter()
+                            .copied()
+                            .filter(|held| *held != *code)
+                            .collect();
+                        let token =
+                            test_support::seed_session_with_permissions(&db, &reduced)
+                                .await
+                                .unwrap();
+                        minus_one.push((code, token));
+                    }
+                    let state = test_support::app_state(db);
+                    let app = crate::routes::router(state);
 
-            // Direction one: the exact-declared principal opens the href.
-            let (status, html) = get_page(&app, &href, &test_support::cookie_for(&exact)).await;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "nav entry {:?} declares {:?} but GET {href} refuses the exact principal",
-                entry.key,
-                declared
-            );
-            if let Some(marker) = named_block_marker(entry.key) {
-                assert!(
-                    html.contains(marker),
-                    "nav entry {:?} promises the block {marker:?} but the page it opens \
-                     does not render it: {html:.600}",
-                    entry.key
-                );
-            }
+                    // Direction one: the exact-declared principal opens the href.
+                    let (status, html) =
+                        get_page(&app, &href, &test_support::cookie_for(&exact)).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::OK,
+                        "nav entry {:?} declares {:?} but GET {href} refuses the exact principal",
+                        entry.key,
+                        declared
+                    );
+                    if let Some(marker) = named_block_marker(entry.key) {
+                        assert!(
+                            html.contains(marker),
+                            "nav entry {:?} promises the block {marker:?} but the page it opens \
+                             does not render it: {html:.600}",
+                            entry.key
+                        );
+                    }
 
-            // Direction two: every declared code is load-bearing.
-            for (code, token) in minus_one {
-                let (status, html) =
-                    get_page(&app, &href, &test_support::cookie_for(&token)).await;
-                if status != StatusCode::OK {
-                    // The code gates the route: without it the href refuses.
-                    continue;
+                    // Direction two: every declared code is load-bearing.
+                    for (code, token) in minus_one {
+                        let (status, html) =
+                            get_page(&app, &href, &test_support::cookie_for(&token)).await;
+                        if status != StatusCode::OK {
+                            // The code gates the route: without it the href refuses.
+                            continue;
+                        }
+                        match named_block_marker(entry.key) {
+                            Some(marker) => assert!(
+                                !html.contains(marker),
+                                "nav entry {:?} declares {code} but the href opens and the \
+                                 named block still renders without it: {code} is \
+                                 over-declared and hides nothing",
+                                entry.key
+                            ),
+                            None => panic!(
+                                "nav entry {:?} declares {code} but the href opens without \
+                                 it and its label names no block: {code} is over-declared \
+                                 and hides a screen the principal may read",
+                                entry.key
+                            ),
+                        }
+                    }
                 }
-                match named_block_marker(entry.key) {
-                    Some(marker) => assert!(
-                        !html.contains(marker),
-                        "nav entry {:?} declares {code} but the href opens and the \
-                         named block still renders without it: {code} is \
-                         over-declared and hides nothing",
-                        entry.key
-                    ),
-                    None => panic!(
-                        "nav entry {:?} declares {code} but the href opens without \
-                         it and its label names no block: {code} is over-declared \
-                         and hides a screen the principal may read",
-                        entry.key
-                    ),
+                NavVisibility::Any(codes) => {
+                    let declared: Vec<&str> = codes.to_vec();
+                    let exact = test_support::seed_session_with_permissions(&db, &declared)
+                        .await
+                        .unwrap();
+                    let none =
+                        test_support::seed_session_with_permissions(&db, &[]).await.unwrap();
+                    let mut singles = Vec::new();
+                    for code in codes {
+                        let token =
+                            test_support::seed_session_with_permissions(&db, &[*code])
+                                .await
+                                .unwrap();
+                        singles.push((code, token));
+                    }
+                    let state = test_support::app_state(db);
+                    let app = crate::routes::router(state);
+
+                    // (a) The exact-declared principal opens the href.
+                    let (status, html) =
+                        get_page(&app, &href, &test_support::cookie_for(&exact)).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::OK,
+                        "nav entry {:?} declares {:?} but GET {href} refuses the exact principal",
+                        entry.key,
+                        declared
+                    );
+                    if let Some(marker) = named_block_marker(entry.key) {
+                        assert!(
+                            html.contains(marker),
+                            "nav entry {:?} promises the block {marker:?} but the page it opens \
+                             does not render it: {html:.600}",
+                            entry.key
+                        );
+                    }
+
+                    // (b) Holding NONE of the declared codes opens nothing: the
+                    // href refuses AND the fragment route refuses with the
+                    // `HX-Request` header the browser's filter form sends. The
+                    // fragment route is `/web/documents` because `documents` is
+                    // the first (and only) any-of row; a second any-of row adds
+                    // its own fragment probe to its markers here.
+                    let (status, _) =
+                        get_page(&app, &href, &test_support::cookie_for(&none)).await;
+                    assert_eq!(
+                        status,
+                        StatusCode::FORBIDDEN,
+                        "the empty set must never open the any-of page {href}"
+                    );
+                    let (status, _) =
+                        get_page_htmx(&app, "/web/documents", &test_support::cookie_for(&none))
+                            .await;
+                    assert_eq!(
+                        status,
+                        StatusCode::FORBIDDEN,
+                        "the empty set must never open the /web/documents fragment"
+                    );
+
+                    // (c) + (d) Every declared code ALONE opens the href and
+                    // renders its own part of the screen — and never the part
+                    // the marker table reserves for another code.
+                    for (code, token) in singles {
+                        let (status, html) =
+                            get_page(&app, &href, &test_support::cookie_for(&token)).await;
+                        assert_eq!(
+                            status,
+                            StatusCode::OK,
+                            "nav entry {:?} promises {code} alone is sufficient: GET {href}",
+                            entry.key
+                        );
+                        let (present, absent) = any_of_entry_markers(entry.key, code)
+                            .unwrap_or_else(|| panic!(
+                                "nav entry {:?} declares Any but its code {code} states no \
+                                 marker pair: every any-of code must say what it renders \
+                                 and what it must not",
+                                entry.key
+                            ));
+                        assert!(
+                            html.contains(present),
+                            "holding exactly {code} must render {present:?}: {html:.600}"
+                        );
+                        assert!(
+                            !html.contains(absent),
+                            "holding exactly {code} must NOT render {absent:?}: {html:.600}"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// The any-of row and its route cannot be allowed to drift: the nav row's
+    /// declared code list must equal, in the same order, the code list the
+    /// route's `RequireAny<(…)>` tuple names. Without this tie a route that
+    /// accepted a fifth code (or a nav that promised a sixth) would drift
+    /// silently: the page would be reachable by URL for a principal the
+    /// sidebar hides it from, or hidden from one the route would refuse.
+    #[test]
+    fn ac21_the_any_of_entry_declares_exactly_the_codes_its_route_accepts() {
+        let entry = NAV_ENTRIES
+            .iter()
+            .find(|entry| entry.key == "documents")
+            .expect("the documents nav row must exist for the any-of route");
+        assert_eq!(entry_codes(entry), documents_route_declared_codes());
+    }
+
+    /// The code list `src/routes/documents_web.rs` actually declares in its
+    /// `RequireAny<(…)>` gate, read from the source the same way the sidebar
+    /// extraction reads the partial: so the tie the test above asserts is
+    /// against the route's own bytes, not a parallel list that could drift.
+    fn documents_route_declared_codes() -> Vec<&'static str> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes/documents_web.rs");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let needle = "RequireAny<(";
+        let at = content
+            .find(needle)
+            .unwrap_or_else(|| panic!("documents_web.rs declares no RequireAny<(…)> gate"));
+        let rest = &content[at + needle.len()..];
+        let end = rest
+            .find(")>")
+            .unwrap_or_else(|| panic!("unterminated RequireAny tuple in documents_web.rs"));
+        rest[..end]
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(|name| match name {
+                "SalesRead" => SalesRead::CODE,
+                "PurchasesRead" => PurchasesRead::CODE,
+                "InventoryRead" => InventoryRead::CODE,
+                "CustomersRead" => CustomersRead::CODE,
+                other => panic!(
+                    "documents_web.rs names {other} in its RequireAny tuple, which is not \
+                     one of the four read codes the documents nav row promises"
+                ),
+            })
+            .collect()
     }
 
     /// The visible set is computed, not asserted: for any principal, the
@@ -1610,6 +1765,33 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
+    /// Same as [`get_page`] plus the `HX-Request: true` header: the request
+    /// the browser's filter form sends when it fetches a fragment route.
+    async fn get_page_htmx(
+        app: &axum::Router,
+        uri: &str,
+        cookie: &str,
+    ) -> (StatusCode, String) {
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .header("HX-Request", "true")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
     // -- The any-of gate (PermissionSet / RequireAny / NavVisibility) --------------
 
     /// A synthetic entry builder for the visibility truth table: private to the
@@ -1700,20 +1882,19 @@ mod tests {
 
     /// The migration's behavior-preservation proof: every existing row keeps
     /// the all-of semantics it had before `NavVisibility` existed. Declared
-    /// rows are all `All`, and only the password entry declares no code; for
-    /// each row the principal holding exactly the declared codes sees it and
-    /// the principal holding one code fewer does not (for the password entry,
-    /// whose empty list is vacuous, the permissionless principal sees it).
+    /// rows are all `All` except `documents` — the first any-of row, which
+    /// opens with ANY ONE of four departments' read permissions, so the
+    /// all-of probe below does not describe it; its any-of semantics are
+    /// proved over the real router by
+    /// `ac21_a_principal_holding_exactly_what_an_entry_declares_opens_its_href`,
+    /// so this proof skips any `Any` row untouched and keeps every original
+    /// assertion for the rest.
     #[test]
     fn nav_migration_preserves_every_rows_all_semantics() {
         for entry in NAV_ENTRIES {
             let codes = match &entry.visibility {
                 NavVisibility::All(codes) => *codes,
-                NavVisibility::Any(_) => panic!(
-                    "nav entry {:?} declares Any: a declared row whose sidebar item \
-                     and route do not exist yet would fail the ac21 declaration test",
-                    entry.key
-                ),
+                NavVisibility::Any(_) => continue,
             };
             if entry.key == "password" {
                 assert!(
@@ -1855,6 +2036,7 @@ mod tests {
     const DEPARTMENT_ROUTE_FILES: &[&str] = &[
         "web.rs",
         "api.rs",
+        "documents_web.rs",
         "customers_web.rs",
         "customers_api.rs",
         "inventory_web.rs",

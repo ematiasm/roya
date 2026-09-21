@@ -164,7 +164,7 @@
       document.body.addEventListener('htmx:beforeHistoryUpdate', function (evt) {
         var history = evt.detail && evt.detail.history;
         if (!history || !history.path) return;
-        if (/^\/web\/(sales|products|purchases)(?=\?|$)/.test(history.path)) {
+        if (/^\/web\/(sales|documents|products|purchases)(?=\?|$)/.test(history.path)) {
           history.path = history.path.replace(/^\/web/, '');
         }
       });

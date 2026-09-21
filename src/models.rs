@@ -1141,22 +1141,6 @@ impl DocumentKind {
         }
     }
 
-    /// The filter group this family belongs to.
-    pub fn group(&self) -> DocumentGroup {
-        match self {
-            Self::Sale => DocumentGroup::Sales,
-            Self::SalePayment => DocumentGroup::Payments,
-            Self::Purchase => DocumentGroup::Purchases,
-            Self::PurchasePayment => DocumentGroup::Payments,
-            Self::StockMovement => DocumentGroup::Stock,
-            Self::Receipt => DocumentGroup::Payments,
-        }
-    }
-
-    /// Parse a `token()`; `None` for an unknown or empty token.
-    pub fn parse(token: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|kind| kind.token() == token)
-    }
 }
 
 /// The four groups the operator filters by — the vocabulary of the request
@@ -1198,8 +1182,8 @@ impl DocumentGroup {
     }
 
     /// The families the group covers. The four groups PARTITION the six
-    /// families: every family is listed under exactly one option, so
-    /// `DocumentKind::group` is the single classification and expanding two
+    /// families: every family is listed under exactly one option, so the
+    /// partition is the single classification and expanding two
     /// selected options can never list the same row twice. Sales -> [Sale];
     /// Purchases -> [Purchase]; Stock -> [StockMovement]; Payments ->
     /// [SalePayment, PurchasePayment, Receipt] — the three payment families
@@ -1760,16 +1744,18 @@ impl ReceiptDetail {
 mod tests {
     use super::*;
 
-    /// The URL/filter tokens round-trip for every family, and neither the
-    /// empty token nor a made-up one parses.
+    /// The URL/filter tokens are unique across every family (the property
+    /// that lets the route resolve a token back to one family) and never
+    /// empty.
     #[test]
-    fn document_kind_tokens_round_trip_and_reject_unknowns() {
+    fn document_kind_tokens_are_unique_and_non_empty() {
+        let mut seen: Vec<&str> = Vec::new();
         for kind in DocumentKind::ALL {
-            assert_eq!(DocumentKind::parse(kind.token()), Some(*kind));
+            let token = kind.token();
+            assert!(!token.is_empty(), "{kind:?} has an empty token");
+            assert!(!seen.contains(&token), "token {token:?} is used twice");
+            seen.push(token);
         }
-        assert_eq!(DocumentKind::parse(""), None);
-        assert_eq!(DocumentKind::parse("nope"), None);
-        assert_eq!(DocumentKind::parse("Sale"), None);
     }
 
     /// The group vocabulary round-trips the same way.
@@ -1795,18 +1781,17 @@ mod tests {
         }
     }
 
-    /// The four groups cover the six families: every family is listed under
-    /// the group its `group()` names, the union covers every kind, and
-    /// Payments is a deliberate wide filter over three families while Stock is
-    /// the narrow one. `kinds()` is the filter expansion, so Sales/Purchases
-    /// also list their payment families even though those answer `Payments`.
+    /// The four groups cover the six families: the union of the four
+    /// `kinds()` lists covers every family exactly once, and Payments is a
+    /// deliberate wide filter over three families while Stock is the narrow
+    /// one. `kinds()` is the filter expansion, so the partition is what makes
+    /// it total and duplicate-free — the property the feed's row list
+    /// depends on.
     #[test]
     fn document_group_kinds_partition_every_family() {
-        // The four groups partition the six families: a family appears under
-        // exactly one filter option, names that option back through
-        // `group()`, and the union of the four covers every family. That is
-        // what makes the expansion total and duplicate-free — the property
-        // the feed's row list depends on.
+        // The four groups partition the six families: no family is listed
+        // under two filter options, every group names a non-empty list, and
+        // the union of the four covers every family.
         let mut covered: Vec<DocumentKind> = Vec::new();
         for group in DocumentGroup::ALL {
             assert!(!group.kinds().is_empty());
@@ -1816,11 +1801,6 @@ mod tests {
                     "{kind:?} is listed under two groups"
                 );
                 covered.push(*kind);
-                assert_eq!(
-                    kind.group(),
-                    *group,
-                    "{kind:?} must name the group that lists it"
-                );
             }
         }
         covered.sort();
@@ -1834,7 +1814,14 @@ mod tests {
         assert_eq!(DocumentGroup::Sales.kinds(), &[DocumentKind::Sale]);
         assert_eq!(DocumentGroup::Purchases.kinds(), &[DocumentKind::Purchase]);
         assert_eq!(DocumentGroup::Stock.kinds(), &[DocumentKind::StockMovement]);
-        assert_eq!(DocumentGroup::Payments.kinds().len(), 3);
+        assert_eq!(
+            DocumentGroup::Payments.kinds(),
+            &[
+                DocumentKind::SalePayment,
+                DocumentKind::PurchasePayment,
+                DocumentKind::Receipt,
+            ]
+        );
     }
 
     /// `query(limit)` carries the bounds through unchanged; the family list is

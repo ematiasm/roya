@@ -1,6 +1,7 @@
 pub mod api;
 pub mod customers_api;
 pub mod customers_web;
+pub mod documents_web;
 pub mod identity_api;
 pub mod identity_web;
 pub mod inventory_api;
@@ -31,8 +32,9 @@ use crate::repositories::{
 use crate::security::auth_middleware;
 use crate::services::identity::{SystemClock, ThrottleConfig};
 use crate::services::{
-    AccountService, CustomerReceiptService, CustomerService, IdentityService, InventoryService,
-    PaymentMethodService, PurchasesService, SalesService, SupplierService, TransactionService,
+    AccountService, CustomerReceiptService, CustomerService, DocumentService, IdentityService,
+    InventoryService, PaymentMethodService, PurchasesService, SalesService, SupplierService,
+    TransactionService,
 };
 
 pub type InventorySvc = InventoryService<
@@ -56,6 +58,15 @@ pub type SalesSvc = SalesService<
 >;
 
 pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
+
+/// The cross-department documents index: read-only composition over the four
+/// repository families the `/documents` page reads.
+pub type DocumentSvc = DocumentService<
+    SqliteSaleRepository,
+    SqlitePurchaseRepository,
+    SqliteCustomerReceiptRepository,
+    SqliteStockMovementRepository,
+>;
 
 /// Receipts: the grouped payments of one handover of money. It wraps the same
 /// sales service the routes use, so every grouped payment reaches sales and
@@ -119,6 +130,10 @@ pub struct AppState {
     /// Identity kernel service (S1b): the single session-validity opinion the
     /// guard and the login/logout routes share.
     pub identity_service: IdentitySvc,
+    /// The documents index (`/documents`): the four families' read paths,
+    /// every filter already permission-narrowed by the route. Wired exactly
+    /// like the sibling services (it derives `Clone`, so no `Arc` wrapper).
+    pub document_service: DocumentSvc,
     pub allow_negative: bool,
     pub allow_negative_stock: bool,
     /// `ENFORCE_CREDIT_LIMIT` (default true): the sales service rejects a credit
@@ -239,6 +254,14 @@ impl AppState {
             transaction_service.clone(),
             PaymentMethodService::new(method_repo),
         );
+        // The documents index composes the four families' read paths; it holds
+        // only reads, so wiring it never moves write ownership.
+        let document_service = DocumentService::new(
+            SqliteSaleRepository::new(pool.clone()),
+            SqlitePurchaseRepository::new(pool.clone()),
+            SqliteCustomerReceiptRepository::new(pool.clone()),
+            SqliteStockMovementRepository::new(pool.clone()),
+        );
         Self {
             pool,
             account_service,
@@ -251,6 +274,7 @@ impl AppState {
             supplier_service,
             purchases_service,
             identity_service,
+            document_service,
             allow_negative,
             allow_negative_stock,
             enforce_credit_limit,
@@ -307,6 +331,38 @@ pub async fn audit_actor_names(
     Ok(names)
 }
 
+/// The ids of the users a typed actor filter matches, or `None` when the
+/// filter is empty. `Some(empty)` means the typed name matched no user — a
+/// filter that matches nothing, never an error and never a silent "all".
+/// The match is the same normalized-substring rule `matching_customer_ids`
+/// uses, over `display_name` OR `username`, run in Rust because the identity
+/// tables are small by nature (if that ever stops being true this needs a
+/// normalized index instead). Lives here, with `audit_actor_names`, because
+/// this is the only layer allowed to read the identity tables (AC20), and the
+/// statement below carries no interpolated text at all — the comparison runs
+/// after the read, in Rust.
+pub async fn audit_actor_ids(pool: &SqlitePool, needle: &str) -> AppResult<Option<Vec<i64>>> {
+    let trimmed = needle.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let needle = crate::models::normalize_search(trimmed);
+    let rows = sqlx::query_as::<_, (i64, String, String)>(
+        "SELECT id, display_name, username FROM users",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(Some(
+        rows.into_iter()
+            .filter(|(_, display_name, username)| {
+                crate::models::normalize_search(display_name).contains(&needle)
+                    || crate::models::normalize_search(username).contains(&needle)
+            })
+            .map(|(id, _, _)| id)
+            .collect(),
+    ))
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(api::router())
@@ -321,6 +377,7 @@ pub fn router(state: AppState) -> Router {
         .merge(sales_web::router())
         .merge(purchases_api::router())
         .merge(purchases_web::router())
+        .merge(documents_web::router())
         .merge(suppliers_web::router())
         .merge(users_web::router())
         .merge(roles_web::router())

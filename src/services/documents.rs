@@ -9,6 +9,7 @@ use crate::repositories::{
 
 /// The index over the four repository families. Holds only read paths, so a
 /// page render never touches a write surface.
+#[derive(Clone)]
 pub struct DocumentService<SR, PR, RR, STR> {
     sales: SR,
     purchases: PR,

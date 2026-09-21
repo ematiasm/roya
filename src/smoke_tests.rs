@@ -207,6 +207,39 @@ async fn post_json_with_cookie(
     send_json_with_cookie(app, "PUT", uri, body, cookie).await
 }
 
+/// GET as ANOTHER principal: the cookie value comes from the caller (see
+/// `seed_session_with_permissions`), so a test can drive a second user's page
+/// loads next to the shared fixture session. `htmx` adds the `HX-Request`
+/// header, the way the browser's filter form fetches a fragment.
+async fn get_as(app: &Router, uri: &str, cookie: &str, htmx: bool) -> (StatusCode, String) {
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("cookie", cookie);
+    if htmx {
+        builder = builder.header("HX-Request", "true");
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+/// GET a full page as ANOTHER principal.
+async fn get_with_cookie(app: &Router, uri: &str, cookie: &str) -> (StatusCode, String) {
+    get_as(app, uri, cookie, false).await
+}
+
+/// GET a fragment as ANOTHER principal, with the `HX-Request` header the
+/// browser's filter form sends.
+async fn get_fragment_with_cookie(app: &Router, uri: &str, cookie: &str) -> (StatusCode, String) {
+    get_as(app, uri, cookie, true).await
+}
+
 /// POST a form as ANOTHER principal: the cookie value comes from the caller
 /// (see `seed_session_with_permissions`), so a test can drive a second user
 /// through the HTMX form endpoints next to the shared fixture session.
@@ -1334,6 +1367,12 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
             label: "sales",
             path: "/sales".to_string(),
             concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        GuardedPage {
+            label: "documents",
+            path: "/documents".to_string(),
+            concrete_ids_are_defects: false,
             external_selectors: vec![],
         },
         GuardedPage {
@@ -4421,6 +4460,13 @@ async fn purchase_list_html(app: &Router, query: &str) -> String {
     html
 }
 
+/// The documents list fragment as the browser's filter form fetches it.
+async fn document_list_html(app: &Router, query: &str) -> String {
+    let (status, html) = get(app, &format!("/web/documents{query}")).await;
+    assert_eq!(status, StatusCode::OK, "/web/documents{query}: {html}");
+    html
+}
+
 async fn category_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
     let row: (i64,) = sqlx::query_as("SELECT id FROM categories WHERE name = ?")
         .bind(name)
@@ -7437,6 +7483,335 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
     // The session and receipt triggers survived untouched.
     let (status, page) = get(&crate::routes::router(crate::routes::AppState::new(pool.clone(), false, true)), "/login").await;
     assert_eq!(status, StatusCode::OK, "{page:.200}");
+}
+
+// ---------------------------------------------------------------------------
+// The /documents index: any-of reachability, narrowed content, filters, cap.
+// Every document below is seeded through the same web-flow helpers the
+// neighbouring list tests use; nothing is inserted by hand except the row-cap
+// test, which says so in its own comment.
+// ---------------------------------------------------------------------------
+
+/// The any-of screen opens for any ONE of the four read permissions, and the
+/// content narrows to the families that code owns: the option list and the
+/// rows both obey the permission, so a `sales.read` principal never even sees
+/// the purchases option, and a seeded purchase never leaks into its list.
+#[tokio::test]
+async fn documents_any_single_tier_opens_and_the_content_narrows_to_its_families() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "DOC-P", "1", "50").await;
+    record_stock_via_web(&app, product, "10").await;
+
+    let cash = method_id(&pool, "Cash").await;
+    let _wallet = create_account_via_web(&app, &pool, "DocWallet", &[cash]).await;
+    let buyer = seed_customer(&pool, "DocBuyer", None, None).await;
+    // Credit, so the customer owes and the receipt below has a receivable to
+    // collect against (a collection never exceeds the outstanding debt).
+    let sale = create_sale_draft_on_date(&app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
+    add_sale_line_via_web(&app, sale, product, "1").await;
+    confirm_sale_via_web(&app, sale, None).await;
+    let sale_number = sale_detail(&app, sale).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+
+    let supplier = create_supplier_via_web(&app, &pool, "DocSupplier").await;
+    let purchase = create_purchase_draft_on_date(&app, supplier, "2024-05-10").await;
+    add_purchase_line_via_web(&app, purchase, product, "1").await;
+    confirm_purchase_via_web(&app, purchase).await;
+    let purchase_number = purchase_detail(&app, purchase).await["purchase"]["purchase_number"]
+        .as_str()
+        .expect("confirmed purchase number")
+        .to_string();
+
+    let (status, resp) = post_form(
+        &app,
+        "/web/customer-receipts",
+        &format!("customer_id={buyer}&method_id={cash}&amount=5&date=2024-06-01"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seed receipt: {resp}");
+
+    // sales.read ALONE opens the page, sees only its groups' options and only
+    // the sale rows — the purchase and its option never render.
+    let sales = test_support::seed_session_with_permissions(&pool, &["sales.read"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&sales);
+    let (status, page) = get_with_cookie(&app, "/documents", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(r#"data-document-group="sales""#), "{page:.600}");
+    assert!(!page.contains(r#"data-document-group="purchases""#), "{page:.600}");
+    assert!(page.contains(&sale_number), "{page:.600}");
+    assert!(!page.contains(&purchase_number), "{page:.600}");
+    let (status, fragment) = get_fragment_with_cookie(&app, "/web/documents", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{fragment:.400}");
+    assert!(fragment.contains(&sale_number), "{fragment:.600}");
+    assert!(!fragment.contains(&purchase_number), "{fragment:.600}");
+
+    // customers.read ALONE: the payments families open, the sales option and
+    // the sale rows never render, and the receipt row does.
+    let customers = test_support::seed_session_with_permissions(&pool, &["customers.read"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&customers);
+    let (status, page) = get_with_cookie(&app, "/documents", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(r#"data-document-group="payments""#), "{page:.600}");
+    assert!(!page.contains(r#"data-document-group="sales""#), "{page:.600}");
+    assert!(!page.contains(&sale_number), "{page:.600}");
+    let (status, fragment) = get_fragment_with_cookie(&app, "/web/documents", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{fragment:.400}");
+    assert!(
+        fragment.contains("Recibo de cliente"),
+        "the receipt row must render for the customers reader: {fragment:.600}"
+    );
+}
+
+/// Deny by default: a principal holding none of the four codes is refused the
+/// page AND the fragment request the browser's filter form makes. The empty
+/// set must never open an any-of screen.
+#[tokio::test]
+async fn documents_deny_by_default_refuses_the_page_and_the_fragment() {
+    let (app, pool) = test_app().await;
+    let none = test_support::seed_session_with_permissions(&pool, &[])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&none);
+    let (status, _) = get_with_cookie(&app, "/documents", &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the empty set must not open /documents"
+    );
+    let (status, _) = get_fragment_with_cookie(&app, "/web/documents", &cookie).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the empty set must not open /web/documents"
+    );
+}
+
+/// The fragment is a fragment: the browser's filter form swaps it into the
+/// list region, so it must never carry the page shell.
+#[tokio::test]
+async fn documents_fragment_is_a_fragment_not_a_page() {
+    let (app, pool) = test_app().await;
+    let sales = test_support::seed_session_with_permissions(&pool, &["sales.read"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&sales);
+    let (status, fragment) = get_fragment_with_cookie(&app, "/web/documents", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{fragment:.400}");
+    assert!(
+        !fragment.contains("<html"),
+        "the fragment must not render the shell: {fragment:.400}"
+    );
+}
+
+/// The filters narrow: type, actor, number search and the inclusive date
+/// range each work alone; a filter matching nothing is the empty state, never
+/// an error; and the full page honours the same filters, so a filtered view is
+/// bookmarkable. The session here holds all four codes (the shared fixture),
+/// plus a second actor holding the same four, so the user filter has two
+/// actors to tell apart.
+#[tokio::test]
+async fn documents_filters_narrow_by_group_user_text_and_date() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "DOC-F", "1", "50").await;
+    record_stock_via_web(&app, product, "10").await;
+
+    let ana = seed_customer(&pool, "DocFiltAna", None, None).await;
+    let beto = seed_customer(&pool, "DocFiltBeto", None, None).await;
+
+    // Two actors: the shared fixture session registers the May sale; a probe
+    // principal holding the same four codes registers the July one. The Cash
+    // method needs an account allowlist before a cash sale confirms.
+    let cash = method_id(&pool, "Cash").await;
+    let _wallet = create_account_via_web(&app, &pool, "DocFiltWallet", &[cash]).await;
+    let may_sale = create_sale_draft_on_date(&app, ana, "Cash", "2024-05-02", "").await;
+    add_sale_line_via_web(&app, may_sale, product, "1").await;
+    confirm_sale_via_web(&app, may_sale, Some(cash)).await;
+    let may_number = sale_detail(&app, may_sale).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+
+    let probe = test_support::seed_session_with_permissions(
+        &pool,
+        &[
+            "sales.read",
+            "sales.create",
+            "purchases.read",
+            "inventory.read",
+            "customers.read",
+        ],
+    )
+    .await
+    .unwrap();
+    let probe_cookie = test_support::cookie_for(&probe);
+    let july_sale = create_sale_draft_on_date_as(&app, &probe_cookie, beto, "2024-07-15").await;
+    add_sale_line_via_web(&app, july_sale, product, "1").await;
+    confirm_sale_via_web(&app, july_sale, Some(cash)).await;
+    let july_number = sale_detail(&app, july_sale).await["sale"]["sale_number"]
+        .as_str()
+        .expect("confirmed sale number")
+        .to_string();
+
+    let supplier = create_supplier_via_web(&app, &pool, "DocFiltSupplier").await;
+    let purchase = create_purchase_draft_on_date(&app, supplier, "2024-05-10").await;
+    add_purchase_line_via_web(&app, purchase, product, "1").await;
+    confirm_purchase_via_web(&app, purchase).await;
+    let purchase_number = purchase_detail(&app, purchase).await["purchase"]["purchase_number"]
+        .as_str()
+        .expect("confirmed purchase number")
+        .to_string();
+
+    // Type alone: the purchases option shows the purchase and neither sale.
+    let purchases_only = document_list_html(&app, "?group=purchases").await;
+    assert!(purchases_only.contains(&purchase_number), "{purchases_only:.600}");
+    assert!(!purchases_only.contains(&may_number), "{purchases_only:.600}");
+    assert!(!purchases_only.contains(&july_number), "{purchases_only:.600}");
+
+    // Number: a fragment the operator remembers finds its document; combined
+    // with the type it excludes the other families' numbers too.
+    let may_tail = &may_number[may_number.len() - 6..];
+    let by_number = document_list_html(&app, &format!("?group=sales&q={may_tail}")).await;
+    assert!(by_number.contains(&may_number), "{by_number:.600}");
+    assert!(!by_number.contains(&july_number), "{by_number:.600}");
+    assert!(!by_number.contains(&purchase_number), "{by_number:.600}");
+    let july_tail = &july_number[july_number.len() - 6..];
+    let other_number = document_list_html(&app, &format!("?group=sales&q={july_tail}")).await;
+    assert!(other_number.contains(&july_number), "{other_number:.600}");
+    assert!(!other_number.contains(&may_number), "{other_number:.600}");
+
+    // User: the seeder's display name keeps that actor's documents and drops
+    // the other actor's. The assertions read the SALE rows specifically: a
+    // confirm also writes a stock movement that carries the sale number as its
+    // reference, so a naive substring check would see the number on the
+    // movement row another actor legitimately owns.
+    let by_user = document_list_html(&app, "?user=Test%20Admin").await;
+    assert!(row_having(&by_user, "sale", &may_number), "{by_user:.600}");
+    assert!(!row_having(&by_user, "sale", &july_number), "{by_user:.600}");
+    let by_probe_user = document_list_html(&app, "?user=Test%20Probe").await;
+    assert!(row_having(&by_probe_user, "sale", &july_number), "{by_probe_user:.600}");
+    assert!(!row_having(&by_probe_user, "sale", &may_number), "{by_probe_user:.600}");
+
+    // Dates bound inclusively on both ends.
+    let july = document_list_html(&app, "?from=2024-07-01&to=2024-07-31").await;
+    assert!(row_having(&july, "sale", &july_number), "{july:.600}");
+    assert!(!row_having(&july, "sale", &may_number), "{july:.600}");
+    assert!(!july.contains(&purchase_number), "{july:.600}");
+    let inclusive = document_list_html(&app, "?from=2024-07-15&to=2024-07-15").await;
+    assert!(row_having(&inclusive, "sale", &july_number), "{inclusive:.600}");
+    assert!(!row_having(&inclusive, "sale", &may_number), "{inclusive:.600}");
+
+    // A filter matching nothing is the empty state, never an error.
+    let none = document_list_html(&app, "?user=NoSuchOperator").await;
+    assert!(none.contains("Nothing here yet."), "{none:.600}");
+    assert!(!none.contains(&may_number), "{none:.600}");
+
+    // The full page honours the same filters, so a filtered view is
+    // bookmarkable and re-opens exactly as shared.
+    let (status, page) = get(&app, "/documents?group=purchases").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(&purchase_number), "{page:.600}");
+    assert!(!page.contains(&may_number), "{page:.600}");
+    let (status, page) = get(&app, &format!("/documents?user=Test%20Admin&q={may_tail}")).await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(page.contains(&may_number), "{page:.600}");
+    assert!(!page.contains(&july_number), "{page:.600}");
+}
+
+/// The cap is disclosed: a feed that hits `DOCUMENTS_PAGE_LIMIT` says so, and
+/// a narrower date range that selects fewer rows does not claim truncation.
+/// The rows are inserted with direct SQL inside one transaction — 205 form
+/// posts would dominate the suite's runtime for what is a row-count property.
+#[tokio::test]
+async fn documents_page_limit_is_disclosed_when_the_feed_is_cut() {
+    use crate::models::DOCUMENTS_PAGE_LIMIT;
+    let (app, pool) = test_app().await;
+    let actor = test_support::audit_actor_id(&pool).await.unwrap();
+    let walkin: i64 = sqlx::query_scalar("SELECT id FROM customers WHERE is_walkin = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    for _ in 0..(DOCUMENTS_PAGE_LIMIT + 5) {
+        sqlx::query(
+            "INSERT INTO sales (status, payment_type, customer_id, customer_name, \
+             sale_date, created_by) \
+             VALUES ('Confirmed', 'Cash', ?, 'CapFill', '2024-09-01', ?)",
+        )
+        .bind(walkin)
+        .bind(actor)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    let sales = test_support::seed_session_with_permissions(&pool, &["sales.read"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&sales);
+    let (status, fragment) =
+        get_fragment_with_cookie(&app, "/web/documents?group=sales", &cookie).await;
+    assert_eq!(status, StatusCode::OK, "{fragment:.400}");
+    assert!(
+        fragment.contains(r#"data-document-truncated="true""#),
+        "a feed cut at {DOCUMENTS_PAGE_LIMIT} rows must say so: {fragment:.600}"
+    );
+
+    let (status, narrower) = get_fragment_with_cookie(
+        &app,
+        "/web/documents?group=sales&from=2024-01-01&to=2024-01-31",
+        &cookie,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{narrower:.400}");
+    assert!(
+        !narrower.contains(r#"data-document-truncated="true""#),
+        "a date range that selects fewer rows must not claim truncation: {narrower:.600}"
+    );
+}
+
+/// The row of exactly one document family that carries `needle` in its markup
+/// (reference, party, date line or pill), reading the rendered rows by their
+/// `data-document-kind` marker so a number quoted on a DIFFERENT family's row
+/// (a stock movement references the sale that produced it) never confuses the
+/// assertion.
+fn row_having(html: &str, kind: &str, needle: &str) -> bool {
+    html.split(r#"data-document-kind=""#)
+        .skip(1)
+        .any(|chunk| {
+            chunk.split('"').next().unwrap_or("") == kind && chunk.contains(needle)
+        })
+}
+
+/// Create a sale draft as the principal the cookie carries, on an explicit
+/// date, through the same web form endpoint the browser uses; returns the id
+/// (the last sale for that customer, as the other draft helpers resolve it).
+async fn create_sale_draft_on_date_as(
+    app: &Router,
+    cookie: &str,
+    customer_id: i64,
+    sale_date: &str,
+) -> i64 {
+    let body = format!("customer_id={customer_id}&payment_type=Cash&sale_date={sale_date}");
+    let (status, resp) = post_form_with_cookie(app, "/web/sales", &body, cookie).await;
+    assert_eq!(status, StatusCode::OK, "create sale as probe: {resp}");
+    let (status, body) = get(app, "/api/sales").await;
+    assert_eq!(status, StatusCode::OK, "list sales: {body}");
+    let v = json_body(&body);
+    v["sales"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["sale"]["customer_id"] == json!(customer_id))
+        .last()
+        .and_then(|d| d["sale"]["id"].as_i64())
+        .unwrap_or_else(|| panic!("sale for customer {customer_id} not found: {v}"))
 }
 
 /// Helper: a user's id by username, through the real table.
