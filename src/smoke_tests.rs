@@ -7813,6 +7813,9 @@ struct DrawerFixture {
     purchase_number: String,
     product: i64,
     account: i64,
+    /// An unconfirmed sale: the family's destructive delete control (a bare
+    /// `hx-delete` button, not a form) is only rendered for drafts.
+    draft_sale: i64,
 }
 
 async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
@@ -7893,6 +7896,10 @@ async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
         .to_string();
     let purchase_payment = detail["payments"][0]["id"].as_i64().expect("purchase payment id");
 
+    // One unconfirmed sale: the drawer's delete control is only rendered for
+    // drafts, so the error-handler label assertion needs one of its own.
+    let draft_sale = create_sale_draft_on_date(app, buyer, "Credit", "2024-05-13", "2024-07-13").await;
+
     DrawerFixture {
         sale,
         sale_payment,
@@ -7904,6 +7911,7 @@ async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
         purchase_number,
         product,
         account,
+        draft_sale,
     }
 }
 
@@ -7925,6 +7933,34 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     assert!(body.contains("Registrado por"), "{body:.800}");
     assert!(body.contains("Test Admin"), "{body:.800}");
     assert!(body.contains(&format!("/sales/{}", f.sale)), "{body:.800}");
+    // The confirmed sale's annul form carries the id the cancel endpoint
+    // reads from the body: a broken hidden field would POST an invalid id.
+    assert!(
+        body.contains(&format!(r#"name="sale_id" value="{}""#, f.sale)),
+        "the annul form must carry the document's id: {body:.800}"
+    );
+
+    // Draft sale: the destructive delete control is a bare `<button
+    // hx-delete ...>` and carries the server-rendered `data-action` label the
+    // page's global error handler reads from the element itself when the
+    // request fails (a button has no form for `closest('form[data-action]')`
+    // to find). The JS announce behaviour itself is covered by reading the
+    // handler, not by a browser test.
+    let (status, body) = get(&app, &format!("/web/documents/detail/sale/{}", f.draft_sale)).await;
+    assert_eq!(status, StatusCode::OK, "draft sale drawer: {body:.400}");
+    assert!(
+        body.contains(r#"data-action="Eliminar borrador""#),
+        "the draft delete button must render the error-handler action label: {body:.800}"
+    );
+    assert!(
+        body.contains(&format!(r#"hx-delete="/web/sales/{}""#, f.draft_sale)),
+        "the draft delete must be the hx-delete button for the draft's own path: {body:.800}"
+    );
+    assert_eq!(
+        body.matches("Eliminar borrador").count(),
+        3, // impact-preview header + button text + data-action attribute
+        "the draft drawer must name the delete action exactly three times (label twice + data-action):\n{body}"
+    );
 
     // Sale payment: the payment's own amount, account, method and ledger
     // transaction, plus the parent sale's summary as a sub-block.
@@ -7943,6 +7979,11 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     assert!(body.contains(&f.purchase_number), "{body:.800}");
     assert!(body.contains("DrawerSupplier"), "{body:.800}");
     assert!(body.contains(&format!("/purchases/{}", f.purchase)), "{body:.800}");
+    // The purchase twin: the annul form's hidden field carries the id too.
+    assert!(
+        body.contains(&format!(r#"name="purchase_id" value="{}""#, f.purchase)),
+        "the purchase annul form must carry the document's id: {body:.800}"
+    );
 
     // Purchase payment: amount and parent purchase summary.
     let (status, body) = get(&app, &format!("/web/documents/detail/purchase_payment/{}", f.purchase_payment)).await;

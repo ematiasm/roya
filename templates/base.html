@@ -105,12 +105,25 @@
         var elt = (detail.requestConfig && detail.requestConfig.elt) || detail.elt;
         return elt && elt.matches && elt.matches('form[data-action]') ? elt : null;
       }
+      // Failure notices name the action the operator actually triggered, and
+      // that trigger is not always a form: the document drawer's delete
+      // (Anular / Descartar / Eliminar borrador) is a bare `<button hx-delete
+      // data-action=...>`. So the error path accepts only the element's own
+      // `data-action` and otherwise falls back to the raw request path. The
+      // SUCCESS path keeps `actionForm` (forms only) deliberately: "saved" only
+      // makes sense for a form that saves something, and a debounced search
+      // must never announce "Add line saved".
+      function failedAction(evt) {
+        var detail = evt.detail || {};
+        var elt = (detail.requestConfig && detail.requestConfig.elt) || detail.elt;
+        if (elt && elt.matches && elt.matches('[data-action]')) return elt.getAttribute('data-action');
+        return null;
+      }
       document.body.addEventListener('htmx:responseError', function (evt) {
         var message = evt.detail.xhr.responseText;
         try { message = JSON.parse(message).error || message; } catch (e) { /* keep the raw body */ }
-        var form = actionForm(evt);
-        var action = form ? form.getAttribute('data-action')
-          : (evt.detail.pathInfo && evt.detail.pathInfo.requestPath) || 'The request';
+        var action = failedAction(evt)
+          || (evt.detail.pathInfo && evt.detail.pathInfo.requestPath) || 'The request';
         notice('error', action + ' failed — ' + message);
       });
       document.body.addEventListener('htmx:afterRequest', function (evt) {

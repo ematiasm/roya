@@ -319,7 +319,7 @@ def test_the_impact_preview_renders_before_the_button(page: Page, api: ApiClient
     # The draft: the delete action with its impact above the button.
     _open_drawer(page, "sale", draft_id)
     body = page.locator(_DETAIL_INNER)
-    expect(body).to_contain_text("Se elimina el borrador y sus 1 líneas")
+    expect(body).to_contain_text("Se elimina el borrador y su 1 línea")
     expect(body).to_contain_text("Nunca se confirmó")
     delete_button = body.locator('button[hx-delete="/web/sales/%d"]' % draft_id)
     expect(delete_button).to_be_visible()
@@ -375,6 +375,106 @@ def test_deleting_a_draft_refreshes_the_feed_and_closes_the_drawer(
     assert urlparse(page.url).path == _DOCUMENTS_PAGE, (
         f"the delete navigated away: {page.url}"
     )
+
+
+def test_annulling_a_confirmed_sale_refreshes_the_feed_and_closes_the_drawer(
+    page: Page, api: ApiClient
+) -> None:
+    """The drawer's annul form presses like the delete: dialog, feed, close.
+
+    The POST carries the hidden `sale_id` the form renders — the flow below
+    only works when that field carries the document's id — and the
+    `sale-changed` reaction is the same one the delete proved: the feed
+    re-reads (the row's status line becomes the annulled state), the drawer
+    hides and empties, and the URL never moves.
+    """
+    product_id = create_product(
+        api, sku="ANNUL-WIDGET", name="Annul Widget", stock="5",
+        min_stock="1", max_stock="100",
+    )["id"]
+    customer_id = create_customer(api, "Annul Buyer")
+    sale_id = create_confirmed_credit_sale(api, customer_id, product_id)
+    sale_number = api.get_json(f"/api/sales/{sale_id}")["sale"]["sale_number"]
+
+    _open_documents_page(page, api)
+    listing = page.locator(_DOCUMENT_LIST)
+    expect(listing).to_contain_text(sale_number)
+
+    _open_drawer(page, "sale", sale_id)
+    body = page.locator(_DETAIL_INNER)
+    form = body.locator('form[hx-post="/web/sales/cancel"]')
+    expect(form).to_be_visible()
+    expect(form.locator('input[name="sale_id"]')).to_have_value(str(sale_id))
+
+    seen = _answer_next_dialog(page, accept=True)
+    with page.expect_response(_response_for("/web/sales/cancel", "POST")):
+        form.locator('button[type="submit"]').click()
+    assert "no se puede deshacer" in seen[0], seen
+
+    # The feed re-read lands the row's new state; expect() polls for it.
+    expect(
+        listing.locator('[data-document-kind="sale"]', has_text=sale_number)
+    ).to_contain_text("Cancelled")
+    expect(page.locator(_DRAWER)).not_to_be_visible()
+    assert page.evaluate(
+        "document.getElementById('document-drawer-body').innerHTML"
+    ) == "", "the closed drawer must be empty, not merely hidden"
+    assert urlparse(page.url).path == _DOCUMENTS_PAGE, (
+        f"the annul navigated away: {page.url}"
+    )
+
+
+def test_a_refused_annul_names_the_action_and_the_server_message(
+    page: Page, api: ApiClient
+) -> None:
+    """A server refusal reads like the sibling forms', never as a raw path.
+
+    The drawer's annul form carries ``data-action`` like every sibling form,
+    so the page's global error handler names the action the operator pressed
+    and appends the server's message verbatim. The refusal is real: a cash
+    sale whose paying account was drained, so the refund the annulment would
+    post is refused for the negative balance the endpoint enforces.
+    """
+    account_id = create_account_with_methods(api, "Caja", ("Cash",))
+    method_id = account_method_id(api, account_id, "Cash")
+    product_id = create_product(
+        api, sku="REFUSE-WIDGET", name="Refuse Widget", stock="5",
+        min_stock="1", max_stock="100",
+    )["id"]
+    customer_id = create_customer(api, "Refuse Buyer")
+    sale_id = create_sale_draft(api, customer_id)
+    add_sale_line(api, sale_id, product_id, qty="1", unit_price="10.00")
+    # The cash confirm pays 10.00 into the account...
+    api.post_json(f"/api/sales/{sale_id}/confirm", {"method_id": method_id})
+    # ...and the drain leaves nothing for the annulment's refund to pay from.
+    api.post_json(
+        "/api/transactions",
+        {
+            "account_id": account_id,
+            "type": "Expense",
+            "amount": "10.00",
+            "description": None,
+            "reference": None,
+            "date": "2024-05-03",
+        },
+    )
+
+    _open_documents_page(page, api)
+    _open_drawer(page, "sale", sale_id)
+    body = page.locator(_DETAIL_INNER)
+    form = body.locator('form[hx-post="/web/sales/cancel"]')
+    expect(form).to_be_visible()
+
+    _answer_next_dialog(page, accept=True)
+    with page.expect_response(_response_for("/web/sales/cancel", "POST")):
+        form.locator('button[type="submit"]').click()
+
+    # The refusal names the pressed action, then the server's own message.
+    notice = page.locator("[data-notice='error']")
+    expect(notice).to_contain_text("Anular documento failed")
+    expect(notice).to_contain_text("negative balance")
+    # The refusal leaves the operator with the document, not a closed drawer.
+    expect(page.locator(_DRAWER)).to_be_visible()
 
 
 def test_a_sales_read_only_principal_sees_only_the_sales_family(
