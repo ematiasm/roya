@@ -131,6 +131,11 @@ el permiso «sales.read» para ver este documento"), and the mapping it quotes i
 route and the kernel agreement test share. Nothing a request supplies can widen it: the kind comes
 from the URL, and the URL's token decides nothing the principal's codes have not already decided.
 
+The drawer's links obey the same discipline one step further: a link renders only when the principal
+holds the code its target route declares, so no link is a dead end — and a reader who cannot follow
+a link still reads the datum as text (the payment's ledger entry stays a fact, an allocation keeps
+its sale number).
+
 The index itself still owns no table: the drawer's reads ride the repositories and services that own
 each family (including the only two reads it added — one payment by id in `sale_repo.rs` and
 `purchase_repo.rs`, both one query), and its one WRITE delegates entirely — the draft delete goes

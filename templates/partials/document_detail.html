@@ -67,10 +67,12 @@
       {% if a.method == "delete" %}
       <button type="button"
               class="mt-2 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              data-action="{{ a.data_action }}"
               hx-delete="{{ a.path }}" hx-swap="none"
               {% if let Some(c) = a.confirm %}hx-confirm="{{ c }}"{% endif %}>{{ a.label }}</button>
       {% else %}
       <form class="mt-2 flex flex-col gap-2"
+            data-action="{{ a.data_action }}"
             hx-post="{{ a.path }}" hx-swap="none"
             {% if let Some(c) = a.confirm %}hx-confirm="{{ c }}"{% endif %}>
         {% for f in a.fields %}
@@ -78,7 +80,7 @@
         {% endfor %}
         {% if a.reason %}
         <input class="w-full rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs"
-               type="text" name="reason" maxlength="300" placeholder="Motivo (opcional)" />
+               type="text" name="reason" maxlength="256" placeholder="Motivo (opcional)" />
         {% endif %}
         <button type="submit"
                 class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">{{ a.label }}</button>

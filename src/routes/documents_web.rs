@@ -24,8 +24,8 @@ use crate::models::{
 };
 use crate::routes::AppState;
 use crate::security::authz::{
-    CustomersRead, InventoryRead, Nav, Permission, Principal, PurchasesCancel, PurchasesCreate,
-    PurchasesRead, RequireAny, SalesCancel, SalesCreate, SalesRead,
+    CustomersRead, FinanceRead, InventoryRead, Nav, Permission, Principal, PurchasesCancel,
+    PurchasesCreate, PurchasesRead, RequireAny, SalesCancel, SalesCreate, SalesRead,
 };
 
 pub fn router() -> Router<AppState> {
@@ -392,7 +392,9 @@ struct DrawerParent {
 }
 
 /// One link at the drawer's foot: the page that owns the document (or its
-/// ledger entry), always gated by the same code that opened the drawer.
+/// ledger entry). A link renders only when the principal holds the code its
+/// target route declares, so no link is a dead end — a reader who cannot
+/// follow a link still reads the datum as text in the facts.
 struct DrawerLink {
     label: String,
     href: String,
@@ -413,6 +415,10 @@ struct DrawerAction {
     /// Whether the action takes an optional free-text reason (both cancel
     /// endpoints store it in `cancel_reason`).
     reason: bool,
+    /// The human action name the page's global error handler announces when
+    /// the action fails, so a refusal reads like the sibling forms' and never
+    /// as a raw path.
+    data_action: String,
     /// The impact preview: what this action deletes or creates, one line each,
     /// computed from the same reads the endpoint will use. This is the warning
     /// the operator must read before acting.
@@ -428,7 +434,6 @@ struct DrawerAction {
 #[derive(Template)]
 #[template(path = "partials/document_detail.html")]
 struct DocumentDetailPartial {
-    kind_token: String,
     kind_label: String,
     title: String,
     status_line: String,
@@ -485,11 +490,11 @@ async fn document_detail(
     }
     match kind {
         DocumentKind::Sale => sale_drawer(state, &principal, id).await,
-        DocumentKind::SalePayment => sale_payment_drawer(state, id).await,
+        DocumentKind::SalePayment => sale_payment_drawer(state, &principal, id).await,
         DocumentKind::Purchase => purchase_drawer(state, &principal, id).await,
-        DocumentKind::PurchasePayment => purchase_payment_drawer(state, id).await,
+        DocumentKind::PurchasePayment => purchase_payment_drawer(state, &principal, id).await,
         DocumentKind::StockMovement => stock_movement_drawer(state, id).await,
-        DocumentKind::Receipt => receipt_drawer(state, id).await,
+        DocumentKind::Receipt => receipt_drawer(state, &principal, id).await,
     }
 }
 
@@ -518,13 +523,12 @@ fn edit_affordance_link(status: &str, href: String) -> DrawerLink {
 
 /// The edit affordance as text: where the multi-field actions live, worded by
 /// state. The drawer states it instead of building edit forms it would have
-/// to keep in lockstep with the endpoints.
+/// to keep in lockstep with the endpoints. A draft cannot take payments —
+/// only a Confirmed document does — so the payments mention belongs to the
+/// confirmed state's sentence, never to the draft's.
 fn edit_affordance_notice(status: &str) -> String {
     match status {
-        "Draft" => {
-            "Para editar la cabecera, agregar líneas, confirmar o registrar pagos, abrí el documento."
-                .to_string()
-        }
+        "Draft" => "Para editar la cabecera, agregar líneas o confirmar, abrí el documento.".to_string(),
         "Confirmed" => {
             "Para registrar pagos o ver el detalle completo, abrí el documento.".to_string()
         }
@@ -532,6 +536,17 @@ fn edit_affordance_notice(status: &str) -> String {
             "El documento está anulado. Para ver el detalle completo y su historia, abrí el documento."
                 .to_string()
         }
+    }
+}
+
+/// The draft line count, worded once so the preview and the confirm question
+/// cannot disagree: "1 línea" for a single line, "N líneas" otherwise, with
+/// the possessive and the parenthetical agreeing.
+fn draft_lines_phrase(n: usize) -> (String, String) {
+    if n == 1 {
+        ("su 1 línea".to_string(), "listada arriba".to_string())
+    } else {
+        (format!("sus {n} líneas"), "listadas arriba".to_string())
     }
 }
 
@@ -551,19 +566,21 @@ async fn sale_actions(
         SaleStatus::Draft => {
             if principal.has(SalesCreate::CODE) {
                 let n = record.lines.len();
+                let (lines_phrase, listed) = draft_lines_phrase(n);
                 actions.push(DrawerAction {
                     label: "Eliminar borrador".to_string(),
                     method: "delete".to_string(),
                     path: format!("/web/sales/{}", sale.id),
                     fields: vec![],
                     reason: false,
+                    data_action: "Eliminar borrador".to_string(),
                     impact: vec![
-                        format!("Se elimina el borrador y sus {n} líneas (listadas arriba)."),
+                        format!("Se elimina el borrador y {lines_phrase} ({listed})."),
                         "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
                             .to_string(),
                     ],
                     confirm: Some(format!(
-                        "¿Eliminar el borrador y sus {n} líneas? Esta acción no se puede deshacer."
+                        "¿Eliminar el borrador y {lines_phrase}? Esta acción no se puede deshacer."
                     )),
                 });
             }
@@ -574,6 +591,7 @@ async fn sale_actions(
                     path: "/web/sales/cancel".to_string(),
                     fields: vec![("sale_id".to_string(), sale.id.to_string())],
                     reason: true,
+                    data_action: "Descartar borrador".to_string(),
                     impact: vec![
                         "El borrador pasa a Anulado y deja de aparecer como editable.".to_string(),
                         "No hay stock, ni pagos, ni asientos que revertir.".to_string(),
@@ -646,6 +664,7 @@ async fn sale_annul_action(
         path: "/web/sales/cancel".to_string(),
         fields: vec![("sale_id".to_string(), sale.id.to_string())],
         reason: true,
+        data_action: "Anular documento".to_string(),
         impact,
         confirm: Some("¿Anular este documento? Esta acción no se puede deshacer.".to_string()),
     })
@@ -667,19 +686,21 @@ async fn purchase_actions(
         PurchaseStatus::Draft => {
             if principal.has(PurchasesCreate::CODE) {
                 let n = record.lines.len();
+                let (lines_phrase, listed) = draft_lines_phrase(n);
                 actions.push(DrawerAction {
                     label: "Eliminar borrador".to_string(),
                     method: "delete".to_string(),
                     path: format!("/web/purchases/{}", purchase.id),
                     fields: vec![],
                     reason: false,
+                    data_action: "Eliminar borrador".to_string(),
                     impact: vec![
-                        format!("Se elimina el borrador y sus {n} líneas (listadas arriba)."),
+                        format!("Se elimina el borrador y {lines_phrase} ({listed})."),
                         "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
                             .to_string(),
                     ],
                     confirm: Some(format!(
-                        "¿Eliminar el borrador y sus {n} líneas? Esta acción no se puede deshacer."
+                        "¿Eliminar el borrador y {lines_phrase}? Esta acción no se puede deshacer."
                     )),
                 });
             }
@@ -690,6 +711,7 @@ async fn purchase_actions(
                     path: "/web/purchases/cancel".to_string(),
                     fields: vec![("purchase_id".to_string(), purchase.id.to_string())],
                     reason: true,
+                    data_action: "Descartar borrador".to_string(),
                     impact: vec![
                         "El borrador pasa a Anulado y deja de aparecer como editable.".to_string(),
                         "No hay stock, ni pagos, ni asientos que revertir.".to_string(),
@@ -734,6 +756,7 @@ async fn purchase_actions(
                     path: "/web/purchases/cancel".to_string(),
                     fields: vec![("purchase_id".to_string(), purchase.id.to_string())],
                     reason: true,
+                    data_action: "Anular documento".to_string(),
                     impact,
                     confirm: Some(
                         "¿Anular este documento? Esta acción no se puede deshacer.".to_string(),
@@ -852,7 +875,6 @@ async fn sale_drawer(
     ];
 
     Ok(DocumentDetailPartial {
-        kind_token: DocumentKind::Sale.token().to_string(),
         kind_label: DocumentKind::Sale.label().to_string(),
         title: document_title(sale.sale_number.as_deref(), sale.id),
         status_line: sale.status.to_string(),
@@ -873,7 +895,11 @@ async fn sale_drawer(
 /// a cancelled sale, the refund Expense — linked to the account page that owns
 /// the ledger, never a second account-name read), and the receipt that grouped
 /// it when one did.
-async fn sale_payment_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPartial> {
+async fn sale_payment_drawer(
+    state: &AppState,
+    principal: &Principal,
+    id: i64,
+) -> AppResult<DocumentDetailPartial> {
     let payment = state.sales_service.find_payment(id).await?;
     let record = state.sales_service.get_record(payment.sale_id).await?;
     let sale = &record.sale;
@@ -892,14 +918,19 @@ async fn sale_payment_drawer(state: &AppState, id: i64) -> AppResult<DocumentDet
 
     // The ledger links: the account page owns the transaction's name and
     // balance, so the drawer links there instead of re-reading an account.
+    // The account page declares `finance.read`, which a payment reader does
+    // not necessarily hold, so the link renders only for a finance reader —
+    // the entry itself stays a fact below either way.
     let mut links = Vec::new();
     let original = match payment.transaction_id {
         Some(tx_id) => {
             let tx = state.transaction_service.get(tx_id).await?;
-            links.push(DrawerLink {
-                label: "Ver asiento en Caja".to_string(),
-                href: format!("/accounts/{}", tx.account_id),
-            });
+            if principal.has(FinanceRead::CODE) {
+                links.push(DrawerLink {
+                    label: "Ver asiento en Caja".to_string(),
+                    href: format!("/accounts/{}", tx.account_id),
+                });
+            }
             Some(tx)
         }
         None => None,
@@ -907,17 +938,22 @@ async fn sale_payment_drawer(state: &AppState, id: i64) -> AppResult<DocumentDet
     let refund = match payment.refund_transaction_id {
         Some(tx_id) => {
             let tx = state.transaction_service.get(tx_id).await?;
-            links.push(DrawerLink {
-                label: "Ver reembolso en Caja".to_string(),
-                href: format!("/accounts/{}", tx.account_id),
-            });
+            if principal.has(FinanceRead::CODE) {
+                links.push(DrawerLink {
+                    label: "Ver reembolso en Caja".to_string(),
+                    href: format!("/accounts/{}", tx.account_id),
+                });
+            }
             Some(tx)
         }
         None => None,
     };
-    if let Some(receipt_id) = payment.receipt_id {
+    // The receipt grouped this payment; the customer page declares
+    // `customers.read`, so the link obeys the same rule. The receipt NUMBER
+    // stays a fact below either way.
+    if payment.receipt_id.is_some() && principal.has(CustomersRead::CODE) {
         links.push(DrawerLink {
-            label: "Ver recibo del cliente".to_string(),
+            label: "Ver el cliente del recibo".to_string(),
             href: format!("/customers/{}", sale.customer_id),
         });
     }
@@ -963,7 +999,6 @@ async fn sale_payment_drawer(state: &AppState, id: i64) -> AppResult<DocumentDet
     };
 
     Ok(DocumentDetailPartial {
-        kind_token: DocumentKind::SalePayment.token().to_string(),
         kind_label: DocumentKind::SalePayment.label().to_string(),
         title: format!("Pago de {}", document_title(sale.sale_number.as_deref(), sale.id)),
         status_line: format!("Pago · {} · {}", payment.date, sale.status),
@@ -1062,7 +1097,6 @@ async fn purchase_drawer(
     ];
 
     Ok(DocumentDetailPartial {
-        kind_token: DocumentKind::Purchase.token().to_string(),
         kind_label: DocumentKind::Purchase.label().to_string(),
         title: document_title(purchase.purchase_number.as_deref(), purchase.id),
         status_line: purchase.status.to_string(),
@@ -1080,7 +1114,11 @@ async fn purchase_drawer(
 
 /// The PURCHASE-PAYMENTS family: the mirror of the sale-payment drawer with
 /// `purchase-changed`-family links.
-async fn purchase_payment_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPartial> {
+async fn purchase_payment_drawer(
+    state: &AppState,
+    principal: &Principal,
+    id: i64,
+) -> AppResult<DocumentDetailPartial> {
     let payment = state.purchases_service.find_payment(id).await?;
     let record = state.purchases_service.get_record(payment.purchase_id).await?;
     let purchase = &record.purchase;
@@ -1097,14 +1135,19 @@ async fn purchase_payment_drawer(state: &AppState, id: i64) -> AppResult<Documen
     let (created_by, updated_by) =
         actor_facts(state, payment.created_by, payment.updated_by).await?;
 
+    // The ledger links, gated like the sale side: `/accounts/{id}` declares
+    // `finance.read`, so the link renders only for a finance reader while the
+    // entry stays a fact below either way.
     let mut links = Vec::new();
     let original = match payment.transaction_id {
         Some(tx_id) => {
             let tx = state.transaction_service.get(tx_id).await?;
-            links.push(DrawerLink {
-                label: "Ver asiento en Caja".to_string(),
-                href: format!("/accounts/{}", tx.account_id),
-            });
+            if principal.has(FinanceRead::CODE) {
+                links.push(DrawerLink {
+                    label: "Ver asiento en Caja".to_string(),
+                    href: format!("/accounts/{}", tx.account_id),
+                });
+            }
             Some(tx)
         }
         None => None,
@@ -1112,10 +1155,12 @@ async fn purchase_payment_drawer(state: &AppState, id: i64) -> AppResult<Documen
     let refund = match payment.refund_transaction_id {
         Some(tx_id) => {
             let tx = state.transaction_service.get(tx_id).await?;
-            links.push(DrawerLink {
-                label: "Ver reembolso en Caja".to_string(),
-                href: format!("/accounts/{}", tx.account_id),
-            });
+            if principal.has(FinanceRead::CODE) {
+                links.push(DrawerLink {
+                    label: "Ver reembolso en Caja".to_string(),
+                    href: format!("/accounts/{}", tx.account_id),
+                });
+            }
             Some(tx)
         }
         None => None,
@@ -1159,7 +1204,6 @@ async fn purchase_payment_drawer(state: &AppState, id: i64) -> AppResult<Documen
     };
 
     Ok(DocumentDetailPartial {
-        kind_token: DocumentKind::PurchasePayment.token().to_string(),
         kind_label: DocumentKind::PurchasePayment.label().to_string(),
         title: format!(
             "Pago de {}",
@@ -1206,7 +1250,6 @@ async fn stock_movement_drawer(state: &AppState, id: i64) -> AppResult<DocumentD
     facts.extend(updated_by);
 
     Ok(DocumentDetailPartial {
-        kind_token: DocumentKind::StockMovement.token().to_string(),
         kind_label: DocumentKind::StockMovement.label().to_string(),
         title: format!("Movimiento #{}", movement.id),
         status_line: format!("{} · {}", movement.movement_type, movement.reason),
@@ -1227,8 +1270,14 @@ async fn stock_movement_drawer(state: &AppState, id: i64) -> AppResult<DocumentD
 
 /// The RECEIPTS family: the collection's facts plus the payments it grouped —
 /// each allocation names its sale the way the operator does (the receipt read
-/// resolves the sale numbers) and links to the sale it applied to.
-async fn receipt_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPartial> {
+/// resolves the sale numbers) and links to the sale it applied to, the link
+/// only for a principal holding the `sales.read` the sale page declares (the
+/// number stays as text for a reader without it).
+async fn receipt_drawer(
+    state: &AppState,
+    principal: &Principal,
+    id: i64,
+) -> AppResult<DocumentDetailPartial> {
     let detail = state.customer_receipt_service.get_receipt(id).await?;
     let customer = state
         .customer_service
@@ -1274,13 +1323,19 @@ async fn receipt_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPa
                     payment.date.to_string(),
                     payment.amount.to_string(),
                 ],
-                href: Some(format!("/sales/{}", payment.sale_id)),
+                // The sale page declares `sales.read`; the receipt drawer
+                // opens with `customers.read`, so the link renders only for
+                // a principal holding both. The number stays as text.
+                href: if principal.has(SalesRead::CODE) {
+                    Some(format!("/sales/{}", payment.sale_id))
+                } else {
+                    None
+                },
             })
             .collect(),
     }];
 
     Ok(DocumentDetailPartial {
-        kind_token: DocumentKind::Receipt.token().to_string(),
         kind_label: DocumentKind::Receipt.label().to_string(),
         title: format!("Recibo #{}", detail.receipt.id),
         status_line: "Cobro".to_string(),
@@ -1803,6 +1858,144 @@ mod tests {
             html.contains("agrupa"),
             "the receipt drawer explains why it cannot be deleted: {html:.800}"
         );
+    }
+
+    /// The link rule on the payment family: a link renders ONLY when the
+    /// principal holds the code its target route declares, so no link is a
+    /// dead end. The ledger links point at `/accounts/{id}`, a page that
+    /// declares `finance.read`, and the receipt's customer link points at
+    /// `/customers/{id}`, which declares `customers.read` — but the drawer
+    /// itself opens with `sales.read`. The FACTS never hide: the ledger
+    /// entry and the receipt number stay readable as text.
+    #[tokio::test]
+    async fn document_drawer_payment_links_render_only_for_the_code_the_target_route_declares() {
+        let state = test_state().await;
+        let (product, _, method) = seed_sale_kit(&state).await;
+        // A credit sale carries debt, so a collection can apply to it; the
+        // receipt then creates the payment it groups (with `receipt_id` set),
+        // exactly how production links a payment to its receipt.
+        let sale = seed_sale_typed(&state, product, true, crate::models::PaymentType::Credit, None).await;
+        let customer_id = state
+            .sales_service
+            .get_detail(sale)
+            .await
+            .unwrap()
+            .sale
+            .customer_id;
+        let app = crate::routes::router(state.clone());
+        let body = format!("customer_id={customer_id}&method_id={method}&amount=1&date=2024-05-05");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/customer-receipts")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "seed receipt");
+        let (payment,): (i64,) = sqlx::query_as(
+            "SELECT id FROM sale_payments WHERE receipt_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let uri = format!("/web/documents/detail/sale_payment/{}", payment);
+
+        // Full permission: every link renders, the ledger's included.
+        let (status, html) = get_drawer(app.clone(), &uri, test_support::TEST_COOKIE).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("Ver asiento en Caja"), "{html:.800}");
+        assert!(html.contains("/accounts/"), "{html:.800}");
+        assert!(html.contains("Ver el cliente del recibo"), "{html:.800}");
+        assert!(html.contains("Recibo #"), "the receipt fact: {html:.800}");
+
+        // `sales.read` only: the drawer still opens, but no link may point
+        // where this principal would be refused — while the facts stay.
+        let reader = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let (status, html) = get_drawer(app, &uri, &test_support::cookie_for(&reader)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("/accounts/"),
+            "the account page declares finance.read: {html:.800}"
+        );
+        assert!(!html.contains("Ver asiento en Caja"), "{html:.800}");
+        assert!(!html.contains("Ver el cliente del recibo"), "{html:.800}");
+        assert!(
+            html.contains("Asiento"),
+            "the ledger entry stays readable as a fact: {html:.800}"
+        );
+        assert!(html.contains("Income"), "the entry's kind stays visible: {html:.800}");
+        assert!(
+            html.contains("Recibo #"),
+            "the receipt number stays readable as a fact: {html:.800}"
+        );
+        assert!(
+            html.contains("Abrir en Ventas"),
+            "the sale page declares only sales.read, which this principal holds: {html:.800}"
+        );
+    }
+
+    /// The link rule on the receipt family: each allocation row names its
+    /// sale as text, but the row links to `/sales/{sale_id}` — a page that
+    /// declares `sales.read` — ONLY when the principal holds that code,
+    /// because the receipt drawer itself opens with `customers.read`.
+    #[tokio::test]
+    async fn document_drawer_receipt_allocation_links_render_only_for_sales_read() {
+        let state = test_state().await;
+        let (product, _, method) = seed_sale_kit(&state).await;
+        let sale = seed_sale_typed(&state, product, true, crate::models::PaymentType::Credit, None).await;
+        let detail = state.sales_service.get_detail(sale).await.unwrap();
+        let customer_id = detail.sale.customer_id;
+        let sale_number = detail.sale.sale_number.expect("a confirmed sale has a number");
+        let app = crate::routes::router(state.clone());
+        let body = format!("customer_id={customer_id}&method_id={method}&amount=1&date=2024-05-05");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/customer-receipts")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "seed receipt");
+        let (receipt_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM customer_receipts ORDER BY id DESC LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        let uri = format!("/web/documents/detail/receipt/{receipt_id}");
+
+        // Full permission: the allocation's sale is a link to its page.
+        let (status, html) = get_drawer(app.clone(), &uri, test_support::TEST_COOKIE).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains(&format!("href=\"/sales/{}\"", sale)),
+            "the allocation links the sale it applied to: {html:.800}"
+        );
+        assert!(html.contains(&sale_number), "{html:.800}");
+
+        // `customers.read` only: the rows and their sale numbers stay, the
+        // links do not.
+        let reader = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
+        let (status, html) = get_drawer(app, &uri, &test_support::cookie_for(&reader)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("/sales/"),
+            "the sale page declares sales.read: {html:.800}"
+        );
+        assert!(
+            html.contains(&sale_number),
+            "the allocation keeps its sale number as text: {html:.800}"
+        );
+        assert!(html.contains("Asignaciones"), "the table still renders: {html:.800}");
     }
 
     /// The purchase mirror: the draft delete renders only for a
