@@ -223,9 +223,16 @@ costos por proveedor (diferido desde F1).
       los dos difieren), el badge en la Card B, y ningún token de clase nuevo. Cinco
       tests de ruta, incluido el que discrimina: con un proveedor preferido más
       caro y uno no preferido más barato, gana el preferido.
-- [ ] T2 — **Señal B, e2e.** Los tres casos: difiere, coincide, y sin costo de
-      referencia (`reference_cost` es `None`). Más el caso `cost_price = 0`, que
-      se trata como "sin costo" y no como una diferencia.
+- [x] T2 — **Señal B, e2e.** → `test(inventory): cover the stale cost badge from the
+      browser`. Cuatro tests de navegador: difiere (afirma el nodo exacto
+      `reference $12.50 • stored $5.00`), coincide, sin filas de proveedor, y
+      `cost_price = 0` con costo de proveedor presente. La ausencia se afirma
+      contando el label exacto `stale cost`, que se verificó que no aparece en
+      ningún otro lado del árbol. Validado revirtiendo el fix: con el badge
+      incondicional fallan los tres tests de ausencia (el de presencia sigue
+      pasando, y eso es correcto: mostraría los mismos valores dinámicos).
+      `scripts/e2e.sh -k products`: 22 passed, 1 skipped (el probe opt-in).
+      `cargo test`: 782, sin moverse.
 - [ ] T3 — **Señal A, modelo y servicio.** La comparación en `PurchaseLineView`
       (`src/models.rs:1076-1095`) poblada en `record_from_detail`
       (`src/services/purchases.rs:428-448`, donde el producto ya se fetchea). Sin
@@ -297,3 +304,9 @@ costos por proveedor (diferido desde F1).
 - **Nit cosmético a limpiar**: el comentario del template dice `(cost-freshness S1)`
   y el documento numera la slice como T1. Alinearlo cuando se vuelva a tocar ese
   template, no vale un write propio.
+- **Señal B cerrada** (T1 + T2): el badge permanente está implementado, testeado a
+  nivel de ruta y cubierto desde el navegador. La rama
+  `feat/cost-price-freshness` está pusheada a `origin` y trackea la remota; el
+  remoto quedó con la protección respetada (no se tocó `main`).
+- Sigue la **Señal A** (T3–T6): el aviso efímero en la línea del draft y el botón
+  que aplica el costo.
