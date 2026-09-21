@@ -256,12 +256,17 @@ costos por proveedor (diferido desde F1).
 
 ## Progress
 - **Convención de entrega (decidido 2026-09-21)**: F1 entró a `main` con un push
-  directo que **bypasseó la regla de protección del remoto** (`Changes must be made
-  through a pull request`; el remoto lo reportó como "Bypassed rule violations").
-  Decisión del usuario: **`main` queda como está, sin reescribir historia**, y de
-  acá en adelante todo entra por PR. Consecuencia concreta para F2: la rama
-  `feat/cost-price-freshness` va a `origin` y **se mergea por PR, nunca con un
-  push directo a `main`**. Toda la protección de rama se respeta desde ahora.
+  directo. El remoto lo reportó como `Bypassed rule violations`. Diagnóstico
+  correcto, leído de la API (`gh api repos/ematiasm/roya/rulesets`): **el ruleset
+  aplica a `~ALL`, no a la rama default** — o sea que cada push directo a
+  *cualquier* rama viola la regla `pull_request`, y el rol Admin la bypassea
+  siempre (`bypass_mode: always`). Con esa configuración la regla no gatea nada
+  para el admin: solo avisa y deja pasar. También incluye `non_fast_forward` y
+  `deletion`.
+  Decisiones del usuario: **`main` queda como está, sin reescribir historia**, el
+  **ruleset no se toca**, y de acá en adelante todo entra por PR. Consecuencia
+  concreta para F2: la rama `feat/cost-price-freshness` va a `origin` y **se
+  mergea por PR, nunca con un push directo a `main`**.
 - Documento creado con las decisiones 1 y 2 (botón único escritor, cascada
   automática). Sin código.
 - Se resolvió la pregunta de arquitectura previa: draft y documento **no** son
