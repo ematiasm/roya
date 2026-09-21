@@ -1087,6 +1087,23 @@ where
             AppError::Internal("confirmed sale missing sale_number".into())
         })?;
 
+        // Invariant 10: every expected rejection is validated before any write.
+        // A partially-applied annulment (an earlier attempt failed after posting
+        // some refunds) must be REFUSED, not doubled: running the pass again
+        // would write the Sale-return movements a second time and refund every
+        // payment again. The residual says the document is in an inconsistent
+        // state; naming it beats hiding it.
+        let partial = payments
+            .iter()
+            .filter(|p| p.refund_transaction_id.is_some())
+            .count();
+        if partial > 0 {
+            return Err(AppError::Validation(format!(
+                "annulment already partially applied: {partial} of {} payments already linked a refund; refusing to write a second return or duplicate refunds",
+                payments.len()
+            )));
+        }
+
         // Pre-validate products (for In) and refund balances (guard).
         let mut tracked: Vec<SaleLine> = Vec::new();
         for line in &lines {
@@ -1102,6 +1119,16 @@ where
             }
         }
         if !self.transactions.allow_negative {
+            // The refunds of one annulment hit the same accounts together, so the
+            // guard must be evaluated against the AGGREGATE of refunds per
+            // account, not per payment against the pre-refund balance. The old
+            // per-payment check passed two payments of 60 against a balance of
+            // 100 (both saw 100, nothing was written yet) and only the live
+            // re-check inside `create_with_reference` caught the second refund —
+            // after the stock had already been returned. Here nothing is written
+            // until every account's `balance - Σ refunds >= 0` holds.
+            let mut refunds_by_account: std::collections::BTreeMap<i64, Decimal> =
+                std::collections::BTreeMap::new();
             for pay in &payments {
                 if !self.transactions.accounts.exists(pay.account_id).await? {
                     return Err(AppError::NotFound(format!(
@@ -1109,15 +1136,20 @@ where
                         pay.account_id
                     )));
                 }
-                let current = self
+                *refunds_by_account
+                    .entry(pay.account_id)
+                    .or_insert(Decimal::ZERO) += pay.amount;
+            }
+            for (account_id, refunds) in &refunds_by_account {
+                let balance = self
                     .transactions
                     .transactions
-                    .balance_for_account(pay.account_id)
+                    .balance_for_account(*account_id)
                     .await?;
-                if current - pay.amount < Decimal::ZERO {
+                if balance - refunds < Decimal::ZERO {
                     return Err(AppError::Validation(format!(
-                        "refund would cause negative balance: {current} - {}",
-                        pay.amount
+                        "refund would cause negative balance on account {account_id}: balance {balance} would become {} with {refunds} in refunds",
+                        balance - refunds
                     )));
                 }
             }
@@ -1981,6 +2013,211 @@ mod tests {
             .unwrap();
         s2.cancel(audit_actor(&s2).await, sale2.id, None).await.unwrap();
         assert_eq!(s2.inventory.stock(prod2.id).await.unwrap(), dec("10"));
+    }
+
+    // -- Annulment pre-validation: aggregate per account + partial detection ------
+
+    /// The audit's scenario: two payments of 60 on one account whose balance is
+    /// 100, `allow_negative = false`. The per-payment pre-check saw 100 twice and
+    /// passed; the first refund posted (100 → 40) and the second hit
+    /// `create_with_reference`'s live guard, leaving the sale Confirmed with the
+    /// stock already returned and one refund linked. The annulment must be
+    /// pre-validated against the AGGREGATE of refunds per account, before any
+    /// write — and a rejection must leave every effect absent, not half of them.
+    #[tokio::test]
+    async fn red_cancel_refuses_when_aggregate_refunds_exceed_balance() {
+        let (s, pool) = svc_with_flags(true, false).await;
+        let prod = seed_product(&s, "ANUL-1", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-anul").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        // A Credit sale creates no payment at confirm, so the two payments of 60
+        // below are the only ones (the walk-in cannot take credit; the seeded
+        // credit customer can).
+        let sale = s
+            .create_draft(audit_actor(&s).await, NewSale {
+                customer_id: CREDIT_CUSTOMER_ID,
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: Some(sale_date()),
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, prod.id, dec("12"), None).await.unwrap(); // total 120
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+
+        // Two payments of 60 (each posts Income 60); then drain 20 so the
+        // account balance is 100 while the sale still holds 120 paid.
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("60"), sale_date())
+            .await
+            .unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("60"), sale_date())
+            .await
+            .unwrap();
+        s.transactions
+            .create(
+                audit_actor(&s).await,
+                acc.id,
+                crate::models::TransactionKind::Expense,
+                dec("20"),
+                Some("gasto".into()),
+                sale_date(),
+            )
+            .await
+            .unwrap();
+        let balance_before = s
+            .transactions
+            .transactions
+            .balance_for_account(acc.id)
+            .await
+            .unwrap();
+        assert_eq!(balance_before, dec("100"));
+
+        // The aggregate refund (60 + 60 = 120) exceeds the balance (100): refuse
+        // with a Validation naming the shortfall, BEFORE writing anything.
+        let err = s
+            .cancel(audit_actor(&s).await, sale.id, Some("anulo".into()))
+            .await
+            .unwrap_err();
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        assert!(msg.contains("balance 100"), "message must name the balance: {msg}");
+        assert!(msg.contains("would become"), "message must name the result: {msg}");
+
+        // NOTHING was written: the sale is still Confirmed...
+        let still = s.sales.find_sale(sale.id).await.unwrap().unwrap();
+        assert_eq!(still.status, crate::models::SaleStatus::Confirmed);
+        // ...no Sale-return movement exists for its number...
+        let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
+        assert!(
+            !moves.iter().any(|m| m.reason == MovementReason::SaleReturn),
+            "no Sale-return movement may exist after a refused annulment"
+        );
+        // ...and neither payment carries a refund link.
+        let payments = s.sales.list_payments(sale.id).await.unwrap();
+        assert_eq!(payments.len(), 2);
+        assert!(
+            payments.iter().all(|p| p.refund_transaction_id.is_none()),
+            "no payment may carry a refund after a refused annulment"
+        );
+    }
+
+    /// The same shape with `allow_negative = true`: the aggregate guard is
+    /// configuration-dependent, not a new rule — the annulment goes through and
+    /// both refunds exist.
+    #[tokio::test]
+    async fn red_cancel_with_allow_negative_skips_the_aggregate_guard() {
+        let (s, _) = svc_with_flags(true, true).await;
+        let prod = seed_product(&s, "ANUL-2", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-anul2").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        let sale = s
+            .create_draft(audit_actor(&s).await, NewSale {
+                customer_id: CREDIT_CUSTOMER_ID,
+                payment_type: PaymentType::Credit,
+                sale_date: sale_date(),
+                due_date: Some(sale_date()),
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, prod.id, dec("12"), None).await.unwrap(); // total 120
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("120"), sale_date())
+            .await
+            .unwrap();
+
+        let cancelled = s
+            .cancel(audit_actor(&s).await, sale.id, Some("anulo".into()))
+            .await
+            .unwrap();
+        assert_eq!(cancelled.sale.status, crate::models::SaleStatus::Cancelled);
+        let payments = s.sales.list_payments(sale.id).await.unwrap();
+        assert_eq!(payments.len(), 1);
+        assert!(payments.iter().all(|p| p.refund_transaction_id.is_some()));
+    }
+
+    /// Invariant 10's "the residual is detected rather than hidden": a sale whose
+    /// annulment was PARTIALLY applied by an earlier attempt (one payment already
+    /// carries a `refund_transaction_id`) must be refused, not doubled — a second
+    /// pass would write the return movement a second time and refund twice.
+    #[tokio::test]
+    async fn red_cancel_refuses_a_partially_applied_annulment() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "ANUL-3", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-anul3").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        let sale = s
+            .create_draft(audit_actor(&s).await, NewSale {
+                customer_id: WALKIN_ID,
+                payment_type: PaymentType::Cash,
+                sale_date: sale_date(),
+                due_date: None,
+                receipt_no: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        s.add_line(sale.id, prod.id, dec("4"), None).await.unwrap(); // total 40
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash)).await.unwrap();
+        let payments = s.sales.list_payments(sale.id).await.unwrap();
+        assert_eq!(payments.len(), 1);
+
+        // Simulate the earlier attempt's residual directly: one refund link on
+        // the payment row, pointing at a real transaction (the FK is RESTRICT).
+        // The real defect's first pass also left a Sale-return movement behind —
+        // which is exactly what this guard refuses to double.
+        let residual = s
+            .transactions
+            .create(
+                audit_actor(&s).await,
+                acc.id,
+                crate::models::TransactionKind::Expense,
+                dec("40"),
+                Some("refund residual".into()),
+                sale_date(),
+            )
+            .await
+            .unwrap();
+        s.sales
+            .set_payment_refund_transaction(audit_actor(&s).await, payments[0].id, residual.id)
+            .await
+            .unwrap();
+        let movements_before = movement_count(&pool).await;
+
+        let err = s
+            .cancel(audit_actor(&s).await, sale.id, Some("otra vez".into()))
+            .await
+            .unwrap_err();
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        assert!(
+            msg.contains("already linked"),
+            "message must name the partial state: {msg}"
+        );
+        assert!(msg.contains("1 of 1"), "message must name how many refunds: {msg}");
+
+        // Nothing new was written: no additional return movement.
+        assert_eq!(
+            movement_count(&pool).await,
+            movements_before,
+            "a refused partial annulment must not write another movement"
+        );
     }
 
     // -- triangulate -----------------------------------------------------------------

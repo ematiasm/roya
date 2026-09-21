@@ -48,6 +48,12 @@ different accounts over time. The customer, the credit rules and the receivable 
   already collected as an `Expense` per payment, back to each payment's originating account. The refund
   is guarded by `ALLOW_NEGATIVE_BALANCE`, because the money leaves the account. The original
   `transaction_id` stays intact while `refund_transaction_id` records the reversal.
+  The balance guard is evaluated on the AGGREGATE of refunds per account, before any write: two
+  payments of 60 on one account whose balance is 100 refuse the annulment (`100 - 120 < 0`) even
+  though each payment alone would pass. Nothing is written when the guard rejects, and if any
+  payment already carries a `refund_transaction_id` the annulment was partially applied by an
+  earlier attempt: it is refused, not doubled — the residual must be resolved, never a second
+  return movement or a duplicate refund written over it.
 - Cancelling a draft discards it and leaves `sale_number` null.
 - The same product may appear on several lines of one sale, which is legitimate when some units carry
   a different price. A purchase does not allow it, for the reason stated in that capability's spec.

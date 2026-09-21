@@ -951,6 +951,23 @@ where
             })?;
 
         // Pre-validate products (for the return movement) and refund accounts.
+        // Invariant 10: a partially-applied annulment (an earlier attempt failed
+        // after posting some refunds) is REFUSED, not doubled — a second pass
+        // would write the Purchase-return movements a second time and refund
+        // every payment again. There is no aggregate balance guard here by
+        // design: the purchase refund is an `Income`, money entering the
+        // account, so `create_with_reference` enforces no balance precondition
+        // on it and copying the sales check would be dead code.
+        let partial = payments
+            .iter()
+            .filter(|p| p.refund_transaction_id.is_some())
+            .count();
+        if partial > 0 {
+            return Err(AppError::Validation(format!(
+                "annulment already partially applied: {partial} of {} payments already linked a refund; refusing to write a second return or duplicate refunds",
+                payments.len()
+            )));
+        }
         let mut tracked: Vec<PurchaseLine> = Vec::new();
         for line in &lines {
             let product = self.inventory.get_product(line.product_id).await?;
@@ -1942,6 +1959,79 @@ mod tests {
             dec("40")
         );
         let _ = pool;
+    }
+
+    // -- Annulment pre-validation: partial-state detection ------------------------
+
+    /// Invariant 10's "the residual is detected rather than hidden", mirrored from
+    /// sales: a purchase whose annulment was PARTIALLY applied by an earlier
+    /// attempt (a payment already carries a `refund_transaction_id`) must be
+    /// refused, not doubled — a second pass would write the return movement a
+    /// second time and refund twice. There is no aggregate balance guard here by
+    /// design: the purchase refund is an `Income`, money entering the account, so
+    /// `create_with_reference` enforces no balance precondition on it.
+    #[tokio::test]
+    async fn red_purch_cancel_refuses_a_partially_applied_annulment() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "ANUL-P", "5").await;
+        seed_stock(&s, prod.id, "10").await;
+        let sup = seed_supplier(&s, "ANUL SUP").await;
+        let acc = seed_account(&s, "caja-anul-p").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("4"), Some(dec("10")))
+            .await
+            .unwrap(); // total 40
+        s.confirm(audit_actor(&s).await, purchase.id, Some(cash)).await.unwrap();
+        let payments = s.purchases.list_payments(purchase.id).await.unwrap();
+        assert_eq!(payments.len(), 1);
+
+        // Simulate the earlier attempt's residual directly: one refund link on
+        // the payment row, pointing at a real transaction (the FK is RESTRICT).
+        // The real defect's first pass also left a Purchase-return movement
+        // behind — which is what this guard refuses to double.
+        let residual = s
+            .transactions
+            .create(
+                audit_actor(&s).await,
+                acc.id,
+                TransactionKind::Income,
+                dec("40"),
+                Some("refund residual".into()),
+                purchase_date(),
+            )
+            .await
+            .unwrap();
+        s.purchases
+            .set_payment_refund_transaction(audit_actor(&s).await, payments[0].id, residual.id)
+            .await
+            .unwrap();
+        let movements_before = movement_count(&pool).await;
+
+        let err = s
+            .cancel(audit_actor(&s).await, purchase.id, Some("otra vez".into()))
+            .await
+            .unwrap_err();
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        assert!(
+            msg.contains("already linked"),
+            "message must name the partial state: {msg}"
+        );
+        assert!(msg.contains("1 of 1"), "message must name how many refunds: {msg}");
+
+        // Nothing new was written: no additional return movement, status intact.
+        assert_eq!(
+            movement_count(&pool).await,
+            movements_before,
+            "a refused partial annulment must not write another movement"
+        );
+        let still = s.purchases.find_purchase(purchase.id).await.unwrap().unwrap();
+        assert_eq!(still.status, PurchaseStatus::Confirmed);
     }
 
     // -- AC9: satellite update on confirm + CRITICAL pre-validation ---------------
