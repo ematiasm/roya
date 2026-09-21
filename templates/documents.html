@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Roya — Documents{% endblock %}
+{% block content %}
+{% let page_title = "Documents" %}
+{% let page_breadcrumb_label = "" %}
+{% let page_breadcrumb_href = "" %}
+{% let page_action_href = "" %}
+{% let page_action_label = "" %}
+{% include "partials/page_header.html" %}
+<div class="rounded-2xl border border-border bg-card p-5">
+  <div class="mb-3 flex items-center justify-between">
+    <h2 class="text-lg font-semibold">Documents</h2>
+  </div>
+  {# The shared list-filter bar: `filter_module` is the singular form-id and
+     list-target prefix, `filter_list` the plural endpoint path segment and
+     Clear href (the contract lives in `partials/list_filters_open.html`). The
+     type options are the PERMITTED groups only — the server narrows the
+     screen per principal, so a code the request supplies never widens the
+     list. The labels are the operator's Spanish vocabulary
+     (`DocumentGroup::label`), while the page chrome stays English like the
+     sibling list pages: that split is deliberate. #}
+  {% let filter_module = "document" %}
+  {% let filter_list = "documents" %}
+  {% include "partials/list_filters_open.html" %}
+    <select class="min-w-[130px] flex-1" name="group">
+      <option value="">All types</option>
+      {% for g in groups %}
+      <option value="{{ g.token }}" data-document-group="{{ g.token }}" {% if g.selected %}selected{% endif %}>{{ g.label }}</option>
+      {% endfor %}
+    </select>
+    <input class="min-w-[120px] flex-1" type="text" name="user" placeholder="User" value="{{ filter_user }}" />
+    <input class="min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
+    <input class="min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+    <input class="min-w-[150px] flex-1" type="text" name="q" placeholder="Search number or counterpart" value="{{ filter_q }}" />
+  {% include "partials/list_filters_close.html" %}
+  {# `hx-history-elt` snapshots only the list on a history push, so Back
+     restores the previous list instead of re-fetching it from a filter form
+     that already holds the newer value; base.html syncs the form to the
+     restored URL and rewrites the fragment path to this page's URL. #}
+  <div id="document-list"
+       hx-history-elt
+       hx-get="/web/documents"
+       hx-trigger="refresh from:body, load"
+       hx-include="#document-filters"
+       hx-swap="innerHTML">
+    {% include "partials/document_list.html" %}
+  </div>
+</div>
+{% endblock %}
