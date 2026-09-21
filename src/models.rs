@@ -1082,6 +1082,221 @@ pub struct PurchaseListFilter {
 }
 
 
+// ---------------------------------------------------------------------------
+// Documents index (cross-department read layer, slice 1 of 2): the shared types
+// the sales and purchases repositories already project and the receipts/stock
+// families compose later. One row per stored document; `DocumentKind` is the
+// feed's vocabulary (declaration order is the last tiebreak, so it is stable)
+// and `DocumentGroup` is the filter form's coarser one.
+// ---------------------------------------------------------------------------
+
+/// One family of documents the cross-department index reads: one table per
+/// variant. Declaration order is the feed's last tiebreak, so it is stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DocumentKind {
+    Sale,
+    SalePayment,
+    Purchase,
+    PurchasePayment,
+    StockMovement,
+    Receipt,
+}
+
+impl DocumentKind {
+    /// Every family, in declaration order.
+    pub const ALL: &'static [DocumentKind] = &[
+        Self::Sale,
+        Self::SalePayment,
+        Self::Purchase,
+        Self::PurchasePayment,
+        Self::StockMovement,
+        Self::Receipt,
+    ];
+
+    /// The stable token the filter form and the URL use: "sale",
+    /// "sale_payment", "purchase", "purchase_payment", "stock_movement",
+    /// "receipt".
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Sale => "sale",
+            Self::SalePayment => "sale_payment",
+            Self::Purchase => "purchase",
+            Self::PurchasePayment => "purchase_payment",
+            Self::StockMovement => "stock_movement",
+            Self::Receipt => "receipt",
+        }
+    }
+
+    /// The Spanish label a row and a filter option show: "Venta",
+    /// "Pago de venta", "Compra", "Pago de compra", "Movimiento de stock",
+    /// "Recibo de cliente".
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Sale => "Venta",
+            Self::SalePayment => "Pago de venta",
+            Self::Purchase => "Compra",
+            Self::PurchasePayment => "Pago de compra",
+            Self::StockMovement => "Movimiento de stock",
+            Self::Receipt => "Recibo de cliente",
+        }
+    }
+
+    /// The filter group this family belongs to.
+    pub fn group(&self) -> DocumentGroup {
+        match self {
+            Self::Sale => DocumentGroup::Sales,
+            Self::SalePayment => DocumentGroup::Payments,
+            Self::Purchase => DocumentGroup::Purchases,
+            Self::PurchasePayment => DocumentGroup::Payments,
+            Self::StockMovement => DocumentGroup::Stock,
+            Self::Receipt => DocumentGroup::Payments,
+        }
+    }
+
+    /// Parse a `token()`; `None` for an unknown or empty token.
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|kind| kind.token() == token)
+    }
+}
+
+/// The four groups the operator filters by — the vocabulary of the request
+/// ("ventas, compras, movimientos de stock, pagos") over six families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DocumentGroup {
+    Sales,
+    Purchases,
+    Stock,
+    Payments,
+}
+
+impl DocumentGroup {
+    pub const ALL: &'static [DocumentGroup] = &[
+        Self::Sales,
+        Self::Purchases,
+        Self::Stock,
+        Self::Payments,
+    ];
+
+    /// Tokens: "sales", "purchases", "stock", "payments".
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Sales => "sales",
+            Self::Purchases => "purchases",
+            Self::Stock => "stock",
+            Self::Payments => "payments",
+        }
+    }
+
+    /// Labels: "Ventas", "Compras", "Movimientos de stock", "Pagos".
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Sales => "Ventas",
+            Self::Purchases => "Compras",
+            Self::Stock => "Movimientos de stock",
+            Self::Payments => "Pagos",
+        }
+    }
+
+    /// The families the group covers. The four groups PARTITION the six
+    /// families: every family is listed under exactly one option, so
+    /// `DocumentKind::group` is the single classification and expanding two
+    /// selected options can never list the same row twice. Sales -> [Sale];
+    /// Purchases -> [Purchase]; Stock -> [StockMovement]; Payments ->
+    /// [SalePayment, PurchasePayment, Receipt] — the three payment families
+    /// are one option because that is the vocabulary the operator filters
+    /// by, and choosing "Ventas" means the sale documents, not their money.
+    pub fn kinds(&self) -> &'static [DocumentKind] {
+        match self {
+            Self::Sales => &[DocumentKind::Sale],
+            Self::Purchases => &[DocumentKind::Purchase],
+            Self::Stock => &[DocumentKind::StockMovement],
+            Self::Payments => &[
+                DocumentKind::SalePayment,
+                DocumentKind::PurchasePayment,
+                DocumentKind::Receipt,
+            ],
+        }
+    }
+
+    /// Parse a `token()`; `None` for an unknown or empty token.
+    pub fn parse(token: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|group| group.token() == token)
+    }
+}
+
+/// What the page asks the index for. `kinds` is the page's decision, already
+/// narrowed by the principal's permissions in the route.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentFilter {
+    /// The families to read. Empty reads nothing.
+    pub kinds: Vec<DocumentKind>,
+    /// Audit-actor ids the filter accepts; `Some(empty)` matches nothing.
+    pub actor_ids: Option<Vec<i64>>,
+    /// Inclusive lower bound on the family's date column.
+    pub from: Option<NaiveDate>,
+    /// Inclusive upper bound on the family's date column.
+    pub to: Option<NaiveDate>,
+    /// Free text: the document's identifier/reference and its counterpart.
+    pub search: Option<String>,
+}
+
+impl DocumentFilter {
+    /// The per-family bounds for a read capped at `limit` rows. The method
+    /// called on the repository decides the family, so `kinds` plays no part
+    /// in the per-family query.
+    pub fn query(&self, limit: usize) -> DocumentQuery {
+        DocumentQuery {
+            actor_ids: self.actor_ids.clone(),
+            from: self.from,
+            to: self.to,
+            search: self.search.clone(),
+            limit,
+        }
+    }
+}
+
+/// What ONE family read accepts: the filter's bounds plus the row cap (the
+/// method called decides the family, so the family list plays no part).
+#[derive(Debug, Clone)]
+pub struct DocumentQuery {
+    pub actor_ids: Option<Vec<i64>>,
+    pub from: Option<NaiveDate>,
+    pub to: Option<NaiveDate>,
+    pub search: Option<String>,
+    /// Maximum rows THIS family read returns.
+    pub limit: usize,
+}
+
+/// One row of the index: one stored document projected to the facts the feed
+/// shows. `amount` is the derived money (summed in Rust, never with SQL) and
+/// `quantity` is the stock magnitude — the only family with no money.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentRow {
+    pub kind: DocumentKind,
+    /// The row's own id.
+    pub id: i64,
+    /// The owning document's id: the drill-down target.
+    pub owner_id: i64,
+    /// The identifier the operator reads.
+    pub reference: String,
+    /// The counterpart: customer, supplier or product.
+    pub party: String,
+    pub date: NaiveDate,
+    /// The status/detail pill.
+    pub detail: String,
+    pub amount: Option<Decimal>,
+    pub quantity: Option<Decimal>,
+    /// The audit actor the row records.
+    pub created_by: i64,
+}
+
+/// The index's row cap: the newest N documents the feed shows. A page that
+/// hits it says so instead of pretending the history ended.
+pub const DOCUMENTS_PAGE_LIMIT: usize = 200;
+
 /// One low-stock product with a chosen supplier from the cost satellite.
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseSuggestion {
@@ -1538,5 +1753,114 @@ impl ReceiptDetail {
         self.account_name = account_name;
         self.method_name = method_name;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The URL/filter tokens round-trip for every family, and neither the
+    /// empty token nor a made-up one parses.
+    #[test]
+    fn document_kind_tokens_round_trip_and_reject_unknowns() {
+        for kind in DocumentKind::ALL {
+            assert_eq!(DocumentKind::parse(kind.token()), Some(*kind));
+        }
+        assert_eq!(DocumentKind::parse(""), None);
+        assert_eq!(DocumentKind::parse("nope"), None);
+        assert_eq!(DocumentKind::parse("Sale"), None);
+    }
+
+    /// The group vocabulary round-trips the same way.
+    #[test]
+    fn document_group_tokens_round_trip_and_reject_unknowns() {
+        for group in DocumentGroup::ALL {
+            assert_eq!(DocumentGroup::parse(group.token()), Some(*group));
+        }
+        assert_eq!(DocumentGroup::parse(""), None);
+        assert_eq!(DocumentGroup::parse("nope"), None);
+    }
+
+    /// `ALL` covers every variant exactly once (a drift here would silently
+    /// drop a family from every "parse any token" loop).
+    #[test]
+    fn document_kind_all_covers_every_variant_exactly_once() {
+        let all = DocumentKind::ALL;
+        assert_eq!(all.len(), 6);
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// The four groups cover the six families: every family is listed under
+    /// the group its `group()` names, the union covers every kind, and
+    /// Payments is a deliberate wide filter over three families while Stock is
+    /// the narrow one. `kinds()` is the filter expansion, so Sales/Purchases
+    /// also list their payment families even though those answer `Payments`.
+    #[test]
+    fn document_group_kinds_partition_every_family() {
+        // The four groups partition the six families: a family appears under
+        // exactly one filter option, names that option back through
+        // `group()`, and the union of the four covers every family. That is
+        // what makes the expansion total and duplicate-free — the property
+        // the feed's row list depends on.
+        let mut covered: Vec<DocumentKind> = Vec::new();
+        for group in DocumentGroup::ALL {
+            assert!(!group.kinds().is_empty());
+            for kind in group.kinds() {
+                assert!(
+                    !covered.contains(kind),
+                    "{kind:?} is listed under two groups"
+                );
+                covered.push(*kind);
+                assert_eq!(
+                    kind.group(),
+                    *group,
+                    "{kind:?} must name the group that lists it"
+                );
+            }
+        }
+        covered.sort();
+        let mut all = DocumentKind::ALL.to_vec();
+        all.sort();
+        assert_eq!(covered, all);
+
+        // The filter vocabulary: only payments is wide, because the three
+        // payment families are one option for the operator; every other
+        // group is exactly its own document.
+        assert_eq!(DocumentGroup::Sales.kinds(), &[DocumentKind::Sale]);
+        assert_eq!(DocumentGroup::Purchases.kinds(), &[DocumentKind::Purchase]);
+        assert_eq!(DocumentGroup::Stock.kinds(), &[DocumentKind::StockMovement]);
+        assert_eq!(DocumentGroup::Payments.kinds().len(), 3);
+    }
+
+    /// `query(limit)` carries the bounds through unchanged; the family list is
+    /// deliberately not part of the per-family query.
+    #[test]
+    fn document_filter_query_carries_bounds_and_limit() {
+        let filter = DocumentFilter {
+            kinds: vec![DocumentKind::Sale],
+            actor_ids: Some(vec![7, 9]),
+            from: NaiveDate::from_ymd_opt(2024, 1, 1),
+            to: NaiveDate::from_ymd_opt(2024, 1, 31),
+            search: Some("perez".into()),
+        };
+        let query = filter.query(50);
+        assert_eq!(query.actor_ids.as_deref(), Some(&[7i64, 9][..]));
+        assert_eq!(query.from, NaiveDate::from_ymd_opt(2024, 1, 1));
+        assert_eq!(query.to, NaiveDate::from_ymd_opt(2024, 1, 31));
+        assert_eq!(query.search.as_deref(), Some("perez"));
+        assert_eq!(query.limit, 50);
+
+        // An empty filter yields an empty query and the given cap.
+        let empty = DocumentFilter::default().query(DOCUMENTS_PAGE_LIMIT);
+        assert!(empty.actor_ids.is_none());
+        assert!(empty.from.is_none());
+        assert!(empty.to.is_none());
+        assert!(empty.search.is_none());
+        assert_eq!(empty.limit, DOCUMENTS_PAGE_LIMIT);
     }
 }

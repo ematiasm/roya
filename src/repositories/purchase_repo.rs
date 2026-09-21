@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewPurchase, PaymentType, Purchase, PurchaseLine, PurchaseListFilter, PurchasePayment,
-    PurchaseStatus, UpdatePurchaseDraft,
+    DocumentKind, DocumentQuery, DocumentRow, NewPurchase, PaymentType, Purchase, PurchaseLine,
+    PurchaseListFilter, PurchasePayment, PurchaseStatus, UpdatePurchaseDraft,
 };
 
 fn parse_decimal(s: &str) -> Decimal {
@@ -176,6 +176,19 @@ pub trait PurchaseRepository: Send + Sync {
         refund_transaction_id: i64,
     ) -> AppResult<PurchasePayment>;
     async fn list_payments(&self, purchase_id: i64) -> AppResult<Vec<PurchasePayment>>;
+
+    /// The PURCHASES family of the documents index: the stored purchase
+    /// projected to the feed's facts, with its derived total summed in Rust
+    /// over ONE batched lines read — `PurchaseLine::subtotal`, the same
+    /// definition the purchase record page uses, never SQL `SUM` over a TEXT
+    /// column.
+    async fn list_document_rows(&self, query: &DocumentQuery) -> AppResult<Vec<DocumentRow>>;
+
+    /// The PURCHASE-PAYMENTS family of the documents index: the payment joined
+    /// to its purchase so the row names the document the way the operator does
+    /// (number, or `Draft #id`) and shows the supplier's name.
+    async fn list_payment_document_rows(&self, query: &DocumentQuery)
+        -> AppResult<Vec<DocumentRow>>;
 }
 
 #[derive(Clone)]
@@ -568,4 +581,687 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         Ok(rows.into_iter().map(row_to_payment).collect())
     }
 
+    async fn list_document_rows(&self, query: &DocumentQuery) -> AppResult<Vec<DocumentRow>> {
+        // `Some(empty)` matched no actor, so no document can match: answer
+        // without querying, like every other `Some(empty)` id filter here.
+        if let Some(ids) = &query.actor_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        // Purchases are the only family with no frozen counterpart name: the
+        // read-only suppliers JOIN resolves the name the row shows. One JOIN
+        // per family read beats N per-row name lookups in the caller.
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT p.id, p.purchase_number, p.supplier_id, p.status, p.payment_type, p.purchase_date, p.due_date, p.supplier_invoice_no, p.notes, p.cancel_reason, p.created_by, p.updated_by, p.created_at, p.updated_at, p.confirmed_at, p.cancelled_at, s.name AS supplier_name FROM purchases p JOIN suppliers s ON s.id = p.supplier_id",
+        );
+        qb.push(" WHERE 1 = 1");
+        if let Some(ids) = &query.actor_ids {
+            qb.push(" AND p.created_by IN (");
+            {
+                let mut separated = qb.separated(", ");
+                for id in ids {
+                    separated.push_bind(*id);
+                }
+                separated.push_unseparated(")");
+            }
+        }
+        if let Some(from) = query.from {
+            qb.push(" AND p.purchase_date >= ").push_bind(from);
+        }
+        if let Some(to) = query.to {
+            qb.push(" AND p.purchase_date <= ").push_bind(to);
+        }
+        if let Some(search) = &query.search {
+            // The operator searches a purchase by its number, the supplier's
+            // own invoice or the supplier's name; every nullable side is
+            // COALESCEd so a NULL never drops the row from the OR chain.
+            qb.push(" AND (LOWER(COALESCE(p.purchase_number, '')) LIKE LOWER(")
+                .push_bind(like_needle(search))
+                .push(") ESCAPE '\\' OR LOWER(COALESCE(p.supplier_invoice_no, '')) LIKE LOWER(")
+                .push_bind(like_needle(search))
+                .push(") ESCAPE '\\' OR LOWER(s.name) LIKE LOWER(")
+                .push_bind(like_needle(search))
+                .push(") ESCAPE '\\')");
+        }
+        // Newest first: date descending, then id as the stable tiebreak.
+        qb.push(" ORDER BY p.purchase_date DESC, p.id DESC LIMIT ")
+            .push_bind(query.limit as i64);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+        let purchases: Vec<(Purchase, String)> = rows
+            .into_iter()
+            .map(|row| {
+                let supplier_name: String = row.get("supplier_name");
+                (row_to_purchase(row), supplier_name)
+            })
+            .collect();
+        if purchases.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ONE batched lines read for the whole page: the query count stays
+        // constant no matter how many documents matched. The total is folded
+        // in Rust over `PurchaseLine::subtotal`, never with SQL SUM over TEXT.
+        let ids: Vec<i64> = purchases.iter().map(|(p, _)| p.id).collect();
+        let mut lines_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, purchase_id, product_id, qty, unit_cost, created_at FROM purchase_lines WHERE purchase_id IN (",
+        );
+        {
+            let mut separated = lines_qb.separated(", ");
+            for id in &ids {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(") ORDER BY id");
+        }
+        let line_rows = lines_qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+
+        let mut totals: std::collections::BTreeMap<i64, Decimal> =
+            std::collections::BTreeMap::new();
+        for row in line_rows {
+            let line = row_to_line(row);
+            *totals.entry(line.purchase_id).or_insert_with(|| Decimal::ZERO) += line.subtotal();
+        }
+
+        Ok(purchases
+            .into_iter()
+            .map(|(purchase, supplier_name)| DocumentRow {
+                kind: DocumentKind::Purchase,
+                id: purchase.id,
+                owner_id: purchase.id,
+                reference: purchase
+                    .purchase_number
+                    .clone()
+                    .unwrap_or_else(|| format!("Draft #{}", purchase.id)),
+                party: supplier_name,
+                date: purchase.purchase_date,
+                detail: purchase.status.to_string(),
+                amount: Some(totals.remove(&purchase.id).unwrap_or_default()),
+                quantity: None,
+                created_by: purchase.created_by,
+            })
+            .collect())
+    }
+
+    async fn list_payment_document_rows(
+        &self,
+        query: &DocumentQuery,
+    ) -> AppResult<Vec<DocumentRow>> {
+        // `Some(empty)` matched no actor, so no payment can match.
+        if let Some(ids) = &query.actor_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        // The JOINs are the whole point of this family read: the payment names
+        // its purchase (number or Draft #id) and the supplier, in the same
+        // single query that reads the payment.
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT pp.id, pp.purchase_id, pp.amount, pp.date, pp.created_by, p.purchase_number, p.supplier_invoice_no, s.name AS supplier_name FROM purchase_payments pp JOIN purchases p ON p.id = pp.purchase_id JOIN suppliers s ON s.id = p.supplier_id",
+        );
+        qb.push(" WHERE 1 = 1");
+        if let Some(ids) = &query.actor_ids {
+            qb.push(" AND pp.created_by IN (");
+            {
+                let mut separated = qb.separated(", ");
+                for id in ids {
+                    separated.push_bind(*id);
+                }
+                separated.push_unseparated(")");
+            }
+        }
+        if let Some(from) = query.from {
+            qb.push(" AND pp.date >= ").push_bind(from);
+        }
+        if let Some(to) = query.to {
+            qb.push(" AND pp.date <= ").push_bind(to);
+        }
+        if let Some(search) = &query.search {
+            // The operator searches a payment by the purchase it belongs to.
+            qb.push(" AND (LOWER(COALESCE(p.purchase_number, '')) LIKE LOWER(")
+                .push_bind(like_needle(search))
+                .push(") ESCAPE '\\' OR LOWER(COALESCE(p.supplier_invoice_no, '')) LIKE LOWER(")
+                .push_bind(like_needle(search))
+                .push(") ESCAPE '\\' OR LOWER(s.name) LIKE LOWER(")
+                .push_bind(like_needle(search))
+                .push(") ESCAPE '\\')");
+        }
+        qb.push(" ORDER BY pp.date DESC, pp.id DESC LIMIT ")
+            .push_bind(query.limit as i64);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let amount_str: String = row.get("amount");
+                let purchase_id: i64 = row.get("purchase_id");
+                let purchase_number: Option<String> = row.get("purchase_number");
+                DocumentRow {
+                    kind: DocumentKind::PurchasePayment,
+                    id: row.get("id"),
+                    owner_id: purchase_id,
+                    reference: purchase_number.unwrap_or_else(|| format!("Draft #{purchase_id}")),
+                    party: row.get("supplier_name"),
+                    date: row.get("date"),
+                    detail: "Pago".to_string(),
+                    amount: Some(parse_decimal(&amount_str)),
+                    quantity: None,
+                    created_by: row.get("created_by"),
+                }
+            })
+            .collect())
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::security::test_support;
+    use chrono::NaiveDate;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    async fn memory_pool() -> SqlitePool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true)
+            // Same posture as db::create_pool so the walk-in backstops fire
+            // exactly as they do in production.
+            .pragma("recursive_triggers", "1");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    async fn product_id(pool: &SqlitePool, actor: i64) -> i64 {
+        // The test seeds several lines per document; one product row per
+        // database is enough, and the sku is UNIQUE so reuse it.
+        match sqlx::query_scalar("SELECT id FROM products WHERE sku = 'DOC-P'")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar(
+                    r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+                       VALUES ('DOC-P', 'doc prod', 'Product', 'un', '10', 1, ?)
+                       RETURNING id"#,
+                )
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            }
+        }
+    }
+
+    async fn seed_supplier(pool: &SqlitePool, name: &str, actor: i64) -> i64 {
+        // The supplier name is UNIQUE, so a repeated seed in one database
+        // (the bulk read-count test uses one supplier for 20 documents)
+        // reuses the existing row.
+        match sqlx::query_scalar("SELECT id FROM suppliers WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar(
+                    "INSERT INTO suppliers (name, is_active, created_by) VALUES (?, 1, ?) RETURNING id",
+                )
+                .bind(name)
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            }
+        }
+    }
+
+    /// One confirmed purchase through raw SQL (the projection tests seed shapes
+    /// the repository API cannot build: arbitrary numbers, dates and actors).
+    async fn seed_purchase(
+        pool: &SqlitePool,
+        number: Option<&str>,
+        supplier: &str,
+        date: NaiveDate,
+        actor: i64,
+    ) -> i64 {
+        let supplier_id = seed_supplier(pool, supplier, actor).await;
+        sqlx::query_scalar(
+            r#"INSERT INTO purchases (purchase_number, supplier_id, status, payment_type, purchase_date, created_by)
+               VALUES (?, ?, 'Confirmed', 'Cash', ?, ?)
+               RETURNING id"#,
+        )
+        .bind(number)
+        .bind(supplier_id)
+        .bind(date)
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_line(pool: &SqlitePool, purchase_id: i64, qty: &str, cost: &str) {
+        let (actor,): (i64,) = sqlx::query_as("SELECT created_by FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let product = product_id(pool, actor).await;
+        sqlx::query(
+            "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) VALUES (?, ?, ?, ?)",
+        )
+        .bind(purchase_id)
+        .bind(product)
+        .bind(qty)
+        .bind(cost)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn account_and_method(pool: &SqlitePool, actor: i64) -> (i64, i64) {
+        // One wallet per test database: the name is UNIQUE, so reuse it when a
+        // second payment in the same test needs the pair.
+        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar(
+                    "INSERT INTO accounts (name, created_by) VALUES ('doc wallet', ?) RETURNING id",
+                )
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            }
+        };
+        let (method,): (i64,) =
+            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (account, method)
+    }
+
+    async fn seed_payment(
+        pool: &SqlitePool,
+        purchase_id: i64,
+        amount: &str,
+        date: NaiveDate,
+        actor: i64,
+    ) -> i64 {
+        let (account, method) = account_and_method(pool, actor).await;
+        sqlx::query_scalar(
+            r#"INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, created_by)
+               VALUES (?, ?, ?, ?, ?, ?)
+               RETURNING id"#,
+        )
+        .bind(purchase_id)
+        .bind(account)
+        .bind(method)
+        .bind(amount)
+        .bind(date)
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The projection: number (or Draft #id), resolved supplier name, status
+    /// pill, owner id, the exact Rust-summed line total, no quantity, actor.
+    #[tokio::test]
+    async fn purchase_document_rows_project_the_feed_facts() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+
+        let confirmed =
+            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
+                .await;
+        seed_line(&pool, confirmed, "2", "10").await;
+        seed_line(&pool, confirmed, "3", "2.5").await; // Σ = 20 + 7.5 = 27.5
+        let draft = seed_purchase(&pool, None, "Importadora Norte", d(2024, 5, 3), actor).await;
+        seed_line(&pool, draft, "1", "5").await;
+
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let confirmed_row = rows
+            .iter()
+            .find(|r| r.id == confirmed)
+            .expect("confirmed purchase row");
+        assert_eq!(confirmed_row.kind, DocumentKind::Purchase);
+        assert_eq!(confirmed_row.reference, "2024-PURCH-000001");
+        assert_eq!(confirmed_row.party, "Distribuidora Sur");
+        assert_eq!(confirmed_row.date, d(2024, 5, 2));
+        assert_eq!(confirmed_row.detail, "Confirmed");
+        assert_eq!(confirmed_row.owner_id, confirmed);
+        assert_eq!(confirmed_row.amount, Some(dec("27.5")));
+        assert_eq!(confirmed_row.quantity, None);
+        assert_eq!(confirmed_row.created_by, actor);
+
+        let draft_row = rows.iter().find(|r| r.id == draft).expect("draft row");
+        assert_eq!(draft_row.reference, format!("Draft #{draft}"));
+        assert_eq!(draft_row.party, "Importadora Norte");
+    }
+
+    /// The audit-actor filter narrows the family read to the given ids, and
+    /// `Some(empty)` matches nothing.
+    #[tokio::test]
+    async fn purchase_document_rows_filter_by_actor_and_empty_actor_set() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let sistema = test_support::audit_actor_id(&pool).await.unwrap();
+        let other = test_support::seed_audit_user(&pool, "doc-actor-2", "Doc Actor 2")
+            .await
+            .unwrap();
+        assert_ne!(sistema, other);
+
+        let mine = seed_purchase(&pool, Some("2024-PURCH-000001"), "Sur", d(2024, 5, 2), sistema).await;
+        let theirs =
+            seed_purchase(&pool, Some("2024-PURCH-000002"), "Norte", d(2024, 5, 3), other).await;
+
+        let only_sistema = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: Some(vec![sistema]),
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            only_sistema.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![mine]
+        );
+
+        let only_other = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: Some(vec![other]),
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            only_other.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![theirs]
+        );
+
+        let none = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: Some(vec![]),
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// Both date bounds are inclusive and exclude the neighbours.
+    #[tokio::test]
+    async fn purchase_document_rows_date_range_is_inclusive() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let early = seed_purchase(&pool, Some("2024-PURCH-000001"), "A", d(2024, 5, 1), actor).await;
+        let first = seed_purchase(&pool, Some("2024-PURCH-000002"), "B", d(2024, 5, 2), actor).await;
+        let last = seed_purchase(&pool, Some("2024-PURCH-000003"), "C", d(2024, 5, 4), actor).await;
+        let late = seed_purchase(&pool, Some("2024-PURCH-000004"), "D", d(2024, 5, 5), actor).await;
+
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: Some(d(2024, 5, 2)),
+                to: Some(d(2024, 5, 4)),
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        let ids = rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert!(!ids.contains(&early) && !ids.contains(&late));
+        assert!(ids.contains(&first) && ids.contains(&last));
+        assert_eq!(ids.len(), 2);
+    }
+
+    /// The search matches number, supplier invoice and supplier name partially
+    /// and case-insensitively; matching nothing is empty, never an error.
+    #[tokio::test]
+    async fn purchase_document_rows_search_number_invoice_and_supplier() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let with_invoice =
+            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
+                .await;
+        sqlx::query("UPDATE purchases SET supplier_invoice_no = 'FACT-77' WHERE id = ?")
+            .bind(with_invoice)
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_purchase(&pool, Some("2024-PURCH-000002"), "Importadora Norte", d(2024, 5, 3), actor)
+            .await;
+
+        // Partial, case-insensitive number match.
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("purch-000002".into()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference, "2024-PURCH-000002");
+
+        // Supplier name match.
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("norte".into()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].party, "Importadora Norte");
+
+        // Supplier invoice match.
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("fact-77".into()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference, "2024-PURCH-000001");
+
+        // Matching nothing is empty, never an error.
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("zzz-nothing".into()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// The family read returns at most `limit` newest rows, date then id
+    /// descending — the feed's newest-first contract.
+    #[tokio::test]
+    async fn purchase_document_rows_limit_returns_newest_first() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let a = seed_purchase(&pool, Some("2024-PURCH-000001"), "A", d(2024, 5, 1), actor).await;
+        let b = seed_purchase(&pool, Some("2024-PURCH-000002"), "B", d(2024, 5, 2), actor).await;
+        let c = seed_purchase(&pool, Some("2024-PURCH-000003"), "C", d(2024, 5, 2), actor).await;
+
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        // Same date falls back to id descending, so c beats b.
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![c, b]);
+        assert!(!rows.iter().any(|r| r.id == a));
+    }
+
+    /// The bounded-reads contract: 20 documents cost exactly two queries (the
+    /// rows query plus ONE batched lines read), never one read per row.
+    #[tokio::test]
+    async fn purchase_document_rows_read_count_stays_bounded() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        for i in 1..=20 {
+            let id = seed_purchase(
+                &pool,
+                Some(&format!("2024-PURCH-{i:06}")),
+                "Bulk",
+                d(2024, 5, 1),
+                actor,
+            )
+            .await;
+            seed_line(&pool, id, "1", "1").await;
+        }
+
+        repo.reset_reads();
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 200,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 20);
+        assert_eq!(repo.read_count(), 2, "rows query + one batched lines read");
+
+        // A filter matching nothing stops after the rows query.
+        repo.reset_reads();
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("zzz-nothing".into()),
+                limit: 200,
+            })
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(repo.read_count(), 1, "no lines batch for an empty result");
+    }
+
+    /// The payment projection names the purchase the way the operator does and
+    /// carries the supplier name; one query total.
+    #[tokio::test]
+    async fn purchase_payment_document_rows_project_the_feed_facts() {
+        let pool = memory_pool().await;
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+
+        let confirmed =
+            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
+                .await;
+        let draft = seed_purchase(&pool, None, "Importadora Norte", d(2024, 5, 3), actor).await;
+        seed_payment(&pool, confirmed, "10", d(2024, 5, 10), actor).await;
+        seed_payment(&pool, draft, "5", d(2024, 5, 11), actor).await;
+
+        repo.reset_reads();
+        let rows = repo
+            .list_payment_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(repo.read_count(), 1, "the joined read is one query");
+        assert_eq!(rows.len(), 2);
+
+        let confirmed_payment = rows
+            .iter()
+            .find(|r| r.owner_id == confirmed)
+            .expect("payment of the confirmed purchase");
+        assert_eq!(confirmed_payment.kind, DocumentKind::PurchasePayment);
+        assert_eq!(confirmed_payment.reference, "2024-PURCH-000001");
+        assert_eq!(confirmed_payment.party, "Distribuidora Sur");
+        assert_eq!(confirmed_payment.date, d(2024, 5, 10));
+        assert_eq!(confirmed_payment.detail, "Pago");
+        assert_eq!(confirmed_payment.amount, Some(dec("10")));
+        assert_eq!(confirmed_payment.quantity, None);
+        assert_eq!(confirmed_payment.created_by, actor);
+
+        let draft_payment = rows
+            .iter()
+            .find(|r| r.owner_id == draft)
+            .expect("payment of the draft");
+        assert_eq!(draft_payment.reference, format!("Draft #{draft}"));
+        assert_eq!(draft_payment.party, "Importadora Norte");
+    }
 }

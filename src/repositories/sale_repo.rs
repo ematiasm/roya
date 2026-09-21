@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewSale, PaymentType, Sale, SaleLine, SaleListFilter, SalePayment, SaleStatus,
-    UpdateSaleDraft,
+    DocumentKind, DocumentQuery, DocumentRow, NewSale, PaymentType, Sale, SaleLine,
+    SaleListFilter, SalePayment, SaleStatus, UpdateSaleDraft,
 };
 
 fn parse_decimal(s: &str) -> Decimal {
@@ -193,6 +193,27 @@ pub trait SaleRepository: Send + Sync {
     /// for `sale_payments` stays here, in the sales module that owns the table, so
     /// the receipt repository can expose the read without querying a sales table.
     async fn list_payments_by_receipt(&self, receipt_id: i64) -> AppResult<Vec<SalePayment>>;
+
+    /// The SALES family of the documents index (documents-index): the stored
+    /// sale projected to the feed's facts, with its derived total summed in Rust
+    /// over ONE batched lines read — `SaleLine::subtotal`, the same definition
+    /// the sale record page uses, never SQL `SUM` over a TEXT column.
+    async fn list_document_rows(&self, query: &DocumentQuery) -> AppResult<Vec<DocumentRow>>;
+
+    /// The SALE-PAYMENTS family of the documents index: the payment joined to
+    /// its sale so the row names the sale the way the operator does (number, or
+    /// `Draft #id`) and shows the frozen customer name.
+    async fn list_payment_document_rows(&self, query: &DocumentQuery)
+        -> AppResult<Vec<DocumentRow>>;
+
+    /// `receipt_id -> Σ amount` for every payment grouped under the given
+    /// receipts. The receipt family's total comes from here so
+    /// `customer_receipt_repo` keeps its rule of never querying a sales table.
+    /// An empty id list answers an empty map without touching the database.
+    async fn receipt_allocations(
+        &self,
+        receipt_ids: &[i64],
+    ) -> AppResult<std::collections::BTreeMap<i64, Decimal>>;
 }
 
 #[derive(Clone)]
@@ -677,11 +698,214 @@ impl SaleRepository for SqliteSaleRepository {
         .await?;
         Ok(rows.into_iter().map(row_to_payment).collect())
     }
+
+    async fn list_document_rows(&self, query: &DocumentQuery) -> AppResult<Vec<DocumentRow>> {
+        // `Some(empty)` matched no actor, so no document can match: answer
+        // without querying, like every other `Some(empty)` id filter here.
+        if let Some(ids) = &query.actor_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM sales",
+        );
+        qb.push(" WHERE 1 = 1");
+        if let Some(ids) = &query.actor_ids {
+            qb.push(" AND created_by IN (");
+            {
+                let mut separated = qb.separated(", ");
+                for id in ids {
+                    separated.push_bind(*id);
+                }
+                separated.push_unseparated(")");
+            }
+        }
+        if let Some(from) = query.from {
+            qb.push(" AND sale_date >= ").push_bind(from);
+        }
+        if let Some(to) = query.to {
+            qb.push(" AND sale_date <= ").push_bind(to);
+        }
+        if let Some(search) = &query.search {
+            // NULL-safe on every nullable identifier; the frozen customer name
+            // is NOT NULL, so it needs no COALESCE. ESCAPE is per-comparison
+            // SQLite syntax, so the needle repeats three times.
+            let needle = like_needle(search);
+            qb.push(" AND (LOWER(COALESCE(sale_number, '')) LIKE LOWER(")
+                .push_bind(needle.clone())
+                .push(") ESCAPE '\\' OR LOWER(COALESCE(receipt_no, '')) LIKE LOWER(")
+                .push_bind(needle.clone())
+                .push(") ESCAPE '\\' OR LOWER(customer_name) LIKE LOWER(")
+                .push_bind(needle)
+                .push(") ESCAPE '\\')");
+        }
+        // Newest first: date descending, then id as the stable tiebreak.
+        qb.push(" ORDER BY sale_date DESC, id DESC LIMIT ")
+            .push_bind(query.limit as i64);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+        let sales: Vec<Sale> = rows.into_iter().map(row_to_sale).collect();
+        if sales.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ONE batched lines read for the whole page: the query count stays
+        // constant no matter how many documents matched. The total is folded
+        // in Rust over `SaleLine::subtotal`, never with SQL SUM over TEXT.
+        let ids: Vec<i64> = sales.iter().map(|sale| sale.id).collect();
+        let mut lines_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT id, sale_id, product_id, qty, unit_price, created_at FROM sale_lines WHERE sale_id IN (",
+        );
+        {
+            let mut separated = lines_qb.separated(", ");
+            for id in &ids {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(") ORDER BY id");
+        }
+        let line_rows = lines_qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+
+        let mut totals: std::collections::BTreeMap<i64, Decimal> =
+            std::collections::BTreeMap::new();
+        for row in line_rows {
+            let line = row_to_line(row);
+            *totals.entry(line.sale_id).or_insert_with(|| Decimal::ZERO) += line.subtotal();
+        }
+
+        Ok(sales
+            .into_iter()
+            .map(|sale| DocumentRow {
+                kind: DocumentKind::Sale,
+                id: sale.id,
+                owner_id: sale.id,
+                reference: sale
+                    .sale_number
+                    .clone()
+                    .unwrap_or_else(|| format!("Draft #{}", sale.id)),
+                party: sale.customer_name.clone(),
+                date: sale.sale_date,
+                detail: sale.status.to_string(),
+                amount: Some(totals.remove(&sale.id).unwrap_or_default()),
+                quantity: None,
+                created_by: sale.created_by,
+            })
+            .collect())
+    }
+
+    async fn list_payment_document_rows(
+        &self,
+        query: &DocumentQuery,
+    ) -> AppResult<Vec<DocumentRow>> {
+        // `Some(empty)` matched no actor, so no payment can match.
+        if let Some(ids) = &query.actor_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        // The JOIN is the whole point of this family read: the payment names
+        // its sale (number or Draft #id) and the frozen customer snapshot, in
+        // the same single query that reads the payment.
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT sp.id, sp.sale_id, sp.amount, sp.date, sp.created_by, s.sale_number, s.customer_name FROM sale_payments sp JOIN sales s ON s.id = sp.sale_id",
+        );
+        qb.push(" WHERE 1 = 1");
+        if let Some(ids) = &query.actor_ids {
+            qb.push(" AND sp.created_by IN (");
+            {
+                let mut separated = qb.separated(", ");
+                for id in ids {
+                    separated.push_bind(*id);
+                }
+                separated.push_unseparated(")");
+            }
+        }
+        if let Some(from) = query.from {
+            qb.push(" AND sp.date >= ").push_bind(from);
+        }
+        if let Some(to) = query.to {
+            qb.push(" AND sp.date <= ").push_bind(to);
+        }
+        if let Some(search) = &query.search {
+            // The operator searches a payment by the sale it belongs to.
+            let needle = like_needle(search);
+            qb.push(" AND (LOWER(COALESCE(s.sale_number, '')) LIKE LOWER(")
+                .push_bind(needle.clone())
+                .push(") ESCAPE '\\' OR LOWER(COALESCE(s.receipt_no, '')) LIKE LOWER(")
+                .push_bind(needle.clone())
+                .push(") ESCAPE '\\' OR LOWER(s.customer_name) LIKE LOWER(")
+                .push_bind(needle)
+                .push(") ESCAPE '\\')");
+        }
+        qb.push(" ORDER BY sp.date DESC, sp.id DESC LIMIT ")
+            .push_bind(query.limit as i64);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let amount_str: String = row.get("amount");
+                let sale_id: i64 = row.get("sale_id");
+                let sale_number: Option<String> = row.get("sale_number");
+                DocumentRow {
+                    kind: DocumentKind::SalePayment,
+                    id: row.get("id"),
+                    owner_id: sale_id,
+                    reference: sale_number.unwrap_or_else(|| format!("Draft #{sale_id}")),
+                    party: row.get("customer_name"),
+                    date: row.get("date"),
+                    detail: "Pago".to_string(),
+                    amount: Some(parse_decimal(&amount_str)),
+                    quantity: None,
+                    created_by: row.get("created_by"),
+                }
+            })
+            .collect())
+    }
+
+    async fn receipt_allocations(
+        &self,
+        receipt_ids: &[i64],
+    ) -> AppResult<std::collections::BTreeMap<i64, Decimal>> {
+        if receipt_ids.is_empty() {
+            // Nothing was asked: no query, no rows, an empty map.
+            return Ok(std::collections::BTreeMap::new());
+        }
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT receipt_id, amount FROM sale_payments WHERE receipt_id IN (",
+        );
+        {
+            let mut separated = qb.separated(", ");
+            for id in receipt_ids {
+                separated.push_bind(*id);
+            }
+            separated.push_unseparated(")");
+        }
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        #[cfg(test)]
+        self.tick();
+
+        let mut out: std::collections::BTreeMap<i64, Decimal> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let receipt_id: i64 = row.get("receipt_id");
+            let amount_str: String = row.get("amount");
+            *out.entry(receipt_id).or_insert_with(|| Decimal::ZERO) += parse_decimal(&amount_str);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::test_support;
+    use chrono::NaiveDate;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     async fn memory_pool() -> SqlitePool {
@@ -903,5 +1127,503 @@ mod tests {
                 "sale_repo must not run `{needle}` SQL; sales reach customers through CustomerService"
             );
         }
+    }
+
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    async fn documents_pool() -> SqlitePool {
+        let pool = memory_pool().await;
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn product_id(pool: &SqlitePool, actor: i64) -> i64 {
+        // The test seeds several lines per document; one product row per
+        // database is enough, and the sku is UNIQUE so reuse it.
+        match sqlx::query_scalar("SELECT id FROM products WHERE sku = 'DOC-P'")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar(
+                    r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+                       VALUES ('DOC-P', 'doc prod', 'Product', 'un', '10', 1, ?)
+                       RETURNING id"#,
+                )
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            }
+        }
+    }
+
+    /// One confirmed sale through raw SQL (the projection tests seed shapes the
+    /// repository API cannot build: arbitrary numbers, dates and actors).
+    async fn seed_sale(
+        pool: &SqlitePool,
+        number: Option<&str>,
+        customer: &str,
+        date: NaiveDate,
+        actor: i64,
+    ) -> i64 {
+        let (walkin,): (i64,) =
+            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        sqlx::query_scalar(
+            r#"INSERT INTO sales (sale_number, status, payment_type, customer_id, customer_name, sale_date, created_by)
+               VALUES (?, 'Confirmed', 'Credit', ?, ?, ?, ?)
+               RETURNING id"#,
+        )
+        .bind(number)
+        .bind(walkin)
+        .bind(customer)
+        .bind(date)
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn seed_line(pool: &SqlitePool, sale_id: i64, qty: &str, price: &str) {
+        let (actor,): (i64,) = sqlx::query_as("SELECT created_by FROM sales WHERE id = ?")
+            .bind(sale_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let product = product_id(pool, actor).await;
+        sqlx::query("INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) VALUES (?, ?, ?, ?)")
+            .bind(sale_id)
+            .bind(product)
+            .bind(qty)
+            .bind(price)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn account_and_method(pool: &SqlitePool, actor: i64) -> (i64, i64) {
+        // One wallet per test database: the name is UNIQUE, so reuse it when a
+        // second payment in the same test needs the pair.
+        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar(
+                    "INSERT INTO accounts (name, created_by) VALUES ('doc wallet', ?) RETURNING id",
+                )
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+            }
+        };
+        let (method,): (i64,) =
+            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        (account, method)
+    }
+
+    async fn seed_payment(
+        pool: &SqlitePool,
+        sale_id: i64,
+        amount: &str,
+        date: NaiveDate,
+        actor: i64,
+        receipt_id: Option<i64>,
+    ) -> i64 {
+        let (account, method) = account_and_method(pool, actor).await;
+        sqlx::query_scalar(
+            r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, receipt_id, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               RETURNING id"#,
+        )
+        .bind(sale_id)
+        .bind(account)
+        .bind(method)
+        .bind(amount)
+        .bind(date)
+        .bind(receipt_id)
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The projection: number (or Draft #id), frozen customer, status pill,
+    /// owner id, the exact Rust-summed line total, no quantity, the actor.
+    #[tokio::test]
+    async fn sale_document_rows_project_the_feed_facts() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+
+        let confirmed = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        seed_line(&pool, confirmed, "2", "10").await;
+        seed_line(&pool, confirmed, "3", "2.5").await; // Σ = 20 + 7.5 = 27.5
+        let draft = seed_sale(&pool, None, "Díaz", d(2024, 5, 3), actor).await;
+        seed_line(&pool, draft, "1", "5").await;
+
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let confirmed_row = rows
+            .iter()
+            .find(|r| r.id == confirmed)
+            .expect("confirmed sale row");
+        assert_eq!(confirmed_row.kind, DocumentKind::Sale);
+        assert_eq!(confirmed_row.reference, "2024-SALE-000001");
+        assert_eq!(confirmed_row.party, "Pérez");
+        assert_eq!(confirmed_row.date, d(2024, 5, 2));
+        assert_eq!(confirmed_row.detail, "Confirmed");
+        assert_eq!(confirmed_row.owner_id, confirmed);
+        assert_eq!(confirmed_row.amount, Some(dec("27.5")));
+        assert_eq!(confirmed_row.quantity, None);
+        assert_eq!(confirmed_row.created_by, actor);
+
+        let draft_row = rows.iter().find(|r| r.id == draft).expect("draft row");
+        assert_eq!(draft_row.reference, format!("Draft #{draft}"));
+        assert_eq!(draft_row.detail, "Confirmed");
+    }
+
+    /// The audit-actor filter narrows the family read to the given ids, and
+    /// `Some(empty)` matches nothing without touching the database.
+    #[tokio::test]
+    async fn sale_document_rows_filter_by_actor_and_empty_actor_set() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let sistema = test_support::audit_actor_id(&pool).await.unwrap();
+        let other = test_support::seed_audit_user(&pool, "doc-actor-2", "Doc Actor 2")
+            .await
+            .unwrap();
+        assert_ne!(sistema, other);
+
+        let mine = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), sistema).await;
+        let theirs = seed_sale(&pool, Some("2024-SALE-000002"), "Díaz", d(2024, 5, 3), other).await;
+
+        let only_sistema = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: Some(vec![sistema]),
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            only_sistema.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![mine]
+        );
+
+        let only_other = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: Some(vec![other]),
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            only_other.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![theirs]
+        );
+
+        let none = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: Some(vec![]),
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// Both date bounds are inclusive and exclude the neighbours.
+    #[tokio::test]
+    async fn sale_document_rows_date_range_is_inclusive() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let early = seed_sale(&pool, Some("2024-SALE-000001"), "Early", d(2024, 5, 1), actor).await;
+        let first = seed_sale(&pool, Some("2024-SALE-000002"), "First", d(2024, 5, 2), actor).await;
+        let last = seed_sale(&pool, Some("2024-SALE-000003"), "Last", d(2024, 5, 4), actor).await;
+        let late = seed_sale(&pool, Some("2024-SALE-000004"), "Late", d(2024, 5, 5), actor).await;
+
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: Some(d(2024, 5, 2)),
+                to: Some(d(2024, 5, 4)),
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        let ids = rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert!(!ids.contains(&early) && !ids.contains(&late));
+        assert!(ids.contains(&first) && ids.contains(&last));
+        assert_eq!(ids.len(), 2);
+    }
+
+    /// The search matches number and counterpart partially and
+    /// case-insensitively, and a search matching nothing is an empty list.
+    #[tokio::test]
+    async fn sale_document_rows_search_number_and_counterpart() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        seed_sale(&pool, Some("2024-SALE-000001"), "González", d(2024, 5, 2), actor).await;
+        seed_sale(&pool, Some("2024-SALE-000002"), "Pérez", d(2024, 5, 3), actor).await;
+
+        // Partial, case-insensitive number match.
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("sale-000002".into()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference, "2024-SALE-000002");
+
+        // Counterpart match.
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("gonzález".into()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].party, "González");
+
+        // Matching nothing is empty, never an error.
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("zzz-nothing".into()),
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// The family read returns at most `limit` newest rows, date then id
+    /// descending — the feed's newest-first contract.
+    #[tokio::test]
+    async fn sale_document_rows_limit_returns_newest_first() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let a = seed_sale(&pool, Some("2024-SALE-000001"), "A", d(2024, 5, 1), actor).await;
+        let b = seed_sale(&pool, Some("2024-SALE-000002"), "B", d(2024, 5, 2), actor).await;
+        let c = seed_sale(&pool, Some("2024-SALE-000003"), "C", d(2024, 5, 2), actor).await;
+
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 2,
+            })
+            .await
+            .unwrap();
+        // Same date falls back to id descending, so c beats b.
+        assert_eq!(rows.iter().map(|r| r.id).collect::<Vec<_>>(), vec![c, b]);
+        assert!(!rows.iter().any(|r| r.id == a));
+    }
+
+    /// The bounded-reads contract: 20 documents cost exactly two queries (the
+    /// rows query plus ONE batched lines read), never one read per row.
+    #[tokio::test]
+    async fn sale_document_rows_read_count_stays_bounded() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        for i in 1..=20 {
+            let id = seed_sale(
+                &pool,
+                Some(&format!("2024-SALE-{i:06}")),
+                "Bulk",
+                d(2024, 5, 1),
+                actor,
+            )
+            .await;
+            seed_line(&pool, id, "1", "1").await;
+        }
+
+        repo.reset_reads();
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 200,
+            })
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 20);
+        assert_eq!(repo.read_count(), 2, "rows query + one batched lines read");
+
+        // A filter matching nothing stops after the rows query.
+        repo.reset_reads();
+        let rows = repo
+            .list_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: Some("zzz-nothing".into()),
+                limit: 200,
+            })
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(repo.read_count(), 1, "no lines batch for an empty result");
+    }
+
+    /// The payment projection names the sale the way the operator does and
+    /// carries the frozen customer name; one query total.
+    #[tokio::test]
+    async fn sale_payment_document_rows_project_the_feed_facts() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+
+        let confirmed = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        let draft = seed_sale(&pool, None, "Díaz", d(2024, 5, 3), actor).await;
+        seed_payment(&pool, confirmed, "10", d(2024, 5, 10), actor, None).await;
+        seed_payment(&pool, draft, "5", d(2024, 5, 11), actor, None).await;
+
+        repo.reset_reads();
+        let rows = repo
+            .list_payment_document_rows(&DocumentQuery {
+                actor_ids: None,
+                from: None,
+                to: None,
+                search: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(repo.read_count(), 1, "the joined read is one query");
+        assert_eq!(rows.len(), 2);
+
+        let confirmed_payment = rows
+            .iter()
+            .find(|r| r.owner_id == confirmed)
+            .expect("payment of the confirmed sale");
+        assert_eq!(confirmed_payment.kind, DocumentKind::SalePayment);
+        assert_eq!(confirmed_payment.reference, "2024-SALE-000001");
+        assert_eq!(confirmed_payment.party, "Pérez");
+        assert_eq!(confirmed_payment.date, d(2024, 5, 10));
+        assert_eq!(confirmed_payment.detail, "Pago");
+        assert_eq!(confirmed_payment.amount, Some(dec("10")));
+        assert_eq!(confirmed_payment.quantity, None);
+        assert_eq!(confirmed_payment.created_by, actor);
+
+        let draft_payment = rows
+            .iter()
+            .find(|r| r.owner_id == draft)
+            .expect("payment of the draft");
+        assert_eq!(draft_payment.reference, format!("Draft #{draft}"));
+        assert_eq!(draft_payment.party, "Díaz");
+    }
+
+    /// The receipt allocations fold: one receipt's total is the exact sum of
+    /// the payments grouped under it, and the whole read is one query.
+    #[tokio::test]
+    async fn receipt_allocations_sum_grouped_payments_in_one_read() {
+        let pool = documents_pool().await;
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (account, method) = account_and_method(&pool, actor).await;
+        let (walkin,): (i64,) =
+            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let receipt_a: i64 = sqlx::query_scalar(
+            r#"INSERT INTO customer_receipts (customer_id, account_id, method_id, date, created_by)
+               VALUES (?, ?, ?, '2024-06-01', ?) RETURNING id"#,
+        )
+        .bind(walkin)
+        .bind(account)
+        .bind(method)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let receipt_b: i64 = sqlx::query_scalar(
+            r#"INSERT INTO customer_receipts (customer_id, account_id, method_id, date, created_by)
+               VALUES (?, ?, ?, '2024-06-02', ?) RETURNING id"#,
+        )
+        .bind(walkin)
+        .bind(account)
+        .bind(method)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let sale = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        seed_payment(&pool, sale, "10", d(2024, 6, 1), actor, Some(receipt_a)).await;
+        seed_payment(&pool, sale, "2.5", d(2024, 6, 1), actor, Some(receipt_a)).await;
+        seed_payment(&pool, sale, "7", d(2024, 6, 2), actor, Some(receipt_b)).await;
+
+        repo.reset_reads();
+        let map = repo
+            .receipt_allocations(&[receipt_a, receipt_b])
+            .await
+            .unwrap();
+        assert_eq!(repo.read_count(), 1);
+        assert_eq!(map.get(&receipt_a), Some(&dec("12.5")));
+        assert_eq!(map.get(&receipt_b), Some(&dec("7")));
+
+        // An empty id list answers an empty map without touching the database.
+        repo.reset_reads();
+        let map = repo.receipt_allocations(&[]).await.unwrap();
+        assert!(map.is_empty());
+        assert_eq!(repo.read_count(), 0);
     }
 }
