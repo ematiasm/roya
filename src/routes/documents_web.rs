@@ -1447,6 +1447,7 @@ mod tests {
                     max_stock: Some(rust_decimal::Decimal::from(100)),
                     location: None,
                     notes: None,
+                    markup_pct: None,
                 },
             )
             .await
@@ -2027,6 +2028,7 @@ mod tests {
                     max_stock: Some(rust_decimal::Decimal::from(100)),
                     location: None,
                     notes: None,
+                    markup_pct: None,
                 },
             )
             .await

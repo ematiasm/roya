@@ -1,0 +1,12 @@
+-- Product markup (pricing T1): markup_pct is the percentage applied over
+-- cost_price to derive sale_price. TEXT like every other decimal in this
+-- project. NULL is meaningful, not an absence: it means "no markup, sale_price
+-- is manual", which is NOT the same as 0 (a 0% markup would pin the price to
+-- the cost). No rebuild: a plain ADD COLUMN is enough because the column is
+-- nullable with a NULL default — SQLite refuses ADD COLUMN only for a NOT NULL
+-- column without a constant default and for a REFERENCES clause with a
+-- non-NULL default (the rule migration 34 documents for the audit columns).
+-- Existing rows stay NULL, so no stored price changes; the derivation that
+-- consumes markup_pct is a later slice (T4), so no backfill and no price
+-- recalculation happen here.
+ALTER TABLE products ADD COLUMN markup_pct TEXT NULL;

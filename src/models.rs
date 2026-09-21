@@ -295,6 +295,10 @@ pub struct Product {
     pub unit: String,
     pub sale_price: Decimal,
     pub cost_price: Decimal,
+    /// Percentage over `cost_price` used to derive `sale_price` (pricing T1).
+    /// `None` means "no markup, manual price" — a real value, not an absence;
+    /// the derivation itself lands in a later slice (T4).
+    pub markup_pct: Option<Decimal>,
     pub track_stock: bool,
     pub min_stock: Option<Decimal>,
     pub max_stock: Option<Decimal>,
@@ -365,6 +369,7 @@ pub struct NewProduct {
     pub unit: String,
     pub sale_price: Decimal,
     pub cost_price: Decimal,
+    pub markup_pct: Option<Decimal>,
     pub track_stock: bool,
     pub min_stock: Option<Decimal>,
     pub max_stock: Option<Decimal>,
@@ -385,6 +390,12 @@ pub struct UpdateProduct {
     pub unit: Option<String>,
     pub sale_price: Option<Decimal>,
     pub cost_price: Option<Decimal>,
+    /// Double option on purpose, unlike the plain `Option<Decimal>` money
+    /// fields above: outer `None` means "leave unchanged", `Some(None)` means
+    /// "clear it back to no markup", and `Some(Some(v))` sets the markup. NULL
+    /// is a real value here ("manual price"), not an absence, so the three
+    /// states must be distinguishable.
+    pub markup_pct: Option<Option<Decimal>>,
     pub track_stock: Option<bool>,
     pub min_stock: Option<Option<Decimal>>,
     pub max_stock: Option<Option<Decimal>>,

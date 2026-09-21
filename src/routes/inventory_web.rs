@@ -750,6 +750,8 @@ async fn web_create_product(
         } else {
             Some(form.notes)
         },
+        // The web form has no markup field yet: NULL ("manual price") until T4.
+        markup_pct: None,
     };
     let created = state.inventory_service.create_product(principal.user_id, input).await?;
     if is_htmx(&headers) {
@@ -905,6 +907,8 @@ async fn web_edit_product(
                 Some(form.notes)
             },
         ),
+        // The web form has no markup field yet: None = leave unchanged until T4.
+        markup_pct: None,
     };
     state
         .inventory_service
@@ -1294,6 +1298,7 @@ mod tests {
                 max_stock: None,
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -1668,6 +1673,7 @@ mod tests {
                 max_stock: None,
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -1796,6 +1802,7 @@ mod tests {
                 max_stock: Some(Decimal::from(50)),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap()
@@ -1996,6 +2003,7 @@ mod tests {
                 max_stock: None,
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -2088,6 +2096,7 @@ mod tests {
                 max_stock: Some(Decimal::from(50)),
                 location: Some("shelf 3".into()),
                 notes: Some("fragile".into()),
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -2279,6 +2288,7 @@ mod tests {
                 max_stock: None,
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -2357,6 +2367,7 @@ mod tests {
                 max_stock: Some(Decimal::from(50)),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -2377,6 +2388,7 @@ mod tests {
                 max_stock: Some(Decimal::from(50)),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();

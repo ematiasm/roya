@@ -308,6 +308,7 @@ where
             unit: unit.to_string(),
             sale_price: input.sale_price,
             cost_price: input.cost_price,
+            markup_pct: None,
             track_stock: input.track_stock,
             min_stock: input.min_stock,
             max_stock: input.max_stock,
@@ -344,6 +345,10 @@ where
             unit: patch.unit.unwrap_or_else(|| current.unit.clone()),
             sale_price: patch.sale_price.unwrap_or(current.sale_price),
             cost_price: patch.cost_price.unwrap_or(current.cost_price),
+            // Double option: outer None = leave unchanged, Some(None) = clear
+            // back to "no markup, manual price", Some(Some(v)) = set. NULL is a
+            // real value, so the merge must preserve it, never default it.
+            markup_pct: patch.markup_pct.unwrap_or(current.markup_pct),
             track_stock: patch.track_stock.unwrap_or(current.track_stock),
             min_stock: patch.min_stock.unwrap_or(current.min_stock),
             max_stock: patch.max_stock.unwrap_or(current.max_stock),
@@ -761,6 +766,7 @@ mod tests {
             max_stock: Some(dec("50")),
             location: None,
             notes: None,
+            markup_pct: None,
         }
     }
 
@@ -1239,6 +1245,7 @@ mod tests {
                 max_stock: Some(Some(dec("80"))),
                 location: Some(Some("shelf 3".into())),
                 notes: Some(Some("edited".into())),
+                markup_pct: None,
             };
             let updated = s.update_product(actor(&s).await, p.id, patch).await.unwrap();
             assert_eq!(updated.id, p.id);

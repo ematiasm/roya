@@ -703,6 +703,7 @@ mod tests {
                 max_stock: Some(Decimal::from(100)),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -888,6 +889,7 @@ mod tests {
                 max_stock: Some(Decimal::from(100)),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -1044,6 +1046,7 @@ mod tests {
                 max_stock: Some(Decimal::from(100)),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -1538,6 +1541,7 @@ mod tests {
                 max_stock: Some(Decimal::from(100)),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();

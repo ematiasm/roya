@@ -413,6 +413,7 @@ mod tests {
                 max_stock: Some(dec("100")),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();

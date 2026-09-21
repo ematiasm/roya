@@ -227,6 +227,8 @@ async fn create_product(
         max_stock: payload.max_stock,
         location: payload.location,
         notes: payload.notes,
+        // markup_pct has no API field yet: NULL ("manual price") until T4.
+        markup_pct: None,
     };
     let product = state.inventory_service.create_product(principal.user_id, input).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(product))))
@@ -266,6 +268,8 @@ async fn update_product(
                 max_stock: payload.max_stock,
                 location: payload.location,
                 notes: payload.notes,
+                // markup_pct has no API field yet: None = leave unchanged.
+                markup_pct: None,
             },
         )
         .await?;
