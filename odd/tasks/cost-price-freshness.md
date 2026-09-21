@@ -248,6 +248,13 @@ costos por proveedor (diferido desde F1).
       slice no vieron, así que esta no se saltea.
 
 ## Progress
+- **Convención de entrega (decidido 2026-09-21)**: F1 entró a `main` con un push
+  directo que **bypasseó la regla de protección del remoto** (`Changes must be made
+  through a pull request`; el remoto lo reportó como "Bypassed rule violations").
+  Decisión del usuario: **`main` queda como está, sin reescribir historia**, y de
+  acá en adelante todo entra por PR. Consecuencia concreta para F2: la rama
+  `feat/cost-price-freshness` va a `origin` y **se mergea por PR, nunca con un
+  push directo a `main`**. Toda la protección de rama se respeta desde ahora.
 - Documento creado con las decisiones 1 y 2 (botón único escritor, cascada
   automática). Sin código.
 - Se resolvió la pregunta de arquitectura previa: draft y documento **no** son
