@@ -16,9 +16,19 @@ payments), `customer_receipt_repo.rs` (receipts) and `stock_repo.rs` (movements)
 still honours: it comes from `SaleRepository::receipt_allocations`, so the receipts file keeps its
 rule of never querying a sales table. The index is the one place that joins a counterpart name
 (customer, supplier, product) into its own projection: it is a read-only join that keeps the page at
-one query per family instead of one per row, and it moves no write ownership. No file of this
-capability reads an identity table: the acting user's display name is resolved by the route layer
-(`routes::audit_actor_names`, `routes::audit_actor_ids`), the only layer allowed to.
+one query per family instead of one per row, and it moves no write ownership.
+
+The index reaches those families through the repositories that own them, not through their
+services: a service-level document read expands one query per row — the sales and purchases list
+readers return a full detail per document — which is exactly the cost this page's read bound exists
+to avoid. The precedent is the receipts repository, which already delegates its `sale_payments` read
+to the sales repository so its own file never queries a sales table. That is the index's one
+departure from the "exclusively through their services" reading of the architecture invariants, and
+it is recorded here rather than left implicit: every statement still lives in the repository that
+owns its table, the index writes nothing, and a page render never expands one query per document.
+
+No file of this capability reads an identity table: the acting user's display name is resolved by
+the route layer (`routes::audit_actor_names`, `routes::audit_actor_ids`), the only layer allowed to.
 
 ## The families and the codes that open them
 | Family (`DocumentKind`) | Table | Code that reads it |

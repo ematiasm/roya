@@ -14,6 +14,7 @@ never a proposal.
 | [sales](sales/spec.md) | M2 | Sales, lines, payments, document numbering, cash and credit, cancellation |
 | [purchases](purchases/spec.md) | M3 | Suppliers, per-supplier cost history, purchases, purchase orders from the reorder suggestion, cancellation |
 | [customers](customers/spec.md) | M4 | Customers, the protected walk-in, credit rules, derived receivables and ageing, receipts that group a handover across sales |
+| [documents](documents/spec.md) | — | The cross-department documents index: one read-only feed over sales, sale payments, purchases, purchase payments, stock movements and customer receipts, newest first, with type/user/date filters and a text search; it opens for any one of the four read tiers and narrows its content to the tier that opened it, while owning no table and no write path |
 | [identity](identity/spec.md) | M5 | Users, revocable sessions, roles with editable permission matrices, the permission catalog, the deny-by-default kernel, the route → permission contract, the role-grant trail, and the actor audit: every mutation of the audited tables records the authenticated principal, with pre-audit rows attributed to the `sistema` sentinel and the interface showing names, never ids |
 | [verification](verification/spec.md) | — | The two test layers, the boundary between them, the browser harness contract, and the rule that makes a green suite mean something |
 
@@ -70,6 +71,11 @@ These hold across every capability and are the rules a new module must respect.
     transversal and identity is not a department. The actor audit extends the same rule to actions:
     the actor a mutation records is the principal the kernel resolved for that request, never
     anything the request's payload can supply, and the owning module writes its own audit columns.
+    The declaration has an any-of form for a screen several tiers each open a part of
+    (`RequireAny<S>` over a set of catalog codes): the route admits any ONE of them and the
+    page then narrows its content to the tier that opened it, so the screen is an index of
+    what the principal may already read and never a new grant. The documents index is the
+    worked example, and an any-of gate over an empty set denies.
 
 ## Verification
 
