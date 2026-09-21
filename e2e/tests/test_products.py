@@ -381,6 +381,73 @@ def test_creating_with_a_markup_derives_the_price_and_locks_the_field(
     )
 
 
+def test_second_create_after_a_markup_create_is_not_poisoned_by_the_reset(
+    page: Page, api: ApiClient
+) -> None:
+    """A markup create must not leave the modal unable to take a manual price.
+
+    The modal's script locks the price field the moment a markup is typed; the
+    success handler then resets the form, and a reset restores values but fires
+    no ``input`` event, so the lock used to survive the reset with the markup
+    field already empty again. The poisoned second create could not be typed
+    into — the price stayed readonly and empty, the handler answered 400, htmx
+    swapped nothing, and the operator saw a silent dead end until they happened
+    to touch the markup field. The catch: the second product (no markup) must
+    be creatable in the SAME page session, with the price that was typed shown
+    in the list; a test that only checked the first create would never see the
+    stale lock.
+    """
+    create_product(
+        api,
+        sku="POISON-SEED-20",
+        name="Poison Seed Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    _open_products_list(page, api, name="Poison Seed Widget")
+
+    dialog = page.locator("#new-product-dialog")
+    # First create: WITH a markup and an empty sale price, exactly the create
+    # that locks the field and then resets the form. The derived price must
+    # land in the list so the seed itself is proven before the second act.
+    page.get_by_role("button", name="New product").click()
+    expect(dialog).to_be_visible()
+    dialog.locator('input[name="sku"]').fill("MARKUP-FIRST-20")
+    dialog.locator('input[name="name"]').fill("Markup First Widget")
+    dialog.locator('input[name="cost_price"]').fill("10.00")
+    dialog.locator('input[name="markup_pct"]').fill("50")
+    with page.expect_response(_response_for("/web/products", "POST")):
+        dialog.get_by_role("button", name="Create product").click()
+    expect(dialog).not_to_be_visible()
+    listing = page.locator(f"#{_PRODUCTS_INNER}")
+    expect(listing).to_contain_text("Markup First Widget")
+
+    # Second create, same page session, WITHOUT reloading: no markup, so the
+    # operator must be able to type a price again.
+    page.get_by_role("button", name="New product").click()
+    expect(dialog).to_be_visible()
+    dialog.locator('input[name="sku"]').fill("MANUAL-SECOND-20")
+    dialog.locator('input[name="name"]').fill("Manual Second Widget")
+    price_input = dialog.locator('input[name="sale_price"]')
+    # The sharp assertion: the reset emptied the markup field, so the price
+    # field must be editable again — a stale readonly lock from the markup
+    # create fails right here, before the fill that needs it.
+    expect(price_input).to_be_editable()
+    price_input.fill("19.50")
+    with page.expect_response(_response_for("/web/products", "POST")):
+        dialog.get_by_role("button", name="Create product").click()
+
+    # The second product is created and appears in the list with the typed
+    # price — an empty price would have been rejected with a 400 htmx ignores.
+    expect(listing).to_contain_text("Manual Second Widget")
+    row = listing.locator("> div[id^='product-']").filter(
+        has_text="Manual Second Widget"
+    )
+    expect(row).to_have_count(1)
+    expect(row).to_contain_text("$19.50")
+
+
 # ---------------------------------------------------------------------------
 # Drawer
 # ---------------------------------------------------------------------------
@@ -460,6 +527,45 @@ def test_editing_a_product_in_the_drawer_updates_drawer_and_list(
     expect(row).to_contain_text("Edited Widget")
     expect(row).to_contain_text("$29.50")
     expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Edit Me Widget")
+
+
+def test_drawer_markup_field_toggles_the_price_editability_live(
+    page: Page, api: ApiClient
+) -> None:
+    """The drawer's markup field must toggle the price field as it is typed.
+
+    The drawer fragment's inline script mirrors the modal's: a markup in the
+    field means the server will derive the price on save, so the field locks;
+    clearing it hands the price back to the operator. No test exercised the
+    script live — the drawer save tests only ever saw its output after the
+    fragment was re-rendered from stored state — so a broken toggle (a lock
+    that never engages, or a stale readonly that survives the clear) reached
+    the operator unseen. Typing and clearing without saving proves all three
+    states in one drawer session.
+    """
+    product = create_product(
+        api,
+        sku="TOGGLE-SKU-21",
+        name="Toggle Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Toggle Widget")
+    _open_product_drawer(page, product_id)
+
+    form = _edit_form(page)
+    markup = form.locator('input[name="markup_pct"]')
+    price = form.locator('input[name="sale_price"]')
+    # No markup: the operator owns the price.
+    expect(price).to_be_editable()
+    # Typing a markup locks it — the server would derive the price on save.
+    markup.fill("50")
+    expect(price).not_to_be_editable()
+    # Clearing it hands the price back, with no save and no reload in between.
+    markup.fill("")
+    expect(price).to_be_editable()
 
 
 def test_changing_the_markup_in_the_drawer_recalculates_the_price(

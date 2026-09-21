@@ -250,6 +250,14 @@
       if (derived) { price.removeAttribute('required'); } else { price.setAttribute('required', ''); }
     }
     markup.addEventListener('input', sync);
+    // The success handler resets the form after every create, and a reset
+    // restores the field values but fires no `input`, so without its own
+    // listener this sync would never run again: a markup create would leave
+    // the price readonly even after the reset emptied the markup, and the next
+    // manual create could not be typed into. The reset event fires before the
+    // browser restores the values, so the sync must be deferred one tick.
+    var form = markup.closest('form');
+    if (form) form.addEventListener('reset', function () { setTimeout(sync, 0); });
     sync();
   })();
 </script>
