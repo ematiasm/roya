@@ -33,7 +33,7 @@ use crate::models::{
     format_purchase_number, MovementReason, MovementType, NewMovement, NewPurchase,
     PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter,
     PurchasePayment, PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
-    PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, UpdatePurchaseDraft,
+    PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, StaleLineCostView, UpdatePurchaseDraft,
 };
 
 #[derive(Clone)]
@@ -432,6 +432,21 @@ where
             // cannot drift from what those flows will do.
             let tracks_stock =
                 product.kind == crate::models::ProductKind::Product && product.track_stock;
+            // Stale-cost flag, derived from the same product read (no extra
+            // query): `Some` only when the line's cost is strictly higher than
+            // a real stored cost. Zero means "no cost recorded yet" (the
+            // column is NOT NULL DEFAULT '0'), and equal or lower is not what
+            // this warning is about — the drawer badge covers any disagreement.
+            let stale_cost = if line.unit_cost > product.cost_price
+                && product.cost_price != Decimal::ZERO
+            {
+                Some(StaleLineCostView {
+                    line_cost: line.unit_cost,
+                    stored_cost: product.cost_price,
+                })
+            } else {
+                None
+            };
             lines.push(PurchaseLineView {
                 id: line.id,
                 product_name: product.name,
@@ -441,6 +456,7 @@ where
                 unit_cost: line.unit_cost,
                 subtotal: line.subtotal(),
                 tracks_stock,
+                stale_cost,
             });
         }
 
@@ -1398,6 +1414,123 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    // -- Stale line cost (draft freshness flag) -------------------------------
+
+    /// The real rendering path: build the record view for a purchase's lines
+    /// through `record_from_detail`, never by hand-constructing the view.
+    async fn line_views(s: &Svc, purchase_id: i64) -> Vec<PurchaseLineView> {
+        let detail = s.get_detail(purchase_id).await.unwrap();
+        s.record_from_detail(detail).await.unwrap().lines
+    }
+
+    #[tokio::test]
+    async fn stale_line_cost_flags_line_cost_higher_than_stored_with_both_values() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "CF-HIGH", "5").await;
+        let sup = seed_supplier(&s, "CF HIGH SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        let stale = views[0].stale_cost.as_ref().expect("a rising cost must be flagged");
+        // Both numbers asserted so the fields cannot be swapped silently.
+        assert_eq!(stale.line_cost, dec("7"));
+        assert_eq!(stale.stored_cost, dec("5"));
+    }
+
+    #[tokio::test]
+    async fn stale_line_cost_equal_cost_is_not_stale() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "CF-EQ", "5").await;
+        let sup = seed_supplier(&s, "CF EQ SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("5")))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        assert!(views[0].stale_cost.is_none(), "equal is not stale");
+    }
+
+    #[tokio::test]
+    async fn stale_line_cost_lower_cost_is_not_stale() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "CF-LOW", "5").await;
+        let sup = seed_supplier(&s, "CF LOW SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("3")))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        assert!(views[0].stale_cost.is_none(), "a decrease is not what this warns about");
+    }
+
+    #[tokio::test]
+    async fn stale_line_cost_zero_stored_cost_is_never_stale() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "CF-ZERO", "0").await;
+        let sup = seed_supplier(&s, "CF ZERO SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("4")))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        assert!(views[0].stale_cost.is_none(), "zero stored cost means none recorded yet");
+    }
+
+    #[tokio::test]
+    async fn stale_line_cost_mixed_draft_flags_only_qualified_lines() {
+        let (s, _pool) = svc().await;
+        let rising = seed_product(&s, "CF-MIX-A", "5").await;
+        let equal = seed_product(&s, "CF-MIX-B", "5").await;
+        let no_cost = seed_product(&s, "CF-MIX-C", "0").await;
+        let lowering = seed_product(&s, "CF-MIX-D", "9").await;
+        let sup = seed_supplier(&s, "CF MIX SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        let l_rising = s
+            .add_line(audit_actor(&s).await, purchase.id, rising.id, dec("1"), Some(dec("9")))
+            .await
+            .unwrap();
+        // The other three lines exist only to prove they are NOT flagged, so
+        // their ids are not needed: the assertion below pins the flagged set
+        // to exactly the rising one.
+        s.add_line(audit_actor(&s).await, purchase.id, equal.id, dec("1"), Some(dec("5")))
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, purchase.id, no_cost.id, dec("1"), Some(dec("8")))
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, purchase.id, lowering.id, dec("1"), Some(dec("4")))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 4, "every line renders; only qualifying ones are flagged");
+        let flagged: Vec<i64> = views
+            .iter()
+            .filter(|v| v.stale_cost.is_some())
+            .map(|v| v.id)
+            .collect();
+        assert_eq!(flagged, vec![l_rising.id], "only the rising-cost line is flagged");
+        let stale = views
+            .iter()
+            .find(|v| v.id == l_rising.id)
+            .unwrap()
+            .stale_cost
+            .as_ref()
+            .unwrap();
+        assert_eq!(stale.line_cost, dec("9"));
+        assert_eq!(stale.stored_cost, dec("5"));
     }
 
     // -- AC1 ------------------------------------------------------------------
