@@ -1162,7 +1162,7 @@ its own Node runtime inside the suite's virtual environment):
 scripts/e2e.sh          # headless; see e2e/README.md for setup and options
 ```
 
-The suite currently covers 62 tests (plus 4 opt-in probes — two screenshot probes and two
+The suite currently covers 68 tests (plus 4 opt-in probes — two screenshot probes and two
 artifact probes — that skip by default, `ROYA_E2E_*_PROBE=1`). It builds the binary once, spawns it
 against a throwaway SQLite file on a free port whose isolation it proves from the server's own
 log, seeds data through
