@@ -82,7 +82,7 @@ links to the products list at that product's row, because no product record page
 is the list and the product detail is an HTMX drawer fragment. Every link is gated by the same code
 that made the row visible, so no row points at a page its reader would be refused.
 
-## The drawer (read-only slice)
+## The drawer
 Clicking a row's identifier opens the side drawer the sibling list pages use: a fixed right panel
 (`#document-drawer`) whose body the row's `hx-get` swaps into (`#document-drawer-body`). Escape
 closes it and empties the body; there is no backdrop; `base.html` is untouched. The fragment is
@@ -131,11 +131,51 @@ el permiso «sales.read» para ver este documento"), and the mapping it quotes i
 route and the kernel agreement test share. Nothing a request supplies can widen it: the kind comes
 from the URL, and the URL's token decides nothing the principal's codes have not already decided.
 
-The index itself still owns no table and writes nothing: the drawer's reads ride the repositories
-and services that own each family (including the only two reads it added — one payment by id in
-`sale_repo.rs` and `purchase_repo.rs`, both one query), and no drawer action exists yet. The
-drawer's action buttons (cancel/discard with their impact warnings, draft delete) land in the next
-slice; this slice renders the drawer read-only and says so rather than pretending it is final.
+The index itself still owns no table: the drawer's reads ride the repositories and services that own
+each family (including the only two reads it added — one payment by id in `sale_repo.rs` and
+`purchase_repo.rs`, both one query), and its one WRITE delegates entirely — the draft delete goes
+through `SaleRepository::delete_draft` / `PurchaseRepository::delete_draft`, whose `WHERE status =
+'Draft'` is the load-bearing backstop that makes deleting a confirmed document impossible even if a
+caller relaxed the service's state guard.
+
+## The drawer's actions
+The action block offers ONLY the actions that really exist, each built only when the principal holds
+the code its endpoint requires and the document's state allows it — a rendered button is always a
+button that works, and the drawer never invents one. Three rules, all deliberate:
+
+1. **Delete is real only for a DRAFT** (`DELETE /web/sales/{id}` → `sales.create`,
+   `DELETE /web/purchases/{id}` → `purchases.create`): a draft has no payments (`record_payment`
+   refuses anything not `Confirmed`), no stock movement and no ledger entry (both are created by
+   `confirm`), and nothing else references it but its CASCADE children — so a draft delete leaves
+   nothing dangling. The service refuses any other state with a `Validation` naming it, and the
+   SQL backstop above holds even without the service check.
+2. **A confirmed document is ANULLED, never deleted** (`POST /web/sales/cancel` → `sales.cancel`,
+   `POST /web/purchases/cancel` → `purchases.cancel`, with the optional reason stored in
+   `cancel_reason`): `cancel` is the designed inverse — one `In · Sale-return` / `Out
+   · Purchase-return` movement per tracked line, one `Expense`/`Income` refund per payment,
+   `cancel_reason` and the actor recorded. For a DRAFT the same endpoint is offered as
+   "Descartar": a state change with no stock, money or ledger to revert.
+3. **Payments, receipts and stock movements get NO delete** — the drawer says why instead of
+   rendering a dead button: a payment's money is already in the ledger and the entry stays (the
+   refund of an annulment is recorded by the annulment, not by hand), a receipt groups payments
+   the database refuses to orphan while it explains them, and stock history is append-only — the
+   drawer points at the product's adjustment path to compensate instead.
+
+**The impact preview**: every action renders its impact ABOVE the button, computed on the server
+from the same reads the endpoint will use — for the delete, the draft and its N listed lines with
+the sentence of what a draft never did; for the annulment, one line per tracked line (the line
+view's `tracks_stock` is exactly the confirm/cancel predicate), one line per payment naming amount
+and account, the state change that stops the debt, and a `No se puede anular` blocker line per
+tracked product that is NOW inactive (resolved through `inventory_service.get_product` — the same
+precondition `cancel` refuses on). A blocker never hides the action: the operator sees the refusal
+before pressing. With `allow_negative = false`, the sale annulment also previews the
+negative-balance refusal (purchases refund Income, so no such caveat exists to state).
+
+The edit affordance is a state-labelled BUTTON-STYLED LINK to the record page ("Editar cabecera"
+for a draft, "Abrir el documento" otherwise) plus one sentence saying the multi-field actions live
+there: the drawer duplicates no edit form. After any action the endpoints answer with
+`HX-Trigger` (`sale-changed` / `purchase-changed`); the page closes the drawer and re-reads the
+feed.
 
 ## Filters
 - **Type** (`group`): one of the four options, or absent for all of them. The requested option is
@@ -169,8 +209,13 @@ widen the feed. The route → permission table in `identity/spec.md` is the auth
 ## Non-goals
 - A principal holding one tier never sees another tier's family, not even as an option: the screen
   shows the shape of what the reader may see, so it never advertises data it would refuse.
-- No write action lives here. Confirming, cancelling, collecting or adjusting stays on the page that
-  owns the document; the index is a way in, not a second place to do it.
+- No write action is INVENTED here, and the index itself still owns no table and writes nothing of
+  its own: the drawer offers each document's own existing actions, each gated by the code its
+  endpoint requires — the draft delete is the only document delete in the system (its `WHERE
+  status = 'Draft'` backstop makes a confirmed delete impossible at the SQL level), a confirmed
+  document is annulled instead, and payments, receipts and stock movements are never deletable from
+  here. Confirming, editing the header, adding lines, collecting or adjusting stays on the page
+  that owns the document.
 - No cash ledger. `transactions` is out of scope by decision; the index answers which document, the
   ledger answers which money.
 - No pagination: the feed is the newest 200 with an explicit notice when the cap cut. The project has

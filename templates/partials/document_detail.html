@@ -1,12 +1,14 @@
 {# The documents drawer body: ONE partial for all six families. The route (in
    `documents_web.rs`) fills the sections per family — the fact list, the
-   optional tables, the optional parent summary, the optional notice and the
-   links — so six near-identical per-family templates cannot drift; every
-   display name is resolved in the route before this template runs. The
-   operator-facing copy below (section titles, the parent block, "Abrir") is
-   Spanish like the record pages the drawer mirrors, while the page chrome
-   stays English like the sibling list pages: that split is deliberate. This
-   slice renders no action buttons; the actions land in the next slice. #}
+   optional tables, the optional parent summary, the optional action block,
+   the optional notice and the links — so six near-identical per-family
+   templates cannot drift; every display name is resolved in the route before
+   this template runs. The operator-facing copy below (section titles, the
+   parent block, "Abrir") is Spanish like the record pages the drawer
+   mirrors, while the page chrome stays English like the sibling list pages:
+   that split is deliberate. The actions block renders only what the route
+   built — a real, permitted action — and always lists the impact preview
+   (muted, above the button) the operator must read before pressing. #}
 <div id="document-detail-inner" class="flex flex-col gap-4">
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1 flex flex-wrap items-center gap-2">
@@ -50,6 +52,42 @@
     </div>
     {% endfor %}
   </section>
+
+  {% if !actions.is_empty() %}
+  <section class="flex flex-col gap-3">
+    {% for a in actions %}
+    <div class="rounded-2xl border border-border bg-surface p-4">
+      <div class="text-[13px] font-semibold">{{ a.label }}</div>
+      {# The impact preview: what this action deletes or creates, computed on
+         the server from the same reads the endpoint will use. Muted, above
+         the button, so it is read before the press, not after. #}
+      <ul class="mt-1.5 flex flex-col gap-1 text-[13px] text-muted">
+        {% for line in a.impact %}<li>{{ line }}</li>{% endfor %}
+      </ul>
+      {% if a.method == "delete" %}
+      <button type="button"
+              class="mt-2 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              hx-delete="{{ a.path }}" hx-swap="none"
+              {% if let Some(c) = a.confirm %}hx-confirm="{{ c }}"{% endif %}>{{ a.label }}</button>
+      {% else %}
+      <form class="mt-2 flex flex-col gap-2"
+            hx-post="{{ a.path }}" hx-swap="none"
+            {% if let Some(c) = a.confirm %}hx-confirm="{{ c }}"{% endif %}>
+        {% for f in a.fields %}
+        <input type="hidden" name="{{ f.0 }}" value="{{ f.1 }}" />
+        {% endfor %}
+        {% if a.reason %}
+        <input class="w-full rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs"
+               type="text" name="reason" maxlength="300" placeholder="Motivo (opcional)" />
+        {% endif %}
+        <button type="submit"
+                class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">{{ a.label }}</button>
+      </form>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
 
   {% if let Some(p) = parent %}
   <section class="rounded-2xl border border-border bg-card p-5">

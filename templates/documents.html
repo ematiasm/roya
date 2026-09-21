@@ -86,5 +86,16 @@
   document.body.addEventListener('htmx:afterSwap', function (evt) {
     if (evt.detail.target && evt.detail.target.id === 'document-drawer-body') openDocumentDrawer();
   });
+  // The drawer's write endpoints own the business result and answer with an
+  // `HX-Trigger` (`sale-changed` / `purchase-changed`); the page only reacts
+  // to those events by closing the drawer and re-reading the feed.
+  document.body.addEventListener('sale-changed', function () {
+    closeDocumentDrawer();
+    htmx.trigger('#document-list', 'refresh');
+  });
+  document.body.addEventListener('purchase-changed', function () {
+    closeDocumentDrawer();
+    htmx.trigger('#document-list', 'refresh');
+  });
 </script>
 {% endblock %}

@@ -18,10 +18,14 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{DocumentFilter, DocumentGroup, DocumentKind, DocumentRow};
+use crate::models::{
+    DocumentFilter, DocumentGroup, DocumentKind, DocumentRow, PurchaseRecord, PurchaseStatus,
+    SaleRecord, SaleStatus,
+};
 use crate::routes::AppState;
 use crate::security::authz::{
-    CustomersRead, InventoryRead, Nav, Permission, Principal, PurchasesRead, RequireAny, SalesRead,
+    CustomersRead, InventoryRead, Nav, Permission, Principal, PurchasesCancel, PurchasesCreate,
+    PurchasesRead, RequireAny, SalesCancel, SalesCreate, SalesRead,
 };
 
 pub fn router() -> Router<AppState> {
@@ -394,8 +398,32 @@ struct DrawerLink {
     href: String,
 }
 
+/// One action the drawer offers. It is built ONLY when the principal holds
+/// the code the endpoint requires and the document's state allows it, so a
+/// rendered button is always a button that can actually work — the drawer
+/// never invents an action, it re-presents the ones the system has.
+struct DrawerAction {
+    label: String,
+    /// "delete" or "post" — the HTTP verb the button must use.
+    method: String,
+    path: String,
+    /// Hidden fields for a post action (the collection endpoints read the id
+    /// from the body).
+    fields: Vec<(String, String)>,
+    /// Whether the action takes an optional free-text reason (both cancel
+    /// endpoints store it in `cancel_reason`).
+    reason: bool,
+    /// The impact preview: what this action deletes or creates, one line each,
+    /// computed from the same reads the endpoint will use. This is the warning
+    /// the operator must read before acting.
+    impact: Vec<String>,
+    /// The native confirm question for a destructive action.
+    confirm: Option<String>,
+}
+
 /// The one partial all six families render: a title (the identifier), a status
-/// line, the fact list, optional tables, the optional parent summary, an
+/// line, the fact list, optional tables, the optional parent summary, the
+/// optional action block (built only from real, permitted actions), an
 /// optional notice sentence and the links. The route decides what fills it.
 #[derive(Template)]
 #[template(path = "partials/document_detail.html")]
@@ -407,6 +435,7 @@ struct DocumentDetailPartial {
     facts: Vec<DrawerFact>,
     tables: Vec<DrawerTable>,
     parent: Option<DrawerParent>,
+    actions: Vec<DrawerAction>,
     notice: Option<String>,
     links: Vec<DrawerLink>,
 }
@@ -455,9 +484,9 @@ async fn document_detail(
         )));
     }
     match kind {
-        DocumentKind::Sale => sale_drawer(state, id).await,
+        DocumentKind::Sale => sale_drawer(state, &principal, id).await,
         DocumentKind::SalePayment => sale_payment_drawer(state, id).await,
-        DocumentKind::Purchase => purchase_drawer(state, id).await,
+        DocumentKind::Purchase => purchase_drawer(state, &principal, id).await,
         DocumentKind::PurchasePayment => purchase_payment_drawer(state, id).await,
         DocumentKind::StockMovement => stock_movement_drawer(state, id).await,
         DocumentKind::Receipt => receipt_drawer(state, id).await,
@@ -468,6 +497,253 @@ async fn document_detail(
 /// the assigned number, or `Draft #id` while a draft has none.
 fn document_title(number: Option<&str>, id: i64) -> String {
     number.map(str::to_string).unwrap_or_else(|| format!("Draft #{id}"))
+}
+
+/// The edit affordance the user asked for as a real BUTTON-styled link: the
+/// FIRST entry of the links list, labelled by what the state allows. It
+/// deliberately navigates to the record page — the drawer never duplicates
+/// the multi-field forms (header, lines, payments, confirm) that page owns.
+/// The status arrives as its `Display` form — both families' status enums
+/// share the exact three names — so sale and purchase call the same helper.
+fn edit_affordance_link(status: &str, href: String) -> DrawerLink {
+    let label = match status {
+        "Draft" => "Editar cabecera",
+        _ => "Abrir el documento",
+    };
+    DrawerLink {
+        label: label.to_string(),
+        href,
+    }
+}
+
+/// The edit affordance as text: where the multi-field actions live, worded by
+/// state. The drawer states it instead of building edit forms it would have
+/// to keep in lockstep with the endpoints.
+fn edit_affordance_notice(status: &str) -> String {
+    match status {
+        "Draft" => {
+            "Para editar la cabecera, agregar líneas, confirmar o registrar pagos, abrí el documento."
+                .to_string()
+        }
+        "Confirmed" => {
+            "Para registrar pagos o ver el detalle completo, abrí el documento.".to_string()
+        }
+        _ => {
+            "El documento está anulado. Para ver el detalle completo y su historia, abrí el documento."
+                .to_string()
+        }
+    }
+}
+
+/// The SALE drawer's action block, per state and permission. Real actions
+/// only — the drawer never invents one: the delete exists for a DRAFT (a
+/// draft never touched stock, money or a customer's debt, so nothing
+/// dangles), Anular/Descartar re-present the tested `cancel` endpoint, and a
+/// cancelled document offers nothing because its inverse already happened.
+async fn sale_actions(
+    state: &AppState,
+    principal: &Principal,
+    record: &SaleRecord,
+) -> AppResult<Vec<DrawerAction>> {
+    let sale = &record.sale;
+    let mut actions = Vec::new();
+    match sale.status {
+        SaleStatus::Draft => {
+            if principal.has(SalesCreate::CODE) {
+                let n = record.lines.len();
+                actions.push(DrawerAction {
+                    label: "Eliminar borrador".to_string(),
+                    method: "delete".to_string(),
+                    path: format!("/web/sales/{}", sale.id),
+                    fields: vec![],
+                    reason: false,
+                    impact: vec![
+                        format!("Se elimina el borrador y sus {n} líneas (listadas arriba)."),
+                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
+                            .to_string(),
+                    ],
+                    confirm: Some(format!(
+                        "¿Eliminar el borrador y sus {n} líneas? Esta acción no se puede deshacer."
+                    )),
+                });
+            }
+            if principal.has(SalesCancel::CODE) {
+                actions.push(DrawerAction {
+                    label: "Descartar".to_string(),
+                    method: "post".to_string(),
+                    path: "/web/sales/cancel".to_string(),
+                    fields: vec![("sale_id".to_string(), sale.id.to_string())],
+                    reason: true,
+                    impact: vec![
+                        "El borrador pasa a Anulado y deja de aparecer como editable.".to_string(),
+                        "No hay stock, ni pagos, ni asientos que revertir.".to_string(),
+                    ],
+                    confirm: None,
+                });
+            }
+        }
+        SaleStatus::Confirmed => {
+            if principal.has(SalesCancel::CODE) {
+                actions.push(sale_annul_action(state, record).await?);
+            }
+        }
+        SaleStatus::Cancelled => {}
+    }
+    Ok(actions)
+}
+
+/// The annul impact preview, computed from the SAME reads `cancel` runs: one
+/// line per tracked line (the view's `tracks_stock` IS the confirm/cancel
+/// predicate), the product's CURRENT active flag from
+/// `inventory_service.get_product` — the exact precondition `cancel` refuses
+/// on, so the warning cannot drift from the refusal — one line per payment,
+/// and the state change. An inactive tracked product renders a blocker line
+/// instead of a movement line: the action stays rendered and says plainly it
+/// will be refused, never hiding the operator's only path. With
+/// `allow_negative = false` the refusal caveat the endpoint enforces renders
+/// too.
+async fn sale_annul_action(
+    state: &AppState,
+    record: &SaleRecord,
+) -> AppResult<DrawerAction> {
+    let sale = &record.sale;
+    let mut impact = Vec::new();
+    for line in &record.lines {
+        if !line.tracks_stock {
+            continue;
+        }
+        let product = state.inventory_service.get_product(line.product_id).await?;
+        if !product.is_active {
+            impact.push(format!(
+                "No se puede anular: el producto «{}» está inactivo.",
+                product.name
+            ));
+        } else {
+            impact.push(format!(
+                "Se devuelve el stock de «{}» ({}) con un movimiento In · Sale-return.",
+                line.product_name, line.qty
+            ));
+        }
+    }
+    for payment in &record.payments {
+        impact.push(format!(
+            "Se reembolsa «{}» en «{}» con un asiento Expense.",
+            payment.amount, payment.account_name
+        ));
+    }
+    impact.push(
+        "El documento pasa a Anulado y deja de contar como deuda del cliente.".to_string(),
+    );
+    if !state.allow_negative {
+        impact.push(
+            "Si algún reembolso dejaría una cuenta en negativo, la anulación se rechaza y verás el motivo."
+                .to_string(),
+        );
+    }
+    Ok(DrawerAction {
+        label: "Anular".to_string(),
+        method: "post".to_string(),
+        path: "/web/sales/cancel".to_string(),
+        fields: vec![("sale_id".to_string(), sale.id.to_string())],
+        reason: true,
+        impact,
+        confirm: Some("¿Anular este documento? Esta acción no se puede deshacer.".to_string()),
+    })
+}
+
+/// The PURCHASE drawer's action block — the mirror of the sale's with the
+/// purchase wording: `Out · Purchase-return` movements (confirm writes
+/// In/Purchase, cancel writes Out/Purchase-return), refunds that are `Income`
+/// (money entering: no negative-balance refusal exists to preview), and the
+/// purchase cancel endpoint.
+async fn purchase_actions(
+    state: &AppState,
+    principal: &Principal,
+    record: &PurchaseRecord,
+) -> AppResult<Vec<DrawerAction>> {
+    let purchase = &record.purchase;
+    let mut actions = Vec::new();
+    match purchase.status {
+        PurchaseStatus::Draft => {
+            if principal.has(PurchasesCreate::CODE) {
+                let n = record.lines.len();
+                actions.push(DrawerAction {
+                    label: "Eliminar borrador".to_string(),
+                    method: "delete".to_string(),
+                    path: format!("/web/purchases/{}", purchase.id),
+                    fields: vec![],
+                    reason: false,
+                    impact: vec![
+                        format!("Se elimina el borrador y sus {n} líneas (listadas arriba)."),
+                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
+                            .to_string(),
+                    ],
+                    confirm: Some(format!(
+                        "¿Eliminar el borrador y sus {n} líneas? Esta acción no se puede deshacer."
+                    )),
+                });
+            }
+            if principal.has(PurchasesCancel::CODE) {
+                actions.push(DrawerAction {
+                    label: "Descartar".to_string(),
+                    method: "post".to_string(),
+                    path: "/web/purchases/cancel".to_string(),
+                    fields: vec![("purchase_id".to_string(), purchase.id.to_string())],
+                    reason: true,
+                    impact: vec![
+                        "El borrador pasa a Anulado y deja de aparecer como editable.".to_string(),
+                        "No hay stock, ni pagos, ni asientos que revertir.".to_string(),
+                    ],
+                    confirm: None,
+                });
+            }
+        }
+        PurchaseStatus::Confirmed => {
+            if principal.has(PurchasesCancel::CODE) {
+                let mut impact = Vec::new();
+                for line in &record.lines {
+                    if !line.tracks_stock {
+                        continue;
+                    }
+                    let product = state.inventory_service.get_product(line.product_id).await?;
+                    if !product.is_active {
+                        impact.push(format!(
+                            "No se puede anular: el producto «{}» está inactivo.",
+                            product.name
+                        ));
+                    } else {
+                        impact.push(format!(
+                            "Se devuelve el stock de «{}» ({}) con un movimiento Out · Purchase-return.",
+                            line.product_name, line.qty
+                        ));
+                    }
+                }
+                for payment in &record.payments {
+                    impact.push(format!(
+                        "Se reembolsa «{}» en «{}» con un asiento Income.",
+                        payment.amount, payment.account_name
+                    ));
+                }
+                impact.push(
+                    "El documento pasa a Anulado y deja de contar como deuda con el proveedor."
+                        .to_string(),
+                );
+                actions.push(DrawerAction {
+                    label: "Anular".to_string(),
+                    method: "post".to_string(),
+                    path: "/web/purchases/cancel".to_string(),
+                    fields: vec![("purchase_id".to_string(), purchase.id.to_string())],
+                    reason: true,
+                    impact,
+                    confirm: Some(
+                        "¿Anular este documento? Esta acción no se puede deshacer.".to_string(),
+                    ),
+                });
+            }
+        }
+        PurchaseStatus::Cancelled => {}
+    }
+    Ok(actions)
 }
 
 /// Resolve the actor display names in ONE `audit_actor_names` call over the
@@ -494,10 +770,16 @@ async fn actor_facts(
 }
 
 /// The SALE family: the full record the `/sales/{id}` page renders as facts —
-/// the product/account/method names are already resolved by `get_record`.
-async fn sale_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPartial> {
+/// the product/account/method names are already resolved by `get_record` —
+/// plus the action block, built only from real actions the principal may use.
+async fn sale_drawer(
+    state: &AppState,
+    principal: &Principal,
+    id: i64,
+) -> AppResult<DocumentDetailPartial> {
     let record = state.sales_service.get_record(id).await?;
     let sale = &record.sale;
+    let actions = sale_actions(state, principal, &record).await?;
     let (created_by, updated_by) = actor_facts(state, sale.created_by, sale.updated_by).await?;
 
     let mut facts = vec![
@@ -577,11 +859,12 @@ async fn sale_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailParti
         facts,
         tables,
         parent: None,
-        notice: None,
-        links: vec![DrawerLink {
-            label: "Abrir en Ventas".to_string(),
-            href: format!("/sales/{}", sale.id),
-        }],
+        actions,
+        notice: Some(edit_affordance_notice(&sale.status.to_string())),
+        links: vec![edit_affordance_link(
+            &sale.status.to_string(),
+            format!("/sales/{}", sale.id),
+        )],
     })
 }
 
@@ -598,7 +881,12 @@ async fn sale_payment_drawer(state: &AppState, id: i64) -> AppResult<DocumentDet
         .payments
         .iter()
         .find(|v| v.id == payment.id)
-        .expect("the parent record renders the payment this drawer opened");
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "payment {} missing from its own sale's record",
+                payment.id
+            ))
+        })?;
     let (created_by, updated_by) =
         actor_facts(state, payment.created_by, payment.updated_by).await?;
 
@@ -682,16 +970,25 @@ async fn sale_payment_drawer(state: &AppState, id: i64) -> AppResult<DocumentDet
         facts,
         tables: Vec::new(),
         parent: Some(parent),
-        notice: None,
+        actions: Vec::new(),
+        notice: Some(
+            "El pago no se edita ni se elimina: el dinero ya está en la caja y el asiento queda. Si el documento se anula, el reembolso lo registra la anulación, no una edición manual."
+                .to_string(),
+        ),
         links,
     })
 }
 
 /// The PURCHASE family: the mirror of the sale drawer with supplier, supplier
-/// invoice and unit costs.
-async fn purchase_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPartial> {
+/// invoice, unit costs — and the purchase-family action block.
+async fn purchase_drawer(
+    state: &AppState,
+    principal: &Principal,
+    id: i64,
+) -> AppResult<DocumentDetailPartial> {
     let record = state.purchases_service.get_record(id).await?;
     let purchase = &record.purchase;
+    let actions = purchase_actions(state, principal, &record).await?;
     let (created_by, updated_by) =
         actor_facts(state, purchase.created_by, purchase.updated_by).await?;
 
@@ -772,11 +1069,12 @@ async fn purchase_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailP
         facts,
         tables,
         parent: None,
-        notice: None,
-        links: vec![DrawerLink {
-            label: "Abrir en Compras".to_string(),
-            href: format!("/purchases/{}", purchase.id),
-        }],
+        actions,
+        notice: Some(edit_affordance_notice(&purchase.status.to_string())),
+        links: vec![edit_affordance_link(
+            &purchase.status.to_string(),
+            format!("/purchases/{}", purchase.id),
+        )],
     })
 }
 
@@ -790,7 +1088,12 @@ async fn purchase_payment_drawer(state: &AppState, id: i64) -> AppResult<Documen
         .payments
         .iter()
         .find(|v| v.id == payment.id)
-        .expect("the parent record renders the payment this drawer opened");
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "payment {} missing from its own purchase's record",
+                payment.id
+            ))
+        })?;
     let (created_by, updated_by) =
         actor_facts(state, payment.created_by, payment.updated_by).await?;
 
@@ -866,7 +1169,11 @@ async fn purchase_payment_drawer(state: &AppState, id: i64) -> AppResult<Documen
         facts,
         tables: Vec::new(),
         parent: Some(parent),
-        notice: None,
+        actions: Vec::new(),
+        notice: Some(
+            "El pago no se edita ni se elimina: el dinero ya está en la caja y el asiento queda. Si el documento se anula, el reembolso lo registra la anulación, no una edición manual."
+                .to_string(),
+        ),
         links,
     })
 }
@@ -906,8 +1213,10 @@ async fn stock_movement_drawer(state: &AppState, id: i64) -> AppResult<DocumentD
         facts,
         tables: Vec::new(),
         parent: None,
+        actions: Vec::new(),
         notice: Some(
-            "El movimiento es historia append-only: no se edita ni se elimina.".to_string(),
+                "El movimiento es historia append-only: no se edita ni se elimina. Para compensarlo, registrá un ajuste en el producto."
+                .to_string(),
         ),
         links: vec![DrawerLink {
             label: "Ver producto".to_string(),
@@ -978,10 +1287,665 @@ async fn receipt_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPa
         facts,
         tables,
         parent: None,
-        notice: None,
+        actions: Vec::new(),
+        notice: Some(
+            "El recibo agrupa los pagos de un cobro: mientras los explique, la base rechaza eliminarlo."
+                .to_string(),
+        ),
         links: vec![DrawerLink {
             label: "Abrir en Clientes".to_string(),
             href: format!("/customers/{}", detail.receipt.customer_id),
         }],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+    use tower::ServiceExt;
+
+    use crate::routes::AppState;
+    use crate::security::test_support;
+
+    async fn test_state() -> AppState {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true)
+            // Same posture as db::create_pool: the walk-in triggers fire like
+            // they do in production.
+            .pragma("recursive_triggers", "1");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        test_support::seed_session(&pool).await.unwrap();
+        AppState::new(pool, false, true)
+    }
+
+    /// The same state with `allow_negative = true`: the purchase mirror test
+    /// confirms a CASH purchase whose Expense posts from a zero balance, and
+    /// that refusal belongs to finance's own tests, not this one.
+    async fn test_state_allow_negative() -> AppState {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .pragma("recursive_triggers", "1");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        test_support::seed_session(&pool).await.unwrap();
+        AppState::new(pool, true, true)
+    }
+
+    async fn audit_actor(state: &AppState) -> i64 {
+        test_support::audit_actor_id(&state.pool).await.unwrap()
+    }
+
+    async fn get_drawer(app: axum::Router, uri: &str, cookie: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// One tracked product + one cash account with its Cash method, the
+    /// minimum a sale drawer test needs to reach Draft and Confirmed states.
+    async fn seed_sale_kit(state: &AppState) -> (i64, i64, i64) {
+        use crate::models::NewProduct;
+        use rust_decimal::Decimal;
+
+        let actor = audit_actor(state).await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "DRAW-S".into(),
+                    name: "Drawer product".into(),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    // Tracked products require min/max stock in this shop's
+                    // rules, even in a fixture.
+                    track_stock: true,
+                    min_stock: Some(rust_decimal::Decimal::ZERO),
+                    max_stock: Some(rust_decimal::Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let account = state
+            .account_service
+            .create(actor, "Caja")
+            .await
+            .unwrap();
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(actor, account.id, "Caja")
+            .await
+            .unwrap();
+        // The account's OWN Cash: a method is usable only while an account
+        // owns it, so the fixture picks the one `ensure_defaults_for_account`
+        // just attached.
+        let method = state
+            .payment_method_service
+            .catalog_for_account(account.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash")
+            .expect("the account defaults include Cash");
+        (product.id, account.id, method.id)
+    }
+
+    async fn seed_sale(state: &AppState, product_id: i64, confirm: bool) -> i64 {
+        seed_sale_typed(state, product_id, confirm, crate::models::PaymentType::Cash, None).await
+    }
+
+    /// The same fixture with an explicit payment type: the receipt family test
+    /// needs a CREDIT sale, because a collection never exceeds the customer's
+    /// outstanding debt and only credit creates one.
+    async fn seed_sale_typed(
+        state: &AppState,
+        product_id: i64,
+        confirm: bool,
+        payment_type: crate::models::PaymentType,
+        method_id: Option<i64>,
+    ) -> i64 {
+        use crate::models::NewSale;
+        use rust_decimal::Decimal;
+
+        let actor = audit_actor(state).await;
+        let customer = state
+            .customer_service
+            .create_customer(
+                actor,
+                crate::models::NewCustomer {
+                    name: "Drawer Buyer".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    payment_days: None,
+                },
+            )
+            .await
+            .unwrap()
+            .customer;
+        let sale = state
+            .sales_service
+            .create_draft(
+                actor,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type,
+                    sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    // Credit requires a due date; Cash requires none.
+                    due_date: match payment_type {
+                        crate::models::PaymentType::Credit => {
+                            Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap())
+                        }
+                        crate::models::PaymentType::Cash => None,
+                    },
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .add_line(sale.id, product_id, Decimal::from(2), None)
+            .await
+            .unwrap();
+        if confirm {
+            // A cash confirm carries the method; a credit one never does.
+            let confirm_method = match payment_type {
+                crate::models::PaymentType::Cash => method_id,
+                crate::models::PaymentType::Credit => None,
+            };
+            state
+                .sales_service
+                .confirm(actor, sale.id, confirm_method)
+                .await
+                .unwrap();
+        }
+        sale.id
+    }
+
+    /// One draft sale seen by three principals: the drawer renders each action
+    /// ONLY for the code its endpoint requires — "Eliminar borrador" needs
+    /// `sales.create` and "Descartar" needs `sales.cancel` — while the edit
+    /// affordance (a LINK to the record page, never a duplicated form) stays
+    /// for every reader.
+    #[tokio::test]
+    async fn document_drawer_draft_sale_shows_each_action_only_for_its_code() {
+        let state = test_state().await;
+        let (product, _, _) = seed_sale_kit(&state).await;
+        let sale = seed_sale(&state, product, false).await;
+        let app = crate::routes::router(state.clone());
+        let uri = format!("/web/documents/detail/sale/{sale}");
+
+        // Full permission: both actions plus the state-labelled edit link.
+        let (status, html) = get_drawer(app.clone(), &uri, test_support::TEST_COOKIE).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("Eliminar borrador"), "{html:.800}");
+        assert!(html.contains("Descartar"), "{html:.800}");
+        assert!(
+            html.contains("Editar cabecera"),
+            "the edit affordance is a button-styled link: {html:.800}"
+        );
+        assert!(
+            html.contains(&format!("hx-delete=\"/web/sales/{sale}\"")),
+            "{html:.800}"
+        );
+        assert!(html.contains("hx-post=\"/web/sales/cancel\""), "{html:.800}");
+        assert!(
+            html.contains("Nunca se confirmó"),
+            "the delete impact must say what a draft never did: {html:.800}"
+        );
+
+        // Reader only: no action buttons at all, but the edit link stays.
+        let reader = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let (status, html) =
+            get_drawer(app.clone(), &uri, &test_support::cookie_for(&reader)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(!html.contains("Eliminar borrador"), "{html:.800}");
+        assert!(!html.contains("Descartar"), "{html:.800}");
+        assert!(!html.contains("hx-delete"), "{html:.800}");
+        assert!(html.contains("Editar cabecera"), "{html:.800}");
+
+        // Cancel permission without create: "Descartar" yes, delete no.
+        let canceller = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["sales.read", "sales.cancel"],
+        )
+        .await
+        .unwrap();
+        let (status, html) =
+            get_drawer(app, &uri, &test_support::cookie_for(&canceller)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("Descartar"), "{html:.800}");
+        assert!(!html.contains("Eliminar borrador"), "{html:.800}");
+        assert!(!html.contains("hx-delete"), "{html:.800}");
+    }
+
+    /// A confirmed sale offers Anular (never the draft delete) and the impact
+    /// preview lists EXACTLY what cancel will create: one `In · Sale-return`
+    /// movement per tracked line, one `Expense` refund per payment, and the
+    /// state change that stops the customer debt. This state was built with
+    /// `allow_negative = false`, so the negative-balance caveat renders too.
+    #[tokio::test]
+    async fn document_drawer_confirmed_sale_offers_anular_and_lists_the_impact() {
+        let state = test_state().await;
+        let (product, account, method) = seed_sale_kit(&state).await;
+        // A CASH confirm pays in full with the method it carries: the drawer
+        // then previews exactly one refund Expense for that payment.
+        let sale =
+            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
+                .await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/sale/{sale}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("Anular"), "{html:.800}");
+        assert!(
+            !html.contains("Eliminar borrador"),
+            "a confirmed document is annulled, never deleted: {html:.800}"
+        );
+        assert!(
+            html.contains("In · Sale-return"),
+            "one movement per tracked line: {html:.800}"
+        );
+        assert!(
+            html.contains("Drawer product"),
+            "the movement line names the product: {html:.800}"
+        );
+        assert!(
+            html.contains("asiento Expense"),
+            "one refund per payment: {html:.800}"
+        );
+        assert!(
+            html.contains("Caja"),
+            "the refund line names the account: {html:.800}"
+        );
+        assert!(
+            html.contains("deja de contar como deuda del cliente"),
+            "{html:.800}"
+        );
+        assert!(
+            html.contains("Si algún reembolso dejaría una cuenta en negativo"),
+            "allow_negative = false, so the caveat renders: {html:.800}"
+        );
+        let _ = account;
+    }
+
+    /// The same pre-condition check `cancel` refuses on — an inactive
+    /// tracked product — is surfaced BEFORE the operator presses the button:
+    /// the action stays rendered, and the preview says it will be refused.
+    #[tokio::test]
+    async fn document_drawer_confirmed_sale_warns_about_an_inactive_product_before_the_refusal() {
+        let state = test_state().await;
+        let (product, _, method) = seed_sale_kit(&state).await;
+        let sale =
+            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
+                .await;
+        state
+            .inventory_service
+            .set_product_active(audit_actor(&state).await, product, false)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/sale/{sale}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("No se puede anular"),
+            "the blocker must be visible before the click: {html:.800}"
+        );
+        assert!(
+            html.contains("está inactivo"),
+            "{html:.800}"
+        );
+        assert!(
+            html.contains("Anular"),
+            "the action is NOT hidden: the refusal path is still the operator's path"
+        );
+    }
+
+    /// A cancelled document offers no action at all and says why: the document
+    /// is annulled, its inverse already happened.
+    #[tokio::test]
+    async fn document_drawer_cancelled_sale_offers_no_action() {
+        let state = test_state().await;
+        let (product, _, method) = seed_sale_kit(&state).await;
+        let sale =
+            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
+                .await;
+        state
+            .sales_service
+            .cancel(
+                audit_actor(&state).await,
+                sale,
+                Some("test annulment".into()),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/sale/{sale}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(!html.contains("hx-delete"), "{html:.800}");
+        assert!(!html.contains("hx-post"), "{html:.800}");
+        assert!(
+            html.contains("anulado"),
+            "the drawer must say the document is annulled: {html:.800}"
+        );
+    }
+
+    /// The families without a real action show NO button — not even a dead
+    /// one — and say why instead: a payment's money is already in the ledger,
+    /// a movement is append-only history (compensate with an adjustment), a
+    /// receipt groups payments the database refuses to orphan.
+    #[tokio::test]
+    async fn document_drawer_payment_movement_and_receipt_families_render_no_action() {
+        let state = test_state().await;
+        let (product, account, method) = seed_sale_kit(&state).await;
+        let actor = audit_actor(&state).await;
+
+        // A paid confirmed sale gives the payment family its row.
+        let sale = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Credit,
+            None,
+        )
+        .await;
+        let payment = state
+            .sales_service
+            .record_payment(
+                actor,
+                sale,
+                method,
+                rust_decimal::Decimal::from(10),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 3).unwrap(),
+            )
+            .await
+            .unwrap();
+        let movement = state
+            .inventory_service
+            .record_movement(
+                actor,
+                crate::models::NewMovement {
+                    product_id: product,
+                    qty: rust_decimal::Decimal::from(3),
+                    movement_type: crate::models::MovementType::Adjust,
+                    reason: crate::models::MovementReason::Adjust,
+                    reference: "stocktake".into(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 5, 4).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        // The receipt needs a collection through the web form (customer debt
+        // from the confirmed Credit path is not required for the drawer test:
+        // any receipt id renders the same family shape).
+        let app = crate::routes::router(state.clone());
+        let _ = account;
+
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/sale_payment/{}", payment.id),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(!html.contains("hx-delete"), "{html:.800}");
+        assert!(!html.contains("hx-post"), "{html:.800}");
+        assert!(
+            html.contains("ya está en la caja"),
+            "the payment drawer explains why there is no action: {html:.800}"
+        );
+
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/stock_movement/{}", movement.id),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(!html.contains("hx-delete"), "{html:.800}");
+        assert!(!html.contains("hx-post"), "{html:.800}");
+        assert!(
+            html.contains("ajuste"),
+            "the movement drawer points at the compensation path: {html:.800}"
+        );
+
+        // A receipt for the paid sale: collect through the real web endpoint.
+        let body = format!(
+            "customer_id={}&method_id={method}&amount=1&date=2024-05-05",
+            state
+                .sales_service
+                .get_detail(sale)
+                .await
+                .unwrap()
+                .sale
+                .customer_id
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/web/customer-receipts")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let (receipt_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM customer_receipts ORDER BY id DESC LIMIT 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/receipt/{receipt_id}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(!html.contains("hx-delete"), "{html:.800}");
+        assert!(!html.contains("hx-post"), "{html:.800}");
+        assert!(
+            html.contains("agrupa"),
+            "the receipt drawer explains why it cannot be deleted: {html:.800}"
+        );
+    }
+
+    /// The purchase mirror: the draft delete renders only for a
+    /// `purchases.create` holder, and a confirmed purchase's impact names the
+    /// `Out · Purchase-return` movement and the Income refund.
+    #[tokio::test]
+    async fn document_drawer_purchase_actions_mirror_sales_with_their_own_wording() {
+        use crate::models::{NewProduct, NewPurchase, NewSupplier, PaymentType, ProductKind};
+        use rust_decimal::Decimal;
+
+        let state = test_state_allow_negative().await;
+        let actor = audit_actor(&state).await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "DRAW-P".into(),
+                    name: "Drawer purchase product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    // Tracked products require min/max stock in this shop's
+                    // rules, even in a fixture.
+                    track_stock: true,
+                    min_stock: Some(rust_decimal::Decimal::ZERO),
+                    max_stock: Some(rust_decimal::Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(
+                actor,
+                NewSupplier {
+                    name: "Drawer Supplier".into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        // A cash confirm needs a method the account owns.
+        let account = state.account_service.create(actor, "Caja").await.unwrap();
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(actor, account.id, "Caja")
+            .await
+            .unwrap();
+        let method = state
+            .payment_method_service
+            .catalog_for_account(account.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash")
+            .expect("the account defaults include Cash");
+        let purchase = state
+            .purchases_service
+            .create_draft(
+                actor,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type: PaymentType::Cash,
+                    purchase_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .add_line(actor, purchase.id, product.id, Decimal::from(2), None)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // Draft, full permission: "Eliminar borrador" with the purchase path.
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/purchase/{}", purchase.id),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("Eliminar borrador"), "{html:.800}");
+        assert!(
+            html.contains(&format!("hx-delete=\"/web/purchases/{}\"", purchase.id)),
+            "{html:.800}"
+        );
+        assert!(html.contains("Editar cabecera"), "{html:.800}");
+
+        // Reader only: no actions.
+        let reader =
+            test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+                .await
+                .unwrap();
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/purchase/{}", purchase.id),
+            &test_support::cookie_for(&reader),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(!html.contains("hx-delete"), "{html:.800}");
+        assert!(!html.contains("hx-post"), "{html:.800}");
+
+        // Confirmed: Anular with the purchase return wording.
+        state
+            .purchases_service
+            .confirm(actor, purchase.id, Some(method.id))
+            .await
+            .unwrap();
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/purchase/{}", purchase.id),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains("Anular"), "{html:.800}");
+        assert!(
+            !html.contains("Eliminar borrador"),
+            "{html:.800}"
+        );
+        assert!(
+            html.contains("Out · Purchase-return"),
+            "the purchase wording differs from the sale's: {html:.800}"
+        );
+        assert!(
+            html.contains("asiento Income"),
+            "a purchase refund is money entering: {html:.800}"
+        );
+        assert!(
+            !html.contains("Si algún reembolso dejaría una cuenta en negativo"),
+            "purchase refunds are Income: no negative-balance caveat exists to state: {html:.800}"
+        );
+    }
 }

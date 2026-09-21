@@ -514,6 +514,7 @@ service still requires the current password).
 | `/web/sales/payments` | POST | `customers.collect` |
 | `/web/sales/cancel` | POST | `sales.cancel` |
 | `/web/sales/{id}` | GET | `sales.read` |
+| `/web/sales/{id}` | DELETE | `sales.create` |
 | `/web/sales/{id}/lines` | POST | `sales.create` |
 | `/web/sales/{sale_id}/lines/{line_id}` | POST | `sales.create` |
 | `/web/sales/{sale_id}/lines/{line_id}` | DELETE | `sales.create` |
@@ -587,6 +588,7 @@ service still requires the current password).
 | `/web/purchases/payments` | POST | `purchases.create` |
 | `/web/purchases/cancel` | POST | `purchases.cancel` |
 | `/web/purchases/{id}` | GET | `purchases.read` |
+| `/web/purchases/{id}` | DELETE | `purchases.create` |
 | `/web/purchases/{id}/lines` | POST | `purchases.create` |
 | `/web/purchases/{purchase_id}/lines/{line_id}` | POST | `purchases.create` |
 | `/web/purchases/{purchase_id}/lines/{line_id}` | DELETE | `purchases.create` |
@@ -640,7 +642,11 @@ service still requires the current password).
 | `/web/documents` | GET | ANY OF `sales.read`, `purchases.read`, `inventory.read`, `customers.read` (`RequireAny`) |
 
 The content of both routes narrows per tier (see `documents/spec.md`): the gate admits any one read
-code, and the page renders only the families that code owns.
+code, and the page renders only the families that code owns. The drawer's action block rides the
+`DELETE /web/sales/{id}` (`sales.create`) and `DELETE /web/purchases/{id}` (`purchases.create`)
+rows above: deleting a DRAFT is the only document delete in the system (the `WHERE status = 'Draft'`
+in the delete statements is the backstop), and a confirmed document is annulled through the
+document's cancel endpoint instead.
 
 Mapping decisions the operator should know (all deliberate, fail-closed):
 - **Account creation and method allowlisting are `finance.methods.manage`, not `finance.write`**:

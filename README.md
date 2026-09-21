@@ -35,8 +35,11 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
 - **Documents index (`/documents`)** — one screen over the documents the shop produces: sales,
   sale payments, purchases, purchase payments, stock movements and customer receipts, newest first,
   with a text search (document number/reference and counterpart name) and filters by type, acting
-  user and inclusive date range. It is a read-only index: every row opens the document page that
-  already owns it. Visibility is per type and uses the existing catalog — `sales.read` opens the
+  user and inclusive date range. The index itself writes nothing; every row opens the document page
+  that already owns it, and the drawer additionally re-presents each document's own real actions
+  (draft delete with `sales.create`/`purchases.create`, annul/discard with the cancel codes) with a
+  server-computed impact preview — see the `GET /documents` block below. Visibility is per type and
+  uses the existing catalog — `sales.read` opens the
   sale documents, `purchases.read` the purchases, `inventory.read` the stock movements and
   `customers.read` the collection receipts; any ONE of the four opens the screen, and the page
   narrows its content to the tiers the principal holds (no new permission, no migration). The feed
@@ -731,9 +734,30 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
   names the read code it lacks); `Open` links to the page that owns the document (`/sales/{id}`,
   `/purchases/{id}`, `/customers/{id}`), and a stock movement opens the
   products list at that product's row, because there is no product record page
+- Drawer actions (real ones only, never invented, each gated by the code its endpoint requires):
+  - **Draft sale/purchase** — "Eliminar borrador" (`DELETE /web/sales/{id}` / `DELETE
+    /web/purchases/{id}`, `sales.create` / `purchases.create`) with a confirm; a draft never left
+    stock, money or ledger entries, so this is the only document delete in the system. "Descartar"
+    (`POST /web/sales/cancel` / `POST /web/purchases/cancel`, `sales.cancel` / `purchases.cancel`)
+    turns a draft into Cancelled with nothing to revert
+  - **Confirmed sale/purchase** — "Anular" over the existing cancel endpoint (optional reason): the
+    designed inverse that writes one return movement per tracked line and one refund per payment,
+    and stops the debt
+  - **Impact preview before every press** — the drawer lists, computed server-side from the same
+    reads the endpoint will use, exactly what will be deleted (the draft and its listed lines) or
+    created (each `In · Sale-return` / `Out · Purchase-return` movement, each `Expense`/`Income`
+    refund with amount and account, the debt effect), plus a plain refusal warning when a tracked
+    product is now inactive or a refund could push an account negative (`allow_negative = false`)
+  - **Payments, receipts and stock movements get no button** — the drawer explains why instead: the
+    money is already in the ledger, the receipt groups payments the database keeps while it
+    explains them, and stock history is append-only (compensate with an adjustment on the product)
+  - After an action the endpoint answers `HX-Trigger` (`sale-changed` / `purchase-changed`); the
+    page closes the drawer and re-reads the feed
 - The feed shows the newest 200 documents and states when the cap cut the history instead of
   pretending the history ended
-- Read-only: nothing is created, edited, confirmed or cancelled from this screen
+- The index itself still writes nothing of its own: the drawer only re-presents each document's own
+  existing actions (draft delete, annul/discard), each gated by the permission its endpoint already
+  requires
 
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
