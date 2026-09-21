@@ -15,7 +15,7 @@
                   hx-get="/web/products/detail/{{ ps.product.id }}"
                   hx-target="#product-drawer-body"
                   hx-swap="innerHTML">{{ ps.product.name }}</button>
-          <span class="text-xs text-muted">{{ ps.product.sku }} • {{ ps.product.unit }} • ${{ ps.product.sale_price }}</span>
+          <span class="text-xs text-muted">{{ ps.product.sku }} • {{ ps.product.unit }} • ${{ ps.product.sale_price_display() }}</span>
           {% if !ps.product.track_stock %}
             <span class="text-xs text-muted">untracked</span>
           {% else %}

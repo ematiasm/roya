@@ -542,6 +542,11 @@ pub struct CreateProductForm {
     pub sale_price: String,
     #[serde(default)]
     pub cost_price: String,
+    // Empty means "no markup": the price stays manual. Kept as a String so an
+    // unparseable value can surface its own validation error instead of a
+    // deserialization rejection.
+    #[serde(default)]
+    pub markup_pct: String,
     #[serde(default)]
     pub track_stock: Option<String>,
     #[serde(default)]
@@ -574,6 +579,11 @@ pub struct EditProductForm {
     pub sale_price: String,
     #[serde(default)]
     pub cost_price: String,
+    // The drawer always sends the field: an empty value is an explicit CLEAR
+    // back to a manual price (`Some(None)` in the update), matching the form's
+    // "empty optional values are a clear" contract.
+    #[serde(default)]
+    pub markup_pct: String,
     #[serde(default)]
     pub track_stock: Option<String>,
     #[serde(default)]
@@ -707,8 +717,24 @@ async fn web_create_product(
             .parse()
             .map_err(AppError::Validation)?
     };
+    // The markup is parsed BEFORE the price gate: the gate now depends on it.
+    let markup_pct = if form.markup_pct.trim().is_empty() {
+        None
+    } else {
+        Some(
+            Decimal::from_str(form.markup_pct.trim())
+                .map_err(|_| AppError::Validation("invalid markup_pct".into()))?,
+        )
+    };
+    // An empty sale_price is only an error when the price is manual. With a
+    // markup the service DERIVES and validates the price and ignores the
+    // incoming one, so Decimal::ZERO is a safe placeholder that can never
+    // reach the database.
     let sale_price = if form.sale_price.trim().is_empty() {
-        return Err(AppError::Validation("sale_price is required".into()));
+        if markup_pct.is_none() {
+            return Err(AppError::Validation("sale_price is required".into()));
+        }
+        Decimal::ZERO
     } else {
         Decimal::from_str(form.sale_price.trim())
             .map_err(|_| AppError::Validation("invalid sale_price".into()))?
@@ -750,8 +776,9 @@ async fn web_create_product(
         } else {
             Some(form.notes)
         },
-        // The web form has no markup field yet: NULL ("manual price") until T4.
-        markup_pct: None,
+        // Parsed from the form above: `Some` derives and validates the price
+        // in the service; `None` (empty field) keeps the price manual.
+        markup_pct: markup_pct,
     };
     let created = state.inventory_service.create_product(principal.user_id, input).await?;
     if is_htmx(&headers) {
@@ -860,8 +887,24 @@ async fn web_edit_product(
     } else {
         form.kind.parse().map_err(AppError::Validation)?
     };
+    // The markup is parsed BEFORE the price gate: the gate now depends on it.
+    let markup_pct = if form.markup_pct.trim().is_empty() {
+        None
+    } else {
+        Some(
+            Decimal::from_str(form.markup_pct.trim())
+                .map_err(|_| AppError::Validation("invalid markup_pct".into()))?,
+        )
+    };
+    // An empty sale_price is only an error when the price is manual. With a
+    // markup the service DERIVES and validates the price and ignores the
+    // incoming one, so Decimal::ZERO is a safe placeholder that can never
+    // reach the database.
     let sale_price = if form.sale_price.trim().is_empty() {
-        return Err(AppError::Validation("sale_price is required".into()));
+        if markup_pct.is_none() {
+            return Err(AppError::Validation("sale_price is required".into()));
+        }
+        Decimal::ZERO
     } else {
         Decimal::from_str(form.sale_price.trim())
             .map_err(|_| AppError::Validation("invalid sale_price".into()))?
@@ -907,8 +950,10 @@ async fn web_edit_product(
                 Some(form.notes)
             },
         ),
-        // The web form has no markup field yet: None = leave unchanged until T4.
-        markup_pct: None,
+        // The drawer always sends the field: an empty markup is an explicit
+        // clear back to a manual price (`Some(None)`); a value re-derives the
+        // price from the cost.
+        markup_pct: Some(markup_pct),
     };
     state
         .inventory_service
@@ -2137,6 +2182,245 @@ mod tests {
         assert_eq!(after.name, "clearable prod");
         assert_eq!(after.sale_price, Decimal::from(25));
         assert_eq!(after.cost_price, Decimal::from(5));
+    }
+
+    // -- markup on the web forms (product-markup T6) --------------------------
+
+    /// The stored product for a web SKU: the catalogue filter is the same read
+    /// the list uses, so an exact SKU match fetches the row without touching a
+    /// repository directly from the tests.
+    async fn web_product_by_sku(state: &AppState, sku: &str) -> crate::models::Product {
+        state
+            .inventory_service
+            .filter_products(sku, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|ps| ps.product.sku == sku)
+            .map(|ps| ps.product)
+            .unwrap()
+    }
+
+    /// A markup and an EMPTY sale_price is the derived-price path: the create
+    /// form lets the operator type only cost and markup, and the service both
+    /// derives and validates the price, so the empty field must not be a 400.
+    #[tokio::test]
+    async fn web_create_with_markup_and_empty_sale_price_derives_the_price() {
+        use rust_decimal::Decimal;
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let body = "sku=MKWEB-1&name=Markup+Web&kind=Product&unit=un&sale_price=&cost_price=5&markup_pct=100&track_stock=1&min_stock=5&max_stock=50";
+        let (status, _, html) = post_form_full(app, "/web/products", body, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+
+        let stored = web_product_by_sku(&state, "MKWEB-1").await;
+        // cost 5 with a 100% markup derives 5 * (1 + 100/100) = 10.
+        assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
+        assert_eq!(stored.markup_pct, Some(Decimal::from(100)));
+    }
+
+    /// Without a markup the price is manual, so the empty-sale_price gate keeps
+    /// firing exactly as before; the markup field must not weaken it.
+    #[tokio::test]
+    async fn web_create_without_markup_still_requires_sale_price() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let body = "sku=MKWEB-2&name=No+Markup&kind=Product&unit=un&sale_price=&cost_price=5";
+        let (status, _, html) = post_form_full(app, "/web/products", body, &[]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{html}");
+        assert!(html.contains("sale_price is required"), "{html}");
+    }
+
+    /// The submitted price is IGNORED whenever a markup is present: the stored
+    /// price is the derived one, never the form's value.
+    #[tokio::test]
+    async fn web_create_with_markup_ignores_the_submitted_price() {
+        use rust_decimal::Decimal;
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        // The 999 is deliberate: if the stored price is 10, the form's price
+        // was overridden, not coincidentally equal.
+        let body = "sku=MKWEB-3&name=Override+Web&kind=Product&unit=un&sale_price=999&cost_price=5&markup_pct=100&track_stock=1&min_stock=5&max_stock=50";
+        let (status, _, html) = post_form_full(app, "/web/products", body, &[]).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+
+        let stored = web_product_by_sku(&state, "MKWEB-3").await;
+        assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
+    }
+
+    /// Editing with a markup set derives the price on the web path too, and the
+    /// submitted sale_price is ignored exactly like creation.
+    #[tokio::test]
+    async fn web_edit_with_markup_derives_the_price() {
+        use rust_decimal::Decimal;
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "EDIT-MK").await;
+        let app = crate::routes::router(state.clone());
+
+        let body = format!(
+            "id={}&sku=EDIT-MK&name=Edited+markup&kind=Product&unit=un&sale_price=999&cost_price=5&markup_pct=100&category_id=&track_stock=1&min_stock=2&max_stock=80",
+            product.id
+        );
+        let (status, _, html) = post_form_full(
+            app,
+            "/web/products/edit",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+
+        let stored = state.inventory_service.get_product(product.id).await.unwrap();
+        assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
+        assert_eq!(stored.markup_pct, Some(Decimal::from(100)));
+    }
+
+    /// Clearing the markup (empty field — the drawer always sends every field)
+    /// keeps the last derived price and returns the product to a manual price
+    /// (markup NULL). The fresh fragment must render the manual gate again:
+    /// no readonly price input while there is no markup.
+    #[tokio::test]
+    async fn web_edit_clearing_the_markup_keeps_the_price_and_goes_manual() {
+        use rust_decimal::Decimal;
+        let state = test_state().await;
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
+                sku: "EDIT-MKCLR".into(),
+                name: "markup to clear".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                // Deliberately absurd: with a markup the request price must be
+                // ignored, so a stored 10 proves the derivation happened.
+                sale_price: Decimal::from(999),
+                cost_price: Decimal::from(5),
+                track_stock: true,
+                min_stock: Some(Decimal::from(2)),
+                max_stock: Some(Decimal::from(50)),
+                location: None,
+                notes: None,
+                markup_pct: Some(Decimal::from(100)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(product.sale_price, Decimal::from_str("10").unwrap());
+        let app = crate::routes::router(state.clone());
+
+        // `sale_price=10` is what the readonly price input submits — the
+        // operator sees the price the server last derived.
+        let body = format!(
+            "id={}&sku=EDIT-MKCLR&name=markup+cleared&kind=Product&unit=un&sale_price=10&cost_price=5&markup_pct=&category_id=&track_stock=1&min_stock=2&max_stock=80",
+            product.id
+        );
+        let (status, _, html) = post_form_full(
+            app,
+            "/web/products/edit",
+            &body,
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+
+        let stored = state.inventory_service.get_product(product.id).await.unwrap();
+        assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap(), "the last price survives the clear");
+        assert_eq!(stored.markup_pct, None, "an empty markup field clears back to manual");
+        assert!(
+            !html.contains("readonly"),
+            "the manual price must not render readonly again: {html:.600}"
+        );
+    }
+
+    /// The edit gate mirrors creation's in BOTH directions: with a markup an
+    /// empty sale_price is legal because the server derives it, and without a
+    /// markup an empty price is still refused. The create path had both
+    /// directions tested; the edit path had neither, so its gate was dead code
+    /// as far as the suite could tell.
+    #[tokio::test]
+    async fn web_edit_gate_depends_on_the_markup_like_creation() {
+        use rust_decimal::Decimal;
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "EDIT-MKGATE").await;
+        let app = crate::routes::router(state.clone());
+        let body = |markup: &str, price: &str| {
+            format!(
+                "id={}&sku=EDIT-MKGATE&name=Edited+gate&kind=Product&unit=un&sale_price={price}&cost_price=5&markup_pct={markup}&category_id=&track_stock=1&min_stock=2&max_stock=80",
+                product.id
+            )
+        };
+
+        // A markup makes an empty price legal: the server derives and stores it.
+        let (status, _, html) = post_form_full(
+            app.clone(),
+            "/web/products/edit",
+            &body("100", ""),
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        let stored = state.inventory_service.get_product(product.id).await.unwrap();
+        assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
+        assert_eq!(stored.markup_pct, Some(Decimal::from(100)));
+
+        // Without a markup the price is manual, so empty stays an error and
+        // the refusal must write nothing.
+        let (status, _, html) = post_form_full(
+            app,
+            "/web/products/edit",
+            &body("", ""),
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{html:.600}");
+        assert!(html.contains("sale_price is required"), "{html:.400}");
+        let stored = state.inventory_service.get_product(product.id).await.unwrap();
+        assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
+        assert_eq!(stored.markup_pct, Some(Decimal::from(100)));
+    }
+
+    /// The drawer fragment renders the stored markup value and pins the price
+    /// input readonly while a markup is present: the server-rendered state is
+    /// correct before any script runs.
+    #[tokio::test]
+    async fn web_drawer_fragment_renders_the_stored_markup_and_readonly_price() {
+        use rust_decimal::Decimal;
+        let state = test_state().await;
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor_id(&state).await,
+                NewProduct {
+                sku: "DRAW-MK".into(),
+                name: "drawer markup".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(999),
+                cost_price: Decimal::from(8),
+                track_stock: false,
+                min_stock: None,
+                max_stock: None,
+                location: None,
+                notes: None,
+                markup_pct: Some(Decimal::from(25)),
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+        let (status, html) =
+            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains("name=\"markup_pct\"") && html.contains("value=\"25\""),
+            "the drawer must render the stored markup value: {html:.900}"
+        );
+        // cost 8 with a 25% markup derives 10, stored at two decimals.
+        assert!(
+            html.contains("readonly") && html.contains("value=\"10.00\""),
+            "the derived price must render readonly while a markup is set: {html:.900}"
+        );
     }
 
     /// Recording a cost creates/updates the satellite row and fires

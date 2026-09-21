@@ -134,12 +134,17 @@
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
         <label>Sale price</label>
-        <input type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required />
+        <input id="new-product-sale-price" type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required />
       </div>
       <div>
         <label>Cost price</label>
         <input type="number" name="cost_price" step="0.01" min="0" placeholder="0" value="0" />
       </div>
+    </div>
+    <div>
+      <label>Markup % (optional)</label>
+      <input id="new-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" />
+      <div class="text-[13px] text-muted">With a markup the sale price is derived from the cost; leave empty to set it manually.</div>
     </div>
     <div>
       <label>Category (optional)</label>
@@ -231,5 +236,21 @@
   document.body.addEventListener('category-created', function(){ htmx.trigger('#product-list','refresh'); });
   document.body.addEventListener('product-cost-recorded', function(){ htmx.trigger('#product-list','refresh'); });
   document.body.addEventListener('movement-created', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
+  // Markup field courtesy only (product-markup T6): the create handler is the
+  // enforcement — whenever a markup is present the server ignores the price
+  // and derives it from the cost, so the browser disabling the field changes
+  // nothing about what is stored.
+  (function () {
+    var markup = document.getElementById('new-product-markup');
+    var price = document.getElementById('new-product-sale-price');
+    if (!markup || !price) return;
+    function sync() {
+      var derived = markup.value.trim() !== '';
+      price.readOnly = derived;
+      if (derived) { price.removeAttribute('required'); } else { price.setAttribute('required', ''); }
+    }
+    markup.addEventListener('input', sync);
+    sync();
+  })();
 </script>
 {% endblock %}
