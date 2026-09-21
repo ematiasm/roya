@@ -312,25 +312,32 @@ def create_product(
     unit: str = "un",
     min_stock: str | None = None,
     max_stock: str | None = None,
+    markup_pct: str | None = None,
 ) -> dict[str, Any]:
-    """Create a tracked product, optionally with a barcode and opening stock."""
-    product = api.post_json(
-        "/api/products",
-        {
-            "sku": sku,
-            "name": name,
-            "kind": "Product",
-            "category_id": None,
-            "unit": unit,
-            "sale_price": sale_price,
-            "cost_price": cost_price,
-            "track_stock": True,
-            "min_stock": min_stock,
-            "max_stock": max_stock,
-            "location": None,
-            "notes": None,
-        },
-    )
+    """Create a tracked product, optionally with a barcode and opening stock.
+
+    ``markup_pct`` rides the request body only when given: omitting the key is
+    the request an existing caller makes, and the API distinguishes an absent
+    markup (manual price) from any value, so the seed must not imply one it was
+    not asked for.
+    """
+    payload = {
+        "sku": sku,
+        "name": name,
+        "kind": "Product",
+        "category_id": None,
+        "unit": unit,
+        "sale_price": sale_price,
+        "cost_price": cost_price,
+        "track_stock": True,
+        "min_stock": min_stock,
+        "max_stock": max_stock,
+        "location": None,
+        "notes": None,
+    }
+    if markup_pct is not None:
+        payload["markup_pct"] = markup_pct
+    product = api.post_json("/api/products", payload)
     product_id = int(product["id"])
     if barcode is not None:
         api.post_json(f"/api/products/{product_id}/barcodes", {"code": barcode})

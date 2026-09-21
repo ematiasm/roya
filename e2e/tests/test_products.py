@@ -321,6 +321,66 @@ def test_new_category_modal_creates_and_fills_both_category_selects(
     expect(page.locator('#new-product-category option[value=""]')).to_have_count(1)
 
 
+def test_creating_with_a_markup_derives_the_price_and_locks_the_field(
+    page: Page, api: ApiClient
+) -> None:
+    """A markup derives the price server-side, so the empty price must save.
+
+    With a markup the modal's sale price stays empty (the modal's script drops
+    ``required`` the moment the markup has a value, and the server accepts an
+    empty price whenever a markup is present — the readonly state is courtesy,
+    the handler is the enforcement). Asserting the DERIVED value ($15.00 from a
+    $10.00 cost and a 50% markup) rather than anything the form submitted
+    catches a create that echoed a price back instead of deriving one, and the
+    drawer's locked field and hint catch a create whose stored markup the UI
+    then lost.
+    """
+    create_product(
+        api,
+        sku="MARKUP-SEED-17",
+        name="Seed Widget",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    _open_products_list(page, api, name="Seed Widget")
+
+    page.get_by_role("button", name="New product").click()
+    dialog = page.locator("#new-product-dialog")
+    expect(dialog).to_be_visible()
+    dialog.locator('input[name="sku"]').fill("MARKUP-SKU-17")
+    dialog.locator('input[name="name"]').fill("Markup Widget")
+    dialog.locator('input[name="cost_price"]').fill("10.00")
+    # The sale price stays empty on purpose: with a markup the server derives
+    # and stores it, and an operator never types one.
+    dialog.locator('input[name="markup_pct"]').fill("50")
+    with page.expect_response(_response_for("/web/products", "POST")):
+        dialog.get_by_role("button", name="Create product").click()
+
+    listing = page.locator(f"#{_PRODUCTS_INNER}")
+    expect(listing).to_contain_text("Markup Widget")
+    row = listing.locator("> div[id^='product-']").filter(has_text="Markup Widget")
+    expect(row).to_have_count(1)
+    # The stored price is the derivation: cost 10.00 + 50% markup ⇒ $15.00. No
+    # price was submitted, so anything else here is a broken derivation.
+    expect(row).to_contain_text("$15.00")
+    product_id = int(row.get_attribute("id").removeprefix("product-"))
+
+    # The drawer mirrors the stored state: the markup input carries the value,
+    # the price input is not editable (readonly renders bare, so the
+    # editability check is what the browser state actually is), and the muted
+    # hint explains why the field is locked.
+    _open_product_drawer(page, product_id)
+    form = _edit_form(page)
+    expect(form.locator('input[name="markup_pct"]')).to_have_value("50")
+    price = form.locator('input[name="sale_price"]')
+    expect(price).not_to_be_editable()
+    expect(price).to_have_value("15.00")
+    expect(page.locator("#product-detail-inner")).to_contain_text(
+        "Recalculated from the cost and the 50% markup when you save"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Drawer
 # ---------------------------------------------------------------------------
@@ -400,6 +460,95 @@ def test_editing_a_product_in_the_drawer_updates_drawer_and_list(
     expect(row).to_contain_text("Edited Widget")
     expect(row).to_contain_text("$29.50")
     expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Edit Me Widget")
+
+
+def test_changing_the_markup_in_the_drawer_recalculates_the_price(
+    page: Page, api: ApiClient
+) -> None:
+    """Saving a changed markup must re-derive the price, not just store it.
+
+    The derivation is server-side and happens on save, so a drawer save that
+    stored the new markup but skipped the re-derivation would be invisible in
+    the drawer (which re-renders the stored price either way after the swap) —
+    the list row is the only surface that exposes it. The refreshed row must
+    show the price derived from the NEW markup (cost 10.00 + 100% ⇒ $20.00)
+    and must have dropped the price the old markup produced.
+    """
+    product = create_product(
+        api,
+        sku="MARKUP-SKU-18",
+        name="Recalc Widget",
+        cost_price="10.00",
+        markup_pct="50",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Recalc Widget")
+    _open_product_drawer(page, product_id)
+
+    form = _edit_form(page)
+    # The product arrives with a markup, so the drawer's price input is locked.
+    expect(form.locator('input[name="sale_price"]')).not_to_be_editable()
+    form.locator('input[name="markup_pct"]').fill("100")
+    with page.expect_response(_response_for("/web/products/edit", "POST")):
+        with page.expect_response(_response_for(_PRODUCTS_LIST)):
+            form.get_by_role("button", name="Save product").click()
+
+    # A successful save closes the drawer and refreshes the list behind it with
+    # the newly derived price.
+    expect(page.locator("#product-drawer")).not_to_be_visible()
+    row = page.locator(f"#product-{product_id}")
+    expect(row).to_contain_text("$20.00")
+    expect(row).not_to_contain_text("$15.00")
+
+
+def test_clearing_the_markup_in_the_drawer_hands_the_price_back_to_the_operator(
+    page: Page, api: ApiClient
+) -> None:
+    """Clearing the markup must keep the last price and make it editable again.
+
+    Two failure modes live in this one save: a clear that also wiped the price
+    (the operator would lose the number they were charging), and a drawer that
+    stayed readonly after the markup was gone (a stale courtesy state). The
+    price must remain exactly what the last derivation stored — NULL markup
+    means manual, not zero — and reopening the drawer must show an editable
+    price input beside an empty markup field, so the operator can really take
+    the price over.
+    """
+    product = create_product(
+        api,
+        sku="MARKUP-SKU-19",
+        name="Manual Price Widget",
+        cost_price="10.00",
+        markup_pct="50",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Manual Price Widget")
+    _open_product_drawer(page, product_id)
+
+    form = _edit_form(page)
+    form.locator('input[name="markup_pct"]').fill("")
+    with page.expect_response(_response_for("/web/products/edit", "POST")):
+        with page.expect_response(_response_for(_PRODUCTS_LIST)):
+            form.get_by_role("button", name="Save product").click()
+
+    # The price survived the clear: the refreshed row still shows what the
+    # derivation last stored, and a successful save closed the drawer.
+    expect(page.locator("#product-drawer")).not_to_be_visible()
+    row = page.locator(f"#product-{product_id}")
+    expect(row).to_contain_text("$15.00")
+
+    # Reopening the drawer shows a manual price again: the input is editable
+    # (no stale readonly state) and the markup field is empty.
+    _open_product_drawer(page, product_id)
+    form = _edit_form(page)
+    price = form.locator('input[name="sale_price"]')
+    expect(price).to_be_editable()
+    expect(price).to_have_value("15.00")
+    expect(form.locator('input[name="markup_pct"]')).to_have_value("")
 
 
 def test_editing_a_product_while_a_matching_filter_is_active_keeps_the_row_visible(
