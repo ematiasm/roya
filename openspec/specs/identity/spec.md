@@ -2,12 +2,11 @@
 
 > Provenance: promoted from `openspec/changes/2026-09-18-add-identity-module/` (Phase A) on
 > delivery, 2026-09-23, and verified claim by claim against the code and the migration chain. The
-> audit of the actor on every business table is **in progress, per department**, and this spec
-> states the departments that ship today: the finance, inventory and sales/customers tables, and
-> now the purchases/suppliers tables, carry it (see "What the actor audit covers today"). The
-> identity tables' own audit is planned in
-> `openspec/changes/2026-09-19-add-actor-audit/`, and this section is updated as each one lands rather
-> than describing the end state ahead of the code. Behaviour stated here is verified by the test suites, not by a reviewed upstream
+> actor audit now covers the finance, inventory, sales/customers, purchases/suppliers tables AND
+> the identity tables themselves (`users`, `roles`, `permissions`; migration
+> 20240101000034 — see "What the actor audit covers today"). Phase B's change folder
+> (`openspec/changes/2026-09-19-add-actor-audit/`) holds only its closing verification. Behaviour
+> stated here is verified by the test suites, not by a reviewed upstream
 > proposal.
 
 ## Purpose
@@ -35,6 +34,16 @@ catalog below are one contract: the route table in this spec is the operator-fac
 - `is_active INTEGER NOT NULL DEFAULT 1`
 - `must_change_password INTEGER NOT NULL DEFAULT 0`
 - `last_login_at TEXT NULL`, `created_at`, `updated_at`
+- Audit columns (migration 20240101000034): `created_by INTEGER NULL REFERENCES users(id)
+  ON DELETE RESTRICT`, `updated_by INTEGER NULL` (same FK). Unlike every other audited table the
+  columns are nullable ON PURPOSE: the migration's sentinel account has no creator and the
+  bootstrap administrator is created by the system, not by an operator — for those rows NULL is
+  the honest value and means "the system" (the interface renders it as "el sistema", never as a
+  blank or an id). A user created through the screen carries the acting principal in
+  `created_by`; an activation toggle, the administrator password reset (on the target) and the
+  user's own password change at `/password` (on themselves) stamp `updated_by`. A login is not an
+  edit: `touch_last_login` writes no audit column, so "Actualizado por" keeps meaning "who last
+  changed the user".
 - Rules: a username is unique and immutable in practice; users are never deleted, they are
   deactivated; an inactive user cannot log in and cannot hold a session.
 
@@ -52,7 +61,10 @@ catalog below are one contract: the route table in this spec is the operator-fac
 - `id PK`, `code TEXT NOT NULL UNIQUE` (`^[a-z][a-z0-9_]*$`), `name TEXT NOT NULL` (the Spanish
   label shown in the interface), `description TEXT NULL` (≤ 256)
 - `is_system INTEGER NOT NULL DEFAULT 0` — a protected role
-- `created_at`, `updated_at`
+- Audit columns (migration 20240101000034): `created_by INTEGER NOT NULL REFERENCES users(id)
+  ON DELETE RESTRICT` (the seeds are attributed to the sentinel; a screen-created role names its
+  author), `updated_by INTEGER NULL` (the details edit AND the matrix replacement both stamp it),
+  `created_at`, `updated_at`.
 - Seed: `admin` (`is_system = 1`, all permissions), plus three ordinary roles `vendedor`, `cajero`,
   `deposito` with their matrices, every insert guarded so re-running cannot duplicate.
 - Rules: a protected role cannot be deleted, its `code` cannot change, and its permission rows
@@ -62,6 +74,10 @@ catalog below are one contract: the route table in this spec is the operator-fac
 ### permissions
 - `id PK`, `code TEXT NOT NULL UNIQUE` (`<module>.<action>` or `<module>.<resource>.<action>`),
   `module TEXT NOT NULL`, `action TEXT NOT NULL`, `description TEXT NOT NULL`, `created_at`
+- Audit columns (migration 20240101000034): `created_by INTEGER NOT NULL REFERENCES users(id)
+  ON DELETE RESTRICT` — every row's creator is the migration's sentinel — and
+  `updated_by INTEGER NULL` with no runtime writer: the catalog is never written at runtime, so
+  the column exists for schema uniformity, not because an editor exists.
 - Seeded catalog, 23 rows: `dashboard.read`; `finance.read`, `finance.write`,
   `finance.methods.manage`; `inventory.read`, `inventory.write`, `inventory.stock.write`;
   `sales.read`, `sales.create`, `sales.cancel`; `customers.read`, `customers.write`,
@@ -83,17 +99,21 @@ catalog below are one contract: the route table in this spec is the operator-fac
 ### role_permissions
 - `role_id NOT NULL REFERENCES roles(id) ON DELETE CASCADE`, `permission_id NOT NULL REFERENCES
   permissions(id) ON DELETE CASCADE`, primary key `(role_id, permission_id)`.
+- No audit columns of their own (the join-row rule): a matrix row inherits the actor of the role
+  it belongs to, and a matrix edit stamps the ROLE's `updated_by` in the same transaction.
 
 ### user_roles
 - `user_id NOT NULL REFERENCES users(id) ON DELETE CASCADE`, `role_id NOT NULL REFERENCES roles(id)
   ON DELETE RESTRICT`, `granted_by NOT NULL REFERENCES users(id) ON DELETE RESTRICT`, `granted_at
   NOT NULL`, unique `(user_id, role_id)`.
-- The grant trail — who granted, and when — is the actor record this capability owns. Beyond it,
-  the audit columns ship per department: `accounts`, `transactions`, `payment_methods`,
-  `categories`, `products`, `stock_movements`, `sales`, `sale_payments`, `customer_receipts`,
-  `customers`, `purchases`, `purchase_payments`, `suppliers` and `product_supplier_costs` carry
-  `created_by`/`updated_by` today (see "What the actor audit covers today"), and the identity
-  tables' own audit is planned in `openspec/changes/2026-09-19-add-actor-audit/`.
+- The grant trail — who granted, and when — is the actor record this capability owns, and the
+  users screen renders it (slice S13): for every granted role, "«rol»: otorgado por «nombre» el
+  «fecha»", names never ids. Beyond it, the audit columns ship per department: `accounts`,
+  `transactions`, `payment_methods`, `categories`, `products`, `stock_movements`, `sales`,
+  `sale_payments`, `customer_receipts`, `customers`, `purchases`, `purchase_payments`,
+  `suppliers`, `product_supplier_costs`, and now the identity tables themselves — `users`
+  (nullable, self-referencing), `roles` and `permissions` (NOT NULL `created_by`) — carry
+  `created_by`/`updated_by` (see "What the actor audit covers today").
 
 ## Derived reads
 - `effective_permissions(user) = UNION of the permissions of the user's roles`, resolved per
@@ -291,16 +311,28 @@ attributing them to one would invent history. The sentinel consumes `users.id = 
 install because the seeded payment methods are rows the audit must attribute; it cannot log in (an
 unusable credential and an inactive state, two independent guards) and appears in the users list as
 an inactive account, which is where the attribution is explained rather than hidden. The
-inventory, the sales/customers and the purchases/suppliers migrations reuse that same sentinel —
-their own guarded inserts are defensive, firing only if the account is somehow absent when there
-are rows to attribute. The sale's payment rows and its customer receipt carry the actor of the
+inventory, the sales/customers, the purchases/suppliers and the identity migrations reuse that
+same sentinel — their own guarded inserts are defensive, firing only if the account is somehow
+absent when there are rows to attribute. The sale's payment rows and its customer receipt carry the actor of the
 flow's own request (the confirming, payment or collection request), never the sale's creator and
 never a fresh one — and the same argument covers the purchase side: a purchase's payment, the
 satellite cost rows its confirm writes and a line change's stamp on the draft all carry the flow's
 request actor.
 
-Every remaining table (`users`, `roles`, `permissions`) records no actor yet: the identity
-tables' own audit is the next Phase B slice (see the provenance note).
+The identity tables themselves are audited by migration 20240101000034. `roles` and
+`permissions` are rebuilt with NOT NULL `created_by` and every pre-existing row attributed to
+the sentinel — the seeded roles and the permission catalog were nobody's screen work, so
+attributing them to a person would invent history; the seven identity guard triggers are dropped
+before the rebuild and recreated byte-identically at the end, and the refusal suites prove they
+still bite. `users` is NOT rebuilt: SQLite permits
+`ALTER TABLE ADD COLUMN ... REFERENCES users(id)` when the column's default is NULL, and its
+audit columns are honestly nullable — the sentinel has no creator and the bootstrap
+administrator is created by the system, so for those rows NULL means "created by the system" and
+the interface renders it as "el sistema" rather than inventing a name. A user row's `updated_by`
+is written by the existing edit paths only (the activation toggle, the administrator reset on
+the target, the user's own `/password` change); a login writes no audit column.
+`role_permissions` inherits its role's actor; the matrix edit stamps the role's `updated_by`
+with the request's principal.
 
 ### Boundaries
 Identity performs SQL only against identity tables; no department queries identity tables or
