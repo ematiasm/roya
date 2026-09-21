@@ -153,10 +153,10 @@ Spec
       de los literales de fixture (35 sitios, 14 archivos).
 - [x] T3 — Repo: columna en los 8 statements + `row_to_product` + parser
       dedicado que preserva `None` + bind del patch. → `942e328`
-- [ ] T4 — Servicio: derivación en `validate_product`, bounds del markup, guard
+- [x] T4 — Servicio: derivación en `validate_product`, bounds del markup, guard
       de costo 0, merge en `update_product` antes de derivar, y redondeo a
-      centavos del valor derivado (el proyecto no tiene `round_dp` hoy).
-- [ ] T5 — API: DTOs y mapeo en `inventory_api.rs`.
+      centavos del valor derivado (el proyecto no tenía `round_dp`).
+- [x] T5 — API: DTOs y mapeo en `inventory_api.rs`. → `1327a10`
 - [ ] T6 — UI web: gates condicionales en los dos handlers + inputs de margen y
       precio readonly en los dos templates.
 - [ ] T7 — Formato de display del dinero en templates (el redondeo del valor
@@ -186,3 +186,24 @@ Spec
   (fila completa, no patch), así que la distinción `Some(None)` = limpiar vs
   `None` = sin cambio vive en el merge del servicio
   (`src/services/inventory.rs:351`), no en el repo. Hay que testearla ahí.
+- T4–T5 → `1327a10`. `cargo test` 764 passed, 0 failed. La fórmula quedó en
+  `validate_product` (`src/services/inventory.rs`), con el porcentaje aplicado
+  como multiplicación por `Decimal::new(1, 2)` — el repo sigue sin una sola
+  división de `Decimal`, verificado con búsqueda sobre los 63 `.rs`.
+- **Corrección a lo que yo había escrito**: en `rust_decimal` el enum es
+  `RoundingStrategy`, no `RoundingMode` (confirmado en la crate 1.43.0,
+  `decimal.rs:145`). Es la primera vez que el proyecto redondea.
+- Verificación independiente de T4–T5: CONFIRMED en fórmula, orden de la regla
+  de precio contra el precio efectivo, camino de recómputo por patch de costo,
+  wiring de `double_option` en la API y disciplina de alcance. Encontró **seis
+  huecos de cobertura**, todos cerrados en `1327a10`: redondeo a cero (producto
+  rechaza, servicio acepta 0.00), aceptación de `m = -99`, `sale_price` sin
+  sentido ignorado cuando hay markup, precio manual sin redondear, y el
+  empate del redondeo (`10.005 → 10.01`, que es lo único que realmente prueba
+  la estrategia half-up elegida).
+- Divergencia deliberada y pineada: un `Product` cuyo precio derivado redondea a
+  `0.00` se rechaza, pero un `Service` lo acepta, porque la regla preexistente
+  permite servicio gratis (`sale_price >= 0`). Es consistente con la spec; queda
+  como decisión visible, no como accidente.
+- Baseline real de la suite: 745 → 758 (T4–T5) → 764 (hardening). El documento
+  decía 745 "antes de T1" y el baseline previo a la feature era 745.
