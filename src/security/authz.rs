@@ -1870,6 +1870,7 @@ mod tests {
         "account.rs",
         "customer_receipts.rs",
         "customers.rs",
+        "documents.rs",
         "finance_methods.rs",
         "inventory.rs",
         "purchases.rs",
