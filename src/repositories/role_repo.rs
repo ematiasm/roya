@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewRole, NewUserRole, Role};
+use crate::models::{NewRole, NewUserRole, Role, RoleGrant};
 
 fn row_to_role(row: &sqlx::sqlite::SqliteRow) -> Role {
     let system: i64 = row.get("is_system");
@@ -24,6 +24,8 @@ fn row_to_role(row: &sqlx::sqlite::SqliteRow) -> Role {
         name: row.get("name"),
         description: row.get("description"),
         is_system: system == 1,
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -130,20 +132,29 @@ pub trait RoleRepository: Send + Sync {
     /// active protected-role holder.
     async fn replace_user_roles(&self, user_id: i64, role_ids: &[i64], granted_by: i64)
         -> AppResult<Vec<Role>>;
-    /// Create a role row (the S4 create form). The schema CHECK is the
-    /// backstop behind the service's shape validation; the UNIQUE index
-    /// backs the pre-checked uniqueness.
-    async fn create(&self, input: &NewRole) -> AppResult<Role>;
+    /// Create a role row (the S4 create form). `created_by` is the acting
+    /// principal — the database refuses a row without one (NOT NULL) — so a
+    /// role created through the screen always names its author. The schema
+    /// CHECK is the backstop behind the service's shape validation; the
+    /// UNIQUE index backs the pre-checked uniqueness.
+    async fn create(&self, input: &NewRole, created_by: i64) -> AppResult<Role>;
     /// Edit a role's name and description (the S4 edit form). The code is
     /// not part of this statement: renames are refused by the guard trigger
     /// for a protected role and are not offered by the interface for any
-    /// role (a machine name is not a relabel). Touches `updated_at`.
-    async fn update_details(&self, id: i64, name: &str, description: Option<&str>)
+    /// role (a machine name is not a relabel). Touches `updated_at` and
+    /// stamps `updated_by` with the editing actor (slice S13).
+    async fn update_details(&self, id: i64, name: &str, description: Option<&str>,
+        updated_by: i64)
         -> AppResult<()>;
     /// Usernames of EVERY user holding the role (AC15): the names a blocked
     /// deletion reports. `user_roles.role_id` is ON DELETE RESTRICT for
     /// holders of any state, active or not, so the refusal names all of them.
     async fn holder_names(&self, role_id: i64) -> AppResult<Vec<String>>;
+    /// The grant trail of one user (slice S13): every role they hold together
+    /// with `granted_by`/`granted_at` — the columns the RBAC slice has
+    /// recorded since S2 and the interface never showed. Role order matches
+    /// `list_for_user` (creation order).
+    async fn list_grants_for_user(&self, user_id: i64) -> AppResult<Vec<RoleGrant>>;
 }
 
 #[derive(Clone)]
@@ -161,7 +172,7 @@ impl SqliteRoleRepository {
 impl RoleRepository for SqliteRoleRepository {
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Role>> {
         let row = sqlx::query(
-            r#"SELECT id, code, name, description, is_system, created_at, updated_at
+            r#"SELECT id, code, name, description, is_system, created_by, updated_by, created_at, updated_at
                FROM roles WHERE id = ?"#,
         )
         .bind(id)
@@ -172,7 +183,7 @@ impl RoleRepository for SqliteRoleRepository {
 
     async fn find_by_code(&self, code: &str) -> AppResult<Option<Role>> {
         let row = sqlx::query(
-            r#"SELECT id, code, name, description, is_system, created_at, updated_at
+            r#"SELECT id, code, name, description, is_system, created_by, updated_by, created_at, updated_at
                FROM roles WHERE code = ?"#,
         )
         .bind(code)
@@ -183,7 +194,7 @@ impl RoleRepository for SqliteRoleRepository {
 
     async fn list(&self) -> AppResult<Vec<Role>> {
         let rows = sqlx::query(
-            r#"SELECT id, code, name, description, is_system, created_at, updated_at
+            r#"SELECT id, code, name, description, is_system, created_by, updated_by, created_at, updated_at
                FROM roles ORDER BY id"#,
         )
         .fetch_all(&self.pool)
@@ -194,7 +205,7 @@ impl RoleRepository for SqliteRoleRepository {
     async fn list_for_user(&self, user_id: i64) -> AppResult<Vec<Role>> {
         let rows = sqlx::query(
             r#"SELECT r.id, r.code, r.name, r.description, r.is_system,
-                      r.created_at, r.updated_at
+                      r.created_by, r.updated_by, r.created_at, r.updated_at
                FROM roles r
                JOIN user_roles ur ON ur.role_id = r.id
                WHERE ur.user_id = ?
@@ -215,7 +226,7 @@ impl RoleRepository for SqliteRoleRepository {
         // variable cap (32 766 on the bundled build) sits far above any real
         // submission.
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
-            "SELECT id, code, name, description, is_system, created_at, updated_at FROM roles WHERE id IN (",
+            "SELECT id, code, name, description, is_system, created_by, updated_by, created_at, updated_at FROM roles WHERE id IN (",
         );
         {
             let mut separated = qb.separated(", ");
@@ -341,7 +352,7 @@ impl RoleRepository for SqliteRoleRepository {
         }
         let rows = sqlx::query(
             r#"SELECT r.id, r.code, r.name, r.description, r.is_system,
-                      r.created_at, r.updated_at
+                      r.created_by, r.updated_by, r.created_at, r.updated_at
                FROM roles r
                JOIN user_roles ur ON ur.role_id = r.id
                WHERE ur.user_id = ?
@@ -354,31 +365,34 @@ impl RoleRepository for SqliteRoleRepository {
         Ok(rows.iter().map(row_to_role).collect())
     }
 
-    async fn create(&self, input: &NewRole) -> AppResult<Role> {
+    async fn create(&self, input: &NewRole, created_by: i64) -> AppResult<Role> {
         let row = sqlx::query(
-            r#"INSERT INTO roles (code, name, description)
-               VALUES (?, ?, ?)
-               RETURNING id, code, name, description, is_system, created_at, updated_at"#,
+            r#"INSERT INTO roles (code, name, description, created_by)
+               VALUES (?, ?, ?, ?)
+               RETURNING id, code, name, description, is_system, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.code)
         .bind(&input.name)
         .bind(&input.description)
+        .bind(created_by)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_role(&row))
     }
 
-    async fn update_details(&self, id: i64, name: &str, description: Option<&str>)
+    async fn update_details(&self, id: i64, name: &str, description: Option<&str>,
+        updated_by: i64)
         -> AppResult<()> {
         sqlx::query(
             r#"UPDATE roles
-               SET name = ?, description = ?,
+               SET name = ?, description = ?, updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?"#,
         )
         .bind(name)
         .bind(description)
+        .bind(updated_by)
         .bind(id)
         .execute(&self.pool)
         .await
@@ -397,6 +411,29 @@ impl RoleRepository for SqliteRoleRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn list_grants_for_user(&self, user_id: i64) -> AppResult<Vec<RoleGrant>> {
+        let rows = sqlx::query(
+            r#"SELECT r.id, r.code, r.name, r.description, r.is_system,
+                      r.created_by, r.updated_by, r.created_at, r.updated_at,
+                      ur.granted_by, ur.granted_at
+               FROM user_roles ur
+               JOIN roles r ON r.id = ur.role_id
+               WHERE ur.user_id = ?
+               ORDER BY r.id"#,
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| RoleGrant {
+                role: row_to_role(row),
+                granted_by: row.get("granted_by"),
+                granted_at: row.get("granted_at"),
+            })
+            .collect())
     }
 }
 
@@ -427,12 +464,15 @@ mod tests {
         let admin = roles.find_by_code("admin").await.unwrap().unwrap();
         for name in names {
             let user = users
-                .create(&NewUser {
-                    username: name.to_string(),
-                    display_name: name.to_string(),
-                    password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
-                    must_change_password: false,
-                })
+                .create(
+                    &NewUser {
+                        username: name.to_string(),
+                        display_name: name.to_string(),
+                        password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+                        must_change_password: false,
+                    },
+                    None,
+                )
                 .await
                 .unwrap();
             roles
@@ -556,21 +596,27 @@ mod tests {
         // Granted by a persistent third user: a self-granted holder is also
         // held by the granted_by RESTRICT, which would mask the trigger.
         let grantor_user = SqliteUserRepository::new(p.clone())
-            .create(&NewUser {
-                username: "hr-grantor".into(),
-                display_name: "HR".into(),
-                password_hash: "placeholder-not-a-real-argon2-hash".into(),
-                must_change_password: false,
-            })
+            .create(
+                &NewUser {
+                    username: "hr-grantor".into(),
+                    display_name: "HR".into(),
+                    password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                    must_change_password: false,
+                },
+                None,
+            )
             .await
             .unwrap();
         let holder = SqliteUserRepository::new(p.clone())
-            .create(&NewUser {
-                username: "first-admin".into(),
-                display_name: "First".into(),
-                password_hash: "placeholder-not-a-real-argon2-hash".into(),
-                must_change_password: false,
-            })
+            .create(
+                &NewUser {
+                    username: "first-admin".into(),
+                    display_name: "First".into(),
+                    password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                    must_change_password: false,
+                },
+                Some(grantor_user.id),
+            )
             .await
             .unwrap();
         let admin = SqliteRoleRepository::new(p.clone())
@@ -686,8 +732,8 @@ mod tests {
     async fn an_insert_or_replace_of_a_protected_role_row_aborts() {
         let p = pool().await;
         let err = sqlx::query(
-            r#"INSERT OR REPLACE INTO roles (id, code, name, is_system)
-               SELECT id, code, name, is_system FROM roles WHERE code = 'admin'"#,
+            r#"INSERT OR REPLACE INTO roles (id, code, name, is_system, created_by)
+               SELECT id, code, name, is_system, created_by FROM roles WHERE code = 'admin'"#,
         )
         .execute(&p)
         .await
@@ -870,7 +916,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        users.set_active(first, false).await.unwrap();
+        users.set_active(first, false, None).await.unwrap();
 
         // The read is the TOTAL set: the deactivated holder is named too.
         let named = roles.holder_names(vendedor.id).await.unwrap();
@@ -958,5 +1004,73 @@ mod tests {
         assert_eq!(codes, vec!["cajero", "vendedor"]);
         // The empty set asks nothing.
         assert!(roles.find_by_ids(&[]).await.unwrap().is_empty());
+    }
+
+    // -- S13: the grant trail read ------------------------------------------------
+
+    /// `list_grants_for_user` reads the `user_roles` columns the RBAC slice
+    /// has recorded since S2: one entry per held role, the granter's id and
+    /// the recorded instant, in the same role order as `list_for_user`. The
+    /// display name is the wiring layer's job; the repository returns the
+    /// stored ids, never resolved names.
+    #[tokio::test]
+    async fn list_grants_for_user_returns_the_recorded_grant_trail_in_role_order() {
+        let p = pool().await;
+        let users = SqliteUserRepository::new(p.clone());
+        let roles = SqliteRoleRepository::new(p.clone());
+        let granter = users
+            .create(
+                &NewUser {
+                    username: "grant-giver".into(),
+                    display_name: "Grant Giver".into(),
+                    password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                    must_change_password: false,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let target = users
+            .create(
+                &NewUser {
+                    username: "teller".into(),
+                    display_name: "Teller".into(),
+                    password_hash: "placeholder-not-a-real-argon2-hash".into(),
+                    must_change_password: false,
+                },
+                Some(granter.id),
+            )
+            .await
+            .unwrap();
+        let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
+        let cajero = roles.find_by_code("cajero").await.unwrap().unwrap();
+        roles
+            .grant(&NewUserRole {
+                user_id: target.id,
+                role_id: vendedor.id,
+                granted_by: granter.id,
+            })
+            .await
+            .unwrap();
+        roles
+            .replace_user_roles(target.id, &[vendedor.id, cajero.id], granter.id)
+            .await
+            .unwrap();
+
+        let trail = roles.list_grants_for_user(target.id).await.unwrap();
+        assert_eq!(
+            trail
+                .iter()
+                .map(|g| g.role.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vendedor", "cajero"],
+            "the trail follows the same role order as list_for_user"
+        );
+        for grant in &trail {
+            assert_eq!(grant.granted_by, granter.id, "the granter is recorded");
+            assert!(!grant.granted_at.to_string().is_empty(), "the instant is recorded");
+        }
+        // A user holding nothing answers the empty trail, never an error.
+        assert!(roles.list_grants_for_user(granter.id).await.unwrap().is_empty());
     }
 }

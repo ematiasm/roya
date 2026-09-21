@@ -62,12 +62,15 @@ pub async fn seed_audit_user(
 ) -> AppResult<i64> {
     let users = SqliteUserRepository::new(pool.clone());
     let user = users
-        .create(&NewUser {
-            username: username.to_string(),
-            display_name: display_name.to_string(),
-            password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
-            must_change_password: false,
-        })
+        .create(
+            &NewUser {
+                username: username.to_string(),
+                display_name: display_name.to_string(),
+                password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+                must_change_password: false,
+            },
+            None,
+        )
         .await?;
     Ok(user.id)
 }
@@ -135,12 +138,15 @@ pub async fn seed_session_without_roles(pool: &SqlitePool) -> AppResult<i64> {
     let users = SqliteUserRepository::new(pool.clone());
     let sessions = SqliteSessionRepository::new(pool.clone());
     let user = users
-        .create(&NewUser {
-            username: TEST_USERNAME.to_string(),
-            display_name: "Test Admin".to_string(),
-            password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
-            must_change_password: false,
-        })
+        .create(
+            &NewUser {
+                username: TEST_USERNAME.to_string(),
+                display_name: "Test Admin".to_string(),
+                password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+                must_change_password: false,
+            },
+            None,
+        )
         .await?;
     let session = sessions
         .insert(&NewSession {
@@ -167,15 +173,18 @@ pub async fn seed_session_with_permissions(
     let users = SqliteUserRepository::new(pool.clone());
     let sessions = SqliteSessionRepository::new(pool.clone());
     let user = users
-        .create(&NewUser {
-            // A per-call suffix: a test can seed more than one probe principal
-            // in the same pool (e.g. one read-only, one holding the permission
-            // under test), and usernames are unique case-insensitively.
-            username: probe_username().to_string(),
-            display_name: "Test Probe".to_string(),
-            password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
-            must_change_password: false,
-        })
+        .create(
+            &NewUser {
+                // A per-call suffix: a test can seed more than one probe principal
+                // in the same pool (e.g. one read-only, one holding the permission
+                // under test), and usernames are unique case-insensitively.
+                username: probe_username().to_string(),
+                display_name: "Test Probe".to_string(),
+                password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+                must_change_password: false,
+            },
+            None,
+        )
         .await?;
     let codes: Vec<&str> = permissions.to_vec();
     grant_role_with_codes(pool, &probe_role_code(), "Probe Set", user.id, &codes).await?;
@@ -208,11 +217,14 @@ async fn grant_role_with_codes(
     let roles = SqliteRoleRepository::new(pool.clone());
     let permissions_repo = SqlitePermissionRepository::new(pool.clone());
     let role = roles
-        .create(&NewRole {
-            code: role_code.to_string(),
-            name: role_name.to_string(),
-            description: None,
-        })
+        .create(
+            &NewRole {
+                code: role_code.to_string(),
+                name: role_name.to_string(),
+                description: None,
+            },
+            user_id,
+        )
         .await?;
     let mut permission_ids = Vec::with_capacity(codes.len());
     for code in codes.iter() {
@@ -228,7 +240,7 @@ async fn grant_role_with_codes(
         permission_ids.push(id);
     }
     permissions_repo
-        .set_role_permissions(role.id, &permission_ids)
+        .set_role_permissions(role.id, &permission_ids, user_id)
         .await?;
     roles
         .grant(&NewUserRole {
@@ -308,12 +320,15 @@ pub async fn seed_flagged_session(pool: &SqlitePool) -> AppResult<(String, i64)>
     let users = SqliteUserRepository::new(pool.clone());
     let sessions = SqliteSessionRepository::new(pool.clone());
     let user = users
-        .create(&NewUser {
-            username: "flagged-admin".to_string(),
-            display_name: "Flagged Admin".to_string(),
-            password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
-            must_change_password: true,
-        })
+        .create(
+            &NewUser {
+                username: "flagged-admin".to_string(),
+                display_name: "Flagged Admin".to_string(),
+                password_hash: "placeholder-not-a-real-argon2-hash".to_string(),
+                must_change_password: true,
+            },
+            None,
+        )
         .await?;
     let token = mint_token()?;
     let session = sessions

@@ -36,6 +36,8 @@ fn row_to_user(row: &sqlx::sqlite::SqliteRow) -> User {
         is_active: active == 1,
         must_change_password: must_change == 1,
         last_login_at: row.get("u_last_login_at"),
+        created_by: row.get("u_created_by"),
+        updated_by: row.get("u_updated_by"),
         created_at: row.get("u_created_at"),
         updated_at: row.get("u_updated_at"),
     }
@@ -145,6 +147,7 @@ impl SessionRepository for SqliteSessionRepository {
                       u.display_name AS u_display_name, u.is_active AS u_is_active,
                       u.must_change_password AS u_must_change_password,
                       u.last_login_at AS u_last_login_at,
+                      u.created_by AS u_created_by, u.updated_by AS u_updated_by,
                       u.created_at AS u_created_at, u.updated_at AS u_updated_at
                FROM sessions s
                JOIN users u ON u.id = s.user_id

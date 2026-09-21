@@ -562,7 +562,10 @@ mod tests {
         State(state): State<AppState>,
         _: Require<CustomersWrite>,
     ) -> &'static str {
-        sqlx::query("INSERT INTO roles (code, name) VALUES ('probe-writer', 'probe')")
+        sqlx::query(
+            "INSERT INTO roles (code, name, created_by) VALUES ('probe-writer', 'probe', \
+             (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
+        )
             .execute(&state.pool)
             .await
             .unwrap();
@@ -757,8 +760,13 @@ mod tests {
                 .unwrap();
             kept.push(id.0);
         }
+        let actor_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+            .bind(test_support::TEST_USERNAME)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         permissions_repo
-            .set_role_permissions(vendedor.id, &kept)
+            .set_role_permissions(vendedor.id, &kept, actor_id)
             .await
             .unwrap();
 
@@ -778,7 +786,7 @@ mod tests {
                 .unwrap();
         kept.push(customers_write.0);
         permissions_repo
-            .set_role_permissions(vendedor.id, &kept)
+            .set_role_permissions(vendedor.id, &kept, actor_id)
             .await
             .unwrap();
         let restored = send(&app, "/kernel-gated", &[]).await;
@@ -829,6 +837,8 @@ mod tests {
         let user = User {
             id: 7,
             username: "maria".into(),
+            created_by: None,
+            updated_by: None,
             display_name: "María".into(),
             is_active: true,
             must_change_password: true,
@@ -1379,6 +1389,8 @@ mod tests {
         let user = User {
             id: 7,
             username: "nav-probe".into(),
+            created_by: None,
+            updated_by: None,
             display_name: "Nav Probe".into(),
             is_active: true,
             must_change_password: false,

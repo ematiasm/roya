@@ -1330,6 +1330,13 @@ pub struct User {
     pub is_active: bool,
     pub must_change_password: bool,
     pub last_login_at: Option<chrono::NaiveDateTime>,
+    /// Audit actor (M5 Phase B, slice S13): who created the user and who last
+    /// edited it (an activation toggle, the administrator reset or the
+    /// user's own password change). NULL means the system created the row —
+    /// the migration's sentinel, the bootstrap administrator — and the
+    /// interface renders that honestly instead of inventing a name.
+    pub created_by: Option<i64>,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -1424,6 +1431,11 @@ pub struct Role {
     pub name: String,
     pub description: Option<String>,
     pub is_system: bool,
+    /// Audit actor (M5 Phase B, slice S13): the seeded roles are attributed to
+    /// the migration's sentinel; a role created through the screen names its
+    /// author, and an edit of its details or matrix names the editor.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
     pub updated_at: chrono::NaiveDateTime,
 }
@@ -1450,6 +1462,21 @@ pub struct Permission {
 pub struct UserWithRoles {
     pub user: User,
     pub roles: Vec<Role>,
+    /// The grant trail (slice S13): for every role the user holds, who
+    /// granted it and when — the `user_roles` columns the RBAC slice has
+    /// recorded since S2 and the interface never showed. Same order as
+    /// `roles`.
+    pub grants: Vec<RoleGrant>,
+}
+
+/// One grant of a role to a user: the role, the granter's user id and the
+/// instant the grant was recorded. The display name is resolved in the wiring
+/// layer, like every other audit display.
+#[derive(Debug, Clone)]
+pub struct RoleGrant {
+    pub role: Role,
+    pub granted_by: i64,
+    pub granted_at: chrono::NaiveDateTime,
 }
 
 /// Service-level input for assigning a role to a user. `granted_by` records

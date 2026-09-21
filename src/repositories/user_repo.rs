@@ -22,6 +22,10 @@ fn row_to_user(row: &sqlx::sqlite::SqliteRow) -> User {
         is_active: active == 1,
         must_change_password: must_change == 1,
         last_login_at: row.get("last_login_at"),
+        // NULL is the honest "the system created/edited this row" value: the
+        // migration's sentinel and the bootstrap administrator carry it.
+        created_by: row.get("created_by"),
+        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -55,7 +59,12 @@ fn map_db_err(e: sqlx::Error) -> AppError {
         // user_roles.granted_by is ON DELETE RESTRICT (and a role holder's own
         // grant records the user too): a role grant records who granted it,
         // and that reference holds the user row the statement tried to delete.
-        AppError::Conflict("this user granted a role: the grant records who granted it, and the deletion is held".into())
+        // Slice S13 added the audit columns' own self-references
+        // (users.created_by/updated_by, both RESTRICT): a user whose id
+        // another user's audit columns name is held the same way. The message
+        // names both origins; the interface shows the reason, never the raw
+        // SQL.
+        AppError::Conflict("this user is still referenced: the grant trail or another user's audit record holds them".into())
     } else if s.contains("CHECK constraint failed") {
         if s.contains("users_username_shape") {
             AppError::Validation(
@@ -75,7 +84,11 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 
 #[async_trait]
 pub trait UserRepository: Send + Sync {
-    async fn create(&self, input: &NewUser) -> AppResult<User>;
+    /// Create a user. `created_by` is the acting principal's id, or `None`
+    /// when the SYSTEM creates the row — the bootstrap administrator is
+    /// created by the bootstrap, not by an operator, and the schema honestly
+    /// stores NULL for it (slice S13).
+    async fn create(&self, input: &NewUser, created_by: Option<i64>) -> AppResult<User>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<User>>;
     /// Case-insensitive lookup through the NOCASE unique index.
     async fn find_by_username(&self, username: &str) -> AppResult<Option<User>>;
@@ -84,9 +97,19 @@ pub trait UserRepository: Send + Sync {
         -> AppResult<Option<UserWithHash>>;
     async fn find_with_hash_by_id(&self, id: i64) -> AppResult<Option<UserWithHash>>;
     /// Replace the stored PHC string (password change / admin reset).
-    async fn update_password_hash(&self, id: i64, password_hash: &str) -> AppResult<()>;
-    async fn set_must_change_password(&self, id: i64, value: bool) -> AppResult<()>;
-    async fn set_active(&self, id: i64, active: bool) -> AppResult<()>;
+    /// `updated_by` is the acting user's id — the target itself on the
+    /// confined change, the resetting administrator on the admin reset — or
+    /// `None` when the system performs the write (the bootstrap recovery).
+    async fn update_password_hash(&self, id: i64, password_hash: &str, updated_by: Option<i64>)
+        -> AppResult<()>;
+    async fn set_must_change_password(&self, id: i64, value: bool, updated_by: Option<i64>)
+        -> AppResult<()>;
+    /// Activation toggle. `updated_by` names the acting principal; the
+    /// bootstrap's recovery reactivation passes `None` (the system did it).
+    async fn set_active(&self, id: i64, active: bool, updated_by: Option<i64>) -> AppResult<()>;
+    /// Stamp `last_login_at` at the login instant. A login is NOT an edit of
+    /// the record: it touches no audit column, so "Actualizado por" keeps
+    /// meaning "who last changed the user", not "who logged in last".
     async fn touch_last_login(&self, id: i64, when: NaiveDateTime) -> AppResult<()>;
     /// Every user, creation order (the S3 users list read). The ordinary
     /// read: no hash material.
@@ -113,17 +136,18 @@ impl SqliteUserRepository {
 
 #[async_trait]
 impl UserRepository for SqliteUserRepository {
-    async fn create(&self, input: &NewUser) -> AppResult<User> {
+    async fn create(&self, input: &NewUser, created_by: Option<i64>) -> AppResult<User> {
         let row = sqlx::query(
-            r#"INSERT INTO users (username, display_name, password_hash, must_change_password)
-               VALUES (?, ?, ?, ?)
+            r#"INSERT INTO users (username, display_name, password_hash, must_change_password, created_by)
+               VALUES (?, ?, ?, ?, ?)
                RETURNING id, username, display_name, is_active, must_change_password,
-                         last_login_at, created_at, updated_at"#,
+                         last_login_at, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.username)
         .bind(&input.display_name)
         .bind(&input.password_hash)
         .bind(if input.must_change_password { 1i64 } else { 0i64 })
+        .bind(created_by)
         .fetch_one(&self.pool)
         .await
         .map_err(map_db_err)?;
@@ -133,7 +157,7 @@ impl UserRepository for SqliteUserRepository {
     async fn find_by_id(&self, id: i64) -> AppResult<Option<User>> {
         let row = sqlx::query(
             r#"SELECT id, username, display_name, is_active, must_change_password,
-                      last_login_at, created_at, updated_at
+                      last_login_at, created_by, updated_by, created_at, updated_at
                FROM users WHERE id = ?"#,
         )
         .bind(id)
@@ -145,7 +169,7 @@ impl UserRepository for SqliteUserRepository {
     async fn find_by_username(&self, username: &str) -> AppResult<Option<User>> {
         let row = sqlx::query(
             r#"SELECT id, username, display_name, is_active, must_change_password,
-                      last_login_at, created_at, updated_at
+                      last_login_at, created_by, updated_by, created_at, updated_at
                FROM users WHERE username = ? COLLATE NOCASE"#,
         )
         .bind(username)
@@ -160,7 +184,7 @@ impl UserRepository for SqliteUserRepository {
     ) -> AppResult<Option<UserWithHash>> {
         let row = sqlx::query(
             r#"SELECT id, username, display_name, is_active, must_change_password,
-                      last_login_at, created_at, updated_at, password_hash
+                      last_login_at, created_by, updated_by, created_at, updated_at, password_hash
                FROM users WHERE username = ? COLLATE NOCASE"#,
         )
         .bind(username)
@@ -172,7 +196,7 @@ impl UserRepository for SqliteUserRepository {
     async fn find_with_hash_by_id(&self, id: i64) -> AppResult<Option<UserWithHash>> {
         let row = sqlx::query(
             r#"SELECT id, username, display_name, is_active, must_change_password,
-                      last_login_at, created_at, updated_at, password_hash
+                      last_login_at, created_by, updated_by, created_at, updated_at, password_hash
                FROM users WHERE id = ?"#,
         )
         .bind(id)
@@ -181,31 +205,36 @@ impl UserRepository for SqliteUserRepository {
         Ok(row.map(row_to_user_with_hash))
     }
 
-    async fn update_password_hash(&self, id: i64, password_hash: &str) -> AppResult<()> {
-        sqlx::query("UPDATE users SET password_hash = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
+    async fn update_password_hash(&self, id: i64, password_hash: &str, updated_by: Option<i64>)
+        -> AppResult<()> {
+        sqlx::query("UPDATE users SET password_hash = ?, updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
             .bind(password_hash)
+            .bind(updated_by)
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    async fn set_must_change_password(&self, id: i64, value: bool) -> AppResult<()> {
+    async fn set_must_change_password(&self, id: i64, value: bool, updated_by: Option<i64>)
+        -> AppResult<()> {
         sqlx::query(
-            "UPDATE users SET must_change_password = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            "UPDATE users SET must_change_password = ?, updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
         )
         .bind(if value { 1i64 } else { 0i64 })
+        .bind(updated_by)
         .bind(id)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    async fn set_active(&self, id: i64, active: bool) -> AppResult<()> {
+    async fn set_active(&self, id: i64, active: bool, updated_by: Option<i64>) -> AppResult<()> {
         sqlx::query(
-            "UPDATE users SET is_active = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            "UPDATE users SET is_active = ?, updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
         )
         .bind(if active { 1i64 } else { 0i64 })
+        .bind(updated_by)
         .bind(id)
         .execute(&self.pool)
         .await
@@ -229,7 +258,7 @@ impl UserRepository for SqliteUserRepository {
     async fn list(&self) -> AppResult<Vec<User>> {
         let rows = sqlx::query(
             r#"SELECT id, username, display_name, is_active, must_change_password,
-                      last_login_at, created_at, updated_at
+                      last_login_at, created_by, updated_by, created_at, updated_at
                FROM users ORDER BY id"#,
         )
         .fetch_all(&self.pool)
@@ -272,7 +301,10 @@ mod tests {
     #[tokio::test]
     async fn f4_uppercase_username_hits_the_shape_check_and_maps_to_validation() {
         let repo = SqliteUserRepository::new(pool().await);
-        let err = repo.create(&new_user("Admin", "Admin")).await.unwrap_err();
+        let err = repo
+            .create(&new_user("Admin", "Admin"), None)
+            .await
+            .unwrap_err();
         let msg = match &err {
             AppError::Validation(m) => m.clone(),
             other => panic!("expected Validation, got {other:?}"),
@@ -286,14 +318,20 @@ mod tests {
     #[tokio::test]
     async fn f4_username_shorter_than_three_chars_maps_to_validation() {
         let repo = SqliteUserRepository::new(pool().await);
-        let err = repo.create(&new_user("ab", "Ab")).await.unwrap_err();
+        let err = repo
+            .create(&new_user("ab", "Ab"), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
     #[tokio::test]
     async fn f4_username_with_illegal_characters_maps_to_validation() {
         let repo = SqliteUserRepository::new(pool().await);
-        let err = repo.create(&new_user("ok!", "Ok")).await.unwrap_err();
+        let err = repo
+            .create(&new_user("ok!", "Ok"), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
@@ -301,7 +339,10 @@ mod tests {
     async fn f4_display_name_longer_than_128_chars_maps_to_validation() {
         let repo = SqliteUserRepository::new(pool().await);
         let long: String = "x".repeat(200);
-        let err = repo.create(&new_user("teller", &long)).await.unwrap_err();
+        let err = repo
+            .create(&new_user("teller", &long), None)
+            .await
+            .unwrap_err();
         let msg = match &err {
             AppError::Validation(m) => m.clone(),
             other => panic!("expected Validation, got {other:?}"),
@@ -320,8 +361,14 @@ mod tests {
     async fn a_grantor_user_delete_maps_the_foreign_key_refusal() {
         let p = pool().await;
         let repo = SqliteUserRepository::new(p.clone());
-        let grantor = repo.create(&new_user("hr-grantor", "HR")).await.unwrap();
-        let holder = repo.create(&new_user("teller", "Teller")).await.unwrap();
+        let grantor = repo
+            .create(&new_user("hr-grantor", "HR"), None)
+            .await
+            .unwrap();
+        let holder = repo
+            .create(&new_user("teller", "Teller"), Some(grantor.id))
+            .await
+            .unwrap();
         sqlx::query(
             r#"INSERT INTO user_roles (user_id, role_id, granted_by)
                VALUES (?, (SELECT id FROM roles WHERE code = 'admin'), ?)"#,
@@ -341,10 +388,41 @@ mod tests {
         match &mapped {
             AppError::Conflict(message) => {
                 assert!(
-                    message.contains("granted a role"),
+                    message.contains("referenced"),
                     "the refusal must name the reason: {message}"
                 );
                 assert!(!message.contains("FOREIGN KEY"), "no raw SQL text: {message}");
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// The audit columns are nullable but their RESTRICT foreign keys are
+    /// real: a user named in another user's `created_by` cannot be deleted
+    /// while that reference exists — the same hold the grant trail applies.
+    #[tokio::test]
+    async fn a_user_named_in_another_users_created_by_cannot_be_deleted() {
+        let p = pool().await;
+        let repo = SqliteUserRepository::new(p.clone());
+        let creator = repo
+            .create(&new_user("hr-creator", "HR"), None)
+            .await
+            .unwrap();
+        let _newcomer = repo
+            .create(&new_user("teller", "Teller"), Some(creator.id))
+            .await
+            .unwrap();
+
+        let err = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(creator.id)
+            .execute(&p)
+            .await
+            .unwrap_err();
+        let mapped = map_db_err(err);
+        match &mapped {
+            AppError::Conflict(message) => {
+                assert!(message.contains("referenced"), "{message}");
+                assert!(!message.contains("FOREIGN KEY"), "{message}");
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
