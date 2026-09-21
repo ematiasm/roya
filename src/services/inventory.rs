@@ -252,9 +252,26 @@ where
                 // sale_price = cost_price * (1 + markup_pct/100). The
                 // percentage's scale shift is a multiplication by 0.01,
                 // because this project never divides a `Decimal`.
-                let derived = Self::round_derived_price_to_cents(
-                    input.cost_price * (Decimal::ONE + m * Decimal::new(1, 2)),
-                );
+                //
+                // Every operand here is user-supplied and unbounded, and
+                // rust_decimal's `Mul`/`Add` PANIC on overflow, so the bare
+                // operators would let an authenticated caller 500 the
+                // handler. The checked forms turn the same inputs into a
+                // validation error instead. There is deliberately no upper
+                // bound on `markup_pct`: whether a markup is plausible is a
+                // product decision, not an arithmetic one.
+                let factor = m
+                    .checked_mul(Decimal::new(1, 2))
+                    .and_then(|shift| Decimal::ONE.checked_add(shift))
+                    .and_then(|f| input.cost_price.checked_mul(f));
+                let derived = match factor {
+                    Some(f) => Self::round_derived_price_to_cents(f),
+                    None => {
+                        return Err(AppError::Validation(
+                            "markup_pct or cost_price is too large to derive a sale_price".into(),
+                        ));
+                    }
+                };
                 (derived, Some(m))
             }
         };
@@ -1716,6 +1733,52 @@ mod tests {
                 "a rejected derivation must write nothing"
             );
         }
+    }
+
+    /// The derivation multiplies and adds user-supplied unbounded Decimals,
+    /// and rust_decimal's `Mul`/`Add` panic on overflow: without the checked
+    /// forms an authenticated caller could 500 the handler with an extreme
+    /// markup. The overflow must be a validation error instead, and a
+    /// rejected derivation must write nothing. A panic fails these tests
+    /// anyway, which is exactly what makes them discriminate.
+    #[tokio::test]
+    async fn an_overflowing_markup_derivation_is_a_validation_error_not_a_panic() {
+        let s = svc(true).await;
+        // A markup at the extreme end of the representable range: the factor
+        // alone still fits (rust_decimal rescales intermediates, 5 * ~7.9e26
+        // stays under the 7.9e28 cap), so the final `cost_price * factor` is
+        // the step that overflows, with an ordinary cost of 1000.
+        let err = s
+            .create_product(
+                actor(&s).await,
+                markup_input("MK-OVF-1", "1000", "79228162514264337593543950335"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            s.products.find_by_sku("MK-OVF-1").await.unwrap().is_none(),
+            "a rejected derivation must write nothing"
+        );
+    }
+
+    /// The mirror case: an ordinary markup with a cost so large the final
+    /// `cost_price * factor` overflows the representable range.
+    #[tokio::test]
+    async fn an_overflowing_cost_derivation_is_a_validation_error_not_a_panic() {
+        let s = svc(true).await;
+        let err = s
+            .create_product(
+                actor(&s).await,
+                markup_input("MK-OVF-2", "79228162514264337593543950335", "50"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            s.products.find_by_sku("MK-OVF-2").await.unwrap().is_none(),
+            "a rejected derivation must write nothing"
+        );
     }
 
     #[tokio::test]
