@@ -16,8 +16,22 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
   database triggers, the navigation rendering only the entries the principal may read, and role
   grants recording who granted them (`user_roles.granted_by`/`granted_at`). Every department route
   declares the permission its action needs; the kernel answers — see
-  `openspec/specs/identity/spec.md` for the complete route → permission table. Recording the actor
-  on every business table is planned, not built (Phase B, `openspec/changes/2026-09-19-add-actor-audit/`).
+  `openspec/specs/identity/spec.md` for the complete route → permission table.
+- **Actor audit (M5 Phase B)** — every mutation of the business tables and the identity tables
+  records who made it happen: `created_by` (`NOT NULL`, FK to `users`, `ON DELETE RESTRICT`) and
+  `updated_by` (nullable) on `accounts`, `transactions`, `payment_methods`, `categories`,
+  `products`, `stock_movements`, `sales`, `sale_payments`, `customer_receipts`, `customers`,
+  `purchases`, `purchase_payments`, `suppliers`, `product_supplier_costs`, `roles` and
+  `permissions`; `users` carries nullable self-referencing columns where NULL means "the system"
+  (the sentinel and the bootstrap administrator are the system's work). The actor comes from the
+  authenticated principal, never from anything the request supplies, and a document created inside
+  a flow (a sale's payment, a purchase's cost row, a confirm's stock movement) carries the flow's
+  request actor. Rows that predate the audit are attributed to the inactive, roleless sentinel
+  account `sistema` ("Sistema (anterior al registro)") — not to a person, because attributing
+  pre-audit rows to one would invent history. The interface shows the actor as a display name,
+  never an id ("Registrado por" / "Actualizado por" in the detail views, "el sistema" for the
+  NULL `users` columns, and the grant trail "«rol»: otorgado por «nombre» el «fecha»" on the
+  users screen) — see `openspec/specs/identity/spec.md` ("The actor audit") for the rules.
 - **Account** — `id, name, cached_balance, created_at`
 - **Transaction** — `id, account_id (FK), kind (Income/Expense), amount (Decimal), description, reference (nullable, opaque), date (NaiveDate), created_at`
 - Balance is **always derived** `SUM(Income) - SUM(Expense)` — `cached_balance` is kept in sync transactionally but never trusted for reads.
@@ -279,6 +293,24 @@ Current migrations:
 - `20240101000029_clarify_identity_permission_descriptions.sql` — corrected seeded descriptions
   for the two `identity.*` manage codes (they now say exactly what the gate allows; the AC12 drift
   test compares descriptions as well as codes)
+- `20240101000030_add_audit_finance.sql` — the actor audit begins (Phase B): `created_by` NOT NULL
+  + `updated_by` on `accounts`, `transactions`, `payment_methods`; creates the sentinel account
+  `sistema` (inactive, roleless, deliberately malformed hash) and attributes every pre-existing row
+  to it — an honest attribution, never a person's name on rows nobody's screen created
+- `20240101000031_add_audit_inventory.sql` — audit columns on `categories`, `products`,
+  `stock_movements`; reuses the sentinel (its own guarded insert is defensive only)
+- `20240101000032_add_audit_sales_customers.sql` — audit columns on `sales`, `sale_payments`,
+  `customer_receipts` and `customers`; `sale_lines` gains no columns (a line inherits its sale's
+  actor), and a sale's payments carry the confirming request's actor
+- `20240101000033_add_audit_purchases_suppliers.sql` — audit columns on `purchases`,
+  `purchase_payments`, `suppliers`, `product_supplier_costs`; `purchase_lines` inherit, a line
+  change stamps the draft's `updated_by`
+- `20240101000034_add_audit_identity_tables.sql` — the audit reaches the identity tables:
+  `roles`/`permissions` rebuilt with NOT NULL `created_by` (the seven identity guard triggers
+  dropped and recreated byte-identically; `permissions.updated_by` has no runtime writer — the
+  catalog is never written at runtime), `users` ALTERed with nullable self-referencing columns
+  (NULL = the system, rendered "el sistema"), `role_permissions` inheriting the role's actor and
+  the matrix edit stamping the role's `updated_by`
 
 ## REST API
 

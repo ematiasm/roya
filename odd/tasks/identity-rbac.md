@@ -1579,3 +1579,43 @@ binario real (DATABASE_URL propio, `ROYA_ADMIN_PASSWORD`): login del admin, usua
 "Creado por el sistema" en las filas del centinela y del admin, la pantalla de roles muestra
 "Creado por Sistema (anterior al registro)" ×4 y "Creado por Admin" ×1; cero ids crudos; la base
 de la sonda termina con `PRAGMA foreign_key_check` vacío.
+
+## Cierre S14 (T31) y del feature — 2026-09-23
+
+Slice documental final sobre `docs/identity-phase-b-close` (creada desde `main` actualizado). Sin
+cambios de código, plantillas, migraciones ni `e2e/`: lo que un documento decía y el código no,
+se corrigió el documento.
+
+- **Promoción de la auditoría:** las reglas del audit son ahora la verdad en tiempo presente en
+  `openspec/specs/identity/spec.md`, sección "The actor audit" — el actor viene del principal
+  autenticado y nunca de nada que el request suministre; una mutación no se registra sin actor
+  donde la columna es `NOT NULL`; las filas previas al audit pertenecen al centinela `sistema`
+  (inactivo, sin roles, hash malformado) y por qué no es una persona; en `users` NULL = "el
+  sistema" y la pantalla lo dice; líneas y filas de join heredan el actor del padre; un documento
+  creado dentro de un flujo lleva el actor del request del flujo; la pantalla muestra nombres,
+  nunca ids. Los criterios AC18–AC19 se plegaron a las reglas (dejan de ser checkboxes de un
+  change folder que se archivó). La sección narrativa "What the actor audit covers today" se
+  reemplazó por las reglas.
+- **Truth check:** cada afirmación se verificó contra migraciones 20240101000030–34, repositorios
+  y plantillas. `permissions.updated_by` queda declarado explícitamente SIN escritor en runtime
+  (la columna existe por uniformidad del schema; el modelo Rust ni la lleva). Hallazgo de
+  documento contradictorio: `openspec/specs/verification/spec.md` decía "613 tests" (número del
+  cierre de Fase A) — corregido a **652**. En `README.md` y `openspec/specs/README.md` la
+  auditoría decía "planned, not built" — reescrita como entregada.
+- **README.md:** la auditoría como feature (el actor en cada mutación, el significado del
+  centinela, la huella de otorgamiento) y las migraciones 30–34 agregadas a la lista; el conteo
+  del suite de navegador ya decía 62 tests + 4 sondas opt-in (verificado, sin cambio).
+- **Invariantes:** `openspec/specs/README.md` gana la cláusula de auditoría en el invariante 12
+  (el actor que una mutación registra es el principal que el kernel resolvió para ese request;
+  el módulo dueño escribe sus propias columnas de auditoría).
+- **Archivo:** `openspec/changes/2026-09-19-add-actor-audit/` movido con `mv` a
+  `openspec/changes/archive/2026-09-19-add-actor-audit/` (nombre preservado), con línea de
+  archivo al tope de su `tasks.md`; T31, los cuatro ítems de Verify y Archiving tildados con
+  evidencia.
+- **Números finales:** `cargo test` **652 passed / 0 failed**; navegador **62 passed / 4 skipped**
+  (sondas opt-in). Ledger: **55 warnings** (`cargo check --all-targets`, 57 crudas − 2 resúmenes
+  por target). Dormant sin consumidor conocido: `role_repo::{count_active_holders, revoke}`;
+  dormidos de Fase B ya consumidos por la auditoría (`Role.{created_at, updated_at}`,
+  `Permission.{action, created_at}` son production-readable). Nada quedó pendiente del feature:
+  las doce tablas de negocio + `users`/`roles`/`permissions` llevan actor, y `openspec/specs/`
+  es a partir de ahora la única descripción (los change folders son historia).
