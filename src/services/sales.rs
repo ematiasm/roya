@@ -1248,7 +1248,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewCustomer, NewProduct, ProductKind};
+    use crate::models::{NewCustomer, NewProduct, ProductKind, UpdateProduct};
     use crate::repositories::{
         CustomerRepository, PaymentMethodRepository, SqliteAccountRepository,
         SqliteBarcodeRepository, SqliteCategoryRepository, SqliteCustomerRepository,
@@ -1391,6 +1391,7 @@ mod tests {
                 max_stock: Some(dec("100")),
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap()
@@ -1413,6 +1414,7 @@ mod tests {
                 max_stock: None,
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap()
@@ -3969,5 +3971,100 @@ mod tests {
         let (s, _pool) = svc().await;
         let err = s.delete_draft(999_999).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+    }
+
+    // -- price snapshot immutability (product-markup) -------------------------
+
+    /// The "history is unaffected" claim, pinned: `sale_lines.unit_price`
+    /// snapshots the product's price when the line is built instead of
+    /// referencing the product, so re-deriving the product's price never
+    /// moves a stored document. The product half of the assertions is what
+    /// keeps the test honest — if both prices stayed put, a pass would also
+    /// mean the derivation had silently stopped working.
+    #[tokio::test]
+    async fn a_sale_line_keeps_the_price_it_snapshotted_when_the_products_markup_moves() {
+        let (s, _pool) = svc().await;
+        // cost 5 with a 100% markup derives 10; the line must snapshot exactly
+        // that. The manual 999 sale_price is ignored while markup is set.
+        let prod = s
+            .inventory
+            .create_product(
+                audit_actor(&s).await,
+                NewProduct {
+                    sku: "SNAP-1".into(),
+                    name: "snap prod".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec("999"),
+                    cost_price: dec("5"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: Some(dec("100")),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            prod.sale_price,
+            dec("10"),
+            "the derived price must be live before the line is built"
+        );
+
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: WALKIN_ID,
+                    payment_type: PaymentType::Cash,
+                    sale_date: sale_date(),
+                    due_date: None,
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        // No explicit unit_price: the line takes the product's derived price.
+        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        let before = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(
+            before.lines[0].unit_price,
+            dec("10"),
+            "the line must snapshot the derived price it was built with"
+        );
+
+        // Move the derived price: markup 200% on the same cost derives 15.
+        let moved = s
+            .inventory
+            .update_product(
+                audit_actor(&s).await,
+                prod.id,
+                UpdateProduct {
+                    markup_pct: Some(Some(dec("200"))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            moved.sale_price,
+            dec("15"),
+            "the product's price must move, or the snapshot assertion is vacuous"
+        );
+
+        let after = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(
+            after.lines[0].unit_price, before.lines[0].unit_price,
+            "the stored line's snapshot price must not move with the product"
+        );
+        assert_eq!(
+            after.lines[0].unit_price,
+            dec("10"),
+            "the snapshot stays exactly the price at line-build time"
+        );
     }
 }

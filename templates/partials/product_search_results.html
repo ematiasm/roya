@@ -120,13 +120,13 @@
                 data-product-id="{{ ps.product.id }}"
                 class="flex w-full items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-left text-sm text-text">
           <span class="min-w-0 truncate font-semibold">{{ ps.product.name }}</span>
-          <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • {% if show_cost %}cost ${{ ps.product.cost_price }}{% else %}${{ ps.product.sale_price }}{% endif %} • stock {{ ps.stock }}</span>
+          <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • {% if show_cost %}cost ${{ ps.product.cost_price_display() }}{% else %}${{ ps.product.sale_price_display() }}{% endif %} • stock {{ ps.stock }}</span>
         </button>
       </form>
       {% else %}
       <div class="flex items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-sm">
         <span class="min-w-0 truncate font-semibold">{{ ps.product.name }}</span>
-        <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • {% if show_cost %}cost ${{ ps.product.cost_price }}{% else %}${{ ps.product.sale_price }}{% endif %} • stock {{ ps.stock }}</span>
+        <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • {% if show_cost %}cost ${{ ps.product.cost_price_display() }}{% else %}${{ ps.product.sale_price_display() }}{% endif %} • stock {{ ps.stock }}</span>
       </div>
       {% endif %}
     {% endfor %}

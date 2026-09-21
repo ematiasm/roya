@@ -186,6 +186,23 @@ where
 
     // -- products -----------------------------------------------------------
 
+    /// Pins a markup-derived price to cents with half-up rounding
+    /// (`RoundingStrategy::MidpointAwayFromZero` — half-up away from zero,
+    /// retail convention; rust_decimal names it RoundingStrategy, not
+    /// RoundingMode).
+    ///
+    /// This is deliberately the project's FIRST rounding helper. Until now
+    /// every money operation was exact: multiplying an exact quantity by an
+    /// exact price never produced a third decimal, so no `round_dp` existed
+    /// anywhere. Deriving a price from a percentage is the first operation
+    /// that can (80.00 * 1.3333 = 106.6640), so the derived value is pinned to
+    /// cents here and only here. Manual prices keep the exact value the caller
+    /// sent — never round those.
+    fn round_derived_price_to_cents(price: Decimal) -> Decimal {
+        use rust_decimal::RoundingStrategy;
+        price.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
+    }
+
     async fn validate_product(&self, input: NewProduct) -> AppResult<NewProduct> {
         let sku = input.sku.trim();
         if sku.is_empty() {
@@ -209,16 +226,68 @@ where
                 "unit must be 1..16 chars".into(),
             ));
         }
+        // Markup-derived pricing (product-markup T4): when `markup_pct` is
+        // set the sale price is DERIVED from cost and the incoming
+        // `sale_price` is ignored. When it is `None` the price is manual and
+        // everything below behaves exactly as before. Clearing a markup
+        // (`Some(None)`) reaches this function as `None` after the update
+        // merge, so the price keeps its last stored value and becomes manual
+        // again — nothing reverts to any earlier price.
+        let (sale_price, markup_pct) = match input.markup_pct {
+            None => (input.sale_price, None),
+            Some(m) => {
+                if m <= Decimal::from(-100) {
+                    return Err(AppError::Validation(
+                        "markup_pct must be > -100".into(),
+                    ));
+                }
+                // `cost_price` is NOT NULL DEFAULT '0': "no cost" manifests
+                // as 0, not NULL. A zero (or negative) cost must be rejected
+                // instead of silently deriving a free price.
+                if input.cost_price <= Decimal::ZERO {
+                    return Err(AppError::Validation(
+                        "cost_price must be > 0 when markup_pct is set".into(),
+                    ));
+                }
+                // sale_price = cost_price * (1 + markup_pct/100). The
+                // percentage's scale shift is a multiplication by 0.01,
+                // because this project never divides a `Decimal`.
+                //
+                // Every operand here is user-supplied and unbounded, and
+                // rust_decimal's `Mul`/`Add` PANIC on overflow, so the bare
+                // operators would let an authenticated caller 500 the
+                // handler. The checked forms turn the same inputs into a
+                // validation error instead. There is deliberately no upper
+                // bound on `markup_pct`: whether a markup is plausible is a
+                // product decision, not an arithmetic one.
+                let factor = m
+                    .checked_mul(Decimal::new(1, 2))
+                    .and_then(|shift| Decimal::ONE.checked_add(shift))
+                    .and_then(|f| input.cost_price.checked_mul(f));
+                let derived = match factor {
+                    Some(f) => Self::round_derived_price_to_cents(f),
+                    None => {
+                        return Err(AppError::Validation(
+                            "markup_pct or cost_price is too large to derive a sale_price".into(),
+                        ));
+                    }
+                };
+                (derived, Some(m))
+            }
+        };
+        // The price rule applies to the EFFECTIVE price: the derived one when
+        // markup is set, the incoming one otherwise. A caller that supplies a
+        // markup must not also be forced to send a meaningful sale_price.
         match input.kind {
             ProductKind::Product => {
-                if input.sale_price <= Decimal::ZERO {
+                if sale_price <= Decimal::ZERO {
                     return Err(AppError::Validation(
                         "sale_price must be > 0 for products".into(),
                     ));
                 }
             }
             ProductKind::Service => {
-                if input.sale_price < Decimal::ZERO {
+                if sale_price < Decimal::ZERO {
                     return Err(AppError::Validation(
                         "sale_price cannot be negative".into(),
                     ));
@@ -306,8 +375,13 @@ where
             kind: input.kind,
             category_id: input.category_id,
             unit: unit.to_string(),
-            sale_price: input.sale_price,
+            // The effective values: the derived price when markup is set, the
+            // incoming manual price otherwise. This return value is what gets
+            // persisted, so a derived price computed but not fed back here
+            // would be silently dropped.
+            sale_price,
             cost_price: input.cost_price,
+            markup_pct,
             track_stock: input.track_stock,
             min_stock: input.min_stock,
             max_stock: input.max_stock,
@@ -332,6 +406,10 @@ where
     /// the same `validate_product` rules as create, so an edit can never bypass a
     /// business rule. The only edit-specific check is the duplicate SKU, done
     /// against other rows only so re-sending the same SKU is not a conflict.
+    /// Because the merged row re-derives the price, a patch that only changes
+    /// `cost_price` while `markup_pct` is set recomputes `sale_price` — a
+    /// sister feature relies on exactly that path to keep the formula in one
+    /// place.
     /// `actor` is the audit actor of the editing request: it lands on
     /// `updated_by` while `created_by` keeps the row's creator.
     pub async fn update_product(&self, actor: i64, id: i64, patch: UpdateProduct) -> AppResult<Product> {
@@ -344,6 +422,10 @@ where
             unit: patch.unit.unwrap_or_else(|| current.unit.clone()),
             sale_price: patch.sale_price.unwrap_or(current.sale_price),
             cost_price: patch.cost_price.unwrap_or(current.cost_price),
+            // Double option: outer None = leave unchanged, Some(None) = clear
+            // back to "no markup, manual price", Some(Some(v)) = set. NULL is a
+            // real value, so the merge must preserve it, never default it.
+            markup_pct: patch.markup_pct.unwrap_or(current.markup_pct),
             track_stock: patch.track_stock.unwrap_or(current.track_stock),
             min_stock: patch.min_stock.unwrap_or(current.min_stock),
             max_stock: patch.max_stock.unwrap_or(current.max_stock),
@@ -761,6 +843,7 @@ mod tests {
             max_stock: Some(dec("50")),
             location: None,
             notes: None,
+            markup_pct: None,
         }
     }
 
@@ -1239,6 +1322,7 @@ mod tests {
                 max_stock: Some(Some(dec("80"))),
                 location: Some(Some("shelf 3".into())),
                 notes: Some(Some("edited".into())),
+                markup_pct: None,
             };
             let updated = s.update_product(actor(&s).await, p.id, patch).await.unwrap();
             assert_eq!(updated.id, p.id);
@@ -1516,5 +1600,343 @@ mod tests {
             matches!(&missing, Err(AppError::NotFound(msg)) if msg.contains("movement")),
             "an unknown movement must be NotFound naming the family: {missing:?}"
         );
+    }
+
+    // -- markup-derived pricing (product-markup T4) --------------------------
+
+    /// A markup input over the standard fixture. The manual sale_price is
+    /// deliberately absurd (999): whenever markup_pct is set the request price
+    /// must be ignored, so a derived 10 proves the override, not a coincidence.
+    fn markup_input(sku: &str, cost: &str, markup: &str) -> NewProduct {
+        NewProduct {
+            sale_price: dec("999"),
+            cost_price: dec(cost),
+            markup_pct: Some(dec(markup)),
+            ..product_input(sku)
+        }
+    }
+
+    #[tokio::test]
+    async fn markup_derives_sale_price_from_cost() {
+        let s = svc(true).await;
+        // cost 5 with a 100% markup derives 5 * (1 + 100/100) = 10.
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-1", "5", "100"))
+            .await
+            .unwrap();
+        assert_eq!(p.sale_price, dec("10"));
+        assert_eq!(p.markup_pct, Some(dec("100")));
+    }
+
+    #[tokio::test]
+    async fn markup_ignores_the_incoming_sale_price() {
+        let s = svc(true).await;
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-2", "5", "100"))
+            .await
+            .unwrap();
+        assert_eq!(
+            p.sale_price,
+            dec("10"),
+            "the supplied 999 must be ignored when markup_pct is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn markup_none_leaves_the_manual_price_alone() {
+        let s = svc(true).await;
+        let mut inp = product_input("MK-3");
+        inp.sale_price = dec("7"); // cost stays 5: without markup nothing derives
+        let p = s.create_product(actor(&s).await, inp).await.unwrap();
+        assert_eq!(p.sale_price, dec("7"));
+        assert_eq!(p.markup_pct, None);
+        // A manual price patch still applies verbatim when markup is not set.
+        let updated = s
+            .update_product(
+                actor(&s).await,
+                p.id,
+                UpdateProduct {
+                    sale_price: Some(dec("9")),
+                    ..UpdateProduct::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.sale_price, dec("9"));
+        assert_eq!(updated.markup_pct, None);
+    }
+
+    #[tokio::test]
+    async fn clearing_markup_keeps_the_last_price_and_makes_it_manual() {
+        let s = svc(true).await;
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-4", "5", "100"))
+            .await
+            .unwrap();
+        assert_eq!(p.sale_price, dec("10"));
+        // Clear the markup without touching sale_price: the price keeps its
+        // last value (10) and becomes manual again; it does NOT revert.
+        let cleared = s
+            .update_product(
+                actor(&s).await,
+                p.id,
+                UpdateProduct {
+                    markup_pct: Some(None),
+                    ..UpdateProduct::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.markup_pct, None);
+        assert_eq!(cleared.sale_price, dec("10"));
+        // Manual again: the price is now freely editable.
+        let manual = s
+            .update_product(
+                actor(&s).await,
+                cleared.id,
+                UpdateProduct {
+                    sale_price: Some(dec("3")),
+                    ..UpdateProduct::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(manual.sale_price, dec("3"));
+    }
+
+    #[tokio::test]
+    async fn markup_without_a_cost_is_rejected() {
+        let s = svc(true).await;
+        // "No cost" is 0 (cost_price is NOT NULL DEFAULT '0'), never a NULL.
+        let err = s
+            .create_product(actor(&s).await, markup_input("MK-5", "0", "50"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            s.products.find_by_sku("MK-5").await.unwrap().is_none(),
+            "a rejected derivation must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn markup_at_or_below_minus_100_is_rejected() {
+        let s = svc(true).await;
+        for m in ["-100", "-150"] {
+            let err = s
+                .create_product(actor(&s).await, markup_input("MK-6", "5", m))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "markup {m}: {err:?}");
+            assert!(
+                s.products.find_by_sku("MK-6").await.unwrap().is_none(),
+                "a rejected derivation must write nothing"
+            );
+        }
+    }
+
+    /// The derivation multiplies and adds user-supplied unbounded Decimals,
+    /// and rust_decimal's `Mul`/`Add` panic on overflow: without the checked
+    /// forms an authenticated caller could 500 the handler with an extreme
+    /// markup. The overflow must be a validation error instead, and a
+    /// rejected derivation must write nothing. A panic fails these tests
+    /// anyway, which is exactly what makes them discriminate.
+    #[tokio::test]
+    async fn an_overflowing_markup_derivation_is_a_validation_error_not_a_panic() {
+        let s = svc(true).await;
+        // A markup at the extreme end of the representable range: the factor
+        // alone still fits (rust_decimal rescales intermediates, 5 * ~7.9e26
+        // stays under the 7.9e28 cap), so the final `cost_price * factor` is
+        // the step that overflows, with an ordinary cost of 1000.
+        let err = s
+            .create_product(
+                actor(&s).await,
+                markup_input("MK-OVF-1", "1000", "79228162514264337593543950335"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            s.products.find_by_sku("MK-OVF-1").await.unwrap().is_none(),
+            "a rejected derivation must write nothing"
+        );
+    }
+
+    /// The mirror case: an ordinary markup with a cost so large the final
+    /// `cost_price * factor` overflows the representable range.
+    #[tokio::test]
+    async fn an_overflowing_cost_derivation_is_a_validation_error_not_a_panic() {
+        let s = svc(true).await;
+        let err = s
+            .create_product(
+                actor(&s).await,
+                markup_input("MK-OVF-2", "79228162514264337593543950335", "50"),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            s.products.find_by_sku("MK-OVF-2").await.unwrap().is_none(),
+            "a rejected derivation must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_price_is_rounded_to_cents() {
+        let s = svc(true).await;
+        // 80 * (1 + 33.33/100) = 106.664 unrounded; pinned to 106.66 half-up.
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-7", "80", "33.33"))
+            .await
+            .unwrap();
+        assert_eq!(p.sale_price, dec("106.66"));
+    }
+
+    #[tokio::test]
+    async fn patching_cost_price_recomputes_the_derived_price() {
+        let s = svc(true).await;
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-8", "5", "100"))
+            .await
+            .unwrap();
+        assert_eq!(p.sale_price, dec("10"));
+        // Load-bearing path: a sister feature updates cost_price through a
+        // plain cost patch precisely so this recomputation fires and the
+        // formula stays in one place. The markup persists, the derived price
+        // follows the new cost.
+        let updated = s
+            .update_product(
+                actor(&s).await,
+                p.id,
+                UpdateProduct {
+                    cost_price: Some(dec("6")),
+                    ..UpdateProduct::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.cost_price, dec("6"));
+        assert_eq!(updated.markup_pct, Some(dec("100")));
+        assert_eq!(updated.sale_price, dec("12"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_derivation_writes_nothing() {
+        let s = svc(true).await;
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-9", "5", "100"))
+            .await
+            .unwrap();
+        let err = s
+            .update_product(
+                actor(&s).await,
+                p.id,
+                UpdateProduct {
+                    cost_price: Some(dec("0")),
+                    ..UpdateProduct::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        let stored = s.get_product(p.id).await.unwrap();
+        assert_eq!(stored.cost_price, dec("5"));
+        assert_eq!(stored.sale_price, dec("10"));
+        assert_eq!(stored.markup_pct, Some(dec("100")));
+    }
+
+    // -- hardening: the gaps the independent verification found ----------------
+
+    /// A derived price can round DOWN to zero from a positive cost. For a
+    /// product that must be refused, never stored as a free price: the
+    /// effective-price rule catches it before any write happens.
+    #[tokio::test]
+    async fn a_derived_price_that_rounds_to_zero_is_rejected_for_products() {
+        let s = svc(true).await;
+        // 0.01 * (1 + -99.5/100) = 0.00005, which rounds to 0.00.
+        let err = s
+            .create_product(actor(&s).await, markup_input("MK-10", "0.01", "-99.5"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            s.products.find_by_sku("MK-10").await.unwrap().is_none(),
+            "a rejected derivation must write nothing"
+        );
+    }
+
+    /// The same rounding IS legal for a Service, because the pre-existing rule
+    /// allows a free service (`sale_price >= 0`). Pinned deliberately: the two
+    /// kinds diverge here, and that is a decision, not an accident.
+    #[tokio::test]
+    async fn a_service_derived_price_may_round_to_zero() {
+        let s = svc(true).await;
+        let input = NewProduct {
+            kind: ProductKind::Service,
+            track_stock: false,
+            min_stock: None,
+            max_stock: None,
+            ..markup_input("MK-11", "0.01", "-99.5")
+        };
+        let p = s.create_product(actor(&s).await, input).await.unwrap();
+        assert_eq!(p.sale_price, dec("0"));
+        assert_eq!(p.markup_pct, Some(dec("-99.5")));
+    }
+
+    /// Only the rejection boundary was covered. Just above it the markup is
+    /// legal, and the derived price still has to satisfy the product rule.
+    #[tokio::test]
+    async fn markup_just_above_minus_100_is_accepted() {
+        let s = svc(true).await;
+        // 5 * (1 - 99/100) = 0.05, positive, so the product rule passes.
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-12", "5", "-99"))
+            .await
+            .unwrap();
+        assert_eq!(p.sale_price, dec("0.05"));
+        assert_eq!(p.markup_pct, Some(dec("-99")));
+    }
+
+    /// The price rule runs against the EFFECTIVE price, so a nonsense request
+    /// price must not block a request that supplies a markup. The other
+    /// override test sends a valid 999, which would pass either way.
+    #[tokio::test]
+    async fn a_nonsense_sale_price_is_ignored_when_markup_is_set() {
+        let s = svc(true).await;
+        let input = NewProduct {
+            sale_price: dec("0"),
+            ..markup_input("MK-13", "5", "100")
+        };
+        let p = s.create_product(actor(&s).await, input).await.unwrap();
+        assert_eq!(p.sale_price, dec("10"));
+    }
+
+    /// The rounding helper belongs to the derived price only. A manual price
+    /// keeps the exact value it was sent, scale included.
+    #[tokio::test]
+    async fn manual_prices_are_not_rounded() {
+        let s = svc(true).await;
+        let input = NewProduct {
+            sale_price: dec("7.777"),
+            ..product_input("MK-14")
+        };
+        let p = s.create_product(actor(&s).await, input).await.unwrap();
+        assert_eq!(p.sale_price, dec("7.777"), "manual prices stay exact");
+        assert_eq!(p.sale_price.to_string(), "7.777");
+    }
+
+    /// Pins the strategy choice, not merely that some rounding happens:
+    /// 10.005 is an exact midpoint, and half-up away from zero gives 10.01.
+    /// The other rounding test rounds a non-midpoint DOWN, so it would pass
+    /// under any strategy and cannot prove this one.
+    #[tokio::test]
+    async fn derived_price_rounds_the_midpoint_up() {
+        let s = svc(true).await;
+        // 10 * (1 + 0.05/100) = 10.005 exactly.
+        let p = s
+            .create_product(actor(&s).await, markup_input("MK-15", "10", "0.05"))
+            .await
+            .unwrap();
+        assert_eq!(p.sale_price, dec("10.01"));
     }
 }

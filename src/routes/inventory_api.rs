@@ -55,6 +55,12 @@ pub struct CreateProductRequest {
     pub max_stock: Option<Decimal>,
     pub location: Option<String>,
     pub notes: Option<String>,
+    /// Markup percentage. When present, the sale price is DERIVED from
+    /// `cost_price` and the supplied `sale_price` is ignored; `sale_price`
+    /// itself stays REQUIRED here only to keep the existing API contract
+    /// unchanged.
+    #[serde(default)]
+    pub markup_pct: Option<Decimal>,
 }
 
 /// Patch-style PUT body for product edits, mirroring `UpdateSupplierRequest`:
@@ -101,6 +107,11 @@ pub struct UpdateProductRequest {
     pub location: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub notes: Option<Option<String>>,
+    /// Clearable like `location`/`notes`: absent leaves the stored markup
+    /// (and its derived price) unchanged, `null` clears it back to a manual
+    /// price keeping the last value, a value sets it and re-derives the price.
+    #[serde(default, deserialize_with = "double_option")]
+    pub markup_pct: Option<Option<Decimal>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -227,6 +238,9 @@ async fn create_product(
         max_stock: payload.max_stock,
         location: payload.location,
         notes: payload.notes,
+        // When markup_pct is present the service derives sale_price from
+        // cost_price and this supplied sale_price is ignored.
+        markup_pct: payload.markup_pct,
     };
     let product = state.inventory_service.create_product(principal.user_id, input).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(product))))
@@ -266,6 +280,10 @@ async fn update_product(
                 max_stock: payload.max_stock,
                 location: payload.location,
                 notes: payload.notes,
+                // Clearable patch field: None = leave unchanged,
+                // Some(None) = clear back to a manual price,
+                // Some(Some(v)) = set and re-derive sale_price.
+                markup_pct: payload.markup_pct,
             },
         )
         .await?;
@@ -945,5 +963,74 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    // -- markup-derived pricing over REST (product-markup T5) -----------------
+
+    #[tokio::test]
+    async fn create_with_markup_derives_the_sale_price_in_the_response() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let mut body = product_body("MK-REST-C");
+        body["markup_pct"] = serde_json::json!("100");
+        let (st, v) = post_json(app, "/api/products", body).await;
+        assert_eq!(st, StatusCode::CREATED, "create: {v}");
+        assert_eq!(v.get("sale_price").and_then(|x| x.as_str()), Some("10.00"));
+        assert_eq!(v.get("markup_pct").and_then(|x| x.as_str()), Some("100"));
+    }
+
+    #[tokio::test]
+    async fn update_with_markup_sets_it_and_derives_the_price() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let (_, v) = post_json(app.clone(), "/api/products", product_body("MK-REST-U")).await;
+        let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
+        let (st, v) = put_json(
+            app,
+            &format!("/api/products/{pid}"),
+            serde_json::json!({ "markup_pct": "100" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "update: {v}");
+        assert_eq!(v.get("markup_pct").and_then(|x| x.as_str()), Some("100"));
+        // cost 5 with a 100% markup derives 10.
+        assert_eq!(v.get("sale_price").and_then(|x| x.as_str()), Some("10.00"));
+    }
+
+    #[tokio::test]
+    async fn update_with_null_markup_clears_it_and_keeps_the_last_price() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let mut body = product_body("MK-REST-N");
+        body["markup_pct"] = serde_json::json!("100");
+        let (_, v) = post_json(app.clone(), "/api/products", body).await;
+        let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
+        // Explicit null is the clear state: markup goes back to "no markup,
+        // manual price" while the price keeps its last derived value.
+        let (st, v) = put_json(
+            app,
+            &format!("/api/products/{pid}"),
+            serde_json::json!({ "markup_pct": null }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "clear: {v}");
+        assert_eq!(v.get("markup_pct"), Some(&serde_json::Value::Null));
+        assert_eq!(v.get("sale_price").and_then(|x| x.as_str()), Some("10.00"));
+    }
+
+    #[tokio::test]
+    async fn update_without_the_markup_key_leaves_it_unchanged() {
+        let state = test_state(true).await;
+        let app = crate::routes::router(state);
+        let mut body = product_body("MK-REST-K");
+        body["markup_pct"] = serde_json::json!("100");
+        let (_, v) = post_json(app.clone(), "/api/products", body).await;
+        let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
+        // An empty patch (no markup_pct key) leaves both the markup and the
+        // derived price exactly as stored.
+        let (st, v) = put_json(app, &format!("/api/products/{pid}"), serde_json::json!({})).await;
+        assert_eq!(st, StatusCode::OK, "patch: {v}");
+        assert_eq!(v.get("markup_pct").and_then(|x| x.as_str()), Some("100"));
+        assert_eq!(v.get("sale_price").and_then(|x| x.as_str()), Some("10.00"));
     }
 }

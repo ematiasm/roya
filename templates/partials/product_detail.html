@@ -28,7 +28,7 @@
       <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">negative</span>
       {% endif %}
     </div>
-    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • ${{ product.sale_price }}</div>
+    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • ${{ product.sale_price_display() }}</div>
     <div class="text-[13px] text-muted">stock {{ stock }}{% if let Some(min) = product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = product.max_stock %} • max {{ max }}{% endif %}</div>
     {# Audit attribution (M5 Phase B): who registered the product and who last
        changed it, shown as a display name resolved in the wiring layer — the
@@ -97,12 +97,26 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label>Sale price</label>
-          <input type="number" name="sale_price" step="0.01" required value="{{ product.sale_price }}" />
+          {# Courtesy only (product-markup T6): the edit handler is the
+             enforcement — whenever a markup is present the server ignores
+             this field and derives the price from the cost, so the readonly
+             state here only mirrors what the server already does. #}
+          <input id="edit-product-sale-price" type="number" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ product.sale_price_display() }}" />
+          {% if product.markup_pct.is_some() %}
+          {# The readonly field shows the stored price from the last save; the
+             derivation from the cost is server-side, so the number only moves
+             when the product is saved. #}
+          <div class="text-[13px] text-muted">Recalculated from the cost and the {{ product.markup_pct.unwrap() }}% markup when you save.</div>
+          {% endif %}
         </div>
         <div>
           <label>Cost price</label>
-          <input type="number" name="cost_price" step="0.01" value="{{ product.cost_price }}" />
+          <input type="number" name="cost_price" step="0.01" value="{{ product.cost_price_display() }}" />
         </div>
+      </div>
+      <div>
+        <label>Markup % (optional)</label>
+        <input id="edit-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ m }}"{% endif %} />
       </div>
       <div>
         <label>Category</label>
@@ -141,6 +155,25 @@
       <button type="submit" class="bg-accent2 text-white">Save product</button>
       <div class="text-[13px] text-muted">The same rules as creation apply: services cannot track stock, tracked products need min and max, and the SKU cannot collide with another product (⇒ 400/409).</div>
     </form>
+    {# Markup courtesy only (product-markup T6): the edit handler is the
+       enforcement — whenever a markup is present the server ignores the price
+       and derives it from the cost, so the browser disabling the field changes
+       nothing about what is stored. Runs once on load because HTMX swaps this
+       drawer body in. #}
+    <script>
+      (function () {
+        var markup = document.getElementById('edit-product-markup');
+        var price = document.getElementById('edit-product-sale-price');
+        if (!markup || !price) return;
+        function sync() {
+          var derived = markup.value.trim() !== '';
+          price.readOnly = derived;
+          if (derived) { price.removeAttribute('required'); } else { price.setAttribute('required', ''); }
+        }
+        markup.addEventListener('input', sync);
+        sync();
+      })();
+    </script>
   </section>
 
   {# Card B: the per-supplier cost satellite, read from the product side. The

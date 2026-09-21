@@ -295,6 +295,10 @@ pub struct Product {
     pub unit: String,
     pub sale_price: Decimal,
     pub cost_price: Decimal,
+    /// Percentage over `cost_price` used to derive `sale_price` (pricing T1).
+    /// `None` means "no markup, manual price" — a real value, not an absence;
+    /// the derivation itself lands in a later slice (T4).
+    pub markup_pct: Option<Decimal>,
     pub track_stock: bool,
     pub min_stock: Option<Decimal>,
     pub max_stock: Option<Decimal>,
@@ -316,6 +320,37 @@ impl Product {
     pub fn category_is(&self, id: &i64) -> bool {
         self.category_id == Some(*id)
     }
+
+    /// Display form of the sale price (product-markup T7). See `money_display`
+    /// for the rule; a display method per field keeps every template call site
+    /// a plain `{{ ... }}` instead of a function import.
+    pub fn sale_price_display(&self) -> String {
+        money_display(self.sale_price)
+    }
+
+    /// Display form of the cost price, same rule and never-lie reason as the
+    /// sale price above.
+    pub fn cost_price_display(&self) -> String {
+        money_display(self.cost_price)
+    }
+}
+
+/// Human display of a money value (product-markup T7). A stored value at
+/// scale 2 or below is normalised UP to exactly two decimals (`7.5` →
+/// `"7.50"`), so a list never mixes `$100` and `$100.00` side by side. A
+/// stored value with MORE than two decimals prints exactly as stored —
+/// rounding for display would misstate the price the customer is charged
+/// (the transaction surface deliberately allows finer amounts), so the
+/// normalisation is guarded by the scale check and can never round.
+/// Display only: nothing here changes what is stored or validated.
+pub fn money_display(d: Decimal) -> String {
+    let mut out = d;
+    if out.scale() <= 2 {
+        // `rescale` up is exact (appending zeros); the guard above means the
+        // value already fits in two decimals, so no rounding can occur.
+        out.rescale(2);
+    }
+    out.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +400,7 @@ pub struct NewProduct {
     pub unit: String,
     pub sale_price: Decimal,
     pub cost_price: Decimal,
+    pub markup_pct: Option<Decimal>,
     pub track_stock: bool,
     pub min_stock: Option<Decimal>,
     pub max_stock: Option<Decimal>,
@@ -385,6 +421,12 @@ pub struct UpdateProduct {
     pub unit: Option<String>,
     pub sale_price: Option<Decimal>,
     pub cost_price: Option<Decimal>,
+    /// Double option on purpose, unlike the plain `Option<Decimal>` money
+    /// fields above: outer `None` means "leave unchanged", `Some(None)` means
+    /// "clear it back to no markup", and `Some(Some(v))` sets the markup. NULL
+    /// is a real value here ("manual price"), not an absence, so the three
+    /// states must be distinguishable.
+    pub markup_pct: Option<Option<Decimal>>,
     pub track_stock: Option<bool>,
     pub min_stock: Option<Option<Decimal>>,
     pub max_stock: Option<Option<Decimal>>,
@@ -1915,5 +1957,28 @@ mod tests {
         assert!(empty.to.is_none());
         assert!(empty.search.is_none());
         assert_eq!(empty.limit, DOCUMENTS_PAGE_LIMIT);
+    }
+
+    // -- money display (product-markup T7) ------------------------------------
+
+    fn dec(s: &str) -> Decimal {
+        std::str::FromStr::from_str(s).unwrap()
+    }
+
+    /// At-or-below-2 scale is normalised UP to exactly two decimals: the same
+    /// list never shows `$100` and `$100.00` side by side.
+    #[test]
+    fn money_display_scales_short_values_up_to_two_decimals() {
+        assert_eq!(money_display(dec("7.5")), "7.50");
+        assert_eq!(money_display(dec("100")), "100.00");
+        assert_eq!(money_display(dec("10.00")), "10.00");
+    }
+
+    /// The never-lie guard: a value stored with MORE than two decimals prints
+    /// exactly as stored — rounding for display would misstate the price the
+    /// customer is charged.
+    #[test]
+    fn money_display_never_rounds_finer_than_two_decimals() {
+        assert_eq!(money_display(dec("7.777")), "7.777");
     }
 }

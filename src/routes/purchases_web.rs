@@ -1205,6 +1205,7 @@ mod tests {
                 max_stock: None,
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();
@@ -1309,6 +1310,7 @@ mod tests {
                 max_stock: None,
                 location: None,
                 notes: None,
+                markup_pct: None,
             })
             .await
             .unwrap();

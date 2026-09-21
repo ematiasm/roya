@@ -10,7 +10,7 @@ never a proposal.
 | Capability | Module | What it covers |
 |---|---|---|
 | [finance](finance/spec.md) | M0 | Accounts, transactions, derived balance, payment methods and their per-account allowlist, document references |
-| [inventory](inventory/spec.md) | M1 | Categories, products and services, barcodes, stock movements, derived stock and reorder suggestion |
+| [inventory](inventory/spec.md) | M1 | Categories, products and services, barcodes, stock movements, derived stock and reorder suggestion, pricing derived from cost and markup |
 | [sales](sales/spec.md) | M2 | Sales, lines, payments, document numbering, cash and credit, cancellation |
 | [purchases](purchases/spec.md) | M3 | Suppliers, per-supplier cost history, purchases, purchase orders from the reorder suggestion, cancellation |
 | [customers](customers/spec.md) | M4 | Customers, the protected walk-in, credit rules, derived receivables and ageing, receipts that group a handover across sales |

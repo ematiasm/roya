@@ -38,6 +38,15 @@ fn parse_decimal_opt(v: Option<String>) -> Option<Decimal> {
     v.as_deref().map(|s| Decimal::from_str(s).unwrap_or(Decimal::ZERO))
 }
 
+/// Strict sibling of `parse_decimal_opt` for `markup_pct`. `parse_decimal_opt`
+/// degrades a malformed stored value to `Decimal::ZERO`, but for markup that
+/// ZERO is a *meaningful* value: a 0% markup pins sale_price to cost_price
+/// once the T4 derivation lands. So a malformed `markup_pct` degrades to `None`
+/// ("no markup, manual price") instead, leaving the stored price alone.
+fn parse_decimal_opt_strict(v: Option<String>) -> Option<Decimal> {
+    v.as_deref().and_then(|s| Decimal::from_str(s).ok())
+}
+
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
 }
@@ -53,6 +62,7 @@ fn kind_from_str(s: &str) -> ProductKind {
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Product {
     let sale_str: String = row.get("sale_price");
     let cost_str: String = row.get("cost_price");
+    let markup_str: Option<String> = row.get("markup_pct");
     let min_str: Option<String> = row.get("min_stock");
     let max_str: Option<String> = row.get("max_stock");
     let track: i64 = row.get("track_stock");
@@ -66,6 +76,7 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Product {
         unit: row.get("unit"),
         sale_price: parse_decimal(&sale_str),
         cost_price: parse_decimal(&cost_str),
+        markup_pct: parse_decimal_opt_strict(markup_str),
         track_stock: track == 1,
         min_stock: parse_decimal_opt(min_str),
         max_stock: parse_decimal_opt(max_str),
@@ -111,9 +122,9 @@ impl ProductRepository for SqliteProductRepository {
         let row = sqlx::query(
             r#"INSERT INTO products
                (sku, name, kind, category_id, unit, sale_price, cost_price,
-                track_stock, min_stock, max_stock, location, notes, created_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
+                markup_pct, track_stock, min_stock, max_stock, location, notes, created_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.sku)
         .bind(&input.name)
@@ -122,6 +133,7 @@ impl ProductRepository for SqliteProductRepository {
         .bind(&input.unit)
         .bind(input.sale_price.to_string())
         .bind(input.cost_price.to_string())
+        .bind(input.markup_pct.map(|d| d.to_string()))
         .bind(if input.track_stock { 1i64 } else { 0i64 })
         .bind(input.min_stock.map(|d| d.to_string()))
         .bind(input.max_stock.map(|d| d.to_string()))
@@ -136,7 +148,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Product>> {
         let row = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE id = ?"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -146,7 +158,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn find_by_sku(&self, sku: &str) -> AppResult<Option<Product>> {
         let row = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE sku = ?"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE sku = ?"#,
         )
         .bind(sku)
         .fetch_optional(&self.pool)
@@ -156,7 +168,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>> {
         let row = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE sku = ? COLLATE NOCASE ORDER BY id LIMIT 1"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE sku = ? COLLATE NOCASE ORDER BY id LIMIT 1"#,
         )
         .bind(sku)
         .fetch_optional(&self.pool)
@@ -183,7 +195,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn list(&self) -> AppResult<Vec<Product>> {
         let rows = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products ORDER BY id"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products ORDER BY id"#,
         )
         .fetch_all(&self.pool)
         .await?;
@@ -192,7 +204,7 @@ impl ProductRepository for SqliteProductRepository {
 
     async fn list_by_category(&self, category_id: i64) -> AppResult<Vec<Product>> {
         let rows = sqlx::query(
-            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE category_id = ? ORDER BY id"#,
+            r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE category_id = ? ORDER BY id"#,
         )
         .bind(category_id)
         .fetch_all(&self.pool)
@@ -212,7 +224,7 @@ impl ProductRepository for SqliteProductRepository {
     async fn set_active(&self, actor: i64, id: i64, active: bool) -> AppResult<Product> {
         let row = sqlx::query(
             r#"UPDATE products SET is_active = ?, updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
+               WHERE id = ? RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(if active { 1i64 } else { 0i64 })
         .bind(actor)
@@ -226,11 +238,11 @@ impl ProductRepository for SqliteProductRepository {
         let row = sqlx::query(
             r#"UPDATE products
                SET sku = ?, name = ?, kind = ?, category_id = ?, unit = ?,
-                   sale_price = ?, cost_price = ?, track_stock = ?, min_stock = ?,
+                   sale_price = ?, cost_price = ?, markup_pct = ?, track_stock = ?, min_stock = ?,
                    max_stock = ?, location = ?, notes = ?,
                    updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
-               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
+               RETURNING id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.sku)
         .bind(&input.name)
@@ -239,6 +251,7 @@ impl ProductRepository for SqliteProductRepository {
         .bind(&input.unit)
         .bind(input.sale_price.to_string())
         .bind(input.cost_price.to_string())
+        .bind(input.markup_pct.map(|d| d.to_string()))
         .bind(if input.track_stock { 1i64 } else { 0i64 })
         .bind(input.min_stock.map(|d| d.to_string()))
         .bind(input.max_stock.map(|d| d.to_string()))
@@ -331,6 +344,7 @@ mod tests {
             max_stock: Some(Decimal::from_str("50").unwrap()),
             location: None,
             notes: None,
+            markup_pct: None,
         }
     }
 
@@ -353,6 +367,7 @@ mod tests {
             max_stock: None,
             location: Some("shelf 9".to_string()),
             notes: Some("repo note".to_string()),
+            markup_pct: None,
         };
         let updated = r.update(actor(&r).await, created.id, &input).await.unwrap();
         assert_eq!(updated.id, created.id);
@@ -378,5 +393,63 @@ mod tests {
         let r = repo().await;
         let err = r.update(actor(&r).await, 99999, &product_input("REPO-GHOST")).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+
+    /// Pricing T1: a stored markup_pct round-trips through create and find_by_id.
+    #[tokio::test]
+    async fn markup_pct_set_round_trips_through_create_and_find_by_id() {
+        let r = repo().await;
+        let mut input = product_input("REPO-MK1");
+        input.markup_pct = Some(Decimal::from_str("21.5").unwrap());
+        let created = r.create(actor(&r).await, &input).await.unwrap();
+        assert_eq!(created.markup_pct, Some(Decimal::from_str("21.5").unwrap()));
+        let reloaded = r.find_by_id(created.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.markup_pct, Some(Decimal::from_str("21.5").unwrap()));
+    }
+
+    /// Pricing T1: no markup means NULL, and NULL reads back as None — the
+    /// "manual price" state, never invented into a numeric markup.
+    #[tokio::test]
+    async fn markup_pct_none_round_trips_as_none() {
+        let r = repo().await;
+        let created = r.create(actor(&r).await, &product_input("REPO-MK2")).await.unwrap();
+        assert_eq!(created.markup_pct, None);
+        let reloaded = r.find_by_id(created.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.markup_pct, None);
+    }
+
+    /// Pricing T1 regression guard for the parser choice: a malformed stored
+    /// value reads back as None, NOT Decimal::ZERO. ZERO would be a meaningful
+    /// 0% markup that pins sale_price to cost_price (what T4 will derive), so
+    /// garbage must degrade to "no markup", leaving the stored price alone.
+    #[tokio::test]
+    async fn malformed_stored_markup_pct_reads_back_as_none_not_zero() {
+        let r = repo().await;
+        let created = r.create(actor(&r).await, &product_input("REPO-MK3")).await.unwrap();
+        sqlx::query("UPDATE products SET markup_pct = 'abc' WHERE id = ?")
+            .bind(created.id)
+            .execute(&r.pool)
+            .await
+            .unwrap();
+        let reloaded = r.find_by_id(created.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.markup_pct, None);
+    }
+
+    /// Pricing T1: the full-row update can set markup_pct on an existing row.
+    /// NOTE: the repository update takes a full `NewProduct` (not a patch), so
+    /// the clear (`Some(None)`) vs leave-unchanged (`None`) distinction of the
+    /// double option lives at the service merge (inventory::update_product);
+    /// here only the set path is covered.
+    #[tokio::test]
+    async fn update_sets_markup_pct_on_existing_row() {
+        let r = repo().await;
+        let created = r.create(actor(&r).await, &product_input("REPO-MK4")).await.unwrap();
+        assert_eq!(created.markup_pct, None);
+        let mut input = product_input("REPO-MK4");
+        input.markup_pct = Some(Decimal::from_str("30").unwrap());
+        let updated = r.update(actor(&r).await, created.id, &input).await.unwrap();
+        assert_eq!(updated.markup_pct, Some(Decimal::from_str("30").unwrap()));
+        let reloaded = r.find_by_id(created.id).await.unwrap().unwrap();
+        assert_eq!(reloaded.markup_pct, Some(Decimal::from_str("30").unwrap()));
     }
 }

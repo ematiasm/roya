@@ -155,6 +155,29 @@ async fn post_form(app: &Router, uri: &str, body: &str) -> (StatusCode, String) 
     .await
 }
 
+/// POST the way the drawer's inline edit form does: `HX-Request` plus
+/// `HX-Target: product-drawer-body`, so the handler takes the drawer branch and
+/// answers the fresh detail fragment (see `web_edit_product`'s `from_drawer`).
+/// [`post_form`] covers the non-drawer HTMX caller; this is the drawer's shape.
+async fn post_drawer_form(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("HX-Target", "product-drawer-body"),
+    );
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
 /// POST a plain browser form (no HTMX header), e.g. the account detail form.
 async fn post_browser_form(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
     send(
@@ -5080,6 +5103,121 @@ async fn create_matching_filter_answer_holds_the_new_row_without_a_notice() {
     assert!(
         !html.contains("data-notice-server") && !html.contains("hx-swap-oob"),
         "a matching filter must not raise the notice: {html:.400}"
+    );
+}
+
+/// A product's stored row, read back through the JSON API the same way the
+/// service sees it: the derived `sale_price` and the `markup_pct` column.
+async fn product_json(app: &Router, product_id: i64) -> Value {
+    let (status, body) = get(app, &format!("/api/products/{product_id}")).await;
+    assert_eq!(status, StatusCode::OK, "read back product: {body}");
+    json_body(&body)
+}
+
+/// The drawer's save path over markup-derived pricing (product-markup T4–T7).
+/// Until now no smoke test ever posted `/web/products/edit`, so the drawer's
+/// save path had page-level coverage in neither direction. This test drives it
+/// end to end: a create with a markup and an EMPTY price must store the
+/// server-derived price; the drawer fragment must render the stored markup and
+/// the readonly derived price; a save with a changed markup must re-derive the
+/// price from the cost (the stale readonly value the browser re-submits must be
+/// ignored); and a save with the markup cleared must keep the last stored price
+/// standing while the markup column goes back to NULL (NULL is manual, not 0).
+#[tokio::test]
+async fn products_drawer_edit_derives_the_price_from_the_markup_and_clearing_it_keeps_the_price() {
+    let (app, pool) = test_app().await;
+
+    // Create the way the create modal sends it: markup present, price empty —
+    // the server derives 10 * (1 + 50/100) = 15.00 and ignores the price field.
+    let body = "sku=MKP-A&name=Markup+Widget&kind=Product&unit=un&sale_price=&cost_price=10&track_stock=1&min_stock=1&max_stock=50&markup_pct=50";
+    let (status, resp) = post_form(&app, "/web/products", body).await;
+    assert_eq!(status, StatusCode::OK, "create with markup: {resp:.400}");
+    let product = product_id_by_sku(&pool, "MKP-A").await;
+    let stored = product_json(&app, product).await;
+    assert_eq!(
+        dec(&stored["sale_price"]),
+        Decimal::from_str("15.00").unwrap(),
+        "the derived price must be stored, not an echoed one: {stored}"
+    );
+    assert_eq!(
+        stored["markup_pct"],
+        json!("50"),
+        "the markup must be stored with the product: {stored}"
+    );
+
+    // The drawer fragment mirrors the stored state: the markup value in its
+    // input, the derived price readonly with the last-stored value, and the
+    // derivation hint the operator reads while the field is locked.
+    let (status, drawer) = get(&app, &format!("/web/products/detail/{product}")).await;
+    assert_eq!(status, StatusCode::OK, "drawer fragment: {drawer:.400}");
+    assert!(
+        drawer.contains("name=\"markup_pct\" step=\"0.01\" min=\"-99\" placeholder=\"25\" value=\"50\""),
+        "the drawer must render the stored markup value: {drawer:.400}"
+    );
+    assert!(
+        drawer.contains("step=\"0.01\" readonly value=\"15.00\""),
+        "the drawer's price input must be readonly and show the derived price: {drawer:.400}"
+    );
+    assert!(
+        drawer.contains("Recalculated from the cost and the 50% markup when you save"),
+        "the drawer must carry the derivation hint: {drawer:.400}"
+    );
+
+    // An edit that changes the markup re-derives the price. The price field
+    // re-submits its stale readonly value (15.00) exactly as the browser's
+    // readonly input would: the server must ignore it and store 10 * 2 = 20.00.
+    let edit = format!(
+        "id={product}&sku=MKP-A&name=Markup+Widget&kind=Product&unit=un&sale_price=15.00&cost_price=10&category_id=&track_stock=1&min_stock=1&max_stock=50&location=&notes=&markup_pct=100"
+    );
+    let (status, html) = post_drawer_form(&app, "/web/products/edit", &edit).await;
+    assert_eq!(status, StatusCode::OK, "edit with a new markup: {html:.400}");
+    // The drawer branch answers with the fresh detail fragment, so the operator
+    // sees the re-derived price and the new markup without a reload.
+    assert!(
+        html.contains("name=\"markup_pct\" step=\"0.01\" min=\"-99\" placeholder=\"25\" value=\"100\""),
+        "the drawer answer must render the new markup: {html:.400}"
+    );
+    assert!(
+        html.contains("step=\"0.01\" readonly value=\"20.00\""),
+        "the drawer answer must render the re-derived price: {html:.400}"
+    );
+    let stored = product_json(&app, product).await;
+    assert_eq!(
+        dec(&stored["sale_price"]),
+        Decimal::from_str("20.00").unwrap(),
+        "the re-derived price must be stored over the stale submitted one: {stored}"
+    );
+    assert_eq!(
+        stored["markup_pct"],
+        json!("100"),
+        "the changed markup must be stored: {stored}"
+    );
+
+    // An edit that clears the markup hands the price back to the operator: the
+    // price SURVIVES the clear (the last derived value becomes the manual one)
+    // and the markup column goes back to NULL, not to 0.
+    let edit = format!(
+        "id={product}&sku=MKP-A&name=Markup+Widget&kind=Product&unit=un&sale_price=20.00&cost_price=10&category_id=&track_stock=1&min_stock=1&max_stock=50&location=&notes=&markup_pct="
+    );
+    let (status, html) = post_drawer_form(&app, "/web/products/edit", &edit).await;
+    assert_eq!(status, StatusCode::OK, "clear the markup: {html:.400}");
+    assert!(
+        html.contains("step=\"0.01\" required value=\"20.00\"") && !html.contains("readonly"),
+        "the cleared drawer must render the price editable again, value standing: {html:.400}"
+    );
+    assert!(
+        !html.contains("Recalculated from the cost"),
+        "the derivation hint must leave with the markup: {html:.400}"
+    );
+    let stored = product_json(&app, product).await;
+    assert_eq!(
+        dec(&stored["sale_price"]),
+        Decimal::from_str("20.00").unwrap(),
+        "the price must survive the markup clear: {stored}"
+    );
+    assert!(
+        stored["markup_pct"].is_null(),
+        "a cleared markup must store NULL, not zero: {stored}"
     );
 }
 
