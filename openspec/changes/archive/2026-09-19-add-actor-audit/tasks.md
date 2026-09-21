@@ -1,3 +1,12 @@
+> **ARCHIVED 2026-09-23.** This change is delivered and closed; the present-tense truth is now
+> `openspec/specs/identity/spec.md` — the actor audit is a shipped set of rules ("The actor audit"
+> section): the actor comes from the authenticated principal and never from the request's payload,
+> a mutation cannot be recorded without one where the column is `NOT NULL`, pre-audit rows belong
+> to the sentinel `sistema`, `users` NULL means "the system", lines and join rows inherit their
+> parent's actor, a flow's documents carry the flow's request actor, and the interface shows names,
+> never ids (with `permissions.updated_by` stated as having no runtime writer). This folder is
+> history.
+
 # Tasks: add-actor-audit (M5, Phase B)
 
 ## Provenance
@@ -54,20 +63,45 @@ then archives its own scope.
       recreated byte-identically. See the slice's section in `odd/tasks/identity-rbac.md` for the
       demonstrated upgrade sequence, the constraint-preservation audit, the mutation table and the
       verification numbers.)
-- [ ] T31 (S14): closing verification — `cargo test` green with the audit tests mutation-validated,
+- [x] T31 (S14): closing verification — `cargo test` green with the audit tests mutation-validated,
       `openspec/specs/identity/spec.md` extended with the audit rules and AC18–AC19, and this
       change's folder archived.
+      (2026-09-23: delivered on `docs/identity-phase-b-close`. `cargo test` **652 passed / 0 failed**
+      — the S13 close's numbers, with the audit guards mutation-validated per slice as recorded in
+      each slice's section of `odd/tasks/identity-rbac.md` (bind dropped → witness test failed →
+      reverted, `cargo test` back to 652/0 after each restoration). The audit rules and the
+      AC18–AC19 acceptance criteria are now the present-tense rules of the identity spec's "The
+      actor audit" section — verified claim by claim against migrations 20240101000030–34, the
+      repositories and the templates. `permissions.updated_by` is stated as having no runtime
+      writer. The folder moved to `openspec/changes/archive/2026-09-19-add-actor-audit/` with
+      `mv`.)
 
 ## Verify
 
-- [ ] `cargo test` green at the end of every slice, with every guard mutation-validated
+- [x] `cargo test` green at the end of every slice, with every guard mutation-validated
       (reintroduce the bug, watch the test fail).
-- [ ] AC25 holds for every new comparison against a database-written timestamp.
-- [ ] `cargo check --all-targets` with no new errors and no new `#[allow(dead_code)]` /
+      (Each slice's section in `odd/tasks/identity-rbac.md` records its own mutation table and
+      numbers: S9 close 623/0, S10 close 631/0, S11 close 638/0, S12 close 645/0, S13 close
+      652/0 — final **652 passed / 0 failed**. Every guard was reintroduced and its witness test
+      observed failing before the revert.)
+- [x] AC25 holds for every new comparison against a database-written timestamp.
+      (AC25 is the SQLite ISO-Z timestamp-encoding rule, inherited by the audit columns per the
+      design. Every `DEFAULT` the audit migrations add is the ISO-Z
+      `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')` form, and the audit plumbing binds actor ids, not
+      timestamps — the grant trail renders the stored `granted_at` instead of recomparing it.)
+- [x] `cargo check --all-targets` with no new errors and no new `#[allow(dead_code)]` /
       `#[allow(unused_imports)]` attributes.
-- [ ] Independent verification of each slice before its PR.
+      (Each slice's section records 0 errors and the ledger unchanged at **55 warnings**
+      (57 raw − 2 target summaries, measured since the S10 close); `grep allow(dead_code)|allow(unused_imports)`
+      over `src/` returns nothing new at every close.)
+- [x] Independent verification of each slice before its PR.
+      (Every slice S9–S13 was verified independently (`gentle-ai-verify`) before its PR, per the
+      verification-evidence sections of `odd/tasks/identity-rbac.md`; the checks include the live
+      probe with the real binary and the `PRAGMA foreign_key_check` sweep.)
 
 ## Archiving
 
-- [ ] On merge of Phase B: extend `openspec/specs/identity/spec.md` with the audit rules and
+- [x] On merge of Phase B: extend `openspec/specs/identity/spec.md` with the audit rules and
       AC18–AC19, and move this change's folder to `openspec/changes/archive/`.
+      (Done 2026-09-23: the rules and the folded AC18–AC19 live in the identity spec's "The actor
+      audit" section; the folder moved with `mv` to `openspec/changes/archive/2026-09-19-add-actor-audit/`.)

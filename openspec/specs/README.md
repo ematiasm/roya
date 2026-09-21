@@ -14,7 +14,7 @@ never a proposal.
 | [sales](sales/spec.md) | M2 | Sales, lines, payments, document numbering, cash and credit, cancellation |
 | [purchases](purchases/spec.md) | M3 | Suppliers, per-supplier cost history, purchases, purchase orders from the reorder suggestion, cancellation |
 | [customers](customers/spec.md) | M4 | Customers, the protected walk-in, credit rules, derived receivables and ageing, receipts that group a handover across sales |
-| [identity](identity/spec.md) | M5 | Users, revocable sessions, roles with editable permission matrices, the permission catalog, the deny-by-default kernel, the route → permission contract, and the role-grant trail (the actor on business tables is planned, not built) |
+| [identity](identity/spec.md) | M5 | Users, revocable sessions, roles with editable permission matrices, the permission catalog, the deny-by-default kernel, the route → permission contract, the role-grant trail, and the actor audit: every mutation of the audited tables records the authenticated principal, with pre-audit rows attributed to the `sistema` sentinel and the interface showing names, never ids |
 | [verification](verification/spec.md) | — | The two test layers, the boundary between them, the browser harness contract, and the rule that makes a green suite mean something |
 
 ## Architecture invariants
@@ -67,7 +67,9 @@ These hold across every capability and are the rules a new module must respect.
     answers. Deny by default: an undeclared route still needs a valid session, and a route that needs
     a permission declares it — the route → permission table in the identity spec is the contract.
     No department reads identity tables or takes the identity service as a dependency; the kernel is
-    transversal and identity is not a department.
+    transversal and identity is not a department. The actor audit extends the same rule to actions:
+    the actor a mutation records is the principal the kernel resolved for that request, never
+    anything the request's payload can supply, and the owning module writes its own audit columns.
 
 ## Verification
 

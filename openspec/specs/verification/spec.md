@@ -6,7 +6,7 @@ nothing.
 
 ## The two layers, and the boundary between them
 ```
-Rust suite        cargo test         613 tests, about 14 s
+Rust suite        cargo test         652 tests, about 14 s
 Browser suite     scripts/e2e.sh     62 tests, about 90 s
 ```
 
