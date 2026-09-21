@@ -247,15 +247,16 @@ costos por proveedor (diferido desde F1).
       subtotal y el assert sigue siendo real. Metido entre esas celdas lo habría
       roto por una razón de layout. Verificado con hash de blob: idéntico en
       worktree, `d55ed00` y HEAD.
-- [ ] T5 — **Señal A, el botón.** Handler nuevo en `src/routes/purchases_web.rs`
-      que llama `inventory_service.update_product` con un patch de solo
-      `cost_price`, gateado `InventoryWrite`, más el form struct y la
-      registración en `router()` (`:930-971`). Tests de ruta. El guard de wiring
-      de smoke lo va a probar solo.
-      **Pendiente que arrastra de T4**: el comentario del test positivo dice que
-      afirma el fragmento scopeado, pero el body HTTP de agregar línea es el
-      partial entero y el scopeo real lo hace el `hx-select` del cliente. Afirmar
-      `#purchase-record-money` contiene el aviso, en vez del body completo.
+- [x] T5 — **Señal A, el botón.** → `844248c`. Ruta
+      `POST /web/purchases/{purchase_id}/lines/{line_id}/apply-cost`, gateada
+      `Require<InventoryWrite>`, que escribe vía `update_product` con un patch de
+      solo `cost_price`. `cargo test` 797. El handler **no toma ningún extractor de
+      body**: el producto y el costo salen de la línea guardada, resuelta por
+      `get_detail(purchase_id)` — que es también lo que impide aplicar el id de
+      línea de otra compra. La verificación confirmó las dos cosas y el test de la
+      frontera se validó haciendo el lookup global y viéndolo fallar 200 contra 404.
+      El comentario del test de T4 que sobreafirmaba el scopeo quedó ajustado en la
+      misma slice (ahora afirma el aviso dentro de `#purchase-record-money`).
 - [ ] T6 — **Señal A, e2e del flujo.** Aviso → botón → `cost_price` actualizado →
       `sale_price` recalculado cuando hay markup.
 - [ ] T7 — **Spec.** Change folder OpenSpec + promoción de `inventory`. La spec de
@@ -342,6 +343,20 @@ costos por proveedor (diferido desde F1).
   slice** — el template cambió antes que los tests — así que no hay evidencia de
   fase roja; se reportó en vez de inventarla.
 - Dos hallazgos de la verificación de T4 que quedan como deuda chica: el comentario
-  del test positivo sobreafirma el scopeo (anotado dentro de T5), y el aviso deja
-  dos líneas de borde en una fila marcada (cosmético, se decidió no tocar la fila
+  del test positivo sobreafirma el scopeo (se corrigió en T5), y el aviso deja dos
+  líneas de borde en una fila marcada (cosmético, se decidió no tocar la fila
   existente).
+- **T5 cerrada** → `844248c`. 797 passed, 55 warnings, guard de wiring verde.
+  **Corrección de una afirmación mía**: dije que el guard genérico de wiring iba a
+  probar la ruta nueva "sola" y es **falso**. El fixture del guard crea una línea a
+  costo 7,50 contra un producto de costo 10, así que el aviso nunca se renderiza en
+  las páginas vigiladas y el `hx-post` nuevo **no se prueba nunca**. La ruta igual
+  queda cubierta por los 7 tests dedicados que le pegan (200/400/403), así que una
+  registración faltante se detectaría igual — pero por los tests, no por el guard.
+  Decisión: **no** tocar el fixture compartido (cambiarlo arriesga los otros guards)
+  y dejar el hueco de cobertura registrado.
+- Otras dos deudas chicas registradas por la verificación de T5, ninguna defecto: el
+  handler duplica la comparación de estado de `ensure_draft` (que es privado en
+  `src/services/purchases.rs`, fuera del alcance de la slice); y la suite read-only de
+  AC10 no incluye la ruta nueva, aunque su compuerta sí está cubierta por un test
+  dedicado.
