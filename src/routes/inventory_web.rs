@@ -7,7 +7,7 @@ use axum::{
     Router,
 };
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
@@ -115,6 +115,28 @@ pub struct ProductCostView {
     pub supplier_name: String,
 }
 
+/// Derived, never stored: the supplier reference cost against the product's
+/// stored cost. `Some` only when the two genuinely disagree, because that is
+/// the only state worth showing.
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleCostView {
+    pub reference: Decimal,
+    pub stored: Decimal,
+}
+
+impl StaleCostView {
+    /// Display form of the reference cost, same rule as `Product`'s display
+    /// methods so the two numbers of the gap render consistently.
+    pub fn reference_display(&self) -> String {
+        crate::models::money_display(self.reference)
+    }
+
+    /// Display form of the stored cost, same rule as above.
+    pub fn stored_display(&self) -> String {
+        crate::models::money_display(self.stored)
+    }
+}
+
 /// The product slide-over drawer body: the header with derived stock and the
 /// inline edit form, the per-supplier cost satellite (record/switch preferred)
 /// and the stock movement form. Field names are the template task's contract.
@@ -137,6 +159,7 @@ struct ProductDetailPartial {
     categories: Vec<crate::models::Category>,
     supplier_costs: Vec<ProductCostView>,
     suppliers: Vec<crate::models::Supplier>,
+    stale_cost: Option<StaleCostView>,
     today: String,
 }
 
@@ -480,6 +503,18 @@ async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String
     let created_by_name = name_for(ps.product.created_by);
     let updated_by_name = ps.product.updated_by.and_then(name_for);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    // Derived, never stored (cost-freshness S1): the supplier reference cost
+    // disagrees with the stored cost only when there IS a supplier truth to
+    // compare against (no rows ⇒ the product column IS the truth), the stored
+    // cost was ever recorded (0 is the NOT NULL DEFAULT, "no cost yet", not a
+    // cost), and the two genuinely differ (equal ⇒ fresh).
+    let stale_cost = match (state.supplier_service.reference_cost(id).await?, ps.product.cost_price != Decimal::ZERO) {
+        (Some(r), true) if r != ps.product.cost_price => Some(StaleCostView {
+            reference: r,
+            stored: ps.product.cost_price,
+        }),
+        _ => None,
+    };
     let html = ProductDetailPartial {
         product: ps.product,
         stock: ps.stock,
@@ -489,6 +524,7 @@ async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String
         categories,
         supplier_costs,
         suppliers,
+        stale_cost,
         today,
     }
     .render()
@@ -1948,6 +1984,182 @@ mod tests {
         let app = crate::routes::router(test_state().await);
         let (status, _) = get_html(app, "/web/products/detail/99999").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // -- Stale-cost badge: the derived disagreement between the supplier
+    //    reference cost (`SupplierService::reference_cost`, reused as-is) and
+    //    the product's stored `cost_price`. `Some` only when the two genuinely
+    //    disagree: no supplier rows means the product column IS the truth, and
+    //    `cost_price` 0 means "no cost recorded yet", not a comparable cost.
+
+    /// Same seeding as `seed_tracked_product` but with the cost price under
+    /// test: the badge's whole job is comparing it to the supplier rows.
+    async fn seed_product_with_cost(
+        state: &AppState,
+        sku: &str,
+        cost_price: Decimal,
+    ) -> crate::models::Product {
+        state
+            .inventory_service
+            .create_product(
+                audit_actor_id(state).await,
+                NewProduct {
+                    sku: sku.into(),
+                    name: format!("prod {sku}"),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price,
+                    track_stock: true,
+                    min_stock: Some(Decimal::from(2)),
+                    max_stock: Some(Decimal::from(50)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn seed_supplier_cost(
+        state: &AppState,
+        product_id: i64,
+        supplier_name: &str,
+        cost: Decimal,
+        preferred: bool,
+    ) {
+        let actor = audit_actor_id(state).await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(
+                actor,
+                NewSupplier {
+                    name: supplier_name.into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .supplier_service
+            .record_cost(
+                actor,
+                product_id,
+                supplier.id,
+                cost,
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        if preferred {
+            state
+                .supplier_service
+                .set_preferred(actor, product_id, supplier.id)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The badge appears when the preferred supplier's reference cost differs
+    /// from the stored cost, and shows BOTH values so the operator sees the
+    /// gap without arithmetic.
+    #[tokio::test]
+    async fn web_product_detail_shows_stale_cost_badge_when_reference_differs_stored() {
+        let state = test_state().await;
+        let product = seed_product_with_cost(&state, "STALE-1", Decimal::from(5)).await;
+        seed_supplier_cost(&state, product.id, "Stale Sup", Decimal::from_str("12.50").unwrap(), true)
+            .await;
+
+        let app = crate::routes::router(state);
+        let (status, html) =
+            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        for expected in ["stale cost", "reference $12.50", "stored $5.00"] {
+            assert!(
+                html.contains(expected),
+                "stale badge must show {expected}: {html:.900}"
+            );
+        }
+    }
+
+    /// Equal costs mean fresh: no badge, even though a supplier row exists.
+    #[tokio::test]
+    async fn web_product_detail_hides_stale_cost_badge_when_costs_are_equal() {
+        let state = test_state().await;
+        let product = seed_product_with_cost(&state, "STALE-2", Decimal::from(5)).await;
+        seed_supplier_cost(&state, product.id, "Fresh Sup", Decimal::from(5), true).await;
+
+        let app = crate::routes::router(state);
+        let (status, html) =
+            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains("stale cost"),
+            "equal costs must not render the badge: {html:.900}"
+        );
+    }
+
+    /// No supplier rows means `reference_cost` is `None`: the product column
+    /// IS the truth, so there is nothing to compare and no badge.
+    #[tokio::test]
+    async fn web_product_detail_hides_stale_cost_badge_without_supplier_rows() {
+        let state = test_state().await;
+        let product = seed_product_with_cost(&state, "STALE-3", Decimal::from(5)).await;
+
+        let app = crate::routes::router(state);
+        let (status, html) =
+            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains("stale cost"),
+            "no supplier rows must not render the badge: {html:.900}"
+        );
+    }
+
+    /// `cost_price` 0 is `NOT NULL DEFAULT '0'` = "no cost recorded yet", not
+    /// a cost to compare against: the badge must stay hidden even when a
+    /// supplier cost exists.
+    #[tokio::test]
+    async fn web_product_detail_hides_stale_cost_badge_when_stored_cost_is_zero() {
+        let state = test_state().await;
+        let product = seed_product_with_cost(&state, "STALE-4", Decimal::ZERO).await;
+        seed_supplier_cost(&state, product.id, "Zero-Cost Sup", Decimal::from_str("12.50").unwrap(), true)
+            .await;
+
+        let app = crate::routes::router(state);
+        let (status, html) =
+            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains("stale cost"),
+            "stored cost 0 must not render the badge: {html:.900}"
+        );
+    }
+
+    /// The reference is the PREFERRED supplier's cost, not the cheapest: the
+    /// badge must reuse `reference_cost`'s rule, never reimplement a min().
+    #[tokio::test]
+    async fn web_product_detail_stale_cost_badge_uses_preferred_supplier_cost_not_cheapest() {
+        let state = test_state().await;
+        let product = seed_product_with_cost(&state, "STALE-5", Decimal::from(5)).await;
+        seed_supplier_cost(&state, product.id, "Cheap Sup", Decimal::from(8), false).await;
+        seed_supplier_cost(&state, product.id, "Preferred Sup", Decimal::from(20), true).await;
+
+        let app = crate::routes::router(state);
+        let (status, html) =
+            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("reference $20.00"),
+            "badge must show the preferred supplier's cost: {html:.900}"
+        );
+        assert!(
+            !html.contains("reference $8.00"),
+            "badge must not fall back to the cheapest row: {html:.900}"
+        );
     }
 
     /// Drawer submissions get the fresh detail fragment plus two triggers:

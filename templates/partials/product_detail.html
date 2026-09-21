@@ -181,6 +181,18 @@
      is only the fallback when this list is empty. #}
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1.5 font-bold text-[13px] text-muted">Supplier costs ({{ supplier_costs.len() }})</div>
+    {# Derived stale-cost badge (cost-freshness S1): rendered only when the
+       supplier reference cost genuinely disagrees with the stored cost — the
+       Rust side already filtered the no-rows, zero-cost and equal cases.
+       Both values are shown so the operator sees the gap without arithmetic;
+       the badge reuses the card's own badge styling (the neutral price_alert
+       variant), no new Tailwind classes. #}
+    {% if let Some(stale) = stale_cost %}
+    <div class="mb-3 flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
+      <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">stale cost</span>
+      <span class="text-[13px] text-muted">reference ${{ stale.reference_display() }} • stored ${{ stale.stored_display() }}</span>
+    </div>
+    {% endif %}
     {% if supplier_costs.is_empty() %}
       <div class="mb-3 text-[13px] text-muted">No supplier rows yet — the reference cost falls back to the product's cost price until one is recorded here.</div>
     {% else %}
