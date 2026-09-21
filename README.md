@@ -32,6 +32,17 @@ The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CS
   never an id ("Registrado por" / "Actualizado por" in the detail views, "el sistema" for the
   NULL `users` columns, and the grant trail "«rol»: otorgado por «nombre» el «fecha»" on the
   users screen) — see `openspec/specs/identity/spec.md` ("The actor audit") for the rules.
+- **Documents index (`/documents`)** — one screen over the documents the shop produces: sales,
+  sale payments, purchases, purchase payments, stock movements and customer receipts, newest first,
+  with a text search (document number/reference and counterpart name) and filters by type, acting
+  user and inclusive date range. It is a read-only index: every row opens the document page that
+  already owns it. Visibility is per type and uses the existing catalog — `sales.read` opens the
+  sale documents, `purchases.read` the purchases, `inventory.read` the stock movements and
+  `customers.read` the collection receipts; any ONE of the four opens the screen, and the page
+  narrows its content to the tiers the principal holds (no new permission, no migration). The feed
+  shows the newest 200 documents and says so when it cut the history. Movements of cash
+  (`transactions`) are deliberately out of scope: the index answers "which document", the ledger
+  answers "which money".
 - **Account** — `id, name, cached_balance, created_at`
 - **Transaction** — `id, account_id (FK), kind (Income/Expense), amount (Decimal), description, reference (nullable, opaque), date (NaiveDate), created_at`
 - Balance is **always derived** `SUM(Income) - SUM(Expense)` — `cached_balance` is kept in sync transactionally but never trusted for reads.
@@ -700,9 +711,30 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
   - Delete supplier: `DELETE /web/suppliers/:id` (HTMX, RESTRICT-aware)
   - Record product cost: `POST /web/supplier-costs` (HTMX)
 
+`GET /documents` — documents index (cross-department):
+
+- One feed over six document families, newest first: sales, sale payments, purchases, purchase
+  payments, stock movements and customer receipts (HTMX `GET /web/documents`)
+- The page opens for ANY ONE of `sales.read`, `purchases.read`, `inventory.read` and
+  `customers.read`, and narrows its content per tier: a `sales.read`-only principal sees the sale
+  documents and their payments, never the purchases, the stock movements or the receipts — not even
+  the type option. Movements of cash (`transactions`) are out of scope by decision
+- Filter bar (`#document-filters`): type (`group`; the operator's four options — Ventas, Compras,
+  Movimientos de stock, Pagos — and only the permitted ones render), acting user (`user`,
+  a display-name or username substring), inclusive date range (`from`/`to`) and the text search
+  (`q`, matched against the document number/reference and the counterpart's name). The filter is
+  addressable (`/documents?group=…&q=…`) and Back restores the list it was applied to
+- Every row carries the document's date, family, identifier, counterpart, status/detail, its amount
+  or stock quantity, and the acting user's display name; `Open` links to the page that owns the
+  document (`/sales/{id}`, `/purchases/{id}`, `/customers/{id}`), and a stock movement opens the
+  products list at that product's row, because there is no product record page
+- The feed shows the newest 200 documents and states when the cap cut the history instead of
+  pretending the history ended
+- Read-only: nothing is created, edited, confirmed or cancelled from this screen
+
 All forms use HTMX; server returns HTML fragments (`partials/*`) and `HX-Trigger` events for refresh. HTMX 1.9.12 is served locally from `/static/htmx.min.js` (no CDN).
 
-Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases), Catalogue (Products, Suppliers, Customers), Cash (Accounts, currently the dashboard section) and Account (Users, Roles, Password). Each page's rendering struct carries a nav view built from the request's principal, so the server renders only the entries that principal may read (each entry declares the permissions its href and named blocks need — the mapping lives in `authz::NAV_ENTRIES` and is drift-tested) and hides a group heading when nothing in it is visible; the active entry is marked server-side, so the state is correct without JavaScript. The signed-in user's display name and username sit next to the logout control. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path. A response that carries its own server-rendered notice wins over the generic `<action> saved` text: the create-under-filter answer swaps its notice out of band into `#notice` (`templates/partials/notice.html`) and marks it `data-notice-server`, which `base.html` reads to skip the generic one. The name travels in the body rather than an `HX-Trigger` payload because product names are arbitrary UTF-8: a raw non-ASCII header value reaches the client as mojibake, since XHR decodes header bytes as ISO-8859-1 (`HeaderValue` itself accepts bytes >= 0x80), and re-encoding the name into ASCII by hand is the fragile part, not the header.
+Navigation: the sidebar groups destinations into Operation (Dashboard, Sales, Purchases, Documents), Catalogue (Products, Suppliers, Customers), Cash (Accounts, currently the dashboard section) and Account (Users, Roles, Password). Each page's rendering struct carries a nav view built from the request's principal, so the server renders only the entries that principal may read (each entry declares the permissions its href and named blocks need — the mapping lives in `authz::NAV_ENTRIES` and is drift-tested) and hides a group heading when nothing in it is visible; the active entry is marked server-side, so the state is correct without JavaScript. The signed-in user's display name and username sit next to the logout control. The environment line (`local · SQLite`) and the REST API link sit below the groups. Failed and successful actions report through the dismissible `#notice` region instead of a blocking browser dialog; forms name the action with `data-action` and fall back to the request path. A response that carries its own server-rendered notice wins over the generic `<action> saved` text: the create-under-filter answer swaps its notice out of band into `#notice` (`templates/partials/notice.html`) and marks it `data-notice-server`, which `base.html` reads to skip the generic one. The name travels in the body rather than an `HX-Trigger` payload because product names are arbitrary UTF-8: a raw non-ASCII header value reaches the client as mojibake, since XHR decodes header bytes as ISO-8859-1 (`HeaderValue` itself accepts bytes >= 0x80), and re-encoding the name into ASCII by hand is the fragile part, not the header.
 
 ## Styles & local assets
 
@@ -921,6 +953,8 @@ src/services/customers.rs  — customer CRUD, walk-in protection, duplicate-name
 src/services/customer_receipts.rs — collect oldest-first: one receipt grouping one payment per covered sale
 src/services/suppliers.rs  — supplier CRUD + product/supplier satellite cost rule
 src/services/purchases.rs  — Draft/Confirm/Pay/Cancel + suggestion builder (orchestrates stock, finance, satellite)
+src/services/documents.rs   — the cross-department documents index: composes the four families'
+                             reads, merges newest-first, caps the page at 200 and reports when it cut
 src/services/identity.rs   — identity: bootstrap admin, login with constant-time verification and
                              the generic failure, the in-memory throttle, session mint/resolve/
                              renew/revoke, password change, the users and roles tier rules
@@ -956,6 +990,7 @@ src/routes/identity_web.rs — GET/POST /login, POST /logout, GET/POST /password
 src/routes/identity_api.rs — POST/DELETE /api/sessions (JSON session API)
 src/routes/users_web.rs    — Web /users: list, create, deactivate/activate, password reset, roles
 src/routes/roles_web.rs    — Web /roles: list, create, edit, delete, permission matrix
+src/routes/documents_web.rs — Web /documents: the cross-department index page + its list fragment (any-of read gate)
 src/routes/mod.rs
 templates/base.html
 templates/dashboard.html
@@ -970,11 +1005,13 @@ templates/sales.html
 templates/customers.html
 templates/purchases.html
 templates/suppliers.html
+templates/documents.html
 templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_list.html,
                              purchase_detail.html, supplier_list.html, suggestion_list.html,
                              customer_list.html, customer_statement.html, receipt_list.html,
                              sidebar.html (the permission-gated navigation), user_list.html,
-                             role_list.html, user_roles_form.html, user_password_form.html
+                             role_list.html, user_roles_form.html, user_password_form.html,
+                             document_list.html
 migrations/*.sql
 assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/, @theme palette)
 static/tailwind.css        — compiled stylesheet (committed; rebuild via scripts/build-css.sh)
