@@ -16,9 +16,11 @@
    `#confirm-purchase` / `#edit-header` / `#discard-purchase` /
    `#record-payment` / `#cancel-purchase` are the forms' dialogs. #}
 {% import "partials/product_search_results.html" as picker %}
+{% import "partials/purchase_effects_preview.html" as effects %}
 {% macro record_money(record) %}
 <div id="purchase-record-money">
   <div class="my-2 text-2xl font-bold">${{ record.total }} <span class="text-[13px] text-muted">paid {{ record.paid }} • due {{ record.due }}</span></div>
+  {% if record.purchase.status.to_string() == "Draft" %}{% call effects::effects_preview(record) %}{% endif %}
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
   {% if record.lines.is_empty() %}
