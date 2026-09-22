@@ -71,16 +71,18 @@ aggregate > 400 (slices recorded here at delivery time). Skill: `work-unit-commi
 T1–T3: **delegated direct** (writer trigger: 2+ non-trivial files).
 
 ## Checklist
-- [ ] T1 Repo predicate + tests (discarded deletes; protection re-pinned to
+- [x] T1 Repo predicate + tests (discarded deletes; protection re-pinned to
       confirmed-then-cancelled; unknown-id unchanged; REST DELETE absence confirmed).
-- [ ] T2 Service + route (RED→GREEN; refusal names state; contract unchanged).
+      Commit: df59bc5.
+- [x] T2 Service + route (RED→GREEN; refusal names state; contract unchanged).
+      Commits: b0ba110 + route-tests commit.
 - [ ] T3 UI both surfaces (record page + documents drawer) + tests; smoke/e2e if pinned
       contracts change.
 - [ ] T4 Full `cargo test` green; e2e if affected; evidence checkoffs with commit hashes.
 
 ## Progress
-- [x] T1 done — RED (822 passed / 1 failed: discarded) then GREEN via predicate + trait-doc (delete_draft: Draft OR Cancelled∧sale_number IS NULL).
-- [x] T2 done — service deletable check (Draft OR Cancelled∧number NULL), refusal + race copy mirrored from purchases, doc comment + route doc updated; 2 new service tests (discarded removes, confirmed-then-cancelled refuses).
+- [x] T1 done — RED (822 passed / 1 failed: discarded) then GREEN via predicate + trait-doc (delete_draft: Draft OR Cancelled∧sale_number IS NULL). Commit: df59bc5. REST check: `/api/sales/{id}` has no DELETE (get/put only; line-level DELETE pre-exists on `/api/sales/lines/{line_id}` but no sale-document DELETE) → REST untouched.
+- [x] T2 done — service deletable check (Draft OR Cancelled∧number NULL), refusal + race copy mirrored from purchases, doc comment + route doc updated; 2 new service tests (discarded removes, confirmed-then-cancelled refuses). Commits: b0ba110 (service + route doc), plus route tests commit (discard-200, confirmed-then-cancelled-400, unknown-404 — GREEN immediately, pinning behavior landed in b0ba110; RED was observed at the service layer in the T2 work).
 
 ## Acceptance criteria
 1. Discarded cancelled sale: DELETE removes it + lines; record page 404s after.

@@ -2424,6 +2424,96 @@ mod tests {
         assert!(state.sales_service.get_detail(fixture.sale_id).await.is_ok());
     }
 
+    /// A discarded sale (cancelled before confirm, number still NULL)
+    /// deletes through the same route: empty 200, `sale-changed` trigger,
+    /// detail then 404s — the acceptance path for never-confirmed cancelled
+    /// rows.
+    #[tokio::test]
+    async fn web_delete_draft_discarded_cancelled_sale_answers_200_and_is_gone() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .sales_service
+            .cancel(audit_actor(&state).await, fixture.sale_id, None)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body, trigger) = send_delete(
+            app,
+            &format!("/web/sales/{}", fixture.sale_id),
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            trigger.as_deref(),
+            Some("sale-changed"),
+            "the documents page listens for sale-changed"
+        );
+        let err = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::AppError::NotFound(_)),
+            "the deleted discarded sale must be gone: {err:?}"
+        );
+    }
+
+    /// Confirmed-then-cancelled keeps the protection at the route: 400 and
+    /// the row survives.
+    #[tokio::test]
+    async fn web_delete_draft_refuses_a_confirmed_then_cancelled_sale_with_400() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .sales_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.sale_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .cancel(
+                audit_actor(&state).await,
+                fixture.sale_id,
+                Some("wrong order".to_string()),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body, _) = send_delete(
+            app,
+            &format!("/web/sales/{}", fixture.sale_id),
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(state.sales_service.get_detail(fixture.sale_id).await.is_ok());
+    }
+
+    /// An unknown id is 404 through the same route — the service's NotFound
+    /// shape, unchanged by the predicate widening.
+    #[tokio::test]
+    async fn web_delete_draft_unknown_sale_is_404() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+
+        let (status, body, _) = send_delete(
+            app,
+            "/web/sales/999999",
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
     #[tokio::test]
     async fn web_delete_draft_requires_sales_create() {
         let state = test_state().await;
