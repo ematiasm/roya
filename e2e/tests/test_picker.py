@@ -197,6 +197,9 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     spare_id = data.sale_line_product_id
     page.goto(f"{api.base_url}/purchases/{data.purchase_id}")
 
+    # The purchase picker lives in the add-line drawer now: open it the way
+    # the operator does (the bar's Add line button) before touching the field.
+    page.locator("#add-line").click()
     picker = page.locator("#product-picker")
     picker.fill("Harness")
     results = page.locator("#product-search-results")
@@ -211,7 +214,16 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
 
     row = _purchase_line_row(page, "Harness Spare")
     expect(row).to_have_count(1)
-    expect(row).to_contain_text(re.compile(r"HARNESS-SPARE\s+4\s+\$"))
+    expect(row).to_contain_text("HARNESS-SPARE")
+    # Qty and unit cost are inline-edit inputs now (T7): their content is the
+    # value attribute, not cell text, so the row shape is asserted through the
+    # inputs while the derived subtotal stays plain text.
+    expect(row.locator("input[name='qty']")).to_have_value("4")
+    expect(row.locator("input[name='unit_cost']")).to_have_value("2.00")
+    expect(row).to_contain_text("$8.00")
+    # The keep-open preference defaults to OFF, so a successful add closes the
+    # drawer and the line is what remains on screen.
+    expect(page.locator("#line-drawer")).to_be_hidden()
 
     detail = api.get_json(f"/api/purchases/{data.purchase_id}")
     line = next(

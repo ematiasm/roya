@@ -107,7 +107,7 @@ was deepened and fully approved for implementation (2026-09-22).
       checkbox in localStorage; OOB close/clear; focus return).
 - [x] T7 Inline line edit (inputs + PUT registered on the existing update-line
       route + revert on invalid).
-- [ ] T8 Full verification: `cargo test` green; e2e purchase suites green;
+- [x] T8 Full verification: `cargo test` green; e2e purchase suites green;
       update this doc with evidence per task (commit hashes).
 
 ## Route declaration
@@ -200,7 +200,23 @@ was deepened and fully approved for implementation (2026-09-22).
       notice still announces the refusal). New `w-20` utility — CSS rebuilt.
       Re-run: new test 1, `purchase` 124, `wiring` 15. FULL `cargo test`:
       805 passed. Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T8.
+- [x] T8 done. e2e updates (RED-first where the suite observed the break):
+      `test_purchases.py` opens the dialog via the bar's `#open-confirm`
+      (new stable id) before submitting, Credit comment corrected (no method
+      control at all); `test_picker.py` opens the add-line drawer before
+      filling the picker, asserts qty/unit_cost through the inline inputs'
+      values (cell text no longer carries them) and the `$`-prefixed money
+      cell (restored on the cost input after the first e2e run caught its
+      loss), plus the keep-open-OFF drawer close after a successful add.
+      `test_confirmation.py` is sale-only — untouched. FULL e2e
+      (`scripts/e2e.sh`): **82 passed, 4 skipped** (all four skips are the
+      suite's opt-in probes by design). FINAL FULL `cargo test`: **805
+      passed**. Commit hashes for T1–T7: `47458a1` (T1), `0d1484b` (T2),
+      `8736f9b` (T3), `a44de33` (T4), `f3281b7` + `b530706` (T5,
+      feature + checkbox fix), `27b2be2` (T6), `b29a55c` (T7). T8's own
+      hash cannot live in this commit — it is recorded in the final report.
+- [x] All tasks complete. The receiving desk is implemented, verified, and
+      committed.
 
 ## Acceptance criteria (feature-level)
 

@@ -58,7 +58,7 @@
                      hx-trigger="change delay:400ms" />
             </td>
             <td class="py-2.5 pr-3 text-right">
-              <input type="number" id="line-cost-{{ line.id }}" name="unit_cost"
+              <span class="text-muted">$</span><input type="number" id="line-cost-{{ line.id }}" name="unit_cost"
                      class="w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
                      value="{{ line.unit_cost }}" min="0" step="any" data-action="Edit line"
                      hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
@@ -173,7 +173,7 @@
     <button type="button" id="add-line"
             class="rounded-[10px] border border-border bg-transparent px-3.5 py-2 text-sm text-text"
             onclick="openLineDrawer()">Add line</button>
-    <button type="button" class="bg-accent2 text-white"{% if record.lines.is_empty() %} disabled{% endif %}
+    <button type="button" id="open-confirm" class="bg-accent2 text-white"{% if record.lines.is_empty() %} disabled{% endif %}
             onclick="openRecordDialog('confirm-purchase')">Confirm ▾</button>
     <div class="relative ml-auto">
       <button type="button" id="record-menu-toggle" aria-label="More actions"
