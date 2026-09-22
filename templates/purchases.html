@@ -4,12 +4,9 @@
 {% let page_title = "Purchases" %}
 {% let page_breadcrumb_label = "" %}
 {% let page_breadcrumb_href = "" %}
-{% let page_action_href = "#new-purchase" %}
-{% let page_action_label = "New purchase" %}
 {% include "partials/page_header.html" %}
 <div class="mb-4 text-[13px] text-muted">purchases • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %} • {% if allow_negative %}overdraft allowed{% else %}overdraft blocked{% endif %}</div>
-<div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
-  <div class="flex flex-col gap-6">
+<div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Purchases</h2>
@@ -64,33 +61,6 @@
       <div class="mt-2 text-[13px] text-muted">Suggested = max − stock when stock ≤ min. Supplier = preferred satellite row, else cheapest current cost. Products without a cost row are listed separately. Serving a suggestion opens its new draft record.</div>
     </div>
     {% endif %}
-  </div>
-
-  <div class="flex flex-col gap-6">
-    <div class="rounded-2xl border border-border bg-card p-5" id="new-purchase">
-      <h2 class="mb-3 text-lg font-semibold">New Purchase (Draft)</h2>
-      <form class="flex flex-col gap-2.5" data-action="Create purchase" hx-post="/web/purchases" hx-swap="none">
-        <div>
-          <label>Supplier</label>
-          <select name="supplier_id" required>
-            {% for s in suppliers %}
-            <option value="{{ s.id }}">{{ s.name }}{% if !s.is_active %} (inactive){% endif %}</option>
-            {% endfor %}
-          </select>
-        </div>
-        {# Payment is imputed at confirm (purchase-payment-at-confirm): the
-           draft asks only WHO and WHEN it happened — type and due date live
-           in the confirm dialog; invoice and notes are record-page header
-           edits. An omitted type stores Cash server-side (decision #4). #}
-        <div>
-          <label>Purchase date</label>
-          <input type="date" name="purchase_date" required value="{{ today }}" />
-        </div>
-        <button type="submit">Create Draft</button>
-        <div class="text-[13px] text-muted">Creating opens the new draft's page. Also at <code>POST /api/purchases</code></div>
-      </form>
-    </div>
-  </div>
 </div>
 
 {# The purchase peek shell, the same pattern the documents drawer uses: a
@@ -105,7 +75,6 @@
 </div>
 
 <script>
-  document.body.addEventListener('purchase-created', function(){ htmx.trigger('#purchase-list','refresh'); });
   function openPurchaseDrawer() {
     var drawer = document.getElementById('purchase-drawer');
     if (drawer) {

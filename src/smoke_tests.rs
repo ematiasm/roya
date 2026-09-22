@@ -1158,6 +1158,22 @@ async fn probe_or_fail(
     Ok(())
 }
 
+/// The guard's non-vacuity decision, extracted so mutation tests can pin its
+/// boundary directly. A page is worth guarding when it renders at least one
+/// `hx-*` request target, or a native form whose action is a real URL:
+/// non-empty and not the placeholder `#` (an `action="#"` form posts nowhere,
+/// so it checks nothing). Extracted unchanged from the inline check the
+/// S4-widened guard carried; behaviour-preserving.
+fn wiring_is_vacuous(targets: &[RenderedTarget], forms: &[RenderedForm]) -> bool {
+    let renders_wired_native_form = forms.iter().any(|f| {
+        f.action
+            .as_deref()
+            .map(|a| !a.is_empty() && a != "#")
+            .unwrap_or(false)
+    });
+    targets.is_empty() && !renders_wired_native_form
+}
+
 /// Prove every rendered request target resolves to a registered route for the
 /// verb that will actually be sent.
 ///
@@ -1197,9 +1213,17 @@ async fn assert_htmx_targets_are_wired(
     }
 
     let targets = extract_htmx_targets(html);
-    if targets.is_empty() {
+    let forms = extract_rendered_forms(html)
+        .into_iter()
+        .collect::<Vec<_>>();
+    // A page renders wiring either as htmx request attributes or as a native
+    // form action (both are probed with real verbs below). A page with neither
+    // renders nothing this guard can check, so it must not be guarded — but a
+    // native-form-only page (the creation page posts the collection endpoint
+    // with a plain action/method) is fully checked and never vacuous.
+    if wiring_is_vacuous(&targets, &forms) {
         return Err(format!(
-            "{page}: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets rendered; guard would be vacuous"
+            "{page}: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets or native form action rendered; guard would be vacuous"
         ));
     }
     for target in &targets {
@@ -1232,8 +1256,8 @@ async fn assert_htmx_targets_are_wired(
         .await?;
     }
 
-    for form in extract_rendered_forms(html) {
-        check_native_form(page, &form, concrete_ids_are_defects)?;
+    for form in &forms {
+        check_native_form(page, form, concrete_ids_are_defects)?;
         if let Some(action) = &form.action {
             if !action.is_empty() && action != "#" {
                 probe_or_fail(probe_app, page, "form action", &form.method, action).await?;
@@ -1417,6 +1441,16 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
         GuardedPage {
             label: "purchases",
             path: "/purchases".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        // The creation page: like the list, its URL carries no id and its form
+        // posts the collection endpoint (/web/purchases) with no data-bound id
+        // in any request target — the supplier roster renders as names/values,
+        // not as a typed id.
+        GuardedPage {
+            label: "purchase new page",
+            path: "/purchases/new".to_string(),
             concrete_ids_are_defects: true,
             external_selectors: vec![],
         },
@@ -2933,6 +2967,63 @@ fn wiring_guard_catches_dead_native_form_action_rewrite() {
     assert!(err.contains("this.action"), "{err}");
 }
 
+/// The widened non-vacuity boundary (S4): a native form with a real,
+/// non-`#` action makes a target-free page guarded, not vacuous. Pinned on
+/// all three sides of the boundary, asserting the guard's exact vacuity
+/// text, so relaxing `wiring_is_vacuous` fails here before a page like
+/// `/purchases/new` can silently lose its only wiring.
+#[tokio::test]
+async fn wiring_guard_pins_the_non_vacuity_boundary_of_native_form_actions() {
+    let (app, _pool) = test_app().await;
+
+    // The predicate directly, on all three boundaries.
+    let form_with_action = extract_rendered_forms(r#"<form method="get" action="/login"></form>"#);
+    assert!(!wiring_is_vacuous(&[], &form_with_action));
+    let form_with_placeholder = extract_rendered_forms(r##"<form method="post" action="#"></form>"##);
+    assert!(wiring_is_vacuous(&[], &form_with_placeholder));
+    assert!(wiring_is_vacuous(&[], &[]));
+
+    // And end-to-end through the guard, whose vacuity error text the
+    // boundary pins assert verbatim.
+
+    // (a) No hx-* target, but a form with a real action: guarded, not
+    // vacuous — the form's action is probed and a real route answers.
+    assert_htmx_targets_are_wired(
+        &app,
+        "mutation-5a",
+        r#"<form method="get" action="/login"></form>"#,
+        false,
+    )
+    .await
+    .unwrap();
+
+    // (b) A form whose action is the `#` placeholder posts nowhere, so it
+    // checks nothing: vacuous.
+    let err = assert_htmx_targets_are_wired(
+        &app,
+        "mutation-5b",
+        r##"<form method="post" action="#"></form>"##,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "mutation-5b: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets or native form action rendered; guard would be vacuous",
+        "{err}"
+    );
+
+    // (c) No form and no target at all: vacuous.
+    let err = assert_htmx_targets_are_wired(&app, "mutation-5c", "<p>nothing wired</p>", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "mutation-5c: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets or native form action rendered; guard would be vacuous",
+        "{err}"
+    );
+}
+
 /// `data-action` names the failed action for the `#notice` region. It is not a
 /// native form `action`, so the guard must not read it as one and probe
 /// "Create product" as a URL.
@@ -3738,6 +3829,125 @@ async fn purchases_page_drops_the_rest_api_card() {
         !purchases.contains(">REST API</h2>"),
         "the REST API card must not be rendered on /purchases"
     );
+}
+
+/// The purchases-index redesign S4 (odd/tasks/redesign-purchases-index.md):
+/// "New purchase" is a real creation page at `/purchases/new` — a write gets a
+/// page, the list's primary action navigates to it, and the form posts the
+/// existing `POST /web/purchases` (payment type and due date are decided at
+/// confirm, invoice and notes are the two optional fields the POST accepts).
+/// The `#new-purchase` card leaves the list and the now-empty right column
+/// collapses, so the page renders a single column.
+#[tokio::test]
+async fn purchases_new_page_renders_the_creation_form() {
+    let (app, pool) = test_app().await;
+    create_supplier_via_web(&app, &pool, "NewPageSup").await;
+    let (status, page) = get(&app, "/purchases/new").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    // The shell's page title, so the page header component drives the same
+    // h1 every other page renders.
+    assert!(
+        page.contains("data-page-title>New purchase</h1>"),
+        "the creation page must render the New purchase title in the shell: {page:.600}"
+    );
+    // The four fields, the same names `POST /web/purchases` already accepts.
+    for field in ["supplier_id", "purchase_date", "supplier_invoice_no", "notes"] {
+        assert!(
+            page.contains(&format!("name=\"{field}\"")),
+            "the creation form must render the {field} field: {page:.600}"
+        );
+    }
+    // The form posts to the existing creation endpoint.
+    assert!(
+        page.contains("action=\"/web/purchases\""),
+        "the creation form must post to the existing /web/purchases endpoint: {page:.600}"
+    );
+    // The supplier roster renders by name, like the old card did.
+    assert!(
+        page.contains("NewPageSup"),
+        "the supplier select must list the roster: {page:.600}"
+    );
+}
+
+#[tokio::test]
+async fn purchases_new_page_replaces_the_list_card() {
+    let (app, _pool) = test_app().await;
+    let (status, page) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        !page.contains("id=\"new-purchase\""),
+        "the New Purchase (Draft) card must not render on /purchases"
+    );
+    // The page action now points at the creation page (a plain <a>, the way
+    // page_header.html has always rendered it).
+    assert!(
+        page.contains("href=\"/purchases/new\""),
+        "the page action must navigate to /purchases/new: {page:.600}"
+    );
+}
+
+#[tokio::test]
+async fn purchases_new_page_collapses_the_list_to_one_column() {
+    let (app, _pool) = test_app().await;
+    let (status, page) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    // With the card gone the right column is empty, so the two-column grid
+    // class must not render at all.
+    assert!(
+        !page.contains("min-[900px]:grid-cols-[minmax(0,1fr)_360px]"),
+        "/purchases must not render the two-column grid class once the card is gone"
+    );
+}
+
+/// Creating through the new page's plain full-page form still lands on the new
+/// draft's record — a 303 Location, not the htmx `HX-Redirect` header (that
+/// branch belongs to the record page's own flows and stays untouched).
+#[tokio::test]
+async fn purchases_new_page_form_lands_on_the_record() {
+    let (app, pool) = test_app().await;
+    let supplier = create_supplier_via_web(&app, &pool, "LandingSup").await;
+    let body = format!(
+        "supplier_id={supplier}&purchase_date=2024-05-02&supplier_invoice_no=INV-9&notes=via+the+new+page"
+    );
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded"),
+    );
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "a plain full-page create must redirect"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("a plain create must redirect to the record")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/purchases/"),
+        "the redirect must land on the new record: {location}"
+    );
+    let purchase_id: i64 = location["/purchases/".len()..]
+        .parse()
+        .unwrap_or_else(|_| panic!("the redirect must end in the purchase id: {location}"));
+    // The two optional fields the new page sends persist server-side.
+    let (invoice, notes): (Option<String>, String) =
+        sqlx::query_as("SELECT supplier_invoice_no, notes FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(invoice.as_deref(), Some("INV-9"), "invoice no must persist");
+    assert_eq!(notes, "via the new page", "notes must persist");
 }
 
 #[tokio::test]

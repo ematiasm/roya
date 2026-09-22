@@ -50,9 +50,11 @@ struct PurchasesTemplate {
     purchases: Vec<PurchaseView>,
     suggestions: PurchaseSuggestions,
     has_suggestions: bool,
-    suppliers: Vec<crate::models::Supplier>,
     allow_negative: bool,
     allow_negative_stock: bool,
+    /// Live: the included `partials/suggestion_list.html` renders `{{ today }}`
+    /// in its seed-options date input, so this is not the deleted creation
+    /// card's leftover — the page include shares this struct's context.
     today: String,
     nav_key: &'static str,
     /// Current filter values, so a bookmarkable `/purchases?supplier=…`
@@ -70,6 +72,13 @@ struct PurchasesTemplate {
     /// half of the old consequence where a `purchases.read`-only principal
     /// saw suggestions it could not refresh.
     show_suggestions: bool,
+    /// The page header's primary action, the same way the record page carries
+    /// it (the shared component reads the struct fields without locals):
+    /// "New purchase" → `/purchases/new` when the principal holds
+    /// `purchases.create`, empty label = no action rendered (AC21: never an
+    /// entry the principal cannot open).
+    page_action_href: String,
+    page_action_label: String,
 }
 
 /// The `/purchases/{id}` record page. The page-header values are struct fields,
@@ -96,6 +105,16 @@ struct PurchasePageTemplate {
     /// the wiring layer (AC20).
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
+    nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
+}
+
+#[derive(Template)]
+#[template(path = "purchase_new.html")]
+struct PurchaseNewTemplate {
+    today: String,
+    suppliers: Vec<crate::models::Supplier>,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -314,15 +333,13 @@ async fn changed_with_picker(
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-/// The purchases page is a single `purchases.read` gate. The supplier roster
-/// (`suppliers.read` data) stays server-rendered for the create dialog — the
-/// recorded deliberate consequence: a purchases-only principal sees the
-/// roster it needs to record a purchase, and the supplier screens themselves
-/// refuse it. The reorder suggestions are the coherent half: the block now
-/// renders only when the principal holds `inventory.read`, the same gate the
-    /// suggestions fragment and API carry, so a purchases-only principal sees no
-    /// suggestions block it could not refresh (S7 part 2 closed the consequence the
-/// part 1 review recorded).
+/// The purchases page is a single `purchases.read` gate. Creation moved to
+/// its own page (`/purchases/new`, gated `purchases.create`), so the list no
+/// longer carries the supplier roster. The reorder suggestions are
+/// stock-derived data: the block renders only when the principal holds
+/// `inventory.read`, the same gate the suggestions fragment and API carry, so
+/// a purchases-only principal sees no suggestions block it could not refresh
+/// (S7 part 2 closed the consequence the part 1 review recorded).
 async fn purchases_page(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
@@ -344,14 +361,23 @@ async fn purchases_page(
     } else {
         (PurchaseSuggestions::default(), false)
     };
-    let suppliers = state.supplier_service.list_suppliers().await?;
+    // The header's primary action navigates to the creation page, so it is
+    // offered only when the principal can open it (AC21, the same rule the
+    // sidebar applies): a `purchases.read`-only principal renders no action
+    // and never hits the creation page's 403.
+    let (page_action_href, page_action_label) = if principal.has_permission::<PurchasesCreate>() {
+        ("/purchases/new".to_string(), "New purchase".to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    // `today` stays: the included `partials/suggestion_list.html` renders it
+    // as the seed form's default purchase date (see the struct field comment).
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = PurchasesTemplate {
         title: "All purchases".to_string(),
         purchases,
         suggestions,
         has_suggestions,
-        suppliers,
         allow_negative: state.allow_negative,
         allow_negative_stock: state.allow_negative_stock,
         today,
@@ -363,6 +389,8 @@ async fn purchases_page(
         filter_to: query.to.trim().to_string(),
         nav: Nav::for_principal(&principal),
         show_suggestions,
+        page_action_href,
+        page_action_label,
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -463,6 +491,33 @@ async fn purchase_record_page(
         today: context.today,
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
+        nav_key: "purchases",
+        nav: Nav::for_principal(&principal),
+    };
+    Ok(Html(
+        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+    ))
+}
+
+/// `/purchases/new`: the creation page. A write gets a page — the list's
+/// primary action navigates here and the form posts the existing
+/// `POST /web/purchases`, whose non-htmx branch 303s the browser onto
+/// `/purchases/{id}`. The gate is the one the creation POST itself carries
+/// (`purchases.create`): a principal that could not create the draft would
+/// only hit the POST's 403 one submit later. The supplier roster is
+/// server-rendered for the select, the same recorded consequence the list
+/// page carries — a purchases-only principal sees the roster it needs to
+/// record a purchase; the supplier screens themselves refuse it.
+async fn purchases_new_page(
+    State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+) -> Result<Html<String>, AppError> {
+    let suppliers = state.supplier_service.list_suppliers().await?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let tmpl = PurchaseNewTemplate {
+        today,
+        suppliers,
         nav_key: "purchases",
         nav: Nav::for_principal(&principal),
     };
@@ -1059,6 +1114,7 @@ async fn web_seed_from_suggestion(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/purchases", get(purchases_page))
+        .route("/purchases/new", get(purchases_new_page))
         .route("/purchases/{id}", get(purchase_record_page))
         .route(
             "/web/purchases",
@@ -1636,43 +1692,52 @@ mod tests {
         );
     }
 
-    /// Payment is imputed at confirm (purchase-payment-at-confirm T1): the
-    /// Create Draft form asks ONLY supplier + purchase date, and the
-    /// Sugerido seed options ask ONLY purchase date. No Type, Due date,
-    /// invoice or notes input may appear anywhere on the purchases page —
-    /// the confirm dialog that owns the type lives on the record page.
+    /// The creation form (`/purchases/new`) asks the required pair — supplier
+    /// and purchase date — plus the optional supplier invoice no and notes,
+    /// both editable later on the record page. It must NOT ask payment type
+    /// or due date: the payment decision is made in the record page's confirm
+    /// dialog (purchase-payment-at-confirm). The list page still carries no
+    /// payment-decision input anywhere: the Sugerido seed options ask
+    /// purchase date only.
     #[tokio::test]
-    async fn web_create_draft_form_asks_only_supplier_and_purchase_date() {
+    async fn web_new_purchase_form_asks_supplier_and_date_with_optional_invoice_notes_not_payment() {
         let state = test_state().await;
-        let app = crate::routes::router(state);
-        let (status, html) = get_html(app, "/purchases").await;
-        assert_eq!(status, StatusCode::OK);
+        let app = crate::routes::router(state.clone());
 
+        // The creation page's form: the required pair plus the two optional
+        // fields, and never a payment input.
+        let (status, html) = get_html(app.clone(), "/purchases/new").await;
+        assert_eq!(status, StatusCode::OK);
         let form = enclosing_form(&html, "data-action=\"Create purchase\"");
-        assert!(
-            form.contains("name=\"supplier_id\"") && form.contains("name=\"purchase_date\""),
-            "Create Draft keeps supplier + purchase date: {form:.600}"
-        );
-        for input in ["payment_type", "due_date", "supplier_invoice_no", "notes"] {
+        for input in ["supplier_id", "purchase_date", "supplier_invoice_no", "notes"] {
+            assert!(
+                form.contains(&format!("name=\"{input}\"")),
+                "the creation form must ask {input}: {form:.600}"
+            );
+        }
+        for input in ["payment_type", "due_date"] {
             assert!(
                 !form.contains(&format!("name=\"{input}\"")),
-                "the Create Draft form must not ask {input}: {form:.600}"
+                "the creation form must not ask {input}: the payment decision stays in the \
+                 record page's confirm dialog: {form:.600}"
             );
         }
 
-        // The whole page carries no payment-decision input at all: the seed
-        // options lost Type + Due date, and nothing else on this page asks one.
+        // The list page carries no payment-decision input at all: the seed
+        // options ask purchase date only, and nothing else on it asks one.
+        let (status, list_html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
         assert!(
-            !html.contains("name=\"payment_type\""),
-            "no payment-type input on the purchases page: {html:.600}"
+            !list_html.contains("name=\"payment_type\""),
+            "no payment-type input on the purchases page: {list_html:.600}"
         );
         assert!(
-            !html.contains("name=\"due_date\""),
-            "no due-date input on the purchases page: {html:.600}"
+            !list_html.contains("name=\"due_date\""),
+            "no due-date input on the purchases page: {list_html:.600}"
         );
         assert!(
-            !html.contains("Draft type") && !html.contains("Due date"),
-            "the seed options ask purchase date only: {html:.600}"
+            !list_html.contains("Draft type") && !list_html.contains("Due date"),
+            "the seed options ask purchase date only: {list_html:.600}"
         );
     }
 
@@ -4128,6 +4193,52 @@ mod tests {
         );
     }
 
+    // -- S4: creation is a full page, so the list's primary action is a gate --
+
+    /// The list page is gated `purchases.read`, but its header action now
+    /// navigates to `/purchases/new`, gated `purchases.create` — creation is a
+    /// full page, not a card on the list. The repo's rule (AC21, the same one
+    /// the sidebar's `nav.visible(key)` applies) extends to the primary
+    /// action: a principal without `purchases.create` renders no page action
+    /// at all; a principal holding it sees "New purchase" → `/purchases/new`.
+    #[tokio::test]
+    async fn s4_purchases_page_offers_the_new_purchase_action_only_when_the_principal_can_create() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = get_html_as(app.clone(), "/purchases", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("data-page-action"),
+            "a principal without purchases.create must not be offered the primary \
+             action it could not open: {html:.600}"
+        );
+
+        // The same page for a principal holding BOTH codes: the action is
+        // back, pointing at the creation page.
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "purchases.create"],
+        )
+        .await
+        .unwrap();
+        let (status, html) =
+            get_html_as(app, "/purchases", Some(&test_support::cookie_for(&holder))).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("data-page-action"),
+            "a principal that may create must see the primary action: {html:.600}"
+        );
+        assert!(
+            html.contains("href=\"/purchases/new\"") && html.contains("New purchase"),
+            "the action must navigate to the creation page: {html:.600}"
+        );
+    }
+
     // -- S3: the purchases list opens the read-only document peek -------------
 
     /// The peek shell lives on `/purchases` and mirrors the documents drawer:
@@ -4208,6 +4319,16 @@ mod tests {
             let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
             assert_eq!(status, StatusCode::OK, "{uri}: {html:.200}");
         }
+
+        // The creation page is its own gated read (S4): without
+        // `purchases.create` it answers the same 403 refusal the POST
+        // carries, while the list above still rendered for this principal.
+        let (status, body) = get_html_as(app.clone(), "/purchases/new", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.200}");
+        assert!(
+            body.contains("purchases.create"),
+            "the creation page's refusal must name purchases.create: {body:.400}"
+        );
 
         // Creating a purchase over HTMX: JSON naming the recording gate.
         let (status, body) = post_form_as(

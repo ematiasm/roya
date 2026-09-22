@@ -684,11 +684,14 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
   SKU, unit cost and subtotal, and the payments table with account and method
   names; the product picker matches name, SKU and barcode and shows current stock;
   an unknown id is a 404
+- `/purchases/new` — creation page (`purchases.create`): the list's "New
+  purchase" header action navigates here, and a read-only principal renders no
+  action at all; the page's plain form posts the existing `POST /web/purchases`,
+  and the non-htmx branch answers a 303 to the new record (`/purchases/{id}`)
 - Sugerido panel rendering the suggestion with a `→ Draft` seed button per row
   (HTMX `GET /web/purchases/suggestions`, seed via `POST /web/purchases/from-suggestion`,
   which opens the new draft's record)
 - Actions, gated by status and offered in context on the record page:
-  - New purchase Draft: `POST /web/purchases` (HTMX, answers `HX-Redirect` to the new record)
   - Add line (Draft): `POST /web/purchases/:id/lines` (HTMX, scanner or picker; the
     repeated-product rule is a clear 400)
   - Edit header (Draft): `POST /web/purchases/:id/header` (HTMX)
@@ -1031,6 +1034,7 @@ templates/products.html
 templates/sales.html
 templates/customers.html
 templates/purchases.html
+templates/purchase_new.html
 templates/suppliers.html
 templates/documents.html
 templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_list.html,
@@ -1115,7 +1119,7 @@ router, form extraction and Askama rendering.
   allocations, each grouped payment's `transaction_id`, and the
   money-traceability invariant over the whole database the flow built.
 - **Generic form-wiring guard**: for the seeded `/`, `/accounts/{id}`,
-  `/products`, `/sales`, `/purchases`, `/suppliers` and `/customers` pages (plus
+  `/products`, `/sales`, `/purchases`, `/purchases/new`, `/suppliers` and `/customers` pages (plus
   the sale and purchase detail fragments and the `/customers/{id}` statement) it extracts every `hx-get`, `hx-post`, `hx-put`,
   `hx-patch` and `hx-delete` target with the HTTP verb htmx will send, the
   native `action`/`onsubmit` wiring of rendered forms, and the application URLs
