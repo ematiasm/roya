@@ -75,10 +75,10 @@ T1–T3: **delegated direct** (writer trigger: 2+ non-trivial files).
       confirmed-then-cancelled; unknown-id unchanged; REST DELETE absence confirmed).
       Commit: df59bc5.
 - [x] T2 Service + route (RED→GREEN; refusal names state; contract unchanged).
-      Commits: b0ba110 + route-tests commit.
+      Commits: b0ba110 + 311c930 (route tests).
 - [x] T3 UI both surfaces (record page + documents drawer) + tests; smoke/e2e if pinned
       contracts change.
-      Commit: (this task's work-unit commit).
+      Commit: bc1f454.
       Evidence: RED `cargo test web_sale_record_offers_delete_only` → 1 failed
       ("a discarded sale must offer delete") and `cargo test
       document_drawer_discarded_sale_offers` → 1 failed ("a discarded sale
@@ -97,11 +97,24 @@ T1–T3: **delegated direct** (writer trigger: 2+ non-trivial files).
       dialogs and the cancelled list row — all untouched; the new Delete
       buttons render on discarded-sale surfaces, and no browser test asserts
       their absence).
-- [ ] T4 Full `cargo test` green; e2e if affected; evidence checkoffs with commit hashes.
+- [x] T4 Full `cargo test` green; e2e if affected; evidence checkoffs with commit hashes.
+      Evidence: full `cargo test` = **830 passed, 0 failed** (74.19s) after
+      T1–T3. E2E: **skipped — no e2e-pinned DOM contract changed** (the
+      browser suite pins the SALE draft drawer delete, the discard/cancel
+      dialogs, and the cancelled list row — all untouched; the new Delete
+      controls render only on discarded-sale surfaces, which no browser test
+      asserts to be delete-free; per e2e/README the suite runs only when a
+      pinned contract changes). Work-unit commits: T1 df59bc5, T2 b0ba110 +
+      311c930, T3 bc1f454, T4 this doc-evidence commit.
 
 ## Progress
+
+- [x] All tasks complete. Next step: none (awaiting review; no push/PR per
+      locked scope).
 - [x] T1 done — RED (822 passed / 1 failed: discarded) then GREEN via predicate + trait-doc (delete_draft: Draft OR Cancelled∧sale_number IS NULL). Commit: df59bc5. REST check: `/api/sales/{id}` has no DELETE (get/put only; line-level DELETE pre-exists on `/api/sales/lines/{line_id}` but no sale-document DELETE) → REST untouched.
-- [x] T2 done — service deletable check (Draft OR Cancelled∧number NULL), refusal + race copy mirrored from purchases, doc comment + route doc updated; 2 new service tests (discarded removes, confirmed-then-cancelled refuses). Commits: b0ba110 (service + route doc), plus route tests commit (discard-200, confirmed-then-cancelled-400, unknown-404 — GREEN immediately, pinning behavior landed in b0ba110; RED was observed at the service layer in the T2 work).
+- [x] T2 done — service deletable check (Draft OR Cancelled∧number NULL), refusal + race copy mirrored from purchases, doc comment + route doc updated; 2 new service tests (discarded removes, confirmed-then-cancelled refuses). Commits: b0ba110 (service + route doc), 311c930 (route tests: discard-200, confirmed-then-cancelled-400, unknown-404 — GREEN immediately, pinning behavior landed in b0ba110; RED was observed at the service layer in the T2 work).
+- [x] T3 done — record page Delete (Cancelled+no number, hx-confirm) and documents-drawer "Eliminar descarte" (SalesCreate-gated); both pinned present/absent; old cancelled-offers-no-action test renamed to confirmed_then_cancelled (fixture confirms first — expectation unchanged); record fixture got purchases-style per-process SKU/account suffix. Commit: bc1f454. Evidence: RED (both new tests failed "must offer delete") → GREEN. Smoke `cargo test smoke` → 93 passed; e2e skipped (no pinned contract changed — see checklist).
+- [x] T4 done — full `cargo test` → **830 passed, 0 failed** (74.19s) on this branch after T1–T3. Work-unit commits: T1 df59bc5, T2 b0ba110 + 311c930, T3 bc1f454, T4 this doc-evidence commit.
 
 ## Acceptance criteria
 1. Discarded cancelled sale: DELETE removes it + lines; record page 404s after.
