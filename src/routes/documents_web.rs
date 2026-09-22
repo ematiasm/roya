@@ -674,7 +674,11 @@ async fn sale_annul_action(
 /// purchase wording: `Out · Purchase-return` movements (confirm writes
 /// In/Purchase, cancel writes Out/Purchase-return), refunds that are `Income`
 /// (money entering: no negative-balance refusal exists to preview), and the
-/// purchase cancel endpoint.
+/// purchase cancel endpoint. A DISCARDED purchase (Cancelled while never
+/// confirmed: `purchase_number` NULL) re-offers the delete: it posted
+/// nothing, so removing it strands no history; a cancelled purchase that
+/// carries a number was confirmed first and offers nothing — its inverse
+/// already happened and the audit trail stays.
 async fn purchase_actions(
     state: &AppState,
     principal: &Principal,
@@ -764,7 +768,31 @@ async fn purchase_actions(
                 });
             }
         }
-        PurchaseStatus::Cancelled => {}
+        PurchaseStatus::Cancelled => {
+            // Number still NULL → discarded before confirm → deletable. With
+            // a number the purchase was confirmed first: permanent audit
+            // trail, no action.
+            if purchase.purchase_number.is_none() && principal.has(PurchasesCreate::CODE) {
+                let n = record.lines.len();
+                let (lines_phrase, listed) = draft_lines_phrase(n);
+                actions.push(DrawerAction {
+                    label: "Eliminar descarte".to_string(),
+                    method: "delete".to_string(),
+                    path: format!("/web/purchases/{}", purchase.id),
+                    fields: vec![],
+                    reason: false,
+                    data_action: "Eliminar descarte".to_string(),
+                    impact: vec![
+                        format!("Se elimina el descarte y {lines_phrase} ({listed})."),
+                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
+                            .to_string(),
+                    ],
+                    confirm: Some(format!(
+                        "¿Eliminar el descarte y {lines_phrase}? Esta acción no se puede deshacer."
+                    )),
+                });
+            }
+        }
     }
     Ok(actions)
 }
@@ -1997,6 +2025,127 @@ mod tests {
             "the allocation keeps its sale number as text: {html:.800}"
         );
         assert!(html.contains("Asignaciones"), "the table still renders: {html:.800}");
+    }
+
+    /// T3: the drawer — home of the existing draft delete — offers the delete
+    /// for a DISCARDED purchase (Cancelled while never confirmed: no number)
+    /// and nothing for a confirmed-then-cancelled one, whose number proves it
+    /// must stay as audit trail.
+    #[tokio::test]
+    async fn document_drawer_discarded_purchase_offers_delete_but_annulled_does_not() {
+        use crate::models::{NewProduct, NewPurchase, NewSupplier, PaymentType, ProductKind};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let actor = audit_actor(&state).await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "DRAW-DC".into(),
+                    name: "Drawer discarded product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(
+                actor,
+                NewSupplier {
+                    name: "Drawer Discard Supplier".into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        async fn draft_with_line(state: &AppState, supplier_id: i64, product_id: i64) -> i64 {
+            use rust_decimal::Decimal;
+            let actor = audit_actor(state).await;
+            let purchase = state
+                .purchases_service
+                .create_draft(
+                    actor,
+                    NewPurchase {
+                        supplier_id,
+                        payment_type: PaymentType::Credit,
+                        purchase_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                        due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                        supplier_invoice_no: None,
+                        notes: None,
+                    },
+                )
+                .await
+                .unwrap();
+            state
+                .purchases_service
+                .add_line(actor, purchase.id, product_id, Decimal::from(2), None)
+                .await
+                .unwrap();
+            purchase.id
+        }
+
+        // Discarded: cancelled before confirm, number stays NULL → delete renders.
+        let discarded_id = draft_with_line(&state, supplier.id, product.id).await;
+        state
+            .purchases_service
+            .cancel(actor, discarded_id, None)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/purchase/{discarded_id}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains(&format!("hx-delete=\"/web/purchases/{discarded_id}\"")),
+            "a discarded purchase must offer its delete: {html:.800}"
+        );
+        assert!(
+            html.contains("hx-confirm"),
+            "the delete must ask first: {html:.800}"
+        );
+
+        // Confirmed then cancelled: the number proves it → NO delete renders.
+        let annulled_id = draft_with_line(&state, supplier.id, product.id).await;
+        state
+            .purchases_service
+            .confirm(actor, annulled_id, None)
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .cancel(actor, annulled_id, Some("wrong order".to_string()))
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/purchase/{annulled_id}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains(&format!("hx-delete=\"/web/purchases/{annulled_id}\"")),
+            "a confirmed-then-cancelled purchase must offer no delete: {html:.800}"
+        );
     }
 
     /// The purchase mirror: the draft delete renders only for a
