@@ -121,9 +121,13 @@ solo con proveedor y fecha".
       `web_update_purchase_header` (header edits never touch due; only the
       confirm Cash path clears it):
       `cargo test purchases_web` → `53 passed, 762 filtered out`;
-      `cargo test smoke_tests` → `93 passed, 722 filtered out`.
-- [ ] T5 Verification: full `cargo test`; e2e purchase suites; evidence per
+      `cargo test smoke_tests` → `93 passed, 722 filtered out`. Commit: `28727ae`.
+- [x] T5 Verification: full `cargo test`; e2e purchase suites; evidence per
       task in this doc.
+      Evidence: `cargo test` → `815 passed (1 suite, 72.30s)`.
+      `bash scripts/e2e.sh` → `82 passed, 4 skipped in 130.43s` (the four
+      skips are pre-existing opt-in probes: artifact/parties/products
+      screenshot probes, not this feature).
 
 ## Route declaration
 
@@ -131,8 +135,9 @@ T1–T4: delegated direct (writer trigger: 2+ non-trivial files).
 
 ## Progress
 
-- [x] T1 done (commit `b61f689`), T2 done (commit `13ed93c`), T3 done
-      (commit `7231c18`), T4 done. Next step: T5.
+- [x] All tasks done: T1 `b61f689`, T2 `13ed93c`, T3 `7231c18`, T4
+      `28727ae`, T5 verification (this commit records T4's hash + T5
+      evidence).
 
 ## Acceptance criteria
 
