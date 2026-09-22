@@ -112,8 +112,16 @@ solo con proveedor y fecha".
       still branched on stored type). GREEN after gating both badge spans on
       `status != "Draft"` and unbranching the preview:
       `cargo test purchases_web` → `52 passed, 762 filtered out`;
-      `cargo test smoke_tests` → `93 passed, 721 filtered out`.
-- [ ] T4 Edit header drops Due date field; RED test.
+      `cargo test smoke_tests` → `93 passed, 721 filtered out`. Commit: `7231c18`.
+- [x] T4 Edit header drops Due date field; RED test.
+      Evidence: RED `cargo test web_edit_header_dialog_drops_due_date_and_keeps_the_stored_due`
+      → `FAILED. 0 passed; 1 failed` (dialog still rendered the field).
+      GREEN after dropping `#header-due-date`, removing `due_date` from
+      `UpdatePurchaseHeaderForm` and passing `due_date: None` in
+      `web_update_purchase_header` (header edits never touch due; only the
+      confirm Cash path clears it):
+      `cargo test purchases_web` → `53 passed, 762 filtered out`;
+      `cargo test smoke_tests` → `93 passed, 722 filtered out`.
 - [ ] T5 Verification: full `cargo test`; e2e purchase suites; evidence per
       task in this doc.
 
@@ -123,8 +131,8 @@ T1–T4: delegated direct (writer trigger: 2+ non-trivial files).
 
 ## Progress
 
-- [x] T1 done (commit `b61f689`), T2 done (commit `13ed93c`), T3 done.
-      Next step: T4.
+- [x] T1 done (commit `b61f689`), T2 done (commit `13ed93c`), T3 done
+      (commit `7231c18`), T4 done. Next step: T5.
 
 ## Acceptance criteria
 

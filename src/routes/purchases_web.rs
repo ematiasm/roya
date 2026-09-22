@@ -609,8 +609,6 @@ pub struct UpdatePurchaseHeaderForm {
     #[serde(default)]
     pub purchase_date: String,
     #[serde(default)]
-    pub due_date: String,
-    #[serde(default)]
     pub supplier_invoice_no: String,
     #[serde(default)]
     pub notes: String,
@@ -960,8 +958,11 @@ async fn web_cancel_purchase_collection(
     web_cancel_purchase_impl(state, principal.user_id, headers, form.purchase_id, form).await
 }
 
-/// Edit the draft header in place (dates, invoice, notes); the supplier and the
-/// payment type stay fixed at creation, as the service enforces.
+/// Edit the draft header in place (purchase date, invoice, notes); the
+/// supplier and the payment type stay fixed at creation, as the service
+/// enforces. Due date is decided at confirm (purchase-payment-at-confirm T4):
+/// this route never touches it (`due_date: None` = no-change), so an invoice
+/// edit cannot clear a Credit draft's stored due.
 async fn web_update_purchase_header(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
@@ -971,7 +972,6 @@ async fn web_update_purchase_header(
     Form(form): Form<UpdatePurchaseHeaderForm>,
 ) -> AppResult<Response> {
     let purchase_date = parse_opt_date(&form.purchase_date, "purchase_date")?;
-    let due_date = parse_opt_date(&form.due_date, "due_date")?;
     state
         .purchases_service
         .update_draft(
@@ -979,7 +979,7 @@ async fn web_update_purchase_header(
             id,
             crate::models::UpdatePurchaseDraft {
                 purchase_date,
-                due_date: Some(due_date),
+                due_date: None,
                 supplier_invoice_no: Some(clean_opt(&form.supplier_invoice_no)),
                 notes: Some(form.notes),
                 ..Default::default()
@@ -3545,6 +3545,57 @@ mod tests {
         assert!(
             html.contains("input[hx-put]") && html.contains("defaultValue"),
             "a refused edit reverts the input to its rendered value: {html:.900}"
+        );
+    }
+
+    /// T4: payment is decided at confirm, so the edit-header dialog drops the
+    /// due-date field (purchase date, invoice and notes remain), and a header
+    /// post that omits it leaves the stored due date untouched — clearing a
+    /// Credit draft's due is the confirm dialog's Cash path alone
+    /// (`due_date: Some(None)`), never an invoice edit.
+    #[tokio::test]
+    async fn web_edit_header_dialog_drops_due_date_and_keeps_the_stored_due() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // -- The dialog: no due input, the other header fields remain -------
+        let dialog = slice_dialog(&html, "edit-header");
+        assert!(
+            !dialog.contains("name=\"due_date\""),
+            "the edit-header dialog drops the due date: {dialog:.600}"
+        );
+        for field in [
+            "name=\"purchase_date\"",
+            "name=\"supplier_invoice_no\"",
+            "name=\"notes\"",
+        ] {
+            assert!(dialog.contains(field), "edit keeps {field}: {dialog:.600}");
+        }
+
+        // -- The route: omitting the field must NOT clear the stored due ----
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/header", fixture.purchase_id),
+            "purchase_date=2024-05-03&supplier_invoice_no=A-9&notes=edited",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.purchase_date.to_string(), "2024-05-03");
+        assert_eq!(detail.purchase.supplier_invoice_no.as_deref(), Some("A-9"));
+        assert_eq!(
+            detail.purchase.due_date.map(|d| d.to_string()),
+            Some("2024-06-02".to_string()),
+            "a header edit leaves the stored due date untouched: {:?}",
+            detail.purchase.due_date
         );
     }
 

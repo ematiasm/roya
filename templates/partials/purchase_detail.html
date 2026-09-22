@@ -308,14 +308,12 @@
     <form class="flex flex-col gap-2.5" data-action="Edit header"
           hx-post="/web/purchases/{{ record.purchase.id }}/header"
           hx-target="#purchase-record" hx-swap="innerHTML">
+      {# Due date is decided at confirm (purchase-payment-at-confirm T4):
+         the edit header keeps purchase date, invoice and notes only. #}
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label for="header-purchase-date">Purchase date</label>
           <input type="date" id="header-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
-        </div>
-        <div>
-          <label for="header-due-date">Due date (Credit only)</label>
-          <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.purchase.due_date %}{{ due }}{% endif %}" />
         </div>
       </div>
       <div>
