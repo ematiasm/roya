@@ -309,8 +309,16 @@
   <div id="line-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
     <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
       <span class="text-sm font-semibold">Add line</span>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
-              aria-label="Close add line" onclick="closeLineDrawer()">✕</button>
+      <div class="flex items-center gap-2.5">
+        {# The preference sits OUTSIDE `#line-picker`: every add OOB-swaps
+           that subtree (clear + focus) and would wipe a checkbox inside it. #}
+        <label class="flex items-center gap-2 text-xs text-muted" for="keep-open-lines">
+          <input type="checkbox" id="keep-open-lines" />
+          Keep open after adding
+        </label>
+        <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                aria-label="Close add line" onclick="closeLineDrawer()">✕</button>
+      </div>
     </div>
     <div class="flex-1 overflow-y-auto p-4">
       {% call picker::line_picker(false, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = product cost)", "product cost", "cost") %}

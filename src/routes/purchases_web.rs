@@ -2938,6 +2938,52 @@ mod tests {
         );
     }
 
+    /// The add-line drawer carries a "Keep open after adding" preference:
+    /// the checkbox lives OUTSIDE `#line-picker` (the picker OOB-swaps on
+    /// every add and would wipe it), its state persists in localStorage, and
+    /// the page shell closes the drawer — returning focus to the bar's
+    /// add-line button — after a successful POST when the preference is off.
+    #[tokio::test]
+    async fn web_purchase_add_line_drawer_carries_keep_open_preference_outside_the_picker() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The checkbox renders in the drawer, before the picker subtree, so
+        // the picker's out-of-band clear+focus swap cannot destroy it.
+        let drawer_start = html
+            .find("<div id=\"line-drawer\"")
+            .expect("the add-line drawer renders");
+        let keep = html
+            .find("id=\"keep-open-lines\"")
+            .expect("the keep-open checkbox renders");
+        let picker = html
+            .find("id=\"line-picker\"")
+            .expect("the drawer hosts the picker");
+        assert!(
+            keep > drawer_start && keep < picker,
+            "the keep-open checkbox sits in the drawer, outside the picker: keep={keep} picker={picker} drawer={drawer_start}"
+        );
+
+        // The preference persists across swaps: the page shell owns the
+        // localStorage key and the after-request close.
+        assert!(
+            html.contains("purchases.addLine.keepOpen"),
+            "the page shell persists the preference: {html:.600}"
+        );
+        assert!(
+            html.contains("htmx:afterRequest"),
+            "the page shell reacts to the add-line response: {html:.600}"
+        );
+        // Focus return: closing the drawer hands focus back to the bar button.
+        assert!(
+            html.contains("getElementById('add-line')") && html.contains("addBtn.focus()"),
+            "closing the drawer returns focus to Add line: {html:.600}"
+        );
+    }
+
     /// The record-page actions swap the record body and keep the
     /// `purchase-changed` refresh event, so the URL stays stable and subscribed
     /// regions update.

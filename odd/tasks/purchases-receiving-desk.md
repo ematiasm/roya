@@ -103,7 +103,7 @@ was deepened and fully approved for implementation (2026-09-22).
       no payment inputs; Confirm disabled at 0 lines).
 - [x] T5 Confirm `<dialog>` (Cash: method select + account; Credit: due
       summary, no select) posting to existing confirm route.
-- [ ] T6 Add-line drawer (documents.html pattern + `line_picker` + keep-open
+- [x] T6 Add-line drawer (documents.html pattern + `line_picker` + keep-open
       checkbox in localStorage; OOB close/clear; focus return).
 - [ ] T7 Inline line edit (inputs + NEW web route + revert on invalid).
 - [ ] T8 Full verification: `cargo test` green; e2e purchase suites green;
@@ -175,7 +175,19 @@ was deepened and fully approved for implementation (2026-09-22).
       with a method already 400s; Cash without one already 400s). Re-run:
       new test 1, `purchase` 122, `wiring` 15. FULL `cargo test`: 803 passed.
       Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T6.
+- [x] T6 done. RED: new `web_purchase_add_line_drawer_carries_keep_open_preference_outside_the_picker`
+      failed (no `keep-open-lines` checkbox). GREEN: the drawer header now
+      hosts a "Keep open after adding" checkbox OUTSIDE `#line-picker` (the
+      OOB clear+focus swap wipes anything inside it); the page shell owns
+      `localStorage['purchases.addLine.keepOpen']` (default OFF, synced on
+      drawer open, written on change) and a document `htmx:afterRequest`
+      listener that closes the drawer after a successful add-line POST
+      (4xx keeps it open so the notice stays next to the form; preference ON
+      leaves it open for the next add), with `closeLineDrawer` returning focus
+      to the bar's `#add-line` button. CSS rebuilt — no diff (all utilities
+      pre-existing). Re-run: new test 1, `picker` 9, `purchase` 123. FULL
+      `cargo test`: 804 passed. Commit hash recorded at T8.
+- [ ] All remaining tasks pending. Next step: T7.
 
 ## Acceptance criteria (feature-level)
 
