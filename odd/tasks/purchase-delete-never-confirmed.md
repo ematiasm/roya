@@ -115,7 +115,7 @@ Therefore:
       for Confirmed and for confirmed-then-cancelled.
 - [x] T3 UI: Delete control on Cancelled+no-number record with confirm
       prompt; smoke/e2e assertions as needed.
-      Commit: (this task's work-unit commit).
+      Commit: 69ae397.
       Evidence: RED `cargo test offers_delete` → 2 failed, 0 passed
       (`web_purchase_record_offers_delete_only_for_a_discarded_cancelled_purchase`
       "a discarded purchase must offer delete"; drawer test
@@ -130,8 +130,17 @@ Therefore:
       with hx-confirm). Confirmed / cancelled-after-confirmed render no
       delete on either surface. Smoke tests untouched (grep-only: no
       pinned assertion covers the new state; fixtures are draft/confirmed).
-- [ ] T4 Full verification: `cargo test`; e2e if DOM contracts changed;
+- [x] T4 Full verification: `cargo test`; e2e if DOM contracts changed;
       evidence per task.
+      Evidence: full `cargo test` = **822 passed, 0 failed** (78.78s) on
+      this branch after T1–T3. E2E: **skipped — no e2e-pinned DOM contract
+      changed** (the browser suite pins the SALE draft drawer delete, the
+      confirmed purchase record, the picker and the sales discard dialog —
+      all untouched; the new Delete controls render only for discarded
+      purchases, a state no browser test visits; per e2e/README the suite
+      runs only when a pinned contract changes).
+      Work-unit commits: T1 8708c87 (repo predicate), T2 f6789f9
+      (service + route), T3 69ae397 (UI), T4 this doc-evidence commit.
 
 ## Route declaration
 
@@ -139,7 +148,19 @@ T1–T3: delegated direct (writer trigger: 2+ non-trivial files).
 
 ## Progress
 
-- [ ] All tasks pending. Next step: T1.
+- [x] All tasks complete. Next step: none (awaiting review; no push/PR
+      per locked scope).
+  - T1 8708c87 — repo predicate `Draft OR (Cancelled AND purchase_number
+    IS NULL)`; protected test re-pinned to confirmed-then-cancelled; new
+    discarded-delete test. REST check: `/api/purchases/{id}` has no DELETE
+    (get/put only) → REST untouched.
+  - T2 f6789f9 — service `delete_draft` admits the discarded state and
+    refuses the rest with a Validation naming the state; route tests for
+    both paths.
+  - T3 69ae397 — record page Delete (Cancelled+no number, hx-confirm) and
+    documents-drawer "Eliminar descarte"; both pinned present/absent.
+  - T4 — full `cargo test` 822/822 green; e2e skipped (no pinned DOM
+    contract changed).
 
 ## Acceptance criteria
 
