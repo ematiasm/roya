@@ -68,8 +68,8 @@ sliced into 2 PRs, each under budget (recorded at push, 2026-09-22):
 
 | PR | Branch | Commits | Increment | Lines |
 |----|--------|---------|-----------|-------|
-| (pending) | `feat/sale-delete-s1` | `83f2e4e, df59bc5, b0ba110, 311c930` | plan + T1 repo + T2 service/route | 391 |
-| (pending) | `feat/sale-delete-never-confirmed` | `bc1f454, 24a7ecd` + doc commits | T3 UI + T4 evidence | 219 |
+| [#89](https://github.com/ematiasm/roya/pull/89) | `feat/sale-delete-s1` | `83f2e4e, df59bc5, b0ba110, 311c930` | plan + T1 repo + T2 service/route | 391 |
+| [#90](https://github.com/ematiasm/roya/pull/90) | `feat/sale-delete-never-confirmed` | `bc1f454, 24a7ecd` + doc commits | T3 UI + T4 evidence | 219 |
 
 Skill: `work-unit-commits`
 (`/home/mamull/.config/opencode/skills/work-unit-commits/SKILL.md`).
