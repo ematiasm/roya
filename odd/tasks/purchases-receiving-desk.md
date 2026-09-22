@@ -87,10 +87,10 @@ was deepened and fully approved for implementation (2026-09-22).
 
   | PR | Branch | Commits | Increment | Lines |
   |----|--------|---------|-----------|-------|
-  | 1 | `feat/receiving-desk-s1` | `47458a1, 0d1484b` | T1+T2 English + tracked_units | 254 |
-  | 2 | `feat/receiving-desk-s2` | `8736f9b` | T3 sticky action bar | 607 — **`size:exception` approved by maintainer (2026-09-22; atomic single-commit work unit)** |
-  | 3 | `feat/receiving-desk-s3` | `a44de33, f3281b7, b530706` | T4+T5 effects preview + confirm dialog | 317 |
-  | 4 | `feat/purchases-receiving-desk` | `27b2be2..HEAD` | T6+T7+T8 drawer + inline edit + e2e | 287 + this doc commit |
+  | [#81](https://github.com/ematiasm/roya/pull/81) | `feat/receiving-desk-s1` | `47458a1, 0d1484b` | T1+T2 English + tracked_units | 254 |
+  | [#82](https://github.com/ematiasm/roya/pull/82) | `feat/receiving-desk-s2` | `8736f9b` | T3 sticky action bar | 607 — **`size:exception` approved by maintainer (2026-09-22; atomic single-commit work unit)** |
+  | [#83](https://github.com/ematiasm/roya/pull/83) | `feat/receiving-desk-s3` | `a44de33, f3281b7, b530706` | T4+T5 effects preview + confirm dialog | 317 |
+  | [#84](https://github.com/ematiasm/roya/pull/84) | `feat/purchases-receiving-desk` | `27b2be2..HEAD` | T6+T7+T8 drawer + inline edit + e2e | 287 + doc commits |
 
 ## TDD / checks
 
