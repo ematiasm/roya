@@ -70,10 +70,10 @@ Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount
   `cancel`, `GET /api/purchases/suggestions`, and `POST /api/supplier-payments` (supplier-level
   payment, oldest-first, no receipt document).
 - Web: `/purchases` with the purchase list, the "Sugerido" panel that seeds a draft, the draft line
-  editor and the confirm, pay and cancel forms; a draft line whose cost is strictly higher than
-  the product's stored cost, when that stored cost is non-zero (zero means no cost recorded yet),
-  renders a stale-cost warning with an "Apply to product" action
-  (`POST /web/purchases/{purchase_id}/lines/{line_id}/apply-cost`, draft-only, gated
+  editor and the confirm, pay and cancel forms; a line on a Confirmed purchase whose cost is
+  strictly higher than the product's stored cost, when that stored cost is non-zero (zero means no
+  cost recorded yet), renders a stale-cost warning with an "Apply to product" action
+  (`POST /web/purchases/{purchase_id}/lines/{line_id}/apply-cost`, confirmed-only, gated
   `inventory.write`); `/suppliers` with the cost satellite and its
   raise/lower badge, and the drawer detail with the pay-supplier form (`POST /web/supplier-payments`)
   and the record-cost form.
