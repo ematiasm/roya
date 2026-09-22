@@ -592,6 +592,7 @@ service still requires the current password).
 | `/web/purchases/{id}/lines` | POST | `purchases.create` |
 | `/web/purchases/{purchase_id}/lines/{line_id}` | POST | `purchases.create` |
 | `/web/purchases/{purchase_id}/lines/{line_id}` | DELETE | `purchases.create` |
+| `/web/purchases/{purchase_id}/lines/{line_id}/apply-cost` | POST | `inventory.write` |
 | `/web/purchases/{id}/header` | POST | `purchases.create` |
 | `/web/purchases/{id}/confirm` | POST | `purchases.create` |
 | `/web/purchases/{id}/payments` | POST | `purchases.create` |

@@ -20,7 +20,7 @@ use std::str::FromStr;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     NewPurchase, PaymentType, PurchaseDetail, PurchaseListFilter, PurchaseRecord, PurchaseStatus,
-    PurchaseSuggestions,
+    PurchaseSuggestions, UpdateProduct,
 };
 use crate::routes::AppState;
 // S7 enforcement: every registered handler declares the permission its action
@@ -29,7 +29,7 @@ use crate::routes::AppState;
 // mapping and its judgement calls are recorded in
 // openspec/changes/2026-09-18-add-identity-module/tasks.md (S7 section).
 use crate::security::authz::{
-    InventoryRead, Nav, PurchasesCancel, PurchasesCreate, PurchasesRead, Require,
+    InventoryRead, InventoryWrite, Nav, PurchasesCancel, PurchasesCreate, PurchasesRead, Require,
 };
 
 // ---------------------------------------------------------------------------
@@ -719,6 +719,75 @@ async fn web_remove_line(
     changed(&state, purchase_id).await
 }
 
+/// Cost-freshness T5: the stale-cost warning's action. Applies a draft line's
+/// recorded cost to its product — the one `products.cost_price` write that is
+/// not a human product edit.
+///
+/// The client sends ONLY the line id (already in the URL): the product and the
+/// cost are resolved server-side from the stored line, and the request body is
+/// never read, so no caller can inject an amount. The whole point of the
+/// button is that the price landing on the product is the one the supplier's
+/// line recorded, not whatever a request carries.
+///
+/// Gate: this action writes a PRODUCT, so it carries `inventory.write` like
+/// every other product write, never `purchases.create`. The button renders for
+/// every draft viewer by design: the purchase page is gated `purchases.read`, so
+/// any operator who can open it sees the button, and one who lacks
+/// `inventory.write` gets a visible refusal on click — the application's error
+/// notice for the htmx request, not the forbidden page, which is what a
+/// full-page navigation gets. The audit actor is the acting user, the way `web_edit_product`
+/// passes it under the same permission.
+///
+/// Draft-only: the button renders only in Draft, and the handler refuses a
+/// non-draft purchase itself. `PurchasesService::ensure_draft` stays private
+/// inside the service, so the handler holds the same single status comparison
+/// against `PurchaseStatus::Draft` here, in the service's own message shape,
+/// instead of silently duplicating the guard.
+///
+/// The write goes through `InventoryService::update_product` with a patch
+/// carrying only `cost_price` — never SQL, never the purchase flow. That path
+/// recomputes a markup-derived `sale_price`, which a raw cost write would
+/// leave stale behind the new cost.
+async fn web_apply_line_cost(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    headers: HeaderMap,
+    Path((purchase_id, line_id)): Path<(i64, i64)>,
+) -> AppResult<Response> {
+    let detail = state.purchases_service.get_detail(purchase_id).await?;
+    if detail.purchase.status != PurchaseStatus::Draft {
+        return Err(AppError::Validation(format!(
+            "purchase {purchase_id} is not editable (status {})",
+            detail.purchase.status
+        )));
+    }
+    let line = detail
+        .lines
+        .iter()
+        .find(|line| line.id == line_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "purchase line {line_id} not found in purchase {purchase_id}"
+            ))
+        })?;
+    state
+        .inventory_service
+        .update_product(
+            principal.user_id,
+            line.product_id,
+            UpdateProduct {
+                cost_price: Some(line.unit_cost),
+                ..Default::default()
+            },
+        )
+        .await?;
+    if is_htmx(&headers) {
+        return changed(&state, purchase_id).await;
+    }
+    Ok(Redirect::to(&format!("/purchases/{purchase_id}")).into_response())
+}
+
 async fn web_confirm_purchase(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
@@ -960,6 +1029,10 @@ pub fn router() -> Router<AppState> {
             post(web_update_line).delete(web_remove_line),
         )
         .route(
+            "/web/purchases/{purchase_id}/lines/{line_id}/apply-cost",
+            post(web_apply_line_cost),
+        )
+        .route(
             "/web/purchases/{id}/header",
             post(web_update_purchase_header),
         )
@@ -981,6 +1054,8 @@ mod tests {
     use crate::models::PaymentType;
     use crate::routes::AppState;
     use crate::security::test_support;
+    // T5's markup test builds an `UpdateProduct` patch through the service.
+    use crate::models::UpdateProduct;
 
     /// A valid acting user for the mechanical call sites: the migration's
     /// sentinel account (the system actor pre-existing rows are attributed to).
@@ -1699,6 +1774,157 @@ mod tests {
         );
     }
 
+    /// Cost-freshness T4: a draft line whose cost rose above the product's
+    /// stored cost renders the stale-cost warning with BOTH numbers, as a
+    /// sub-row underneath the line row (never inside it, so the line row's
+    /// text order stays product · qty · cost, which the browser suite
+    /// asserts as-is). The same response that adds a line swaps only
+    /// `#purchase-record-money`, so the warning must ride that fragment.
+    #[tokio::test]
+    async fn web_purchase_record_draft_flags_a_rising_line_cost_on_the_fragment() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        // The fixture's line sits at the product's stored cost (10); push the
+        // line's cost above it to reach the warning's condition.
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(">stale cost<"),
+            "a rising line cost must be flagged on the record page: {html:.800}"
+        );
+        assert!(
+            html.contains("line cost $12.00"),
+            "the warning must show the line's cost: {html:.800}"
+        );
+        assert!(
+            html.contains("stored $10.00"),
+            "the warning must show the stored cost it is behind: {html:.800}"
+        );
+
+        // Placement: the line row itself keeps its text order — the warning is
+        // a separate sub-row after it, still inside the lines table.
+        let line_row = row_with_id(&html, &format!("purchase-line-{}", fixture.line_id));
+        assert!(
+            !line_row.contains("stale cost"),
+            "the warning must not sit inside the line row: {line_row}"
+        );
+        let after_line_row = &html[html.find(line_row).unwrap() + line_row.len()..];
+        let table_end = after_line_row
+            .find("</tbody>")
+            .expect("the lines table must close");
+        assert!(
+            after_line_row[..table_end].contains(">stale cost<"),
+            "the warning must render as a sub-row right below its line: {}",
+            &after_line_row[..table_end]
+        );
+
+        // Adding a line swaps only `#purchase-record-money`: the warning must
+        // travel inside that fragment, so a newly added stale line is flagged
+        // by the very response that adds it. The second product keeps the
+        // first line's warning on screen (one product, one line per purchase).
+        let second = seed_extra_product(&state, "COST-RISE", None).await;
+        let (status, _, added) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            &format!(
+                "product=record&qty=1&unit_cost=15&product_id={}",
+                second.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+        // An HTTP test cannot see the client-side `hx-select`, so scoping is
+        // proven here the only way it can be: the warning must sit inside the
+        // `#purchase-record-money` element of the response body, not just
+        // somewhere in it. The money region ends where the payments heading
+        // begins (the partial renders them back to back).
+        let money_start = added
+            .find("id=\"purchase-record-money\"")
+            .expect("the add-line response must render the money region");
+        let money_end = added[money_start..]
+            .find(">Payments (")
+            .expect("the money region must be followed by the payments heading");
+        let money = &added[money_start..money_start + money_end];
+        assert!(
+            money.contains(">stale cost<"),
+            "the add-line response must carry the warning inside #purchase-record-money: {money:.800}"
+        );
+        assert!(
+            money.contains("line cost $15.00") && money.contains("stored $10.00"),
+            "the fragment must show both numbers: {money:.800}"
+        );
+    }
+
+    /// Cost-freshness T4 triangulation: an equal cost is not stale, so the
+    /// draft renders no warning at all.
+    #[tokio::test]
+    async fn web_purchase_record_draft_hides_the_cost_warning_when_costs_are_equal() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            !html.contains("stale cost"),
+            "an equal cost is not stale: {html:.800}"
+        );
+    }
+
+    /// Cost-freshness T4 triangulation: the warning is draft-only. The action
+    /// that follows it only exists while the purchase is editable, and the
+    /// product drawer already carries the permanent badge for a confirmed
+    /// purchase, so a confirmed document renders no warning even with a
+    /// genuinely rising line cost.
+    #[tokio::test]
+    async fn web_purchase_record_confirmed_purchase_hides_the_rising_cost_warning() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            !html.contains("stale cost"),
+            "a confirmed purchase must not carry the draft-only warning: {html:.800}"
+        );
+    }
+
     /// Triangulation for the status gate: the template is presentation only.
     /// Posting the hidden draft actions directly at a confirmed purchase still
     /// reaches the service, which refuses them (400) and leaves the document
@@ -1749,6 +1975,453 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after.lines.len(), detail.lines.len());
+    }
+
+    // -- Cost-freshness T5: the stale-cost warning ACTS -----------------------
+
+    /// T5: applying writes the line's recorded cost into the product. The line
+    /// sits at 12 after the rise, the product's stored cost at 10, so after
+    /// the POST the product must carry the line's 12 — the whole feature: the
+    /// supplier's recorded price becomes the product's cost.
+    #[tokio::test]
+    async fn web_apply_line_cost_writes_the_line_cost_into_the_product() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, body) = post_form_response(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, fixture.line_id
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let product = state
+            .inventory_service
+            .get_product(fixture.product_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            product.cost_price,
+            Decimal::from(12),
+            "the product must carry the line's cost, not its old stored one"
+        );
+    }
+
+    /// T5: the load-bearing link to the earlier feature. The product carries a
+    /// markup, so `update_product` DERIVES `sale_price` from the incoming
+    /// cost; a raw SQL cost write (or a write through the purchase flow) would
+    /// leave the sale price stale behind the new cost. 12.00 * 1.50 = 18.00.
+    #[tokio::test]
+    async fn web_apply_line_cost_recomputes_a_markup_derived_sale_price() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        // Give the fixture's product a 50% markup (its stored cost 10 > 0, so
+        // the markup validates). The service then derives every sale price.
+        state
+            .inventory_service
+            .update_product(
+                audit_actor(&state).await,
+                fixture.product_id,
+                UpdateProduct {
+                    markup_pct: Some(Some(Decimal::from(50))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, body) = post_form_response(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, fixture.line_id
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let product = state
+            .inventory_service
+            .get_product(fixture.product_id)
+            .await
+            .unwrap();
+        assert_eq!(product.cost_price, Decimal::from(12), "{product:?}");
+        assert_eq!(
+            product.sale_price,
+            Decimal::from(18),
+            "the markup must re-derive the sale price from the applied cost"
+        );
+    }
+
+    /// T5: the action writes a PRODUCT, so it is gated `inventory.write` like
+    /// every other product write — never `purchases.create`. A principal
+    /// holding only the purchase permission (the one the button's screen is
+    /// about) is refused with the forbidden page; the product is untouched.
+    #[tokio::test]
+    async fn web_apply_line_cost_refuses_a_principal_without_inventory_write() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.create"])
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = post_form_as(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, fixture.line_id
+            ),
+            "",
+            &[("HX-Request", "true")],
+            Some(&test_support::cookie_for(&probe)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
+        assert!(
+            body.contains("inventory.write") || body.contains("Acción no permitida"),
+            "the refusal must be visible, not silent: {body:.400}"
+        );
+
+        let product = state
+            .inventory_service
+            .get_product(fixture.product_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            product.cost_price,
+            Decimal::from(10),
+            "a refused principal must not move the product's cost"
+        );
+    }
+
+    /// T5: the button renders only in Draft, and the handler refuses a
+    /// non-draft purchase itself — the template is presentation only, the same
+    /// triangulation the draft actions get. A confirmed purchase's line cost
+    /// is frozen history, so applying it must fail and leave the product
+    /// carrying its old stored cost.
+    #[tokio::test]
+    async fn web_apply_line_cost_refuses_a_non_draft_purchase_and_leaves_the_product_untouched() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, body) = post_form_response(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, fixture.line_id
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-draft purchase must be refused: {body}"
+        );
+
+        let product = state
+            .inventory_service
+            .get_product(fixture.product_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            product.cost_price,
+            Decimal::from(10),
+            "a refused purchase must leave the product untouched"
+        );
+    }
+
+    /// T5: the price being applied is the one RECORDED on the line. The route
+    /// takes no cost field at all (the client sends only the line id in the
+    /// URL), so a body stuffed with attacker-chosen amounts is simply ignored
+    /// and the stored line cost is what lands on the product.
+    #[tokio::test]
+    async fn web_apply_line_cost_ignores_a_client_supplied_cost() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // The same body an attacker would send to write an arbitrary cost.
+        let (status, _, body) = post_form_response(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, fixture.line_id
+            ),
+            "cost_price=999&unit_cost=0.01&product_id=7",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let product = state
+            .inventory_service
+            .get_product(fixture.product_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            product.cost_price,
+            Decimal::from(12),
+            "the STORED line cost must land, never a client-supplied one"
+        );
+    }
+
+    /// T5: the response swaps the refreshed record body, so the warning for a
+    /// line whose cost now matches the product is gone from the very response
+    /// that applied it.
+    #[tokio::test]
+    async fn web_apply_line_cost_response_drops_the_warning_when_the_cost_matches() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, body) = post_form_response(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, fixture.line_id
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.contains(">stale cost<"),
+            "the applied line must lose its warning: {body:.800}"
+        );
+        let row = row_with_id(&body, &format!("purchase-line-{}", fixture.line_id));
+        assert!(
+            row.contains("$12"),
+            "the refreshed fragment still shows the line at its applied cost: {row}"
+        );
+    }
+
+    /// T5: the line is resolved only INSIDE the purchase's own lines. Posting
+    /// purchase A's id with purchase B's line id must answer NotFound and leave
+    /// BOTH products' costs untouched — a handler that returned 404 after
+    /// writing would slip past a status-only assertion, so the stored costs are
+    /// checked too. The matching pair still applies in the same state, so the
+    /// 404 is caused by the mismatch, not by a broken setup.
+    #[tokio::test]
+    async fn web_apply_line_cost_refuses_a_line_from_another_purchase_and_leaves_both_products_untouched(
+    ) {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        // The second purchase reuses the fixture's supplier and follows the
+        // established two-purchase shape: `seed_extra_product` for its own
+        // product (a purchase takes one line per product), then a draft and
+        // its line through the service like the fixture does.
+        let product_b = seed_extra_product(&state, "CROSS-APPLY", None).await;
+        let purchase_b = state
+            .purchases_service
+            .create_draft(
+                audit_actor(&state).await,
+                crate::models::NewPurchase {
+                    supplier_id: fixture.supplier_id,
+                    payment_type: PaymentType::Cash,
+                    purchase_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let line_b = state
+            .purchases_service
+            .add_line(
+                audit_actor(&state).await,
+                purchase_b.id,
+                product_b.id,
+                Decimal::from(1),
+                None,
+            )
+            .await
+            .unwrap();
+        // Distinct recorded costs, both above the stored 10, so a stray write
+        // of either cost onto either product is visible.
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                line_b.id,
+                Decimal::from(1),
+                Decimal::from(15),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // Purchase A's id, purchase B's line id: the mismatched pair.
+        let (status, _, body) = post_form_response(
+            app.clone(),
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, line_b.id
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "another purchase's line is not this purchase's line: {body:.400}"
+        );
+
+        let product_a = state
+            .inventory_service
+            .get_product(fixture.product_id)
+            .await
+            .unwrap();
+        let product_b_after = state
+            .inventory_service
+            .get_product(product_b.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            product_a.cost_price,
+            Decimal::from(10),
+            "the refused pair must not move product A's cost"
+        );
+        assert_eq!(
+            product_b_after.cost_price,
+            Decimal::from(10),
+            "the refused pair must not move product B's cost"
+        );
+
+        // The matching pair in the same state still applies: the 404 above is
+        // the boundary, not a broken fixture.
+        let (status, _, body) = post_form_response(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/{}/apply-cost",
+                fixture.purchase_id, fixture.line_id
+            ),
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let product_a = state
+            .inventory_service
+            .get_product(fixture.product_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            product_a.cost_price,
+            Decimal::from(12),
+            "the matching pair applies the line's recorded cost"
+        );
+        let product_b_after = state
+            .inventory_service
+            .get_product(product_b.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            product_b_after.cost_price,
+            Decimal::from(10),
+            "applying A's line must not touch B's product"
+        );
     }
 
     /// AC7: cancelling asks for confirmation before the request is sent; the

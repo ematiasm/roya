@@ -1071,6 +1071,33 @@ impl PurchaseDetail {
     }
 }
 
+/// Derived, never stored: one purchase line's cost against the product's
+/// stored cost. `Some` only when the line's cost is HIGHER and the stored cost
+/// is a real one, which is the state where the product is behind what the
+/// supplier is charging. A decrease is deliberately not flagged here: the
+/// product drawer's permanent badge covers any disagreement, while this is
+/// about a cost that rose.
+#[derive(Debug, Clone, Serialize)]
+pub struct StaleLineCostView {
+    pub line_cost: Decimal,
+    pub stored_cost: Decimal,
+}
+
+impl StaleLineCostView {
+    /// Display form of the line's cost, mirroring `StaleCostView`'s display
+    /// methods: a raw `Decimal` renders with its stored scale (e.g. `12.000`
+    /// next to `10.00`), and `money_display` is this project's single money
+    /// formatting, so both numbers of the gap render consistently.
+    pub fn line_cost_display(&self) -> String {
+        crate::models::money_display(self.line_cost)
+    }
+
+    /// Display form of the stored cost, same rule as above.
+    pub fn stored_cost_display(&self) -> String {
+        crate::models::money_display(self.stored_cost)
+    }
+}
+
 /// One purchase line resolved for `/purchases/{id}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseLineView {
@@ -1089,6 +1116,12 @@ pub struct PurchaseLineView {
     /// from the very product read that resolves the name — so any preview
     /// built from this view cannot drift from what those flows will do.
     pub tracks_stock: bool,
+    /// Derived, never stored: `Some` only when this line's cost is strictly
+    /// higher than the product's stored cost and that stored cost is a real
+    /// one (non-zero). Built by `PurchasesService::record_from_detail` in
+    /// Rust, because Askama cannot compare decimals or build `Some(...)` in an
+    /// expression.
+    pub stale_cost: Option<StaleLineCostView>,
 }
 
 /// One purchase payment resolved for `/purchases/{id}`.

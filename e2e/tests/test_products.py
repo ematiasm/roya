@@ -982,6 +982,151 @@ def test_recording_a_supplier_cost_and_setting_preferred_from_the_drawer(
     expect(row_b.locator('form[hx-post="/web/product-costs/preferred"]')).to_have_count(1)
 
 
+# ---------------------------------------------------------------------------
+# Stale-cost badge (cost-freshness F2-T1)
+# ---------------------------------------------------------------------------
+
+
+def _open_drawer_for_cost_scenario(
+    page: Page, api: ApiClient, product: dict, name: str
+):
+    """Open the products page and the product's drawer, and return the drawer body.
+
+    Shared by the stale-cost badge tests, which all seed a product, optionally
+    record supplier costs, and then need the swapped detail fragment.
+    """
+    product_id = int(product["id"])
+    _open_products_list(page, api, name=name)
+    _open_product_drawer(page, product_id)
+    drawer = page.locator("#product-detail-inner")
+    expect(page.locator("#product-drawer")).to_be_visible()
+    return drawer
+
+
+def test_drawer_shows_stale_cost_badge_with_both_values_when_costs_disagree(
+    page: Page, api: ApiClient
+) -> None:
+    """A stored cost that disagrees with the supplier reference shows both values.
+
+    This is the browser's proof of the one thing the route-level tests cannot
+    see: the operator actually SEES the disagreement without doing arithmetic.
+    If the badge stopped carrying the values, an operator would read "stale
+    cost" and still have to guess which side moved — so both the reference and
+    the stored amount must render, not just the label.
+    """
+    product = create_product(
+        api,
+        sku="STALE-SKU-09",
+        name="Stale Widget",
+        cost_price="5.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    supplier_id = create_supplier(api, "Stale Supplier One")
+    record_supplier_cost(api, int(product["id"]), supplier_id, cost="12.50")
+
+    drawer = _open_drawer_for_cost_scenario(page, api, product, "Stale Widget")
+
+    badge = drawer.get_by_text("stale cost", exact=True)
+    expect(badge).to_be_visible()
+    # Both values in the badge's own sentence, as one exact text node: a
+    # supplier row repeating an amount cannot satisfy it, and the bullet joins
+    # them so either half dropping silently breaks the match.
+    values = drawer.get_by_text("reference $12.50 • stored $5.00", exact=True)
+    expect(values).to_be_visible()
+    expect(values).to_have_count(1)
+
+
+def test_drawer_hides_stale_cost_badge_when_reference_equals_stored(
+    page: Page, api: ApiClient
+) -> None:
+    """A supplier cost equal to the stored cost must not flag the column stale.
+
+    The failure this guards is the disagreement gate collapsing to a subset
+    (e.g. an always-true comparison): the badge would then render on every
+    product with supplier rows, crying wolf and destroying the badge's value as
+    a signal. Equal costs are the normal, fresh state and must render nothing.
+    """
+    product = create_product(
+        api,
+        sku="FRESH-SKU-10",
+        name="Fresh Widget",
+        cost_price="8.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    supplier_id = create_supplier(api, "Fresh Supplier Two")
+    record_supplier_cost(api, int(product["id"]), supplier_id, cost="8.00")
+
+    drawer = _open_drawer_for_cost_scenario(page, api, product, "Fresh Widget")
+
+    # The badge's own label is the anchor: `stale cost` appears nowhere else in
+    # the templates (grep over the tree finds it only in the product detail
+    # partial), so a page-level absence is discriminating and would catch the
+    # badge rendering even outside the drawer body.
+    expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
+    expect(drawer.get_by_text("reference $8.00")).to_have_count(0)
+
+
+def test_drawer_hides_stale_cost_badge_when_the_product_has_no_supplier_rows(
+    page: Page, api: ApiClient
+) -> None:
+    """Without supplier rows the column IS the truth, so nothing can be stale.
+
+    The comparison must not fall through to some implicit reference (the
+    product's own cost, an empty cheapest pick): that would flag every
+    supplier-less product, the exact opposite of the fallback the empty state
+    message explains to the operator. No badge may render.
+    """
+    product = create_product(
+        api,
+        sku="NOSUP-SKU-11",
+        name="Supplierless Widget",
+        cost_price="5.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+
+    drawer = _open_drawer_for_cost_scenario(
+        page, api, product, "Supplierless Widget"
+    )
+
+    expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
+    # The card still tells the operator why there is no comparison to make.
+    expect(drawer).to_contain_text("No supplier rows yet")
+
+
+def test_drawer_hides_stale_cost_badge_when_the_stored_cost_is_zero(
+    page: Page, api: ApiClient
+) -> None:
+    """A zero stored cost means "no cost recorded yet", never a disagreement.
+
+    ``products.cost_price`` is ``NOT NULL DEFAULT '0'``, so zero is the column's
+    empty state, not a value that can disagree with the supplier reference. A
+    badge here would read as "your $7.25 supplier cost contradicts your (non)
+    cost" — noise for a product that simply has not had its cost entered.
+    """
+    product = create_product(
+        api,
+        sku="ZERO-SKU-12",
+        name="Zero Cost Widget",
+        cost_price="0.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    supplier_id = create_supplier(api, "Zero Cost Supplier")
+    record_supplier_cost(api, int(product["id"]), supplier_id, cost="7.25")
+
+    drawer = _open_drawer_for_cost_scenario(page, api, product, "Zero Cost Widget")
+
+    expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
+    expect(drawer.get_by_text("reference $7.25")).to_have_count(0)
+
+
 def test_recording_a_stock_movement_from_the_drawer_updates_both_surfaces(
     page: Page, api: ApiClient
 ) -> None:
