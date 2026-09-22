@@ -1302,12 +1302,18 @@ mod tests {
         use chrono::NaiveDate;
         use rust_decimal::Decimal;
 
+        // A per-process suffix: one test may seed several fixtures, and the
+        // product SKU / supplier name must not collide across them.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sku = format!("REC-PUR-{seq}");
+
         let product = state
             .inventory_service
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "REC-PUR".into(),
+                sku,
                 name: "Record purchase product".into(),
                 kind: ProductKind::Product,
                 category_id: None,
@@ -1326,7 +1332,7 @@ mod tests {
         let supplier = state
             .supplier_service
             .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Record Supplier".into(),
+                name: format!("Record Supplier {seq}"),
                 phone: None,
                 notes: None,
             })
@@ -1352,7 +1358,13 @@ mod tests {
             .add_line(audit_actor(&state).await, purchase.id, product.id, Decimal::from(2), None)
             .await
             .unwrap();
-        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
+        // accounts.name is UNIQUE: suffix it per fixture, and still pass the
+        // canonical "Caja" to the defaults helper so the Cash method seeds.
+        let account = state
+            .account_service
+            .create(audit_actor(&state).await, &format!("Caja {seq}"))
+            .await
+            .unwrap();
         // Purchase payments are Expenses; fund the account so the guard flag under
         // test is the record shape, not a zero balance.
         state
@@ -2860,6 +2872,69 @@ mod tests {
         assert!(
             html.contains("Stock · no stock movement"),
             "an empty draft previews no stock movement: {html:.600}"
+        );
+    }
+
+    /// The payment-method control appears ONLY inside the confirm dialog, and
+    /// only for Cash: a Cash draft must pick a method before it can submit
+    /// (the account is derived from it), while a Credit draft carries no
+    /// method control at all — only a due-date summary — so the client cannot
+    /// send the method the server rejects for Credit.
+    #[tokio::test]
+    async fn web_purchase_record_confirm_dialog_carries_payment_method_only_for_cash() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+
+        /// Slice one dialog's markup out of the page (open tag → `</dialog>`).
+        fn dialog_of(html: &str, id: &str) -> String {
+            let start_tag = format!("<dialog id=\"{id}\"");
+            let start = html
+                .find(&start_tag)
+                .unwrap_or_else(|| panic!("the {id} dialog renders"));
+            let end = html[start..]
+                .find("</dialog>")
+                .expect("the dialog closes")
+                + start
+                + "</dialog>".len();
+            html[start..end].to_string()
+        }
+
+        // -- Cash draft: the method select lives in the confirm dialog -----
+        let cash = seed_record_fixture(&state, PaymentType::Cash).await;
+        let (_, cash_html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
+            .await;
+        let cash_dialog = dialog_of(&cash_html, "confirm-purchase");
+        assert!(
+            cash_dialog.contains("id=\"confirm-method\"") && cash_dialog.contains("required"),
+            "a Cash draft requires a method in the confirm dialog: {cash_dialog:.500}"
+        );
+        assert!(
+            !cash_dialog.contains("none (Credit)"),
+            "Cash offers no empty method: {cash_dialog:.500}"
+        );
+        assert_eq!(
+            cash_html.matches("name=\"method_id\"").count(),
+            1,
+            "the draft's only method control is the confirm dialog: {cash_html:.500}"
+        );
+
+        // -- Credit draft: no method control anywhere, a due summary only ---
+        let credit = seed_record_fixture(&state, PaymentType::Credit).await;
+        let (_, credit_html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
+            .await;
+        let credit_dialog = dialog_of(&credit_html, "confirm-purchase");
+        assert!(
+            !credit_dialog.contains("confirm-method") && !credit_dialog.contains("<select"),
+            "the Credit confirm dialog has no method control: {credit_dialog:.500}"
+        );
+        assert!(
+            credit_dialog.contains("2024-06-02"),
+            "the Credit confirm dialog shows the due date: {credit_dialog:.500}"
+        );
+        assert_eq!(
+            credit_html.matches("name=\"method_id\"").count(),
+            0,
+            "a Credit draft carries no payment-method control at all: {credit_html:.500}"
         );
     }
 

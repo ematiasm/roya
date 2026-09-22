@@ -232,15 +232,22 @@
     <form class="flex flex-col gap-2.5" data-action="Confirm purchase"
           hx-post="/web/purchases/{{ record.purchase.id }}/confirm"
           hx-target="#purchase-record" hx-swap="innerHTML">
+      {% if record.purchase.payment_type.to_string() == "Cash" %}
       <div>
-        <label for="confirm-method">Method (Cash only; the account is derived from it)</label>
-        <select id="confirm-method" name="method_id">
-          <option value="">— none (Credit) —</option>
+        <label for="confirm-method">Method (the cash account is derived from it)</label>
+        <select id="confirm-method" name="method_id" required>
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
           {% endfor %}
         </select>
       </div>
+      {% else %}
+      <p class="text-[13px] text-muted">
+        Credit purchase · ${{ record.total }} due on
+        {% if let Some(due) = record.purchase.due_date %}{{ due }}{% else %}(no due date){% endif %}
+        after confirm. No payment is recorded yet.
+      </p>
+      {% endif %}
       <button type="submit" class="bg-accent2 text-white">Confirm</button>
     </form>
   </dialog>

@@ -162,7 +162,20 @@ was deepened and fully approved for implementation (2026-09-22).
       Confirm `disabled` at 0 lines / enabled with a line (triangulated).
       Re-run: new test 1, `web_purchase_record` 11, `purchase` 121, `money` 7.
       FULL `cargo test`: 802 passed. Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T5.
+- [x] T5 done. RED: new `web_purchase_record_confirm_dialog_carries_payment_method_only_for_cash`
+      failed (select present but not `required`, empty Credit option shown).
+      Setup fixes en route: `seed_record_fixture` now suffixes product SKU,
+      supplier name, and account name with a process counter (accounts.name
+      is UNIQUE; one test may seed several fixtures — the defaults helper
+      still receives the canonical "Caja"). GREEN: the confirm dialog branches
+      on payment type — Cash renders `#confirm-method` with `required` and no
+      empty option (the only `name="method_id"` on a draft page), Credit
+      renders a due summary (`$total due on {date} after confirm`) with zero
+      method controls on the page. Server confirm behavior untouched (Credit
+      with a method already 400s; Cash without one already 400s). Re-run:
+      new test 1, `purchase` 122, `wiring` 15. FULL `cargo test`: 803 passed.
+      Commit hash recorded at T8.
+- [ ] All remaining tasks pending. Next step: T6.
 
 ## Acceptance criteria (feature-level)
 
