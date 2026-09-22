@@ -99,9 +99,9 @@ was deepened and fully approved for implementation (2026-09-22).
 - [x] T2 `track_stock` enrichment on purchase lines (models/query + tests).
 - [x] T3 Sticky action bar + `⋯` secondary menu replacing the 4-card Draft
       grid; status-based primary (keep legacy ids).
-- [ ] T4 Effects preview partial (draft, projections only: stock/cash/due;
+- [x] T4 Effects preview partial (draft, projections only: stock/cash/due;
       no payment inputs; Confirm disabled at 0 lines).
-- [ ] T5 Confirm `<dialog>` (Cash: method select + account; Credit: due
+- [x] T5 Confirm `<dialog>` (Cash: method select + account; Credit: due
       summary, no select) posting to existing confirm route.
 - [ ] T6 Add-line drawer (documents.html pattern + `line_picker` + keep-open
       checkbox in localStorage; OOB close/clear; focus return).
@@ -147,10 +147,35 @@ was deepened and fully approved for implementation (2026-09-22).
       re-pinned to find the OOB picker by tag, not the first OOB. Tailwind
       regenerated (`scripts/build-css.sh`). Re-run: new test 1 passed,
       `cargo test purchase` 120, `picker` 8, `line_picker` 2, `sale` 136,
-      wiring guards (`seeded_pages_render_only_wired`, `wiring_guard` 15,
+      wiring guards       (`seeded_pages_render_only_wired`, `wiring_guard` 15,
       `fragment_external_selectors`) green. FULL `cargo test`: 801 passed.
       Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T4.
+- [x] T4 done. RED: new `web_purchase_record_effects_preview_projects_confirm_without_payment_inputs`
+      failed (no `effects-preview`; two setup fixes en route: tracked products
+      need min/max stock, nested async helper instead of a FnOnce closure).
+      GREEN: new partial `purchase_effects_preview.html` (macro, Draft-only,
+      called inside `record_money` so add-line swaps refresh it) with
+      `Stock · +N units (tracked)|no stock movement` from
+      `record.tracked_units.is_zero()` (Askama rejects `Decimal > 0`),
+      `Cash · -$total at confirm|no cash movement`, `Due · $0|+$total at
+      confirm` — projections only, zero inputs in the preview (pinned), and
+      Confirm `disabled` at 0 lines / enabled with a line (triangulated).
+      Re-run: new test 1, `web_purchase_record` 11, `purchase` 121, `money` 7.
+      FULL `cargo test`: 802 passed. Commit hash recorded at T8.
+- [x] T5 done. RED: new `web_purchase_record_confirm_dialog_carries_payment_method_only_for_cash`
+      failed (select present but not `required`, empty Credit option shown).
+      Setup fixes en route: `seed_record_fixture` now suffixes product SKU,
+      supplier name, and account name with a process counter (accounts.name
+      is UNIQUE; one test may seed several fixtures — the defaults helper
+      still receives the canonical "Caja"). GREEN: the confirm dialog branches
+      on payment type — Cash renders `#confirm-method` with `required` and no
+      empty option (the only `name="method_id"` on a draft page), Credit
+      renders a due summary (`$total due on {date} after confirm`) with zero
+      method controls on the page. Server confirm behavior untouched (Credit
+      with a method already 400s; Cash without one already 400s). Re-run:
+      new test 1, `purchase` 122, `wiring` 15. FULL `cargo test`: 803 passed.
+      Commit hash recorded at T8.
+- [ ] All remaining tasks pending. Next step: T6.
 
 ## Acceptance criteria (feature-level)
 
