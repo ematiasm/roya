@@ -428,6 +428,10 @@ where
         // inside the loop would touch a partially moved value.
         let status = detail.purchase.status;
         let mut lines = Vec::with_capacity(detail.lines.len());
+        // Receiving-desk T2: the units the stock flows will move, summed from
+        // the same per-line `tracks_stock` flags below — never recomputed
+        // elsewhere (a second predicate could drift from confirm/cancel).
+        let mut tracked_units = Decimal::ZERO;
         for line in detail.lines {
             let product = self.inventory.get_product(line.product_id).await?;
             // The same predicate confirm and cancel use to decide whether a
@@ -466,6 +470,9 @@ where
             } else {
                 None
             };
+            if tracks_stock {
+                tracked_units += line.qty;
+            }
             lines.push(PurchaseLineView {
                 id: line.id,
                 product_name: product.name,
@@ -522,6 +529,7 @@ where
             paid: detail.paid,
             due: detail.due,
             payment_status: detail.payment_status,
+            tracked_units,
         })
     }
 
@@ -1624,6 +1632,57 @@ mod tests {
         assert!(
             views[0].stale_cost.is_none(),
             "a confirmed-then-cancelled purchase is a historical document; it must not flag"
+        );
+    }
+
+    // -- Receiving desk T2: track_stock enrichment -----------------------------
+
+    /// The record carries `tracked_units`: the sum of `qty` over the lines
+    /// that `confirm`/`cancel` will actually move stock — the projection base
+    /// for the effects preview. It is derived from the SAME per-line
+    /// `tracks_stock` predicate the record already computes (never
+    /// recomputed in the template), so it cannot drift from what the flows
+    /// will do. The per-line flags are pinned alongside: a stock Product
+    /// tracks, a Service does not.
+    #[tokio::test]
+    async fn record_tracked_units_sums_only_stock_tracking_lines() {
+        let (s, _pool) = svc().await;
+        let tracked = seed_product(&s, "TU-TRK", "5").await;
+        let service = seed_service(&s, "TU-SVC", "8").await;
+        let sup = seed_supplier(&s, "TU SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(audit_actor(&s).await, purchase.id, tracked.id, dec("3"), Some(dec("5")))
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, purchase.id, service.id, dec("4"), Some(dec("8")))
+            .await
+            .unwrap();
+
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        let record = s.record_from_detail(detail).await.unwrap();
+        assert_eq!(
+            record.tracked_units,
+            dec("3"),
+            "only the stock-tracking line counts toward the projection: {:?}",
+            record.tracked_units
+        );
+        let tracked_view = record
+            .lines
+            .iter()
+            .find(|l| l.product_id == tracked.id)
+            .expect("the tracked line is in the record");
+        let service_view = record
+            .lines
+            .iter()
+            .find(|l| l.product_id == service.id)
+            .expect("the service line is in the record");
+        assert!(
+            tracked_view.tracks_stock,
+            "a stock Product line is what confirm/cancel will move"
+        );
+        assert!(
+            !service_view.tracks_stock,
+            "a Service line never moves stock, so it cannot feed the projection"
         );
     }
 

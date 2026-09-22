@@ -96,7 +96,7 @@ was deepened and fully approved for implementation (2026-09-22).
 
 - [x] T1 English unification of purchase surfaces (strings + update pinned
       smoke assertions RED→GREEN).
-- [ ] T2 `track_stock` enrichment on purchase lines (models/query + tests).
+- [x] T2 `track_stock` enrichment on purchase lines (models/query + tests).
 - [ ] T3 Sticky action bar + `⋯` secondary menu replacing the 4-card Draft
       grid; status-based primary (keep legacy ids).
 - [ ] T4 Effects preview partial (draft, projections only: stock/cash/due;
@@ -125,7 +125,15 @@ was deepened and fully approved for implementation (2026-09-22).
       `cargo test ac21_the_suggestions_block` 1 passed. Remaining
       `Registrado por` occurrences are non-purchase surfaces (out of scope).
       Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T2.
+- [x] T2 done. RED: new service test `record_tracked_units_sums_only_stock_tracking_lines`
+      failed to compile (`E0609: no field tracked_units`). GREEN: added
+      `PurchaseRecord.tracked_units` (models.rs, doc-commented as the
+      projection base) computed inside `record_from_detail` from the same
+      per-line `tracks_stock` flags (`tracked_units += line.qty` when
+      tracking); pins tracked=3 / service line excluded + both per-line
+      flags. Re-run: test 1 passed; `cargo test purchase` 119 passed,
+      `cargo test document` 58 passed. Commit hash recorded at T8.
+- [ ] All remaining tasks pending. Next step: T3.
 
 ## Acceptance criteria (feature-level)
 
