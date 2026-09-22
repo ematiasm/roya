@@ -281,10 +281,19 @@ ruta nueva), y el formato de dinero de los costos por proveedor (diferido desde 
       y promocionado a las specs de `inventory`, `purchases` y `openspec/specs/README.md`.
       La regla de compras **nunca escribe `cost_price`** (AC10) no cambia; la spec de
       purchases gana la Interface y el Authorization de la ruta nueva.
-- [ ] T8 — **Verificación final independiente**: `cargo test`,
+- [x] T8 — **Verificación final independiente**: `cargo test`,
       `cargo check --all-targets`, `scripts/e2e.sh -k purchases` y `-k products`.
       La verificación de F1 encontró un bug alcanzable que las verificaciones por
-      slice no vieron, así que esta no se saltea.
+      slice no vieron, así que esta no se saltea. **Ejecutada y verde**:
+      `cargo test` **797 passed / 0 failed**, `cargo check --all-targets` **0
+      errores / 55 warnings** (el baseline), y la suite completa de navegador
+      **81 passed / 4 skipped** (los skips son los probes opt-in preexistentes).
+      La invariante nunca-escribe-`cost_price` y AC10 intactas y sin
+      modificaciones; las tres propiedades de seguridad están fijadas por tests
+      de verdad, no solo afirmadas; nada nuevo se almacena; **cero defectos de
+      código de producción**. Encontró siete defectos de documentación, todos
+      corregidos en `e9b83a2` — el detalle en Progress. El código queda listo
+      para review y merge.
 
 ## Progress
 - **Convención de entrega (decidido 2026-09-21)**: F1 entró a `main` con un push
@@ -393,3 +402,41 @@ ruta nueva), y el formato de dinero de los costos por proveedor (diferido desde 
   quedó en `openspec/specs/inventory/spec.md` (el badge como read derivado),
   `openspec/specs/purchases/spec.md` (la ruta en Interface y su Authorization) y
   `openspec/specs/README.md`. AC10 y su test intactos.
+- **T8 cerrada — verificación final independiente, verde.** Todas las suites
+  exactamente como se esperaba: `cargo test` **797 passed / 0 failed**,
+  `cargo check --all-targets` **0 errores / 55 warnings** (el baseline), y la
+  suite completa de navegador **81 passed / 4 skipped** (los skips son los
+  probes opt-in preexistentes). El veredicto: **el código está listo para review
+  y merge** — cero defectos de código de producción, la invariante
+  nunca-escribe-`cost_price` y AC10 intactas y sin modificaciones, las tres
+  propiedades de seguridad fijadas por tests de verdad y nada nuevo almacenado.
+  Lo que la verificación encontró fueron **siete defectos de documentación, ya
+  corregidos en `e9b83a2`**:
+  - **Dos defectos de spec que ninguna verificación por slice podía ver.** Solo
+    un review con la rama entera a la vista puede comparar la frase
+    *promocionada* contra el código: la spec de purchases había perdido la
+    compuerta de costo guardado no-cero que el delta spec del propio cambio sí
+    tenía, y la ruta nueva faltaba en la tabla ruta→permiso de la spec de
+    identity, que la spec de purchases nombra como autoridad.
+  - **El wording de la negación estaba mal en cinco lugares** — cuatro
+    documentos más el comentario del propio handler — y quedó corregido: la
+    página de compra está gateada `purchases.read`, así que un principal con
+    solo `purchases.create` no puede cargarla para nada, y una negación HTMX
+    aparece como el aviso de error de la aplicación, no como la página de
+    prohibido.
+  - **Correcciones de bookkeeping**: el archivo de tasks archivado tenía cuatro
+    conteos de test mal y el conteo de commits mal, y el propio documento
+    contradecía a la rama sobre si la spec de purchases cambia.
+  - **Un juicio que se registró en vez de cambiar**: el label del badge dice
+    "stale cost" pero el badge dispara ante una discrepancia en cualquiera de
+    las dos direcciones, mientras que el aviso del draft dispara solo ante una
+    suba. "Stale" es exacto en ambas (el costo guardado está desactualizado en
+    las dos direcciones) y el aviso es direccional a propósito: solo una suba
+    amerita actuar en el momento de cargar la compra. Queda como está.
+  - **La verificación declaró una mutación que causó ella misma** — un `touch`
+    sobre un archivo que solo cambió su mtime, con el árbol limpio antes y
+    después — y la reportó en vez de esconderla.
+- **Forma de la rama**: `feat/cost-price-freshness`, **14 commits** sobre
+  `main` (medidos con `git log --oneline main..HEAD`), pusheada a `origin` y
+  esperando PR — como manda la convención de entrega: nunca un push directo a
+  `main`.
