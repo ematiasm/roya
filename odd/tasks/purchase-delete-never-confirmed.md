@@ -103,6 +103,7 @@ Therefore:
       GREEN after predicate change → `cargo test delete_draft` = 21 passed;
       `cargo test repositories::purchase_repo` = 13 passed.
 - [x] T2 Service + route behavior and error copy; tests RED→GREEN.
+      Commit: f6789f9.
       Evidence: RED `cargo test delete_draft` → 2 failed, 23 passed
       (service `delete_draft_removes_a_discarded_cancelled_purchase...` and
       route `web_delete_draft_discarded_cancelled_purchase_answers_200_and_is_gone`,
@@ -112,8 +113,23 @@ Therefore:
       copy now: `purchase {id} is {state}: only a draft or a discarded
       (never-confirmed) cancelled purchase can be deleted` — names the state
       for Confirmed and for confirmed-then-cancelled.
-- [ ] T3 UI: Delete control on Cancelled+no-number record with confirm
+- [x] T3 UI: Delete control on Cancelled+no-number record with confirm
       prompt; smoke/e2e assertions as needed.
+      Commit: (this task's work-unit commit).
+      Evidence: RED `cargo test offers_delete` → 2 failed, 0 passed
+      (`web_purchase_record_offers_delete_only_for_a_discarded_cancelled_purchase`
+      "a discarded purchase must offer delete"; drawer test
+      `document_drawer_discarded_purchase_offers_delete_but_annulled_does_not`
+      no hx-delete rendered); GREEN → 2 passed. Regressions:
+      `cargo test routes::documents_web` = 9 passed,
+      `cargo test routes::purchases_web` = 56 passed,
+      `cargo test drawer` = 25 passed, `cargo test purchase_record` = 16
+      passed. Surfaces: `purchase_detail.html` (Cancelled + no number →
+      Delete with hx-confirm, swap clears `#purchase-record`) and the
+      documents drawer `purchase_actions` (Spanish "Eliminar descarte"
+      with hx-confirm). Confirmed / cancelled-after-confirmed render no
+      delete on either surface. Smoke tests untouched (grep-only: no
+      pinned assertion covers the new state; fixtures are draft/confirmed).
 - [ ] T4 Full verification: `cargo test`; e2e if DOM contracts changed;
       evidence per task.
 

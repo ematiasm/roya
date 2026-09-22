@@ -4662,6 +4662,63 @@ mod tests {
             .is_ok());
     }
 
+    /// T3: the record page offers Delete — with the native confirm — ONLY for
+    /// a discarded (never-confirmed, number still NULL) cancelled purchase.
+    /// A confirmed-then-cancelled record carries its number and must show no
+    /// delete at all.
+    #[tokio::test]
+    async fn web_purchase_record_offers_delete_only_for_a_discarded_cancelled_purchase() {
+        let state = test_state().await;
+        let discarded = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .cancel(audit_actor(&state).await, discarded.purchase_id, None)
+            .await
+            .unwrap();
+
+        let annulled = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                annulled.purchase_id,
+                Some(annulled.method_id),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .cancel(
+                audit_actor(&state).await,
+                annulled.purchase_id,
+                Some("wrong order".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", discarded.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let needle = format!("hx-delete=\"/web/purchases/{}\"", discarded.purchase_id);
+        assert!(
+            html.contains(&needle),
+            "a discarded purchase must offer delete: {html:.400}"
+        );
+        assert!(
+            element_tag_containing(&html, &needle).contains("hx-confirm"),
+            "deleting must ask first"
+        );
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", annulled.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains(&format!("hx-delete=\"/web/purchases/{}\"", annulled.purchase_id)),
+            "a confirmed-then-cancelled record must offer no delete: {html:.400}"
+        );
+    }
+
     #[tokio::test]
     async fn web_delete_draft_requires_purchases_create() {
         let state = test_state().await;
