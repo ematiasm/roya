@@ -99,7 +99,7 @@ solo con proveedor y fecha".
       updated), method-active test failed; omitting-type pin passed. GREEN after
       `ConfirmPurchaseForm` + update-then-confirm route + dialog rewrite +
       shell `toggleConfirmPaymentType`: `cargo test web_confirm` → `5 passed`;
-      `cargo test web_purchase_record_activates_method_only_for_cash` →
+      `cargo test web_purchase_record_confirm_dialog_activates_method_only_for_cash` →
       `1 passed`; `cargo test purchases_web` → `51 passed, 762 filtered out`;
       `cargo test smoke_tests` → `93 passed, 720 filtered out` (a comment
       apostrophe in `templates/purchase.html` had flipped the guard's naive
