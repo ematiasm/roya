@@ -161,6 +161,12 @@ item out as domain work rather than presentation.
   ceremony, ordinary checks only.
 - No push and no PR unless the user asks. Delivery is work-unit commits on
   `feat/redesign-purchases-index`.
+- **A "do not run the whole suite" instruction must come with the right filter.**
+  S4's first round ran only `purchases_new`, `create_purchase` and the guard, and
+  missed a red test in the same file that pinned the markup the slice deleted —
+  so a green focused run hid a red suite until independent verification. For any
+  slice that DELETES markup or renames a route, the focused filter must be chosen
+  to include the tests that assert that markup, or the worker runs the full suite.
 
 ## Delivery strategy
 
@@ -208,12 +214,18 @@ item out as domain work rather than presentation.
       into a drawer shell; the row is one anchor carrying both the `hx-get` and a
       real `href` to the record page; the `Open` button is gone. SKU left both
       drawer line tables. Done in `ee90d3e` (part A) and `4a8ec2e` (part B).
-- [ ] **S4 — `/purchases/new` as a creation page.** Supplier (required), purchase
-      date (default today), supplier invoice no and notes, all four in one form;
-      `page_action_href` becomes `/purchases/new`, so `page_header.html` is not
-      touched. Creating still lands on `/purchases/{id}`. The Edit header dialog
-      on the record page gains the supplier select (`UpdatePurchaseDraft.supplier_id`
-      already supports it; only `UpdatePurchaseHeaderForm` lacks the field).
+- [x] **S4 — `/purchases/new` as a creation page.** Supplier and purchase
+      date (required), supplier invoice no and notes (optional), one plain form
+      posting the existing `POST /web/purchases` and landing on
+      `/purchases/{id}`. `page_action_href` became `/purchases/new`, so
+      `page_header.html` was not touched. The card, the two-column grid and the
+      roster on the list went with it, and the action is now offered only to a
+      principal holding `purchases.create`. Done in `7ae7c62`.
+- [ ] **S4b — The supplier select in Edit header.** The record page's Edit
+      header dialog gains the supplier field
+      (`UpdatePurchaseDraft.supplier_id` already supports it; only
+      `UpdatePurchaseHeaderForm` lacks it). The record page struct must then
+      carry the supplier roster.
 - [ ] **S5 — The entry row.** Picking a product commits a line immediately at
       qty 1, so there is no unsaved state; the qty field acts as an optional
       multiplier that resets; a repeat product increments the existing line (A1).
@@ -263,7 +275,8 @@ item out as domain work rather than presentation.
 | S1 | **done** | `8e22377` — 4 templates, 4 contract tests, stylesheet regenerated. Worker observed RED (4 failures: "the REST API card must not be rendered on …") then GREEN; `gentle-ai-verify` confirmed `cargo test` 834 passed / 0 failed, the wiring guard `seeded_pages_render_only_wired_htmx_targets` green, and the surviving sidebar link intact. Parent review caught and fixed two writer defects before commit: an unrelated HTML comment deleted from `dashboard.html`, and a stale test cross-reference (`sidebar_renders_*` → `sidebar_groups_navigation_into_operation_catalogue_and_cash`). |
 | S2 | **done** | `737b1bd` — `fix(purchases)`, 5 files. Worker RED: `left: 5 / right: 9.50` ("empty cost must default to the supplier's satellite cost") then GREEN. `gentle-ai-verify` verdict *pass* on `cargo test` 838 passed / 0 failed, with the `Some(c)` branch byte-identical to HEAD and 2 of the 4 new tests confirmed as genuine RED pins (the other 2 are triangulation). The verifier raised two caveats, both fixed inside the commit: the picker label `Unit cost (empty = product cost)` had become false, and two test messages still stated the old unconditional rule. |
 | S3 | **done** | `ee90d3e` (part A) + `4a8ec2e` (part B) — 5 files. Worker observed RED for both parts (drawer headers `left: ["Producto", "SKU", …]`; `/purchases` missing the peek shell) then GREEN. `gentle-ai-verify` verdict *pass-with-caveats* on `cargo test` 842 passed / 0 failed: header/cell counts read as 4 and 4 in both tables, exactly 4 deleted lines, no nested anchor, Escape handlers statically disjoint, no new route or Tailwind utility, guard green. Both caveats fixed before commit: an orphan wrapper `div` left by the deleted `Open` anchor, and a smoke comment/assertion that still claimed the drawer rendered SKU (the token matched the product's name, so it proved nothing). Parent review also caught the writer titling the new shell `Compra` — new Spanish on an English page — and changed it to `Purchase`. |
-| S4 | not started | — |
+| S4 | **done** | `7ae7c62` — 5 files. Worker RED for three contract tests, then GREEN. First verification pass returned **FAIL**: `cargo test` was red on `web_create_draft_form_asks_only_supplier_and_purchase_date`, a pre-existing test that pinned the deleted card and forbade the invoice field the page must now have. The fix round rewrote it to the new contract (keeping the prohibition that still matters: no payment decision in the creation form), pinned `/purchases/new`'s 403, and extracted the guard's non-vacuity decision into `wiring_is_vacuous` with a three-boundary mutation pin. Second pass verdict *pass* on `cargo test` 848 passed / 0 failed, run twice by the verifier. |
+| S4b | not started | — |
 | S5 | not started | — |
 | S6 | not started | — |
 | S7 | not started | — |
