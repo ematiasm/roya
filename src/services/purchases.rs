@@ -1079,36 +1079,42 @@ where
         self.detail_for(cancelled).await
     }
 
-    /// The documents drawer's draft delete — the mirror of the sale flow. A
-    /// draft is the ONE deletable state: it never touched stock, money or a
-    /// supplier's debt — payments only exist on a Confirmed document, and the
-    /// stock movement and the ledger entry are both created by `confirm` — so
-    /// nothing dangles when it goes; only its own CASCADE children die with
-    /// it. A confirmed (or cancelled) document is ANULLED through `cancel`
-    /// instead: deleting one would strand its ledger entries and stock
-    /// history.
+    /// The documents drawer's draft delete — the mirror of the sale flow,
+    /// extended to the discarded sibling. TWO states are deletable, and both
+    /// posted nothing: a Draft, and a purchase discarded while still Draft
+    /// (status Cancelled with `purchase_number` still NULL) — payments only
+    /// exist on a Confirmed document, and the stock movement and the ledger
+    /// entry are both created by `confirm`, so nothing dangles when the row
+    /// goes; only its own CASCADE children die with it. A confirmed document
+    /// — even one cancelled afterwards — is ANULLED through `cancel` instead:
+    /// deleting one would strand its ledger entries and stock history, and
+    /// its number proves it was confirmed. The refusal is always a Validation
+    /// NAMING the state, never silent.
     ///
     /// No `actor` parameter, deliberately: nothing survives to stamp — the
     /// row and its lines are gone — and the control is the route's permission
-    /// plus the fact that a draft never moved stock, money or debt.
+    /// plus the fact that neither deletable state moved stock, money or debt.
     pub async fn delete_draft(&self, id: i64) -> AppResult<()> {
         let purchase = self
             .purchases
             .find_purchase(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("purchase {id} not found")))?;
-        if purchase.status != PurchaseStatus::Draft {
+        let deletable = purchase.status == PurchaseStatus::Draft
+            || (purchase.status == PurchaseStatus::Cancelled
+                && purchase.purchase_number.is_none());
+        if !deletable {
             return Err(AppError::Validation(format!(
-                "purchase {id} is {}: only a draft can be deleted",
+                "purchase {id} is {}: only a draft or a discarded (never-confirmed) cancelled purchase can be deleted",
                 purchase.status
             )));
         }
         let deleted = self.purchases.delete_draft(id).await?;
         if !deleted {
-            // A concurrent confirm won the race: the document is no longer a
-            // draft, so the honest answer is the same refusal as above.
+            // A concurrent confirm won the race: the document is no longer
+            // deletable, so the honest answer is the same refusal as above.
             return Err(AppError::Validation(format!(
-                "purchase {id} is no longer a draft: only a draft can be deleted"
+                "purchase {id} is no longer deletable: only a draft or a discarded (never-confirmed) cancelled purchase can be deleted"
             )));
         }
         Ok(())
@@ -3525,6 +3531,54 @@ mod tests {
             other => panic!("expected Validation, got {other:?}"),
         }
         // The document survives the refused delete.
+        assert!(s.get_detail(purchase.id).await.is_ok());
+    }
+
+    /// A discarded purchase (cancelled while still Draft: `purchase_number`
+    /// stays NULL) posted nothing, so it IS deletable: the row and its lines
+    /// go and a later read is the standard NotFound.
+    #[tokio::test]
+    async fn delete_draft_removes_a_discarded_cancelled_purchase_and_get_detail_then_404s() {
+        let (s, _pool) = svc().await;
+        let actor = audit_actor(&s).await;
+        let purchase = draft_with_one_tracked_line(&s, "DEL-X").await;
+        s.cancel(actor, purchase.id, None).await.unwrap();
+
+        s.delete_draft(purchase.id).await.unwrap();
+        let err = s.get_detail(purchase.id).await.unwrap_err();
+        assert!(
+            matches!(&err, AppError::NotFound(msg) if msg.contains("purchase")),
+            "the deleted discarded purchase must be NotFound naming the family: {err:?}"
+        );
+    }
+
+    /// Confirmed-then-cancelled: the number proves it was confirmed, so the
+    /// refusal is a Validation NAMING the state (never silent) and the row
+    /// survives. The SQL backstop is proven separately at the repository level.
+    #[tokio::test]
+    async fn delete_draft_refuses_a_confirmed_then_cancelled_purchase_naming_the_state() {
+        let (s, _pool) = svc().await;
+        let actor = audit_actor(&s).await;
+        let purchase = draft_with_line_typed(&s, "DEL-Y", PaymentType::Credit).await;
+        s.confirm(actor, purchase.id, None).await.unwrap();
+        s.cancel(actor, purchase.id, Some("wrong order".to_string()))
+            .await
+            .unwrap();
+
+        let err = s.delete_draft(purchase.id).await.unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("Cancelled"),
+                    "the refusal must name the state: {msg}"
+                );
+                assert!(
+                    msg.contains("draft"),
+                    "the refusal must say only a draft can be deleted: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
         assert!(s.get_detail(purchase.id).await.is_ok());
     }
 
