@@ -3765,11 +3765,23 @@ async fn converted_pages_expose_the_notice_region_and_named_actions() {
 /// The add-line response must bring the picker back out of band, empty and
 /// focused, so the next scan lands without a click.
 fn assert_oob_picker_is_empty_and_focused(html: &str) {
-    let oob_pos = html
-        .find("hx-swap-oob=\"true\"")
-        .unwrap_or_else(|| panic!("the picker must come back out of band: {html:.800}"));
-    let tag_start = html[..oob_pos].rfind('<').unwrap();
-    let tag_end = oob_pos + html[oob_pos..].find('>').unwrap();
+    // The response can carry more than one OOB element (the purchase action
+    // bar rides out of band on add-line too) and more than one `#line-picker`
+    // (the in-place picker plus its OOB copy): locate the OOB picker by ITS
+    // tag carrying `hx-swap-oob`, never by the first OOB in the document.
+    let mut from = 0usize;
+    let (tag_start, tag_end) = loop {
+        let rel = html[from..]
+            .find("id=\"line-picker\"")
+            .unwrap_or_else(|| panic!("the out-of-band picker must render: {html:.800}"));
+        let pos = from + rel;
+        let start = html[..pos].rfind('<').expect("the id must sit inside a tag");
+        let end_rel = html[start..].find('>').expect("unterminated tag");
+        if html[start..=start + end_rel].contains("hx-swap-oob") {
+            break (start, start + end_rel);
+        }
+        from = pos + 1;
+    };
     let oob_tag = &html[tag_start..=tag_end];
     assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
     let oob = &html[tag_start..];

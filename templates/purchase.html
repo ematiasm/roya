@@ -7,4 +7,84 @@
 <div id="purchase-record">
   {% include "partials/purchase_detail.html" %}
 </div>
+{# Receiving-desk T3 interactions (bar menu, dialogs, add-line drawer).
+
+   This script lives in the PAGE SHELL, not the record fragment: the fragment
+   is swapped by every action response, and a script inside swapped content
+   would re-register the document-level listeners on every swap. The functions
+   query the DOM by id at call time, so they keep working after a swap rebuilds
+   the bar, the dialogs or the drawer.
+
+   Escape: a native <dialog> closes itself, so the handler stands down while
+   one is open; the picker input owns Escape to clear its own value, so the
+   handler stands down for that target too (otherwise the drawer would vanish
+   before the keyup could clear the field). Everything else closes the menu
+   and the drawer. #}
+<script>
+  function openRecordDialog(id) {
+    closeRecordMenu();
+    var dlg = document.getElementById(id);
+    if (dlg) dlg.showModal();
+  }
+  function openLineDrawer() {
+    closeRecordMenu();
+    var drawer = document.getElementById('line-drawer');
+    if (drawer) {
+      drawer.classList.remove('hidden');
+      drawer.classList.add('flex');
+      var input = document.getElementById('product-picker');
+      if (input) input.focus();
+    }
+  }
+  function closeLineDrawer() {
+    var drawer = document.getElementById('line-drawer');
+    if (drawer) {
+      drawer.classList.add('hidden');
+      drawer.classList.remove('flex');
+    }
+  }
+  function toggleRecordMenu(evt) {
+    if (evt) evt.stopPropagation();
+    var menu = document.getElementById('record-menu');
+    var toggle = document.getElementById('record-menu-toggle');
+    if (!menu) return;
+    var willOpen = menu.classList.contains('hidden');
+    menu.classList.toggle('hidden', !willOpen);
+    if (toggle) toggle.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+  }
+  function closeRecordMenu() {
+    var menu = document.getElementById('record-menu');
+    if (menu) menu.classList.add('hidden');
+    var toggle = document.getElementById('record-menu-toggle');
+    if (toggle) toggle.setAttribute('aria-expanded', 'false');
+  }
+  // Outside click closes the menu; the header action anchors open the same
+  // targets their in-page ids name (a plain anchor jump would not click the
+  // button or open the dialog).
+  document.addEventListener('click', function (evt) {
+    var menu = document.getElementById('record-menu');
+    if (menu && !menu.classList.contains('hidden')) {
+      var t = evt.target;
+      var onToggle = t && t.closest && t.closest('#record-menu-toggle');
+      if (!onToggle && !menu.contains(t)) closeRecordMenu();
+    }
+    if (!evt.target || !evt.target.closest) return;
+    if (evt.target.closest('a[href="#add-line"]')) {
+      evt.preventDefault();
+      openLineDrawer();
+      return;
+    }
+    if (evt.target.closest('a[href="#record-payment"]')) {
+      evt.preventDefault();
+      openRecordDialog('record-payment');
+    }
+  });
+  document.addEventListener('keydown', function (evt) {
+    if (evt.key !== 'Escape') return;
+    if (document.querySelector('dialog[open]')) return;
+    if (evt.target && evt.target.closest && evt.target.closest('#product-picker')) return;
+    closeRecordMenu();
+    closeLineDrawer();
+  });
+</script>
 {% endblock %}
