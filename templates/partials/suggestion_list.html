@@ -27,7 +27,7 @@
           <span class="font-semibold">{{ s.product.name }}</span>
           <span class="text-xs text-muted">{{ s.product.sku }}</span>
         </div>
-        <span class="text-[13px] text-muted">stock {{ s.stock }} • sugerido {{ s.suggested_qty }} × ${{ s.unit_cost }} • {{ s.supplier_name }}</span>
+        <span class="text-[13px] text-muted">stock {{ s.stock }} • suggested {{ s.suggested_qty }} × ${{ s.unit_cost }} • {{ s.supplier_name }}</span>
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums text-expense">{{ s.subtotal }}</span>
@@ -49,7 +49,7 @@
       <div class="mb-2 flex items-center justify-between rounded-[10px] border border-dashed border-border px-3.5 py-3" id="suggestion-nosup-{{ w.product.id }}">
         <div class="flex flex-col">
           <span class="font-semibold">{{ w.product.name }}</span>
-          <span class="text-[13px] text-muted">{{ w.product.sku }} • stock {{ w.stock }} • sugerido {{ w.suggested_qty }}</span>
+          <span class="text-[13px] text-muted">{{ w.product.sku }} • stock {{ w.stock }} • suggested {{ w.suggested_qty }}</span>
         </div>
         <a href="/suppliers" class="text-xs">record cost</a>
       </div>

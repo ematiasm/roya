@@ -117,7 +117,7 @@
   {# Audit attribution (slice S12): the purchase's creator and its last editor
      (a header edit, a line change, the confirm or the cancel), rendered as
      display names the wiring layer resolved. #}
-  <div class="text-[13px] text-muted" data-purchase-actor>Registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
+  <div class="text-[13px] text-muted" data-purchase-actor>Registered by {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Updated by {{ editor }}{% endif %}</div>
   {% if !record.purchase.notes.is_empty() %}
     <div class="text-[13px] text-muted">{{ record.purchase.notes }}</div>
   {% endif %}

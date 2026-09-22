@@ -6938,8 +6938,9 @@ async fn ac19_the_purchases_migration_recreates_a_missing_sentinel() {
 
 /// The purchase record page shows the actor as a DISPLAY NAME, never an id:
 /// the shared session user creates the draft and its line, a second probe
-/// user confirms it, and the page renders both names — "Registrado por" for
-/// the creator and "Actualizado por" for the confirming edit.
+/// user confirms it, and the page renders both names — "Registered by" for
+/// the creator and "Updated by" for the confirming edit (the purchase
+/// surfaces are English, receiving-desk T1).
 #[tokio::test]
 async fn audit_the_purchase_record_shows_the_actor_display_name() {
     let (app, pool) = test_app().await;
@@ -6982,17 +6983,17 @@ async fn audit_the_purchase_record_shows_the_actor_display_name() {
     let (status, page) = get(&app, &format!("/purchases/{purchase_id}")).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(
-        page.matches("Registrado por Test Admin").count(),
+        page.matches("Registered by Test Admin").count(),
         1,
         "the purchase names its creator: {page:.600}"
     );
     assert_eq!(
-        page.matches("Actualizado por Test Probe").count(),
+        page.matches("Updated by Test Probe").count(),
         1,
         "the confirm names its editor: {page:.600}"
     );
     assert!(
-        !page.contains("Registrado por 1"),
+        !page.contains("Registered by 1"),
         "the interface never renders a raw user id: {page}"
     );
 }
