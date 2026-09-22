@@ -101,7 +101,7 @@ was deepened and fully approved for implementation (2026-09-22).
       grid; status-based primary (keep legacy ids).
 - [x] T4 Effects preview partial (draft, projections only: stock/cash/due;
       no payment inputs; Confirm disabled at 0 lines).
-- [ ] T5 Confirm `<dialog>` (Cash: method select + account; Credit: due
+- [x] T5 Confirm `<dialog>` (Cash: method select + account; Credit: due
       summary, no select) posting to existing confirm route.
 - [ ] T6 Add-line drawer (documents.html pattern + `line_picker` + keep-open
       checkbox in localStorage; OOB close/clear; focus return).
