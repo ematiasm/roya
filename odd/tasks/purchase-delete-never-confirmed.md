@@ -96,12 +96,22 @@ Therefore:
 
 - [x] T1 Repo predicate + tests: discarded-cancelled deletes; protected test
       re-pinned to confirmed-then-cancelled; unknown-id unchanged.
+      Commit: 8708c87.
       Evidence: RED `cargo test delete_draft` →
       `delete_draft_on_a_discarded_cancelled_purchase_deletes_it_with_its_lines`
       failed ("a never-confirmed cancelled purchase is deletable"), 20 passed;
       GREEN after predicate change → `cargo test delete_draft` = 21 passed;
       `cargo test repositories::purchase_repo` = 13 passed.
-- [ ] T2 Service + route behavior and error copy; tests RED→GREEN.
+- [x] T2 Service + route behavior and error copy; tests RED→GREEN.
+      Evidence: RED `cargo test delete_draft` → 2 failed, 23 passed
+      (service `delete_draft_removes_a_discarded_cancelled_purchase...` and
+      route `web_delete_draft_discarded_cancelled_purchase_answers_200_and_is_gone`,
+      both with `Validation("purchase 1 is Cancelled: only a draft can be deleted")`
+      / 400-vs-200); GREEN → 25 passed. Also `cargo test services::purchases`
+      = 52 passed, `cargo test routes::purchases_web` = 55 passed. Refusal
+      copy now: `purchase {id} is {state}: only a draft or a discarded
+      (never-confirmed) cancelled purchase can be deleted` — names the state
+      for Confirmed and for confirmed-then-cancelled.
 - [ ] T3 UI: Delete control on Cancelled+no-number record with confirm
       prompt; smoke/e2e assertions as needed.
 - [ ] T4 Full verification: `cargo test`; e2e if DOM contracts changed;

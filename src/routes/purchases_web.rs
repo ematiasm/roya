@@ -490,9 +490,11 @@ async fn web_purchase_detail(
 }
 
 /// `DELETE /web/purchases/{id}`: the documents drawer's draft delete — the
-/// mirror of the sale flow. The same house shape as the other HTMX writes:
-/// an empty 200 whose `HX-Trigger` tells the listening pages to re-read the
-/// feed; the business outcome lives in the service, the route only answers.
+/// mirror of the sale flow, plus the discarded (never-confirmed) cancelled
+/// purchase the service now admits. The same house shape as the other HTMX
+/// writes: an empty 200 whose `HX-Trigger` tells the listening pages to
+/// re-read the feed; the business outcome lives in the service, the route
+/// only answers.
 async fn web_delete_draft(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
@@ -4563,6 +4565,84 @@ mod tests {
                 audit_actor(&state).await,
                 fixture.purchase_id,
                 Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body, _) = send_delete(
+            app,
+            &format!("/web/purchases/{}", fixture.purchase_id),
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .is_ok());
+    }
+
+    /// A discarded purchase (cancelled before confirm, number still NULL)
+    /// deletes through the same route: empty 200, `purchase-changed` trigger,
+    /// detail then 404s — the acceptance path for never-confirmed cancelled
+    /// rows.
+    #[tokio::test]
+    async fn web_delete_draft_discarded_cancelled_purchase_answers_200_and_is_gone() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .cancel(audit_actor(&state).await, fixture.purchase_id, None)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body, trigger) = send_delete(
+            app,
+            &format!("/web/purchases/{}", fixture.purchase_id),
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            trigger.as_deref(),
+            Some("purchase-changed"),
+            "the documents page listens for purchase-changed"
+        );
+        let err = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::AppError::NotFound(_)),
+            "the deleted discarded purchase must be gone: {err:?}"
+        );
+    }
+
+    /// Confirmed-then-cancelled keeps the protection at the route: 400 and
+    /// the row survives.
+    #[tokio::test]
+    async fn web_delete_draft_refuses_a_confirmed_then_cancelled_purchase_with_400() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .cancel(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some("wrong order".to_string()),
             )
             .await
             .unwrap();
