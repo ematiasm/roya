@@ -139,7 +139,7 @@
   <div class="mb-3 flex flex-wrap items-center gap-2">
     <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.purchase.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if record.purchase.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.purchase.status }}</span>
     <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.payment_status }}</span>
-    <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.purchase.payment_type }}</span>
+    {% if record.purchase.status.to_string() != "Draft" %}<span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.purchase.payment_type }}</span>{% endif %}
     <span class="text-base font-bold">
       {% if let Some(n) = record.purchase.purchase_number %}{{ n }}{% else %}Draft purchase{% endif %}
     </span>

@@ -103,9 +103,16 @@ solo con proveedor y fecha".
       `1 passed`; `cargo test purchases_web` → `51 passed, 762 filtered out`;
       `cargo test smoke_tests` → `93 passed, 720 filtered out` (a comment
       apostrophe in `templates/purchase.html` had flipped the guard's naive
-      quote pairing and exposed `indexOf('/lines')` as a probe — reworded).
-- [ ] T3 Hide Draft type badges (detail + list); effects preview shows both
+      quote pairing and       exposed `indexOf('/lines')` as a probe — reworded). Commit: `13ed93c`.
+- [x] T3 Hide Draft type badges (detail + list); effects preview shows both
       scenarios; RED tests.
+      Evidence: RED `cargo test web_draft_hides_the_payment_type_badge_until_confirm`
+      → `FAILED. 0 passed; 1 failed` (draft badge still rendered);
+      `cargo test web_purchase_record_effects_preview` → `FAILED` (preview
+      still branched on stored type). GREEN after gating both badge spans on
+      `status != "Draft"` and unbranching the preview:
+      `cargo test purchases_web` → `52 passed, 762 filtered out`;
+      `cargo test smoke_tests` → `93 passed, 721 filtered out`.
 - [ ] T4 Edit header drops Due date field; RED test.
 - [ ] T5 Verification: full `cargo test`; e2e purchase suites; evidence per
       task in this doc.
@@ -116,7 +123,8 @@ T1–T4: delegated direct (writer trigger: 2+ non-trivial files).
 
 ## Progress
 
-- [x] T1 done (commit `b61f689`), T2 done. Next step: T3.
+- [x] T1 done (commit `b61f689`), T2 done (commit `13ed93c`), T3 done.
+      Next step: T4.
 
 ## Acceptance criteria
 

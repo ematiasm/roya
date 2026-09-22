@@ -3152,7 +3152,9 @@ mod tests {
     /// Receiving-desk T4: a draft's money region carries an effects preview —
     /// projections only (stock/cash/due), never a payment input — built from
     /// the record's own `tracked_units` so "+N units (tracked)" cannot drift
-    /// from what confirm will move. The bar's Confirm primary is disabled at
+    /// from what confirm will move. Purchase-payment-at-confirm T3: the
+    /// preview no longer trusts the stored type — BOTH scenarios render until
+    /// confirm. The bar's Confirm primary is disabled at
     /// zero lines and enabled once a line exists.
     #[tokio::test]
     async fn web_purchase_record_effects_preview_projects_confirm_without_payment_inputs() {
@@ -3252,12 +3254,14 @@ mod tests {
             .total
             .to_string();
         assert!(
-            preview.contains(&format!("Cash · -${total} at confirm")),
+            preview.contains(&format!("Cash scenario · -${total} at confirm")),
             "the cash projection is the document total: {preview}"
         );
         assert!(
-            preview.contains("Due · $0 at confirm"),
-            "a cash draft settles at confirm: {preview}"
+            preview.contains(&format!(
+                "Credit scenario · no cash movement · due +${total} at confirm"
+            )),
+            "a draft previews BOTH scenarios until confirm: {preview}"
         );
         assert!(
             !preview.contains("<select") && !preview.contains("<input"),
@@ -3296,12 +3300,14 @@ mod tests {
             .total
             .to_string();
         assert!(
-            preview.contains(&format!("Due · +${credit_total} at confirm")),
+            preview.contains(&format!(
+                "Credit scenario · no cash movement · due +${credit_total} at confirm"
+            )),
             "the due projection is what confirm establishes: {preview}"
         );
         assert!(
-            preview.contains("Cash · no cash movement"),
-            "a credit confirm posts no cash: {preview}"
+            preview.contains(&format!("Cash scenario · -${credit_total} at confirm")),
+            "the preview does not trust the stored type: both scenarios show: {preview}"
         );
         assert!(
             preview.contains("+2 units (tracked)"),
@@ -3321,6 +3327,74 @@ mod tests {
         assert!(
             html.contains("Stock · no stock movement"),
             "an empty draft previews no stock movement: {html:.600}"
+        );
+    }
+
+    /// T3: payment is decided at confirm, so the stored type is invisible
+    /// while the purchase is a Draft — neither the record header nor the list
+    /// row shows a payment-type badge. Once confirmed the type is a fact and
+    /// the badge returns (the row it came from is proven by the exact-once
+    /// count: every draft this test seeded must still be badgeless).
+    #[tokio::test]
+    async fn web_draft_hides_the_payment_type_badge_until_confirm() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+
+        // -- Draft record pages: no type badge -----------------------------
+        let cash = seed_record_fixture(&state, PaymentType::Cash).await;
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("uppercase\">Cash</span>"),
+            "a Cash draft shows no payment-type badge: {html:.600}"
+        );
+        let credit = seed_record_fixture(&state, PaymentType::Credit).await;
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("uppercase\">Credit</span>"),
+            "a Credit draft shows no payment-type badge: {html:.600}"
+        );
+
+        // -- The list hides it on both draft rows --------------------------
+        let (status, list) = get_html(app.clone(), "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !list.contains("uppercase\">Cash</span>")
+                && !list.contains("uppercase\">Credit</span>"),
+            "draft rows carry no payment-type badge: {list:.600}"
+        );
+
+        // -- Confirm: the badge returns on record and list -----------------
+        let (status, _, resp) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/confirm", cash.purchase_id),
+            &format!(
+                "payment_type=Cash&due_date=&method_id={}",
+                cash.method_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("uppercase\">Cash</span>"),
+            "a confirmed purchase keeps its type badge: {html:.600}"
+        );
+        let (status, list) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            list.matches("uppercase\">Cash</span>").count(),
+            1,
+            "the confirmed row shows the badge exactly once, drafts stay hidden: {list:.600}"
+        );
+        assert!(
+            !list.contains("uppercase\">Credit</span>"),
+            "the Credit draft row stays badgeless: {list:.600}"
         );
     }
 
