@@ -165,14 +165,17 @@ pub trait SaleRepository: Send + Sync {
         -> AppResult<SaleLine>;
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
-    /// Delete a DRAFT sale and let its lines die by CASCADE. The `status =
-    /// 'Draft'` in the WHERE is the load-bearing backstop: even if a caller
-    /// ever relaxed the service's state guard, a Confirmed or Cancelled row
-    /// cannot be removed by this statement — it answers `false` instead, so
-    /// the caller can refuse honestly. A draft is the only deletable state by
-    /// construction (no payments — `record_payment` refuses anything not
-    /// Confirmed — no stock movement, no ledger entry, no customer debt), so
-    /// nothing dangles. This is a WRITE, not a read: the test read counter
+    /// Delete a DRAFT sale — or a DISCARDED one (Cancelled while never
+    /// confirmed: `sale_number IS NULL`) — and let its lines die by
+    /// CASCADE. The predicate in the WHERE is the load-bearing backstop: even
+    /// if a caller ever relaxed the service's state guard, a Confirmed row or
+    /// a Cancelled row that carries a number cannot be removed by this
+    /// statement — it answers `false` instead, so the caller can refuse
+    /// honestly. Both deletable states posted nothing by construction (no
+    /// payments — nothing but a Confirmed document takes them — no stock
+    /// movement, no ledger entry, no customer debt), so nothing dangles; a
+    /// confirmed-then-cancelled document is permanent audit trail and stays
+    /// protected. This is a WRITE, not a read: the test read counter
     /// stays untouched.
     async fn delete_draft(&self, id: i64) -> AppResult<bool>;
 
@@ -639,12 +642,21 @@ impl SaleRepository for SqliteSaleRepository {
     }
 
     async fn delete_draft(&self, id: i64) -> AppResult<bool> {
-        // `AND status = 'Draft'` is the backstop that makes deleting a
-        // confirmed (or cancelled) document impossible even if the service
-        // check were relaxed: the WHERE simply matches nothing and the answer
-        // is `false`.
-        let res = sqlx::query(r#"DELETE FROM sales WHERE id = ? AND status = 'Draft'"#)
-            .bind(id)
+        // The WHERE clause is the backstop that makes deleting an
+        // undeletable document impossible even if the service check were
+        // relaxed: the statement simply matches nothing and the answer is
+        // `false`. Deletable = a Draft, OR a Cancelled row whose
+        // `sale_number` is NULL — a sale discarded before confirm,
+        // which never touched stock or finance. A Cancelled row WITH a
+        // number was confirmed first and is permanent audit trail (its
+        // receipt and ledger history reference it).
+        let res = sqlx::query(
+            r#"DELETE FROM sales
+               WHERE id = ?
+                 AND (status = 'Draft'
+                      OR (status = 'Cancelled' AND sale_number IS NULL))"#,
+        )
+        .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
@@ -1853,8 +1865,14 @@ mod tests {
         );
     }
 
+    /// Re-pinned protection test: a sale that was CONFIRMED (its number was
+    /// assigned at confirm and is immutable) and then cancelled stays
+    /// undeletable — the audit trail (refund transactions) references it. The
+    /// number is stamped directly, exactly the fact confirm would have written:
+    /// `sale_number IS NOT NULL` is the only marker that separates this
+    /// fixture from a discarded draft.
     #[tokio::test]
-    async fn delete_draft_on_a_cancelled_sale_returns_false_and_the_row_survives() {
+    async fn delete_draft_on_a_confirmed_then_cancelled_sale_returns_false_and_the_row_survives() {
         let pool = migrated_pool().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let repo = SqliteSaleRepository::new(pool.clone());
@@ -1866,11 +1884,74 @@ mod tests {
             actor,
         )
         .await;
+        sqlx::query("UPDATE sales SET sale_number = '2024-SALE-000001' WHERE id = ?")
+            .bind(cancelled)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         assert!(!repo.delete_draft(cancelled).await.unwrap());
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM sales WHERE id = ?", cancelled).await,
-            1
+            1,
+            "a confirmed-then-cancelled sale must survive a direct repository delete"
+        );
+    }
+
+    /// A discarded (never-confirmed) cancelled sale posts nothing — it is a
+    /// garbage row and MUST delete, taking its lines with it (CASCADE), while
+    /// a sibling discarded sale keeps its row.
+    #[tokio::test]
+    async fn delete_draft_on_a_discarded_cancelled_sale_deletes_it_with_its_lines() {
+        let pool = migrated_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let product = seed_delete_product(&pool, actor).await;
+
+        let discarded =
+            seed_sale_with_status(&pool, "Cancelled", "Discard Buyer", d(2024, 5, 2), actor).await;
+        sqlx::query(
+            "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) VALUES (?, ?, '1', '10')",
+        )
+        .bind(discarded)
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let other =
+            seed_sale_with_status(&pool, "Cancelled", "Other Buyer", d(2024, 5, 3), actor).await;
+        sqlx::query(
+            "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) VALUES (?, ?, '3', '10')",
+        )
+        .bind(other)
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            repo.delete_draft(discarded).await.unwrap(),
+            "a never-confirmed cancelled sale is deletable"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM sales WHERE id = ?", discarded).await,
+            0,
+            "the discarded row must be gone"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?", discarded).await,
+            0,
+            "its lines must be gone with it"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM sales WHERE id = ?", other).await,
+            1,
+            "the sibling discarded sale must survive"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?", other).await,
+            1,
+            "the sibling's lines must survive"
         );
     }
 

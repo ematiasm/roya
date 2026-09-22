@@ -79,7 +79,7 @@ T1–T3: **delegated direct** (writer trigger: 2+ non-trivial files).
 - [ ] T4 Full `cargo test` green; e2e if affected; evidence checkoffs with commit hashes.
 
 ## Progress
-All tasks pending. Next step: T1.
+- [x] T1 done — RED (822 passed / 1 failed: discarded) then GREEN via predicate + trait-doc (delete_draft: Draft OR Cancelled∧sale_number IS NULL).
 
 ## Acceptance criteria
 1. Discarded cancelled sale: DELETE removes it + lines; record page 404s after.
