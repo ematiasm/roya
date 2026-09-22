@@ -1,4 +1,5 @@
-{# Purchase record body (redesign-interface N3; product picker N4).
+{# Purchase record body (redesign-interface N3; product picker N4;
+   receiving-desk T3: action bar + dialogs + add-line drawer).
 
    Rendered both by `/purchases/{id}` inside the shell and standalone by every
    action response that swaps `#purchase-record`, so the same context travels with
@@ -7,7 +8,13 @@
 
    `record_money` wraps the running total and the lines so one response carries
    both: adding a line swaps that region while the picker is replaced out of
-   band, empty and focused, ready for the next scan. #}
+   band, empty and focused, ready for the next scan. The sticky action bar and
+   the add-line drawer live OUTSIDE that region — the add-line response marks
+   the bar `hx-swap-oob` so it refreshes with the same swap (HTMX processes OOB
+   before `hx-select`), while the dialogs and the drawer keep their ids as the
+   record's legacy anchors: `#add-line` is the bar's drawer button,
+   `#confirm-purchase` / `#edit-header` / `#discard-purchase` /
+   `#record-payment` / `#cancel-purchase` are the forms' dialogs. #}
 {% import "partials/product_search_results.html" as picker %}
 {% macro record_money(record) %}
 <div id="purchase-record-money">
@@ -15,7 +22,7 @@
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
   {% if record.lines.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet{% if record.purchase.status.to_string() == "Draft" %} — add one below.{% else %}.{% endif %}</div>
+    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet{% if record.purchase.status.to_string() == "Draft" %} — use Add line.{% else %}.{% endif %}</div>
   {% else %}
     <div class="overflow-x-auto">
       <table class="w-full border-collapse text-sm">
@@ -98,6 +105,10 @@
 </div>
 {% endmacro %}
 
+{# The secondary-menu button and the dialog openers share these ids across
+   statuses, so only one of each renders per record. The `⋯` menu and the
+   dialogs are presentation: every form inside them posts the same routes the
+   four-card grid used, and hx-confirm stays on the destructive forms. #}
 <div id="purchase-record-inner" data-purchase-record>
   <div class="mb-3 flex flex-wrap items-center gap-2">
     <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.purchase.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if record.purchase.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.purchase.status }}</span>
@@ -123,6 +134,55 @@
   {% endif %}
   {% if let Some(c) = record.purchase.cancel_reason %}
     <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-cancel-reason>Cancelled: {{ c }}</div>
+  {% endif %}
+
+  {# Sticky action bar (receiving-desk T3): one primary action per status
+     plus the `⋯` secondary menu, replacing the four-card grid. It sits
+     OUTSIDE `record_money` so the add-line response can refresh it out of
+     band; `top-14` clears the sticky mobile header (`md:top-0` — the desktop
+     header is not sticky). A cancelled record renders no bar: read-only. #}
+  {% if record.purchase.status.to_string() == "Draft" %}
+  <div id="purchase-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
+       class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
+    <button type="button" id="add-line"
+            class="rounded-[10px] border border-border bg-transparent px-3.5 py-2 text-sm text-text"
+            onclick="openLineDrawer()">Add line</button>
+    <button type="button" class="bg-accent2 text-white"{% if record.lines.is_empty() %} disabled{% endif %}
+            onclick="openRecordDialog('confirm-purchase')">Confirm ▾</button>
+    <div class="relative ml-auto">
+      <button type="button" id="record-menu-toggle" aria-label="More actions"
+              aria-haspopup="true" aria-expanded="false"
+              class="rounded-[10px] border border-border bg-transparent px-3.5 py-2 text-text"
+              onclick="toggleRecordMenu(event)">⋯</button>
+      <div id="record-menu" class="hidden absolute right-0 top-full z-30 mt-1 min-w-[160px] rounded-[10px] border border-border bg-card p-1 shadow-xl">
+        <button type="button"
+                class="block w-full rounded-[10px] bg-transparent px-3 py-2 text-left text-sm text-text"
+                onclick="openRecordDialog('edit-header')">Edit header</button>
+        <button type="button"
+                class="block w-full rounded-[10px] bg-transparent px-3 py-2 text-left text-sm text-danger"
+                onclick="openRecordDialog('discard-purchase')">Discard draft</button>
+      </div>
+    </div>
+  </div>
+  {% else if record.purchase.status.to_string() == "Confirmed" %}
+  <div id="purchase-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
+       class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
+    {% if record.purchase.payment_type.to_string() == "Credit" %}
+    <button type="button" class="bg-accent2 text-white"
+            onclick="openRecordDialog('record-payment')">+ Record payment</button>
+    {% endif %}
+    <div class="relative ml-auto">
+      <button type="button" id="record-menu-toggle" aria-label="More actions"
+              aria-haspopup="true" aria-expanded="false"
+              class="rounded-[10px] border border-border bg-transparent px-3.5 py-2 text-text"
+              onclick="toggleRecordMenu(event)">⋯</button>
+      <div id="record-menu" class="hidden absolute right-0 top-full z-30 mt-1 min-w-[160px] rounded-[10px] border border-border bg-card p-1 shadow-xl">
+        <button type="button"
+                class="block w-full rounded-[10px] bg-transparent px-3 py-2 text-left text-sm text-danger"
+                onclick="openRecordDialog('cancel-purchase')">Cancel purchase</button>
+      </div>
+    </div>
+  </div>
   {% endif %}
 
   {% call record_money(record) %}
@@ -155,120 +215,149 @@
     </div>
   {% endif %}
 
-  {# Actions in context, gated by status. Destructive actions ask first. #}
+  {# Action forms as dialogs, gated by status exactly like the cards were.
+     Destructive forms keep hx-confirm on the <form> itself, so whichever
+     element first posts the route already asks first. The page shell
+     (purchase.html) owns the open/close JS; these ids are the record's
+     legacy anchors. #}
   {% if record.purchase.status.to_string() == "Draft" %}
-  <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
-    <div class="rounded-2xl border border-border bg-card p-4" id="add-line">
-      <h2 class="mb-3 text-base font-semibold">Add line</h2>
+  <dialog id="confirm-purchase" class="rounded-2xl border border-border bg-card p-5 text-text">
+    <div class="mb-3 flex items-center justify-between gap-6">
+      <h2 class="text-lg font-semibold">Confirm purchase</h2>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              aria-label="Close dialog" onclick="document.getElementById('confirm-purchase').close()">✕</button>
+    </div>
+    <form class="flex flex-col gap-2.5" data-action="Confirm purchase"
+          hx-post="/web/purchases/{{ record.purchase.id }}/confirm"
+          hx-target="#purchase-record" hx-swap="innerHTML">
+      <div>
+        <label for="confirm-method">Method (Cash only; the account is derived from it)</label>
+        <select id="confirm-method" name="method_id">
+          <option value="">— none (Credit) —</option>
+          {% for m in method_options %}
+          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button type="submit" class="bg-accent2 text-white">Confirm</button>
+    </form>
+  </dialog>
+
+  <dialog id="edit-header" class="rounded-2xl border border-border bg-card p-5 text-text">
+    <div class="mb-3 flex items-center justify-between gap-6">
+      <h2 class="text-lg font-semibold">Edit header</h2>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              aria-label="Close dialog" onclick="document.getElementById('edit-header').close()">✕</button>
+    </div>
+    <form class="flex flex-col gap-2.5" data-action="Edit header"
+          hx-post="/web/purchases/{{ record.purchase.id }}/header"
+          hx-target="#purchase-record" hx-swap="innerHTML">
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label for="header-purchase-date">Purchase date</label>
+          <input type="date" id="header-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
+        </div>
+        <div>
+          <label for="header-due-date">Due date (Credit only)</label>
+          <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.purchase.due_date %}{{ due }}{% endif %}" />
+        </div>
+      </div>
+      <div>
+        <label for="header-supplier-invoice-no">Supplier invoice no (optional)</label>
+        <input type="text" id="header-supplier-invoice-no" name="supplier_invoice_no" maxlength="64" value="{% if let Some(inv) = record.purchase.supplier_invoice_no %}{{ inv }}{% endif %}" />
+      </div>
+      <div>
+        <label for="header-notes">Notes</label>
+        <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" />
+      </div>
+      <button type="submit">Save header</button>
+    </form>
+  </dialog>
+
+  <dialog id="discard-purchase" class="rounded-2xl border border-border bg-card p-5 text-text">
+    <div class="mb-3 flex items-center justify-between gap-6">
+      <h2 class="text-lg font-semibold">Discard draft</h2>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              aria-label="Close dialog" onclick="document.getElementById('discard-purchase').close()">✕</button>
+    </div>
+    <form class="flex flex-col gap-2.5" data-action="Discard draft"
+          hx-post="/web/purchases/{{ record.purchase.id }}/cancel"
+          hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
+          hx-target="#purchase-record" hx-swap="innerHTML">
+      <div>
+        <label for="discard-reason">Reason (optional)</label>
+        <input type="text" id="discard-reason" name="reason" maxlength="256" />
+      </div>
+      <button type="submit" class="border border-border bg-transparent text-text">Discard draft</button>
+    </form>
+  </dialog>
+
+  {# The add-line drawer (documents.html shell pattern): a fixed right panel,
+     no backdrop, hosting the same `line_picker` the card used — the picker's
+     hx-disinherit rules and swap targets are untouched. Opened by the bar's
+     `#add-line` button (or the header action anchor); the page shell owns
+     the open/close JS and Escape. #}
+  <div id="line-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
+    <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+      <span class="text-sm font-semibold">Add line</span>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              aria-label="Close add line" onclick="closeLineDrawer()">✕</button>
+    </div>
+    <div class="flex-1 overflow-y-auto p-4">
       {% call picker::line_picker(false, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = product cost)", "product cost", "cost") %}
     </div>
-
-    <div class="rounded-2xl border border-border bg-card p-4" id="confirm-purchase">
-      <h2 class="mb-3 text-base font-semibold">Confirm purchase</h2>
-      <form class="flex flex-col gap-2.5" data-action="Confirm purchase"
-            hx-post="/web/purchases/{{ record.purchase.id }}/confirm"
-            hx-target="#purchase-record" hx-swap="innerHTML">
-        <div>
-          <label for="confirm-method">Method (Cash only; the account is derived from it)</label>
-          <select id="confirm-method" name="method_id">
-            <option value="">— none (Credit) —</option>
-            {% for m in method_options %}
-            <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
-            {% endfor %}
-          </select>
-        </div>
-        <button type="submit" class="bg-accent2 text-white">Confirm</button>
-      </form>
-    </div>
-
-    <div class="rounded-2xl border border-border bg-card p-4" id="edit-header">
-      <h2 class="mb-3 text-base font-semibold">Edit header</h2>
-      <form class="flex flex-col gap-2.5" data-action="Edit header"
-            hx-post="/web/purchases/{{ record.purchase.id }}/header"
-            hx-target="#purchase-record" hx-swap="innerHTML">
-        <div class="flex gap-2.5 [&>*]:flex-1">
-          <div>
-            <label for="header-purchase-date">Purchase date</label>
-            <input type="date" id="header-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
-          </div>
-          <div>
-            <label for="header-due-date">Due date (Credit only)</label>
-            <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.purchase.due_date %}{{ due }}{% endif %}" />
-          </div>
-        </div>
-        <div>
-          <label for="header-supplier-invoice-no">Supplier invoice no (optional)</label>
-          <input type="text" id="header-supplier-invoice-no" name="supplier_invoice_no" maxlength="64" value="{% if let Some(inv) = record.purchase.supplier_invoice_no %}{{ inv }}{% endif %}" />
-        </div>
-        <div>
-          <label for="header-notes">Notes</label>
-          <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" />
-        </div>
-        <button type="submit">Save header</button>
-      </form>
-    </div>
-
-    <div class="rounded-2xl border border-border bg-card p-4" id="discard-purchase">
-      <h2 class="mb-3 text-base font-semibold">Discard draft</h2>
-      <form class="flex flex-col gap-2.5" data-action="Discard draft"
-            hx-post="/web/purchases/{{ record.purchase.id }}/cancel"
-            hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
-            hx-target="#purchase-record" hx-swap="innerHTML">
-        <div>
-          <label for="discard-reason">Reason (optional)</label>
-          <input type="text" id="discard-reason" name="reason" maxlength="256" />
-        </div>
-        <button type="submit" class="border border-border bg-transparent text-text">Discard draft</button>
-      </form>
-    </div>
   </div>
-  {% else %}
-    {% if record.purchase.status.to_string() == "Confirmed" %}
-    <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
-      {% if record.purchase.payment_type.to_string() == "Credit" %}
-      <div class="rounded-2xl border border-border bg-card p-4" id="record-payment">
-        <h2 class="mb-3 text-base font-semibold">Record payment</h2>
-        <form class="flex flex-col gap-2.5" data-action="Record payment"
-              hx-post="/web/purchases/{{ record.purchase.id }}/payments"
-              hx-target="#purchase-record" hx-swap="innerHTML">
-          <div>
-            <label for="payment-method">Method (the account is derived from it)</label>
-            <select id="payment-method" name="method_id" required>
-              {% for m in method_options %}
-              <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
-              {% endfor %}
-            </select>
-          </div>
-          <div class="flex gap-2.5 [&>*]:flex-1">
-            <div>
-              <label for="payment-amount">Amount</label>
-              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
-            </div>
-            <div>
-              <label for="payment-date">Date</label>
-              <input type="date" id="payment-date" name="date" required value="{{ today }}" />
-            </div>
-          </div>
-          <button type="submit" class="bg-accent2 text-white">Record payment</button>
-        </form>
-      </div>
-      {% endif %}
-
-      <div class="rounded-2xl border border-border bg-card p-4" id="cancel-purchase">
-        <h2 class="mb-3 text-base font-semibold">Cancel purchase</h2>
-        <form class="flex flex-col gap-2.5" data-action="Cancel purchase"
-              hx-post="/web/purchases/{{ record.purchase.id }}/cancel"
-              hx-confirm="Cancel this purchase? Stock returns and recorded payments are refunded."
-              hx-target="#purchase-record" hx-swap="innerHTML">
-          <div>
-            <label for="cancel-reason">Reason</label>
-            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="wrong order…" />
-          </div>
-          <button type="submit" class="border border-border bg-transparent text-text">Cancel purchase</button>
-        </form>
-      </div>
+  {% else if record.purchase.status.to_string() == "Confirmed" %}
+  {% if record.purchase.payment_type.to_string() == "Credit" %}
+  <dialog id="record-payment" class="rounded-2xl border border-border bg-card p-5 text-text">
+    <div class="mb-3 flex items-center justify-between gap-6">
+      <h2 class="text-lg font-semibold">Record payment</h2>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              aria-label="Close dialog" onclick="document.getElementById('record-payment').close()">✕</button>
     </div>
-    {% endif %}
+    <form class="flex flex-col gap-2.5" data-action="Record payment"
+          hx-post="/web/purchases/{{ record.purchase.id }}/payments"
+          hx-target="#purchase-record" hx-swap="innerHTML">
+      <div>
+        <label for="payment-method">Method (the account is derived from it)</label>
+        <select id="payment-method" name="method_id" required>
+          {% for m in method_options %}
+          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="flex gap-2.5 [&>*]:flex-1">
+        <div>
+          <label for="payment-amount">Amount</label>
+          <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+        </div>
+        <div>
+          <label for="payment-date">Date</label>
+          <input type="date" id="payment-date" name="date" required value="{{ today }}" />
+        </div>
+      </div>
+      <button type="submit" class="bg-accent2 text-white">Record payment</button>
+    </form>
+  </dialog>
+  {% endif %}
+
+  <dialog id="cancel-purchase" class="rounded-2xl border border-border bg-card p-5 text-text">
+    <div class="mb-3 flex items-center justify-between gap-6">
+      <h2 class="text-lg font-semibold">Cancel purchase</h2>
+      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              aria-label="Close dialog" onclick="document.getElementById('cancel-purchase').close()">✕</button>
+    </div>
+    <form class="flex flex-col gap-2.5" data-action="Cancel purchase"
+          hx-post="/web/purchases/{{ record.purchase.id }}/cancel"
+          hx-confirm="Cancel this purchase? Stock returns and recorded payments are refunded."
+          hx-target="#purchase-record" hx-swap="innerHTML">
+      <div>
+        <label for="cancel-reason">Reason</label>
+        <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="wrong order…" />
+      </div>
+      <button type="submit" class="border border-border bg-transparent text-text">Cancel purchase</button>
+    </form>
+  </dialog>
   {% endif %}
 </div>
 

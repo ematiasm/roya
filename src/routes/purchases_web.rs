@@ -86,6 +86,10 @@ struct PurchasePageTemplate {
     page_action_label: String,
     record: PurchaseRecord,
     oob_picker: bool,
+    /// Receiving-desk T3: the action bar rides out of band exactly when the
+    /// picker does — both only matter on the add-line response, whose main
+    /// swap takes just the money region (HTMX runs OOB before `hx-select`).
+    oob_action_bar: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
     /// Audit display names for the record body the page includes: resolved in
@@ -111,6 +115,10 @@ struct PurchaseListPartial {
 struct PurchaseDetailPartial {
     record: PurchaseRecord,
     oob_picker: bool,
+    /// The action bar swaps out of band on the add-line response, so its
+    /// enabled state (Confirm disabled at zero lines) follows the line count
+    /// while the main swap only takes the money region.
+    oob_action_bar: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
     /// The purchase's creator and its last editor, as display names the
@@ -255,10 +263,15 @@ async fn record_context(state: &AppState, purchase_id: i64) -> AppResult<Purchas
     })
 }
 
-fn render_record(context: PurchaseRecordContext, oob_picker: bool) -> AppResult<Html<String>> {
+fn render_record(
+    context: PurchaseRecordContext,
+    oob_picker: bool,
+    oob_action_bar: bool,
+) -> AppResult<Html<String>> {
     let html = PurchaseDetailPartial {
         record: context.record,
         oob_picker,
+        oob_action_bar,
         method_options: context.method_options,
         today: context.today,
         created_by_name: context.created_by_name,
@@ -276,13 +289,21 @@ async fn changed(state: &AppState, purchase_id: i64) -> AppResult<Response> {
 }
 
 /// Line-add response: the same body plus the out-of-band picker, empty and
-/// focused, so the scanner can feed the next line without a click.
+/// focused, so the scanner can feed the next line without a click. Both OOB
+/// flags ride together: this response is only used where the request's
+/// `hx-select` takes the money region, so whatever else must refresh (the
+/// action bar) has to arrive out of band too.
 async fn changed_with_picker(
     state: &AppState,
     purchase_id: i64,
     oob_picker: bool,
 ) -> AppResult<Response> {
-    let html = render_record(record_context(state, purchase_id).await?, oob_picker)?.0;
+    let html = render_record(
+        record_context(state, purchase_id).await?,
+        oob_picker,
+        oob_picker,
+    )?
+    .0;
     let mut resp = Html(html).into_response();
     resp.headers_mut()
         .insert("HX-Trigger", "purchase-changed".parse().unwrap());
@@ -437,6 +458,7 @@ async fn purchase_record_page(
         page_action_label: action_label,
         record: context.record,
         oob_picker: false,
+        oob_action_bar: false,
         method_options: context.method_options,
         today: context.today,
         created_by_name: context.created_by_name,
@@ -463,7 +485,7 @@ async fn web_purchase_detail(
     _: Require<PurchasesRead>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    let html = render_record(record_context(&state, id).await?, false)?.0;
+    let html = render_record(record_context(&state, id).await?, false, false)?.0;
     Ok(Html(html).into_response())
 }
 
@@ -1222,11 +1244,23 @@ mod tests {
     /// The line response must bring the picker back out of band, empty and
     /// focused, so the next scan lands without a click.
     fn assert_oob_picker_is_empty_and_focused(html: &str) {
-        let oob_pos = html
-            .find("hx-swap-oob=\"true\"")
-            .unwrap_or_else(|| panic!("the picker must come back out of band: {html:.800}"));
-        let tag_start = html[..oob_pos].rfind('<').unwrap();
-        let tag_end = oob_pos + html[oob_pos..].find('>').unwrap();
+        // The response can carry more than one OOB element (the action bar
+        // rides out of band on add-line too) and more than one `#line-picker`
+        // (the in-place picker plus its OOB copy): locate the OOB picker by
+        // ITS tag carrying `hx-swap-oob`, never by the first OOB in the doc.
+        let mut from = 0usize;
+        let (tag_start, tag_end) = loop {
+            let rel = html[from..]
+                .find("id=\"line-picker\"")
+                .unwrap_or_else(|| panic!("the out-of-band picker must render: {html:.800}"));
+            let pos = from + rel;
+            let start = html[..pos].rfind('<').expect("the id must sit inside a tag");
+            let end_rel = html[start..].find('>').expect("unterminated tag");
+            if html[start..=start + end_rel].contains("hx-swap-oob") {
+                break (start, start + end_rel);
+            }
+            from = pos + 1;
+        };
         let oob_tag = &html[tag_start..=tag_end];
         assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
         let oob = &html[tag_start..];
@@ -2515,6 +2549,143 @@ mod tests {
             cancel.contains("hx-confirm"),
             "cancelling a confirmed purchase must ask first: {cancel}"
         );
+    }
+
+    /// Receiving-desk T3: the four-card action grid is replaced by a sticky
+    /// action bar (one primary action per status plus a `⋯` secondary menu),
+    /// and every action form lives in a `<dialog>` the bar opens. The legacy
+    /// ids keep their meaning so in-page anchors still resolve: `#add-line`
+    /// is the bar's drawer button, `#confirm-purchase` / `#edit-header` /
+    /// `#discard-purchase` / `#record-payment` / `#cancel-purchase` are the
+    /// dialogs. Cancelled is read-only: no bar, no menu, no dialogs. The
+    /// add-line response carries the bar out of band, because its main swap
+    /// only takes the money region (HTMX processes OOB before `hx-select`).
+    #[tokio::test]
+    async fn web_purchase_record_renders_sticky_action_bar_and_status_dialogs() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+        let base = format!("/web/purchases/{}", fixture.purchase_id);
+
+        // -- Draft: sticky bar + secondary menu + drawer + dialogs ----------
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let bar_tag = element_tag_containing(&html, "id=\"purchase-action-bar\"");
+        assert!(
+            bar_tag.contains("sticky"),
+            "the action bar must stick under the header: {bar_tag}"
+        );
+        assert!(
+            html.contains("id=\"record-menu\""),
+            "the secondary menu renders: {html:.400}"
+        );
+        assert!(
+            html.contains("id=\"line-drawer\""),
+            "the add-line drawer hosts the picker: {html:.400}"
+        );
+        for dialog in ["confirm-purchase", "edit-header", "discard-purchase"] {
+            assert!(
+                html.contains(&format!("<dialog id=\"{dialog}\"")),
+                "the draft renders the {dialog} dialog: {html:.400}"
+            );
+        }
+        assert!(
+            element_tag_containing(&html, "id=\"add-line\"").contains("openLineDrawer"),
+            "the bar's add-line button opens the drawer"
+        );
+        assert!(
+            !html.contains("min-[760px]:grid-cols-2"),
+            "the four-card action grid is gone: {html:.400}"
+        );
+        // The discard form sits inside its dialog, not in a loose card.
+        let dialog_start = html
+            .find("<dialog id=\"discard-purchase\"")
+            .expect("the discard dialog renders");
+        let form_pos = html
+            .find(&format!("hx-post=\"{base}/cancel\""))
+            .expect("the discard form posts cancel");
+        let dialog_end = dialog_start
+            + html[dialog_start..]
+                .find("</dialog>")
+                .expect("the discard dialog closes");
+        assert!(
+            form_pos > dialog_start && form_pos < dialog_end,
+            "the discard form must live inside its dialog"
+        );
+
+        // The add-line response refreshes the bar out of band: the main swap
+        // takes only `#purchase-record-money`, and the bar's enabled state
+        // (Confirm disabled at zero lines) must follow the line count.
+        let extra = seed_extra_product(&state, "BAR-EXTRA", None).await;
+        let (status, _, added) = post_form_response(
+            app.clone(),
+            &format!("{base}/lines"),
+            &format!("product_id={}&qty=1&unit_cost=", extra.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added:.400}");
+        let oob_bar = element_tag_containing(&added, "id=\"purchase-action-bar\"");
+        assert!(
+            oob_bar.contains("hx-swap-oob"),
+            "the bar must ride out of band on add-line: {oob_bar}"
+        );
+
+        // -- Confirmed (credit): payment primary + cancel in the menu --------
+        state
+            .purchases_service
+            .confirm(audit_actor(&state).await, fixture.purchase_id, None)
+            .await
+            .unwrap();
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("id=\"purchase-action-bar\"") && html.contains("id=\"record-menu\""),
+            "a confirmed purchase keeps the bar and its menu: {html:.400}"
+        );
+        assert!(
+            html.contains("<dialog id=\"record-payment\""),
+            "the payment form moves into a dialog: {html:.400}"
+        );
+        assert!(
+            html.contains("<dialog id=\"cancel-purchase\""),
+            "cancelling a confirmed purchase asks via its dialog: {html:.400}"
+        );
+        assert!(
+            !html.contains("id=\"line-drawer\""),
+            "a confirmed purchase cannot add lines: {html:.400}"
+        );
+        assert!(
+            !html.contains("<dialog id=\"edit-header\"")
+                && !html.contains("<dialog id=\"confirm-purchase\""),
+            "the header and confirm controls freeze once confirmed: {html:.400}"
+        );
+
+        // -- Cancelled: read-only, no bar, no menu, no dialogs ---------------
+        state
+            .purchases_service
+            .cancel(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some("wrong order".to_string()),
+            )
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        for id in [
+            "purchase-action-bar",
+            "record-menu",
+            "line-drawer",
+            "confirm-purchase",
+            "record-payment",
+        ] {
+            assert!(
+                !html.contains(&format!("id=\"{id}\"")),
+                "a cancelled purchase is read-only, found {id}: {html:.400}"
+            );
+        }
     }
 
     /// The record-page actions swap the record body and keep the

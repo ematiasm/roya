@@ -97,7 +97,7 @@ was deepened and fully approved for implementation (2026-09-22).
 - [x] T1 English unification of purchase surfaces (strings + update pinned
       smoke assertions RED→GREEN).
 - [x] T2 `track_stock` enrichment on purchase lines (models/query + tests).
-- [ ] T3 Sticky action bar + `⋯` secondary menu replacing the 4-card Draft
+- [x] T3 Sticky action bar + `⋯` secondary menu replacing the 4-card Draft
       grid; status-based primary (keep legacy ids).
 - [ ] T4 Effects preview partial (draft, projections only: stock/cash/due;
       no payment inputs; Confirm disabled at 0 lines).
@@ -133,7 +133,24 @@ was deepened and fully approved for implementation (2026-09-22).
       tracking); pins tracked=3 / service line excluded + both per-line
       flags. Re-run: test 1 passed; `cargo test purchase` 119 passed,
       `cargo test document` 58 passed. Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T3.
+- [x] T3 done. RED: new `web_purchase_record_renders_sticky_action_bar_and_status_dialogs`
+      failed (no `purchase-action-bar`). GREEN: the 4-card grid became a sticky
+      bar (`sticky top-14 md:top-0 z-20`, after the identity header, outside
+      `record_money`) with status primaries (Draft `Confirm ▾` disabled at 0
+      lines + `#add-line` drawer button; Confirmed-Credit `+ Record payment`;
+      Confirmed-Cash menu only) and a `⋯` menu; action forms moved into
+      `<dialog>`s keeping the legacy ids; add-line drawer (documents shell,
+      `line_picker` untouched) hosts the picker; `oob_action_bar` rides with
+      the OOB picker (verified against htmx 1.9.12 source: OOB runs before
+      `hx-select`); all page-shell JS (menu/drawer/Escape/header-anchor) in
+      `purchase.html`; both `assert_oob_picker_is_empty_and_focused` helpers
+      re-pinned to find the OOB picker by tag, not the first OOB. Tailwind
+      regenerated (`scripts/build-css.sh`). Re-run: new test 1 passed,
+      `cargo test purchase` 120, `picker` 8, `line_picker` 2, `sale` 136,
+      wiring guards (`seeded_pages_render_only_wired`, `wiring_guard` 15,
+      `fragment_external_selectors`) green. FULL `cargo test`: 801 passed.
+      Commit hash recorded at T8.
+- [ ] All remaining tasks pending. Next step: T4.
 
 ## Acceptance criteria (feature-level)
 
