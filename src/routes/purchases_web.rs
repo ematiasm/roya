@@ -3737,7 +3737,7 @@ mod tests {
         assert_eq!(
             line.unit_cost,
             Decimal::from(10),
-            "an empty cost falls back to the product cost price"
+            "an empty cost uses the product cost price only when the supplier has no satellite row"
         );
 
         // One response carries the lines, the running total and the OOB picker, so

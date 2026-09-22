@@ -315,9 +315,13 @@ where
                 }
                 c
             }
-            // Manual line with no supplier cost yet: fall back to the product
-            // column, which purchases never write.
-            None => product.cost_price,
+            // Manual line with no explicit cost: this supplier's satellite cost
+            // wins; only when no satellite row exists does the product column
+            // apply (the fallback purchases never write).
+            None => match self.suppliers.find_cost(product_id, purchase.supplier_id).await? {
+                Some(row) => row.current_cost,
+                None => product.cost_price,
+            },
         };
         let line = self
             .purchases
@@ -2440,6 +2444,86 @@ mod tests {
         let other_stored = s.inventory.get_product(other.id).await.unwrap();
         assert_eq!(other_stored.cost_price, dec("7"));
         let _ = pool;
+    }
+
+    // -- add_line empty-cost default: satellite for THIS supplier wins -------------
+
+    #[tokio::test]
+    async fn add_line_empty_cost_records_satellite_cost_for_this_supplier() {
+        let (s, _pool) = svc().await;
+        // Column says 5; the satellite says this supplier charges 9.50.
+        let prod = seed_product(&s, "LINE-DEF", "5").await;
+        let sup = seed_supplier(&s, "LINE-DEF SUP").await;
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let purchase = draft_credit(&s, sup.id).await;
+        let line = s
+            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(line.unit_cost, dec("9.50"), "empty cost must default to the supplier's satellite cost");
+    }
+
+    #[tokio::test]
+    async fn add_line_empty_cost_falls_back_to_product_column_without_satellite_row() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "LINE-FB", "5").await;
+        let sup = seed_supplier(&s, "LINE-FB SUP").await;
+
+        let purchase = draft_credit(&s, sup.id).await;
+        let line = s
+            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(line.unit_cost, dec("5"), "no satellite row => the product column is the fallback");
+    }
+
+    #[tokio::test]
+    async fn add_line_explicit_cost_wins_over_satellite_row() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "LINE-EXPL", "5").await;
+        let sup = seed_supplier(&s, "LINE-EXPL SUP").await;
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let purchase = draft_credit(&s, sup.id).await;
+        let line = s
+            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("12")))
+            .await
+            .unwrap();
+
+        assert_eq!(line.unit_cost, dec("12"), "an explicit cost must not be replaced by the satellite");
+    }
+
+    #[tokio::test]
+    async fn add_line_empty_cost_does_not_leak_another_suppliers_row() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "LINE-LEAK", "5").await;
+        let sup_a = seed_supplier(&s, "LINE-LEAK A").await;
+        let sup_b = seed_supplier(&s, "LINE-LEAK B").await;
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup_a.id, dec("8"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup_b.id, dec("6.25"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let purchase_b = draft_credit(&s, sup_b.id).await;
+        let line_b = s
+            .add_line(audit_actor(&s).await, purchase_b.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(line_b.unit_cost, dec("6.25"), "a purchase for B must default to B's cost, not A's");
     }
 
     // -- AC11: references ---------------------------------------------------------

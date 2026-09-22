@@ -42,7 +42,9 @@ Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount
   current one shifts the current value and its date into `previous`, and the new value becomes current.
   A repeated identical cost refreshes only the date, so `previous` keeps the last genuinely different
   price and the derived raised/lowered alert stays meaningful (`100 → 120 → 120 → 120` still reports
-  a raise against 100). The alert is derived; nothing is stored.
+  a raise against 100). The alert is derived; nothing is stored. When a line is added without an
+  explicit cost, the line records the purchase's supplier's current satellite cost, falling back to
+  `products.cost_price` only when that supplier has no satellite row for the product.
 - **A purchase never writes `products.cost_price`.** That column is the fallback for products with no
   supplier row, such as services. The read rule is: if the satellite has rows for the product, the
   satellite wins; otherwise the column.

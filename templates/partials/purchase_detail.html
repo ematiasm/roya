@@ -386,7 +386,7 @@
       </div>
     </div>
     <div class="flex-1 overflow-y-auto p-4">
-      {% call picker::line_picker(false, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = product cost)", "product cost", "cost") %}
+      {% call picker::line_picker(false, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = supplier cost)", "supplier cost", "cost") %}
     </div>
   </div>
   {% else if record.purchase.status.to_string() == "Confirmed" %}
@@ -445,4 +445,4 @@
 
 {# The line response keeps the picker outside the swapped money region and swaps
    it out of band with an empty, focused field, so the next scan lands there. #}
-{% if oob_picker %}{% call picker::line_picker(true, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = product cost)", "product cost", "cost") %}{% endif %}
+{% if oob_picker %}{% call picker::line_picker(true, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = supplier cost)", "supplier cost", "cost") %}{% endif %}

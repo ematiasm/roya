@@ -4070,8 +4070,9 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     );
 
     // Scan 1: the reader types the barcode and presses Enter. The form carries the
-    // field and the quantity, never a product id. The empty cost falls back to the
-    // product cost price (10).
+    // field and the quantity, never a product id. The fixture's supplier has no
+    // satellite row for the product, so the empty cost uses the product cost price
+    // (10).
     let (status, added) = post_form(
         &app,
         &format!("{base}/lines"),
