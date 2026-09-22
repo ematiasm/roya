@@ -26,6 +26,29 @@
     var dlg = document.getElementById(id);
     if (dlg) dlg.showModal();
   }
+  // Payment at confirm (purchase-payment-at-confirm): switching the dialog
+  // type radio activates exactly one side — Cash shows/enables the method
+  // select and hides the due input (clearing its value so a Credit draft
+  // switched to Cash posts due=empty → the route clears it); Credit shows
+  // and requires the due input and hides+disables the method select so no
+  // method is submitted. The server-rendered initial state mirrors this.
+  function toggleConfirmPaymentType(form) {
+    if (!form) return;
+    var chosen = form.querySelector('input[name="payment_type"]:checked');
+    if (!chosen) return;
+    var cash = chosen.value === 'Cash';
+    var methodBlock = form.querySelector('#confirm-method-block');
+    var method = form.querySelector('#confirm-method');
+    var dueBlock = form.querySelector('#confirm-due-block');
+    var due = form.querySelector('#confirm-due-date');
+    if (methodBlock) methodBlock.hidden = !cash;
+    if (method) { method.disabled = !cash; method.required = cash; }
+    if (dueBlock) dueBlock.hidden = cash;
+    if (due) {
+      due.required = !cash;
+      if (cash) due.value = '';
+    }
+  }
   // T6 keep-open preference: default OFF, persisted in localStorage. The
   // checkbox lives in the drawer shell (outside the OOB-swapped picker), and
   // the page shell — not the swapped fragment — owns the read/write so the

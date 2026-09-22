@@ -90,9 +90,20 @@ solo con proveedor y fecha".
       `payment_type`), GREEN after template edits `1 passed`.
       `cargo test payment_type_defaults_to_cash` → `2 passed` (pinning the
       pre-existing server default, green immediately). `cargo test purchases_web`
-      → `46 passed, 762 filtered out`.
-- [ ] T2 Confirm dialog gains type + due (prefilled); confirm route updates
+      → `46 passed, 762 filtered out`. Commit: `b61f689`.
+- [x] T2 Confirm dialog gains type + due (prefilled); confirm route updates
       then confirms; RED tests for Cash/Credit paths incl. due clearing.
+      Evidence: RED `cargo test web_confirm` → markup test failed (dialog had
+      no type radio), Cash path failed (400 vs 200), Credit path failed (due
+      2024-06-02 vs 2024-07-15), header-update-failure test failed (due not
+      updated), method-active test failed; omitting-type pin passed. GREEN after
+      `ConfirmPurchaseForm` + update-then-confirm route + dialog rewrite +
+      shell `toggleConfirmPaymentType`: `cargo test web_confirm` → `5 passed`;
+      `cargo test web_purchase_record_activates_method_only_for_cash` →
+      `1 passed`; `cargo test purchases_web` → `51 passed, 762 filtered out`;
+      `cargo test smoke_tests` → `93 passed, 720 filtered out` (a comment
+      apostrophe in `templates/purchase.html` had flipped the guard's naive
+      quote pairing and exposed `indexOf('/lines')` as a probe — reworded).
 - [ ] T3 Hide Draft type badges (detail + list); effects preview shows both
       scenarios; RED tests.
 - [ ] T4 Edit header drops Due date field; RED test.
@@ -105,7 +116,7 @@ T1–T4: delegated direct (writer trigger: 2+ non-trivial files).
 
 ## Progress
 
-- [ ] All tasks pending. Next step: T1.
+- [x] T1 done (commit `b61f689`), T2 done. Next step: T3.
 
 ## Acceptance criteria
 

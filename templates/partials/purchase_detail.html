@@ -247,6 +247,13 @@
      (purchase.html) owns the open/close JS; these ids are the record's
      legacy anchors. #}
   {% if record.purchase.status.to_string() == "Draft" %}
+  {# Payment is decided HERE (purchase-payment-at-confirm T2): the type radio
+     prefills from the stored value (REST or legacy drafts may carry one),
+     the due input is active only for Credit (required, prefilled from
+     storage) and the method select only for Cash — the shell's
+     toggleConfirmPaymentType flips hidden+disabled+required on switch, so
+     the inactive side is neither shown nor submitted. The posts reach a
+     route that updates the draft header, then confirms. #}
   <dialog id="confirm-purchase" class="rounded-2xl border border-border bg-card p-5 text-text">
     <div class="mb-3 flex items-center justify-between gap-6">
       <h2 class="text-lg font-semibold">Confirm purchase</h2>
@@ -256,22 +263,38 @@
     <form class="flex flex-col gap-2.5" data-action="Confirm purchase"
           hx-post="/web/purchases/{{ record.purchase.id }}/confirm"
           hx-target="#purchase-record" hx-swap="innerHTML">
-      {% if record.purchase.payment_type.to_string() == "Cash" %}
       <div>
+        <label>Payment type</label>
+        <div class="flex gap-4">
+          <label class="flex items-center gap-1.5 text-sm">
+            <input type="radio" id="confirm-type-cash" name="payment_type" value="Cash"
+                   {% if record.purchase.payment_type.to_string() == "Cash" %}checked{% endif %}
+                   onchange="toggleConfirmPaymentType(this.form)" />
+            Cash
+          </label>
+          <label class="flex items-center gap-1.5 text-sm">
+            <input type="radio" id="confirm-type-credit" name="payment_type" value="Credit"
+                   {% if record.purchase.payment_type.to_string() == "Credit" %}checked{% endif %}
+                   onchange="toggleConfirmPaymentType(this.form)" />
+            Credit
+          </label>
+        </div>
+      </div>
+      <div id="confirm-due-block"{% if record.purchase.payment_type.to_string() == "Cash" %} hidden{% endif %}>
+        <label for="confirm-due-date">Due date</label>
+        <input type="date" id="confirm-due-date" name="due_date"
+               value="{% if let Some(due) = record.purchase.due_date %}{{ due }}{% endif %}"
+               {% if record.purchase.payment_type.to_string() == "Credit" %}required{% endif %} />
+      </div>
+      <div id="confirm-method-block"{% if record.purchase.payment_type.to_string() == "Credit" %} hidden{% endif %}>
         <label for="confirm-method">Method (the cash account is derived from it)</label>
-        <select id="confirm-method" name="method_id" required>
+        <select id="confirm-method" name="method_id"
+                {% if record.purchase.payment_type.to_string() == "Credit" %}disabled{% else %}required{% endif %}>
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
           {% endfor %}
         </select>
       </div>
-      {% else %}
-      <p class="text-[13px] text-muted">
-        Credit purchase · ${{ record.total }} due on
-        {% if let Some(due) = record.purchase.due_date %}{{ due }}{% else %}(no due date){% endif %}
-        after confirm. No payment is recorded yet.
-      </p>
-      {% endif %}
       <button type="submit" class="bg-accent2 text-white">Confirm</button>
     </form>
   </dialog>
