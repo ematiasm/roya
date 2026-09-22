@@ -1003,12 +1003,19 @@ mod tests {
         use chrono::NaiveDate;
         use rust_decimal::Decimal;
 
+        // A per-process suffix: one test may seed several fixtures, and the
+        // product SKU must not collide across them (the purchase twin does
+        // the same).
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let sku = format!("REC-SALE-{seq}");
+
         let product = state
             .inventory_service
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "REC-P1".into(),
+                sku,
                 name: "Record product".into(),
                 kind: ProductKind::Product,
                 category_id: None,
@@ -1047,7 +1054,14 @@ mod tests {
             .add_line(sale.id, product.id, Decimal::from(2), None)
             .await
             .unwrap();
-        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
+        // accounts.name is UNIQUE: suffix it per fixture, and still pass the
+        // canonical "Caja" to the defaults helper so the Cash method seeds
+        // (the purchase fixture does the same).
+        let account = state
+            .account_service
+            .create(audit_actor(&state).await, &format!("Caja {seq}"))
+            .await
+            .unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
@@ -2512,6 +2526,63 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    /// T3: the record page offers Delete — with the native confirm — ONLY for
+    /// a discarded (never-confirmed, number still NULL) cancelled sale.
+    /// A confirmed-then-cancelled record carries its number and must show no
+    /// delete at all.
+    #[tokio::test]
+    async fn web_sale_record_offers_delete_only_for_a_discarded_cancelled_sale() {
+        let state = test_state().await;
+        let discarded = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .sales_service
+            .cancel(audit_actor(&state).await, discarded.sale_id, None)
+            .await
+            .unwrap();
+
+        let annulled = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .sales_service
+            .confirm(
+                audit_actor(&state).await,
+                annulled.sale_id,
+                Some(annulled.method_id),
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .cancel(
+                audit_actor(&state).await,
+                annulled.sale_id,
+                Some("wrong order".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", discarded.sale_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let needle = format!("hx-delete=\"/web/sales/{}\"", discarded.sale_id);
+        assert!(
+            html.contains(&needle),
+            "a discarded sale must offer delete: {html:.400}"
+        );
+        assert!(
+            element_tag_containing(&html, &needle).contains("hx-confirm"),
+            "deleting must ask first"
+        );
+
+        let (status, html) = get_html(app, &format!("/sales/{}", annulled.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains(&format!("hx-delete=\"/web/sales/{}\"", annulled.sale_id)),
+            "a confirmed-then-cancelled record must offer no delete: {html:.400}"
+        );
     }
 
     #[tokio::test]

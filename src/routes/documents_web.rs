@@ -554,7 +554,10 @@ fn draft_lines_phrase(n: usize) -> (String, String) {
 /// only — the drawer never invents one: the delete exists for a DRAFT (a
 /// draft never touched stock, money or a customer's debt, so nothing
 /// dangles), Anular/Descartar re-present the tested `cancel` endpoint, and a
-/// cancelled document offers nothing because its inverse already happened.
+/// cancelled sale re-offers the delete ONLY while it was discarded before
+/// confirm (`sale_number` still NULL: same nothing-posted argument as the
+/// draft) — a cancelled sale that carries a number was confirmed first and
+/// offers nothing because its inverse already happened.
 async fn sale_actions(
     state: &AppState,
     principal: &Principal,
@@ -605,7 +608,31 @@ async fn sale_actions(
                 actions.push(sale_annul_action(state, record).await?);
             }
         }
-        SaleStatus::Cancelled => {}
+        SaleStatus::Cancelled => {
+            // Number still NULL → discarded before confirm → deletable. With
+            // a number the sale was confirmed first: permanent audit trail
+            // (refund transactions reference its payments), no action.
+            if sale.sale_number.is_none() && principal.has(SalesCreate::CODE) {
+                let n = record.lines.len();
+                let (lines_phrase, listed) = draft_lines_phrase(n);
+                actions.push(DrawerAction {
+                    label: "Eliminar descarte".to_string(),
+                    method: "delete".to_string(),
+                    path: format!("/web/sales/{}", sale.id),
+                    fields: vec![],
+                    reason: false,
+                    data_action: "Eliminar descarte".to_string(),
+                    impact: vec![
+                        format!("Se elimina el descarte y {lines_phrase} ({listed})."),
+                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
+                            .to_string(),
+                    ],
+                    confirm: Some(format!(
+                        "¿Eliminar el descarte y {lines_phrase}? Esta acción no se puede deshacer."
+                    )),
+                });
+            }
+        }
     }
     Ok(actions)
 }
@@ -1734,9 +1761,11 @@ mod tests {
     }
 
     /// A cancelled document offers no action at all and says why: the document
-    /// is annulled, its inverse already happened.
+    /// is annulled, its inverse already happened. The fixture confirms FIRST,
+    /// so its number marks it confirmed-then-cancelled — the state that must
+    /// stay actionless even after discarded sales gained their delete.
     #[tokio::test]
-    async fn document_drawer_cancelled_sale_offers_no_action() {
+    async fn document_drawer_confirmed_then_cancelled_sale_offers_no_action() {
         let state = test_state().await;
         let (product, _, method) = seed_sale_kit(&state).await;
         let sale =
@@ -1765,6 +1794,65 @@ mod tests {
         assert!(
             html.contains("anulado"),
             "the drawer must say the document is annulled: {html:.800}"
+        );
+    }
+
+    /// T3: the drawer — home of the existing draft delete — offers the delete
+    /// for a DISCARDED sale (Cancelled while never confirmed: no number)
+    /// and nothing for a confirmed-then-cancelled one, whose number proves it
+    /// must stay as audit trail.
+    #[tokio::test]
+    async fn document_drawer_discarded_sale_offers_delete_but_annulled_does_not() {
+        let state = test_state().await;
+        let (product, _, method) = seed_sale_kit(&state).await;
+
+        // Discarded: cancelled before confirm, number stays NULL → delete renders.
+        let discarded_id = seed_sale(&state, product, false).await;
+        state
+            .sales_service
+            .cancel(audit_actor(&state).await, discarded_id, None)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/sale/{discarded_id}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains(&format!("hx-delete=\"/web/sales/{discarded_id}\"")),
+            "a discarded sale must offer its delete: {html:.800}"
+        );
+        assert!(
+            html.contains("hx-confirm"),
+            "the delete must ask first: {html:.800}"
+        );
+
+        // Confirmed then cancelled: the number proves it → NO delete renders.
+        let annulled_id =
+            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
+                .await;
+        state
+            .sales_service
+            .cancel(
+                audit_actor(&state).await,
+                annulled_id,
+                Some("wrong order".to_string()),
+            )
+            .await
+            .unwrap();
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/sale/{annulled_id}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains(&format!("hx-delete=\"/web/sales/{annulled_id}\"")),
+            "a confirmed-then-cancelled sale must offer no delete: {html:.800}"
         );
     }
 

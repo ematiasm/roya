@@ -76,8 +76,27 @@ T1–T3: **delegated direct** (writer trigger: 2+ non-trivial files).
       Commit: df59bc5.
 - [x] T2 Service + route (RED→GREEN; refusal names state; contract unchanged).
       Commits: b0ba110 + route-tests commit.
-- [ ] T3 UI both surfaces (record page + documents drawer) + tests; smoke/e2e if pinned
+- [x] T3 UI both surfaces (record page + documents drawer) + tests; smoke/e2e if pinned
       contracts change.
+      Commit: (this task's work-unit commit).
+      Evidence: RED `cargo test web_sale_record_offers_delete_only` → 1 failed
+      ("a discarded sale must offer delete") and `cargo test
+      document_drawer_discarded_sale_offers` → 1 failed ("a discarded sale
+      must offer its delete"); GREEN after the sale_actions Cancelled arm
+      (Delete iff `sale_number.is_none()` && `SalesCreate`) and the
+      sale_detail.html Cancelled+None button (hx-confirm, `HX-Trigger:
+      sale-changed` contract kept). The old
+      `document_drawer_cancelled_sale_offers_no_action` was renamed
+      `..._confirmed_then_cancelled_...` — its fixture confirms first, so the
+      expectation holds; the name now tells the truth. Record fixture got the
+      purchases-style per-process SKU/account suffix (two fixtures per test
+      collided on `REC-P1`/`Caja`). Smoke: `cargo test smoke` → 93 passed
+      (grep: no pinned assertion covers the new discarded state; fixtures are
+      draft/confirmed). E2E: skipped — no e2e-pinned DOM contract changed
+      (the suite pins the SALE draft drawer delete, the discard/cancel
+      dialogs and the cancelled list row — all untouched; the new Delete
+      buttons render on discarded-sale surfaces, and no browser test asserts
+      their absence).
 - [ ] T4 Full `cargo test` green; e2e if affected; evidence checkoffs with commit hashes.
 
 ## Progress
