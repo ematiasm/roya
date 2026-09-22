@@ -74,7 +74,9 @@ Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount
   strictly higher than the product's stored cost, when that stored cost is non-zero (zero means no
   cost recorded yet), renders a stale-cost warning with an "Apply to product" action
   (`POST /web/purchases/{purchase_id}/lines/{line_id}/apply-cost`, confirmed-only, gated
-  `inventory.write`); `/suppliers` with the cost satellite and its
+  `inventory.write`); a purchase confirmed and later cancelled shows nothing — its costs were
+  real when confirmed, but it is a historical document — and the apply action refuses it;
+  `/suppliers` with the cost satellite and its
   raise/lower badge, and the drawer detail with the pay-supplier form (`POST /web/supplier-payments`)
   and the record-cost form.
 

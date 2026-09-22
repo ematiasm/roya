@@ -1584,6 +1584,49 @@ mod tests {
         );
     }
 
+    /// The decided scope is `Confirmed` only. A purchase confirmed and later
+    /// cancelled is a historical document: its costs were real when confirmed,
+    /// but the document is closed and feeding them into a product update would
+    /// be a silent write from a record that no longer moves goods or money, so
+    /// it shows nothing and the apply handler refuses it. The positive control
+    /// lives in the same test so it proves the cancellation is what removed the
+    /// flag, not that the flag never existed — a gate loosened to anything
+    /// non-draft (e.g. `!= Draft`) keeps every confirmed and draft test green
+    /// while a cancelled purchase silently starts flagging.
+    #[tokio::test]
+    async fn stale_line_cost_confirmed_then_cancelled_does_not_flag() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "CF-CANCEL", "5").await;
+        let sup = seed_supplier(&s, "CF CANCEL SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        // Same shape as the confirmed positive case: line cost 7 over stored 5.
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+
+        // Positive control: while confirmed, this same purchase DID flag.
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        let stale = views[0]
+            .stale_cost
+            .as_ref()
+            .expect("a rising cost must be flagged while the purchase is confirmed");
+        assert_eq!(stale.line_cost, dec("7"));
+        assert_eq!(stale.stored_cost, dec("5"));
+
+        s.cancel(audit_actor(&s).await, purchase.id, Some("devuelvo".into()))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        assert!(
+            views[0].stale_cost.is_none(),
+            "a confirmed-then-cancelled purchase is a historical document; it must not flag"
+        );
+    }
+
     // -- AC1 ------------------------------------------------------------------
 
     #[tokio::test]

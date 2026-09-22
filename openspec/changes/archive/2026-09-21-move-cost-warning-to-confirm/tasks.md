@@ -9,9 +9,15 @@
 - [x] T1: the gate inversion — `stale_cost` derived only on a `Confirmed` purchase in
       `PurchasesService::record_from_detail` (strictly-higher and non-zero-stored gates kept,
       draft and cancelled show nothing), the `web_apply_line_cost` handler refusing any
-      non-confirmed status itself, and the route tests updated for the new gate (including the
-      refusal of a draft and the confirmed-then-cancelled case).
+      non-confirmed status itself, and the route tests updated for the new gate (including
+      the refusal of a draft).
       (2026-09-21: delivered as `f873305` on `fix/cost-warning-at-confirm`.)
+      Correction (2026-09-21): this slice as delivered did **not** include the
+      confirmed-then-cancelled case — no test covered it, though the code and the design
+      already treat `Cancelled != Confirmed` as decided behaviour. The missing service test
+      (`stale_line_cost_confirmed_then_cancelled_does_not_flag`, with the while-confirmed
+      positive control) was added afterwards on the same branch; until then this entry
+      over-claimed.
 - [x] T2: the browser journey updated — a confirmed purchase's line warns with both numbers,
       applying updates the product, and a draft shows no warning.
       (2026-09-21: delivered within `f873305`.)

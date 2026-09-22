@@ -1,5 +1,10 @@
 # Spec: add-cost-price-freshness (M1 inventory / M3 purchases)
 
+> **Superseded (2026-09-21):** the line-cost warning no longer lives on a draft — it moved to a
+> **Confirmed** purchase (and the apply action refuses non-confirmed purchases). See
+> `openspec/changes/archive/2026-09-21-move-cost-warning-to-confirm/`; this folder stays as
+> delivered.
+
 Delivered on `feat/cost-price-freshness`; these rules are the present-tense truth in
 `openspec/specs/inventory/spec.md` (the products badge) and `openspec/specs/purchases/spec.md`
 (the apply-cost route and its authorization consequence). This delta extends two existing

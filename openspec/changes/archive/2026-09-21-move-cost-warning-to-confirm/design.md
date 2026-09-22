@@ -50,5 +50,7 @@ badge fires on any disagreement), with **several suppliers** (a non-preferred su
 cost may differ from the reference cost the badge uses), or **after a confirmed-then-cancelled
 purchase** (the line stops warning while the badge keeps comparing the satellite). This is by
 design rather than a defect: the badge is a permanent standing signal, the warning is an
-ephemeral, line-scoped prompt to act on the exact cost just recorded. The drawer badge covers
-any disagreement the warning deliberately does not.
+ephemeral, line-scoped prompt to act on the exact cost just recorded. The two signals are
+complementary, not redundant: as the bullets above show, the badge can stay silent while the
+warning fires (several suppliers, a line cost above the reference cost) and vice versa, so
+neither covers the other outright.
