@@ -108,7 +108,23 @@ item out as domain work rather than presentation.
     lacks the field.
 12. **Drafts are already persisted server-side.** Every mutation is an immediate
     POST; there is no client-side cart and no document state in the browser. The
-    zero-unsaved-state design in S4 makes that structural rather than incidental.
+    zero-unsaved-state design in S5 makes that structural rather than incidental.
+13. **The peek is the existing fragment, not a second one.** `/purchases` opens
+    `GET /web/documents/detail/purchase/{id}` into the same drawer shell the
+    sibling drawers use. `/documents` and `/purchases` therefore show one peek,
+    defined once. (Decided 2026-09-22.)
+14. **The peek keeps its draft actions.** `Eliminar borrador` (gated
+    `purchases.create`) and `Descartar` (gated `purchases.cancel`), both with a
+    mandatory impact preview, stay. Read-only holds for the document's content;
+    the lifecycle actions are the only writes and they are the ones an operator
+    wants without leaving the list. (Decided 2026-09-22.)
+15. **SKU leaves the drawer line tables.** The drawer is a view; SKU is the least
+    read column and it made the table cramped with no scroll wrapper. Both
+    families lose it, so `/documents` changes too. Done in S3 part A. (Decided
+    2026-09-22.)
+16. **The drawer keeps `max-w-md`.** A 768 px widening was considered and
+    rejected: dropping the SKU column buys the space instead. (Decided
+    2026-09-22.)
 
 ## Out of scope, parked deliberately
 
@@ -187,28 +203,35 @@ item out as domain work rather than presentation.
       falls back to `products.cost_price` only with no satellite row. Four unit
       tests pin the order; the picker label and two stale test messages were
       corrected in the same commit. Done in `737b1bd`.
-- [ ] **S3 — The record panel.** `/purchases/{id}` renders the list with the panel
-      open server-side; the record fragment loads into it over HTMX for in-page
-      clicks; the receiving-desk script is extracted to a partial shared by
-      `purchase.html` and `purchases.html`; the panel width and the line-row
-      stacking below its breakpoint are decided and implemented.
-- [ ] **S4 — The entry row.** Picking a product commits a line immediately at
+- [x] **S3 — The read-only peek on `/purchases`.** The list row opens the
+      existing document fragment (`GET /web/documents/detail/purchase/{id}`)
+      into a drawer shell; the row is one anchor carrying both the `hx-get` and a
+      real `href` to the record page; the `Open` button is gone. SKU left both
+      drawer line tables. Done in `ee90d3e` (part A) and `4a8ec2e` (part B).
+- [ ] **S4 — `/purchases/new` as a creation page.** Supplier (required), purchase
+      date (default today), supplier invoice no and notes, all four in one form;
+      `page_action_href` becomes `/purchases/new`, so `page_header.html` is not
+      touched. Creating still lands on `/purchases/{id}`. The Edit header dialog
+      on the record page gains the supplier select (`UpdatePurchaseDraft.supplier_id`
+      already supports it; only `UpdatePurchaseHeaderForm` lacks the field).
+- [ ] **S5 — The entry row.** Picking a product commits a line immediately at
       qty 1, so there is no unsaved state; the qty field acts as an optional
       multiplier that resets; a repeat product increments the existing line (A1).
       The add-line drawer, the keep-open checkbox, its `localStorage` preference
       and the OOB picker swap are deleted. `e2e/tests/test_picker.py` is rewritten
       to the new order.
-- [ ] **S5 — List row + status palette.** Responsive grid row (identifier,
+- [ ] **S6 — List row + status palette.** Responsive grid row (identifier,
       supplier, date/items, total, state); the total stops encoding payment
       state; a status chip carries paid / pending / overdue; the new warning
       token; the technical subtitle deleted from `/purchases` and `/sales`.
-- [ ] **S6 — Sales mirror.** The same row and panel on `/sales`.
-- [ ] **S7 — One language, one date format.** Centralized labels +
-      `format_date`; English across the sidebar, the document groups and the
-      audit labels still Spanish in ten partials (`Registrado por`,
-      `Actualizado por`, `Sugerido`, `Abrir`); specs and the tests that assert
-      the Spanish labels updated.
-- [ ] **S8 (optional) — Unified `q` search.** `PurchaseListQuery` collapses
+- [ ] **S7 — Sales mirror.** The same row and peek on `/sales`.
+- [ ] **S8 — One language, one date format.** Centralized labels +
+      `format_date`; English across the sidebar, the document groups, the peek's
+      operator copy (`Editar cabecera`, `Abrir el documento`, `Proveedor`,
+      `Líneas`, …) and the audit labels still Spanish in ten partials
+      (`Registrado por`, `Actualizado por`, `Sugerido`); specs and the tests that
+      assert the Spanish labels updated.
+- [ ] **S9 (optional) — Unified `q` search.** `PurchaseListQuery` collapses
       `supplier` + `number` into one free-text field; service + repo change.
 
 ## Acceptance criteria
@@ -239,22 +262,21 @@ item out as domain work rather than presentation.
 |-------|--------|--------------------|
 | S1 | **done** | `8e22377` — 4 templates, 4 contract tests, stylesheet regenerated. Worker observed RED (4 failures: "the REST API card must not be rendered on …") then GREEN; `gentle-ai-verify` confirmed `cargo test` 834 passed / 0 failed, the wiring guard `seeded_pages_render_only_wired_htmx_targets` green, and the surviving sidebar link intact. Parent review caught and fixed two writer defects before commit: an unrelated HTML comment deleted from `dashboard.html`, and a stale test cross-reference (`sidebar_renders_*` → `sidebar_groups_navigation_into_operation_catalogue_and_cash`). |
 | S2 | **done** | `737b1bd` — `fix(purchases)`, 5 files. Worker RED: `left: 5 / right: 9.50` ("empty cost must default to the supplier's satellite cost") then GREEN. `gentle-ai-verify` verdict *pass* on `cargo test` 838 passed / 0 failed, with the `Some(c)` branch byte-identical to HEAD and 2 of the 4 new tests confirmed as genuine RED pins (the other 2 are triangulation). The verifier raised two caveats, both fixed inside the commit: the picker label `Unit cost (empty = product cost)` had become false, and two test messages still stated the old unconditional rule. |
-| S3 | not started | — |
+| S3 | **done** | `ee90d3e` (part A) + `4a8ec2e` (part B) — 5 files. Worker observed RED for both parts (drawer headers `left: ["Producto", "SKU", …]`; `/purchases` missing the peek shell) then GREEN. `gentle-ai-verify` verdict *pass-with-caveats* on `cargo test` 842 passed / 0 failed: header/cell counts read as 4 and 4 in both tables, exactly 4 deleted lines, no nested anchor, Escape handlers statically disjoint, no new route or Tailwind utility, guard green. Both caveats fixed before commit: an orphan wrapper `div` left by the deleted `Open` anchor, and a smoke comment/assertion that still claimed the drawer rendered SKU (the token matched the product's name, so it proved nothing). Parent review also caught the writer titling the new shell `Compra` — new Spanish on an English page — and changed it to `Purchase`. |
 | S4 | not started | — |
 | S5 | not started | — |
 | S6 | not started | — |
 | S7 | not started | — |
-| S8 | not started (optional) | — |
+| S8 | not started | — |
+| S9 | not started (optional) | — |
 
 ## Open decisions
 
-- **Panel width.** `w-full` below a breakpoint and a cap above it is free (the
-  shell already does `w-full max-w-md`). The real work is the line rows, which
-  cannot hold five columns at phone width and must stack. The cap value and the
-  stacking breakpoint are still to be confirmed.
-- **Supplier/date in the panel header.** Read-only facts plus the Edit header
-  dialog (recommended: an always-editable supplier select in a narrow panel is
-  one mis-click away from moving a whole draft) versus inline editable selectors.
 - **`redesign-interface` bookkeeping.** Its R3/AC5 survive intact under this
-  design, so the change needs a note that the record view is now list+panel, not
-  a page reversal.
+  design (the record page is untouched and the row keeps a real `href`), so the
+  change needs a note that `/purchases` now peeks instead of navigating, not a
+  page reversal.
+- **Quick-create supplier.** Not built: `new-supplier-dialog` exists only in
+  `suppliers.html`, so a missing supplier still forces a detour to `/suppliers`.
+  Cheap to add later (`POST /web/suppliers` exists), and it must not nest a
+  `<dialog>` inside the creation page's form.
