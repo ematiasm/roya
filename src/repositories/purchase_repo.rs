@@ -154,14 +154,17 @@ pub trait PurchaseRepository: Send + Sync {
         -> AppResult<PurchaseLine>;
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
-    /// Delete a DRAFT purchase and let its lines die by CASCADE. The `status =
-    /// 'Draft'` in the WHERE is the load-bearing backstop: even if a caller
-    /// ever relaxed the service's state guard, a Confirmed or Cancelled row
-    /// cannot be removed by this statement — it answers `false` instead, so
-    /// the caller can refuse honestly. A draft is the only deletable state by
-    /// construction (no payments — nothing but a Confirmed document takes
-    /// them — no stock movement, no ledger entry, no supplier debt), so
-    /// nothing dangles. This is a WRITE, not a read: the test read counter
+    /// Delete a DRAFT purchase — or a DISCARDED one (Cancelled while never
+    /// confirmed: `purchase_number IS NULL`) — and let its lines die by
+    /// CASCADE. The predicate in the WHERE is the load-bearing backstop: even
+    /// if a caller ever relaxed the service's state guard, a Confirmed row or
+    /// a Cancelled row that carries a number cannot be removed by this
+    /// statement — it answers `false` instead, so the caller can refuse
+    /// honestly. Both deletable states posted nothing by construction (no
+    /// payments — nothing but a Confirmed document takes them — no stock
+    /// movement, no ledger entry, no supplier debt), so nothing dangles; a
+    /// confirmed-then-cancelled document is permanent audit trail and stays
+    /// protected. This is a WRITE, not a read: the test read counter
     /// stays untouched.
     async fn delete_draft(&self, id: i64) -> AppResult<bool>;
 
@@ -535,14 +538,23 @@ impl PurchaseRepository for SqlitePurchaseRepository {
     }
 
     async fn delete_draft(&self, id: i64) -> AppResult<bool> {
-        // `AND status = 'Draft'` is the backstop that makes deleting a
-        // confirmed (or cancelled) document impossible even if the service
-        // check were relaxed: the WHERE simply matches nothing and the answer
-        // is `false`.
-        let res = sqlx::query(r#"DELETE FROM purchases WHERE id = ? AND status = 'Draft'"#)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        // The WHERE clause is the backstop that makes deleting an
+        // undeletable document impossible even if the service check were
+        // relaxed: the statement simply matches nothing and the answer is
+        // `false`. Deletable = a Draft, OR a Cancelled row whose
+        // `purchase_number` is NULL — a purchase discarded before confirm,
+        // which never touched stock or finance. A Cancelled row WITH a
+        // number was confirmed first and is permanent audit trail (return
+        // movements and refund transactions reference it).
+        let res = sqlx::query(
+            r#"DELETE FROM purchases
+               WHERE id = ?
+                 AND (status = 'Draft'
+                      OR (status = 'Cancelled' AND purchase_number IS NULL))"#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -1491,8 +1503,15 @@ mod tests {
         );
     }
 
+    /// Re-pinned protection test: a purchase that was CONFIRMED (its number was
+    /// assigned at confirm and is immutable) and then cancelled stays
+    /// undeletable — the audit trail (return movements, refund transactions)
+    /// references it. The number is stamped directly, exactly the fact confirm
+    /// would have written: `purchase_number IS NOT NULL` is the only marker
+    /// that separates this fixture from a discarded draft.
     #[tokio::test]
-    async fn delete_draft_on_a_cancelled_purchase_returns_false_and_the_row_survives() {
+    async fn delete_draft_on_a_confirmed_then_cancelled_purchase_returns_false_and_the_row_survives(
+    ) {
         let pool = memory_pool().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let repo = SqlitePurchaseRepository::new(pool.clone());
@@ -1504,11 +1523,78 @@ mod tests {
             actor,
         )
         .await;
+        sqlx::query("UPDATE purchases SET purchase_number = '2024-PURCH-000001' WHERE id = ?")
+            .bind(cancelled)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         assert!(!repo.delete_draft(cancelled).await.unwrap());
         assert_eq!(
             count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", cancelled).await,
-            1
+            1,
+            "a confirmed-then-cancelled purchase must survive a direct repository delete"
+        );
+    }
+
+    /// A discarded (never-confirmed) cancelled purchase posts nothing — it is a
+    /// garbage row and MUST delete, taking its lines with it (CASCADE), while
+    /// a sibling discarded purchase keeps its row.
+    #[tokio::test]
+    async fn delete_draft_on_a_discarded_cancelled_purchase_deletes_it_with_its_lines() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let product = product_id(&pool, actor).await;
+
+        let discarded = seed_purchase_with_status(
+            &pool,
+            "Cancelled",
+            "Discarded Supplier",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) VALUES (?, ?, '1', '5')",
+        )
+        .bind(discarded)
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let other = seed_purchase_with_status(
+            &pool,
+            "Cancelled",
+            "Keep Supplier",
+            d(2024, 5, 3),
+            actor,
+        )
+        .await;
+
+        assert!(
+            repo.delete_draft(discarded).await.unwrap(),
+            "a never-confirmed cancelled purchase is deletable"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", discarded).await,
+            0,
+            "the discarded row must be gone"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchase_lines WHERE purchase_id = ?",
+                discarded
+            )
+            .await,
+            0,
+            "its lines must be gone with it"
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", other).await,
+            1,
+            "the sibling row must survive"
         );
     }
 
