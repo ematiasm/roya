@@ -416,10 +416,12 @@ async fn web_sale_detail(
     render_record(record_context(&state, id).await?, false)
 }
 
-/// `DELETE /web/sales/{id}`: the documents drawer's draft delete. The same
-/// house shape as the other HTMX writes (`web_delete_transaction`): an empty
-/// 200 whose `HX-Trigger` tells the listening pages to re-read the feed — the
-/// business outcome lives in the service, the route only answers.
+/// `DELETE /web/sales/{id}`: the documents drawer's draft delete — the
+/// mirror of the purchase flow, plus the discarded (never-confirmed)
+/// cancelled sale the service now admits. The same house shape as the other
+/// HTMX writes (`web_delete_transaction`): an empty 200 whose `HX-Trigger`
+/// tells the listening pages to re-read the feed — the business outcome
+/// lives in the service, the route only answers.
 async fn web_delete_draft(
     State(state): State<AppState>,
     _: Require<SalesCreate>,

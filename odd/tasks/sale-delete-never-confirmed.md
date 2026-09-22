@@ -80,6 +80,7 @@ T1–T3: **delegated direct** (writer trigger: 2+ non-trivial files).
 
 ## Progress
 - [x] T1 done — RED (822 passed / 1 failed: discarded) then GREEN via predicate + trait-doc (delete_draft: Draft OR Cancelled∧sale_number IS NULL).
+- [x] T2 done — service deletable check (Draft OR Cancelled∧number NULL), refusal + race copy mirrored from purchases, doc comment + route doc updated; 2 new service tests (discarded removes, confirmed-then-cancelled refuses).
 
 ## Acceptance criteria
 1. Discarded cancelled sale: DELETE removes it + lines; record page 404s after.
