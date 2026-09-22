@@ -47,29 +47,38 @@
             </td>
             {% endif %}
           </tr>
-          {# Derived stale-cost warning (cost-freshness T4): only on a draft —
-             the action that follows only exists while the purchase is editable
-             (`ensure_draft`), and the product drawer already carries a
-             permanent badge for the standing disagreement. It renders as a
-             full-width sub-row UNDERNEATH the line row, never inside it: the
-             line row's text order (product, qty, cost…) is asserted as-is by
-             the browser suite, so the warning must not sit between the product
-             and the quantity cells. It lives inside `record_money` so an
-             added line brings its own warning with the `#purchase-record-money`
-             swap. Draft renders 5 header cells (the remove column is
-             Draft-only), hence the colspan. Badge and numbers reuse the
-             product drawer's stale-cost styling — no new Tailwind classes.
+          {# Derived stale-cost warning (cost-freshness T9): only on a
+             CONFIRMED purchase. The service owns the rule, so the row renders
+             on `line.stale_cost` alone — no status check here. A draft is
+             deliberately NOT flagged: a draft line's cost is provisional (the
+             line can still be edited or deleted, and the purchase may never
+             be confirmed at all), so the comparison asserts something the
+             domain does not yet know. Confirming is the moment the cost
+             becomes a fact — which is precisely when the action below makes
+             sense: the document exists, so the recorded cost is real. The
+             product drawer already carries a permanent badge for the standing
+             disagreement. It renders as a full-width sub-row UNDERNEATH the
+             line row, never inside it: the line row's text order (product,
+             qty, cost…) is asserted as-is by the browser suite, so the
+             warning must not sit between the product and the quantity cells.
+             It lives inside `record_money` so a response that swaps the
+             record carries the warning with it — on a confirmed purchase, the
+             confirm response itself brings it to the operator right after the
+             click. A confirmed purchase renders 4 header cells (the remove
+             column is Draft-only), hence the colspan. Badge and numbers reuse
+             the product drawer's stale-cost styling — no new Tailwind
+             classes.
 
              Cost-freshness T5: the warning ACTS. The button posts the line id
              (and nothing else — the product and the cost are resolved
              server-side from the stored line) to the apply-cost route, which
-             is gated `inventory.write` because it writes a product: a
-             purchases-only operator sees the button and gets the forbidden
-             page on click, a visible refusal rather than a silent one. Same
-             visual language as the remove button, no new Tailwind classes. #}
-          {% if record.purchase.status.to_string() == "Draft" %}{% if let Some(stale) = line.stale_cost %}
+             is gated `inventory.write` because it writes a product: an
+             operator without it gets a visible refusal on click, rather than
+             a silent one. Same visual language as the remove button, no new
+             Tailwind classes. #}
+          {% if let Some(stale) = line.stale_cost %}
           <tr class="border-b border-border/60">
-            <td colspan="5" class="py-2.5 pr-3">
+            <td colspan="4" class="py-2.5 pr-3">
               <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
                 <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">stale cost</span>
                 <span class="text-[13px] text-muted">line cost ${{ stale.line_cost_display() }} • stored ${{ stale.stored_cost_display() }}</span>
@@ -80,7 +89,7 @@
               </div>
             </td>
           </tr>
-          {% endif %}{% endif %}
+          {% endif %}
           {% endfor %}
         </tbody>
       </table>

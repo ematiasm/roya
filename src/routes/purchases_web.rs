@@ -719,9 +719,9 @@ async fn web_remove_line(
     changed(&state, purchase_id).await
 }
 
-/// Cost-freshness T5: the stale-cost warning's action. Applies a draft line's
-/// recorded cost to its product — the one `products.cost_price` write that is
-/// not a human product edit.
+/// Cost-freshness T5 (gate corrected in T9): the stale-cost warning's action.
+/// Applies a confirmed purchase line's recorded cost to its product — the one
+/// `products.cost_price` write that is not a human product edit.
 ///
 /// The client sends ONLY the line id (already in the URL): the product and the
 /// cost are resolved server-side from the stored line, and the request body is
@@ -730,19 +730,24 @@ async fn web_remove_line(
 /// line recorded, not whatever a request carries.
 ///
 /// Gate: this action writes a PRODUCT, so it carries `inventory.write` like
-/// every other product write, never `purchases.create`. The button renders for
-/// every draft viewer by design: the purchase page is gated `purchases.read`, so
+/// every other product write, never `purchases.create`. The button renders
+/// on a confirmed purchase by design: the purchase page is gated
+/// `purchases.read`, so
 /// any operator who can open it sees the button, and one who lacks
 /// `inventory.write` gets a visible refusal on click — the application's error
 /// notice for the htmx request, not the forbidden page, which is what a
 /// full-page navigation gets. The audit actor is the acting user, the way `web_edit_product`
 /// passes it under the same permission.
 ///
-/// Draft-only: the button renders only in Draft, and the handler refuses a
-/// non-draft purchase itself. `PurchasesService::ensure_draft` stays private
+/// Confirmed-only: the rule is the inverse of what it once was. Applying
+/// makes sense precisely AFTER the document exists — that is when the line's
+/// cost stops being provisional (a draft line can still be edited or deleted,
+/// and the purchase may never be confirmed at all) and becomes a fact. The
+/// button renders only on a confirmed purchase, and the handler refuses
+/// anything else itself. `PurchasesService::ensure_draft` stays private
 /// inside the service, so the handler holds the same single status comparison
-/// against `PurchaseStatus::Draft` here, in the service's own message shape,
-/// instead of silently duplicating the guard.
+/// against `PurchaseStatus::Confirmed` here, in the service's own message
+/// shape, instead of silently duplicating the guard.
 ///
 /// The write goes through `InventoryService::update_product` with a patch
 /// carrying only `cost_price` — never SQL, never the purchase flow. That path
@@ -756,9 +761,9 @@ async fn web_apply_line_cost(
     Path((purchase_id, line_id)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
     let detail = state.purchases_service.get_detail(purchase_id).await?;
-    if detail.purchase.status != PurchaseStatus::Draft {
+    if detail.purchase.status != PurchaseStatus::Confirmed {
         return Err(AppError::Validation(format!(
-            "purchase {purchase_id} is not editable (status {})",
+            "purchase {purchase_id} is not confirmed (status {})",
             detail.purchase.status
         )));
     }
@@ -1774,20 +1779,23 @@ mod tests {
         );
     }
 
-    /// Cost-freshness T4: a draft line whose cost rose above the product's
-    /// stored cost renders the stale-cost warning with BOTH numbers, as a
-    /// sub-row underneath the line row (never inside it, so the line row's
-    /// text order stays product · qty · cost, which the browser suite
-    /// asserts as-is). The same response that adds a line swaps only
-    /// `#purchase-record-money`, so the warning must ride that fragment.
+    /// Cost-freshness T9: a confirmed purchase whose line cost rose above the
+    /// product's stored cost renders the stale-cost warning with BOTH numbers,
+    /// as a sub-row underneath the line row (never inside it, so the line
+    /// row's text order stays product · qty · cost, which the browser suite
+    /// asserts as-is). The response that confirms swaps the record body, so
+    /// the warning appears right after confirming, inside the region the
+    /// operator is already looking at: `#purchase-record-money`.
     #[tokio::test]
-    async fn web_purchase_record_draft_flags_a_rising_line_cost_on_the_fragment() {
+    async fn web_purchase_record_confirmed_flags_a_rising_line_cost_on_the_fragment() {
         use rust_decimal::Decimal;
 
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         // The fixture's line sits at the product's stored cost (10); push the
-        // line's cost above it to reach the warning's condition.
+        // line's cost above it to reach the warning's condition. The purchase
+        // is still a draft here, and the warning must NOT appear yet — that
+        // is exactly what the inversion test pins.
         state
             .purchases_service
             .update_line(
@@ -1800,11 +1808,41 @@ mod tests {
             .unwrap();
         let app = crate::routes::router(state.clone());
 
+        // Confirming via the route is the journey's own moment: the response
+        // that confirms swaps the refreshed record body, so it must carry the
+        // warning inside `#purchase-record-money` — where the operator
+        // already is, right after the click. (On a draft this used to be
+        // asserted through the add-line response; on a confirmed purchase
+        // add-line is refused, and the confirm response is what creates the
+        // warning.)
+        let (status, _, confirmed) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/confirm", fixture.purchase_id),
+            &format!("method_id={}", fixture.method_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{confirmed:.800}");
+        let money_start = confirmed
+            .find("id=\"purchase-record-money\"")
+            .expect("the confirm response must render the money region");
+        let money_end = confirmed[money_start..]
+            .find(">Payments (")
+            .expect("the money region must be followed by the payments heading");
+        let money = &confirmed[money_start..money_start + money_end];
+        assert!(
+            money.contains(">stale cost<"),
+            "the confirm response must carry the warning inside #purchase-record-money: {money:.800}"
+        );
+        assert!(
+            money.contains("line cost $12.00") && money.contains("stored $10.00"),
+            "the fragment must show both numbers: {money:.800}"
+        );
+
         let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains(">stale cost<"),
-            "a rising line cost must be flagged on the record page: {html:.800}"
+            "a rising line cost must be flagged on the confirmed record page: {html:.800}"
         );
         assert!(
             html.contains("line cost $12.00"),
@@ -1831,81 +1869,14 @@ mod tests {
             "the warning must render as a sub-row right below its line: {}",
             &after_line_row[..table_end]
         );
-
-        // Adding a line swaps only `#purchase-record-money`: the warning must
-        // travel inside that fragment, so a newly added stale line is flagged
-        // by the very response that adds it. The second product keeps the
-        // first line's warning on screen (one product, one line per purchase).
-        let second = seed_extra_product(&state, "COST-RISE", None).await;
-        let (status, _, added) = post_form_response(
-            app,
-            &format!("/web/purchases/{}/lines", fixture.purchase_id),
-            &format!(
-                "product=record&qty=1&unit_cost=15&product_id={}",
-                second.id
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{added}");
-        // An HTTP test cannot see the client-side `hx-select`, so scoping is
-        // proven here the only way it can be: the warning must sit inside the
-        // `#purchase-record-money` element of the response body, not just
-        // somewhere in it. The money region ends where the payments heading
-        // begins (the partial renders them back to back).
-        let money_start = added
-            .find("id=\"purchase-record-money\"")
-            .expect("the add-line response must render the money region");
-        let money_end = added[money_start..]
-            .find(">Payments (")
-            .expect("the money region must be followed by the payments heading");
-        let money = &added[money_start..money_start + money_end];
-        assert!(
-            money.contains(">stale cost<"),
-            "the add-line response must carry the warning inside #purchase-record-money: {money:.800}"
-        );
-        assert!(
-            money.contains("line cost $15.00") && money.contains("stored $10.00"),
-            "the fragment must show both numbers: {money:.800}"
-        );
     }
 
     /// Cost-freshness T4 triangulation: an equal cost is not stale, so the
-    /// draft renders no warning at all.
+    /// confirmed purchase renders no warning at all.
     #[tokio::test]
-    async fn web_purchase_record_draft_hides_the_cost_warning_when_costs_are_equal() {
+    async fn web_purchase_record_confirmed_hides_the_cost_warning_when_costs_are_equal() {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
-        let app = crate::routes::router(state);
-
-        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
-        assert_eq!(status, StatusCode::OK, "{html:.600}");
-        assert!(
-            !html.contains("stale cost"),
-            "an equal cost is not stale: {html:.800}"
-        );
-    }
-
-    /// Cost-freshness T4 triangulation: the warning is draft-only. The action
-    /// that follows it only exists while the purchase is editable, and the
-    /// product drawer already carries the permanent badge for a confirmed
-    /// purchase, so a confirmed document renders no warning even with a
-    /// genuinely rising line cost.
-    #[tokio::test]
-    async fn web_purchase_record_confirmed_purchase_hides_the_rising_cost_warning() {
-        use rust_decimal::Decimal;
-
-        let state = test_state().await;
-        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
-        state
-            .purchases_service
-            .update_line(
-                audit_actor(&state).await,
-                fixture.line_id,
-                Decimal::from(2),
-                Decimal::from(12),
-            )
-            .await
-            .unwrap();
         state
             .purchases_service
             .confirm(
@@ -1921,7 +1892,39 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{html:.600}");
         assert!(
             !html.contains("stale cost"),
-            "a confirmed purchase must not carry the draft-only warning: {html:.800}"
+            "an equal cost is not stale: {html:.800}"
+        );
+    }
+
+    /// Cost-freshness T9 triangulation: the warning is confirmed-only. The
+    /// inverse of the rule it used to assert: on a DRAFT the cost is still
+    /// provisional — the line can be edited or deleted, and the purchase may
+    /// never be confirmed — so even a genuinely rising line cost renders no
+    /// warning. The product drawer already carries the permanent badge for
+    /// the standing disagreement.
+    #[tokio::test]
+    async fn web_purchase_record_draft_purchase_hides_the_rising_cost_warning() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .update_line(
+                audit_actor(&state).await,
+                fixture.line_id,
+                Decimal::from(2),
+                Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            !html.contains("stale cost"),
+            "a draft purchase must not carry the warning: its cost is provisional: {html:.800}"
         );
     }
 
@@ -1999,6 +2002,17 @@ mod tests {
             )
             .await
             .unwrap();
+        // The action belongs after the document exists: confirming is when
+        // the line's cost becomes a fact.
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
         let app = crate::routes::router(state.clone());
 
         let (status, _, body) = post_form_response(
@@ -2055,6 +2069,15 @@ mod tests {
                 fixture.line_id,
                 Decimal::from(2),
                 Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
             )
             .await
             .unwrap();
@@ -2138,13 +2161,14 @@ mod tests {
         );
     }
 
-    /// T5: the button renders only in Draft, and the handler refuses a
-    /// non-draft purchase itself — the template is presentation only, the same
-    /// triangulation the draft actions get. A confirmed purchase's line cost
-    /// is frozen history, so applying it must fail and leave the product
-    /// carrying its old stored cost.
+    /// T9: the gate is now Confirmed-only, so the refused one is the DRAFT —
+    /// the inverse of the old rule, and the test that pins it. The handler
+    /// refuses anything that is not a confirmed purchase (the template is
+    /// presentation only), and a refused purchase leaves the product carrying
+    /// its old stored cost: a draft line's cost is provisional, precisely
+    /// because the line can still be edited or the purchase never confirmed.
     #[tokio::test]
-    async fn web_apply_line_cost_refuses_a_non_draft_purchase_and_leaves_the_product_untouched() {
+    async fn web_apply_line_cost_refuses_a_draft_purchase_and_leaves_the_product_untouched() {
         use rust_decimal::Decimal;
 
         let state = test_state().await;
@@ -2156,15 +2180,6 @@ mod tests {
                 fixture.line_id,
                 Decimal::from(2),
                 Decimal::from(12),
-            )
-            .await
-            .unwrap();
-        state
-            .purchases_service
-            .confirm(
-                audit_actor(&state).await,
-                fixture.purchase_id,
-                Some(fixture.method_id),
             )
             .await
             .unwrap();
@@ -2182,7 +2197,11 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::BAD_REQUEST,
-            "a non-draft purchase must be refused: {body}"
+            "a draft purchase must be refused: {body}"
+        );
+        assert!(
+            body.contains("is not confirmed"),
+            "the refusal must say why: the cost is not a fact yet: {body:.400}"
         );
 
         let product = state
@@ -2193,7 +2212,7 @@ mod tests {
         assert_eq!(
             product.cost_price,
             Decimal::from(10),
-            "a refused purchase must leave the product untouched"
+            "a refused draft must leave the product untouched"
         );
     }
 
@@ -2214,6 +2233,15 @@ mod tests {
                 fixture.line_id,
                 Decimal::from(2),
                 Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
             )
             .await
             .unwrap();
@@ -2259,6 +2287,15 @@ mod tests {
                 fixture.line_id,
                 Decimal::from(2),
                 Decimal::from(12),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
             )
             .await
             .unwrap();
@@ -2348,6 +2385,27 @@ mod tests {
                 line_b.id,
                 Decimal::from(1),
                 Decimal::from(15),
+            )
+            .await
+            .unwrap();
+        // Both purchases confirmed: the action exists only after the document
+        // does, so the boundary test must run in the state where applying is
+        // possible at all.
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                purchase_b.id,
+                Some(fixture.method_id),
             )
             .await
             .unwrap();
