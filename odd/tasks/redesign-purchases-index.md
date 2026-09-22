@@ -78,8 +78,37 @@ item out as domain work rather than presentation.
    becomes neutral. `--color-expense` keeps its money-out meaning; a new warning
    token carries "pending".
 5. **No typed identifiers.** Inherited from `redesign-interface` R2.
-6. **Server stays authoritative.** Presentation only; no business rule changes in
-   S1–S4.
+6. **Server stays authoritative.** Any business rule change is named as such and lands in its own slice with its own tests; nothing else here touches a rule.
+7. **A1 — one line per product, and a repeat scan increments it.** The domain
+   rule ("a product may appear only once per purchase, for the same reason as
+   sales") stays. Adding or scanning a product already on the draft increments
+   the existing line's quantity through the existing update route, with visible
+   feedback, instead of the current 400. (Decided 2026-09-22.)
+8. **B1 — an empty line cost means this supplier's cost.** `add_line` resolves
+   the purchase's supplier satellite cost first and falls back to
+   `products.cost_price` only when that supplier has no satellite row. Done in
+   S2. (Decided 2026-09-22.)
+9. **The record is hosted in a right panel, and the receiving desk is retired.**
+   Option 2 of the panel review (2026-09-22). The nested add-line drawer, the
+   "keep open after adding" checkbox, its `localStorage` preference and the OOB
+   picker swap all go — those are what made the desk tosco. The status-gated
+   action bar, the effects preview, the inline line edit, the `⋯` menu and the
+   dialogs stay; the action bar moves to a sticky footer inside the panel.
+10. **The panel is addressable, so R3/AC5 are preserved rather than reversed.**
+    `/purchases/{id}` renders the list with the panel open server-side.
+    Precedent: `templates/customers.html:75` (`{% if drawer_open %}`) fed by
+    `src/routes/customers_web.rs:315`. Reload, back button and bookmarks keep
+    working, and the record fragment route `/web/purchases/{id}` stays for
+    in-page navigation.
+11. **Cabinet data.** The panel header shows identifier, supplier, date and
+    status as read-only facts; editing opens the existing Edit header dialog,
+    which gains the supplier select — the domain already supports it
+    (`UpdatePurchaseDraft.supplier_id`, `src/models.rs:1048`; `update_draft`
+    validates and persists it), only the web form `UpdatePurchaseHeaderForm`
+    lacks the field.
+12. **Drafts are already persisted server-side.** Every mutation is an immediate
+    POST; there is no client-side cart and no document state in the browser. The
+    zero-unsaved-state design in S4 makes that structural rather than incidental.
 
 ## Out of scope, parked deliberately
 
@@ -121,14 +150,21 @@ item out as domain work rather than presentation.
 
 - One slice per commit group; every slice is a chained-PR candidate, all
   targeting `main`, merged strictly in order.
-- Budget: 400 changed lines per slice (default). S2 is the only one near it; if
-  it crosses, report the overage rather than compressing comments or tests.
+- Budget: 400 changed lines per slice (default). Report the overage rather than
+  compressing comments or tests.
 - Skill: `work-unit-commits` (tests and docs travel with the behavior they
   verify).
-- **Re-slice note (2026-09-22)**: the palette token slice was folded into S2. A
-  commit that only adds unused CSS variables has no consumer, no behavior and
-  nothing a test can assert, so it is not a work unit. The token and its use
-  ship together.
+- **Re-slice (2026-09-22, after the panel decision).** The plan was re-cut twice.
+  First the palette token folded into the row slice, because a commit that only
+  adds unused CSS variables has no consumer and is not a work unit. Then the
+  record-in-a-panel decision split the old S2/S2b/S3 apart and put the
+  satellite-cost defect first, because the panel would have displayed and
+  pre-filled that wrong number. The palette now rides in S5 with the list row.
+- **Slice list**: S1 (REST API cards) done, S2 (satellite cost default) done,
+  S3 (record panel + shared record script + responsive line rows), S4 (entry
+  row; the add-line drawer dies), S5 (list row + status palette), S6 (sales
+  mirror), S7 (one language, one date format), S8 (optional: unified `q`
+  search).
 
 ## TDD / checks
 
@@ -145,18 +181,34 @@ item out as domain work rather than presentation.
       deleted (GREEN). Model: `smoke_tests.rs:3656` +
       `e2e/tests/test_products.py:105`. The sidebar `REST API ↗` link stays.
       Done in `8e22377`.
-- [ ] **S2 — Purchase list as a responsive grid row + semantic status palette.**
-      New warning token; status chip carries color; total neutral; money line
-      printed once; draft fallback when `purchase_number` is NULL; technical
-      subtitle deleted from `/purchases` and `/sales`; sales list mirrored.
-- [ ] **S3 — `New purchase` as a `<dialog>`.** Dialog carries the supplier roster
-      the page already renders; `#new-purchase` card deleted; the two-column grid
-      collapses to one column; sales mirrored. Creating still lands on
-      `/purchases/{id}`.
-- [ ] **S4 — One language, one date format.** Centralized labels + `format_date`;
-      English across the sidebar and document groups; specs and the tests that
-      assert the Spanish labels updated.
-- [ ] **S5 (optional) — Unified `q` search.** `PurchaseListQuery` collapses
+- [x] **S2 — Empty line cost defaults to the supplier's satellite cost.**
+      `add_line` resolves
+      `SupplierService::find_cost(product_id, purchase.supplier_id)` first and
+      falls back to `products.cost_price` only with no satellite row. Four unit
+      tests pin the order; the picker label and two stale test messages were
+      corrected in the same commit. Done in `737b1bd`.
+- [ ] **S3 — The record panel.** `/purchases/{id}` renders the list with the panel
+      open server-side; the record fragment loads into it over HTMX for in-page
+      clicks; the receiving-desk script is extracted to a partial shared by
+      `purchase.html` and `purchases.html`; the panel width and the line-row
+      stacking below its breakpoint are decided and implemented.
+- [ ] **S4 — The entry row.** Picking a product commits a line immediately at
+      qty 1, so there is no unsaved state; the qty field acts as an optional
+      multiplier that resets; a repeat product increments the existing line (A1).
+      The add-line drawer, the keep-open checkbox, its `localStorage` preference
+      and the OOB picker swap are deleted. `e2e/tests/test_picker.py` is rewritten
+      to the new order.
+- [ ] **S5 — List row + status palette.** Responsive grid row (identifier,
+      supplier, date/items, total, state); the total stops encoding payment
+      state; a status chip carries paid / pending / overdue; the new warning
+      token; the technical subtitle deleted from `/purchases` and `/sales`.
+- [ ] **S6 — Sales mirror.** The same row and panel on `/sales`.
+- [ ] **S7 — One language, one date format.** Centralized labels +
+      `format_date`; English across the sidebar, the document groups and the
+      audit labels still Spanish in ten partials (`Registrado por`,
+      `Actualizado por`, `Sugerido`, `Abrir`); specs and the tests that assert
+      the Spanish labels updated.
+- [ ] **S8 (optional) — Unified `q` search.** `PurchaseListQuery` collapses
       `supplier` + `number` into one free-text field; service + repo change.
 
 ## Acceptance criteria
@@ -186,7 +238,23 @@ item out as domain work rather than presentation.
 | Slice | Status | Commits / evidence |
 |-------|--------|--------------------|
 | S1 | **done** | `8e22377` — 4 templates, 4 contract tests, stylesheet regenerated. Worker observed RED (4 failures: "the REST API card must not be rendered on …") then GREEN; `gentle-ai-verify` confirmed `cargo test` 834 passed / 0 failed, the wiring guard `seeded_pages_render_only_wired_htmx_targets` green, and the surviving sidebar link intact. Parent review caught and fixed two writer defects before commit: an unrelated HTML comment deleted from `dashboard.html`, and a stale test cross-reference (`sidebar_renders_*` → `sidebar_groups_navigation_into_operation_catalogue_and_cash`). |
-| S2 | not started | — |
+| S2 | **done** | `737b1bd` — `fix(purchases)`, 5 files. Worker RED: `left: 5 / right: 9.50` ("empty cost must default to the supplier's satellite cost") then GREEN. `gentle-ai-verify` verdict *pass* on `cargo test` 838 passed / 0 failed, with the `Some(c)` branch byte-identical to HEAD and 2 of the 4 new tests confirmed as genuine RED pins (the other 2 are triangulation). The verifier raised two caveats, both fixed inside the commit: the picker label `Unit cost (empty = product cost)` had become false, and two test messages still stated the old unconditional rule. |
 | S3 | not started | — |
 | S4 | not started | — |
-| S5 | not started (optional) | — |
+| S5 | not started | — |
+| S6 | not started | — |
+| S7 | not started | — |
+| S8 | not started (optional) | — |
+
+## Open decisions
+
+- **Panel width.** `w-full` below a breakpoint and a cap above it is free (the
+  shell already does `w-full max-w-md`). The real work is the line rows, which
+  cannot hold five columns at phone width and must stack. The cap value and the
+  stacking breakpoint are still to be confirmed.
+- **Supplier/date in the panel header.** Read-only facts plus the Edit header
+  dialog (recommended: an always-editable supplier select in a narrow panel is
+  one mis-click away from moving a whole draft) versus inline editable selectors.
+- **`redesign-interface` bookkeeping.** Its R3/AC5 survive intact under this
+  design, so the change needs a note that the record view is now list+panel, not
+  a page reversal.
