@@ -64,6 +64,17 @@
     var addBtn = document.getElementById('add-line');
     if (addBtn) addBtn.focus();
   }
+  // T7: an inline line edit the server refuses (4xx) reverts to the last
+  // server-rendered value — the base notice still announces the refusal, and
+  // the input must not keep a value the domain rejected. `defaultValue` is
+  // the `value` attribute the last render wrote; typing only changes the
+  // property, so this is exactly "revert". Only line inputs PUT; every other
+  // failure path is left to the base handler.
+  document.addEventListener('htmx:responseError', function (evt) {
+    var elt = evt.detail && evt.detail.requestConfig && evt.detail.requestConfig.elt;
+    if (!elt || !elt.matches || !elt.matches('#purchase-record input[hx-put]')) return;
+    elt.value = elt.defaultValue;
+  });
   // After a successful add-line POST, close the drawer unless the preference
   // is on (then the OOB picker clear+focus already staged the next add).
   // Errors keep the drawer open so the notice is visible next to the form.

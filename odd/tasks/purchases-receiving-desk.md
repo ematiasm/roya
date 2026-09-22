@@ -105,7 +105,8 @@ was deepened and fully approved for implementation (2026-09-22).
       summary, no select) posting to existing confirm route.
 - [x] T6 Add-line drawer (documents.html pattern + `line_picker` + keep-open
       checkbox in localStorage; OOB close/clear; focus return).
-- [ ] T7 Inline line edit (inputs + NEW web route + revert on invalid).
+- [x] T7 Inline line edit (inputs + PUT registered on the existing update-line
+      route + revert on invalid).
 - [ ] T8 Full verification: `cargo test` green; e2e purchase suites green;
       update this doc with evidence per task (commit hashes).
 
@@ -187,7 +188,19 @@ was deepened and fully approved for implementation (2026-09-22).
       to the bar's `#add-line` button. CSS rebuilt — no diff (all utilities
       pre-existing). Re-run: new test 1, `picker` 9, `purchase` 123. FULL
       `cargo test`: 804 passed. Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T7.
+- [x] T7 done. RED: new `web_purchase_line_edit_is_inline_via_put` failed
+      (`PUT …/lines/{line_id}` → 405). GREEN: the route registers
+      `put(web_update_line)` beside the existing POST/DELETE (handler and
+      service unchanged — draft-only, qty > 0, unit_cost ≥ 0 still 400);
+      Draft rows render qty/unit_cost as `type=number` inputs that PUT with
+      `hx-trigger="change delay:400ms"` and `hx-include` both fields (the
+      handler needs the pair), targeting `#purchase-record-money` like
+      add-line; other statuses keep plain text. The page shell reverts a
+      refused input to `defaultValue` on `htmx:responseError` (the base
+      notice still announces the refusal). New `w-20` utility — CSS rebuilt.
+      Re-run: new test 1, `purchase` 124, `wiring` 15. FULL `cargo test`:
+      805 passed. Commit hash recorded at T8.
+- [ ] All remaining tasks pending. Next step: T8.
 
 ## Acceptance criteria (feature-level)
 
