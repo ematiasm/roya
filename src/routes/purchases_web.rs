@@ -9,7 +9,7 @@ use axum::{
     extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use chrono::NaiveDate;
@@ -1053,7 +1053,7 @@ pub fn router() -> Router<AppState> {
         .route("/web/purchases/{id}/lines", post(web_add_line))
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}",
-            post(web_update_line).delete(web_remove_line),
+            put(web_update_line).post(web_update_line).delete(web_remove_line),
         )
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}/apply-cost",
@@ -1188,6 +1188,31 @@ mod tests {
     ) -> (StatusCode, Option<String>, String) {
         let req = Request::builder()
             .method("POST")
+            .uri(uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let redirect = resp
+            .headers()
+            .get("HX-Redirect")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, redirect, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// `post_form_response` with the PUT verb: the inline line edit.
+    async fn put_form_response(
+        app: axum::Router,
+        uri: &str,
+        body: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let req = Request::builder()
+            .method("PUT")
             .uri(uri)
             .header("content-type", "application/x-www-form-urlencoded")
             .header("HX-Request", "true")
@@ -2935,6 +2960,102 @@ mod tests {
             credit_html.matches("name=\"method_id\"").count(),
             0,
             "a Credit draft carries no payment-method control at all: {credit_html:.500}"
+        );
+    }
+
+    /// The add-line drawer carries a "Keep open after adding" preference:
+    /// the checkbox lives OUTSIDE `#line-picker` (the picker OOB-swaps on
+    /// every add and would wipe it), its state persists in localStorage, and
+    /// the page shell closes the drawer — returning focus to the bar's
+    /// add-line button — after a successful POST when the preference is off.
+    #[tokio::test]
+    async fn web_purchase_add_line_drawer_carries_keep_open_preference_outside_the_picker() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The checkbox renders in the drawer, before the picker subtree, so
+        // the picker's out-of-band clear+focus swap cannot destroy it.
+        let drawer_start = html
+            .find("<div id=\"line-drawer\"")
+            .expect("the add-line drawer renders");
+        let keep = html
+            .find("id=\"keep-open-lines\"")
+            .expect("the keep-open checkbox renders");
+        let picker = html
+            .find("id=\"line-picker\"")
+            .expect("the drawer hosts the picker");
+        assert!(
+            keep > drawer_start && keep < picker,
+            "the keep-open checkbox sits in the drawer, outside the picker: keep={keep} picker={picker} drawer={drawer_start}"
+        );
+
+        // The preference persists across swaps: the page shell owns the
+        // localStorage key and the after-request close.
+        assert!(
+            html.contains("purchases.addLine.keepOpen"),
+            "the page shell persists the preference: {html:.600}"
+        );
+        assert!(
+            html.contains("htmx:afterRequest"),
+            "the page shell reacts to the add-line response: {html:.600}"
+        );
+        // Focus return: closing the drawer hands focus back to the bar button.
+        assert!(
+            html.contains("getElementById('add-line')") && html.contains("addBtn.focus()"),
+            "closing the drawer returns focus to Add line: {html:.600}"
+        );
+    }
+
+    /// Draft lines are edited in place: qty/unit_cost render as inputs that
+    /// PUT to the existing update-line route (registered for PUT, not just
+    /// POST) with `change delay:400ms`, and the page shell reverts the input
+    /// to its last server-rendered value when the server refuses (4xx), while
+    /// the base notice announces the refusal.
+    #[tokio::test]
+    async fn web_purchase_line_edit_is_inline_via_put() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let edit_url = format!(
+            "/web/purchases/{}/lines/{}",
+            fixture.purchase_id, fixture.line_id
+        );
+
+        // -- The route accepts PUT ------------------------------------------
+        let (status, _, body) = put_form_response(app.clone(), &edit_url, "qty=3&unit_cost=6").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "PUT must reach the update-line handler: {status} {body:.300}"
+        );
+
+        // -- The server still refuses invalid values (authority unchanged) --
+        let (status, _, _) = put_form_response(app.clone(), &edit_url, "qty=0&unit_cost=6").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "qty must stay > 0 server-side");
+
+        // -- The draft page renders the inputs ------------------------------
+        let (_, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
+            .await;
+        assert!(
+            html.contains(&format!("hx-put=\"{edit_url}\"")),
+            "the qty/cost cells PUT inline: {html:.900}"
+        );
+        assert!(
+            html.contains("hx-trigger=\"change delay:400ms\""),
+            "the inline edit fires on change delay:400ms: {html:.900}"
+        );
+        assert!(
+            html.contains(&format!("id=\"line-qty-{}\"", fixture.line_id)),
+            "the qty cell is an addressable input: {html:.900}"
+        );
+
+        // -- Revert wiring lives in the page shell --------------------------
+        assert!(
+            html.contains("input[hx-put]") && html.contains("defaultValue"),
+            "a refused edit reverts the input to its rendered value: {html:.900}"
         );
     }
 

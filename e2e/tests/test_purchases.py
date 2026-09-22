@@ -162,11 +162,14 @@ def test_confirming_a_rising_cost_purchase_warns_and_applying_updates_the_produc
     # the last assertion, everything after this line happened without one.
     page.evaluate("window.__t10_no_reload = true")
 
-    # Confirm from the browser: Credit needs no method (the select's empty
-    # option is the default), so the click is the whole confirm.
+    # Confirm from the browser: the action lives behind the bar's Confirm ▾
+    # (which opens the dialog), and a Credit confirm carries no method control
+    # at all (the dialog shows the due summary instead), so the submit click
+    # is the whole confirm.
     with page.expect_response(
         _response_for(f"/web/purchases/{purchase_id}/confirm", "POST")
     ):
+        page.locator("#open-confirm").click()
         page.locator("#confirm-purchase button[type='submit']").click()
 
     expect(page.locator("#purchase-record")).to_contain_text("Confirmed")

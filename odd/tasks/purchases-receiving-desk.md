@@ -78,10 +78,19 @@ was deepened and fully approved for implementation (2026-09-22).
 ## Delivery strategy
 
 - `ask-on-risk`, forecast > 400 lines → chain strategy chosen by user:
-  **`stacked-to-main`** (collected 2026-09-22). Split into stacked PRs at
-  delivery time; record slice boundaries here when pushing.
+  **`stacked-to-main`** (collected 2026-09-22).
 - Skill: `work-unit-commits`
   (`/home/mamull/.config/opencode/skills/work-unit-commits/SKILL.md`).
+- **Slice boundaries (recorded at push, 2026-09-22)** — all PRs target
+  `main`, merge strictly in order 1→2→3→4 (each later PR's diff shrinks to
+  its increment once its predecessor merges):
+
+  | PR | Branch | Commits | Increment | Lines |
+  |----|--------|---------|-----------|-------|
+  | [#81](https://github.com/ematiasm/roya/pull/81) | `feat/receiving-desk-s1` | `47458a1, 0d1484b` | T1+T2 English + tracked_units | 254 |
+  | [#82](https://github.com/ematiasm/roya/pull/82) | `feat/receiving-desk-s2` | `8736f9b` | T3 sticky action bar | 607 — **`size:exception` approved by maintainer (2026-09-22; atomic single-commit work unit)** |
+  | [#83](https://github.com/ematiasm/roya/pull/83) | `feat/receiving-desk-s3` | `a44de33, f3281b7, b530706` | T4+T5 effects preview + confirm dialog | 317 |
+  | [#84](https://github.com/ematiasm/roya/pull/84) | `feat/purchases-receiving-desk` | `27b2be2..HEAD` | T6+T7+T8 drawer + inline edit + e2e | 287 + doc commits |
 
 ## TDD / checks
 
@@ -103,10 +112,11 @@ was deepened and fully approved for implementation (2026-09-22).
       no payment inputs; Confirm disabled at 0 lines).
 - [x] T5 Confirm `<dialog>` (Cash: method select + account; Credit: due
       summary, no select) posting to existing confirm route.
-- [ ] T6 Add-line drawer (documents.html pattern + `line_picker` + keep-open
+- [x] T6 Add-line drawer (documents.html pattern + `line_picker` + keep-open
       checkbox in localStorage; OOB close/clear; focus return).
-- [ ] T7 Inline line edit (inputs + NEW web route + revert on invalid).
-- [ ] T8 Full verification: `cargo test` green; e2e purchase suites green;
+- [x] T7 Inline line edit (inputs + PUT registered on the existing update-line
+      route + revert on invalid).
+- [x] T8 Full verification: `cargo test` green; e2e purchase suites green;
       update this doc with evidence per task (commit hashes).
 
 ## Route declaration
@@ -175,7 +185,47 @@ was deepened and fully approved for implementation (2026-09-22).
       with a method already 400s; Cash without one already 400s). Re-run:
       new test 1, `purchase` 122, `wiring` 15. FULL `cargo test`: 803 passed.
       Commit hash recorded at T8.
-- [ ] All remaining tasks pending. Next step: T6.
+- [x] T6 done. RED: new `web_purchase_add_line_drawer_carries_keep_open_preference_outside_the_picker`
+      failed (no `keep-open-lines` checkbox). GREEN: the drawer header now
+      hosts a "Keep open after adding" checkbox OUTSIDE `#line-picker` (the
+      OOB clear+focus swap wipes anything inside it); the page shell owns
+      `localStorage['purchases.addLine.keepOpen']` (default OFF, synced on
+      drawer open, written on change) and a document `htmx:afterRequest`
+      listener that closes the drawer after a successful add-line POST
+      (4xx keeps it open so the notice stays next to the form; preference ON
+      leaves it open for the next add), with `closeLineDrawer` returning focus
+      to the bar's `#add-line` button. CSS rebuilt — no diff (all utilities
+      pre-existing). Re-run: new test 1, `picker` 9, `purchase` 123. FULL
+      `cargo test`: 804 passed. Commit hash recorded at T8.
+- [x] T7 done. RED: new `web_purchase_line_edit_is_inline_via_put` failed
+      (`PUT …/lines/{line_id}` → 405). GREEN: the route registers
+      `put(web_update_line)` beside the existing POST/DELETE (handler and
+      service unchanged — draft-only, qty > 0, unit_cost ≥ 0 still 400);
+      Draft rows render qty/unit_cost as `type=number` inputs that PUT with
+      `hx-trigger="change delay:400ms"` and `hx-include` both fields (the
+      handler needs the pair), targeting `#purchase-record-money` like
+      add-line; other statuses keep plain text. The page shell reverts a
+      refused input to `defaultValue` on `htmx:responseError` (the base
+      notice still announces the refusal). New `w-20` utility — CSS rebuilt.
+      Re-run: new test 1, `purchase` 124, `wiring` 15. FULL `cargo test`:
+      805 passed. Commit hash recorded at T8.
+- [x] T8 done. e2e updates (RED-first where the suite observed the break):
+      `test_purchases.py` opens the dialog via the bar's `#open-confirm`
+      (new stable id) before submitting, Credit comment corrected (no method
+      control at all); `test_picker.py` opens the add-line drawer before
+      filling the picker, asserts qty/unit_cost through the inline inputs'
+      values (cell text no longer carries them) and the `$`-prefixed money
+      cell (restored on the cost input after the first e2e run caught its
+      loss), plus the keep-open-OFF drawer close after a successful add.
+      `test_confirmation.py` is sale-only — untouched. FULL e2e
+      (`scripts/e2e.sh`): **82 passed, 4 skipped** (all four skips are the
+      suite's opt-in probes by design). FINAL FULL `cargo test`: **805
+      passed**. Commit hashes for T1–T7: `47458a1` (T1), `0d1484b` (T2),
+      `8736f9b` (T3), `a44de33` (T4), `f3281b7` + `b530706` (T5,
+      feature + checkbox fix), `27b2be2` (T6), `b29a55c` (T7). T8's own
+      hash cannot live in this commit — it is recorded in the final report.
+- [x] All tasks complete. The receiving desk is implemented, verified, and
+      committed.
 
 ## Acceptance criteria (feature-level)
 

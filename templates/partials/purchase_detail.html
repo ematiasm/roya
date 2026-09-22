@@ -44,8 +44,32 @@
               <span class="font-semibold">{{ line.product_name }}</span>
               <span class="text-[13px] text-muted"> · {{ line.product_sku }}</span>
             </td>
+            {% if record.purchase.status.to_string() == "Draft" %}
+            <td class="py-2.5 pr-3 text-right">
+              {# T7 inline edit: both inputs share the PUT and include each
+                 other, so either change submits the pair the handler needs.
+                 A refused value (server 400) reverts in the page shell. #}
+              <input type="number" id="line-qty-{{ line.id }}" name="qty"
+                     class="w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
+                     value="{{ line.qty }}" min="0.01" step="any" data-action="Edit line"
+                     hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
+                     hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
+                     hx-target="#purchase-record-money" hx-swap="innerHTML"
+                     hx-trigger="change delay:400ms" />
+            </td>
+            <td class="py-2.5 pr-3 text-right">
+              <span class="text-muted">$</span><input type="number" id="line-cost-{{ line.id }}" name="unit_cost"
+                     class="w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
+                     value="{{ line.unit_cost }}" min="0" step="any" data-action="Edit line"
+                     hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
+                     hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
+                     hx-target="#purchase-record-money" hx-swap="innerHTML"
+                     hx-trigger="change delay:400ms" />
+            </td>
+            {% else %}
             <td class="py-2.5 pr-3 text-right tabular-nums">{{ line.qty }}</td>
             <td class="py-2.5 pr-3 text-right tabular-nums">${{ line.unit_cost }}</td>
+            {% endif %}
             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">${{ line.subtotal }}</td>
             {% if record.purchase.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
@@ -149,7 +173,7 @@
     <button type="button" id="add-line"
             class="rounded-[10px] border border-border bg-transparent px-3.5 py-2 text-sm text-text"
             onclick="openLineDrawer()">Add line</button>
-    <button type="button" class="bg-accent2 text-white"{% if record.lines.is_empty() %} disabled{% endif %}
+    <button type="button" id="open-confirm" class="bg-accent2 text-white"{% if record.lines.is_empty() %} disabled{% endif %}
             onclick="openRecordDialog('confirm-purchase')">Confirm ▾</button>
     <div class="relative ml-auto">
       <button type="button" id="record-menu-toggle" aria-label="More actions"
@@ -309,8 +333,16 @@
   <div id="line-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
     <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
       <span class="text-sm font-semibold">Add line</span>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
-              aria-label="Close add line" onclick="closeLineDrawer()">✕</button>
+      <div class="flex items-center gap-2.5">
+        {# The preference sits OUTSIDE `#line-picker`: every add OOB-swaps
+           that subtree (clear + focus) and would wipe a checkbox inside it. #}
+        <label class="flex items-center gap-2 text-xs text-muted" for="keep-open-lines">
+          <input type="checkbox" id="keep-open-lines" />
+          Keep open after adding
+        </label>
+        <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                aria-label="Close add line" onclick="closeLineDrawer()">✕</button>
+      </div>
     </div>
     <div class="flex-1 overflow-y-auto p-4">
       {% call picker::line_picker(false, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = product cost)", "product cost", "cost") %}
