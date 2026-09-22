@@ -8124,14 +8124,17 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     let (app, pool) = test_app().await;
     let f = seed_drawer_fixture(&app, &pool).await;
 
-    // Sale: identifier, customer, lines with product and SKU, totals, actors
-    // and the link to the owning page.
+    // Sale: identifier, customer, its line (product name and quantity),
+    // totals, actors and the link to the owning page.
     let (status, body) = get(&app, &format!("/web/documents/detail/sale/{}", f.sale)).await;
     assert_eq!(status, StatusCode::OK, "sale drawer: {body:.400}");
     assert!(body.contains(&f.sale_number), "{body:.800}");
     assert!(body.contains("DrawerBuyer"), "{body:.800}");
     assert!(body.contains("product DRAWER-P"), "{body:.800}");
-    assert!(body.contains("DRAWER-P"), "{body:.800}");
+    // The line's quantity cell: the drawer's line table renders the Cant.
+    // the sale line carries — there is no SKU column any more, and the
+    // product's name alone does not prove a line row rendered.
+    assert!(body.contains(">2</td>"), "{body:.800}");
     assert!(body.contains("Registrado por"), "{body:.800}");
     assert!(body.contains("Test Admin"), "{body:.800}");
     assert!(body.contains(&format!("/sales/{}", f.sale)), "{body:.800}");

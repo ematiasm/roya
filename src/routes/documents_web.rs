@@ -894,14 +894,13 @@ async fn sale_drawer(
     let tables = vec![
         DrawerTable {
             title: "Líneas",
-            headers: vec!["Producto", "SKU", "Cant.", "Precio unit.", "Subtotal"],
+            headers: vec!["Producto", "Cant.", "Precio unit.", "Subtotal"],
             rows: record
                 .lines
                 .iter()
                 .map(|line| DrawerTableRow {
                     cells: vec![
                         line.product_name.clone(),
-                        line.product_sku.clone(),
                         line.qty.to_string(),
                         line.unit_price.to_string(),
                         line.subtotal.to_string(),
@@ -1116,14 +1115,13 @@ async fn purchase_drawer(
     let tables = vec![
         DrawerTable {
             title: "Líneas",
-            headers: vec!["Producto", "SKU", "Cant.", "Costo unit.", "Subtotal"],
+            headers: vec!["Producto", "Cant.", "Costo unit.", "Subtotal"],
             rows: record
                 .lines
                 .iter()
                 .map(|line| DrawerTableRow {
                     cells: vec![
                         line.product_name.clone(),
-                        line.product_sku.clone(),
                         line.qty.to_string(),
                         line.unit_cost.to_string(),
                         line.subtotal.to_string(),
@@ -2378,6 +2376,157 @@ mod tests {
         assert!(
             !html.contains("Si algún reembolso dejaría una cuenta en negativo"),
             "purchase refunds are Income: no negative-balance caveat exists to state: {html:.800}"
+        );
+    }
+
+    // -- S3: the drawer line tables drop the SKU column ------------------------
+
+    /// The headers of the named table as the drawer template rendered them,
+    /// in order. The drawer route builds `DrawerTable`s; reading the rendered
+    /// fragment pins the contract the operator sees, so a header/cell drift
+    /// fails loudly instead of rendering a misaligned table silently.
+    fn table_headers(html: &str, title: &str) -> Vec<String> {
+        let start = html
+            .find(&format!("{title} ("))
+            .unwrap_or_else(|| panic!("table {title:?} is rendered"));
+        let rest = &html[start..];
+        let rest = &rest[rest.find("<thead>").expect("the table renders a thead")..];
+        let end = rest.find("</thead>").expect("the thead closes");
+        rest[..end]
+            .split("<th class=\"px-2 py-1 font-medium\">")
+            .skip(1)
+            .map(|chunk| chunk.split("</th>").next().unwrap().to_string())
+            .collect()
+    }
+
+    /// Cells in the FIRST data row of the named table: the count the
+    /// operator reads must equal the header count, or the table renders
+    /// misaligned without any error.
+    fn first_row_cell_count(html: &str, title: &str) -> usize {
+        let start = html
+            .find(&format!("{title} ("))
+            .unwrap_or_else(|| panic!("table {title:?} is rendered"));
+        let rest = &html[start..];
+        let rest = &rest[rest.find("<tbody>").expect("the table renders a tbody")..];
+        let rest = &rest[rest.find("<tr class=\"border-t").expect("a data row renders")..];
+        let row_end = rest.find("</tr>").expect("the data row closes");
+        rest[..row_end].matches("<td").count()
+    }
+
+    /// The sale drawer's line table names four columns, not five: SKU is not
+    /// worth a column at the drawer's width, and the data row must align with
+    /// its headers.
+    #[tokio::test]
+    async fn s3_the_sale_drawer_lines_table_drops_the_sku_column() {
+        let state = test_state().await;
+        let (product, _, _) = seed_sale_kit(&state).await;
+        let sale = seed_sale(&state, product, false).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/sale/{sale}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let headers = table_headers(&html, "Líneas");
+        assert_eq!(
+            headers,
+            vec!["Producto", "Cant.", "Precio unit.", "Subtotal"],
+            "{html:.800}"
+        );
+        assert_eq!(
+            first_row_cell_count(&html, "Líneas"),
+            headers.len(),
+            "the data row must align with its headers: {html:.800}"
+        );
+    }
+
+    /// The purchase drawer's line table mirrors the sale's: four columns, no
+    /// SKU, and a data row that aligns with its headers.
+    #[tokio::test]
+    async fn s3_the_purchase_drawer_lines_table_drops_the_sku_column() {
+        use crate::models::{NewProduct, NewPurchase, NewSupplier, ProductKind};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let actor = audit_actor(&state).await;
+        // An untracked product: the drawer line table is the subject, not the
+        // stock rules a tracked fixture would drag in.
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "DRAW-LS".into(),
+                    name: "Drawer line product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(
+                actor,
+                NewSupplier {
+                    name: "Drawer line supplier".into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let purchase = state
+            .purchases_service
+            .create_draft(
+                actor,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type: crate::models::PaymentType::Cash,
+                    purchase_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .add_line(actor, purchase.id, product.id, Decimal::from(2), None)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/purchase/{}", purchase.id),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let headers = table_headers(&html, "Líneas");
+        assert_eq!(
+            headers,
+            vec!["Producto", "Cant.", "Costo unit.", "Subtotal"],
+            "{html:.800}"
+        );
+        assert_eq!(
+            first_row_cell_count(&html, "Líneas"),
+            headers.len(),
+            "the data row must align with its headers: {html:.800}"
         );
     }
 }
