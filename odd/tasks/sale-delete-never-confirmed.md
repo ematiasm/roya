@@ -63,8 +63,15 @@ reference its payments).
 - Keep existing sale ids/DOM contracts pinned by e2e.
 
 ## Delivery strategy
-`ask-on-risk` + `stacked-to-main` (session cache). Forecast ~500 lines → slice before push if
-aggregate > 400 (slices recorded here at delivery time). Skill: `work-unit-commits`
+`ask-on-risk` + `stacked-to-main` (session cache). Aggregate 601 lines > 400 →
+sliced into 2 PRs, each under budget (recorded at push, 2026-09-22):
+
+| PR | Branch | Commits | Increment | Lines |
+|----|--------|---------|-----------|-------|
+| (pending) | `feat/sale-delete-s1` | `83f2e4e, df59bc5, b0ba110, 311c930` | plan + T1 repo + T2 service/route | 391 |
+| (pending) | `feat/sale-delete-never-confirmed` | `bc1f454, 24a7ecd` + doc commits | T3 UI + T4 evidence | 219 |
+
+Skill: `work-unit-commits`
 (`/home/mamull/.config/opencode/skills/work-unit-commits/SKILL.md`).
 
 ## Route declaration
