@@ -93,8 +93,44 @@
   </div>
 </div>
 
+{# The purchase peek shell, the same pattern the documents drawer uses: a
+   fixed right panel whose body the list rows swap the detail fragment into
+   (`#purchase-drawer-body`). No backdrop, like the sibling drawer. #}
+<div id="purchase-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
+  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+    <span class="text-sm font-semibold">Purchase</span>
+    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closePurchaseDrawer()" aria-label="Close detail">✕</button>
+  </div>
+  <div id="purchase-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
+</div>
+
 <script>
   document.body.addEventListener('purchase-created', function(){ htmx.trigger('#purchase-list','refresh'); });
-  document.body.addEventListener('purchase-changed', function(){ htmx.trigger('#purchase-list','refresh'); });
+  function openPurchaseDrawer() {
+    var drawer = document.getElementById('purchase-drawer');
+    if (drawer) {
+      drawer.classList.remove('hidden');
+      drawer.classList.add('flex');
+    }
+  }
+  function closePurchaseDrawer() {
+    var drawer = document.getElementById('purchase-drawer');
+    if (drawer) {
+      drawer.classList.add('hidden');
+      drawer.classList.remove('flex');
+    }
+    var body = document.getElementById('purchase-drawer-body');
+    if (body) body.innerHTML = '';
+  }
+  document.addEventListener('keydown', function (evt) {
+    if (evt.key !== 'Escape') return;
+    closePurchaseDrawer();
+  });
+  document.body.addEventListener('htmx:afterSwap', function (evt) {
+    if (evt.detail.target && evt.detail.target.id === 'purchase-drawer-body') openPurchaseDrawer();
+  });
+  // A mutation inside the peek re-reads the list, so the peek is stale: the
+  // `purchase-changed` family closes it and refreshes the feed.
+  document.body.addEventListener('purchase-changed', function(){ closePurchaseDrawer(); htmx.trigger('#purchase-list','refresh'); });
 </script>
 {% endblock %}

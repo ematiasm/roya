@@ -4128,6 +4128,61 @@ mod tests {
         );
     }
 
+    // -- S3: the purchases list opens the read-only document peek -------------
+
+    /// The peek shell lives on `/purchases` and mirrors the documents drawer:
+    /// a fixed right panel whose body the row swaps the detail fragment into.
+    #[tokio::test]
+    async fn s3_purchase_list_shell_the_purchases_page_renders_the_read_only_peek() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("id=\"purchase-drawer\""),
+            "the page must render the peek shell: {html:.600}"
+        );
+        assert!(
+            html.contains("id=\"purchase-drawer-body\""),
+            "the shell must render the swap target: {html:.600}"
+        );
+        assert!(
+            html.contains("closePurchaseDrawer()"),
+            "the shell's close button must be wired: {html:.600}"
+        );
+    }
+
+    /// The whole list row is the trigger: it carries the peek's `hx-get` over
+    /// its existing `href` (the no-JavaScript fallback), and the old `Open`
+    /// anchor is gone — an `<a>` inside an `<a>` is invalid HTML.
+    #[tokio::test]
+    async fn s3_the_purchase_list_row_opens_the_peek_instead_of_navigating() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let id = fixture.purchase_id;
+        assert!(
+            html.contains(&format!("href=\"/purchases/{id}\"")),
+            "the row keeps its no-JavaScript fallback: {html:.800}"
+        );
+        assert!(
+            html.contains(&format!("hx-get=\"/web/documents/detail/purchase/{id}\"")),
+            "the row opens the peek over HTMX: {html:.800}"
+        );
+        assert!(
+            html.contains("hx-target=\"#purchase-drawer-body\""),
+            "the peek fragment lands in the drawer body: {html:.800}"
+        );
+        assert!(
+            !html.contains(">Open</a>"),
+            "the row is the trigger; the Open anchor must not render: {html:.800}"
+        );
+    }
+
     /// A principal holding ONLY `purchases.read` opens the reads and is
     /// refused every web mutation, each in the shape its caller reads and
     /// naming its own code: the draft lifecycle `purchases.create`, paying

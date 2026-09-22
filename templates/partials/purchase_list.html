@@ -4,7 +4,7 @@
     <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">Nothing here yet.</div>
   {% else %}
     {% for v in purchases %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="purchase-{{ v.detail.purchase.id }}">
+    <a class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3 no-underline hover:no-underline" id="purchase-{{ v.detail.purchase.id }}" href="/purchases/{{ v.detail.purchase.id }}" hx-get="/web/documents/detail/purchase/{{ v.detail.purchase.id }}" hx-target="#purchase-drawer-body" hx-swap="innerHTML">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
           <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if v.detail.purchase.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if v.detail.purchase.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ v.detail.purchase.status }}</span>
@@ -19,11 +19,8 @@
         </div>
         <span class="text-[13px] text-muted">#{{ v.detail.purchase.id }} • {{ v.detail.purchase.purchase_date }}{% if let Some(due) = v.detail.purchase.due_date %} • due {{ due }}{% endif %} • total {{ v.detail.total }} • paid {{ v.detail.paid }} • due {{ v.detail.due }}</span>
       </div>
-      <div class="flex items-center gap-3">
-        <span class="font-bold tabular-nums {% if v.detail.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ v.detail.total }}</span>
-        <a href="/purchases/{{ v.detail.purchase.id }}" class="rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline">Open</a>
-      </div>
-    </div>
+      <span class="font-bold tabular-nums {% if v.detail.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ v.detail.total }}</span>
+    </a>
     {% endfor %}
   {% endif %}
 </div>
