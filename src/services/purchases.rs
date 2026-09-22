@@ -423,6 +423,10 @@ where
             .await?
             .name;
 
+        // The status is read before the loop consumes `detail.lines`: the
+        // purchase itself is moved into the record at the end, so reading it
+        // inside the loop would touch a partially moved value.
+        let status = detail.purchase.status;
         let mut lines = Vec::with_capacity(detail.lines.len());
         for line in detail.lines {
             let product = self.inventory.get_product(line.product_id).await?;
@@ -433,11 +437,26 @@ where
             let tracks_stock =
                 product.kind == crate::models::ProductKind::Product && product.track_stock;
             // Stale-cost flag, derived from the same product read (no extra
-            // query): `Some` only when the line's cost is strictly higher than
-            // a real stored cost. Zero means "no cost recorded yet" (the
-            // column is NOT NULL DEFAULT '0'), and equal or lower is not what
-            // this warning is about — the drawer badge covers any disagreement.
-            let stale_cost = if line.unit_cost > product.cost_price
+            // query): `Some` only on a CONFIRMED purchase whose line cost is
+            // strictly higher than a real stored cost. Zero means "no cost
+            // recorded yet" (the column is NOT NULL DEFAULT '0'), and equal or
+            // lower is not what this warning is about — the drawer badge
+            // covers any disagreement.
+            //
+            // A draft is deliberately NOT flagged: a draft line's cost is
+            // provisional — the line can still be edited or deleted, and the
+            // purchase may never be confirmed at all — so the comparison would
+            // assert something the domain does not yet know. Confirming is
+            // the moment the cost becomes a fact, because that is when the
+            // document starts to exist; it is also why the apply action
+            // belongs here and not in the editable phase. A purchase that was
+            // confirmed and later cancelled is a historical document: it shows
+            // nothing, and its costs must not feed a product update. (The
+            // gate lives here in Rust, not in the template: this is a domain
+            // rule, and the template must not be able to re-enable or silence
+            // it.)
+            let stale_cost = if status == PurchaseStatus::Confirmed
+                && line.unit_cost > product.cost_price
                 && product.cost_price != Decimal::ZERO
             {
                 Some(StaleLineCostView {
@@ -1416,7 +1435,7 @@ mod tests {
         .unwrap()
     }
 
-    // -- Stale line cost (draft freshness flag) -------------------------------
+    // -- Stale line cost (confirmed freshness flag) ---------------------------
 
     /// The real rendering path: build the record view for a purchase's lines
     /// through `record_from_detail`, never by hand-constructing the view.
@@ -1434,6 +1453,9 @@ mod tests {
         s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
             .await
             .unwrap();
+        // Confirmed: the warning exists only after the document does. A credit
+        // purchase confirms with no payment method.
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
@@ -1452,6 +1474,7 @@ mod tests {
         s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("5")))
             .await
             .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
@@ -1467,6 +1490,7 @@ mod tests {
         s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("3")))
             .await
             .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
@@ -1482,6 +1506,7 @@ mod tests {
         s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("4")))
             .await
             .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
@@ -1489,7 +1514,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_line_cost_mixed_draft_flags_only_qualified_lines() {
+    async fn stale_line_cost_mixed_lines_flags_only_qualified_lines() {
         let (s, _pool) = svc().await;
         let rising = seed_product(&s, "CF-MIX-A", "5").await;
         let equal = seed_product(&s, "CF-MIX-B", "5").await;
@@ -1513,6 +1538,7 @@ mod tests {
         s.add_line(audit_actor(&s).await, purchase.id, lowering.id, dec("1"), Some(dec("4")))
             .await
             .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 4, "every line renders; only qualifying ones are flagged");
@@ -1531,6 +1557,74 @@ mod tests {
             .unwrap();
         assert_eq!(stale.line_cost, dec("9"));
         assert_eq!(stale.stored_cost, dec("5"));
+    }
+
+    /// The correction that moved the gate: a draft whose line cost ROSE must
+    /// NOT flag. The comparison asserts something the domain does not yet
+    /// know — the line can still be edited or deleted, and the purchase may
+    /// never be confirmed at all — so the cost stays provisional until the
+    /// document exists. This is the test that fails if anyone removes the
+    /// `Confirmed` gate from `record_from_detail`.
+    #[tokio::test]
+    async fn stale_line_cost_draft_purchase_does_not_flag_a_rising_line_cost() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "CF-DRAFT", "5").await;
+        let sup = seed_supplier(&s, "CF DRAFT SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        // Same shape as the confirmed positive case: line cost 7 over stored 5.
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        assert!(
+            views[0].stale_cost.is_none(),
+            "a draft line's cost is provisional; only a confirmed purchase flags"
+        );
+    }
+
+    /// The decided scope is `Confirmed` only. A purchase confirmed and later
+    /// cancelled is a historical document: its costs were real when confirmed,
+    /// but the document is closed and feeding them into a product update would
+    /// be a silent write from a record that no longer moves goods or money, so
+    /// it shows nothing and the apply handler refuses it. The positive control
+    /// lives in the same test so it proves the cancellation is what removed the
+    /// flag, not that the flag never existed — a gate loosened to anything
+    /// non-draft (e.g. `!= Draft`) keeps every confirmed and draft test green
+    /// while a cancelled purchase silently starts flagging.
+    #[tokio::test]
+    async fn stale_line_cost_confirmed_then_cancelled_does_not_flag() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "CF-CANCEL", "5").await;
+        let sup = seed_supplier(&s, "CF CANCEL SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+        // Same shape as the confirmed positive case: line cost 7 over stored 5.
+        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+
+        // Positive control: while confirmed, this same purchase DID flag.
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        let stale = views[0]
+            .stale_cost
+            .as_ref()
+            .expect("a rising cost must be flagged while the purchase is confirmed");
+        assert_eq!(stale.line_cost, dec("7"));
+        assert_eq!(stale.stored_cost, dec("5"));
+
+        s.cancel(audit_actor(&s).await, purchase.id, Some("devuelvo".into()))
+            .await
+            .unwrap();
+
+        let views = line_views(&s, purchase.id).await;
+        assert_eq!(views.len(), 1);
+        assert!(
+            views[0].stale_cost.is_none(),
+            "a confirmed-then-cancelled purchase is a historical document; it must not flag"
+        );
     }
 
     // -- AC1 ------------------------------------------------------------------

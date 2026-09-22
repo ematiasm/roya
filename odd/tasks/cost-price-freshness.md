@@ -1,5 +1,13 @@
 # F2 — Frescura de `cost_price`: aviso en el draft + badge permanente
 
+> **Nota (2026-09-21, T9/T11):** el aviso ya no vive en el draft. La corrección en la rama
+> `fix/cost-warning-at-confirm` lo mudó a la **compra confirmada** (y el apply exige
+> confirmación); la spec corregida vive en
+> `openspec/changes/archive/2026-09-21-move-cost-warning-to-confirm/` y en
+> `openspec/specs/purchases/spec.md`. El título y las menciones a "draft" como momento del
+> aviso que siguen describen el diseño original y quedaron superados por T9; se conservan
+> para que el plan siga legible.
+
 Feature hermana de `odd/tasks/product-markup-pricing.md` (F1). F1 deriva el precio
 de venta de `cost_price`; esta feature se ocupa de que `cost_price` **no esté
 viejo**. Son independientes: F1 funciona igual sin esto, solo que derivando de un
@@ -10,6 +18,9 @@ Que `products.cost_price` refleje el costo real del proveedor preferido, con
 aprobación humana explícita y **dos detectores complementarios**: un aviso en el
 momento de cargar la compra, y un badge permanente en el producto para cuando ese
 momento pasó sin que nadie mirara.
+
+*(Actualización T9: el aviso se muestra hoy al **confirmar** la compra, no al
+cargar la línea en el draft — el costo de una línea draft es provisional.)*
 
 ## Problem
 `products.cost_price` **nadie lo mantiene**. Las compras nunca lo escriben: en la
@@ -47,12 +58,16 @@ eso significa derivar precios de venta de un costo viejo, y el drift es silencio
    permanente. Como el botón es el único escritor, el aviso es el único detector
    *en el momento*, y sin el badge un operador que confirma sin mirar deja el
    costo viejo para siempre sin que nada lo señale.
+   *(Superado por T9: el aviso ya no es del draft, es de la compra confirmada;
+   sigue siendo efímero y el badge sigue siendo el detector permanente.)*
 4. **Interpretación confirmada**: el aviso compara **el costo de la línea que se
    está cargando contra `products.cost_price`** del producto — el costo que el
    producto tiene guardado hoy. Es la comparación que mantiene la columna fresca y
    la que da sentido al botón "actualizar el costo". La otra lectura (que el
    *proveedor* subió su precio respecto de su propio histórico) **ya está
    cubierta** por `price_alert`/`PriceAlert::Raised` y no necesita nada nuevo.
+   *(T9: el par comparado no cambió; lo que cambió es el momento — la comparación
+   se evalúa sobre la línea confirmada, no sobre la línea en carga del draft.)*
 5. **Permiso del botón: `InventoryWrite`, con el botón siempre visible.** El botón
    escribe un *producto*, así que se gatea como toda escritura de producto. Quien puede
    leer la página de compra (el gate de la página es `purchases.read`,
@@ -111,6 +126,11 @@ ventana coincide exactamente con la ventana en que el documento todavía no es r
 — nada que se avise ahí tiene consecuencias sobre un documento.
 
 **Consecuencia mala**: por lo mismo, el aviso es efímero. De ahí el badge.
+
+*(Ambas consecuencias quedaron superadas por T9: el aviso vive en la compra
+confirmada, que es justo cuando el documento empieza a existir y el costo se
+vuelve un hecho. Se conservan porque explican por qué el diseño original puso el
+aviso en el draft y por qué el badge sigue siendo necesario.)*
 
 ## Lo que ya existe (no reinventar)
 - **La lectura del costo de referencia**: `SupplierService::reference_cost`
@@ -197,23 +217,27 @@ ruta nueva), y el formato de dinero de los costos por proveedor (diferido desde 
   `add_purchase_line` `:551`, `confirm_purchase` `:574`).
 
 ## Acceptance criteria
-- [ ] Al cargar una línea de compra Draft con costo **mayor** que
+- [x] Al **confirmar** una compra con una línea cuyo costo es **mayor** que
       `products.cost_price`, aparece el aviso con el costo actual y el nuevo.
-- [ ] El aviso **no** aparece si el costo es igual o menor, ni si el producto no
-      tiene costo guardado (`0`).
-- [ ] El botón actualiza `cost_price` y, si el producto tiene markup, el
+      *(Corregido por T9: el criterio original decía "línea de compra Draft"; el
+      aviso vive en la compra confirmada.)*
+- [x] El aviso **no** aparece si el costo es igual o menor, ni si el producto no
+      tiene costo guardado (`0`); tampoco en un draft ni en una compra confirmada
+      y luego cancelada. *(La exclusión del cancelado la fijó T9 y su test es
+      `stale_line_cost_confirmed_then_cancelled_does_not_flag`.)*
+- [x] El botón actualiza `cost_price` y, si el producto tiene markup, el
       `sale_price` derivado queda recalculado.
-- [ ] La compra **nunca** escribe `products.cost_price` por sí sola: el test AC10
+- [x] La compra **nunca** escribe `products.cost_price` por sí sola: el test AC10
       sigue verde sin modificaciones. La regla y su test no cambian; la spec de
       purchases sí se extiende, con la Interface y el Authorization de la ruta nueva.
-- [ ] En el drawer del producto, cuando `reference_cost` difiere de
+- [x] En el drawer del producto, cuando `reference_cost` difiere de
       `products.cost_price`, aparece el badge con los dos valores; no aparece
       cuando coinciden ni cuando no hay costo de referencia.
-- [ ] Con `cost_price = 0` el badge trata el caso como "sin costo", no como una
+- [x] Con `cost_price = 0` el badge trata el caso como "sin costo", no como una
       diferencia contra cero.
-- [ ] Ambas señales son **derivadas**: nada nuevo se almacena.
-- [ ] `cargo test` verde y `cargo check --all-targets` sin errores.
-- [ ] `scripts/e2e.sh -k purchases` y `-k products` verdes.
+- [x] Ambas señales son **derivadas**: nada nuevo se almacena.
+- [x] `cargo test` verde y `cargo check --all-targets` sin errores.
+- [x] `scripts/e2e.sh -k purchases` y `-k products` verdes.
 
 ## Applicable checks
 - `cargo test`, `cargo check --all-targets`
@@ -294,6 +318,54 @@ ruta nueva), y el formato de dinero de los costos por proveedor (diferido desde 
       código de producción**. Encontró siete defectos de documentación, todos
       corregidos en `e9b83a2` — el detalle en Progress. El código queda listo
       para review y merge.
+- [x] T9 — **Corrección de comportamiento: la compuerta se muda a `Confirmed`.**
+      La regla vive en el servicio (`record_from_detail`), el template pierde su
+      chequeo de estado, el handler aplica solo sobre compra confirmada, y los
+      tests que afirmaban el comportamiento viejo se confirman/renombran/invierten.
+      Hecho: cinco de servicio y cuatro de ruta confirmados, dos invertidos (el
+      draft ahora es el que no avisa y el que es rechazado), un test nuevo de
+      servicio fijando que un draft con costo subido no marca, validado
+      reintroduciendo el defecto. `cargo test` **798 passed**, `cargo check
+      --all-targets` **0 errores / 55 warnings** (el baseline).
+- [x] T10 — El viaje de navegador (`e2e/tests/test_purchases.py`) confirma antes
+      de que el aviso aparezca.
+      Hecho: el viaje reescrito confirma en el navegador y afirma que el aviso
+      llega en el fragmento swapeado del confirm, sin reload (marcador JS), con
+      el botón Apply listo; más los estados negativos draft y costos-iguales, y
+      el apply devolviendo el registro sin aviso. Verde en la rama
+      `fix/cost-warning-at-confirm`.
+- [x] T11 — La corrección de la spec: el aviso y la acción son de compra
+      confirmada, con la justificación invertida por escrito. → `307ef21`:
+      change folder `openspec/changes/archive/2026-09-21-move-cost-warning-to-confirm/`
+      y la spec promovida `openspec/specs/purchases/spec.md` corregida (Interface
+      y Authorization).
+- [x] T12 — Verificación final: `cargo check --all-targets` (55 warnings),
+      `cargo test` verde, y el test nuevo de draft validado reintroduciendo el
+      defecto. **Ejecutada y verde**: `cargo check --all-targets` **0 errores /
+      55 warnings** (el baseline), `cargo test` **799 passed / 0 failed**, y la
+      suite completa de navegador verde. **Veredicto: el comportamiento del
+      código es correcto y no necesita edición.** Lo que encontró fueron cuatro
+      defectos y dos mejoras, todos ya corregidos en el árbol de trabajo:
+      - **El hueco real que ninguna suite veía**: la regla de confirmado-y-luego-
+        cancelado estaba escrita como comportamiento decidido **sin ningún test
+        detrás**, y el change folder *afirmaba* que estaba cubierta. El hueco era
+        alcanzable: un refactor a `status != Draft` mantenía todos los tests en
+        verde mientras una compra cancelada empezaba a marcar en silencio. Lo
+        pinéa un test de regresión nuevo
+        (`stale_line_cost_confirmed_then_cancelled_does_not_flag`), validado
+        reintroduciendo exactamente ese refactor y viéndolo fallar (el test de
+        draft ya había sido validado igual en T9; este es otro test, para otro
+        borde).
+      - **Corrección de una premisa del padre**: el padre creía que la slice
+        había *divulgado* que faltaba el test; en realidad un documento
+        *afirmaba* que estaba cubierto, que es peor — no era un hueco declarado
+        sino una cobertura falsa.
+      - El ledger tenía T11 sin marcar aunque estaba entregada, y sus secciones
+        vivas todavía describían el aviso en el draft.
+      - El design del change folder sobreafirmaba el badge del drawer como
+        cubriendo todo hueco que el aviso no cubre; la spec promovida dejaba
+        implícita la regla del cancelado; y el change folder archivado viejo
+        no tenía puntero diciendo que la regla se había mudado.
 
 ## Progress
 - **Convención de entrega (decidido 2026-09-21)**: F1 entró a `main` con un push
@@ -440,3 +512,98 @@ ruta nueva), y el formato de dinero de los costos por proveedor (diferido desde 
   `main` (medidos con `git log --oneline main..HEAD`), pusheada a `origin` y
   esperando PR — como manda la convención de entrega: nunca un push directo a
   `main`.
+- **Corrección conductual post-T8: el aviso y su acción se mudan de Draft a
+  `Confirmed`** (rama `fix/cost-warning-at-confirm`). El motivo de fondo: **el
+  costo de una línea draft es provisional** — la línea todavía se puede editar
+  o borrar, y la compra puede que nunca se confirme — así que la comparación
+  contra el costo guardado afirma algo que el dominio todavía no sabe.
+  Confirmar es el momento en que el costo se vuelve un hecho, porque es cuando
+  el documento empieza a existir. Eso **invierte la justificación que estaba
+  escrita y testeada**: la acción de aplicar era deliberadamente draft-only
+  "porque solo tiene sentido mientras la compra es editable", y queda
+  registrada la justificación opuesta — la acción tiene sentido **precisamente
+  después** de que el documento existe, porque es cuando el costo es real.
+  Tres hechos en el registro:
+  - **El badge ya detectaba el mismo hecho.** Confirmar actualiza el satélite,
+    así que `reference_cost` pasa a ser el costo de la línea confirmada y el
+    badge del drawer del producto dispara sobre esa misma discrepancia. Lo que
+    este aviso aporta no es detección nueva sino **dónde y cuándo**: en la
+    página de compra, justo después de confirmar, donde el operador ya está.
+    Las dos señales siguen siendo complementarias, pero el solapamiento es
+    mayor que antes.
+  - **AC10 no se toca.** La acción sigue escribiendo por
+    `InventoryService::update_product` (nunca por el flujo de compras) y
+    confirmar sigue tocando solo el satélite.
+  - **El borde confirmado-y-luego-cancelado no muestra nada**: es un documento
+    histórico, y actualizar el costo del producto desde una compra cancelada
+    sería un error. El scope decidido es **solo `Confirmed`**.
+- **Estado de la corrección en esta slice (parte de T9, sobre
+  `fix/cost-warning-at-confirm`)**: la compuerta quedó en Rust en
+  `record_from_detail` (`Confirmed` && costo de línea > costo guardado > 0),
+  el template renderiza el aviso solo por `stale_cost` (su chequeo de Draft se
+  sacó, y el `colspan` del aviso bajó de 5 a 4 porque una compra confirmada
+  tiene 4 cabeceras), el handler rechaza lo no-confirmado con
+  `purchase {id} is not confirmed (status X)`, y los tests quedaron: cinco de
+  servicio y cuatro de ruta confirmados, `stale_line_cost_mixed_draft...`
+  renombrado a `stale_line_cost_mixed_lines_flags_only_qualified_lines`, dos
+  tests de ruta invertidos (draft ahora es el que no avisa y el que es
+  rechazado), y un test nuevo de servicio que fija que **un draft con costo
+  subido no marca** — validado reintroduciendo el defecto (sin la compuerta,
+  el test falla; restaurada, vuelve a pasar). `cargo test` **798 passed**
+  (797 + 1), `cargo check --all-targets` **0 errores / 55 warnings** (el
+  baseline). `web_apply_line_cost_refuses_a_principal_without_inventory_write`
+  no necesita cambio: el extractor `Require<InventoryWrite>` rechaza antes de
+  que el cuerpo del handler lea el estado, así que el fixture queda en draft y
+  el test sigue midiendo la negación de permiso, no la de estado. La exención
+  de `web_purchase_record_confirmed_refuses_draft_actions_at_the_service` se
+  respeta: es sobre las otras acciones de línea draft-only.
+- **T10 quedó (sobre `fix/cost-warning-at-confirm`)**: el viaje de navegador
+  (`e2e/tests/test_purchases.py`) quedó reescrito a la compuerta nueva. El
+  viaje confirma la compra en el navegador y afirma que el aviso llega en el
+  fragmento swapeado del confirm, sin reload (probado con un marcador JS que
+  una navegación completa destruiría), con el botón Apply listo y el producto
+  recibiendo el costo derivado por markup. Complementa con tres estados
+  negativos ya cubiertos: el draft con costo subido no avisa ni muestra el
+  botón, la compra confirmada con costos iguales tampoco, y el apply con el
+  swap devuelve el registro sin aviso. Está verde: con esto, el archivo deja
+  de codificar el comportamiento viejo en draft y el viaje de navegador no
+  queda pendiente por la compuerta nueva.
+- **T11 cerrada** → `307ef21`: la corrección de la spec (antes fuera de las
+  superficies de edición de la slice T9–T10) entró como change folder propio y
+  con la spec promovida de purchases al día.
+- **T12 cerrada — verificación final independiente, verde.** `cargo test`
+  **799 passed / 0 failed**, `cargo check --all-targets` **0 errores / 55
+  warnings** (el baseline), suite completa de navegador verde. El veredicto:
+  **el comportamiento del código es correcto y no necesita edición** — lo que
+  encontró fueron cuatro defectos y dos mejoras, ya corregidos en el árbol de
+  trabajo (el detalle completo arriba, en T12):
+  - **El hueco que ninguna suite veía**: la regla confirmado-then-cancelado
+    sin test y con un change folder afirmando cobertura falsa. Test de
+    regresión nuevo, validado reintroduciendo el refactor a `status != Draft`
+    y viéndolo fallar.
+  - El bookkeeping del ledger (T11 sin marcar, secciones vivas describiendo el
+    draft), el sobreafirme del design del change folder, la regla del cancelado
+    implícita en la spec promovida, y el puntero faltante en el change folder
+    archivado viejo.
+  - **Corrección de una premisa del padre**: la slice no había divulgado el
+    hueco del test; un documento lo afirmaba cubierto, que es peor.
+- **Forma final de la rama**: `fix/cost-warning-at-confirm`, **2 commits**
+  sobre `main` (medidos con `git log --oneline main..HEAD`), pusheada a
+  `origin` y esperando PR — como manda la convención de entrega: nunca un
+  push directo a `main`. La feature que corrige (`feat/cost-price-freshness`)
+  ya está en `main` vía PR #79 (merge `69b638d`).
+- **Divergencias conocidas entre el aviso y el badge del drawer (por diseño,
+  verificado en la revisión independiente)**: comparan pares distintos — el
+  aviso compara el costo de *esta línea* contra la columna guardada; el badge
+  compara el *costo de referencia del proveedor* (el preferido, si no el más
+  barato) contra la misma columna. Por eso pueden divergir, y no es un
+  defecto:
+  - Una **bajada** de costo dispara el badge y deja el aviso en silencio,
+    porque el aviso es solo por subida.
+  - Con **varios proveedores**, una compra confirmada de un proveedor no
+    referente puede disparar el aviso mientras el badge calla, y también al
+    revés.
+  - Una compra **confirmada y luego cancelada** deja al badge disparando
+    mientras el aviso calla, que es el scope decidido.
+  En el caso simple de un solo proveedor con costo en subida, los dos
+  coinciden.
