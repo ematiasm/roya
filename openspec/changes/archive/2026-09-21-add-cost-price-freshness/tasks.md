@@ -9,7 +9,8 @@
 
 ## Review workload
 
-The branch is six commits (the feature slices below plus their docs commits) and its bulk is
+The branch is thirteen commits (`git log --oneline main..HEAD` from the merge base `40ad8f7`):
+the five feature slices below, their interleaved docs commits, and the spec promotion. Its bulk is
 tests and documents — the route-test modules in `src/routes/inventory_web.rs` and
 `src/routes/purchases_web.rs`, the service-level flag tests in `src/services/purchases.rs`,
 the smoke suite, the browser suites (`e2e/tests/test_products.py`,
@@ -28,22 +29,23 @@ the whole suite); it is not skipped and is recorded in the Verify section.
       three gates (reference exists, stored cost non-zero, they differ) as one match
       expression, `StaleCostView` rendered in the supplier-costs card, derived and never
       stored. (2026-09-21: delivered as `c123678` on `feat/cost-price-freshness`; `cargo test`
-      780 passed, 0 failed.)
+      782 passed, 0 failed.)
 - [x] T2: the badge's browser tests — both values shown when the costs disagree, hidden when
       equal, hidden without supplier rows, hidden at stored zero, preferred-supplier rule.
-      (2026-09-21: delivered as `6f84698`; `scripts/e2e.sh -k products` green.)
+      (2026-09-21: delivered as `6f84698`; `scripts/e2e.sh -k products` 22 passed, 1 skipped;
+      `cargo test` 782 passed, 0 failed, unmoved.)
 - [x] T3: the derived line field — `stale_cost` on `PurchaseLineView`, computed from the
       product read the detail view already fetches: strictly higher line cost, non-zero stored
-      cost. (2026-09-21: delivered as `d55ed00`; `cargo test` 783 passed, 0 failed.)
+      cost. (2026-09-21: delivered as `d55ed00`; `cargo test` 787 passed, 0 failed.)
 - [x] T4: the warning — rendered as a full-width sub-row under the draft line, both numbers,
-      badge styling reused, draft-only. (2026-09-21: delivered as `1ac6555`; `cargo test` 787
+      badge styling reused, draft-only. (2026-09-21: delivered as `1ac6555`; `cargo test` 790
       passed, 0 failed.)
 - [x] T5: the action — `web_apply_line_cost` and its route, gated `Require<InventoryWrite>`,
       draft-only in the handler, no body extractor, the write through
       `InventoryService::update_product` with a `cost_price`-only patch so the markup
       derivation recomputes; route tests for the happy path, the injected body, the
       cross-purchase 404, the permission refusal and the non-draft refusal. (2026-09-21:
-      delivered as `844248c`; `cargo test` 790 passed, 0 failed.)
+      delivered as `844248c`; `cargo test` 797 passed, 0 failed.)
 - [x] T6: the browser journey — a stale draft line warns with both numbers, applying updates
       the product (and its markup-derived price), and no stale badge remains afterwards.
       (2026-09-21: delivered as `ca296a6`; `cargo test` 797 passed, 0 failed.)

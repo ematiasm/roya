@@ -109,7 +109,8 @@ The product drawer shows the badge exactly when a supplier reference cost disagr
 non-zero stored cost; a draft line warns only when its cost is strictly above a real stored
 cost; "Apply to product" writes the line's cost into the product through the inventory
 service, recomputing a markup-derived sale price, for a draft, from the stored line, with a
-body that is never read, under `inventory.write`; a principal without that permission sees a
-visible forbidden page; the purchase flow still never writes the column. Covered by the Rust
+body that is never read, under `inventory.write`; a principal who can read the purchase page but
+lacks that permission sees a visible refusal (on the HTMX click, the application's global error
+notice, not the forbidden page); the purchase flow still never writes the column. Covered by the Rust
 suite (route tests for both signals, the service-level flag tests, the permission and
 cross-purchase refusals), the smoke suite, and browser tests for the badge and the journey.

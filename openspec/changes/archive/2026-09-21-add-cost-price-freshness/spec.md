@@ -30,8 +30,10 @@ purchase never writes `products.cost_price`" is untouched.
   cannot inject a cost, and a line id from a different purchase is a 404.
 - **The action is gated `inventory.write` and draft-only.** The handler refuses a non-draft
   purchase itself, in the service's own message shape. The button renders for every draft
-  viewer by design; an operator holding only `purchases.create` sees a visible forbidden page
-  rather than a dead end.
+  viewer by design; a principal who can read the purchase page but lacks `inventory.write`
+  sees a visible refusal rather than a dead end — the HTMX click surfaces the 403 as the
+  application's global error notice (`htmx:responseError` in `base.html`), not the
+  full-page forbidden page, which full-page navigation alone reaches.
 - **The purchase flow still never writes the column.** The action is a separate,
   human-triggered product write that reaches the product through the inventory service. The
   purchases rule and its pinning test (`ac10_purchase_never_writes_cost_price_and_satellite_wins`)
@@ -67,8 +69,9 @@ purchase never writes `products.cost_price`" is untouched.
       line.
 - [ ] AC9: a line id from a different purchase returns 404 and writes nothing: the line is
       looked up within the purchase's own lines.
-- [ ] AC10: the route is gated `inventory.write`: a principal holding only `purchases.create`
-      gets the forbidden page and the product's cost is untouched.
+- [ ] AC10: the route is gated `inventory.write`: a principal who can read the purchase page
+      but lacks `inventory.write` gets a visible refusal (on the HTMX click, the global error
+      notice, not the forbidden page) and the product's cost is untouched.
 - [ ] AC11: a non-draft purchase refuses the action and leaves the product untouched — the
       handler holds the draft check, not just the template.
 - [ ] AC12: the badge and the warning are pure reads: the only write in the change is the

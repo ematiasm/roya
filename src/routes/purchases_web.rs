@@ -731,9 +731,11 @@ async fn web_remove_line(
 ///
 /// Gate: this action writes a PRODUCT, so it carries `inventory.write` like
 /// every other product write, never `purchases.create`. The button renders for
-/// every draft viewer by design: an operator holding only `purchases.create`
-/// sees it and gets the forbidden page on click — a visible refusal, not a
-/// silent one. The audit actor is the acting user, the way `web_edit_product`
+/// every draft viewer by design: the purchase page is gated `purchases.read`, so
+/// any operator who can open it sees the button, and one who lacks
+/// `inventory.write` gets a visible refusal on click — the application's error
+/// notice for the htmx request, not the forbidden page, which is what a
+/// full-page navigation gets. The audit actor is the acting user, the way `web_edit_product`
 /// passes it under the same permission.
 ///
 /// Draft-only: the button renders only in Draft, and the handler refuses a

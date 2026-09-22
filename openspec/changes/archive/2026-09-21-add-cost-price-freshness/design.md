@@ -59,8 +59,15 @@ from "record what we bought" to "reprice the catalog". The project also reserves
 any-of grant form (`RequireAny<S>`) for read-only index screens that narrow their content to
 the opener's tier; a write route is never an any-of grant.
 
-The button is rendered unconditionally on purpose: an operator holding only
-`purchases.create` sees it and, on click, gets the visible forbidden page. A silently hidden
+The button is rendered unconditionally on purpose: an operator who can read the
+purchase page — the page's own gate is `purchases.read` (`purchases_record_page`,
+`src/routes/purchases_web.rs:412-415`), so a `purchases.create`-only principal never
+loads it at all — but lacks `inventory.write` sees the button and, on click, gets a
+visible refusal. The click is an HTMX post, and the security kernel answers HTMX
+refusals with 403 JSON (`forbidden_response`, `src/security/authz.rs:362-380`) that the
+application's global `htmx:responseError` handler (`templates/base.html:122-129`)
+turns into the dismissible error notice; the full-page forbidden page is reserved for
+full-page navigation. A silently hidden
 button would deny without explanation; a rendered button that refuses makes the permission
 gap visible. This mirrors the deliberate supplier-payment consequence already recorded in the
 purchases spec (a `suppliers.write`-only principal sees the pay card and is refused on
@@ -98,6 +105,18 @@ strictly HIGHER than a real stored cost. A draft that buys cheaper is good news,
 to clean up at the counter, and the standing disagreement in the other direction is already
 covered by the drawer badge. Two signals with different jobs; the warning is about a drift the
 operator is causing right now and can fix in one click.
+
+## The badge's label says "stale cost" for any disagreement (considered decision)
+
+The badge's label reads "stale cost" and fires on a disagreement in either direction,
+while the draft warning fires only on a rise. That asymmetry is deliberate, not an
+oversight: the stored cost is out of date in both directions — whether the satellite
+rose above it or dropped below it, the column no longer reflects the supplier truth —
+so "stale" is accurate for both. The warning is deliberately directional because only
+a rise is worth acting on at purchase time: buying cheaper needs no correction at the
+counter. The badge covers the standing disagreement, whichever way it points. The
+label stays as-is — several tests assert the exact string, and renaming it for this
+nuance is churn the change does not justify.
 
 ## Rejected alternative: syncing the column from the satellite
 

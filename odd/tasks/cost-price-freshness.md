@@ -54,9 +54,13 @@ eso significa derivar precios de venta de un costo viejo, y el drift es silencio
    *proveedor* subió su precio respecto de su propio histórico) **ya está
    cubierta** por `price_alert`/`PriceAlert::Raised` y no necesita nada nuevo.
 5. **Permiso del botón: `InventoryWrite`, con el botón siempre visible.** El botón
-   escribe un *producto*, así que se gatea como toda escritura de producto. Quien
-   solo tiene `purchases.create` ve el aviso y el botón, y al clickear recibe la
-   página de prohibido — visible, no un fallo silencioso. Es el patrón dominante
+   escribe un *producto*, así que se gatea como toda escritura de producto. Quien puede
+   leer la página de compra (el gate de la página es `purchases.read`,
+   `src/routes/purchases_web.rs:412-415`) pero no tiene `inventory.write` ve el aviso y
+   el botón, y al clickear recibe una negación visible: el clic es HTMX, así que el 403
+   JSON alimenta el aviso de error global de la aplicación (`htmx:responseError` en
+   `templates/base.html:122-129`), no la página de prohibido (esa es para navegación
+   full-page, `src/security/authz.rs:362-380`). Es el patrón dominante
    del repo (el markup es cortesía, el handler es la enforcement) y evita plomear
    los permisos del principal hasta el template. Se descartó gatear con
    `PurchasesCreate`: le daría a un comprador la escritura de productos, que es
@@ -153,16 +157,23 @@ Ubicación decidida: el badge va en la **Card B (supplier costs)**
  (`templates/partials/product_detail.html:179-243`), no al lado del precio, porque
  ahí nacen los costos de proveedor y el texto de estado vacío **ya** explica el
  fallback al `cost_price` del producto (`:184-185`). El badge hereda el doble gate
- del drawer (`inventory.read` **y** `purchases.costs.read`,
- `src/routes/inventory_web.rs:445-451`), así que solo lo ve quien tiene los dos.
+ de la apertura del drawer (GET `/web/products/detail/{id}`: `inventory.read` **y**
+ `purchases.costs.read`, `src/routes/inventory_web.rs:468-474`, extractores en `:470-471`),
+ así que al abrir el drawer solo lo ve quien tiene los dos. Pero la Card B también la
+ re-renderizan las rutas mutantes del drawer, que llevan un permiso propio único — el edit
+ (`inventory.write`, `:913`), el record-cost y el preferred (`purchases.costs.write`, `:1036`
+ y `:1077`) y el movimiento de stock (`inventory.stock.write`, `:852`) — así que el badge
+ aparece también bajo esas respuestas. Es exposición preexistente: la card ya listaba los
+ costos de proveedor antes de esta rama, así que el badge no divulga nada nuevo ahí.
 
 Datos de contexto confirmados en el mapeo: la comparación de la Señal A sale del
  producto ya fetcheado en `add_line` (`src/services/purchases.rs:307`, con el
  fallback en `:318-320`), y el `ensure_draft` (`:176`) garantiza que el aviso solo
  puede existir en fase Draft.
 
-Fuera de alcance: la spec de purchases (no cambia), y el formato de dinero de los
-costos por proveedor (diferido desde F1).
+Fuera de alcance: la regla de compras **nunca escribe `cost_price`** y su test AC10 (no
+cambian; la spec de purchases aun así se extiende con la Interface y el Authorization de la
+ruta nueva), y el formato de dinero de los costos por proveedor (diferido desde F1).
 
 ## Constraints
 - `products.cost_price` es `NOT NULL DEFAULT '0'`: "sin costo" se manifiesta como
@@ -193,7 +204,8 @@ costos por proveedor (diferido desde F1).
 - [ ] El botón actualiza `cost_price` y, si el producto tiene markup, el
       `sale_price` derivado queda recalculado.
 - [ ] La compra **nunca** escribe `products.cost_price` por sí sola: el test AC10
-      sigue verde sin modificaciones, y la spec de purchases no cambia.
+      sigue verde sin modificaciones. La regla y su test no cambian; la spec de
+      purchases sí se extiende, con la Interface y el Authorization de la ruta nueva.
 - [ ] En el drawer del producto, cuando `reference_cost` difiere de
       `products.cost_price`, aparece el badge con los dos valores; no aparece
       cuando coinciden ni cuando no hay costo de referencia.
@@ -257,10 +269,18 @@ costos por proveedor (diferido desde F1).
       frontera se validó haciendo el lookup global y viéndolo fallar 200 contra 404.
       El comentario del test de T4 que sobreafirmaba el scopeo quedó ajustado en la
       misma slice (ahora afirma el aviso dentro de `#purchase-record-money`).
-- [ ] T6 — **Señal A, e2e del flujo.** Aviso → botón → `cost_price` actualizado →
-      `sale_price` recalculado cuando hay markup.
-- [ ] T7 — **Spec.** Change folder OpenSpec + promoción de `inventory`. La spec de
-      **purchases no cambia** (AC10 intacto).
+- [x] T6 — **Señal A, e2e del flujo.** Aviso → botón → `cost_price` actualizado →
+      `sale_price` recalculado cuando hay markup. → `ca296a6`: suite nueva
+      `e2e/tests/test_purchases.py` (185 líneas), dos tests de navegador — aplicar el
+      costo recalcula el precio derivado (esperado calculado en el test desde el markup)
+      y una línea con costo igual no ofrece aviso ni botón. Validado con el handler en
+      no-op, dos variantes. `cargo test` 797 sin moverse; `scripts/e2e.sh` 81 passed,
+      4 skipped.
+- [x] T7 — **Spec.** Change folder OpenSpec + promoción de `inventory`. → `8a7f101`:
+      el cambio archivado en `openspec/changes/archive/2026-09-21-add-cost-price-freshness/`
+      y promocionado a las specs de `inventory`, `purchases` y `openspec/specs/README.md`.
+      La regla de compras **nunca escribe `cost_price`** (AC10) no cambia; la spec de
+      purchases gana la Interface y el Authorization de la ruta nueva.
 - [ ] T8 — **Verificación final independiente**: `cargo test`,
       `cargo check --all-targets`, `scripts/e2e.sh -k purchases` y `-k products`.
       La verificación de F1 encontró un bug alcanzable que las verificaciones por
@@ -360,3 +380,16 @@ costos por proveedor (diferido desde F1).
   `src/services/purchases.rs`, fuera del alcance de la slice); y la suite read-only de
   AC10 no incluye la ruta nueva, aunque su compuerta sí está cubierta por un test
   dedicado.
+- **T6 cerrada** → `ca296a6`. Suite nueva `e2e/tests/test_purchases.py` con dos tests
+  de navegador: el viaje (aviso → botón → `cost_price` aplicado → `sale_price`
+  recalculado, con el precio esperado calculado en el test desde el markup) y el
+  negativo (línea con costo igual: sin aviso ni botón). Validado con el handler en
+  no-op, dos variantes. El principal del harness es el admin bootstrap, cuyo rol tiene
+  el catálogo completo — chequeado antes de escribir, porque la ruta exige
+  `inventory.write`. `cargo test` 797 passed (solo tests, sin moverse);
+  `scripts/e2e.sh` 81 passed, 4 skipped.
+- **T7 cerrada** → `8a7f101`. El change folder quedó archivado directamente en su casa
+  (`openspec/changes/archive/2026-09-21-add-cost-price-freshness/`) y el presente-tense
+  quedó en `openspec/specs/inventory/spec.md` (el badge como read derivado),
+  `openspec/specs/purchases/spec.md` (la ruta en Interface y su Authorization) y
+  `openspec/specs/README.md`. AC10 y su test intactos.
