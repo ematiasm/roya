@@ -92,9 +92,9 @@ Therefore:
 
   | PR | Branch | Commits | Increment | Lines |
   |----|--------|---------|-----------|-------|
-  | (pending) | `feat/cancelled-delete-s1` | `8708c87` | T1 repo predicate | 267 |
-  | (pending) | `feat/cancelled-delete-s2` | `f6789f9` | T2 service + route | 180 |
-  | (pending) | `feat/purchase-delete-never-confirmed` | `69ae397, 36e88fe` + doc | T3 UI + T4 evidence | 277 + doc commits |
+  | [#86](https://github.com/ematiasm/roya/pull/86) | `feat/cancelled-delete-s1` | `8708c87` | T1 repo predicate | 267 |
+  | [#87](https://github.com/ematiasm/roya/pull/87) | `feat/cancelled-delete-s2` | `f6789f9` | T2 service + route | 180 |
+  | [#88](https://github.com/ematiasm/roya/pull/88) | `feat/purchase-delete-never-confirmed` | `69ae397, 36e88fe` + doc | T3 UI + T4 evidence | 277 + doc commits |
 
 - Skill: `work-unit-commits`
   (`/home/mamull/.config/opencode/skills/work-unit-commits/SKILL.md`).
