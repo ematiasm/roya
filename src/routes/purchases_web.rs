@@ -66,7 +66,7 @@ struct PurchasesTemplate {
     nav: Nav,
     /// Whether the acting principal may refresh the reorder suggestions
     /// (`inventory.read`, the gate the suggestions fragment and API carry).
-    /// When false the page renders no Sugerido block at all — the coherent
+    /// When false the page renders no suggestions block at all — the coherent
     /// half of the old consequence where a `purchases.read`-only principal
     /// saw suggestions it could not refresh.
     show_suggestions: bool,
@@ -299,8 +299,8 @@ async fn changed_with_picker(
 /// roster it needs to record a purchase, and the supplier screens themselves
 /// refuse it. The reorder suggestions are the coherent half: the block now
 /// renders only when the principal holds `inventory.read`, the same gate the
-/// suggestions fragment and API carry, so a purchases-only principal sees no
-/// Sugerido block it could not refresh (S7 part 2 closed the consequence the
+    /// suggestions fragment and API carry, so a purchases-only principal sees no
+    /// suggestions block it could not refresh (S7 part 2 closed the consequence the
 /// part 1 review recorded).
 async fn purchases_page(
     State(state): State<AppState>,
@@ -313,7 +313,7 @@ async fn purchases_page(
     // the fragment (`/web/purchases/suggestions`) and the API twin are gated
     // `inventory.read` because the suggestion is stock-derived data, so the
     // server-rendered block obeys the same gate. A purchases-only principal
-    // sees the purchases list without the Sugerido section, never a block
+    // sees the purchases list without the suggestions section, never a block
     // that answers 403 on refresh.
     let show_suggestions = principal.has_permission::<InventoryRead>();
     let (suggestions, has_suggestions) = if show_suggestions {
@@ -1483,7 +1483,7 @@ mod tests {
         let (status, html) = get_html(app, "/purchases").await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("Purchases"), "page should mention Purchases");
-        assert!(html.contains("Sugerido"), "page should have the suggestion panel");
+        assert!(html.contains("Suggestions"), "page should have the suggestion panel");
     }
 
     // -- N3: the purchase record page ------------------------------------------
@@ -1512,7 +1512,7 @@ mod tests {
             "every row must link to its record: {html:.600}"
         );
         assert!(
-            html.contains("Sugerido"),
+            html.contains("Suggestions"),
             "the suggestion panel stays on the list page: {html:.600}"
         );
     }
@@ -3008,7 +3008,7 @@ mod tests {
     /// `purchases.read`-only principal saw the reorder suggestions
     /// server-rendered into `/purchases` and was refused them on refresh,
     /// because the fragment and the API are gated `inventory.read`. Now the
-    /// page renders the Sugerido block only when the principal holds that
+    /// page renders the suggestions block only when the principal holds that
     /// same gate: no block that answers 403 on its own refresh button.
     #[tokio::test]
     async fn ac21_the_suggestions_block_hides_from_a_principal_that_cannot_refresh_it() {
@@ -3023,10 +3023,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
             !html.contains("id=\"suggestion-section\""),
-            "the Sugerido block must not render for a principal the suggestions \
+            "the suggestions block must not render for a principal the suggestions \
              fragment would refuse: {html:.600}"
         );
-        assert!(!html.contains("Sugerido"), "{html:.600}");
+        assert!(!html.contains("Suggestions"), "{html:.600}");
 
         // The same page for a principal holding BOTH codes: the block is back.
         let holder = test_support::seed_session_with_permissions(
@@ -3039,7 +3039,7 @@ mod tests {
             get_html_as(app, "/purchases", Some(&test_support::cookie_for(&holder))).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
-            html.contains("id=\"suggestion-section\"") && html.contains("Sugerido"),
+            html.contains("id=\"suggestion-section\"") && html.contains("Suggestions"),
             "a principal that may refresh the suggestions must see the block: {html:.600}"
         );
     }

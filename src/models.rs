@@ -1149,6 +1149,11 @@ pub struct PurchaseRecord {
     pub paid: Decimal,
     pub due: Decimal,
     pub payment_status: PaymentStatus,
+    /// Sum of `qty` over the lines whose `tracks_stock` predicate holds — the
+    /// units `confirm`/`cancel` will actually move (receiving-desk T2). Built
+    /// in Rust from the same per-line flags the record already computes, so
+    /// any effects preview rendered from it cannot drift from those flows.
+    pub tracked_units: Decimal,
 }
 
 /// Format `YYYY-PURCH-NNNNNN` with zero-padded 6-digit sequence.

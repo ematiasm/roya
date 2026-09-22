@@ -52,7 +52,7 @@
     {% if show_suggestions %}
     <div class="rounded-2xl border border-border bg-card p-5" id="suggestion-section">
       <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Sugerido</h2>
+        <h2 class="text-lg font-semibold">Suggestions</h2>
         <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/purchases/suggestions" hx-target="#suggestion-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
       <div id="suggestion-list"
@@ -61,7 +61,7 @@
            hx-swap="innerHTML">
         {% include "partials/suggestion_list.html" %}
       </div>
-      <div class="mt-2 text-[13px] text-muted">Sugerido = max − stock when stock ≤ min. Supplier = preferred satellite row, else cheapest current cost. Products without a cost row are listed separately. Serving a suggestion opens its new draft record.</div>
+      <div class="mt-2 text-[13px] text-muted">Suggested = max − stock when stock ≤ min. Supplier = preferred satellite row, else cheapest current cost. Products without a cost row are listed separately. Serving a suggestion opens its new draft record.</div>
     </div>
     {% endif %}
   </div>
