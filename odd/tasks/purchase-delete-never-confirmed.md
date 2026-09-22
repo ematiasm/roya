@@ -87,8 +87,15 @@ Therefore:
 
 ## Delivery strategy
 
-- `ask-on-risk` + `stacked-to-main` if forecast > 400 (session cache);
-  expected under budget for this change.
+- `ask-on-risk` + `stacked-to-main` (session cache). Aggregate 696 lines >
+  400 → sliced into 3 PRs, each under budget (recorded at push, 2026-09-22):
+
+  | PR | Branch | Commits | Increment | Lines |
+  |----|--------|---------|-----------|-------|
+  | (pending) | `feat/cancelled-delete-s1` | `8708c87` | T1 repo predicate | 267 |
+  | (pending) | `feat/cancelled-delete-s2` | `f6789f9` | T2 service + route | 180 |
+  | (pending) | `feat/purchase-delete-never-confirmed` | `69ae397, 36e88fe` + doc | T3 UI + T4 evidence | 277 + doc commits |
+
 - Skill: `work-unit-commits`
   (`/home/mamull/.config/opencode/skills/work-unit-commits/SKILL.md`).
 
