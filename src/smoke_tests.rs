@@ -3723,6 +3723,56 @@ async fn products_page_uses_modals_drawer_and_clickable_rows() {
     );
 }
 
+/// The purchases-index redesign S1 (odd/tasks/redesign-purchases-index.md):
+/// the four REST API cards left the operator's pages (`/`, `/purchases`,
+/// `/sales`, `/suppliers`). The endpoints themselves stay; the shell's
+/// `REST API ↗` link (`partials/sidebar.html`) remains the surviving API
+/// surface and is pinned separately by
+/// `sidebar_groups_navigation_into_operation_catalogue_and_cash`.
+#[tokio::test]
+async fn purchases_page_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, purchases) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !purchases.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /purchases"
+    );
+}
+
+#[tokio::test]
+async fn sales_page_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, sales) = get(&app, "/sales").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !sales.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /sales"
+    );
+}
+
+#[tokio::test]
+async fn suppliers_page_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, suppliers) = get(&app, "/suppliers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !suppliers.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /suppliers"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, dashboard) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !dashboard.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /"
+    );
+}
+
 #[tokio::test]
 async fn converted_pages_expose_the_notice_region_and_named_actions() {
     let (app, _pool) = test_app().await;
