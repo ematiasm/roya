@@ -9,7 +9,7 @@
         <div class="flex flex-wrap items-center gap-2">
           <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if v.detail.purchase.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if v.detail.purchase.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ v.detail.purchase.status }}</span>
           <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if v.detail.due.is_sign_positive() %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{% if v.detail.due.is_sign_positive() %}payable {{ v.detail.due }}{% else %}settled{% endif %}</span>
-          <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ v.detail.purchase.payment_type }}</span>
+          {% if v.detail.purchase.status.to_string() != "Draft" %}<span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ v.detail.purchase.payment_type }}</span>{% endif %}
           <span class="font-semibold">{{ v.supplier_name }}</span>
           {% if let Some(n) = v.detail.purchase.purchase_number %}
             <span class="text-xs text-muted">{{ n }}</span>

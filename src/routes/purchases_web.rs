@@ -576,6 +576,13 @@ pub struct ConfirmPurchaseForm {
     pub purchase_id: i64,
     #[serde(default)]
     pub method_id: String,
+    /// Payment decided AT confirm (radio in the dialog). Empty/absent = a
+    /// legacy caller that never asked: the stored header travels untouched.
+    #[serde(default)]
+    pub payment_type: String,
+    /// The due date the dialog posts for Credit (empty for Cash → cleared).
+    #[serde(default)]
+    pub due_date: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -601,8 +608,6 @@ pub struct CancelPurchaseForm {
 pub struct UpdatePurchaseHeaderForm {
     #[serde(default)]
     pub purchase_date: String,
-    #[serde(default)]
-    pub due_date: String,
     #[serde(default)]
     pub supplier_invoice_no: String,
     #[serde(default)]
@@ -834,6 +839,30 @@ async fn web_confirm_purchase_impl(
     form: ConfirmPurchaseForm,
 ) -> AppResult<Response> {
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
+    // Decision #7: validate/update the header FIRST (type + due, clearing the
+    // due for Cash), THEN call the existing confirm — service rules stay
+    // untouched. The patch mirrors the header-edit form's exact semantics:
+    // `due_date: Some(parse_opt_date(..))`, so an empty value CLEARS the due
+    // date and an absent type skips the update entirely (a legacy caller can
+    // never silently flip Credit to Cash through parse's Cash default).
+    // A confirm refusal after a successful update leaves the draft updated
+    // but unconfirmed — pinned by web_confirm_failure_leaves_the_draft_updated_but_unconfirmed.
+    if !form.payment_type.trim().is_empty() {
+        let payment_type = parse_payment_type(&form.payment_type)?;
+        let due_date = parse_opt_date(&form.due_date, "due_date")?;
+        state
+            .purchases_service
+            .update_draft(
+                actor,
+                id,
+                crate::models::UpdatePurchaseDraft {
+                    payment_type: Some(payment_type),
+                    due_date: Some(due_date),
+                    ..Default::default()
+                },
+            )
+            .await?;
+    }
     state.purchases_service.confirm(actor, id, method_id).await?;
     if is_htmx(&headers) {
         return changed(&state, id).await;
@@ -929,8 +958,11 @@ async fn web_cancel_purchase_collection(
     web_cancel_purchase_impl(state, principal.user_id, headers, form.purchase_id, form).await
 }
 
-/// Edit the draft header in place (dates, invoice, notes); the supplier and the
-/// payment type stay fixed at creation, as the service enforces.
+/// Edit the draft header in place (purchase date, invoice, notes); the
+/// supplier and the payment type stay fixed at creation, as the service
+/// enforces. Due date is decided at confirm (purchase-payment-at-confirm T4):
+/// this route never touches it (`due_date: None` = no-change), so an invoice
+/// edit cannot clear a Credit draft's stored due.
 async fn web_update_purchase_header(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
@@ -940,7 +972,6 @@ async fn web_update_purchase_header(
     Form(form): Form<UpdatePurchaseHeaderForm>,
 ) -> AppResult<Response> {
     let purchase_date = parse_opt_date(&form.purchase_date, "purchase_date")?;
-    let due_date = parse_opt_date(&form.due_date, "due_date")?;
     state
         .purchases_service
         .update_draft(
@@ -948,7 +979,7 @@ async fn web_update_purchase_header(
             id,
             crate::models::UpdatePurchaseDraft {
                 purchase_date,
-                due_date: Some(due_date),
+                due_date: None,
                 supplier_invoice_no: Some(clean_opt(&form.supplier_invoice_no)),
                 notes: Some(form.notes),
                 ..Default::default()
@@ -1264,6 +1295,21 @@ mod tests {
         let start = html[..pos].rfind("<form").expect("needle must sit in a form");
         let end = html[pos..].find("</form>").expect("form must close");
         &html[start..pos + end + "</form>".len()]
+    }
+
+    /// Cuts one `<dialog id="{id}">…</dialog>` region, for dialog-scoped
+    /// assertions (confirm type/due controls, the edit-header fields).
+    fn slice_dialog<'a>(html: &'a str, id: &str) -> &'a str {
+        let start_tag = format!("<dialog id=\"{id}\"");
+        let start = html
+            .find(&start_tag)
+            .unwrap_or_else(|| panic!("the {id} dialog renders: {html:.400}"));
+        let end = html[start..]
+            .find("</dialog>")
+            .expect("the dialog closes")
+            + start
+            + "</dialog>".len();
+        &html[start..end]
     }
 
     /// The line response must bring the picker back out of band, empty and
@@ -1585,6 +1631,384 @@ mod tests {
         assert!(
             html.contains("Suggestions"),
             "the suggestion panel stays on the list page: {html:.600}"
+        );
+    }
+
+    /// Payment is imputed at confirm (purchase-payment-at-confirm T1): the
+    /// Create Draft form asks ONLY supplier + purchase date, and the
+    /// Sugerido seed options ask ONLY purchase date. No Type, Due date,
+    /// invoice or notes input may appear anywhere on the purchases page —
+    /// the confirm dialog that owns the type lives on the record page.
+    #[tokio::test]
+    async fn web_create_draft_form_asks_only_supplier_and_purchase_date() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let form = enclosing_form(&html, "data-action=\"Create purchase\"");
+        assert!(
+            form.contains("name=\"supplier_id\"") && form.contains("name=\"purchase_date\""),
+            "Create Draft keeps supplier + purchase date: {form:.600}"
+        );
+        for input in ["payment_type", "due_date", "supplier_invoice_no", "notes"] {
+            assert!(
+                !form.contains(&format!("name=\"{input}\"")),
+                "the Create Draft form must not ask {input}: {form:.600}"
+            );
+        }
+
+        // The whole page carries no payment-decision input at all: the seed
+        // options lost Type + Due date, and nothing else on this page asks one.
+        assert!(
+            !html.contains("name=\"payment_type\""),
+            "no payment-type input on the purchases page: {html:.600}"
+        );
+        assert!(
+            !html.contains("name=\"due_date\""),
+            "no due-date input on the purchases page: {html:.600}"
+        );
+        assert!(
+            !html.contains("Draft type") && !html.contains("Due date"),
+            "the seed options ask purchase date only: {html:.600}"
+        );
+    }
+
+    /// The server default is pinned (decision #4): a create whose form omits
+    /// `payment_type` stores Cash, never a rejected submit — the form no
+    /// longer offers the field, so omitting it is the only path.
+    #[tokio::test]
+    async fn web_create_purchase_omitting_payment_type_defaults_to_cash() {
+        let state = test_state().await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(audit_actor(&state).await, crate::models::NewSupplier {
+                name: "Default Cash Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, redirect, resp) = post_form_response(
+            app,
+            "/web/purchases",
+            &format!("supplier_id={}&purchase_date=2024-05-10", supplier.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let redirect = redirect.expect("the create must land on the record");
+        let purchase_id: i64 = redirect["/purchases/".len()..].parse().unwrap();
+        let detail = state
+            .purchases_service
+            .get_detail(purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.payment_type,
+            PaymentType::Cash,
+            "an omitted type defaults to Cash server-side"
+        );
+        assert!(detail.purchase.due_date.is_none(), "no due at creation");
+    }
+
+    /// Same server default on the Sugerido seed: the seed options post only
+    /// product + purchase date, and the draft lands Cash.
+    #[tokio::test]
+    async fn web_seed_from_suggestion_omitting_payment_type_defaults_to_cash() {
+        use crate::models::{NewProduct, ProductKind};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let actor = audit_actor(&state).await;
+        let product = state
+            .inventory_service
+            .create_product(actor, NewProduct {
+                sku: "SEED-NOTYPE".into(),
+                name: "seed no type".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(10),
+                track_stock: true,
+                min_stock: Some(Decimal::from(5)),
+                max_stock: Some(Decimal::from(50)),
+                location: None,
+                notes: None,
+                markup_pct: None,
+            })
+            .await
+            .unwrap();
+        state
+            .inventory_service
+            .record_movement(
+                actor,
+                crate::models::NewMovement {
+                    product_id: product.id,
+                    qty: Decimal::from(2),
+                    movement_type: crate::models::MovementType::In,
+                    reason: crate::models::MovementReason::Initial,
+                    reference: "seed".into(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(actor, crate::models::NewSupplier {
+                name: "Seed NoType Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .supplier_service
+            .record_cost(
+                actor,
+                product.id,
+                supplier.id,
+                Decimal::from(7),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // Exactly what the seed options post after T1: product + date only.
+        let (status, redirect, resp) = post_form_response(
+            app,
+            "/web/purchases/from-suggestion",
+            &format!("product_id={}&purchase_date=2024-05-10", product.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let redirect = redirect.expect("the seed must land on the record");
+        let purchase_id: i64 = redirect["/purchases/".len()..].parse().unwrap();
+        let detail = state
+            .purchases_service
+            .get_detail(purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.payment_type,
+            PaymentType::Cash,
+            "an omitted seed type defaults to Cash server-side"
+        );
+        assert!(detail.purchase.due_date.is_none());
+        assert_eq!(detail.lines.len(), 1, "the seed still adds its line");
+    }
+
+    /// T2 markup: the confirm dialog is where payment is decided. It carries
+    /// a Cash/Credit radio prefilled from the stored value, the due-date
+    /// input active (required + prefilled) ONLY for Credit, and the method
+    /// select active (enabled + required) ONLY for Cash — the inactive side
+    /// is hidden AND disabled so it can neither be seen nor submitted.
+    #[tokio::test]
+    async fn web_confirm_dialog_decides_payment_type_and_due_at_confirm() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+
+        // -- Cash draft: Cash checked, method active, due block inert -------
+        let cash = seed_record_fixture(&state, PaymentType::Cash).await;
+        let (_, cash_html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
+            .await;
+        let cash_dialog = slice_dialog(&cash_html, "confirm-purchase");
+        assert!(
+            cash_dialog.contains("name=\"payment_type\""),
+            "the confirm dialog carries the type radio: {cash_dialog:.500}"
+        );
+        let cash_radio = element_tag_containing(cash_dialog, "value=\"Cash\"");
+        let credit_radio = element_tag_containing(cash_dialog, "value=\"Credit\"");
+        assert!(cash_radio.contains("checked"), "Cash prefills: {cash_radio}");
+        assert!(
+            !credit_radio.contains("checked"),
+            "only the stored type is checked: {credit_radio}"
+        );
+        let method_tag = element_tag_containing(cash_dialog, "id=\"confirm-method\"");
+        assert!(
+            method_tag.contains("required") && !method_tag.contains("disabled"),
+            "a Cash confirm requires the method: {method_tag}"
+        );
+        let due_block = element_tag_containing(cash_dialog, "id=\"confirm-due-block\"");
+        assert!(
+            due_block.contains("hidden"),
+            "no due input shows for Cash: {due_block}"
+        );
+        let due_tag = element_tag_containing(cash_dialog, "id=\"confirm-due-date\"");
+        assert!(
+            !due_tag.contains("required"),
+            "the hidden due input must not block a Cash submit: {due_tag}"
+        );
+
+        // -- Credit draft: Credit checked, due active + prefilled, method inert
+        let credit = seed_record_fixture(&state, PaymentType::Credit).await;
+        let (_, credit_html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
+            .await;
+        let credit_dialog = slice_dialog(&credit_html, "confirm-purchase");
+        let credit_radio = element_tag_containing(credit_dialog, "value=\"Credit\"");
+        let cash_radio = element_tag_containing(credit_dialog, "value=\"Cash\"");
+        assert!(credit_radio.contains("checked"), "Credit prefills: {credit_radio}");
+        assert!(!cash_radio.contains("checked"), "{cash_radio}");
+        let due_tag = element_tag_containing(credit_dialog, "id=\"confirm-due-date\"");
+        assert!(
+            due_tag.contains("required") && due_tag.contains("value=\"2024-06-02\""),
+            "the Credit due input is required and prefilled from storage: {due_tag}"
+        );
+        let due_block = element_tag_containing(credit_dialog, "id=\"confirm-due-block\"");
+        assert!(
+            !due_block.contains("hidden"),
+            "the Credit due input shows: {due_block}"
+        );
+        let method_tag = element_tag_containing(credit_dialog, "id=\"confirm-method\"");
+        assert!(
+            method_tag.contains("disabled") && !method_tag.contains("required"),
+            "a Credit submit must not carry a method: {method_tag}"
+        );
+        let method_block = element_tag_containing(credit_dialog, "id=\"confirm-method-block\"");
+        assert!(
+            method_block.contains("hidden"),
+            "the Credit dialog hides the method: {method_block}"
+        );
+    }
+
+    /// T2 route, Cash path: the dialog posts type + due (empty) + method;
+    /// the route updates the draft header first — clearing the due date with
+    /// the exact header-edit semantics (`due_date: Some(parse)`, empty →
+    /// clear) — then confirms. A Credit draft switched to Cash confirms with
+    /// no due date left behind.
+    #[tokio::test]
+    async fn web_confirm_cash_path_clears_due_then_confirms() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/confirm", fixture.purchase_id),
+            &format!(
+                "payment_type=Cash&due_date=&method_id={}",
+                fixture.method_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(detail.purchase.payment_type, PaymentType::Cash);
+        assert!(
+            detail.purchase.due_date.is_none(),
+            "a Cash confirm leaves no due date: {:?}",
+            detail.purchase.due_date
+        );
+    }
+
+    /// T2 route, Credit path: the dialog's chosen due date persists through
+    /// the header update and survives the confirm (service rule: Credit
+    /// requires it).
+    #[tokio::test]
+    async fn web_confirm_credit_path_persists_the_chosen_due_date() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/confirm", fixture.purchase_id),
+            "payment_type=Credit&due_date=2024-07-15&method_id=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(detail.purchase.payment_type, PaymentType::Credit);
+        assert_eq!(
+            detail.purchase.due_date.map(|d| d.to_string()),
+            Some("2024-07-15".to_string())
+        );
+    }
+
+    /// T2 route gating: a form that omits `payment_type` (the legacy
+    /// collection callers) leaves the header untouched — the stored type and
+    /// due date travel to confirm exactly as they are, so no caller can
+    /// silently flip Credit to Cash (parse would default an empty type).
+    #[tokio::test]
+    async fn web_confirm_omitting_payment_type_leaves_the_header_untouched() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/confirm", fixture.purchase_id),
+            "method_id=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(detail.purchase.payment_type, PaymentType::Credit);
+        assert_eq!(
+            detail.purchase.due_date.map(|d| d.to_string()),
+            Some("2024-06-02".to_string()),
+            "the stored due date is unchanged when the form omits the type"
+        );
+    }
+
+    /// Decision #7 pinned: confirm route order is update-then-confirm, and a
+    /// confirm failure leaves the draft UPDATED but unconfirmed. Here the
+    /// header update succeeds (Credit + a new due date), then the service
+    /// refuses the confirm (a Credit confirm may not carry a method), so the
+    /// new due date is already stored while the status stays Draft.
+    #[tokio::test]
+    async fn web_confirm_failure_leaves_the_draft_updated_but_unconfirmed() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/confirm", fixture.purchase_id),
+            &format!(
+                "payment_type=Credit&due_date=2024-07-15&method_id={}",
+                fixture.method_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp}");
+        assert!(
+            resp.contains("must not include a payment method"),
+            "the refusal is the service's credit rule: {resp}"
+        );
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.status,
+            crate::models::PurchaseStatus::Draft,
+            "a failed confirm must not flip the status"
+        );
+        assert_eq!(
+            detail.purchase.due_date.map(|d| d.to_string()),
+            Some("2024-07-15".to_string()),
+            "the header update already happened before the confirm failed"
         );
     }
 
@@ -2728,7 +3152,9 @@ mod tests {
     /// Receiving-desk T4: a draft's money region carries an effects preview —
     /// projections only (stock/cash/due), never a payment input — built from
     /// the record's own `tracked_units` so "+N units (tracked)" cannot drift
-    /// from what confirm will move. The bar's Confirm primary is disabled at
+    /// from what confirm will move. Purchase-payment-at-confirm T3: the
+    /// preview no longer trusts the stored type — BOTH scenarios render until
+    /// confirm. The bar's Confirm primary is disabled at
     /// zero lines and enabled once a line exists.
     #[tokio::test]
     async fn web_purchase_record_effects_preview_projects_confirm_without_payment_inputs() {
@@ -2828,12 +3254,14 @@ mod tests {
             .total
             .to_string();
         assert!(
-            preview.contains(&format!("Cash · -${total} at confirm")),
+            preview.contains(&format!("Cash scenario · -${total} at confirm")),
             "the cash projection is the document total: {preview}"
         );
         assert!(
-            preview.contains("Due · $0 at confirm"),
-            "a cash draft settles at confirm: {preview}"
+            preview.contains(&format!(
+                "Credit scenario · no cash movement · due +${total} at confirm"
+            )),
+            "a draft previews BOTH scenarios until confirm: {preview}"
         );
         assert!(
             !preview.contains("<select") && !preview.contains("<input"),
@@ -2872,12 +3300,14 @@ mod tests {
             .total
             .to_string();
         assert!(
-            preview.contains(&format!("Due · +${credit_total} at confirm")),
+            preview.contains(&format!(
+                "Credit scenario · no cash movement · due +${credit_total} at confirm"
+            )),
             "the due projection is what confirm establishes: {preview}"
         );
         assert!(
-            preview.contains("Cash · no cash movement"),
-            "a credit confirm posts no cash: {preview}"
+            preview.contains(&format!("Cash scenario · -${credit_total} at confirm")),
+            "the preview does not trust the stored type: both scenarios show: {preview}"
         );
         assert!(
             preview.contains("+2 units (tracked)"),
@@ -2900,38 +3330,96 @@ mod tests {
         );
     }
 
-    /// The payment-method control appears ONLY inside the confirm dialog, and
-    /// only for Cash: a Cash draft must pick a method before it can submit
-    /// (the account is derived from it), while a Credit draft carries no
-    /// method control at all — only a due-date summary — so the client cannot
-    /// send the method the server rejects for Credit.
+    /// T3: payment is decided at confirm, so the stored type is invisible
+    /// while the purchase is a Draft — neither the record header nor the list
+    /// row shows a payment-type badge. Once confirmed the type is a fact and
+    /// the badge returns (the row it came from is proven by the exact-once
+    /// count: every draft this test seeded must still be badgeless).
     #[tokio::test]
-    async fn web_purchase_record_confirm_dialog_carries_payment_method_only_for_cash() {
+    async fn web_draft_hides_the_payment_type_badge_until_confirm() {
         let state = test_state().await;
         let app = crate::routes::router(state.clone());
 
-        /// Slice one dialog's markup out of the page (open tag → `</dialog>`).
-        fn dialog_of(html: &str, id: &str) -> String {
-            let start_tag = format!("<dialog id=\"{id}\"");
-            let start = html
-                .find(&start_tag)
-                .unwrap_or_else(|| panic!("the {id} dialog renders"));
-            let end = html[start..]
-                .find("</dialog>")
-                .expect("the dialog closes")
-                + start
-                + "</dialog>".len();
-            html[start..end].to_string()
-        }
+        // -- Draft record pages: no type badge -----------------------------
+        let cash = seed_record_fixture(&state, PaymentType::Cash).await;
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("uppercase\">Cash</span>"),
+            "a Cash draft shows no payment-type badge: {html:.600}"
+        );
+        let credit = seed_record_fixture(&state, PaymentType::Credit).await;
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("uppercase\">Credit</span>"),
+            "a Credit draft shows no payment-type badge: {html:.600}"
+        );
+
+        // -- The list hides it on both draft rows --------------------------
+        let (status, list) = get_html(app.clone(), "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !list.contains("uppercase\">Cash</span>")
+                && !list.contains("uppercase\">Credit</span>"),
+            "draft rows carry no payment-type badge: {list:.600}"
+        );
+
+        // -- Confirm: the badge returns on record and list -----------------
+        let (status, _, resp) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/confirm", cash.purchase_id),
+            &format!(
+                "payment_type=Cash&due_date=&method_id={}",
+                cash.method_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("uppercase\">Cash</span>"),
+            "a confirmed purchase keeps its type badge: {html:.600}"
+        );
+        let (status, list) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            list.matches("uppercase\">Cash</span>").count(),
+            1,
+            "the confirmed row shows the badge exactly once, drafts stay hidden: {list:.600}"
+        );
+        assert!(
+            !list.contains("uppercase\">Credit</span>"),
+            "the Credit draft row stays badgeless: {list:.600}"
+        );
+    }
+
+    /// The payment-method control appears ONLY inside the confirm dialog, and
+    /// is ACTIVE only for Cash: a Cash draft must pick a method before it can
+    /// submit (the account is derived from it), while a Credit draft renders
+    /// the method hidden AND disabled so the client cannot send the method
+    /// the server rejects for Credit — the due-date input takes its place,
+    /// required and prefilled from the stored value. (purchase-payment-at-confirm
+    /// T2: both sides of the choice now live in the dialog, and the inactive
+    /// side is inert rather than absent.)
+    #[tokio::test]
+    async fn web_purchase_record_confirm_dialog_activates_method_only_for_cash() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
 
         // -- Cash draft: the method select lives in the confirm dialog -----
         let cash = seed_record_fixture(&state, PaymentType::Cash).await;
         let (_, cash_html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
             .await;
-        let cash_dialog = dialog_of(&cash_html, "confirm-purchase");
+        let cash_dialog = slice_dialog(&cash_html, "confirm-purchase");
+        let method_tag = element_tag_containing(&cash_dialog, "id=\"confirm-method\"");
         assert!(
-            cash_dialog.contains("id=\"confirm-method\"") && cash_dialog.contains("required"),
-            "a Cash draft requires a method in the confirm dialog: {cash_dialog:.500}"
+            method_tag.contains("required") && !method_tag.contains("disabled"),
+            "a Cash draft requires an active method in the confirm dialog: {method_tag:.500}"
         );
         assert!(
             !cash_dialog.contains("none (Credit)"),
@@ -2943,23 +3431,24 @@ mod tests {
             "the draft's only method control is the confirm dialog: {cash_html:.500}"
         );
 
-        // -- Credit draft: no method control anywhere, a due summary only ---
+        // -- Credit draft: the method control is present but inert ---------
         let credit = seed_record_fixture(&state, PaymentType::Credit).await;
         let (_, credit_html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
             .await;
-        let credit_dialog = dialog_of(&credit_html, "confirm-purchase");
+        let credit_dialog = slice_dialog(&credit_html, "confirm-purchase");
+        let method_tag = element_tag_containing(&credit_dialog, "id=\"confirm-method\"");
         assert!(
-            !credit_dialog.contains("confirm-method") && !credit_dialog.contains("<select"),
-            "the Credit confirm dialog has no method control: {credit_dialog:.500}"
+            method_tag.contains("disabled"),
+            "the Credit confirm dialog must disable the method control: {method_tag:.500}"
         );
         assert!(
-            credit_dialog.contains("2024-06-02"),
+            credit_dialog.contains("value=\"2024-06-02\""),
             "the Credit confirm dialog shows the due date: {credit_dialog:.500}"
         );
         assert_eq!(
             credit_html.matches("name=\"method_id\"").count(),
-            0,
-            "a Credit draft carries no payment-method control at all: {credit_html:.500}"
+            1,
+            "the method control exists once, inside the confirm dialog: {credit_html:.500}"
         );
     }
 
@@ -3056,6 +3545,57 @@ mod tests {
         assert!(
             html.contains("input[hx-put]") && html.contains("defaultValue"),
             "a refused edit reverts the input to its rendered value: {html:.900}"
+        );
+    }
+
+    /// T4: payment is decided at confirm, so the edit-header dialog drops the
+    /// due-date field (purchase date, invoice and notes remain), and a header
+    /// post that omits it leaves the stored due date untouched — clearing a
+    /// Credit draft's due is the confirm dialog's Cash path alone
+    /// (`due_date: Some(None)`), never an invoice edit.
+    #[tokio::test]
+    async fn web_edit_header_dialog_drops_due_date_and_keeps_the_stored_due() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // -- The dialog: no due input, the other header fields remain -------
+        let dialog = slice_dialog(&html, "edit-header");
+        assert!(
+            !dialog.contains("name=\"due_date\""),
+            "the edit-header dialog drops the due date: {dialog:.600}"
+        );
+        for field in [
+            "name=\"purchase_date\"",
+            "name=\"supplier_invoice_no\"",
+            "name=\"notes\"",
+        ] {
+            assert!(dialog.contains(field), "edit keeps {field}: {dialog:.600}");
+        }
+
+        // -- The route: omitting the field must NOT clear the stored due ----
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/header", fixture.purchase_id),
+            "purchase_date=2024-05-03&supplier_invoice_no=A-9&notes=edited",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.purchase_date.to_string(), "2024-05-03");
+        assert_eq!(detail.purchase.supplier_invoice_no.as_deref(), Some("A-9"));
+        assert_eq!(
+            detail.purchase.due_date.map(|d| d.to_string()),
+            Some("2024-06-02".to_string()),
+            "a header edit leaves the stored due date untouched: {:?}",
+            detail.purchase.due_date
         );
     }
 
