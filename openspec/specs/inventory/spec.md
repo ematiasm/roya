@@ -59,6 +59,15 @@ ON DELETE SET NULL), `unit` (short free text: `un`, `kg`, `lt`, `m`, `hs`), `sal
   decimals when the stored value already fits in two, and returns anything finer untouched — it
   never rounds, because showing `7.78` for a stored `7.777` would misstate the price the customer
   is charged.
+- **The product drawer flags a stale stored cost — a derived read, never stored.**
+  The supplier-costs card shows a "stale cost" badge when `SupplierService::reference_cost`
+  (the preferred supplier's current cost, else the cheapest, else none) disagrees with the
+  stored `cost_price`, showing both values (`reference $X • stored $Y`). Three gates: a
+  reference cost must exist (with no supplier rows the product column IS the truth and there
+  is nothing to compare against), the stored cost must not be zero (the column is
+  `NOT NULL DEFAULT '0'`, so zero means "no cost recorded yet", not a comparable cost), and
+  the two must genuinely differ — equal is fresh, not stale. The comparison is computed at
+  read time; nothing is written.
 - **Service products cannot hold stock:** a `Service`, or any product with `track_stock = false`,
   rejects stock movements and cannot carry `min_stock` or `max_stock`.
 - `track_stock = true` requires `min_stock >= 0` and `max_stock >= min_stock`.
@@ -87,7 +96,8 @@ ON DELETE SET NULL), `unit` (short free text: `un`, `kg`, `lt`, `m`, `hs`), `sal
   hint that it is recalculated on save; the create modal has no stored product, so it shows no
   derived value and no hint, and its price field's `readonly` state is set by client-side script
   that watches the markup field. In both the `readonly` attribute is courtesy only, the handler is
-  the enforcement.
+  the enforcement. The supplier-costs card carries the stale-cost badge described in the rules
+  when the supplier reference cost disagrees with the stored cost.
 - Configuration: `ALLOW_NEGATIVE_STOCK` (default `true`).
 
 ## Authorization

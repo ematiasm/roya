@@ -70,7 +70,10 @@ Same shape as `sale_payments`: `purchase_id`, `account_id`, `method_id`, `amount
   `cancel`, `GET /api/purchases/suggestions`, and `POST /api/supplier-payments` (supplier-level
   payment, oldest-first, no receipt document).
 - Web: `/purchases` with the purchase list, the "Sugerido" panel that seeds a draft, the draft line
-  editor and the confirm, pay and cancel forms; `/suppliers` with the cost satellite and its
+  editor and the confirm, pay and cancel forms; a draft line whose cost is strictly higher than
+  the product's stored cost renders a stale-cost warning with an "Apply to product" action
+  (`POST /web/purchases/{purchase_id}/lines/{line_id}/apply-cost`, draft-only, gated
+  `inventory.write`); `/suppliers` with the cost satellite and its
   raise/lower badge, and the drawer detail with the pay-supplier form (`POST /web/supplier-payments`)
   and the record-cost form.
 
@@ -83,7 +86,14 @@ money movements — a `suppliers.write`-only principal sees the pay card in the 
 is refused on submit), and the reorder suggestions are `inventory.read` (stock-derived data, not a
 purchase document), so the `/purchases` page renders its Sugerido block conditionally on that read.
 The purchase record page itself is a single `purchases.read` gate: the line costs and payments it
-renders are purchases data.
+renders are purchases data. The third deliberate consequence is the apply-cost action: a route
+that lives on the purchases page (`POST /web/purchases/{purchase_id}/lines/{line_id}/apply-cost`)
+is gated `inventory.write`, not `purchases.create`, because its effect lands on the product — it
+writes the line's cost into `products.cost_price` through the inventory service, and gating it
+with a purchase permission would hand a buyer the ability to rewrite product costs. This does not
+weaken the rule that the purchase flow never writes `products.cost_price`: the action is a
+separate, human-triggered product write that reaches the product through the inventory service,
+and the confirmation path still touches only the satellite.
 
 ## Verification
 `src/services/purchases.rs` and `src/services/suppliers.rs` (AC1–AC14 and the cost-rule cases),
