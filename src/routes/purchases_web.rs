@@ -1588,6 +1588,174 @@ mod tests {
         );
     }
 
+    /// Payment is imputed at confirm (purchase-payment-at-confirm T1): the
+    /// Create Draft form asks ONLY supplier + purchase date, and the
+    /// Sugerido seed options ask ONLY purchase date. No Type, Due date,
+    /// invoice or notes input may appear anywhere on the purchases page —
+    /// the confirm dialog that owns the type lives on the record page.
+    #[tokio::test]
+    async fn web_create_draft_form_asks_only_supplier_and_purchase_date() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let form = enclosing_form(&html, "data-action=\"Create purchase\"");
+        assert!(
+            form.contains("name=\"supplier_id\"") && form.contains("name=\"purchase_date\""),
+            "Create Draft keeps supplier + purchase date: {form:.600}"
+        );
+        for input in ["payment_type", "due_date", "supplier_invoice_no", "notes"] {
+            assert!(
+                !form.contains(&format!("name=\"{input}\"")),
+                "the Create Draft form must not ask {input}: {form:.600}"
+            );
+        }
+
+        // The whole page carries no payment-decision input at all: the seed
+        // options lost Type + Due date, and nothing else on this page asks one.
+        assert!(
+            !html.contains("name=\"payment_type\""),
+            "no payment-type input on the purchases page: {html:.600}"
+        );
+        assert!(
+            !html.contains("name=\"due_date\""),
+            "no due-date input on the purchases page: {html:.600}"
+        );
+        assert!(
+            !html.contains("Draft type") && !html.contains("Due date"),
+            "the seed options ask purchase date only: {html:.600}"
+        );
+    }
+
+    /// The server default is pinned (decision #4): a create whose form omits
+    /// `payment_type` stores Cash, never a rejected submit — the form no
+    /// longer offers the field, so omitting it is the only path.
+    #[tokio::test]
+    async fn web_create_purchase_omitting_payment_type_defaults_to_cash() {
+        let state = test_state().await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(audit_actor(&state).await, crate::models::NewSupplier {
+                name: "Default Cash Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, redirect, resp) = post_form_response(
+            app,
+            "/web/purchases",
+            &format!("supplier_id={}&purchase_date=2024-05-10", supplier.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let redirect = redirect.expect("the create must land on the record");
+        let purchase_id: i64 = redirect["/purchases/".len()..].parse().unwrap();
+        let detail = state
+            .purchases_service
+            .get_detail(purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.payment_type,
+            PaymentType::Cash,
+            "an omitted type defaults to Cash server-side"
+        );
+        assert!(detail.purchase.due_date.is_none(), "no due at creation");
+    }
+
+    /// Same server default on the Sugerido seed: the seed options post only
+    /// product + purchase date, and the draft lands Cash.
+    #[tokio::test]
+    async fn web_seed_from_suggestion_omitting_payment_type_defaults_to_cash() {
+        use crate::models::{NewProduct, ProductKind};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let actor = audit_actor(&state).await;
+        let product = state
+            .inventory_service
+            .create_product(actor, NewProduct {
+                sku: "SEED-NOTYPE".into(),
+                name: "seed no type".into(),
+                kind: ProductKind::Product,
+                category_id: None,
+                unit: "un".into(),
+                sale_price: Decimal::from(25),
+                cost_price: Decimal::from(10),
+                track_stock: true,
+                min_stock: Some(Decimal::from(5)),
+                max_stock: Some(Decimal::from(50)),
+                location: None,
+                notes: None,
+                markup_pct: None,
+            })
+            .await
+            .unwrap();
+        state
+            .inventory_service
+            .record_movement(
+                actor,
+                crate::models::NewMovement {
+                    product_id: product.id,
+                    qty: Decimal::from(2),
+                    movement_type: crate::models::MovementType::In,
+                    reason: crate::models::MovementReason::Initial,
+                    reference: "seed".into(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let supplier = state
+            .supplier_service
+            .create_supplier(actor, crate::models::NewSupplier {
+                name: "Seed NoType Sup".into(),
+                phone: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        state
+            .supplier_service
+            .record_cost(
+                actor,
+                product.id,
+                supplier.id,
+                Decimal::from(7),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // Exactly what the seed options post after T1: product + date only.
+        let (status, redirect, resp) = post_form_response(
+            app,
+            "/web/purchases/from-suggestion",
+            &format!("product_id={}&purchase_date=2024-05-10", product.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp}");
+        let redirect = redirect.expect("the seed must land on the record");
+        let purchase_id: i64 = redirect["/purchases/".len()..].parse().unwrap();
+        let detail = state
+            .purchases_service
+            .get_detail(purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.payment_type,
+            PaymentType::Cash,
+            "an omitted seed type defaults to Cash server-side"
+        );
+        assert!(detail.purchase.due_date.is_none());
+        assert_eq!(detail.lines.len(), 1, "the seed still adds its line");
+    }
+
     /// AC4: creating a purchase answers `HX-Redirect` to its record, so htmx
     /// performs a real navigation and no id is typed.
     #[tokio::test]

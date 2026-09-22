@@ -1,19 +1,11 @@
 <div id="suggestion-list-inner">
+  {# Sugerido seed options (purchase-payment-at-confirm): purchase date ONLY —
+     payment type is imputed at confirm, so the seed never asks it (the route
+     defaults an omitted type to Cash server-side). #}
   <div class="mb-3 flex flex-wrap gap-2 [&>*]:flex-1" id="suggestion-seed-options">
-    <div>
-      <label>Draft type</label>
-      <select name="payment_type">
-        <option value="Cash">Cash</option>
-        <option value="Credit">Credit</option>
-      </select>
-    </div>
     <div>
       <label>Purchase date</label>
       <input type="date" name="purchase_date" value="{{ today }}" />
-    </div>
-    <div>
-      <label>Due date (Credit)</label>
-      <input type="date" name="due_date" />
     </div>
   </div>
   {% if !has_suggestions %}
