@@ -136,6 +136,9 @@ item out as domain work rather than presentation.
   class as the card, but five surfaces outside this feature's pages. The
   purchases and sales hints sit inside the `#new-purchase` / `#new-sale` cards,
   so S3 removes them with the cards.
+- **Editing a draft's supplier (S4b).** Declined 2026-09-22: `/purchases/new`
+  chooses the supplier and nothing changes it afterwards. See the checklist entry
+  for what that costs.
 - **Filter bar decluttering** (advanced-filters panel, dropping `Refresh`, a `✕`
   inside the search field). Parked by user decision 2026-09-22: it is the only
   part of the proposal that touches a component shared by four pages
@@ -244,11 +247,17 @@ item out as domain work rather than presentation.
       `page_header.html` was not touched. The card, the two-column grid and the
       roster on the list went with it, and the action is now offered only to a
       principal holding `purchases.create`. Done in `7ae7c62`.
-- [ ] **S4b — The supplier select in Edit header.** The record page's Edit
-      header dialog gains the supplier field
-      (`UpdatePurchaseDraft.supplier_id` already supports it; only
-      `UpdatePurchaseHeaderForm` lacks it). The record page struct must then
-      carry the supplier roster.
+- [x] **S4b — The supplier select in Edit header. DECLINED by user decision
+      (2026-09-22).** Creation stays the only door: `/purchases/new` chooses the
+      supplier once and nothing afterwards offers to change it. The capability
+      is not missing from the system — `UpdatePurchaseDraft.supplier_id` exists,
+      `update_draft` validates and persists it, and `PUT /api/purchases/{id}`
+      reaches that path — so this is a deliberate UI omission, not a gap in the
+      domain.
+      **The cost, recorded so it is a decision and not an oversight:** a draft
+      whose supplier is wrong cannot be corrected. Fixing it means discarding the
+      draft, and any lines already scanned go with it — the exact case that made
+      an editable field worth considering. Revisit if that turns out to bite.
 - [x] **S5a — The entry row; the drawer dies.** One persistent flex row inside
       the swapped money region (product, qty, cost, Add), the results below it so
       they cannot move the button, and every pick commits the line with the typed
@@ -327,7 +336,7 @@ item out as domain work rather than presentation.
 | S2 | **done** | `737b1bd` — `fix(purchases)`, 5 files. Worker RED: `left: 5 / right: 9.50` ("empty cost must default to the supplier's satellite cost") then GREEN. `gentle-ai-verify` verdict *pass* on `cargo test` 838 passed / 0 failed, with the `Some(c)` branch byte-identical to HEAD and 2 of the 4 new tests confirmed as genuine RED pins (the other 2 are triangulation). The verifier raised two caveats, both fixed inside the commit: the picker label `Unit cost (empty = product cost)` had become false, and two test messages still stated the old unconditional rule. |
 | S3 | **done** | `ee90d3e` (part A) + `4a8ec2e` (part B) — 5 files. Worker observed RED for both parts (drawer headers `left: ["Producto", "SKU", …]`; `/purchases` missing the peek shell) then GREEN. `gentle-ai-verify` verdict *pass-with-caveats* on `cargo test` 842 passed / 0 failed: header/cell counts read as 4 and 4 in both tables, exactly 4 deleted lines, no nested anchor, Escape handlers statically disjoint, no new route or Tailwind utility, guard green. Both caveats fixed before commit: an orphan wrapper `div` left by the deleted `Open` anchor, and a smoke comment/assertion that still claimed the drawer rendered SKU (the token matched the product's name, so it proved nothing). Parent review also caught the writer titling the new shell `Compra` — new Spanish on an English page — and changed it to `Purchase`. |
 | S4 | **done** | `7ae7c62` — 5 files. Worker RED for three contract tests, then GREEN. First verification pass returned **FAIL**: `cargo test` was red on `web_create_draft_form_asks_only_supplier_and_purchase_date`, a pre-existing test that pinned the deleted card and forbade the invoice field the page must now have. The fix round rewrote it to the new contract (keeping the prohibition that still matters: no payment decision in the creation form), pinned `/purchases/new`'s 403, and extracted the guard's non-vacuity decision into `wiring_is_vacuous` with a three-boundary mutation pin. Second pass verdict *pass* on `cargo test` 848 passed / 0 failed, run twice by the verifier. |
-| S4b | not started | — |
+| S4b | **declined** | User decision (2026-09-22): creation is the only door. The domain capability stays unused from the UI; the record page keeps the supplier as a read-only fact. The recorded cost is that a wrong supplier on a loaded draft means discarding it and its lines. |
 | S5a | **done** | `34b19ff` — 5 files, 614 changed lines (over the 400 budget; one indivisible work unit, reported not compressed). Verifier verdict **pass** on `cargo test` 849 passed / 0 failed **and** the browser suite: `uv run pytest tests/test_picker.py` → 6 passed in Chromium against the working-tree binary. The verifier confirmed the browser-silent contracts by source (the ids the results fragment's `hx-include` and htmx's id-based re-focus depend on, and the `hx-disinherit` rule), that the shared macro and the sale record are untouched, and that the preview test's narrowed slice is a strict subset that hides no payment input. It named one coverage gap — the record page-action slot was pinned in neither direction — closed before the commit. |
 | S5b | **done** | `9eb8187` — 5 files, 608 changed lines (over budget; one indivisible work unit). Verifier verdict *pass* on `cargo test` 854 passed / 0 failed and the browser suite 7 passed, having checked the equality branch (`Decimal` numeric equality, no tolerance), that the different-cost arm returns through the same function so the message cannot drift, that the `unreachable!` is genuinely unreachable, that the out-of-band notice cannot leak into the `hx-select` main swap (traced in the vendored htmx 1.9.12), and that `add_line` is byte-identical apart from the extracted helper. It raised three findings, all fixed before the commit: a new dead-code warning (`changed_with_entry_row` orphaned by `changed_with_notice`), the merge notice's escaping untested, and an undocumented ordering divergence — `add_or_increment_line` resolves the cost before the uniqueness check because the merge needs it, so a repeat with an invalid explicit cost reports the cost error rather than the duplicate one. |
 | S6 | **done** | `c0f6fc9` — 12 files. Verifier verdict *pass* on `cargo test` 858 passed / 0 failed and the full browser suite 85 passed / 0 failed / 4 skipped (pre-existing opt-in probes). The verifier proved the chip chain byte-identical for all three reachable states by diffing recovered Askama build artifacts, confirmed the two new browser tests are real gates (the 360 px one would fail on genuine overflow; the peek one fails if the row's `hx-get` goes), and confirmed the `Decimal::ZERO` bug was real. Findings fixed before the commit: a stale T3 comment, a stale README claim, the `Pending`/`Due` naming drift, and the two missing tests. |
