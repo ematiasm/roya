@@ -1988,6 +1988,70 @@ mod tests {
         );
     }
 
+    /// N5: matching folds accents and case on both sides — the same behaviour
+    /// the party searches share (N6) — now pinned on the route the island
+    /// reads. The gate is paired so it cannot pass vacuously, in both of the
+    /// ways a match test can be vacuous:
+    ///
+    /// - The SKUs are opaque (`P-001`, `P-002`): `match_catalogue` matches on
+    ///   name OR sku, so a SKU that echoed the query text (e.g. `CAFE-1`) would
+    ///   let every case pass through the SKU branch with the folding deleted.
+    ///   With opaque SKUs the name branch is the only path to a match, and
+    ///   neither `CAFE` nor `cafÉ` can match the unfolded `Café`/`cafÉ` — so a
+    ///   broken fold fails on the query side AND on the stored side.
+    /// - The exact-one-match check plus the other-name exclusion fails if the
+    ///   read stopped discriminating and matched everything.
+    #[tokio::test]
+    async fn n5_product_search_json_folds_accents_and_case() {
+        use crate::models::{NewProduct, ProductKind};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        for (sku, name) in [("P-001", "Café"), ("P-002", "Ñandú")] {
+            state
+                .inventory_service
+                .create_product(
+                    audit_actor_id(&state).await,
+                    NewProduct {
+                        sku: sku.into(),
+                        name: name.into(),
+                        kind: ProductKind::Product,
+                        category_id: None,
+                        unit: "un".into(),
+                        sale_price: Decimal::from(25),
+                        cost_price: Decimal::from(10),
+                        track_stock: false,
+                        min_stock: None,
+                        max_stock: None,
+                        location: None,
+                        notes: None,
+                        markup_pct: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let app = crate::routes::router(state);
+
+        for (needle, name, other) in [
+            ("CAFE", "Café", "Ñandú"),
+            ("cafÉ", "Café", "Ñandú"),
+            ("nandu", "Ñandú", "Café"),
+            ("ÑANDÚ", "Ñandú", "Café"),
+        ] {
+            let (status, json) =
+                get_json(app.clone(), &format!("/web/product-search.json?q={needle}")).await;
+            assert_eq!(status, StatusCode::OK, "{needle}: {json}");
+            let products = json["products"].as_array().expect("products array");
+            assert_eq!(products.len(), 1, "{needle}: exactly one match: {json}");
+            assert_eq!(products[0]["name"], name, "{needle}: {json}");
+            assert!(
+                !json.to_string().contains(other),
+                "{needle}: {other} must not match: {json}"
+            );
+        }
+    }
+
     /// The fragment is generic: when the caller names the record's line action,
     /// every match becomes its own add form that includes the picker form and
     /// supplies its own product id. Without an action there are no dead controls.
