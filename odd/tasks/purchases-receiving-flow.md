@@ -184,13 +184,22 @@ counts before any fix existed. T2 and T3 write their failing browser checks firs
       `hx-swap="outerHTML" hx-select="#purchase-record-money"`, and add the count
       regression test to `e2e/tests/test_purchases.py` first. Independently
       shippable: one file, one test, no design decision. Closed in `f3f7962`.
-- [ ] T2 — **Auto-saved identity.** Give the three header fields
-      `hx-trigger="change"` + `hx-sync`, change the header route's answer to an
-      empty body plus `HX-Trigger` (with the audit line as the only OOB if it
-      proves necessary), add the subtle "Saved" indicator and inline field errors,
-      and retire the `Save header` button. Red-first browser test for "edit a
-      field alone and it persists", "focus survives", and "an empty date posts
-      nothing".
+- [x] T2 — **Auto-saved identity.** Closed in `e0311b6`. The header form posts
+      on `change` with `hx-swap="none"` and `hx-sync="this:replace"`, the
+      `Save header` button is deleted, and a two-second `aria-live` indicator
+      replaces it. **Two refinements to the approved design, both recorded here
+      because they change the contract:**
+      - **The header route's answer did NOT change.** The plan said to make it an
+        empty body plus `HX-Trigger`. Instead the form stops swapping it
+        (`hx-swap="none"`), which leaves the route's contract alone and keeps the
+        supplier picker's consumer of the same route untouched. Smaller change,
+        same outcome.
+      - **Inline field errors are client-side only.** htmx does not swap 4xx
+        responses, so rendering a *server* failure inline would mean swallowing
+        the status and answering 200 — worse than the problem. The case that
+        actually mattered, the empty required date, is client-side and is
+        covered. Server failures keep the global notice, which is what they do
+        today.
 - [ ] T3 — **The entry row island.** `static/entry-row.js` following the
       `picker-island` pattern, the Tailwind `@source` line and a rebuilt
       stylesheet, the shell rewrite in `purchase_detail.html`, and the removal of
@@ -219,7 +228,58 @@ Three slices, in the order the user chose, each independently revertible:
   revertible. The defect is fixed on `main`'s next merge and the three consumers
   of the money region now agree on the same swap contract.
 
+**Accepted debt, recorded so it is not lost**
+
+- **The audit line (`Updated by …`) is stale until the next full load.** With
+  `hx-swap="none"` nothing re-renders it. The fix is a small OOB refresh, and it
+  is deliberately not in T2: it would stack a second unverified htmx behaviour
+  (`hx-swap="none"` together with `hx-swap-oob`) into a change that already had
+  a collision to handle. The vendored source was read and the OOB scan does run
+  before the swap regardless of style, so the mechanism should work — it just
+  deserves its own verification rather than being assumed here.
+- **Server-side failures render in the global notice, not inline.** See the T2
+  refinement above for the reason (a 4xx must stay a 4xx).
+
 ## Verification evidence
+
+- **T2, the collision the plan and the design review both missed**:
+  `base.html`'s `htmx:afterRequest` success handler announces
+  `"<action> saved"` for **every** successful form post carrying a
+  `data-action`. Auto-save would have raised one notice per field. Found by
+  reading the handler before writing the brief, not by a failing test. The form
+  now opts out with `data-silent-save`, placed after the `data-notice-server`
+  tiebreak and before the notice, and `data-action` stays so the failure path
+  still names the action.
+- **T2, the focus test passed vacuously at first.** With no auto-save yet
+  implemented, nothing swapped and focus survived trivially, so the test of the
+  feature's central decision proved nothing. It now also asserts that the save
+  happened, which is what makes the focus check a real gate — the red message
+  says so: `the save did not happen, so the focus check is vacuous`. Fourth
+  instance of the vacuous-test pattern in this session, and the first caught
+  before the test was accepted.
+- **T2, red first**: 4 failed, each for the right reason — the button still
+  present, the save not happening, no response to wait for, and no inline hint.
+- **T2, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **98 passed, 4 skipped, 0 failed** (94 plus the
+  four new tests).
+- **T2, two tests pinned retired mechanisms and were corrected**: the e2e header
+  test clicked the deleted button **and** its docstring claimed the record was
+  swapped, which stopped being true; and a Rust read-only assertion matched the
+  bare substring `purchase-header-form`, which the new page-shell selector string
+  now trips — corrected to `id="purchase-header-form"`, still a negative
+  assertion and now more precise rather than weaker. **The e2e one was my error
+  and a worse kind than a scope miss**: I had already grepped `purchase-header`
+  across the e2e suite and seen that test clicking the button, and did not put it
+  in the brief.
+- **T2, htmx verified against the vendored source rather than assumed**:
+  `hx-trigger="change"` on the form element binds the listener on the element
+  itself with no target filter, so a bubbling `change` from a field fires it; and
+  `hx-sync` strategy `replace` dispatches `htmx:abort` on the sync element, so
+  "the newer request wins" is its literal semantics.
+- **T2, no stylesheet rebuild needed**: every class the change adds
+  (`mt-1`, `text-[13px]`, `text-danger`, `text-muted`) already exists in
+  `templates/`, and the new script adds no styling class, so the committed
+  `static/tailwind.css` stays current. Verified rather than assumed.
 
 - **T1, the coverage gap that let it live two days**: the inline line edit had
   **no browser test at all**. The only thing mentioning it was a Rust test
