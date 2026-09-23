@@ -219,18 +219,35 @@ by its own test, so the surviving path is pinned rather than assumed.
       `requestSubmit`), the Tailwind `@source` line and rebuilt stylesheet, the
       `line_picker` shell rewrite, the `sale_detail.html` call sites, and the e2e
       test. Vertical slice, red first. Closed in `db57ecf`.
-- [ ] T4 — The **purchase** page cutover: retire the inline mirror in
-      `purchase_detail.html`, delete the `base.html` focus and in-flight
-      handlers, drop the `purchase.html:97` Escape stand-down, and rewrite the
-      structural Rust tests in `inventory_web.rs` and `purchases_web.rs` that
-      assert the smuggled `hx-vals`.
-      **Rescoped:** the sale page's structural tests (`sales_web.rs`
+- [ ] T4 — The **purchase** page cutover: cut the entry row in
+      `purchase_detail.html` over to the island shell, delete the `base.html`
+      focus and in-flight handlers, rewrite the structural Rust tests in
+      `purchases_web.rs` that assert the smuggled `hx-vals`, and correct the
+      `static/picker.js` `htmx:load` comment to cover the purchase case.
+      **Rescoped twice.** First: the sale page's structural tests (`sales_web.rs`
       `n4_sale_record_offers_the_picker_instead_of_the_catalogue_select` and the
       sale half of `smoke_tests.rs` `line_picker_loads_a_sale_without_a_click`)
       were originally listed here, which was wrong — they pin the sale page's
-      markup, so they broke in T3 and were rewritten there. T4 keeps the
-      purchase-facing ones, and the route-fragment half of the smoke test stays
-      as the pin that the purchase-facing results body was not disturbed.
+      markup, so they broke in T3 and were rewritten there. Second: the original
+      wording said to **drop** the `purchase.html` Escape stand-down, and that is
+      wrong too. The stand-down exists so Escape inside the picker clears the
+      field **without** also closing the record menu; `base.html`'s keydown
+      handler is what clears the field now, and removing the stand-down would let
+      both handlers act and change the behaviour. The stand-down stays; only its
+      prose ("the picker input owns Escape") is stale and gets corrected.
+      `assert_entry_row_is_empty_and_focused` is expected to need **no** change —
+      it asserts one `line-picker`, no `hx-swap-oob` on the row tag, `autofocus`,
+      an empty value and the qty/cost ids, all of which the island shell
+      preserves, so it becomes the pin that the entry-row contract survived.
+- [ ] T4b — Retire the now-dead HTML search path: the `/web/product-search`
+      route, `ProductSearchResultsPartial`, the route-rendered results body at
+      the bottom of `product_search_results.html`, and the
+      `line_action`/`line_target`/`price` query parameters, together with the
+      tests that pin them (`n4_product_search_*` in `inventory_web.rs` and the
+      route-fragment half of the smoke test). Split out from T4 deliberately: T4
+      is a behaviour change, T4b is pure deletion, and a deletion-only diff is
+      the cheapest thing to review. After T4 that path is unused but still works
+      and still passes its own tests, so T4 stays green on its own.
 - [ ] T5 — e2e sweep (`test_picker.py`, `test_search_ux.py`) and README.
 
 ## Delivery strategy
@@ -242,8 +259,10 @@ large ones and the review workload guard applies:
   removed, nothing on screen changes, independently mergeable and revertible.
 - **Slice 2 — T3.** The sale page cut over. The picker still exists in its old
   form for purchases, so the two consumers are independent.
-- **Slice 3 — T4 + T5.** The purchase cutover and the cleanup: the mirror, the
-  `base.html` machinery, the structural tests, e2e and docs.
+- **Slice 3 — T4 + T4b + T5.** The purchase cutover (a behaviour change), then
+  the retirement of the dead HTML search path (pure deletion, reviewed
+  separately because deletion-only diffs are the cheapest to check), then the
+  e2e sweep and docs.
 
 ## Progress
 
@@ -265,6 +284,13 @@ large ones and the review workload guard applies:
   the two `sale_detail.html` call sites was a no-op in fact; and my T4 scoping
   was wrong, because the sale page's structural tests break in T3, not T4 (see
   the rescope note on T4).
+- 2026-09-24: T4 in flight. A third rescope, found by reading `purchase.html`
+  before writing the brief rather than after: the plan said to drop the Escape
+  stand-down, and reading it showed the stand-down is what keeps Escape in the
+  picker from also closing the record menu. Recorded because the pattern is
+  worth keeping — **the plan's own instructions get checked against the code
+  before they are delegated**, and two of the three corrections in this feature
+  came from that check rather than from a failing test.
 
 ## Accepted debt
 
