@@ -4194,8 +4194,62 @@ async fn line_picker_loads_a_sale_without_a_click() {
 
 /// The same loop as the sale page, against the purchase record: the picker posts
 /// the typed value to the purchase line endpoint, the response carries the updated
-/// lines, the running total and the out-of-band picker, and the repeated-product
-/// rule surfaces as a clear 400 instead of a crash.
+/// lines, the running total and the entry row — persistent inside the swapped
+/// money region, empty and focused for the next scan (no out-of-band picker on
+/// purchases) — and the repeated-product rule surfaces as a clear 400 instead of
+/// a crash.
+
+/// The purchase add response must bring the entry row back inside the swapped
+/// money region, empty and ready for the next scan. The sale record keeps the
+/// out-of-band picker, so purchases get their own contract here: the entry
+/// row renders once, its tag carries NO `hx-swap-oob`, the product field is
+/// empty and `autofocus`, and the qty and cost fields travel with it.
+fn assert_purchase_entry_row_is_empty_and_ready(html: &str) {
+    assert_eq!(
+        html.matches("id=\"line-picker\"").count(),
+        1,
+        "the entry row renders exactly once, inside the money region: {html:.800}"
+    );
+    let row_pos = html
+        .find("id=\"line-picker\"")
+        .expect("the entry row renders on the add-line response");
+    let row_start = html[..row_pos].rfind('<').expect("the id must sit inside a tag");
+    let tag_end = row_start + html[row_start..].find('>').expect("unterminated tag");
+    let row_tag = &html[row_start..=tag_end];
+    assert!(
+        !row_tag.contains("hx-swap-oob"),
+        "the purchase picker is no longer out of band; it travels inside the money region: {row_tag}"
+    );
+    let row = &html[row_pos..];
+    let money_pos = html
+        .find("id=\"purchase-record-money\"")
+        .expect("the add response renders the money region");
+    assert!(
+        money_pos < row_pos,
+        "the entry row must render inside the swapped money region: money={money_pos} row={row_pos}"
+    );
+    let input_pos = row
+        .find("id=\"product-picker\"")
+        .expect("the entry row renders its product field");
+    let input_start = row[..input_pos].rfind('<').unwrap();
+    let input_end = input_pos + row[input_pos..].find('>').unwrap();
+    let input_tag = &row[input_start..=input_end];
+    assert!(
+        input_tag.contains("autofocus"),
+        "the entry row must come back focused: {input_tag}"
+    );
+    assert!(
+        !input_tag.contains("value="),
+        "the entry row must come back empty: {input_tag}"
+    );
+    for id in ["id=\"line-qty\"", "id=\"line-unit-cost\""] {
+        assert!(
+            row.contains(id),
+            "the entry row carries the qty and the cost field: {id}: {row:.600}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn purchase_line_picker_adds_lines_without_a_click() {
     let (app, pool) = test_app().await;
@@ -4295,9 +4349,9 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
         added.contains("$20"),
         "running total after the scan: {added:.800}"
     );
-    assert_oob_picker_is_empty_and_focused(&added);
+    assert_purchase_entry_row_is_empty_and_ready(&added);
 
-    // Scan 2: a different product, and the picker comes back ready again.
+    // Scan 2: a different product, and the entry row comes back ready again.
     let (status, added) = post_form(
         &app,
         &format!("{base}/lines"),
@@ -4306,7 +4360,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     .await;
     assert_eq!(status, StatusCode::OK, "{added}");
     assert!(added.contains("$50"), "running total: {added:.800}");
-    assert_oob_picker_is_empty_and_focused(&added);
+    assert_purchase_entry_row_is_empty_and_ready(&added);
 
     // Removing a line updates the running total from the same response.
     let detail = purchase_detail(&app, purchase).await;

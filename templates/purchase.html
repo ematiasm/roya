@@ -7,19 +7,17 @@
 <div id="purchase-record">
   {% include "partials/purchase_detail.html" %}
 </div>
-{# Receiving-desk T3 interactions (bar menu, dialogs, add-line drawer).
+{# Receiving-desk T3 interactions (bar menu, dialogs).
 
    This script lives in the PAGE SHELL, not the record fragment: the fragment
    is swapped by every action response, and a script inside swapped content
    would re-register the document-level listeners on every swap. The functions
    query the DOM by id at call time, so they keep working after a swap rebuilds
-   the bar, the dialogs or the drawer.
+   the bar or the dialogs.
 
    Escape: a native <dialog> closes itself, so the handler stands down while
    one is open; the picker input owns Escape to clear its own value, so the
-   handler stands down for that target too (otherwise the drawer would vanish
-   before the keyup could clear the field). Everything else closes the menu
-   and the drawer. #}
+   handler stands down for that target too. Everything else closes the menu. #}
 <script>
   function openRecordDialog(id) {
     closeRecordMenu();
@@ -49,44 +47,6 @@
       if (cash) due.value = '';
     }
   }
-  // T6 keep-open preference: default OFF, persisted in localStorage. The
-  // checkbox lives in the drawer shell (outside the OOB-swapped picker), and
-  // the page shell — not the swapped fragment — owns the read/write so the
-  // preference survives every record refresh.
-  var KEEP_OPEN_KEY = 'purchases.addLine.keepOpen';
-  function keepOpenChecked() {
-    try { return localStorage.getItem(KEEP_OPEN_KEY) === '1'; } catch (e) { return false; }
-  }
-  function syncKeepOpenCheckbox() {
-    var box = document.getElementById('keep-open-lines');
-    if (box) box.checked = keepOpenChecked();
-  }
-  document.addEventListener('change', function (evt) {
-    if (!evt.target || evt.target.id !== 'keep-open-lines') return;
-    try { localStorage.setItem(KEEP_OPEN_KEY, evt.target.checked ? '1' : '0'); } catch (e) {}
-  });
-  function openLineDrawer() {
-    closeRecordMenu();
-    var drawer = document.getElementById('line-drawer');
-    if (drawer) {
-      drawer.classList.remove('hidden');
-      drawer.classList.add('flex');
-      syncKeepOpenCheckbox();
-      var input = document.getElementById('product-picker');
-      if (input) input.focus();
-    }
-  }
-  function closeLineDrawer() {
-    var drawer = document.getElementById('line-drawer');
-    if (!drawer || drawer.classList.contains('hidden')) return;
-    drawer.classList.add('hidden');
-    drawer.classList.remove('flex');
-    // Focus return: the bar's Add line button opened the drawer, so it is
-    // where the keyboard goes back (the OOB autofocus targets a now-hidden
-    // picker input, so this call must come after the class swap).
-    var addBtn = document.getElementById('add-line');
-    if (addBtn) addBtn.focus();
-  }
   // T7: an inline line edit the server refuses (4xx) reverts to the last
   // server-rendered value — the base notice still announces the refusal, and
   // the input must not keep a value the domain rejected. `defaultValue` is
@@ -97,18 +57,6 @@
     var elt = evt.detail && evt.detail.requestConfig && evt.detail.requestConfig.elt;
     if (!elt || !elt.matches || !elt.matches('#purchase-record input[hx-put]')) return;
     elt.value = elt.defaultValue;
-  });
-  // After a successful add-line POST, close the drawer unless the preference
-  // is on (then the OOB picker clear+focus already staged the next add).
-  // Errors keep the drawer open so the notice is visible next to the form.
-  document.addEventListener('htmx:afterRequest', function (evt) {
-    var cfg = evt.detail && evt.detail.requestConfig;
-    if (!cfg) return;
-    if (String(cfg.verb).toUpperCase() !== 'POST') return;
-    if (String(cfg.path).indexOf('/lines') === -1) return;
-    if (evt.detail.xhr && evt.detail.xhr.status >= 400) return;
-    if (keepOpenChecked()) return;
-    closeLineDrawer();
   });
   function toggleRecordMenu(evt) {
     if (evt) evt.stopPropagation();
@@ -125,9 +73,10 @@
     var toggle = document.getElementById('record-menu-toggle');
     if (toggle) toggle.setAttribute('aria-expanded', 'false');
   }
-  // Outside click closes the menu; the header action anchors open the same
-  // targets their in-page ids name (a plain anchor jump would not click the
-  // button or open the dialog).
+  // Outside click closes the menu; the header action anchor opens the same
+  // target its in-page id names (a plain anchor jump would not click the
+  // button or open the dialog). The add-line drawer had its own anchor
+  // interceptor and is gone with it: the entry row is persistent.
   document.addEventListener('click', function (evt) {
     var menu = document.getElementById('record-menu');
     if (menu && !menu.classList.contains('hidden')) {
@@ -136,11 +85,6 @@
       if (!onToggle && !menu.contains(t)) closeRecordMenu();
     }
     if (!evt.target || !evt.target.closest) return;
-    if (evt.target.closest('a[href="#add-line"]')) {
-      evt.preventDefault();
-      openLineDrawer();
-      return;
-    }
     if (evt.target.closest('a[href="#record-payment"]')) {
       evt.preventDefault();
       openRecordDialog('record-payment');
@@ -151,7 +95,6 @@
     if (document.querySelector('dialog[open]')) return;
     if (evt.target && evt.target.closest && evt.target.closest('#product-picker')) return;
     closeRecordMenu();
-    closeLineDrawer();
   });
 </script>
 {% endblock %}

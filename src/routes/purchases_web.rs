@@ -94,10 +94,13 @@ struct PurchasePageTemplate {
     page_action_href: String,
     page_action_label: String,
     record: PurchaseRecord,
-    oob_picker: bool,
-    /// Receiving-desk T3: the action bar rides out of band exactly when the
-    /// picker does — both only matter on the add-line response, whose main
-    /// swap takes just the money region (HTMX runs OOB before `hx-select`).
+    /// The entry row renders inside the money region and carries `autofocus`
+    /// only on the add-line response, so the swapped-in copy claims focus for
+    /// the next scan; the page itself always renders without it.
+    entry_row_focus: bool,
+    /// The action bar swaps out of band on the add-line response, so its
+    /// enabled state (Confirm disabled at zero lines) follows the line count
+    /// while the main swap only takes the money region.
     oob_action_bar: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
@@ -133,7 +136,11 @@ struct PurchaseListPartial {
 #[template(path = "partials/purchase_detail.html")]
 struct PurchaseDetailPartial {
     record: PurchaseRecord,
-    oob_picker: bool,
+    /// The entry row is persistent inside the money region; this flag only
+    /// adds `autofocus` to its product field on the add-line response, so
+    /// the swapped-in row claims focus for the next scan (htmx restores
+    /// focus by id after the money-region swap).
+    entry_row_focus: bool,
     /// The action bar swaps out of band on the add-line response, so its
     /// enabled state (Confirm disabled at zero lines) follows the line count
     /// while the main swap only takes the money region.
@@ -284,12 +291,12 @@ async fn record_context(state: &AppState, purchase_id: i64) -> AppResult<Purchas
 
 fn render_record(
     context: PurchaseRecordContext,
-    oob_picker: bool,
+    entry_row_focus: bool,
     oob_action_bar: bool,
 ) -> AppResult<Html<String>> {
     let html = PurchaseDetailPartial {
         record: context.record,
-        oob_picker,
+        entry_row_focus,
         oob_action_bar,
         method_options: context.method_options,
         today: context.today,
@@ -304,23 +311,25 @@ fn render_record(
 /// Record-body response that keeps the cross-region `purchase-changed` refresh
 /// event, so the subscribed list region updates after an action.
 async fn changed(state: &AppState, purchase_id: i64) -> AppResult<Response> {
-    changed_with_picker(state, purchase_id, false).await
+    changed_with_entry_row(state, purchase_id, false).await
 }
 
-/// Line-add response: the same body plus the out-of-band picker, empty and
-/// focused, so the scanner can feed the next line without a click. Both OOB
-/// flags ride together: this response is only used where the request's
-/// `hx-select` takes the money region, so whatever else must refresh (the
-/// action bar) has to arrive out of band too.
-async fn changed_with_picker(
+/// Line-add response: the entry row is now persistent inside the money region
+/// the add swaps, so no out-of-band picker is needed — the flag only adds
+/// `autofocus` to the entry row's product field, so the swapped-in region
+/// claims focus and the scanner can feed the next line without a click. The
+/// action bar still rides out of band: its enabled state (Confirm disabled at
+/// zero lines) must follow the line count while the main swap only takes the
+/// money region (HTMX processes OOB before `hx-select`).
+async fn changed_with_entry_row(
     state: &AppState,
     purchase_id: i64,
-    oob_picker: bool,
+    entry_row_focus: bool,
 ) -> AppResult<Response> {
     let html = render_record(
         record_context(state, purchase_id).await?,
-        oob_picker,
-        oob_picker,
+        entry_row_focus,
+        true,
     )?
     .0;
     let mut resp = Html(html).into_response();
@@ -469,9 +478,7 @@ async fn purchase_record_page(
         Some(number) => number.clone(),
         None => "Draft purchase".to_string(),
     };
-    let (action_href, action_label) = if context.record.purchase.status == PurchaseStatus::Draft {
-        ("#add-line".to_string(), "Add line".to_string())
-    } else if context.record.purchase.status == PurchaseStatus::Confirmed
+    let (action_href, action_label) = if context.record.purchase.status == PurchaseStatus::Confirmed
         && context.record.purchase.payment_type == PaymentType::Credit
     {
         ("#record-payment".to_string(), "Record payment".to_string())
@@ -485,7 +492,7 @@ async fn purchase_record_page(
         page_action_href: action_href,
         page_action_label: action_label,
         record: context.record,
-        oob_picker: false,
+        entry_row_focus: false,
         oob_action_bar: false,
         method_options: context.method_options,
         today: context.today,
@@ -756,7 +763,7 @@ async fn web_add_line_impl(
         .add_line(actor, id, product_id, qty, unit_cost)
         .await?;
     if is_htmx(&headers) {
-        return changed_with_picker(&state, id, true).await;
+        return changed_with_entry_row(&state, id, true).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1370,43 +1377,49 @@ mod tests {
         &html[start..end]
     }
 
-    /// The line response must bring the picker back out of band, empty and
-    /// focused, so the next scan lands without a click.
-    fn assert_oob_picker_is_empty_and_focused(html: &str) {
-        // The response can carry more than one OOB element (the action bar
-        // rides out of band on add-line too) and more than one `#line-picker`
-        // (the in-place picker plus its OOB copy): locate the OOB picker by
-        // ITS tag carrying `hx-swap-oob`, never by the first OOB in the doc.
-        let mut from = 0usize;
-        let (tag_start, tag_end) = loop {
-            let rel = html[from..]
-                .find("id=\"line-picker\"")
-                .unwrap_or_else(|| panic!("the out-of-band picker must render: {html:.800}"));
-            let pos = from + rel;
-            let start = html[..pos].rfind('<').expect("the id must sit inside a tag");
-            let end_rel = html[start..].find('>').expect("unterminated tag");
-            if html[start..=start + end_rel].contains("hx-swap-oob") {
-                break (start, start + end_rel);
-            }
-            from = pos + 1;
-        };
-        let oob_tag = &html[tag_start..=tag_end];
-        assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
-        let oob = &html[tag_start..];
-        assert!(
-            oob.contains("autofocus"),
-            "the picker must come back focused: {oob:.400}"
+    /// The add-line response must bring the entry row back inside the swapped
+    /// money region, empty and focused, so the next scan lands without a
+    /// click. The picker is no longer out of band on purchases: it travels
+    /// inside `#purchase-record-money` (the action bar alone rides OOB).
+    fn assert_entry_row_is_empty_and_focused(html: &str) {
+        // Exactly one entry row renders per record, inside the money region
+        // the add response swaps — never out of band.
+        assert_eq!(
+            html.matches("id=\"line-picker\"").count(),
+            1,
+            "the entry row renders exactly once, inside the money region: {html:.800}"
         );
-        let input_pos = oob
+        let row_pos = html
+            .find("id=\"line-picker\"")
+            .expect("the entry row renders on the add-line response");
+        let row_start = html[..row_pos].rfind('<').expect("the id must sit inside a tag");
+        let tag_end = row_start + html[row_start..].find('>').expect("unterminated tag");
+        let row_tag = &html[row_start..=tag_end];
+        assert!(
+            !row_tag.contains("hx-swap-oob"),
+            "the picker is no longer out of band; it travels inside the money region: {row_tag}"
+        );
+        let row = &html[row_pos..];
+        let input_pos = row
             .find("id=\"product-picker\"")
-            .expect("the out-of-band picker renders its field");
-        let input_start = oob[..input_pos].rfind('<').unwrap();
-        let input_end = input_pos + oob[input_pos..].find('>').unwrap();
-        let input_tag = &oob[input_start..=input_end];
+            .expect("the entry row renders its product field");
+        let input_start = row[..input_pos].rfind('<').unwrap();
+        let input_end = input_pos + row[input_pos..].find('>').unwrap();
+        let input_tag = &row[input_start..=input_end];
+        assert!(
+            input_tag.contains("autofocus"),
+            "the entry row must come back focused: {input_tag}"
+        );
         assert!(
             !input_tag.contains("value="),
-            "the picker must come back empty: {input_tag}"
+            "the entry row must come back empty: {input_tag}"
         );
+        for id in ["id=\"line-qty\"", "id=\"line-unit-cost\""] {
+            assert!(
+                row.contains(id),
+                "the entry row carries the qty and the cost field: {id}: {row:.600}"
+            );
+        }
     }
 
     /// Everything a record-page test needs to address the seeded document.
@@ -3082,12 +3095,14 @@ mod tests {
     /// Receiving-desk T3: the four-card action grid is replaced by a sticky
     /// action bar (one primary action per status plus a `⋯` secondary menu),
     /// and every action form lives in a `<dialog>` the bar opens. The legacy
-    /// ids keep their meaning so in-page anchors still resolve: `#add-line`
-    /// is the bar's drawer button, `#confirm-purchase` / `#edit-header` /
-    /// `#discard-purchase` / `#record-payment` / `#cancel-purchase` are the
-    /// dialogs. Cancelled is read-only: no bar, no menu, no dialogs. The
-    /// add-line response carries the bar out of band, because its main swap
-    /// only takes the money region (HTMX processes OOB before `hx-select`).
+    /// ids keep their meaning so in-page anchors still resolve: `#confirm-
+    /// purchase` / `#edit-header` / `#discard-purchase` / `#record-payment` /
+    /// `#cancel-purchase` are the dialogs. The add-line drawer is gone: the
+    /// entry row is persistent inside the money region, so the bar carries no
+    /// drawer button and the page offers no `#add-line` anchor. Cancelled is
+    /// read-only: no bar, no menu, no dialogs, no entry row. The add-line
+    /// response carries the bar out of band, because its main swap only takes
+    /// the money region (HTMX processes OOB before `hx-select`).
     #[tokio::test]
     async fn web_purchase_record_renders_sticky_action_bar_and_status_dialogs() {
         let state = test_state().await;
@@ -3095,7 +3110,7 @@ mod tests {
         let app = crate::routes::router(state.clone());
         let base = format!("/web/purchases/{}", fixture.purchase_id);
 
-        // -- Draft: sticky bar + secondary menu + drawer + dialogs ----------
+        // -- Draft: sticky bar + secondary menu + entry row + dialogs --------
         let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
             .await;
         assert_eq!(status, StatusCode::OK);
@@ -3109,8 +3124,21 @@ mod tests {
             "the secondary menu renders: {html:.400}"
         );
         assert!(
-            html.contains("id=\"line-drawer\""),
-            "the add-line drawer hosts the picker: {html:.400}"
+            !html.contains("id=\"line-drawer\""),
+            "the add-line drawer is deleted; the entry row replaces it: {html:.400}"
+        );
+        assert!(
+            !html.contains("id=\"add-line\""),
+            "the bar carries no drawer button and the page no drawer anchor: {html:.400}"
+        );
+        // The entry row is persistent: product, qty, cost and the Add action
+        // render without any click, inside the money region adds swap.
+        assert!(
+            html.contains("id=\"line-picker\"")
+                && html.contains("id=\"product-picker\"")
+                && html.contains("id=\"line-qty\"")
+                && html.contains("id=\"line-unit-cost\""),
+            "the entry row renders its fields persistent: {html:.600}"
         );
         for dialog in ["confirm-purchase", "edit-header", "discard-purchase"] {
             assert!(
@@ -3118,10 +3146,6 @@ mod tests {
                 "the draft renders the {dialog} dialog: {html:.400}"
             );
         }
-        assert!(
-            element_tag_containing(&html, "id=\"add-line\"").contains("openLineDrawer"),
-            "the bar's add-line button opens the drawer"
-        );
         assert!(
             !html.contains("min-[760px]:grid-cols-2"),
             "the four-card action grid is gone: {html:.400}"
@@ -3181,7 +3205,7 @@ mod tests {
             "cancelling a confirmed purchase asks via its dialog: {html:.400}"
         );
         assert!(
-            !html.contains("id=\"line-drawer\""),
+            !html.contains("id=\"line-drawer\"") && !html.contains("id=\"line-picker\""),
             "a confirmed purchase cannot add lines: {html:.400}"
         );
         assert!(
@@ -3205,7 +3229,7 @@ mod tests {
         for id in [
             "purchase-action-bar",
             "record-menu",
-            "line-drawer",
+            "line-picker",
             "confirm-purchase",
             "record-payment",
         ] {
@@ -3214,6 +3238,82 @@ mod tests {
                 "a cancelled purchase is read-only, found {id}: {html:.400}"
             );
         }
+    }
+
+    /// The record page's header action slot holds the next obvious action,
+    /// and for a draft that action is no longer the header's to offer: S5a
+    /// removed the add-line drawer, so a draft's line entry lives in the
+    /// entry row inside the document and its primary action is Confirm in
+    /// the sticky action bar — the header renders no `data-page-action` at
+    /// all (an empty slot pair, so the partial drops the anchor; the old
+    /// `#add-line` target no longer exists). A confirmed credit purchase's
+    /// next obvious action IS the header's: "Record payment" anchored at
+    /// `#record-payment`. A confirmed cash purchase was settled at confirm,
+    /// so nothing is left to pay and it too renders none. Pinned in both
+    /// directions: a dead anchor must not creep back, and the payment
+    /// action must not silently drop.
+    #[tokio::test]
+    async fn web_purchase_record_page_action_draft_offers_none_and_confirmed_credit_offers_record_payment() {
+        let state = test_state().await;
+        let credit = seed_record_fixture(&state, PaymentType::Credit).await;
+        let cash = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        // -- Draft: no page action; lines go through the entry row ----------
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("data-page-action"),
+            "a draft's line entry lives in the document's entry row and its primary \
+             action is Confirm in the sticky bar, so the header offers no action: {html:.400}"
+        );
+
+        // -- Confirmed credit: the next obvious action is paying ------------
+        state
+            .purchases_service
+            .confirm(audit_actor(&state).await, credit.purchase_id, None)
+            .await
+            .unwrap();
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let header_start = html
+            .find("data-page-header")
+            .expect("the record page renders its page header");
+        let header_end = header_start
+            + html[header_start..]
+                .find("</header>")
+                .expect("the page header closes");
+        let header = &html[header_start..header_end];
+        let action = element_tag_containing(header, "data-page-action");
+        assert!(
+            action.contains("href=\"#record-payment\""),
+            "a confirmed credit purchase's next obvious action opens the payment \
+             dialog: {action}"
+        );
+        assert!(
+            header.contains(">Record payment</a>"),
+            "the confirmed credit action must be labelled Record payment: {header:.600}"
+        );
+
+        // -- Confirmed cash: settled at confirm, nothing left to pay --------
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                cash.purchase_id,
+                Some(cash.method_id),
+            )
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/purchases/{}", cash.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("data-page-action"),
+            "a confirmed cash purchase has nothing left to pay, so the header \
+             offers no action: {html:.400}"
+        );
     }
 
     /// Receiving-desk T4: a draft's money region carries an effects preview —
@@ -3306,8 +3406,8 @@ mod tests {
             .unwrap_or_else(|| panic!("the draft renders an effects preview: {html:.600}"));
         let preview_end = preview_start
             + html[preview_start..]
-                .find(">Lines (")
-                .expect("the preview sits in the money region, before the lines heading");
+                .find("id=\"line-picker\"")
+                .expect("the preview sits before the persistent entry row");
         let preview = &html[preview_start..preview_end];
         assert!(
             preview.contains("+3 units (tracked)"),
@@ -3356,8 +3456,8 @@ mod tests {
             .expect("the credit draft renders its preview too");
         let preview_end = preview_start
             + html[preview_start..]
-                .find(">Lines (")
-                .expect("the preview sits before the lines heading");
+                .find("id=\"line-picker\"")
+                .expect("the preview sits before the persistent entry row");
         let preview = &html[preview_start..preview_end];
         let credit_total = state
             .purchases_service
@@ -3519,49 +3619,60 @@ mod tests {
         );
     }
 
-    /// The add-line drawer carries a "Keep open after adding" preference:
-    /// the checkbox lives OUTSIDE `#line-picker` (the picker OOB-swaps on
-    /// every add and would wipe it), its state persists in localStorage, and
-    /// the page shell closes the drawer — returning focus to the bar's
-    /// add-line button — after a successful POST when the preference is off.
+    /// The entry row replaces the add-line drawer: it renders persistent
+    /// inside the money region — product, qty, cost and the Add action,
+    /// visible without any click — and the drawer's "Keep open after adding"
+    /// preference is gone with the drawer: no checkbox, no localStorage key,
+    /// and no page-shell code that opened, closed or focused a drawer.
     #[tokio::test]
-    async fn web_purchase_add_line_drawer_carries_keep_open_preference_outside_the_picker() {
+    async fn web_purchase_entry_row_replaces_the_drawer_and_drops_the_keep_open_preference() {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         let app = crate::routes::router(state.clone());
         let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
 
-        // The checkbox renders in the drawer, before the picker subtree, so
-        // the picker's out-of-band clear+focus swap cannot destroy it.
-        let drawer_start = html
-            .find("<div id=\"line-drawer\"")
-            .expect("the add-line drawer renders");
-        let keep = html
-            .find("id=\"keep-open-lines\"")
-            .expect("the keep-open checkbox renders");
-        let picker = html
-            .find("id=\"line-picker\"")
-            .expect("the drawer hosts the picker");
+        // The drawer and its keep-open preference are deleted outright.
         assert!(
-            keep > drawer_start && keep < picker,
-            "the keep-open checkbox sits in the drawer, outside the picker: keep={keep} picker={picker} drawer={drawer_start}"
+            !html.contains("id=\"line-drawer\"") && !html.contains("closeLineDrawer"),
+            "the add-line drawer is deleted: {html:.600}"
+        );
+        assert!(
+            !html.contains("keep-open-lines") && !html.contains("keepOpen"),
+            "the keep-open preference is gone with the drawer: {html:.600}"
+        );
+        assert!(
+            !html.contains("purchases.addLine.keepOpen"),
+            "the localStorage preference is gone: {html:.600}"
+        );
+        assert!(
+            !html.contains("openLineDrawer"),
+            "no code opens a drawer that no longer exists: {html:.600}"
         );
 
-        // The preference persists across swaps: the page shell owns the
-        // localStorage key and the after-request close.
+        // The entry row sits inside the money region every add response
+        // swaps, above the lines: results appearing below cannot move the
+        // Add button, and the region swap re-renders it empty and focused.
+        let money = html
+            .find("id=\"purchase-record-money\"")
+            .expect("the money region renders");
+        let row = html
+            .find("id=\"line-picker\"")
+            .expect("the entry row renders");
+        let results = html
+            .find("id=\"product-search-results\"")
+            .expect("the entry row renders the results container");
+        let lines = html
+            .find(">Lines (")
+            .expect("the lines heading renders");
         assert!(
-            html.contains("purchases.addLine.keepOpen"),
-            "the page shell persists the preference: {html:.600}"
+            money < row && row < results && results < lines,
+            "the entry row and its results sit inside the money region, above the lines: money={money} row={row} results={results} lines={lines}"
         );
+        let form = enclosing_form(&html, "id=\"product-picker\"");
         assert!(
-            html.contains("htmx:afterRequest"),
-            "the page shell reacts to the add-line response: {html:.600}"
-        );
-        // Focus return: closing the drawer hands focus back to the bar button.
-        assert!(
-            html.contains("getElementById('add-line')") && html.contains("addBtn.focus()"),
-            "closing the drawer returns focus to Add line: {html:.600}"
+            form.contains("data-action=\"Add line\"") && form.contains("type=\"submit\""),
+            "the entry row carries the Add action in its flex row: {form:.600}"
         );
     }
 
@@ -3708,7 +3819,8 @@ mod tests {
     /// The catalogue `<select>` is replaced by one field that searches with a
     /// debounce, submits on Enter and clears on Escape; the results container is a
     /// sibling of the form, and every result is its own add action against the
-    /// purchase line endpoint.
+    /// purchase line endpoint. The entry row is persistent inside the money
+    /// region, above the lines.
     #[tokio::test]
     async fn n4_purchase_record_offers_the_picker_instead_of_the_catalogue_select() {
         let state = test_state().await;
@@ -3762,12 +3874,22 @@ mod tests {
             html.contains("id=\"purchase-record-money\""),
             "adding a line swaps the money region, which carries the total and the lines"
         );
+        // Placement: the entry row and its results live inside the money
+        // region, above the lines heading — one flex row, then the results.
+        let money = html.find("id=\"purchase-record-money\"").unwrap();
+        let row = html.find("id=\"line-picker\"").unwrap();
+        let results = html.find("id=\"product-search-results\"").unwrap();
+        let lines = html.find(">Lines (").unwrap();
+        assert!(
+            money < row && row < results && results < lines,
+            "the entry row and its results sit inside the money region, above the lines: money={money} row={row} results={results} lines={lines}"
+        );
     }
 
-    /// AC9 + AC10: an exact barcode submits the line in one step, the same response
-    /// carries the updated lines, the running total and an out-of-band picker that
-    /// is empty and focused, and an empty cost falls back to the product's cost
-    /// price.
+    /// AC9 + AC10: an exact barcode submits the line in one step, the same
+    /// response carries the updated lines, the running total and the entry
+    /// row — inside the swapped money region, empty and focused — and an
+    /// empty cost falls back to the product's cost price.
     #[tokio::test]
     async fn n4_purchase_line_scan_adds_in_one_step_and_resets_the_picker() {
         use rust_decimal::Decimal;
@@ -3805,14 +3927,14 @@ mod tests {
             "an empty cost uses the product cost price only when the supplier has no satellite row"
         );
 
-        // One response carries the lines, the running total and the OOB picker, so
-        // lines and total can never drift.
+        // One response carries the lines, the running total and the entry row
+        // (inside the money region), so lines and total can never drift.
         assert!(added.contains(&scanned.name), "{added:.600}");
         assert!(
             added.contains("$40"),
             "the running total travels with the lines: {added:.800}"
         );
-        assert_oob_picker_is_empty_and_focused(&added);
+        assert_entry_row_is_empty_and_focused(&added);
     }
 
     /// AC10 (clicked result): a result is its own add action; the request includes

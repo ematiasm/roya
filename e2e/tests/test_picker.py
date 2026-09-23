@@ -183,23 +183,22 @@ def test_a_search_is_not_announced_as_an_added_line(
 def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     page: Page, api: ApiClient
 ) -> None:
-    """The purchase record hosts the same picker, but through its own form.
+    """The purchase record hosts the same picker, but through its own entry row.
 
     The sales test above would still pass if only the sale host were fixed, so the
-    purchase page needs its own results-based check: its host form passes a
-    different swap target and asks for cost instead of sale price. Here the results
-    must render, show the purchase context's cost, and a chosen result must add a
-    purchase line with the quantity typed. The seeded purchase already owns a line
-    for the other product, so the new row is unambiguous.
+    purchase page needs its own results-based check: its entry row passes a
+    different swap target and asks for cost instead of sale price. Here the
+    results must render, show the purchase context's cost, and a chosen result
+    must add a purchase line with the quantity typed. The seeded purchase already
+    owns a line for the other product, so the new row is unambiguous.
     """
     data = seed_harness_data(api)
     # The spare product the seed put on the *sale*; the purchase does not own it.
     spare_id = data.sale_line_product_id
     page.goto(f"{api.base_url}/purchases/{data.purchase_id}")
 
-    # The purchase picker lives in the add-line drawer now: open it the way
-    # the operator does (the bar's Add line button) before touching the field.
-    page.locator("#add-line").click()
+    # The entry row is persistent: the product field is already on the page,
+    # no click reveals it.
     picker = page.locator("#product-picker")
     picker.fill("Harness")
     results = page.locator("#product-search-results")
@@ -221,9 +220,6 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     expect(row.locator("input[name='qty']")).to_have_value("4")
     expect(row.locator("input[name='unit_cost']")).to_have_value("2.00")
     expect(row).to_contain_text("$8.00")
-    # The keep-open preference defaults to OFF, so a successful add closes the
-    # drawer and the line is what remains on screen.
-    expect(page.locator("#line-drawer")).to_be_hidden()
 
     detail = api.get_json(f"/api/purchases/{data.purchase_id}")
     line = next(

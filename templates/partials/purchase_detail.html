@@ -1,26 +1,83 @@
 {# Purchase record body (redesign-interface N3; product picker N4;
-   receiving-desk T3: action bar + dialogs + add-line drawer).
+   receiving-desk T3: action bar + dialogs + persistent entry row).
 
    Rendered both by `/purchases/{id}` inside the shell and standalone by every
    action response that swaps `#purchase-record`, so the same context travels with
    the fragment either way. The status gate below is presentation only: the
    service stays the authority and refuses edits to a confirmed purchase.
 
-   `record_money` wraps the running total and the lines so one response carries
-   both: adding a line swaps that region while the picker is replaced out of
-   band, empty and focused, ready for the next scan. The sticky action bar and
-   the add-line drawer live OUTSIDE that region — the add-line response marks
-   the bar `hx-swap-oob` so it refreshes with the same swap (HTMX processes OOB
-   before `hx-select`), while the dialogs and the drawer keep their ids as the
-   record's legacy anchors: `#add-line` is the bar's drawer button,
-   `#confirm-purchase` / `#edit-header` / `#discard-purchase` /
-   `#record-payment` / `#cancel-purchase` are the forms' dialogs. #}
-{% import "partials/product_search_results.html" as picker %}
+   `record_money` wraps the entry row, the running total and the lines so one
+   response carries all three: adding a line swaps that region and the entry
+   row is re-rendered inside it, empty and focused, ready for the next scan —
+   the picker is never out of band. The sticky action bar lives OUTSIDE that
+   region — the add-line response marks the bar `hx-swap-oob` so it refreshes
+   with the same swap (HTMX processes OOB before `hx-select`), while the
+   dialogs keep their ids as the record's legacy anchors: `#confirm-purchase`
+   / `#edit-header` / `#discard-purchase` / `#record-payment` /
+   `#cancel-purchase` are the forms' dialogs. #}
 {% import "partials/purchase_effects_preview.html" as effects %}
-{% macro record_money(record) %}
+{% macro record_money(record, entry_row_focus) %}
 <div id="purchase-record-money">
   <div class="my-2 text-2xl font-bold">${{ record.total }} <span class="text-[13px] text-muted">paid {{ record.paid }} • due {{ record.due }}</span></div>
   {% if record.purchase.status.to_string() == "Draft" %}{% call effects::effects_preview(record) %}{% endif %}
+
+  {# The entry row (S5a): one persistent flex row above the lines — product,
+     qty, cost and the Add button — so the results appearing below can never
+     push the button around. The whole row lives inside `#purchase-record-
+     money` and carries the same ids the old picker macro used, because the
+     results fragment's per-match forms post with `hx-include="#line-picker"`
+     and htmx re-focuses the swapped-in product field by id after the
+     money-region swap: renaming any of these ids breaks the quantity
+     travelling or the focus contract, silently. The `hx-disinherit` rule
+     mirrors the shared picker macro's (`product_search_results.html`): the
+     search GET the product field issues must not inherit this form's
+     hx-target/hx-swap/hx-select, or the results stay permanently empty in a
+     browser — no HTTP test can see that. The macro itself stays untouched:
+     the sale record page still hosts it inside its inline card.
+
+     `entry_row_focus` adds `autofocus` only on the add-line response, so
+     the swapped-in row claims focus for the next scan; the page renders
+     without it. Draft-only: a confirmed purchase cannot add lines. #}
+  {% if record.purchase.status.to_string() == "Draft" %}
+  <div id="line-picker" class="mb-4">
+    <form class="flex flex-wrap items-end gap-2.5" data-action="Add line"
+          hx-post="/web/purchases/{{ record.purchase.id }}/lines"
+          hx-disinherit="hx-select hx-target hx-swap"
+          hx-target="#purchase-record-money" hx-swap="outerHTML" hx-select="#purchase-record-money">
+      <div class="min-w-[150px] flex-1">
+        <label for="product-picker">Product</label>
+        <input type="text" id="product-picker" name="product" required autocomplete="off"
+               placeholder="Scan barcode or type name, SKU…"
+               aria-controls="product-search-results"
+               aria-describedby="product-search-status"
+               hx-get="/web/product-search"
+               hx-indicator="#product-search-busy"
+               hx-trigger="input changed delay:250ms"
+               hx-target="#product-search-results" hx-swap="innerHTML"
+               hx-vals='{"line_action": "/web/purchases/{{ record.purchase.id }}/lines", "line_target": "#purchase-record-money", "price": "cost"}'
+               hx-on:keyup="if (event.key === 'Escape') this.value = ''"
+               {% if entry_row_focus %}autofocus{% endif %} />
+      </div>
+      <div class="w-20">
+        <label for="line-qty">Qty</label>
+        <input type="number" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" />
+      </div>
+      <div class="min-w-[110px]">
+        <label for="line-unit-cost">Unit cost (empty = supplier cost)</label>
+        <input type="number" id="line-unit-cost" name="unit_cost" step="0.01" min="0" placeholder="supplier cost" />
+      </div>
+      <button type="submit">Add line</button>
+    </form>
+    {# Same busy cue and live region the shared picker macro renders: the
+       search GET resolves them by id, and `#product-search-busy` is a
+       sibling outside the entry-row form, so submitting a line never
+       flashes the search's busy state. #}
+    <p id="product-search-busy" class="htmx-indicator mt-2 text-[13px] text-muted" aria-hidden="true">Searching…</p>
+    <div id="product-search-results" role="status" aria-live="polite" aria-atomic="false" class="mt-2">
+      <p id="product-search-status" class="sr-only">Type a name, SKU or barcode.</p>
+    </div>
+  </div>
+  {% endif %}
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
   {% if record.lines.is_empty() %}
@@ -173,9 +230,6 @@
   {% if record.purchase.status.to_string() == "Draft" %}
   <div id="purchase-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
        class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
-    <button type="button" id="add-line"
-            class="rounded-[10px] border border-border bg-transparent px-3.5 py-2 text-sm text-text"
-            onclick="openLineDrawer()">Add line</button>
     <button type="button" id="open-confirm" class="bg-accent2 text-white"{% if record.lines.is_empty() %} disabled{% endif %}
             onclick="openRecordDialog('confirm-purchase')">Confirm ▾</button>
     <div class="relative ml-auto">
@@ -231,7 +285,7 @@
   {% endif %}
   {% endif %}
 
-  {% call record_money(record) %}
+  {% call record_money(record, entry_row_focus) %}
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ record.payments.len() }})</div>
   {% if record.payments.is_empty() %}
@@ -366,29 +420,9 @@
     </form>
   </dialog>
 
-  {# The add-line drawer (documents.html shell pattern): a fixed right panel,
-     no backdrop, hosting the same `line_picker` the card used — the picker's
-     hx-disinherit rules and swap targets are untouched. Opened by the bar's
-     `#add-line` button (or the header action anchor); the page shell owns
-     the open/close JS and Escape. #}
-  <div id="line-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
-    <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-      <span class="text-sm font-semibold">Add line</span>
-      <div class="flex items-center gap-2.5">
-        {# The preference sits OUTSIDE `#line-picker`: every add OOB-swaps
-           that subtree (clear + focus) and would wipe a checkbox inside it. #}
-        <label class="flex items-center gap-2 text-xs text-muted" for="keep-open-lines">
-          <input type="checkbox" id="keep-open-lines" />
-          Keep open after adding
-        </label>
-        <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
-                aria-label="Close add line" onclick="closeLineDrawer()">✕</button>
-      </div>
-    </div>
-    <div class="flex-1 overflow-y-auto p-4">
-      {% call picker::line_picker(false, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = supplier cost)", "supplier cost", "cost") %}
-    </div>
-  </div>
+  {# The add-line drawer is deleted (S5a): the entry row above the lines is
+     persistent, so there is no nested panel to open, no "keep open after
+     adding" checkbox to persist and no OOB picker swap. #}
   {% else if record.purchase.status.to_string() == "Confirmed" %}
   {% if record.purchase.payment_type.to_string() == "Credit" %}
   <dialog id="record-payment" class="rounded-2xl border border-border bg-card p-5 text-text">
@@ -443,6 +477,3 @@
   {% endif %}
 </div>
 
-{# The line response keeps the picker outside the swapped money region and swaps
-   it out of band with an empty, focused field, so the next scan lands there. #}
-{% if oob_picker %}{% call picker::line_picker(true, "purchases", record.purchase.id, "#purchase-record-money", "line-unit-cost", "unit_cost", "Unit cost (empty = supplier cost)", "supplier cost", "cost") %}{% endif %}
