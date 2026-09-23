@@ -240,15 +240,45 @@ by its own test, so the surviving path is pinned rather than assumed.
       it asserts one `line-picker`, no `hx-swap-oob` on the row tag, `autofocus`,
       an empty value and the qty/cost ids, all of which the island shell
       preserves, so it becomes the pin that the entry-row contract survived.
-- [ ] T4b — Retire the now-dead HTML search path: the `/web/product-search`
-      route, `ProductSearchResultsPartial`, the route-rendered results body at
-      the bottom of `product_search_results.html`, and the
-      `line_action`/`line_target`/`price` query parameters, together with the
-      tests that pin them (`n4_product_search_*` in `inventory_web.rs` and the
-      route-fragment half of the smoke test). Split out from T4 deliberately: T4
-      is a behaviour change, T4b is pure deletion, and a deletion-only diff is
-      the cheapest thing to review. After T4 that path is unused but still works
-      and still passes its own tests, so T4 stays green on its own.
+- [ ] T4b — Move the search coverage onto the route that survives. The HTML
+      route has **nine consumers**, not the two the earlier note assumed, and
+      they do not share one fate: some cover behaviour that moved to the island
+      and is already proven in e2e, one is a shared fixture, and one needs
+      retargeting to the JSON route. Dispositions, enumerated so no coverage is
+      dropped silently:
+      - **Delete** the two `GuardedPage` entries for the product-search fragment
+        in `seed_wiring_fixture`, and the product-search part of
+        `fragment_external_selectors_resolve_on_their_host_record_pages`. The
+        guard mechanism and its other entries stay; the `id=` assertions on both
+        host pages stay, because `#line-picker` still exists on both.
+      - **Delete** `product_search_shows_the_context_price` — the price context is
+        now client-side (`data-price-kind`), and e2e's
+        `test_the_picker_island_owns_the_purchase_search` and its sale sibling
+        already prove it.
+      - **Delete** `product_search_results_announce_a_polite_match_count` — the
+        count is now derived in the island, and e2e's
+        `test_the_results_announce_the_match_count` already proves it.
+      - **Retarget** the product-search part of `search_matches_ignore_accents_and_case`
+        to `/web/product-search.json` (the matching is server-side and survives);
+        its customer and supplier parts stay. Add the equivalent accent/case
+        assertion to the `n5_*` JSON tests, so the surviving route pins it in its
+        own module rather than only through a smoke test.
+      - **Delete** the route-fragment halves of `line_picker_loads_a_sale_without_a_click`
+        and `purchase_line_picker_adds_lines_without_a_click`. Their page halves
+        are already the island pins.
+      The HTML route itself **stays** in T4b, so this is a coverage move and the
+      tree stays green.
+- [ ] T4c — Delete the now-dead server path: `web_product_search`, the
+      `/web/product-search` route registration, `ProductSearchResultsPartial`,
+      the `line_action`/`line_target`/`price` fields of `ProductSearchQuery`, the
+      route-rendered results body at the bottom of `product_search_results.html`
+      (everything after `{% endmacro %}`), the `n4_product_search_*` tests that
+      pinned it, and the four stale comments that describe the product search's
+      `line_action`/`line_target` shape (three in `src/routes/suppliers_web.rs`,
+      one in `templates/partials/supplier_search_results.html` — the supplier
+      picker has its own query context now that the product search has none).
+      Genuinely pure deletion, only after T4b has moved the coverage that
+      survives.
 - [ ] T5 — e2e sweep (`test_picker.py`, `test_search_ux.py`) and README.
 
 ## Delivery strategy
@@ -260,10 +290,15 @@ large ones and the review workload guard applies:
   removed, nothing on screen changes, independently mergeable and revertible.
 - **Slice 2 — T3.** The sale page cut over. The picker still exists in its old
   form for purchases, so the two consumers are independent.
-- **Slice 3 — T4 + T4b + T5.** The purchase cutover (a behaviour change), then
-  the retirement of the dead HTML search path (pure deletion, reviewed
-  separately because deletion-only diffs are the cheapest to check), then the
-  e2e sweep and docs.
+- **Slice 3 — T4 + T4b + T4c + T5.** The purchase cutover (a behaviour change),
+  then the coverage move onto the surviving route, then the deletion of the dead
+  path (reviewed separately because a deletion-only diff is the cheapest thing to
+  check), then the e2e sweep and docs.
+
+The order inside slice 3 matters: **move the coverage before deleting the path.**
+Deleting first would mean rewriting tests against a route that is about to
+disappear, and it would make it impossible to tell a coverage move from a
+coverage loss inside the same diff.
 
 ## Progress
 
