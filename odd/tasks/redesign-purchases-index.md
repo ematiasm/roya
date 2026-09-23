@@ -290,12 +290,46 @@ item out as domain work rather than presentation.
       learned apply: the sale row becomes an anchor, so the tag-based e2e
       selector in `e2e/tests/test_filters.py` will break loudly, and the full
       browser suite must run for the slice that changes the row.
-- [ ] **S8 — One language, one date format.** Centralized labels +
-      `format_date`; English across the sidebar, the document groups, the peek's
-      operator copy (`Editar cabecera`, `Abrir el documento`, `Proveedor`,
-      `Líneas`, …) and the audit labels still Spanish in ten partials
-      (`Registrado por`, `Actualizado por`, `Sugerido`); specs and the tests that
-      assert the Spanish labels updated.
+- [ ] **S8 — One language, one date format. MEASURED: this is its own feature,
+      not a sub-slice of this one.** It amends two canonical specs and reaches
+      the identity module's error contract, so it needs its own feature doc and
+      its own OpenSpec change. The inventory, read from the tree on 2026-09-22:
+
+      **Operator copy in templates — 17 files:** `login.html`, `password.html`,
+      `users.html`, `roles.html`, `account_detail.html` and the partials
+      `sidebar.html`, `document_detail.html`, `suggestion_list.html`,
+      `stock_list.html`, `user_list.html`, `role_list.html`, `product_detail.html`,
+      `customer_statement.html`, `supplier_detail.html`, `sale_detail.html`,
+      `user_password_form.html`, `user_roles_form.html`.
+
+      **Rust-side copy — about 90 distinct Spanish strings in
+      `src/routes/documents_web.rs` alone** (the drawer's facts, table headers,
+      action labels, impact previews and notice sentences), plus
+      `DocumentGroup::label` in `src/models.rs` (`Ventas`, `Compras`,
+      `Movimientos de stock`, `Pagos`) and the sidebar's `Usuarios`, `Roles`,
+      `Cerrar sesión`.
+
+      **Two specs currently REQUIRE Spanish, so they must be amended rather than
+      quietly contradicted:** `openspec/specs/documents/spec.md:98` states the
+      drawer's labels are Spanish like the record pages it mirrors, and
+      `openspec/specs/identity/spec.md` states the identity module's error and
+      conflict messages are Spanish in at least five places (its JSON error
+      shape, the seeded role names, the conflict text, the refusal reasons and
+      the trigger-message mappings). **That last one is not UI chrome — it is an
+      API error contract.** Translating it is a separate decision from
+      translating operator copy, and it should be decided explicitly rather than
+      swept into a language sweep.
+
+      **Tests that assert Spanish** live in `src/smoke_tests.rs`,
+      `src/routes/documents_web.rs`, `src/routes/inventory_web.rs`,
+      `src/routes/roles_web.rs`, `src/routes/web.rs` and
+      `e2e/tests/test_documents.py`.
+
+      **The date half is small and separable**: `purchase_date`/`sale_date` are
+      `NaiveDate` rendered through `Display`, so read views need one
+      `format_date` helper; `<input type="date">` values must stay ISO because
+      that is the contract with the server and the database, and the locale the
+      browser shows in the filter is the browser's, not a data inconsistency.
 - [ ] **S9 (optional) — Unified `q` search.** `PurchaseListQuery` collapses
       `supplier` + `number` into one free-text field; service + repo change.
 
@@ -327,6 +361,23 @@ item out as domain work rather than presentation.
       type="date">` values remain ISO.
 - [ ] AC10: `cargo test` green at every slice, and the committed stylesheet is
       up to date with the templates.
+
+## Handoff — how to resume this feature in a new session
+
+The durable source of truth is **this file**, committed on
+`feat/redesign-purchases-index`. A new session resumes it with: `mem_context`,
+then a feature-scoped `mem_search`, then this file, then reconcile before
+continuing the next unfinished slice.
+
+State at the last commit on this branch (2026-09-22): **S1–S6 done**, S4b
+**declined**, S7 **parked**, S8 and S9 not started. `cargo test` is 858 passed
+and the full browser suite is 85 passed / 4 skipped; run both before touching
+anything, and run the FULL browser suite for any slice that changes list
+markup.
+
+If the user says "one language" or "centralized English", that is **S8** — and
+its checklist entry above says why it should start as its own feature with its
+own OpenSpec change rather than as a sub-slice here.
 
 ## Progress
 
