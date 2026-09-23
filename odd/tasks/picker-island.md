@@ -214,16 +214,23 @@ by its own test, so the surviving path is pinned rather than assumed.
       `{"query", "products"}` matching the existing API convention, plus Rust
       tests for name/SKU/barcode matching and the empty-query negative. Red first.
       Closed in `9a53c5b`.
-- [ ] T3 — The island module and the **sale** page cutover: `static/picker.js`
+- [x] T3 — The island module and the **sale** page cutover: `static/picker.js`
       (state, debounced fetch, render, derived focus and status, submit via
       `requestSubmit`), the Tailwind `@source` line and rebuilt stylesheet, the
       `line_picker` shell rewrite, the `sale_detail.html` call sites, and the e2e
-      test. Vertical slice, red first.
+      test. Vertical slice, red first. Closed in `db57ecf`.
 - [ ] T4 — The **purchase** page cutover: retire the inline mirror in
       `purchase_detail.html`, delete the `base.html` focus and in-flight
       handlers, drop the `purchase.html:97` Escape stand-down, and rewrite the
-      structural Rust tests in `inventory_web.rs`, `purchases_web.rs` and
-      `sales_web.rs` that currently assert the smuggled `hx-vals`.
+      structural Rust tests in `inventory_web.rs` and `purchases_web.rs` that
+      assert the smuggled `hx-vals`.
+      **Rescoped:** the sale page's structural tests (`sales_web.rs`
+      `n4_sale_record_offers_the_picker_instead_of_the_catalogue_select` and the
+      sale half of `smoke_tests.rs` `line_picker_loads_a_sale_without_a_click`)
+      were originally listed here, which was wrong — they pin the sale page's
+      markup, so they broke in T3 and were rewritten there. T4 keeps the
+      purchase-facing ones, and the route-fragment half of the smoke test stays
+      as the pin that the purchase-facing results body was not disturbed.
 - [ ] T5 — e2e sweep (`test_picker.py`, `test_search_ux.py`) and README.
 
 ## Delivery strategy
@@ -251,7 +258,25 @@ large ones and the review workload guard applies:
   The `q`/`product` alias resolution was extracted into `resolve_search_query`
   and is now shared by both routes.
 - 2026-09-24: the wire format refined (commit `refactor(picker): send the display
-  form of money on the wire`). Money now travels in display form (decision 4). The refinement was caught by asking what the island would
+  form of money on the wire`). Money now travels in display form (decision 4).
+- 2026-09-24: T3 closed in `db57ecf`. Slice 2 complete. Two findings worth
+  recording: the macro signature needed **no change** (every argument is still
+  used, `price_kind` now also as `data-price-kind`), so the instruction to update
+  the two `sale_detail.html` call sites was a no-op in fact; and my T4 scoping
+  was wrong, because the sale page's structural tests break in T3, not T4 (see
+  the rescope note on T4).
+
+## Accepted debt
+
+- **The failed-search notice is an event re-dispatch.** The island has no notice
+  region of its own, so on failure it dispatches an `htmx:responseError`-shaped
+  `CustomEvent` for `base.html`'s existing notice handler to consume — one notice
+  contract, two transports. Accepted because the alternative is a second notice
+  authority, which the repo's own comment forbids ("Change the two together,
+  never one without the other"). Revisit if htmx's event shape changes, and note
+  that the notice names the raw request path (`/web/product-search.json`) because
+  the picker input carries no `data-action`; that wart predates the island (the
+  old path was `/web/product-search`) and is not a regression. The refinement was caught by asking what the island would
   actually render: a raw decimal string would have silently changed `$25.00`
   into `$25` on cutover.
 
@@ -279,3 +304,29 @@ large ones and the review workload guard applies:
 - **T3 unblocked**: `tailwindcss` v4.3.3 is installed at
   `~/.local/bin/tailwindcss`, so `scripts/build-css.sh` can rebuild
   `static/tailwind.css` after the `@source` line is added.
+- **T3, red first**: the new e2e test failed with `Locator expected not to have
+  attribute — unexpected value "/web/product-search"`, because the field still
+  carried the old declarative read and the island did not exist yet.
+- **T3, green (orchestrator-verified, not taken from the worker's report)**:
+  `cargo test` → **890 passed, 0 failed**; `scripts/e2e.sh` → **92 passed,
+  4 skipped, 0 failed**, the four skips being pre-existing opt-in probes
+  confirmed by their own skip reasons.
+- **T3, Tailwind purge assertion**: `select-none` appears only in
+  `static/picker.js` (`grep -rn "select-none" templates/` → no matches) and
+  survives the rebuild into `static/tailwind.css`.
+- **T3, the two structural rewrites**: verified by reading them, not by trusting
+  the report — both pinned the removed declarative transport
+  (`hx-get`/`delay:`/`hx-on:keyup`) and were rewritten to pin the island's
+  contract (`data-picker`, `data-price-kind="sale"`, no search transport on the
+  field, hidden `product_id`, results container still a form sibling, default
+  qty). The route-fragment half of the smoke test was confirmed byte-identical by
+  diff, so it now doubles as the pin that the purchase-facing body is untouched.
+- **T3, a defect the worker did not report and the orchestrator found**: the
+  change removed the field's `hx-on:keyup` Escape clearing, which made
+  `base.html:228` lie about the mechanism. Fixed in the same commit; the comment
+  now describes the real handoff and stays accurate for the purchase mirror.
+- **T3, a design correction the orchestrator required**: the island originally
+  remounted after the OOB swap through a whole-page `MutationObserver` with
+  `subtree: true`, which the island's own `render()` fed on every keystroke. It
+  now rides `htmx:load`, with the vendored htmx 1.9.12 source read to confirm it
+  fires for OOB content rather than assumed.
