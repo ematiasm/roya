@@ -122,6 +122,84 @@ where
         self.suppliers.list().await
     }
 
+    // -- picker reads (the supplier half of the product picker) --------------
+
+    /// Upper bound for one supplier picker search: the same bound the product
+    /// picker uses, so one fragment never dumps the whole roster into a page.
+    pub const SUPPLIER_SEARCH_LIMIT: usize = 10;
+
+    /// Bounded read behind `GET /web/supplier-search`: normalized name matching
+    /// over the whole (small) supplier table fetched once, sorted by name. The
+    /// empty query is not a search and never returns the roster. Inactive
+    /// suppliers match too and each result carries its own `is_active` so the
+    /// fragment can report it — the operator decides whether to pick one.
+    pub async fn search_suppliers(&self, query: &str) -> AppResult<Vec<Supplier>> {
+        let value = query.trim();
+        if value.is_empty() {
+            return Ok(Vec::new());
+        }
+        let needle = crate::models::normalize_search(value);
+        let mut matches: Vec<Supplier> = self
+            .suppliers
+            .list()
+            .await?
+            .into_iter()
+            .filter(|s| crate::models::normalize_search(&s.name).contains(&needle))
+            .collect();
+        matches.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        matches.truncate(Self::SUPPLIER_SEARCH_LIMIT);
+        Ok(matches)
+    }
+
+    /// Resolve one typed supplier name for a caller that posts a name and no
+    /// id (the creation and header paths, T3 and T4): the exact — normalized,
+    /// case- and diacritic-insensitive — name maps to exactly one supplier
+    /// because `suppliers.name` is UNIQUE, the same contract
+    /// `resolve_product_ref` gives the product picker. An empty value is the
+    /// required-field refusal; anything that is not an exact name is a 400
+    /// naming the value and reporting how many partial matches the search
+    /// found, so the operator picks from the list instead of a guess.
+    /// Resolution deliberately does not go through `search_suppliers`: the
+    /// picker's bound would truncate the candidate list, and with more than
+    /// `SUPPLIER_SEARCH_LIMIT` partial matches two normalized-equal names
+    /// could straddle the bound — one inside resolves silently while its
+    /// look-alike sits outside, or an existing name reports "no exact
+    /// match". The whole table is read and the exact matches selected here,
+    /// with no truncation, so the count below cannot be fooled by the bound.
+    pub async fn resolve_supplier_name(&self, raw: &str) -> AppResult<Supplier> {
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(AppError::Validation("supplier is required".into()));
+        }
+        let needle = crate::models::normalize_search(value);
+        let all = self.suppliers.list().await?;
+        let matches: Vec<&Supplier> = all
+            .iter()
+            .filter(|s| crate::models::normalize_search(&s.name).contains(&needle))
+            .collect();
+        let exact: Vec<&&Supplier> = matches
+            .iter()
+            .filter(|s| crate::models::normalize_search(&s.name) == needle)
+            .collect();
+        match exact.len() {
+            1 => Ok((**exact[0]).clone()),
+            0 => {
+                let noun = if matches.len() == 1 { "match" } else { "matches" };
+                Err(AppError::Validation(format!(
+                    "no exact match for \"{value}\" — the search found {} {noun}; pick one from the list",
+                    matches.len()
+                )))
+            }
+            // Only reachable when the storage holds case-variant duplicates
+            // (`Pérez` and `perez` differ for UNIQUE but fold equal): refuse
+            // rather than pick one.
+            _ => Err(AppError::Validation(format!(
+                "the name \"{value}\" matches {} suppliers with the same spelling; pick one from the list",
+                exact.len()
+            ))),
+        }
+    }
+
     /// Deactivate (`false`) a supplier instead of deleting it when it has
     /// history. The toggle is an edit: the row's `updated_by` carries `actor`.
     pub async fn set_active(&self, actor: i64, id: i64, active: bool) -> AppResult<Supplier> {
@@ -980,5 +1058,175 @@ mod tests {
         let cleared = s.find_cost(product_id, supplier.id).await.unwrap().unwrap();
         assert_eq!(cleared.is_preferred, false);
         assert_eq!(cleared.updated_by, Some(alice), "the demotion names its writer");
+    }
+
+    // -- picker reads (the supplier half of the product picker) --------------
+
+    #[tokio::test]
+    async fn supplier_search_matches_name_fragments_case_and_diacritic_insensitively() {
+        let (s, _pool) = svc().await;
+        let perez = seed_supplier(&s, "Pérez & Hijos").await;
+        let acme = seed_supplier(&s, "ACME Distribución").await;
+        seed_supplier(&s, "Unrelated Supplier").await;
+
+        // Name fragment, case-insensitive.
+        let by_fragment = s.search_suppliers("perez").await.unwrap();
+        assert_eq!(by_fragment.len(), 1, "fragments match by name");
+        assert_eq!(by_fragment[0].id, perez.id);
+
+        // Diacritics fold the same way the product search folds them.
+        let by_diacritic = s.search_suppliers("distribucion").await.unwrap();
+        assert_eq!(by_diacritic.len(), 1);
+        assert_eq!(by_diacritic[0].id, acme.id);
+
+        // No match is an empty list, not an error.
+        let none = s.search_suppliers("nothing-here").await.unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supplier_search_reports_whether_each_match_is_active() {
+        let (s, _pool) = svc().await;
+        let live = seed_supplier(&s, "Live Supplier").await;
+        let gone = seed_supplier(&s, "Gone Supplier").await;
+        s.set_active(audit_actor(&s).await, gone.id, false).await.unwrap();
+
+        let matches = s.search_suppliers("supplier").await.unwrap();
+        let ids: Vec<(i64, bool)> = matches.iter().map(|x| (x.id, x.is_active)).collect();
+        assert_eq!(
+            ids,
+            vec![(gone.id, false), (live.id, true)],
+            "both matches come back and each carries its own active flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn supplier_search_is_bounded_and_the_empty_query_is_not_a_search() {
+        let (s, _pool) = svc().await;
+        for i in 0..(Svc::SUPPLIER_SEARCH_LIMIT + 3) {
+            seed_supplier(&s, &format!("Bound Supplier {i:02}")).await;
+        }
+
+        let bounded = s.search_suppliers("bound supplier").await.unwrap();
+        assert_eq!(
+            bounded.len() as usize,
+            Svc::SUPPLIER_SEARCH_LIMIT,
+            "the picker never returns more than its bound"
+        );
+
+        // An empty or whitespace query is not a search: it returns the empty
+        // result shape rather than the whole roster.
+        assert!(s.search_suppliers("").await.unwrap().is_empty());
+        assert!(s.search_suppliers("   ").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_supplier_name_resolves_the_exact_name_case_insensitively() {
+        let (s, _pool) = svc().await;
+        let perez = seed_supplier(&s, "Pérez & Hijos").await;
+        seed_supplier(&s, "ACME Distribución").await;
+
+        // Exact name, case- and diacritic-insensitive.
+        let resolved = s.resolve_supplier_name("perez & hijos").await.unwrap();
+        assert_eq!(resolved.id, perez.id);
+        let resolved_upper = s.resolve_supplier_name("PÉREZ & HIJOS").await.unwrap();
+        assert_eq!(resolved_upper.id, perez.id);
+    }
+
+    #[tokio::test]
+    async fn resolve_supplier_name_refuses_an_unknown_name_naming_the_value() {
+        let (s, _pool) = svc().await;
+        seed_supplier(&s, "Pérez & Hijos").await;
+
+        let err = s.resolve_supplier_name("Missing Supplier").await.unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("Missing Supplier"),
+                    "the refusal must name the value the caller typed: {msg}"
+                );
+            }
+            other => panic!("an unknown name is a 400 Validation, not {other:?}"),
+        }
+
+        // The empty value is the required-field refusal, not a roster dump.
+        assert!(s.resolve_supplier_name("").await.is_err());
+        assert!(s.resolve_supplier_name("   ").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_supplier_name_refuses_partial_and_ambiguous_look_alikes() {
+        let (s, _pool) = svc().await;
+        let perez = seed_supplier(&s, "Pérez & Hijos").await;
+        seed_supplier(&s, "Pérez & Hermanos").await;
+
+        // A fragment that matches but is not an exact name refuses: the
+        // picker, not a guess, decides which supplier it is.
+        let partial = s.resolve_supplier_name("Pérez").await.unwrap_err();
+        match partial {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("Pérez"),
+                    "the refusal names the value: {msg}"
+                );
+            }
+            other => panic!("a non-exact name is a 400 Validation, not {other:?}"),
+        }
+
+        // Even the exact prefix of another name refuses — only the exact
+        // name resolves.
+        assert!(s.resolve_supplier_name("Pérez &").await.is_err());
+
+        // The exact name itself still resolves past its look-alike.
+        let resolved = s.resolve_supplier_name("Pérez & Hijos").await.unwrap();
+        assert_eq!(resolved.id, perez.id);
+    }
+
+    // The straddle defect: `search_suppliers` truncates to the picker's
+    // bound, so with more than SUPPLIER_SEARCH_LIMIT partial matches two
+    // normalized-equal names can straddle that bound — one inside is then
+    // silently resolved while its look-alike sits outside. Resolution must
+    // read past the bound and refuse.
+    #[tokio::test]
+    async fn resolve_supplier_name_refuses_colliding_look_alikes_that_straddle_the_picker_bound() {
+        let (s, _pool) = svc().await;
+        // Both colliders normalize to "perez & hijos" and every seeded name
+        // contains that fragment. Byte order puts the uppercase collider
+        // first and the ten longer partials between the two, so the bound
+        // hides the lowercase look-alike.
+        let perez_upper = seed_supplier(&s, "Pérez & Hijos").await;
+        let perez_lower = seed_supplier(&s, "perez & hijos").await;
+        assert_ne!(perez_upper.id, perez_lower.id);
+        for i in 1..=Svc::SUPPLIER_SEARCH_LIMIT {
+            seed_supplier(&s, &format!("Pérez & Hijos Norte {i:02}")).await;
+        }
+
+        let refused = s.resolve_supplier_name("perez & hijos").await.unwrap_err();
+        match refused {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("same spelling"),
+                    "two normalized-equal names must refuse as look-alikes, not pick one: {msg}"
+                );
+            }
+            other => panic!("a colliding name is a 400 Validation, not {other:?}"),
+        }
+    }
+
+    // The mirror case: an exact name that exists must still resolve when
+    // more than SUPPLIER_SEARCH_LIMIT partial matches push it past the
+    // picker's bound — "no exact match" would be a lie.
+    #[tokio::test]
+    async fn resolve_supplier_name_resolves_an_exact_name_beyond_the_picker_bound() {
+        let (s, _pool) = svc().await;
+        // Byte order sorts the exact name (lowercase 'p') after every
+        // uppercase 'A' partial, so the bound truncates it away.
+        let perez = seed_supplier(&s, "perez & hijos").await;
+        for i in 1..=(Svc::SUPPLIER_SEARCH_LIMIT + 1) {
+            seed_supplier(&s, &format!("AA Pérez & Hijos {i:02}")).await;
+        }
+
+        let resolved = s.resolve_supplier_name("perez & hijos").await.unwrap();
+        assert_eq!(resolved.id, perez.id);
     }
 }

@@ -687,18 +687,33 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
   supplier, dates, totals, payment status), the lines table with product name and
   SKU, unit cost and subtotal, and the payments table with account and method
   names; the product picker matches name, SKU and barcode and shows current stock;
-  an unknown id is a 404
-- `/purchases/new` — creation page (`purchases.create`): the list's "New
-  purchase" header action navigates here, and a read-only principal renders no
-  action at all; the page's plain form posts the existing `POST /web/purchases`,
-  and the non-htmx branch answers a 303 to the new record (`/purchases/{id}`)
+  an unknown id is a 404, and so is a malformed one (`/purchases/abc`
+  answers 404, not the path extractor's 400 — the route takes `Path<String>`
+  and parses the id itself, which is also what let `/purchases/new` be
+  deleted); note the deliberate inconsistency with the `/web/purchases/{id}`
+  fragments, which keep `Path<i64>` and still answer 400 for a malformed id
+- creation dialog (T3): the `/purchases` page's "New purchase" header action
+  opens `#new-purchase-dialog` for a `purchases.create` principal (a read-only
+  one renders no action at all); the dialog holds the supplier picker
+  pre-filled with the last used supplier, and choosing posts the existing
+  `POST /web/purchases`, which answers `HX-Redirect` to the new record
+  (`/purchases/{id}`); a typed name resolves server-side, an unknown name
+  refuses, and an absent date defaults to today. `/purchases/new` is deleted
 - Sugerido panel rendering the suggestion with a `→ Draft` seed button per row
   (HTMX `GET /web/purchases/suggestions`, seed via `POST /web/purchases/from-suggestion`,
   which opens the new draft's record)
 - Actions, gated by status and offered in context on the record page:
   - Add line (Draft): `POST /web/purchases/:id/lines` (HTMX, scanner or picker; the
     repeated-product rule is a clear 400)
-  - Edit header (Draft): `POST /web/purchases/:id/header` (HTMX)
+  - Draft header (in place): on a draft the record page's header is the edit
+    form itself — supplier (through the T2 picker, same contract as the
+    creation dialog), purchase date, supplier invoice no and notes — posting to
+    `POST /web/purchases/:id/header` (HTMX); on a confirmed or cancelled
+    purchase the header stays read-only text. The Edit header dialog and its
+    `⋯` menu entry are gone. Since the header can now change the supplier, a
+    purchase's supplier is no longer fixed at creation — on a draft it
+    resolves exactly like the creation flow (explicit picker id wins, else the
+    typed name must resolve, or the route refuses)
   - Confirm: `POST /web/purchases/:id/confirm` (HTMX)
   - Record payment (Confirmed, Credit): `POST /web/purchases/:id/payments` (HTMX)
   - Cancel (Confirmed) / discard (Draft): `POST /web/purchases/:id/cancel` (HTMX,
@@ -1038,7 +1053,6 @@ templates/products.html
 templates/sales.html
 templates/customers.html
 templates/purchases.html
-templates/purchase_new.html
 templates/suppliers.html
 templates/documents.html
 templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_list.html,
@@ -1123,7 +1137,7 @@ router, form extraction and Askama rendering.
   allocations, each grouped payment's `transaction_id`, and the
   money-traceability invariant over the whole database the flow built.
 - **Generic form-wiring guard**: for the seeded `/`, `/accounts/{id}`,
-  `/products`, `/sales`, `/purchases`, `/purchases/new`, `/suppliers` and `/customers` pages (plus
+  `/products`, `/sales`, `/purchases`, `/suppliers` and `/customers` pages (plus
   the sale and purchase detail fragments and the `/customers/{id}` statement) it extracts every `hx-get`, `hx-post`, `hx-put`,
   `hx-patch` and `hx-delete` target with the HTTP verb htmx will send, the
   native `action`/`onsubmit` wiring of rendered forms, and the application URLs

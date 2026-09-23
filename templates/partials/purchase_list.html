@@ -13,7 +13,7 @@
        and no chip for `Confirmed`, the normal state — it surfaces as Paid, or
        Due/Overdue plus the bare amount still owed, so an operator never has to
        subtract from the total. The row keeps the S3 peek contract unchanged. #}
-    <a class="mb-2 grid grid-cols-1 gap-1 rounded-[10px] border border-border bg-surface px-3.5 py-3 no-underline hover:no-underline sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)_minmax(0,10rem)] sm:items-center sm:gap-4" id="purchase-{{ v.detail.purchase.id }}" href="/purchases/{{ v.detail.purchase.id }}" hx-get="/web/documents/detail/purchase/{{ v.detail.purchase.id }}" hx-target="#purchase-drawer-body" hx-swap="innerHTML">
+    <a class="mb-2 grid grid-cols-1 gap-1 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-text no-underline hover:no-underline sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)_minmax(0,10rem)] sm:items-center sm:gap-4" id="purchase-{{ v.detail.purchase.id }}" href="/purchases/{{ v.detail.purchase.id }}" hx-get="/web/documents/detail/purchase/{{ v.detail.purchase.id }}" hx-target="#purchase-drawer-body" hx-swap="innerHTML">
       <span class="font-semibold tabular-nums">{% if let Some(n) = v.detail.purchase.purchase_number %}{{ n }}{% else %}Draft #{{ v.detail.purchase.id }}{% endif %}</span>
       <span class="min-w-0">
         <span class="block truncate font-semibold">{{ v.supplier_name }}</span>

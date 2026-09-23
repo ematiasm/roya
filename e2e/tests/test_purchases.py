@@ -491,3 +491,312 @@ def test_clicking_a_purchase_row_opens_the_peek_and_escape_closes_it(
         page.evaluate("document.getElementById('purchase-drawer-body').innerHTML")
         == ""
     ), "Escape must empty the peek body, not just hide the drawer"
+
+
+# ---------------------------------------------------------------------------
+# Rendered-colour gate: computed styles, not class lists.
+#
+# Every colour claim a class assertion makes can pass while the page still
+# reads wrong — an earlier slice shipped a list row that read blue (the
+# stylesheet colours anchors) while every class check passed, because the
+# check looked at a span's classes instead of the element's rendered colour.
+# getComputedStyle on the real element sees that class of defect, so the
+# tests below read the browser's resolved colours against the design tokens:
+#
+#   --color-accent  #6ee7b7 → rgb(110, 231, 183)  (mint background)
+#   base button label #0a0f0d → rgb(10, 15, 13)   (dark button label)
+#   --color-bg      #0f1115 → rgb(15, 17, 21)     (page-action label, text-bg)
+#   --color-text    #e6e8eb → rgb(230, 232, 235)  (normal text colour)
+#   --color-accent2 #60a5fa → rgb(96, 165, 250)   (anchor blue — must NOT appear)
+# ---------------------------------------------------------------------------
+
+_MINT = "rgb(110, 231, 183)"
+_BUTTON_LABEL = "rgb(10, 15, 13)"
+_PAGE_ACTION_LABEL = "rgb(15, 17, 21)"
+_TEXT = "rgb(230, 232, 235)"
+_ANCHOR_BLUE = "rgb(96, 165, 250)"
+
+
+def test_primary_actions_render_accent_colors_not_anchor_blue(
+    page: Page, api: ApiClient
+) -> None:
+    """Buttons render mint with dark labels — proven by computed style, not class.
+
+    The base `button` rule in the stylesheet sets `background-color:
+    var(--color-accent)` and `color: #0a0f0d`, and the classes that once
+    overrode it are gone, so the cascade is deterministic — but only a
+    computed-style assertion can prove the cascade actually resolved that way
+    in a real browser. This test checks both primary-button shapes operators
+    touch: the shared page-header action (`[data-page-action]`) on /purchases,
+    and a form submit button — the Confirm dialog's `<button type="submit">`
+    on the purchase record page, the same button the journey test clicks to
+    confirm a purchase.
+
+    One resolved-value nuance the assertion pins deliberately: the page action
+    carries `text-bg` in both component shapes — a `<button>` on /purchases
+    (dialog mode, T3) and an `<a>` on pages whose action navigates — so its
+    label resolves to `--color-bg` (#0f1115 → rgb(15, 17, 21)) — a different
+    dark than the base button's #0a0f0d. Both are dark; neither is blue.
+
+    The negative makes this a gate rather than a coincidence: no button on
+    either page may compute to the old anchor blue, so any regression that
+    re-colours a primary control fails loudly here.
+    """
+    supplier_id = create_supplier(api, "Colour Supplier")
+    product = create_product(
+        api,
+        sku="COLOR-SKU-01",
+        name="Colour Widget",
+        sale_price="10.00",
+        cost_price="5.00",
+        stock="5",
+        min_stock="1",
+        max_stock="20",
+    )
+    purchase_id = create_purchase_draft(
+        api, supplier_id, payment_type="Credit", due_date="2024-06-01"
+    )
+    add_purchase_line(
+        api, purchase_id, int(product["id"]), qty="1", unit_cost="5.00"
+    )
+
+    # The page action on /purchases (the admin principal holds create
+    # permission, so the "New purchase" action renders).
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+    action = page.locator("[data-page-action]")
+    expect(action).to_be_visible()
+    assert (
+        action.evaluate("el => getComputedStyle(el).backgroundColor") == _MINT
+    ), "the page action must render the mint accent background"
+    assert action.evaluate("el => getComputedStyle(el).color") == _PAGE_ACTION_LABEL
+
+    # The Confirm dialog's submit button on the record page: an unclassed
+    # `<button type="submit">`, so the base button rule decides both colours.
+    with page.expect_response(_response_for(f"/purchases/{purchase_id}")):
+        page.goto(f"{api.base_url}/purchases/{purchase_id}")
+    page.locator("#open-confirm").click()
+    submit = page.locator("#confirm-purchase button[type='submit']")
+    expect(submit).to_be_visible()
+    assert (
+        submit.evaluate("el => getComputedStyle(el).backgroundColor") == _MINT
+    ), "the confirm submit button must render the mint accent background"
+    assert submit.evaluate("el => getComputedStyle(el).color") == _BUTTON_LABEL
+
+    # Negative gate: the old anchor blue must not be any button's background
+    # on either page (transparent controls resolve to rgba(0, 0, 0, 0), which
+    # also fails this check — as they should).
+    for url in (
+        f"{api.base_url}/purchases",
+        f"{api.base_url}/purchases/{purchase_id}",
+    ):
+        page.goto(url)
+        backgrounds = page.eval_on_selector_all(
+            "button", "els => els.map(el => getComputedStyle(el).backgroundColor)"
+        )
+        assert _ANCHOR_BLUE not in backgrounds, (
+            f"a button on {url} renders the old anchor blue: {backgrounds}"
+        )
+
+
+def test_purchase_list_row_renders_text_color_not_anchor_blue(
+    page: Page, api: ApiClient
+) -> None:
+    """The row element itself renders in normal text colour, never anchor blue.
+
+    This is the defect class the last red suite exposed: purchase rows are
+    `<a>` elements, and the stylesheet colours anchors blue — so a row that
+    lost its `text-text` utility reads blue while every class-level assertion
+    still passes. The assertion here targets the ROW element
+    (`#purchase-{id}`, the anchor itself) rather than a span inside it, which
+    is exactly the check that would have caught the original defect: if the
+    row went back to inheriting the anchor colour, `getComputedStyle` on the
+    row would return rgb(96, 165, 250) and fail both assertions below.
+
+    All three row shapes (draft, owed, settled) are seeded through the
+    existing `_seed_purchase_states` helper and checked, so no chip state can
+    hide a colour regression.
+    """
+    seeded = _seed_purchase_states(api)
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+
+    for kind in ("draft", "owed", "settled"):
+        # The row anchor element itself — not a span inside it.
+        row = page.locator(f"#purchase-{seeded[kind]}")
+        expect(row).to_be_visible()
+        colour = row.evaluate("el => getComputedStyle(el).color")
+        assert colour == _TEXT, (
+            f"the {kind} row must render in the normal text colour, got {colour}"
+        )
+        assert colour != _ANCHOR_BLUE, (
+            f"the {kind} row renders the anchor blue — the exact defect this "
+            "test exists to catch"
+        )
+
+
+def test_new_purchase_opens_the_dialog_prefilled_with_the_last_used_supplier(
+    page: Page, api: ApiClient
+) -> None:
+    """The creation flow (purchases-create-and-header T3, AC3/AC4).
+
+    `New purchase` opens `#new-purchase-dialog` — no `/purchases/new` page
+    exists any more — and the dialog's supplier picker arrives pre-filled
+    with the LAST USED supplier as a real, editable value, never a silent
+    guess: the supplier is what resolves every line's default cost. Accepting
+    the pre-filled default (Create draft) posts the existing
+    `POST /web/purchases`, whose htmx branch answers `HX-Redirect`, so the
+    browser lands on the new draft's record page — where the supplier must
+    be the one the dialog offered. The stored record is read back through
+    the API so a draft created for the wrong supplier cannot pass.
+    """
+    # A purchase that already exists, so the dialog has a last used supplier
+    # to offer. Created through the API: the dialog flow itself is what the
+    # browser drives below.
+    supplier_name = "Dialog Default Supplier"
+    supplier_id = create_supplier(api, supplier_name)
+    create_purchase_draft(api, supplier_id, payment_type="Cash")
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+
+    action = page.locator("button[data-page-action]")
+    expect(action).to_have_text("New purchase")
+    action.click()
+    dialog = page.locator("#new-purchase-dialog")
+    expect(dialog).to_be_visible()
+
+    picker_input = dialog.locator("#new-purchase-supplier")
+    expect(picker_input).to_have_value(supplier_name)
+
+    # Arm the response expectation around the click: the listener must exist
+    # before the submit fires, or a fast response is missed and never seen.
+    with page.expect_response(_response_for("/web/purchases", method="POST")):
+        dialog.locator('form[data-action="Create purchase"]').get_by_role(
+            "button", name="Create draft"
+        ).click()
+    page.wait_for_url("**/purchases/*")
+    new_id = int(urlparse(page.url).path.rsplit("/", 1)[1])
+
+    # The record page IS the new draft's, and its supplier is the pre-filled
+    # one — the choosing created the right purchase. T4: the draft's supplier
+    # renders in the inline header's picker FIELD (its value is the fact; the
+    # old read-only text line is gone).
+    record = api.get_json(f"/api/purchases/{new_id}")
+    assert int(record["purchase"]["supplier_id"]) == supplier_id, (
+        "the draft must belong to the supplier the dialog pre-filled"
+    )
+    expect(page.get_by_role("heading", name="Draft purchase")).to_be_visible()
+    expect(page.locator("#record-supplier")).to_have_value(supplier_name)
+
+
+def test_typing_a_different_supplier_and_pressing_enter_creates_the_typed_one(
+    page: Page, api: ApiClient
+) -> None:
+    """The Enter path (purchases-create-and-header T3, the hazard).
+
+    The dialog arrives pre-filled with the LAST USED supplier; the operator
+    types a DIFFERENT exact name and presses Enter inside the text field.
+    That submits the picker's OWN form, whose only field is the text input:
+    the field's text resolves server-side, so the draft must belong to the
+    typed supplier — never the pre-filled one. The stored record is read
+    back through the API, so a draft created for the wrong supplier cannot
+    pass. (The picker's form once carried a hidden `supplier_id` for the
+    pre-filled supplier, which silently won over the typed name — this test
+    is the regression proof that the text is the contract.)
+    """
+    prefilled_name = "Enter Prefilled Supplier"
+    prefilled_id = create_supplier(api, prefilled_name)
+    create_purchase_draft(api, prefilled_id, payment_type="Cash")
+    typed_name = "Enter Typed Supplier"
+    typed_id = create_supplier(api, typed_name)
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+
+    page.locator("button[data-page-action]").click()
+    dialog = page.locator("#new-purchase-dialog")
+    expect(dialog).to_be_visible()
+    picker_input = dialog.locator("#new-purchase-supplier")
+    expect(picker_input).to_have_value(prefilled_name)
+
+    # Type the other supplier's exact name and press Enter: the picker's own
+    # form posts, the htmx branch answers `HX-Redirect` and the browser lands
+    # on the new draft's record.
+    picker_input.fill(typed_name)
+    # Arm the expectation around the Enter press: if the response lands
+    # before the listener is armed, expect_response times out waiting for an
+    # event that already happened.
+    with page.expect_response(_response_for("/web/purchases", method="POST")):
+        picker_input.press("Enter")
+    page.wait_for_url("**/purchases/*")
+    new_id = int(urlparse(page.url).path.rsplit("/", 1)[1])
+
+    record = api.get_json(f"/api/purchases/{new_id}")
+    assert int(record["purchase"]["supplier_id"]) == typed_id, (
+        "the draft must belong to the supplier the operator typed, "
+        f"not the pre-filled one ({prefilled_name})"
+    )
+    expect(page.get_by_role("heading", name="Draft purchase")).to_be_visible()
+    # T4: the draft's supplier renders in the inline header's picker FIELD —
+    # the typed name, not the pre-filled one.
+    expect(page.locator("#record-supplier")).to_have_value(typed_name)
+
+
+def test_editing_a_draft_header_in_place_updates_the_document(page: Page, api: ApiClient) -> None:
+    """The inline header (purchases-create-and-header T4, AC5).
+
+    On a draft's record page the supplier, the purchase date, the supplier
+    invoice no and the notes are editable where the work happens — the
+    always-visible header form that replaced the Edit header dialog. The
+    operator changes the supplier through the picker's field (its typed name
+    resolves server-side, exactly as the creation flow does), edits the
+    invoice and the notes, and saves through the existing
+    `POST /web/purchases/{id}/header`. The page must show the new values in
+    the swapped record, and the stored document is read back through the API
+    so a UI-only update cannot pass. The due date stays untouched: it is
+    decided at confirm, and a header edit must not clear it.
+    """
+    stored_name = "Header Stored Supplier"
+    stored_id = create_supplier(api, stored_name)
+    changed_name = "Header Changed Supplier"
+    changed_id = create_supplier(api, changed_name)
+    purchase_id = create_purchase_draft(
+        api, stored_id, payment_type="Credit", due_date="2024-06-01"
+    )
+
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    # The draft's header form arrives pre-filled with the document's values.
+    supplier_field = page.locator("#record-supplier")
+    expect(supplier_field).to_have_value(stored_name)
+    expect(page.locator("#record-invoice-no")).to_have_value("")
+
+    # Edit all three in place: supplier, invoice, notes.
+    supplier_field.fill(changed_name)
+    page.locator("#record-invoice-no").fill("INV-E2E-4")
+    page.locator("#record-notes").fill("changed in place")
+
+    # Arm the expectation around the save: a listener armed after the click
+    # races the response and times out (the T3 lesson).
+    with page.expect_response(
+        _response_for(f"/web/purchases/{purchase_id}/header", method="POST")
+    ):
+        page.locator("#purchase-header-form").get_by_role(
+            "button", name="Save header"
+        ).click()
+
+    # The swapped record shows the new values, and the form carries them
+    # after the re-render.
+    expect(page.locator("#record-supplier")).to_have_value(changed_name)
+    expect(page.locator("#record-invoice-no")).to_have_value("INV-E2E-4")
+    expect(page.locator("#record-notes")).to_have_value("changed in place")
+
+    # Stored state, read back through the API.
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert int(stored["purchase"]["supplier_id"]) == changed_id, stored
+    assert stored["purchase"]["supplier_invoice_no"] == "INV-E2E-4", stored
+    assert stored["purchase"]["notes"] == "changed in place", stored
+    # The due date is decided at confirm: a header edit must not touch it.
+    assert stored["purchase"]["due_date"] == "2024-06-01", stored

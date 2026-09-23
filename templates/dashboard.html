@@ -6,6 +6,7 @@
 {% let page_breadcrumb_href = "" %}
 {% let page_action_href = "#new-transaction" %}
 {% let page_action_label = "New transaction" %}
+{% let page_action_dialog = "" %}
 {% include "partials/page_header.html" %}
 <div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
   <div class="flex flex-col gap-6">
@@ -117,7 +118,7 @@
           <label>Date</label>
           <input type="date" name="date" required value="{{ today }}" />
         </div>
-        <button type="submit" class="bg-accent2 text-white">Add Transaction</button>
+        <button type="submit">Add Transaction</button>
         <div class="text-[13px] text-muted">Balance is always derived <code>SUM(Income) − SUM(Expense)</code>. Amount must be &gt; 0.</div>
       </form>
     </div>

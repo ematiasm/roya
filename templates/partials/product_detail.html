@@ -152,7 +152,7 @@
         <label>Notes</label>
         <input type="text" name="notes" maxlength="1024" {% if let Some(v) = product.notes %}value="{{ v }}"{% endif %} />
       </div>
-      <button type="submit" class="bg-accent2 text-white">Save product</button>
+      <button type="submit">Save product</button>
       <div class="text-[13px] text-muted">The same rules as creation apply: services cannot track stock, tracked products need min and max, and the SKU cannot collide with another product (⇒ 400/409).</div>
     </form>
     {# Markup courtesy only (product-markup T6): the edit handler is the

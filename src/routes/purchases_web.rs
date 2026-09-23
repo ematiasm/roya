@@ -24,6 +24,7 @@ use crate::models::{
 };
 use crate::routes::AppState;
 use crate::services::purchases::LineAddOutcome;
+
 // S7 enforcement: every registered handler declares the permission its action
 // needs (AC10); the collection adapters and the path handlers share ungated
 // `*_impl` bodies so each registered boundary carries its own real gate. The
@@ -36,6 +37,13 @@ use crate::security::authz::{
 // ---------------------------------------------------------------------------
 // Views + Askama templates
 // ---------------------------------------------------------------------------
+
+/// The three sibling field ids (past the picker's supplier field) the draft's
+/// inline header form owns, included with every post through the picker: the
+/// header route maps invoice and notes unconditionally, so a post that omits
+/// one would arrive as empty and silently wipe the stored value. One constant
+/// because the page and the fragment must carry the identical field set.
+const HEADER_SIBLING_INCLUDE: &str = "#record-purchase-date, #record-invoice-no, #record-notes";
 
 /// A purchase detail plus the resolved supplier name (purchases store only the id),
 /// the row's payment state, derived against `today` so the template never parses
@@ -114,13 +122,29 @@ struct PurchasesTemplate {
     /// half of the old consequence where a `purchases.read`-only principal
     /// saw suggestions it could not refresh.
     show_suggestions: bool,
-    /// The page header's primary action, the same way the record page carries
-    /// it (the shared component reads the struct fields without locals):
-    /// "New purchase" → `/purchases/new` when the principal holds
-    /// `purchases.create`, empty label = no action rendered (AC21: never an
-    /// entry the principal cannot open).
+    /// The page header's primary action (the shared component reads the
+    /// struct fields without locals): "New purchase" when the principal
+    /// holds `purchases.create`, empty label = no action rendered (AC21:
+    /// never an entry the principal cannot use).
+    ///
+    /// T3: the action is a dialog-opening button, not a navigation —
+    /// `page_action_dialog` carries the dialog id and `page_action_href`
+    /// stays empty (the component still compiles the anchor branch against
+    /// this context, so the field must exist).
     page_action_href: String,
     page_action_label: String,
+    /// The dialog the action opens (`new-purchase-dialog`), empty for a
+    /// principal without `purchases.create` — the choosing is what creates,
+    /// so a principal that cannot create is offered no dialog at all (AC7).
+    page_action_dialog: String,
+    /// The LAST USED supplier, pre-filled into the dialog's picker as the
+    /// default: its NAME renders in the text field and resolves server-side —
+    /// the field's text is the picker's whole contract, so no id travels
+    /// with the form (an id wins only on a clicked result). Empty when no
+    /// purchase exists yet — an empty database has no default, so the field
+    /// opens empty and the operator chooses (the supplier is never silently
+    /// guessed).
+    current_supplier_name: String,
 }
 
 /// The `/purchases/{id}` record page. The page-header values are struct fields,
@@ -135,6 +159,10 @@ struct PurchasePageTemplate {
     /// Empty label = no primary action (a cancelled purchase is read-only).
     page_action_href: String,
     page_action_label: String,
+    /// T3: every page including the shared header carries the dialog id
+    /// name; this page's action navigates (Record payment), so it stays
+    /// empty and the component renders the anchor.
+    page_action_dialog: String,
     record: PurchaseRecord,
     /// The entry row renders inside the money region and carries `autofocus`
     /// only on the add-line response, so the swapped-in copy claims focus for
@@ -150,16 +178,10 @@ struct PurchasePageTemplate {
     /// the wiring layer (AC20).
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
-    nav_key: &'static str,
-    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
-    nav: Nav,
-}
-
-#[derive(Template)]
-#[template(path = "purchase_new.html")]
-struct PurchaseNewTemplate {
-    today: String,
-    suppliers: Vec<crate::models::Supplier>,
+    /// T4: the record body (included here) reads these for its inline
+    /// header form — see `PurchaseDetailPartial` for the contract.
+    header_action: String,
+    header_include: &'static str,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -205,6 +227,15 @@ struct PurchaseDetailPartial {
     /// wiring layer resolved (never the ids).
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
+    /// T4: the draft's inline header posts the existing header route, and
+    /// the picker's `include` names the three sibling field ids so every
+    /// post (Enter, Save, a clicked result) carries the same field set —
+    /// the header route maps invoice and notes unconditionally, so an
+    /// absent field would arrive as empty and wipe the stored value.
+    /// Computed in the wiring layer: Askama 0.12 has no string
+    /// concatenation and the codebase passes such strings from Rust.
+    header_action: String,
+    header_include: &'static str,
 }
 
 #[derive(Template)]
@@ -351,6 +382,7 @@ fn render_record(
     entry_row_focus: bool,
     oob_action_bar: bool,
 ) -> AppResult<Html<String>> {
+    let header_action = format!("/web/purchases/{}/header", context.record.purchase.id);
     let html = PurchaseDetailPartial {
         record: context.record,
         entry_row_focus,
@@ -359,6 +391,8 @@ fn render_record(
         today: context.today,
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
+        header_action,
+        header_include: HEADER_SIBLING_INCLUDE,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -402,9 +436,9 @@ async fn changed_with_notice(
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-/// The purchases page is a single `purchases.read` gate. Creation moved to
-/// its own page (`/purchases/new`, gated `purchases.create`), so the list no
-/// longer carries the supplier roster. The reorder suggestions are
+/// The purchases page is a single `purchases.read` gate. Creation happens in
+/// the page's dialog (T3): the action opens it, and the dialog's post goes to
+/// `POST /web/purchases` below. The reorder suggestions are
 /// stock-derived data: the block renders only when the principal holds
 /// `inventory.read`, the same gate the suggestions fragment and API carry, so
 /// a purchases-only principal sees no suggestions block it could not refresh
@@ -430,15 +464,27 @@ async fn purchases_page(
     } else {
         (PurchaseSuggestions::default(), false)
     };
-    // The header's primary action navigates to the creation page, so it is
-    // offered only when the principal can open it (AC21, the same rule the
-    // sidebar applies): a `purchases.read`-only principal renders no action
-    // and never hits the creation page's 403.
-    let (page_action_href, page_action_label) = if principal.has_permission::<PurchasesCreate>() {
-        ("/purchases/new".to_string(), "New purchase".to_string())
-    } else {
-        (String::new(), String::new())
-    };
+    // The header's primary action opens the creation dialog (T3), so it is
+    // offered only when the principal can create (AC21/AC7, the same rule
+    // the sidebar applies): a `purchases.read`-only principal renders no
+    // action and no dialog, and the choosing is what creates.
+    let (page_action_href, page_action_label, page_action_dialog, current_supplier_name) =
+        if principal.has_permission::<PurchasesCreate>() {
+            // The last used supplier is the DIALOG's default, never a silent
+            // guess: it renders as a real, editable NAME the operator can
+            // override (feature doc, "The hazard this design has to respect").
+            // Only the name travels — the picker's form resolves the field's
+            // text server-side; no id rides along.
+            let last = state.purchases_service.last_used_supplier().await?;
+            (
+                String::new(),
+                "New purchase".to_string(),
+                "new-purchase-dialog".to_string(),
+                last.map(|s| s.name).unwrap_or_default(),
+            )
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
     // `today` stays: the included `partials/suggestion_list.html` renders it
     // as the seed form's default purchase date (see the struct field comment).
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -458,6 +504,8 @@ async fn purchases_page(
         show_suggestions,
         page_action_href,
         page_action_label,
+        page_action_dialog,
+        current_supplier_name,
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -529,8 +577,17 @@ async fn purchase_record_page(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
     principal: axum::Extension<crate::security::authz::Principal>,
-    Path(id): Path<i64>,
+    Path(raw_id): Path<String>,
 ) -> Result<Html<String>, AppError> {
+    // The id is parsed here rather than in the `Path<i64>` extractor so a
+    // non-numeric segment — `/purchases/new` above all, since the creation
+    // page was deleted (T3, AC2) — answers the 404 a missing record answers,
+    // not the extractor's 400.
+    let Ok(id) = raw_id.parse::<i64>() else {
+        return Err(AppError::NotFound(format!(
+            "purchase {raw_id} not found"
+        )));
+    };
     let context = record_context(&state, id).await?;
     let label = match &context.record.purchase.purchase_number {
         Some(number) => number.clone(),
@@ -549,6 +606,7 @@ async fn purchase_record_page(
         page_breadcrumb_href: "/purchases".to_string(),
         page_action_href: action_href,
         page_action_label: action_label,
+        page_action_dialog: String::new(),
         record: context.record,
         entry_row_focus: false,
         oob_action_bar: false,
@@ -556,33 +614,8 @@ async fn purchase_record_page(
         today: context.today,
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
-        nav_key: "purchases",
-        nav: Nav::for_principal(&principal),
-    };
-    Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
-    ))
-}
-
-/// `/purchases/new`: the creation page. A write gets a page — the list's
-/// primary action navigates here and the form posts the existing
-/// `POST /web/purchases`, whose non-htmx branch 303s the browser onto
-/// `/purchases/{id}`. The gate is the one the creation POST itself carries
-/// (`purchases.create`): a principal that could not create the draft would
-/// only hit the POST's 403 one submit later. The supplier roster is
-/// server-rendered for the select, the same recorded consequence the list
-/// page carries — a purchases-only principal sees the roster it needs to
-/// record a purchase; the supplier screens themselves refuse it.
-async fn purchases_new_page(
-    State(state): State<AppState>,
-    _: Require<PurchasesCreate>,
-    principal: axum::Extension<crate::security::authz::Principal>,
-) -> Result<Html<String>, AppError> {
-    let suppliers = state.supplier_service.list_suppliers().await?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let tmpl = PurchaseNewTemplate {
-        today,
-        suppliers,
+        header_action: format!("/web/purchases/{}/header", id),
+        header_include: HEADER_SIBLING_INCLUDE,
         nav_key: "purchases",
         nav: Nav::for_principal(&principal),
     };
@@ -654,7 +687,15 @@ async fn web_purchase_suggestions(
 
 #[derive(Debug, Deserialize)]
 pub struct CreatePurchaseForm {
-    pub supplier_id: i64,
+    /// An explicit id (a clicked picker result) wins over the typed name
+    /// (the T2 picker's host contract). Empty/absent falls through to the
+    /// name below.
+    #[serde(default)]
+    pub supplier_id: Option<i64>,
+    /// The typed supplier name (the dialog's pre-filled or edited value);
+    /// resolved server-side, never silently guessed.
+    #[serde(default)]
+    pub supplier_name: String,
     #[serde(default)]
     pub payment_type: String,
     #[serde(default)]
@@ -726,8 +767,26 @@ pub struct CancelPurchaseForm {
     pub reason: String,
 }
 
+/// The draft's identity form (purchases-create-and-header T4): the inline
+/// header form on a draft's record page posts supplier, purchase date,
+/// supplier invoice no and notes. The supplier resolves exactly as the
+/// creation route does: an explicit id (a clicked picker result) wins;
+/// otherwise the typed name must resolve exactly through
+/// `SupplierService::resolve_supplier_name` or the route refuses, naming the
+/// value — never a silent guess. The service remains the authority and
+/// refuses a non-draft. The payment type stays out of this form because it
+/// is decided at confirm, and the due date is untouched (`due_date: None` =
+/// no-change), so a header edit cannot clear a Credit draft's stored due.
 #[derive(Debug, Deserialize)]
 pub struct UpdatePurchaseHeaderForm {
+    /// An explicit id (a clicked picker result) wins over the typed name —
+    /// the same precedence the creation route applies.
+    #[serde(default)]
+    pub supplier_id: Option<i64>,
+    /// The typed supplier name; resolved exactly or the route refuses,
+    /// naming the value (the supplier is never silently guessed).
+    #[serde(default)]
+    pub supplier_name: String,
     #[serde(default)]
     pub purchase_date: String,
     #[serde(default)]
@@ -762,10 +821,24 @@ async fn web_create_purchase(
     headers: HeaderMap,
     Form(form): Form<CreatePurchaseForm>,
 ) -> AppResult<Response> {
+    // The supplier is never silently guessed (the feature doc's hazard: the
+    // supplier resolves every line's default cost): an explicit id — a
+    // clicked picker result — wins (the T2 host contract); otherwise the
+    // typed name resolves exactly or the route refuses, naming the value.
+    // Neither id nor name is the required-field refusal. `purchase_date`
+    // defaults to today when absent (the dialog carries no date field).
+    let supplier_id = match form.supplier_id.filter(|id| *id > 0) {
+        Some(id) => id,
+        None => state
+            .supplier_service
+            .resolve_supplier_name(&form.supplier_name)
+            .await?
+            .id,
+    };
     let purchase = state
         .purchases_service
         .create_draft(principal.user_id, NewPurchase {
-            supplier_id: form.supplier_id,
+            supplier_id,
             payment_type: parse_payment_type(&form.payment_type)?,
             purchase_date: parse_date_or_today(&form.purchase_date)?,
             due_date: parse_opt_date(&form.due_date, "due_date")?,
@@ -1099,11 +1172,17 @@ async fn web_cancel_purchase_collection(
     web_cancel_purchase_impl(state, principal.user_id, headers, form.purchase_id, form).await
 }
 
-/// Edit the draft header in place (purchase date, invoice, notes); the
-/// supplier and the payment type stay fixed at creation, as the service
-/// enforces. Due date is decided at confirm (purchase-payment-at-confirm T4):
-/// this route never touches it (`due_date: None` = no-change), so an invoice
-/// edit cannot clear a Credit draft's stored due.
+/// Edit the draft header in place (purchases-create-and-header T4): the
+/// inline header form on a draft's record page posts here — supplier,
+/// purchase date, supplier invoice no and notes. The supplier resolves
+/// exactly as the creation route does: an explicit id (a clicked picker
+/// result) wins; otherwise the typed name must resolve exactly through
+/// `SupplierService::resolve_supplier_name` or the route refuses, naming the
+/// value — never a silent guess. The service remains the authority and
+/// refuses a non-draft. The payment type stays out of this form because it
+/// is decided at confirm (purchase-payment-at-confirm T4), and the due date
+/// is untouched (`due_date: None` = no-change), so a header edit cannot
+/// clear a Credit draft's stored due.
 async fn web_update_purchase_header(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
@@ -1113,12 +1192,24 @@ async fn web_update_purchase_header(
     Form(form): Form<UpdatePurchaseHeaderForm>,
 ) -> AppResult<Response> {
     let purchase_date = parse_opt_date(&form.purchase_date, "purchase_date")?;
+    // An explicit id wins (the T2 host contract); otherwise the typed name
+    // resolves exactly or the route refuses — an absent/empty name is the
+    // same refusal, never a silent keep-or-guess.
+    let supplier_id = match form.supplier_id.filter(|id| *id > 0) {
+        Some(id) => id,
+        None => state
+            .supplier_service
+            .resolve_supplier_name(&form.supplier_name)
+            .await?
+            .id,
+    };
     state
         .purchases_service
         .update_draft(
             principal.user_id,
             id,
             crate::models::UpdatePurchaseDraft {
+                supplier_id: Some(supplier_id),
                 purchase_date,
                 due_date: None,
                 supplier_invoice_no: Some(clean_opt(&form.supplier_invoice_no)),
@@ -1198,7 +1289,6 @@ async fn web_seed_from_suggestion(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/purchases", get(purchases_page))
-        .route("/purchases/new", get(purchases_new_page))
         .route("/purchases/{id}", get(purchase_record_page))
         .route(
             "/web/purchases",
@@ -1446,7 +1536,7 @@ mod tests {
     }
 
     /// Cuts one `<dialog id="{id}">…</dialog>` region, for dialog-scoped
-    /// assertions (confirm type/due controls, the edit-header fields).
+    /// assertions (confirm type/due controls).
     fn slice_dialog<'a>(html: &'a str, id: &str) -> &'a str {
         let start_tag = format!("<dialog id=\"{id}\"");
         let start = html
@@ -1788,39 +1878,15 @@ mod tests {
         );
     }
 
-    /// The creation form (`/purchases/new`) asks the required pair — supplier
-    /// and purchase date — plus the optional supplier invoice no and notes,
-    /// both editable later on the record page. It must NOT ask payment type
-    /// or due date: the payment decision is made in the record page's confirm
-    /// dialog (purchase-payment-at-confirm). The list page still carries no
-    /// payment-decision input anywhere: the Sugerido seed options ask
-    /// purchase date only.
+    /// The creation dialog (purchases-create-and-header T3): the /purchases
+    /// page renders no supplier roster select and never a payment input — the
+    /// dialog holds the T2 picker (a text field, not a `<select>`) and the
+    /// Sugerido seed options ask purchase date only.
     #[tokio::test]
-    async fn web_new_purchase_form_asks_supplier_and_date_with_optional_invoice_notes_not_payment() {
+    async fn web_purchase_creation_dialog_asks_no_payment_and_no_roster_select() {
         let state = test_state().await;
         let app = crate::routes::router(state.clone());
 
-        // The creation page's form: the required pair plus the two optional
-        // fields, and never a payment input.
-        let (status, html) = get_html(app.clone(), "/purchases/new").await;
-        assert_eq!(status, StatusCode::OK);
-        let form = enclosing_form(&html, "data-action=\"Create purchase\"");
-        for input in ["supplier_id", "purchase_date", "supplier_invoice_no", "notes"] {
-            assert!(
-                form.contains(&format!("name=\"{input}\"")),
-                "the creation form must ask {input}: {form:.600}"
-            );
-        }
-        for input in ["payment_type", "due_date"] {
-            assert!(
-                !form.contains(&format!("name=\"{input}\"")),
-                "the creation form must not ask {input}: the payment decision stays in the \
-                 record page's confirm dialog: {form:.600}"
-            );
-        }
-
-        // The list page carries no payment-decision input at all: the seed
-        // options ask purchase date only, and nothing else on it asks one.
         let (status, list_html) = get_html(app, "/purchases").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
@@ -1834,6 +1900,12 @@ mod tests {
         assert!(
             !list_html.contains("Draft type") && !list_html.contains("Due date"),
             "the seed options ask purchase date only: {list_html:.600}"
+        );
+        // The old creation page's roster select is gone with it; the picker
+        // is a text field, never a `<select>` over the roster.
+        assert!(
+            !list_html.contains("<select name=\"supplier_id\""),
+            "the dialog must not render a supplier roster select: {list_html:.600}"
         );
     }
 
@@ -3179,8 +3251,10 @@ mod tests {
     /// action bar (one primary action per status plus a `⋯` secondary menu),
     /// and every action form lives in a `<dialog>` the bar opens. The legacy
     /// ids keep their meaning so in-page anchors still resolve: `#confirm-
-    /// purchase` / `#edit-header` / `#discard-purchase` / `#record-payment` /
-    /// `#cancel-purchase` are the dialogs. The add-line drawer is gone: the
+    /// purchase` / `#discard-purchase` / `#record-payment` /
+    /// `#cancel-purchase` are the dialogs. The Edit header dialog is deleted
+    /// (T4): a draft's identity fields are the always-visible inline header
+    /// form, so no `#edit-header` anchor remains. The add-line drawer is gone: the
     /// entry row is persistent inside the money region, so the bar carries no
     /// drawer button and the page offers no `#add-line` anchor. Cancelled is
     /// read-only: no bar, no menu, no dialogs, no entry row. The add-line
@@ -3207,6 +3281,10 @@ mod tests {
             "the secondary menu renders: {html:.400}"
         );
         assert!(
+            !html.contains(">Edit header</button>"),
+            "the menu no longer offers Edit header (T4): {html:.400}"
+        );
+        assert!(
             !html.contains("id=\"line-drawer\""),
             "the add-line drawer is deleted; the entry row replaces it: {html:.400}"
         );
@@ -3223,12 +3301,23 @@ mod tests {
                 && html.contains("id=\"line-unit-cost\""),
             "the entry row renders its fields persistent: {html:.600}"
         );
-        for dialog in ["confirm-purchase", "edit-header", "discard-purchase"] {
+        for dialog in ["confirm-purchase", "discard-purchase"] {
             assert!(
                 html.contains(&format!("<dialog id=\"{dialog}\"")),
                 "the draft renders the {dialog} dialog: {html:.400}"
             );
         }
+        // T4: the draft's header is the always-visible editable form, so the
+        // Edit header dialog and its menu entry are gone for good.
+        assert!(
+            html.contains("id=\"purchase-header-form\""),
+            "the draft renders the inline header form: {html:.400}"
+        );
+        assert!(
+            !html.contains("id=\"edit-header\"")
+                && !html.contains("openRecordDialog('edit-header')"),
+            "the Edit header dialog and its menu entry are gone: {html:.400}"
+        );
         assert!(
             !html.contains("min-[760px]:grid-cols-2"),
             "the four-card action grid is gone: {html:.400}"
@@ -3292,9 +3381,20 @@ mod tests {
             "a confirmed purchase cannot add lines: {html:.400}"
         );
         assert!(
-            !html.contains("<dialog id=\"edit-header\"")
-                && !html.contains("<dialog id=\"confirm-purchase\""),
-            "the header and confirm controls freeze once confirmed: {html:.400}"
+            !html.contains("<dialog id=\"confirm-purchase\"")
+                && !html.contains("purchase-header-form")
+                && !html.contains("id=\"record-supplier\""),
+            "the header form and the confirm dialog freeze once confirmed: {html:.400}"
+        );
+        // The read-only facts stay: the supplier name, the due date and the
+        // audit line render exactly as before.
+        assert!(
+            html.contains(&fixture.supplier_name) && html.contains("due 2024-06-02"),
+            "a confirmed purchase still shows its header facts: {html:.400}"
+        );
+        assert!(
+            html.contains("data-purchase-actor"),
+            "a confirmed purchase keeps the audit line: {html:.400}"
         );
 
         // -- Cancelled: read-only, no bar, no menu, no dialogs ---------------
@@ -3315,12 +3415,19 @@ mod tests {
             "line-picker",
             "confirm-purchase",
             "record-payment",
+            "purchase-header-form",
+            "record-supplier",
         ] {
             assert!(
                 !html.contains(&format!("id=\"{id}\"")),
                 "a cancelled purchase is read-only, found {id}: {html:.400}"
             );
         }
+        // Read-only facts stay on the cancelled record too.
+        assert!(
+            html.contains(&fixture.supplier_name) && html.contains("due 2024-06-02"),
+            "a cancelled purchase still shows its header facts: {html:.400}"
+        );
     }
 
     /// The record page's header action slot holds the next obvious action,
@@ -3819,13 +3926,16 @@ mod tests {
         );
     }
 
-    /// T4: payment is decided at confirm, so the edit-header dialog drops the
-    /// due-date field (purchase date, invoice and notes remain), and a header
+    /// T4: the record page's header becomes an ALWAYS-VISIBLE EDITABLE FORM for
+    /// drafts — supplier picker, purchase date, supplier invoice no and notes —
+    /// and stays read-only text for a confirmed or cancelled purchase (the
+    /// service is the authority; the gate here is presentation). The due date
+    /// is decided at confirm and the header keeps not touching it, so a header
     /// post that omits it leaves the stored due date untouched — clearing a
     /// Credit draft's due is the confirm dialog's Cash path alone
-    /// (`due_date: Some(None)`), never an invoice edit.
+    /// (`due_date: Some(None)`), never a header edit.
     #[tokio::test]
-    async fn web_edit_header_dialog_drops_due_date_and_keeps_the_stored_due() {
+    async fn web_edit_header_form_drops_due_date_and_keeps_the_stored_due() {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
         let app = crate::routes::router(state.clone());
@@ -3833,25 +3943,51 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::OK);
 
-        // -- The dialog: no due input, the other header fields remain -------
-        let dialog = slice_dialog(&html, "edit-header");
+        // -- The inline header region: no due input, the four editable
+        // fields (the supplier field lives in the picker's own form; the
+        // other three in the Save form, which `hx-include`s the supplier) --
+        let region_start = html
+            .find("id=\"purchase-header\"")
+            .expect("the draft renders the inline header region");
+        let form_start = html
+            .find("data-action=\"Save header\"")
+            .expect("the draft renders the inline header form");
+        let form_end = form_start
+            + html[form_start..]
+                .find("</form>")
+                .expect("the header form closes");
+        let form = &html[region_start..form_end];
         assert!(
-            !dialog.contains("name=\"due_date\""),
-            "the edit-header dialog drops the due date: {dialog:.600}"
+            !form.contains("name=\"due_date\""),
+            "the inline header form drops the due date: {form:.600}"
         );
         for field in [
+            "name=\"supplier_name\"",
             "name=\"purchase_date\"",
             "name=\"supplier_invoice_no\"",
             "name=\"notes\"",
         ] {
-            assert!(dialog.contains(field), "edit keeps {field}: {dialog:.600}");
+            assert!(form.contains(field), "the header form keeps {field}: {form:.600}");
         }
+        // The supplier field arrives pre-filled with the stored supplier's
+        // name, and the other fields with the stored values.
+        assert!(
+            form.contains(&format!("value=\"{}\"", fixture.supplier_name)),
+            "the supplier field is pre-filled with the document's supplier: {form:.600}"
+        );
 
-        // -- The route: omitting the field must NOT clear the stored due ----
+        // -- The route: omitting the fields must not wipe the stored values.
+        // The form maps `supplier_invoice_no: Some(clean_opt(..))` and
+        // `notes: Some(..)` unconditionally, so an ABSENT field arrives as an
+        // empty string and clears it — the picker's own Enter form must always
+        // carry the three sibling fields pinned by `include`.
         let (status, _, resp) = post_form_response(
             app,
             &format!("/web/purchases/{}/header", fixture.purchase_id),
-            "purchase_date=2024-05-03&supplier_invoice_no=A-9&notes=edited",
+            &format!(
+                "supplier_id={}&purchase_date=2024-05-03&supplier_invoice_no=A-9&notes=edited",
+                fixture.supplier_id
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{resp:.400}");
@@ -3863,10 +3999,412 @@ mod tests {
         assert_eq!(detail.purchase.purchase_date.to_string(), "2024-05-03");
         assert_eq!(detail.purchase.supplier_invoice_no.as_deref(), Some("A-9"));
         assert_eq!(
+            detail.purchase.notes, "edited",
+            "the header post carries the notes field: {:?}",
+            detail.purchase.notes
+        );
+        assert_eq!(
             detail.purchase.due_date.map(|d| d.to_string()),
             Some("2024-06-02".to_string()),
             "a header edit leaves the stored due date untouched: {:?}",
             detail.purchase.due_date
+        );
+    }
+
+    /// T4: the inline header form carries a Save button posting the existing
+    /// header route, and the picker's `include` names the three sibling field
+    /// ids so every path (Save, Enter in the supplier field, a clicked
+    /// result) posts the same field set.
+    #[tokio::test]
+    async fn inline_header_form_includes_the_sibling_fields_and_save_posts_the_header_route() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The Save button posts the existing header route.
+        let save = element_tag_containing(&html, "data-action=\"Save header\"");
+        assert!(
+            save.contains(&format!(
+                "hx-post=\"/web/purchases/{}/header\"",
+                fixture.purchase_id
+            )),
+            "the Save button posts the header route: {save}"
+        );
+
+        // The picker's own form (the Enter path) carries the sibling fields:
+        // its `include` names the date, invoice and notes ids and NEVER a
+        // supplier_id (htmx accumulates colliding values — T3's defect).
+        let form_pos = html
+            .find("data-action=\"Save supplier\"")
+            .expect("the record hosts the picker's own form");
+        let picker_form = enclosing_form(&html[..], &format!("data-action=\"Save supplier\""));
+        let _ = form_pos;
+        let include = picker_form
+            .split("hx-include=\"")
+            .nth(1)
+            .map(|s| s.split('"').next().unwrap().to_string());
+        let include = include.expect("the picker's form names an include");
+        for id in ["record-purchase-date", "record-invoice-no", "record-notes"] {
+            assert!(
+                include.contains(id),
+                "the include must carry {id} so the Enter path posts it: {include}"
+            );
+        }
+        assert!(
+            !include.contains("supplier_id"),
+            "the include must never carry a supplier_id: {include}"
+        );
+
+        // The date, invoice and notes inputs carry those exact ids.
+        for id in ["record-purchase-date", "record-invoice-no", "record-notes"] {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "the header renders #{id}: {html:.400}"
+            );
+        }
+    }
+
+    /// The TRAP (T4): the picker's own form — the Enter path inside the
+    /// supplier field — posts the header route with ONLY the supplier field
+    /// unless the picker's `include` carries the siblings. The route maps
+    /// invoice and notes unconditionally (`Some(clean_opt(..))` / `Some(..)`),
+    /// so an absent field would arrive as empty and WIPE the stored values.
+    /// The request body is built from the inputs the rendered form actually
+    /// carries, the way the T3 Enter-path test does — so a missing `include`
+    /// (or a field rendered outside it) fails the test, not just the intent.
+    #[tokio::test]
+    async fn web_header_enter_path_from_the_picker_preserves_invoice_and_notes() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
+        // The supplier the operator will type into the field on the record
+        // page (its exact name must resolve).
+        let typed = state
+            .supplier_service
+            .create_supplier(
+                audit_actor(&state).await,
+                crate::models::NewSupplier {
+                    name: "Enter Header Supplier".into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Seed values the trap would silently wipe.
+        state
+            .purchases_service
+            .update_draft(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                crate::models::UpdatePurchaseDraft {
+                    supplier_invoice_no: Some(Some("INV-TRAP".to_string())),
+                    notes: Some("trap notes".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The picker's OWN form is what Enter submits. Collect its inputs —
+        // exactly what the browser posts — from the form tag plus everything
+        // `hx-include` names (the sibling inputs live outside the form tag).
+        let form = enclosing_form(&html, "data-action=\"Save supplier\"");
+        let include = form
+            .split("hx-include=\"")
+            .nth(1)
+            .map(|s| s.split('"').next().unwrap().to_string())
+            .expect("the picker's form names an include");
+        let mut scope = form.to_string();
+        for id in include.split(", ") {
+            let needle = format!("id=\"{}\"", id.trim_start_matches('#'));
+            let pos = html
+                .find(&needle)
+                .unwrap_or_else(|| panic!("the include names {needle} but the page does not render it"));
+            let start = html[..pos].rfind('<').expect("the id sits inside a tag");
+            let end = start + html[start..].find('>').expect("unterminated tag");
+            scope.push_str(&html[start..=end]);
+        }
+
+        // Collect (name, value) from every input in scope, the body Enter sends.
+        let mut fields: Vec<(String, String)> = Vec::new();
+        let mut rest = scope.as_str();
+        while let Some(i) = rest.find("<input") {
+            rest = &rest[i..];
+            let tag_end = rest.find('>').expect("unterminated input tag");
+            let tag = &rest[..=tag_end];
+            if let Some(name) = tag.split("name=\"").nth(1).map(|s| s.split('"').next().unwrap()) {
+                let value = tag
+                    .split("value=\"")
+                    .nth(1)
+                    .map(|s| s.split('"').next().unwrap())
+                    .unwrap_or_default();
+                fields.push((name.to_string(), value.to_string()));
+            }
+            rest = &rest[tag_end..];
+        }
+        assert!(
+            fields.iter().any(|(n, _)| n == "supplier_name"),
+            "the picker's field must travel: {fields:?}"
+        );
+        for name in ["purchase_date", "supplier_invoice_no", "notes"] {
+            assert!(
+                fields.iter().any(|(n, _)| n == name),
+                "the Enter path must post {name} or the route wipes it: {fields:?}"
+            );
+        }
+
+        // The operator edits only the supplier's name and presses Enter.
+        let body = fields
+            .iter()
+            .map(|(name, value)| {
+                let value = if name == "supplier_name" {
+                    "Enter Header Supplier"
+                } else {
+                    value
+                };
+                format!("{name}={value}")
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/header", fixture.purchase_id),
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.supplier_id, typed.id,
+            "the typed supplier resolves to the one the operator typed, never the stored one"
+        );
+        assert_eq!(
+            detail.purchase.supplier_invoice_no.as_deref(),
+            Some("INV-TRAP"),
+            "the invoice must SURVIVE the Enter-path header edit: {:?}",
+            detail.purchase.supplier_invoice_no
+        );
+        assert_eq!(
+            detail.purchase.notes, "trap notes",
+            "the notes must SURVIVE the Enter-path header edit: {:?}",
+            detail.purchase.notes
+        );
+    }
+
+    /// Saving a CHANGED supplier through the inline header: the typed name
+    /// resolves server-side and the document's supplier moves — asserted
+    /// through the service, not the markup.
+    #[tokio::test]
+    async fn web_header_save_updates_the_supplier_date_invoice_and_notes() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let other = state
+            .supplier_service
+            .create_supplier(
+                audit_actor(&state).await,
+                crate::models::NewSupplier {
+                    name: "Header Change Supplier".into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let body = "supplier_name=Header+Change+Supplier&purchase_date=2024-05-03&supplier_invoice_no=INV-77&notes=changed+header";
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/header", fixture.purchase_id),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(detail.purchase.supplier_id, other.id);
+        assert_eq!(detail.purchase.purchase_date.to_string(), "2024-05-03");
+        assert_eq!(detail.purchase.supplier_invoice_no.as_deref(), Some("INV-77"));
+        assert_eq!(
+            detail.purchase.notes, "changed header",
+            "the header post carries the notes: {:?}",
+            detail.purchase.notes
+        );
+    }
+
+    /// An unknown typed supplier refuses with a 400 naming the value and
+    /// changes nothing — the name is never silently guessed (the same hazard
+    /// rule the creation flow obeys).
+    #[tokio::test]
+    async fn web_header_unknown_typed_supplier_refuses_naming_the_value_and_changes_nothing() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let before = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/header", fixture.purchase_id),
+            "supplier_name=No+Such+Supplier&purchase_date=2024-05-03&supplier_invoice_no=X&notes=y",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{resp:.400}");
+        assert!(
+            resp.contains("No Such Supplier"),
+            "the refusal names the typed value: {resp:.400}"
+        );
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.purchase.supplier_id, before.purchase.supplier_id,
+            "a refused supplier change must not move the supplier"
+        );
+        assert_eq!(
+            after.purchase.purchase_date, before.purchase.purchase_date,
+            "a refused supplier change must not touch the date"
+        );
+        assert_eq!(
+            after.purchase.notes, before.purchase.notes,
+            "a refused supplier change must not touch the notes"
+        );
+    }
+
+    /// An explicit supplier_id from a clicked picker result wins over the
+    /// typed name, the same precedence the creation route applies.
+    #[tokio::test]
+    async fn web_header_an_explicit_supplier_id_wins_over_the_typed_name() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let typed = state
+            .supplier_service
+            .create_supplier(
+                audit_actor(&state).await,
+                crate::models::NewSupplier {
+                    name: "Header Typed Supplier".into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let clicked = state
+            .supplier_service
+            .create_supplier(
+                audit_actor(&state).await,
+                crate::models::NewSupplier {
+                    name: "Header Clicked Supplier".into(),
+                    phone: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let body = format!(
+            "supplier_id={}&supplier_name=Header+Typed+Supplier&purchase_date=2024-05-03",
+            clicked.id
+        );
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/header", fixture.purchase_id),
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{resp:.400}");
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.supplier_id, clicked.id,
+            "the explicit id must win over the typed name"
+        );
+        assert_ne!(detail.purchase.supplier_id, typed.id);
+    }
+
+    /// A header post against a CONFIRMED purchase still refuses: the service
+    /// is the authority; the template gate is presentation only. The body
+    /// carries a VALID supplier id so the route resolves it and reaches
+    /// `PurchasesService::update_draft` — only the service's draft check can
+    /// then refuse. Route and service refusals are not distinguishable in the
+    /// response (both surface as a 400 with a plain message body), so the
+    /// exact refusing layer is asserted indirectly: a valid supplier means
+    /// the route-side resolution cannot be the refusal, and nothing changed
+    /// rules out any write having happened.
+    #[tokio::test]
+    async fn web_header_service_still_refuses_a_confirmed_purchase() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let before = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // The supplier id is required: without it the route's own
+        // `resolve_supplier_name` refusal would 400 before the service ever
+        // runs, and the test would pass with the service gate removed.
+        let body = format!(
+            "supplier_id={}&purchase_date=2024-05-03",
+            fixture.supplier_id
+        );
+        let (status, _, resp) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/header", fixture.purchase_id),
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the service must refuse a confirmed header edit: {resp:.400}"
+        );
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.purchase.purchase_date, after.purchase.purchase_date,
+            "the route's supplier resolution cannot refuse a valid id, so the 400 above can only be the SERVICE's draft check; nothing must have changed"
+        );
+        assert_eq!(
+            before.purchase.supplier_id, after.purchase.supplier_id,
+            "the service refused before any write landed: {resp:.400}"
         );
     }
 
@@ -3878,7 +4416,10 @@ mod tests {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         let app = crate::routes::router(state.clone());
-        let body = "purchase_date=2024-05-03&due_date=&supplier_invoice_no=A-9&notes=edited+note";
+        let body = format!(
+            "supplier_id={}&purchase_date=2024-05-03&due_date=&supplier_invoice_no=A-9&notes=edited+note",
+            fixture.supplier_id
+        );
         let req = Request::builder()
             .method("POST")
             .uri(format!("/web/purchases/{}/header", fixture.purchase_id))
@@ -4480,12 +5021,14 @@ mod tests {
 
     // -- S4: creation is a full page, so the list's primary action is a gate --
 
-    /// The list page is gated `purchases.read`, but its header action now
-    /// navigates to `/purchases/new`, gated `purchases.create` — creation is a
-    /// full page, not a card on the list. The repo's rule (AC21, the same one
+    /// The list page is gated `purchases.read`, but its header action
+    /// opens the creation dialog (T3). The repo's rule (AC21, the same one
     /// the sidebar's `nav.visible(key)` applies) extends to the primary
     /// action: a principal without `purchases.create` renders no page action
-    /// at all; a principal holding it sees "New purchase" → `/purchases/new`.
+    /// and no creation dialog at all — the choosing is what creates (AC7),
+    /// so a principal that cannot create must not be offered even the
+    /// dialog; a principal holding it sees the "New purchase" button whose
+    /// onclick opens `#new-purchase-dialog`.
     #[tokio::test]
     async fn s4_purchases_page_offers_the_new_purchase_action_only_when_the_principal_can_create() {
         let state = test_state().await;
@@ -4498,13 +5041,13 @@ mod tests {
         let (status, html) = get_html_as(app.clone(), "/purchases", Some(&cookie)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
-            !html.contains("data-page-action"),
+            !html.contains("data-page-action") && !html.contains("id=\"new-purchase-dialog\""),
             "a principal without purchases.create must not be offered the primary \
-             action it could not open: {html:.600}"
+             action or the creation dialog it could not submit: {html:.600}"
         );
 
-        // The same page for a principal holding BOTH codes: the action is
-        // back, pointing at the creation page.
+        // The same page for a principal holding BOTH codes: the action is a
+        // dialog-opening button and the dialog is back.
         let holder = test_support::seed_session_with_permissions(
             &state.pool,
             &["purchases.read", "purchases.create"],
@@ -4515,12 +5058,53 @@ mod tests {
             get_html_as(app, "/purchases", Some(&test_support::cookie_for(&holder))).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
-            html.contains("data-page-action"),
-            "a principal that may create must see the primary action: {html:.600}"
+            html.contains("data-page-action") && html.contains("id=\"new-purchase-dialog\""),
+            "a principal that may create must see the primary action and the dialog: {html:.600}"
         );
         assert!(
-            html.contains("href=\"/purchases/new\"") && html.contains("New purchase"),
-            "the action must navigate to the creation page: {html:.600}"
+            html.contains("onclick=\"document.getElementById('new-purchase-dialog').showModal()\"")
+                && html.contains("New purchase"),
+            "the action must open the creation dialog: {html:.600}"
+        );
+    }
+
+    /// AC1: the shared page action speaks the mint accent with a dark label —
+    /// the rest of the system is mint (`roya ◆`, the active nav entry, the
+    /// success notice), and neither green survives white text (mint on white
+    /// is about 1.4:1), so the label rides the background token. Asserted on
+    /// the action's own opening tag: the component is shared, so a blue or
+    /// white-labelled action on ANY page is a defect this catches at the
+    /// source.
+    #[tokio::test]
+    async fn purchases_page_action_is_mint_with_a_dark_label() {
+        let state = test_state().await;
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "purchases.create"],
+        )
+        .await
+        .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) =
+            get_html_as(app, "/purchases", Some(&test_support::cookie_for(&holder))).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let action = element_tag_containing(&html, "data-page-action");
+        assert!(
+            action.contains("bg-accent "),
+            "the primary action must carry the mint accent, not blue: {action}"
+        );
+        assert!(
+            action.contains("text-bg"),
+            "the label must read the background token — no green survives white text: {action}"
+        );
+        assert!(
+            !action.contains("bg-accent2"),
+            "the primary action must not be blue any more: {action}"
+        );
+        assert!(
+            !action.contains("text-white"),
+            "the label must not stay white on mint: {action}"
         );
     }
 
@@ -4605,14 +5189,14 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{uri}: {html:.200}");
         }
 
-        // The creation page is its own gated read (S4): without
-        // `purchases.create` it answers the same 403 refusal the POST
-        // carries, while the list above still rendered for this principal.
-        let (status, body) = get_html_as(app.clone(), "/purchases/new", Some(&cookie)).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.200}");
+        // The creation page is deleted (T3, AC2): without `purchases.create`
+        // the list renders no action and no dialog, and the deleted route
+        // would answer 404 even with the right gate.
+        let (status, body) = get_html_as(app.clone(), "/purchases", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{body:.200}");
         assert!(
-            body.contains("purchases.create"),
-            "the creation page's refusal must name purchases.create: {body:.400}"
+            !body.contains("data-page-action") && !body.contains("id=\"new-purchase-dialog\""),
+            "a read-only principal must not see the creation action or the dialog: {body:.400}"
         );
 
         // Creating a purchase over HTMX: JSON naming the recording gate.

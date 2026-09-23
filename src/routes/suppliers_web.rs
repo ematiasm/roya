@@ -7,7 +7,7 @@
 // list fragment lives in partials/supplier_list.html.
 use askama::Template;
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
@@ -32,8 +32,8 @@ use crate::routes::AppState;
 // mapping and its judgement calls are recorded in
 // openspec/changes/2026-09-18-add-identity-module/tasks.md (S7 section).
 use crate::security::authz::{
-    Nav, PurchasesCostsRead, PurchasesCostsWrite, PurchasesCreate, Require, SuppliersRead,
-    SuppliersWrite,
+    Nav, PurchasesCostsRead, PurchasesCostsWrite, PurchasesCreate, Require, RequireAny,
+    SuppliersRead, SuppliersWrite,
 };
 
 // ---------------------------------------------------------------------------
@@ -216,6 +216,62 @@ async fn web_supplier_list(
 ) -> AppResult<Response> {
     let suppliers = supplier_views(&state).await?;
     Ok(render_list(suppliers).await?.into_response())
+}
+
+/// The supplier picker's search query: `q` is the documented query name; the
+/// caller's context (`action`, `target`, `include`) travels through the same
+/// query the product search's `line_action`/`line_target` do, so the results
+/// fragment stays generic over its hosts.
+#[derive(Debug, Deserialize, Default)]
+struct SupplierSearchQuery {
+    #[serde(default)]
+    q: String,
+    #[serde(default)]
+    action: String,
+    #[serde(default)]
+    target: String,
+    #[serde(default)]
+    include: String,
+}
+
+/// `GET /web/supplier-search?q=`: the supplier picker's bounded read. Matching
+/// and bounding live in the supplier service; the route only renders.
+///
+/// The gate is an any-of, deliberately (purchases-create-and-header T2): the
+/// endpoint exists so the person RECORDING a purchase can pick the supplier
+/// without opening the supplier screens, and the recorded consequence is that
+/// the supplier roster is served to whoever may record a purchase. So it is
+/// reachable by `purchases.create` alone — the same rule the supplier screens
+/// themselves do NOT have, and that asymmetry is the point. `suppliers.read`
+/// stays in the set because the endpoint is still a supplier read. Refusals
+/// name both codes (AC10).
+async fn web_supplier_search(
+    State(state): State<AppState>,
+    _: RequireAny<(SuppliersRead, PurchasesCreate)>,
+    Query(params): Query<SupplierSearchQuery>,
+) -> Result<Html<String>, AppError> {
+    let raw = params.q.trim();
+    let matches = state.supplier_service.search_suppliers(raw).await?;
+    let html = SupplierSearchResultsPartial {
+        query: raw.to_string(),
+        matches,
+        action: params.action.trim().to_string(),
+        target: params.target.trim().to_string(),
+        include: params.include.trim().to_string(),
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Html(html))
+}
+
+#[derive(Template)]
+#[template(path = "partials/supplier_search_results.html")]
+struct SupplierSearchResultsPartial {
+    query: String,
+    matches: Vec<Supplier>,
+    action: String,
+    target: String,
+    include: String,
 }
 
 /// Drawer detail for one supplier: the header, the outstanding balance (sum
@@ -497,6 +553,7 @@ pub fn router() -> Router<AppState> {
             "/web/suppliers",
             get(web_supplier_list).post(web_create_supplier),
         )
+        .route("/web/supplier-search", get(web_supplier_search))
         .route("/web/suppliers/edit", post(web_update_supplier))
         .route("/web/suppliers/{id}", delete(web_delete_supplier))
         .route("/web/suppliers/{id}/detail", get(web_supplier_detail))
@@ -1697,5 +1754,232 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::SEE_OTHER);
+    }
+
+    // -- the supplier picker (purchases T2) ----------------------------------
+
+    /// Seed suppliers directly through the service and answer the search
+    /// endpoint with the caller context a picker host passes (the same shape
+    /// the product search's line_action/line_target use).
+    async fn seeded_suppliers(state: &AppState, count: usize) -> Vec<crate::models::Supplier> {
+        use crate::models::NewSupplier;
+        let mut out = Vec::new();
+        for i in 0..count {
+            out.push(
+                state
+                    .supplier_service
+                    .create_supplier(audit_actor(state).await, NewSupplier {
+                        name: format!("Picker Supplier {i:02}"),
+                        phone: None,
+                        notes: None,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        out
+    }
+
+    async fn search_html(state: &AppState, query: &str) -> (StatusCode, String) {
+        let app = crate::routes::router(state.clone());
+        let uri = format!(
+            "/web/supplier-search?q={}&action=%2Fweb%2Fpurchases&target=%23purchase-header",
+            query.replace(' ', "%20")
+        );
+        get_html_as(app, &uri, Some(test_support::TEST_COOKIE)).await
+    }
+
+    #[tokio::test]
+    async fn supplier_search_returns_bounded_case_insensitive_name_matches_as_forms() {
+        let state = test_state().await;
+        seeded_suppliers(&state, crate::routes::SupplierSvc::SUPPLIER_SEARCH_LIMIT + 2).await;
+        let (status, html) = search_html(&state, "picker%20supplier").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+
+        // Bounded: the bound, not the whole roster.
+        let forms = html.matches("hx-post=\"/web/purchases\"").count();
+        assert_eq!(
+            forms,
+            crate::routes::SupplierSvc::SUPPLIER_SEARCH_LIMIT,
+            "the fragment is bounded like the product search: {html:.800}"
+        );
+
+        // Each match is its own form carrying that match's supplier_id.
+        assert!(
+            html.contains("name=\"supplier_id\" value=\"1\"")
+                && html.contains("name=\"supplier_id\" value=\"10\""),
+            "every result form carries its supplier_id: {html:.800}"
+        );
+        assert!(
+            !html.contains("Picker Supplier 11"),
+            "matches past the bound stay off the fragment: {html:.800}"
+        );
+
+        // The swap wiring the picker macro hands in travels to the result
+        // forms, the way the product search's line_target does.
+        assert!(
+            html.contains("hx-target=\"#purchase-header\""),
+            "result forms swap the caller's target: {html:.800}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supplier_search_reports_active_and_inactive_matches_and_marks_inactive() {
+        let state = test_state().await;
+        let mut seeded = seeded_suppliers(&state, 2).await;
+        state
+            .supplier_service
+            .set_active(audit_actor(&state).await, seeded.pop().unwrap().id, false)
+            .await
+            .unwrap();
+        let (status, html) = search_html(&state, "picker").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("inactive"),
+            "the fragment reports whether a match is active: {html:.800}"
+        );
+        assert!(
+            html.contains("Picker Supplier 00") && html.contains("Picker Supplier 01"),
+            "both the active and the inactive match are searchable: {html:.800}"
+        );
+    }
+
+    #[tokio::test]
+    async fn supplier_search_with_an_empty_query_answers_the_empty_shape_not_the_roster() {
+        let state = test_state().await;
+        seeded_suppliers(&state, 2).await;
+        for query in ["", "   "] {
+            let (status, html) = search_html(&state, query).await;
+            assert_eq!(status, StatusCode::OK, "{html:.400}");
+            assert!(
+                !html.contains("Picker Supplier"),
+                "an empty query never returns the roster: {html:.800}"
+            );
+            assert!(
+                html.contains("Type a supplier name."),
+                "the empty shape tells the operator what to do: {html:.800}"
+            );
+        }
+    }
+
+    /// The endpoint exists for the person recording a purchase, so a
+    /// principal holding `purchases.create` — even without the supplier
+    /// screens' read — is admitted; the supplier screens themselves refuse
+    /// such a principal. A principal holding neither is refused.
+    #[tokio::test]
+    async fn supplier_search_admits_purchases_create_and_refuses_a_principal_with_neither() {
+        let state = test_state().await;
+        seeded_suppliers(&state, 1).await;
+        let app = crate::routes::router(state.clone());
+        let uri = "/web/supplier-search?q=picker&action=%2Fweb%2Fpurchases&target=%23purchase-header";
+
+        // purchases.create alone: admitted — its reason to exist.
+        let purchases = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.create"],
+        )
+        .await
+        .unwrap();
+        let (status, html) = get_html_as(app.clone(), uri, Some(&test_support::cookie_for(&purchases))).await;
+        assert_eq!(status, StatusCode::OK, "purchases.create must reach the search: {html:.400}");
+
+        // suppliers.read alone: admitted too (the read half of the any-of).
+        let suppliers = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["suppliers.read"],
+        )
+        .await
+        .unwrap();
+        let (status, _) = get_html_as(app.clone(), uri, Some(&test_support::cookie_for(&suppliers))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // An unrelated permission is refused, naming the codes the gate takes.
+        let neither = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["customers.read"],
+        )
+        .await
+        .unwrap();
+        let (status, body) = get_html_as(app, uri, Some(&test_support::cookie_for(&neither))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
+        assert!(
+            body.contains("suppliers.read") && body.contains("purchases.create"),
+            "the refusal names the any-of codes: {body:.400}"
+        );
+    }
+
+    /// The picker macro is shared by two hosts that do not exist yet (T3's
+    /// creation dialog and T4's inline header), so its contract is pinned
+    /// the way the wiring drift tests pin source: the field's TEXT is the
+    /// contract — the picker's own form carries only the text input and
+    /// NO hidden supplier_id (an id wins only on a clicked result, whose
+    /// own form carries it) — and the macro takes the caller's
+    /// action/target plus the current name.
+    #[tokio::test]
+    async fn supplier_picker_macro_carries_the_field_search_and_caller_context() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("templates/partials/supplier_picker.html");
+        let picker = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // The macro's signature: caller's post target, swap target, field id,
+        // current name (plus the caller's extra fields to include) — and no
+        // current-id parameter: the field's text is the whole contract.
+        assert!(
+            picker.contains("macro supplier_picker(action, target, field_id, current_name, include)"),
+            "the macro takes the caller's context: {picker:.400}"
+        );
+        assert!(
+            !picker.contains("current_id"),
+            "no current-id parameter may remain: {picker:.400}"
+        );
+
+        // The field is a text input that searches as you type.
+        assert!(picker.contains("type=\"text\""), "the field is a text input: {picker:.400}");
+        assert!(picker.contains("name=\"supplier_name\""), "{picker:.400}");
+        assert!(picker.contains("hx-get=\"/web/supplier-search\""), "{picker:.400}");
+        assert!(
+            picker.contains("hx-trigger=\"input changed delay:250ms\""),
+            "the search debounces on input: {picker:.400}"
+        );
+        assert!(
+            picker.contains("hx-target=\"#supplier-search-results\""),
+            "results swap into the picker's own results container: {picker:.400}"
+        );
+
+        // The picker's OWN form carries no supplier_id at all: the field's
+        // text resolves server-side, so Enter can never post a stale current
+        // id that would silently win over the typed name. A clicked result
+        // keeps its own explicit id (partials/supplier_search_results.html).
+        assert!(
+            !picker.contains("name=\"supplier_id\""),
+            "the picker's form must not carry any supplier_id input: {picker:.400}"
+        );
+
+        // The caller's post target and swap target drive the widget's form.
+        assert!(picker.contains("hx-post=\"{{ action }}\""), "{picker:.400}");
+        assert!(picker.contains("hx-select=\"{{ target }}\""), "{picker:.400}");
+
+        // The inheritance audit (the product picker's documented trap): the
+        // form's hx-select would filter the search GET to an element the
+        // results fragment does not contain, so it is disinherited. The
+        // exact value matters: the search GET inherits these attributes and
+        // the results then stay permanently empty in a browser, which no
+        // HTTP test can see.
+        assert!(
+            picker.contains("hx-disinherit=\"hx-select hx-target hx-swap\""),
+            "the form must disininherit exactly its request attributes: {picker:.400}"
+        );
+
+        // The results container is a sibling of the form (no nested forms).
+        let form_pos = picker.find("<form").expect("the widget has a form");
+        let form_end = picker[form_pos..]
+            .find("</form>")
+            .map(|i| form_pos + i)
+            .expect("the form closes");
+        assert!(
+            picker[form_end..].contains("id=\"supplier-search-results\""),
+            "the results container sits outside the form: {picker:.400}"
+        );
     }
 }
