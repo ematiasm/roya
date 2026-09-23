@@ -226,12 +226,20 @@ item out as domain work rather than presentation.
       (`UpdatePurchaseDraft.supplier_id` already supports it; only
       `UpdatePurchaseHeaderForm` lacks it). The record page struct must then
       carry the supplier roster.
-- [ ] **S5 — The entry row.** Picking a product commits a line immediately at
-      qty 1, so there is no unsaved state; the qty field acts as an optional
-      multiplier that resets; a repeat product increments the existing line (A1).
-      The add-line drawer, the keep-open checkbox, its `localStorage` preference
-      and the OOB picker swap are deleted. `e2e/tests/test_picker.py` is rewritten
-      to the new order.
+- [x] **S5a — The entry row; the drawer dies.** One persistent flex row inside
+      the swapped money region (product, qty, cost, Add), the results below it so
+      they cannot move the button, and every pick commits the line with the typed
+      quantity — so no line is ever unsaved. Deleted: the drawer, the keep-open
+      checkbox and its `localStorage` preference, the open/close functions, the
+      afterRequest close, the action-bar Add line button and its anchor
+      interceptor, and the out-of-band picker copy. A draft record page no longer
+      offers a header action. Done in `34b19ff`.
+- [ ] **S5b — A1: a repeat product increments instead of 400.** The domain rule
+      (one line per product) stays. A repeat add merges into the existing line
+      only when the resolved cost equals that line's cost; a different cost keeps
+      the 400, because that is exactly the case the rule exists to catch — one
+      product cannot carry two prices on one purchase. The merge needs a visible
+      notice so it is not magic.
 - [ ] **S6 — List row + status palette.** Responsive grid row (identifier,
       supplier, date/items, total, state); the total stops encoding payment
       state; a status chip carries paid / pending / overdue; the new warning
@@ -277,7 +285,8 @@ item out as domain work rather than presentation.
 | S3 | **done** | `ee90d3e` (part A) + `4a8ec2e` (part B) — 5 files. Worker observed RED for both parts (drawer headers `left: ["Producto", "SKU", …]`; `/purchases` missing the peek shell) then GREEN. `gentle-ai-verify` verdict *pass-with-caveats* on `cargo test` 842 passed / 0 failed: header/cell counts read as 4 and 4 in both tables, exactly 4 deleted lines, no nested anchor, Escape handlers statically disjoint, no new route or Tailwind utility, guard green. Both caveats fixed before commit: an orphan wrapper `div` left by the deleted `Open` anchor, and a smoke comment/assertion that still claimed the drawer rendered SKU (the token matched the product's name, so it proved nothing). Parent review also caught the writer titling the new shell `Compra` — new Spanish on an English page — and changed it to `Purchase`. |
 | S4 | **done** | `7ae7c62` — 5 files. Worker RED for three contract tests, then GREEN. First verification pass returned **FAIL**: `cargo test` was red on `web_create_draft_form_asks_only_supplier_and_purchase_date`, a pre-existing test that pinned the deleted card and forbade the invoice field the page must now have. The fix round rewrote it to the new contract (keeping the prohibition that still matters: no payment decision in the creation form), pinned `/purchases/new`'s 403, and extracted the guard's non-vacuity decision into `wiring_is_vacuous` with a three-boundary mutation pin. Second pass verdict *pass* on `cargo test` 848 passed / 0 failed, run twice by the verifier. |
 | S4b | not started | — |
-| S5 | not started | — |
+| S5a | **done** | `34b19ff` — 5 files, 614 changed lines (over the 400 budget; one indivisible work unit, reported not compressed). Verifier verdict **pass** on `cargo test` 849 passed / 0 failed **and** the browser suite: `uv run pytest tests/test_picker.py` → 6 passed in Chromium against the working-tree binary. The verifier confirmed the browser-silent contracts by source (the ids the results fragment's `hx-include` and htmx's id-based re-focus depend on, and the `hx-disinherit` rule), that the shared macro and the sale record are untouched, and that the preview test's narrowed slice is a strict subset that hides no payment input. It named one coverage gap — the record page-action slot was pinned in neither direction — closed before the commit. |
+| S5b | not started | — |
 | S6 | not started | — |
 | S7 | not started | — |
 | S8 | not started | — |
