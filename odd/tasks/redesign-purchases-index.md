@@ -161,6 +161,13 @@ item out as domain work rather than presentation.
   ceremony, ordinary checks only.
 - No push and no PR unless the user asks. Delivery is work-unit commits on
   `feat/redesign-purchases-index`.
+- **The 400-line budget is not holding for this feature.** S5a shipped 614 and
+  S5b 608 changed lines. Both are single indivisible work units — the template
+  change and the Rust flag rename cannot be separated without a broken
+  intermediate, and the merge rule plus its notice plus its tests are one
+  behaviour — so they are reported rather than compressed, per the skill's rule
+  that the budget is not code-golf. Recorded here so the pattern is visible
+  rather than discovered at PR time.
 - **A "do not run the whole suite" instruction must come with the right filter.**
   S4's first round ran only `purchases_new`, `create_purchase` and the guard, and
   missed a red test in the same file that pinned the markup the slice deleted —
@@ -234,12 +241,15 @@ item out as domain work rather than presentation.
       afterRequest close, the action-bar Add line button and its anchor
       interceptor, and the out-of-band picker copy. A draft record page no longer
       offers a header action. Done in `34b19ff`.
-- [ ] **S5b — A1: a repeat product increments instead of 400.** The domain rule
+- [x] **S5b — A1: a repeat product increments instead of 400.** The domain rule
       (one line per product) stays. A repeat add merges into the existing line
       only when the resolved cost equals that line's cost; a different cost keeps
       the 400, because that is exactly the case the rule exists to catch — one
-      product cannot carry two prices on one purchase. The merge needs a visible
-      notice so it is not magic.
+      product cannot carry two prices on one purchase. The rejection reuses the
+      same function the strict path uses, so the message cannot drift. The merge
+      renders a server-rendered notice naming the product and the new quantity.
+      The web route merges; the JSON API keeps the strict 400 deliberately. Done
+      in `9eb8187`.
 - [ ] **S6 — List row + status palette.** Responsive grid row (identifier,
       supplier, date/items, total, state); the total stops encoding payment
       state; a status chip carries paid / pending / overdue; the new warning
@@ -286,7 +296,7 @@ item out as domain work rather than presentation.
 | S4 | **done** | `7ae7c62` — 5 files. Worker RED for three contract tests, then GREEN. First verification pass returned **FAIL**: `cargo test` was red on `web_create_draft_form_asks_only_supplier_and_purchase_date`, a pre-existing test that pinned the deleted card and forbade the invoice field the page must now have. The fix round rewrote it to the new contract (keeping the prohibition that still matters: no payment decision in the creation form), pinned `/purchases/new`'s 403, and extracted the guard's non-vacuity decision into `wiring_is_vacuous` with a three-boundary mutation pin. Second pass verdict *pass* on `cargo test` 848 passed / 0 failed, run twice by the verifier. |
 | S4b | not started | — |
 | S5a | **done** | `34b19ff` — 5 files, 614 changed lines (over the 400 budget; one indivisible work unit, reported not compressed). Verifier verdict **pass** on `cargo test` 849 passed / 0 failed **and** the browser suite: `uv run pytest tests/test_picker.py` → 6 passed in Chromium against the working-tree binary. The verifier confirmed the browser-silent contracts by source (the ids the results fragment's `hx-include` and htmx's id-based re-focus depend on, and the `hx-disinherit` rule), that the shared macro and the sale record are untouched, and that the preview test's narrowed slice is a strict subset that hides no payment input. It named one coverage gap — the record page-action slot was pinned in neither direction — closed before the commit. |
-| S5b | not started | — |
+| S5b | **done** | `9eb8187` — 5 files, 608 changed lines (over budget; one indivisible work unit). Verifier verdict *pass* on `cargo test` 854 passed / 0 failed and the browser suite 7 passed, having checked the equality branch (`Decimal` numeric equality, no tolerance), that the different-cost arm returns through the same function so the message cannot drift, that the `unreachable!` is genuinely unreachable, that the out-of-band notice cannot leak into the `hx-select` main swap (traced in the vendored htmx 1.9.12), and that `add_line` is byte-identical apart from the extracted helper. It raised three findings, all fixed before the commit: a new dead-code warning (`changed_with_entry_row` orphaned by `changed_with_notice`), the merge notice's escaping untested, and an undocumented ordering divergence — `add_or_increment_line` resolves the cost before the uniqueness check because the merge needs it, so a repeat with an invalid explicit cost reports the cost error rather than the duplicate one. |
 | S6 | not started | — |
 | S7 | not started | — |
 | S8 | not started | — |
