@@ -4524,6 +4524,46 @@ mod tests {
         );
     }
 
+    /// AC1: the shared page action speaks the mint accent with a dark label —
+    /// the rest of the system is mint (`roya ◆`, the active nav entry, the
+    /// success notice), and neither green survives white text (mint on white
+    /// is about 1.4:1), so the label rides the background token. Asserted on
+    /// the action's own opening tag: the component is shared, so a blue or
+    /// white-labelled action on ANY page is a defect this catches at the
+    /// source.
+    #[tokio::test]
+    async fn purchases_page_action_is_mint_with_a_dark_label() {
+        let state = test_state().await;
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "purchases.create"],
+        )
+        .await
+        .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) =
+            get_html_as(app, "/purchases", Some(&test_support::cookie_for(&holder))).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let action = element_tag_containing(&html, "data-page-action");
+        assert!(
+            action.contains("bg-accent "),
+            "the primary action must carry the mint accent, not blue: {action}"
+        );
+        assert!(
+            action.contains("text-bg"),
+            "the label must read the background token — no green survives white text: {action}"
+        );
+        assert!(
+            !action.contains("bg-accent2"),
+            "the primary action must not be blue any more: {action}"
+        );
+        assert!(
+            !action.contains("text-white"),
+            "the label must not stay white on mint: {action}"
+        );
+    }
+
     // -- S3: the purchases list opens the read-only document peek -------------
 
     /// The peek shell lives on `/purchases` and mirrors the documents drawer:
