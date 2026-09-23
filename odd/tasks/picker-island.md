@@ -203,9 +203,10 @@ by its own test, so the surviving path is pinned rather than assumed.
 
 - [x] T1 — Lock the wire contract and the island boundary (this document's
       "Locked design decisions" and the Enter decision resolved).
-- [ ] T2 — `GET /web/product-search.json?q=`: the JSON search route, envelope
+- [x] T2 — `GET /web/product-search.json?q=`: the JSON search route, envelope
       `{"query", "products"}` matching the existing API convention, plus Rust
       tests for name/SKU/barcode matching and the empty-query negative. Red first.
+      Closed in `9a53c5b`.
 - [ ] T3 — The island module and the **sale** page cutover: `static/picker.js`
       (state, debounced fetch, render, derived focus and status, submit via
       `requestSubmit`), the Tailwind `@source` line and rebuilt stylesheet, the
@@ -238,3 +239,20 @@ large ones and the review workload guard applies:
   typed name, because the island now owns `product_id` and the two paths no
   longer compete. Delivery agreed as three chained slices with one commit per
   task on `feat/picker-island`.
+- 2026-09-24: T2 closed in `9a53c5b`. Slice 1 complete: the JSON route is a pure
+  addition, so nothing on screen changed and it is independently revertible.
+  The `q`/`product` alias resolution was extracted into `resolve_search_query`
+  and is now shared by both routes.
+
+## Verification evidence
+
+- **T2, red first**: `cargo test n5_product_search_json` → 3 failed / 0 passed,
+  every failure `404 route not found` (the route did not exist). Not a
+  compile error and not a wrong assertion — the right reason.
+- **T2, green**: `cargo test n5_product_search_json` → 3 passed.
+- **T2, full suite**: `cargo test` → **889 passed** (886 before, +3 new), no
+  failures. The refactor of the shared query resolution touched the existing
+  HTML route, so the full suite is the check, not a filtered one.
+- **T3 unblocked**: `tailwindcss` v4.3.3 is installed at
+  `~/.local/bin/tailwindcss`, so `scripts/build-css.sh` can rebuild
+  `static/tailwind.css` after the `@source` line is added.
