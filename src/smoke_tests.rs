@@ -5057,6 +5057,22 @@ fn purchase_row_html(html: &str, purchase_id: i64) -> String {
     html[start..end].to_string()
 }
 
+/// The row anchor's OPENING tag, cut around the row's stable id. Colour
+/// assertions must read this tag, not a span inside the row: the whole row is
+/// an anchor, so its inherited or declared text colour paints the identifier,
+/// the supplier and the meta line — and a class on one inner span (the
+/// total's) once passed for the row's colour.
+fn purchase_row_opening_tag(html: &str, purchase_id: i64) -> String {
+    let id_pos = html
+        .find(&format!("id=\"purchase-{purchase_id}\""))
+        .unwrap_or_else(|| panic!("purchase row {purchase_id} missing from the list"));
+    let start = html[..id_pos]
+        .rfind("<a ")
+        .unwrap_or_else(|| panic!("a purchase row is an anchor"));
+    let end = id_pos + html[id_pos..].find('>').expect("unterminated anchor tag");
+    html[start..=end].to_string()
+}
+
 async fn add_purchase_line_via_web(app: &Router, purchase_id: i64, product_id: i64, qty: &str) {
     let body = format!("purchase_id={purchase_id}&product_id={product_id}&qty={qty}");
     let (status, resp) = post_form(app, "/web/purchases/lines", &body).await;
@@ -5389,6 +5405,24 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
     assert!(
         draft_row.contains(&format!("href=\"/purchases/{draft}\"")),
         "{draft_row}"
+    );
+
+    // AC1b: the row anchor names the normal text colour itself. The stylesheet
+    // makes every anchor blue (`a { @apply text-accent2 … }`), and because the
+    // whole row is an anchor, the identifier, the supplier and the meta line
+    // inherit that blue unless the row's own class says otherwise — the same
+    // `text-text` products and suppliers name on their rows. Read on the
+    // row's OPENING tag, not a span inside it: the total's class once passed
+    // for the row's colour.
+    let draft_tag = purchase_row_opening_tag(&all, draft);
+    assert!(
+        draft_tag.contains("text-text"),
+        "the row anchor must name the normal text colour so identifier, supplier \
+         and meta line stop inheriting the anchor blue: {draft_tag}"
+    );
+    assert!(
+        draft_tag.contains("no-underline hover:no-underline"),
+        "the row keeps its no-underline peek contract: {draft_tag}"
     );
 
     // Exactly one chip per row, and each state gets its own colour. The owed
