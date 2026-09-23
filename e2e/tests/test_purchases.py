@@ -894,3 +894,83 @@ def test_editing_a_draft_header_in_place_updates_the_document(page: Page, api: A
     assert stored["purchase"]["notes"] == "changed in place", stored
     # The due date is decided at confirm: a header edit must not touch it.
     assert stored["purchase"]["due_date"] == "2024-06-01", stored
+
+
+def test_editing_a_line_inline_keeps_every_id_on_the_page_unique(
+    page: Page, api: ApiClient
+) -> None:
+    """An inline line edit must swap only the money region, not the whole body.
+
+    The add-line form consumes the response with `hx-select="#purchase-record-money"`.
+    The inline qty and unit-cost inputs did not select anything, so the whole
+    record body — the header included — was inserted as the money region's
+    `innerHTML`, and every id on the page came back a second time: two
+    `#purchase-header`, two `#purchase-record-inner`, two
+    `#purchase-record-money`, and so on.
+
+    Duplicate ids are not cosmetic. They make every id-based lookup ambiguous:
+    `hx-include="#line-qty-{id}, #line-cost-{id}"` matches two elements,
+    `hx-target` resolves to whichever comes first, and the picker island's
+    `mount()` would mount the duplicated `[data-picker]`. The page is corrupt
+    until it is reloaded. This is the same family as the hidden-id defect the
+    picker work retired: an id lookup silently resolving to the wrong element.
+
+    The assertion is on the counts rather than on the attributes, because the
+    attribute can be present while the behaviour is still wrong; the counts
+    cannot. This is also the first browser test of the inline edit at all — the
+    Rust suite only pins that the inputs exist in the markup.
+    """
+    product = create_product(
+        api,
+        sku="INLINE-SKU",
+        name="Inline Widget",
+        sale_price="20.00",
+        cost_price="5.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    supplier_id = create_supplier(api, "Inline Supplier")
+    purchase_id = create_purchase_draft(api, supplier_id, payment_type="Cash")
+    add_purchase_line(api, purchase_id, int(product["id"]), qty="2", unit_cost="6.00")
+
+    detail = api.get_json(f"/api/purchases/{purchase_id}")
+    line_id = int(detail["lines"][0]["id"])
+
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    unique_ids = [
+        "#purchase-record-inner",
+        "#purchase-header",
+        "#purchase-header-form",
+        "#purchase-record-money",
+        "#line-picker",
+    ]
+    before = {sel: page.locator(sel).count() for sel in unique_ids}
+    assert all(count == 1 for count in before.values()), (
+        f"the page must start with one of each id: {before}"
+    )
+
+    qty = page.locator(f"#line-qty-{line_id}")
+    expect(qty).to_have_value("2")
+    # Arm the expectation around the action: a listener armed after it races the
+    # response and times out (the T3 lesson recorded in the receiving-desk doc).
+    with page.expect_response(
+        _response_for(f"/web/purchases/{purchase_id}/lines/{line_id}", "PUT")
+    ):
+        qty.fill("7")
+        qty.press("Tab")  # the trigger is `change delay:400ms`
+
+    # Let the swap settle before counting. Counting first would race it.
+    page.wait_for_timeout(800)
+
+    after = {sel: page.locator(sel).count() for sel in unique_ids}
+    assert after == before, (
+        "an inline line edit duplicated the record body, so every id on the page "
+        f"is now ambiguous: before={before} after={after}"
+    )
+
+    # And the edit actually landed: the guard must not pass by doing nothing.
+    expect(page.locator(f"#line-qty-{line_id}")).to_have_value("7")
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert Decimal(str(stored["lines"][0]["qty"])) == Decimal("7"), stored
