@@ -110,17 +110,25 @@ struct ProductSearchResultsPartial {
 
 /// The picker island's wire row (N5). Flattened on purpose: the island renders a
 /// name, a SKU, one price and a stock figure, so the wire carries exactly that
-/// instead of the whole `ProductStock` with its nested product. Both prices
-/// travel and the island picks by its own context, which is what keeps the
-/// `price` parameter off the request entirely.
+/// instead of the whole `ProductStock` with its nested product.
+///
+/// The money fields are already in display form. The island renders them
+/// verbatim, so the server keeps the single formatting rule (`money_display`
+/// normalises a stored value up to exactly two decimals) instead of the island
+/// reimplementing it in JS and drifting. `stock` is deliberately NOT normalised:
+/// the fragment renders the raw decimal (`stock {{ ps.stock }}`), so the wire
+/// carries the same raw form and the island shows the same digits.
+///
+/// Both prices travel and the island picks by its own context, which is what
+/// keeps the `price` parameter off the request entirely.
 #[derive(Debug, Serialize)]
 struct ProductSearchRow {
     id: i64,
     name: String,
     sku: String,
-    sale_price: Decimal,
-    cost_price: Decimal,
-    stock: Decimal,
+    sale_price: String,
+    cost_price: String,
+    stock: String,
 }
 
 /// One satellite cost row with the supplier fields the drawer needs to render it.
@@ -502,13 +510,20 @@ async fn web_product_search_json(
     let matches = state.inventory_service.search_products(&raw).await?;
     let products: Vec<ProductSearchRow> = matches
         .into_iter()
-        .map(|ps| ProductSearchRow {
-            id: ps.product.id,
-            name: ps.product.name,
-            sku: ps.product.sku,
-            sale_price: ps.product.sale_price,
-            cost_price: ps.product.cost_price,
-            stock: ps.stock,
+        .map(|ps| {
+            // The same helpers the fragment calls, so the island's verbatim
+            // render cannot differ from today's markup. Computed before the
+            // fields are moved out of `ps.product`, which the borrow needs.
+            let sale_price = ps.product.sale_price_display();
+            let cost_price = ps.product.cost_price_display();
+            ProductSearchRow {
+                id: ps.product.id,
+                name: ps.product.name,
+                sku: ps.product.sku,
+                sale_price,
+                cost_price,
+                stock: ps.stock.to_string(),
+            }
         })
         .collect();
     Ok(Json(serde_json::json!({
@@ -1887,14 +1902,53 @@ mod tests {
             assert_eq!(row["name"], "Yerba Picker", "{needle}: {json}");
             assert_eq!(row["sku"], "PICK-1", "{needle}: {json}");
 
-            let sale = row["sale_price"].as_str().expect("sale_price as string");
-            assert_eq!(sale.parse::<f64>().unwrap(), 25.0, "{needle}: {json}");
-            let cost = row["cost_price"].as_str().expect("cost_price as string");
-            assert_eq!(cost.parse::<f64>().unwrap(), 10.0, "{needle}: {json}");
+            // The island renders these strings verbatim, so they must be the
+            // display form and not a raw decimal: `money_display` normalises a
+            // stored value up to exactly two decimals, so a raw "25" would
+            // render "$25" where the fragment shows "$25.00".
+            assert_eq!(row["sale_price"], "25.00", "{needle}: {json}");
+            assert_eq!(row["cost_price"], "10.00", "{needle}: {json}");
 
             let stock = row["stock"].as_str().expect("stock as string");
             assert_eq!(stock.parse::<f64>().unwrap(), 0.0, "{needle}: {json}");
         }
+    }
+
+    /// N5: the island renders the wire strings verbatim, so the JSON's money must
+    /// be exactly what the HTML fragment already shows. Pinned against the
+    /// fragment itself rather than against a literal, so the two cannot drift:
+    /// if the server's display rule changes, this fails until the island's source
+    /// of truth changes with it. Stock is deliberately NOT normalised — the
+    /// fragment renders the raw decimal (`stock {{ ps.stock }}`), so the wire
+    /// carries the same raw form and the island shows the same digits.
+    #[tokio::test]
+    async fn n5_product_search_json_money_is_the_fragments_display_form() {
+        let state = test_state().await;
+        seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        let (_, json) = get_json(app.clone(), "/web/product-search.json?q=picker").await;
+        let row = &json["products"].as_array().expect("products array")[0];
+        let sale = row["sale_price"].as_str().expect("sale_price as string");
+        let cost = row["cost_price"].as_str().expect("cost_price as string");
+
+        // The default context works in the sale price; `price=cost` is the
+        // purchase context. Each must already render the wire string verbatim.
+        // The ` •` separator terminates the money string, so this pins the exact
+        // boundary: a wire "25" against a rendered "$25.00" fails here, where a
+        // bare "$25" substring check would pass for the wrong reason.
+        let (_, sale_html) = get_html(app.clone(), "/web/product-search?q=picker").await;
+        assert!(
+            sale_html.contains(&format!("${sale} •")),
+            "the sale context must already show ${sale} verbatim: {sale_html}"
+        );
+
+        let (_, cost_html) =
+            get_html(app.clone(), "/web/product-search?q=picker&price=cost").await;
+        assert!(
+            cost_html.contains(&format!("${cost} •")),
+            "the cost context must already show ${cost} verbatim: {cost_html}"
+        );
     }
 
     /// N5 negative: an empty query returns no products, not the catalogue. The

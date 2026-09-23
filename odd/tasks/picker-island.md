@@ -116,9 +116,16 @@ changes to the other screens.
 3. **Search transport is JSON.** New `GET /web/product-search.json?q=`. The
    handler is small because `inventory_service.search_products` already returns
    `Vec<ProductStock>`, which already derives `Serialize`.
-4. **The JSON carries both prices.** `sale_price` and `cost_price` both travel;
-   the island picks by `data-price-kind`. This removes the `price` query
-   parameter from the wire — one fewer smuggled value.
+4. **The JSON carries both prices, already in display form.** `sale_price` and
+   `cost_price` both travel; the island picks by `data-price-kind`. This removes
+   the `price` query parameter from the wire — one fewer smuggled value. The
+   strings are produced by the same `sale_price_display()` /
+   `cost_price_display()` helpers the fragment calls, so the island renders them
+   verbatim and the server keeps the single formatting rule. `money_display`
+   normalises a stored value up to exactly two decimals, so a raw `"25"` would
+   have rendered `$25` where the fragment shows `$25.00`. `stock` is deliberately
+   NOT normalised: the fragment renders the raw decimal, so the wire carries the
+   same raw form.
 5. **One add-line form, not one per row.** The shell renders a single
    `hx-post` form containing the picker input, qty, price and a hidden
    `product_id`. The island sets that hidden input from `state.selectedProductId`
@@ -243,6 +250,10 @@ large ones and the review workload guard applies:
   addition, so nothing on screen changed and it is independently revertible.
   The `q`/`product` alias resolution was extracted into `resolve_search_query`
   and is now shared by both routes.
+- 2026-09-24: the wire format refined in `2e5051c`. Money now travels in display
+  form (decision 4). The refinement was caught by asking what the island would
+  actually render: a raw decimal string would have silently changed `$25.00`
+  into `$25` on cutover.
 
 ## Verification evidence
 
@@ -253,6 +264,18 @@ large ones and the review workload guard applies:
 - **T2, full suite**: `cargo test` → **889 passed** (886 before, +3 new), no
   failures. The refactor of the shared query resolution touched the existing
   HTML route, so the full suite is the check, not a filtered one.
+- **Wire format, red first**: the new
+  `n5_product_search_json_money_is_the_fragments_display_form` was written and
+  **passed vacuously** — `"$25"` is a substring of the rendered `"$25.00"` — so
+  the assertion was tightened to terminate on the ` •` separator, after which it
+  failed for the right reason alongside the exact-string check (`left: "25"`,
+  `right: "25.00"`). Worth recording: a green test that cannot distinguish the
+  two states is not evidence, and only tightening it exposed that.
+- **Wire format, green**: `cargo test` → **890 passed**, 0 failed.
+- **Compile catch worth recording**: the first implementation moved `name` out of
+  `ps.product` before calling `sale_price_display()`, which borrows it —
+  `error[E0382]: borrow of partially moved value`. The display strings are now
+  computed before the fields move.
 - **T3 unblocked**: `tailwindcss` v4.3.3 is installed at
   `~/.local/bin/tailwindcss`, so `scripts/build-css.sh` can rebuild
   `static/tailwind.css` after the `@source` line is added.
