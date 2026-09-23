@@ -744,6 +744,88 @@ def test_typing_a_different_supplier_and_pressing_enter_creates_the_typed_one(
     expect(page.locator("#record-supplier")).to_have_value(typed_name)
 
 
+def test_a_typed_fragment_of_a_supplier_name_renders_the_search_results_and_picking_scopes_the_draft(
+    page: Page, api: ApiClient
+) -> None:
+    """The only test that resolves a supplier the way the browser does: by a fragment.
+
+    Every supplier test above types an EXACT name and submits — a journey that
+    never needs the results list, which is how the picker shipped with a
+    search that returned nothing in a browser: htmx sends the triggering
+    input's value under its own name (`supplier_name`), the endpoint read
+    only `q`, so the query was always empty and the fragment never rendered.\
+    The Rust endpoint tests call with `?q=` and pass regardless; only a real
+    keystroke on the real name can see the defect.
+
+    So this test types a FRAGMENT (not the whole name, so exact resolution can
+    never be the way forward) and applies the negative gate twice — a supplier
+    whose name shares nothing with the fragment must NOT appear in the
+    results, in the creation dialog and on the record header alike, so the
+    list is proven FILTERED by the query, not merely rendered. It then walks
+    both journeys the list enables: a clicked result in the creation dialog
+    creates the scoped draft, and the same fragment-driven pick on a draft's
+    header re-scopes the document. The stored records are read back through
+    the API so a UI-only assertion cannot pass.
+    """
+    homonym_a = "Almacén del Norte"
+    homonym_b = "Almacén del Sur"
+    non_matching = "Ferretería Central"
+    id_a = create_supplier(api, homonym_a)
+    id_b = create_supplier(api, homonym_b)
+    create_supplier(api, non_matching)
+    fragment = "Almacén"
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+    page.locator("button[data-page-action]").click()
+    dialog = page.locator("#new-purchase-dialog")
+    expect(dialog).to_be_visible()
+
+    # Type a fragment, not a name: the result list is the only way forward.
+    dialog.locator("#new-purchase-supplier").fill(fragment)
+    results = dialog.locator("#supplier-search-results")
+    expect(results).to_contain_text(homonym_a)
+    expect(results).to_contain_text(homonym_b)
+    # The negative gate: the query was APPLIED, not ignored into the roster —
+    # a supplier that cannot match the fragment stays out of the results.
+    expect(results).not_to_contain_text(non_matching)
+    expect(results).not_to_contain_text("No suppliers match")
+
+    # Click the match: the result's own form posts the picker's caller target,
+    # so the draft creation must not depend on the field's text at all.
+    with page.expect_response(_response_for("/web/purchases", method="POST")):
+        results.locator("button", has_text=homonym_a).click()
+    page.wait_for_url("**/purchases/*")
+    new_id = int(urlparse(page.url).path.rsplit("/", 1)[1])
+
+    record = api.get_json(f"/api/purchases/{new_id}")
+    assert int(record["purchase"]["supplier_id"]) == id_a, (
+        "the clicked result (not the fragment text) must scope the draft"
+    )
+    expect(page.get_by_role("heading", name="Draft purchase")).to_be_visible()
+    expect(page.locator("#record-supplier")).to_have_value(homonym_a)
+
+    # The header edit walks the SAME fragment-driven journey on the record:
+    # type a fragment, click a result, the header re-scopes to the pick.
+    supplier_field = page.locator("#record-supplier")
+    supplier_field.fill(fragment)
+    header_results = page.locator("#supplier-search-results")
+    expect(header_results).to_contain_text(homonym_b)
+    # The negative gate on the record page: the header's query filters too.
+    expect(header_results).not_to_contain_text(non_matching)
+    expect(header_results).not_to_contain_text("No suppliers match")
+
+    with page.expect_response(
+        _response_for(f"/web/purchases/{new_id}/header", method="POST")
+    ):
+        header_results.locator("button", has_text=homonym_b).click()
+
+    stored = api.get_json(f"/api/purchases/{new_id}")
+    assert int(stored["purchase"]["supplier_id"]) == id_b, stored
+    assert id_a != id_b, "the test is not discriminating: both clicks picked the same supplier"
+    expect(page.locator("#record-supplier")).to_have_value(homonym_b)
+
+
 def test_editing_a_draft_header_in_place_updates_the_document(page: Page, api: ApiClient) -> None:
     """The inline header (purchases-create-and-header T4, AC5).
 
