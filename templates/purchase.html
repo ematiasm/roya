@@ -61,6 +61,47 @@
     if (!elt || !elt.matches || !elt.matches('#purchase-record input[hx-put]')) return;
     elt.value = elt.defaultValue;
   });
+  {# Receiving-desk T2: the identity fields save themselves on blur. The
+     response swaps nothing (hx-swap="none" keeps focus alive), so the only
+     success feedback is this subtle indicator: a successful header save says
+     "Saved" for about two seconds, then goes quiet. `requestConfig.elt` is
+     read, not `detail.elt` — base.html's notice comment explains why
+     `detail.elt` is unreliable when a request swaps the element it came
+     from; the same trap applies here. #}
+  var headerSavedTimer = null;
+  document.addEventListener('htmx:afterRequest', function (evt) {
+    var detail = evt.detail || {};
+    var elt = detail.requestConfig && detail.requestConfig.elt;
+    if (!detail.successful || !elt || !elt.matches || !elt.matches('#purchase-header-form')) return;
+    var saved = document.getElementById('header-saved');
+    if (!saved) return;
+    saved.textContent = 'Saved';
+    if (headerSavedTimer) clearTimeout(headerSavedTimer);
+    headerSavedTimer = setTimeout(function () { saved.textContent = ''; }, 2000);
+  });
+  {# Empty-date guard: clearing the required date to retype it must not post
+     a save the route refuses with 400. `htmx:configRequest` runs before the
+     request is issued and its detail carries the requesting element as
+     `elt`, so preventDefault here cancels the post. The inline hint shows
+     next to the field and hides again once the field has a value. The
+     picker's own form also posts this route but is a different element, so
+     the guard never touches it. #}
+  document.addEventListener('htmx:configRequest', function (evt) {
+    var elt = evt.detail && evt.detail.elt;
+    if (!elt || !elt.matches || !elt.matches('#purchase-header-form')) return;
+    var date = document.getElementById('record-purchase-date');
+    if (date && date.value === '') {
+      evt.preventDefault();
+      var error = document.getElementById('record-purchase-date-error');
+      if (error) error.hidden = false;
+    }
+  });
+  document.addEventListener('input', function (evt) {
+    if (!evt.target || evt.target.id !== 'record-purchase-date') return;
+    if (evt.target.value === '') return;
+    var error = document.getElementById('record-purchase-date-error');
+    if (error) error.hidden = true;
+  });
   function toggleRecordMenu(evt) {
     if (evt) evt.stopPropagation();
     var menu = document.getElementById('record-menu');

@@ -143,6 +143,14 @@
         // generic notice, and if the server ever stops rendering the box the
         // generic notice comes back on its own.
         if (evt.detail.xhr && evt.detail.xhr.responseText.includes('data-notice-server')) return;
+        // A form can opt out of the generic "<action> saved" text with
+        // data-silent-save: the purchase header form saves on every field blur
+        // (receiving-flow T2), and one save per blur would raise one notice per
+        // blur — the page shows a subtle saved indicator instead. A form
+        // without the marker keeps its notice, and the data-notice-server
+        // tiebreak above stays ahead of this. Failures are unaffected: the
+        // error path below still names the action via data-action.
+        if (form.hasAttribute('data-silent-save')) return;
         notice('success', form.getAttribute('data-action') + ' saved');
       });
 
