@@ -226,6 +226,12 @@ async fn web_supplier_list(
 struct SupplierSearchQuery {
     #[serde(default)]
     q: String,
+    /// The picker input is named `supplier_name` because the same field feeds
+    /// the host's form (the creation dialog and the header edit both read
+    /// `supplier_name`); htmx sends the triggering input's value under its own
+    /// name, so both names reach the same search.
+    #[serde(default)]
+    supplier_name: String,
     #[serde(default)]
     action: String,
     #[serde(default)]
@@ -250,10 +256,20 @@ async fn web_supplier_search(
     _: RequireAny<(SuppliersRead, PurchasesCreate)>,
     Query(params): Query<SupplierSearchQuery>,
 ) -> Result<Html<String>, AppError> {
-    let raw = params.q.trim();
-    let matches = state.supplier_service.search_suppliers(raw).await?;
+    // The browser sends the triggering input under its own name
+    // (`supplier_name`); the documented `q` wins when present so page URLs
+    // keep working.
+    let raw = if params.q.trim().is_empty() {
+        params.supplier_name
+    } else {
+        params.q
+    };
+    let matches = state
+        .supplier_service
+        .search_suppliers(raw.trim())
+        .await?;
     let html = SupplierSearchResultsPartial {
-        query: raw.to_string(),
+        query: raw.trim().to_string(),
         matches,
         action: params.action.trim().to_string(),
         target: params.target.trim().to_string(),
@@ -1841,6 +1857,41 @@ mod tests {
         assert!(
             html.contains("Picker Supplier 00") && html.contains("Picker Supplier 01"),
             "both the active and the inactive match are searchable: {html:.800}"
+        );
+    }
+
+    /// The name the browser actually sends: htmx carries the triggering
+    /// input's value under its OWN name (`supplier_name`, the field the host
+    /// forms read), not under the documented `q` — so this is the pair that
+    /// passed while the browser's results never rendered.
+    async fn search_html_by_field_name(state: &AppState, query: &str) -> (StatusCode, String) {
+        let app = crate::routes::router(state.clone());
+        let uri = format!(
+            "/web/supplier-search?supplier_name={}&action=%2Fweb%2Fpurchases&target=%23purchase-header",
+            query.replace(' ', "%20")
+        );
+        get_html_as(app, &uri, Some(test_support::TEST_COOKIE)).await
+    }
+
+    /// The picker's input is named `supplier_name` (the host forms read it),
+    /// so the browser's search GET arrives as `supplier_name=`, never `q=`.
+    /// The endpoint tests here were all written with `?q=`, the documented
+    /// name, which is exactly why they passed while the browser saw an empty
+    /// roster: this pins the name the browser actually sends.
+    #[tokio::test]
+    async fn supplier_search_accepts_the_picker_field_s_own_name_supplier_name() {
+        let state = test_state().await;
+        seeded_suppliers(&state, 3).await;
+
+        let (status, html) = search_html_by_field_name(&state, "Supplier%2001").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("Picker Supplier 01"),
+            "the browser's param name must reach the search: {html:.800}"
+        );
+        assert!(
+            !html.contains("Picker Supplier 00"),
+            "the query was applied, not ignored: {html:.800}"
         );
     }
 

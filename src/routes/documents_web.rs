@@ -510,9 +510,13 @@ fn document_title(number: Option<&str>, id: i64) -> String {
 /// the multi-field forms (header, lines, payments, confirm) that page owns.
 /// The status arrives as its `Display` form — both families' status enums
 /// share the exact three names — so sale and purchase call the same helper.
+/// The draft label names the WHOLE document, not just its header: the record
+/// page is where the identity fields, the lines and the confirmation are
+/// worked on, and one order is one object — the header is not a separate
+/// thing from its lines (user correction on the draft drawer's wording).
 fn edit_affordance_link(status: &str, href: String) -> DrawerLink {
     let label = match status {
-        "Draft" => "Editar cabecera",
+        "Draft" => "Editar el documento",
         _ => "Abrir el documento",
     };
     DrawerLink {
@@ -528,7 +532,10 @@ fn edit_affordance_link(status: &str, href: String) -> DrawerLink {
 /// confirmed state's sentence, never to the draft's.
 fn edit_affordance_notice(status: &str) -> String {
     match status {
-        "Draft" => "Para editar la cabecera, agregar líneas o confirmar, abrí el documento.".to_string(),
+        // The document is the subject and its parts are the list — the same
+        // one-order emphasis as the link label above, which leads with the
+        // header no more.
+        "Draft" => "La cabecera, las líneas y la confirmación se editan en el documento.".to_string(),
         "Confirmed" => {
             "Para registrar pagos o ver el detalle completo, abrí el documento.".to_string()
         }
@@ -1625,8 +1632,12 @@ mod tests {
         assert!(html.contains("Eliminar borrador"), "{html:.800}");
         assert!(html.contains("Descartar"), "{html:.800}");
         assert!(
-            html.contains("Editar cabecera"),
+            html.contains("Editar el documento"),
             "the edit affordance is a button-styled link: {html:.800}"
+        );
+        assert!(
+            !html.contains("Abrir el documento"),
+            "the label is state-dependent: a draft edits, a confirmed one opens — the two states name one document differently: {html:.800}"
         );
         assert!(
             html.contains(&format!("hx-delete=\"/web/sales/{sale}\"")),
@@ -1648,7 +1659,10 @@ mod tests {
         assert!(!html.contains("Eliminar borrador"), "{html:.800}");
         assert!(!html.contains("Descartar"), "{html:.800}");
         assert!(!html.contains("hx-delete"), "{html:.800}");
-        assert!(html.contains("Editar cabecera"), "{html:.800}");
+        assert!(
+            html.contains("Editar el documento"),
+            "the edit affordance is a LINK every reader keeps, whatever their code: {html:.800}"
+        );
 
         // Cancel permission without create: "Descartar" yes, delete no.
         let canceller = test_support::seed_session_with_permissions(
@@ -2330,7 +2344,10 @@ mod tests {
             html.contains(&format!("hx-delete=\"/web/purchases/{}\"", purchase.id)),
             "{html:.800}"
         );
-        assert!(html.contains("Editar cabecera"), "{html:.800}");
+        assert!(
+            html.contains("Editar el documento"),
+            "the purchase mirror keeps the same state-labelled edit link: {html:.800}"
+        );
 
         // Reader only: no actions.
         let reader =
