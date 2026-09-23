@@ -12,12 +12,21 @@ the supplier list grows.
 
 Read from the tree on 2026-09-23, after `redesign-purchases-index` merged:
 
-1. **The primary action's colour is the only blue thing left.** The page action
-   in the shared `partials/page_header.html:29` is `bg-accent2` (`#60a5fa`), and
-   so is every other primary action (the dashboard's Add transaction, the
-   customer drawer's Collect, the record page's Confirm and Add line). The rest
-   of the system speaks the mint accent (`--color-accent`, the `roya ◆` logo, the
-   active nav entry, the success notice).
+1. **The primary action's colour was the last blue thing.** The page action in
+   the shared `partials/page_header.html:29` was `bg-accent2` (`#60a5fa`). The
+   rest of the system speaks the mint accent (`--color-accent`, the `roya ◆`
+   logo, the active nav entry, the success notice) — **and the base `button`
+   element style is already mint with a dark label**, so the blue buttons are
+   overrides fighting the base style, not a second palette. Verified count after
+   T1: **ten** templates still carry an explicit `bg-accent2 text-white` —
+   `dashboard.html` (Add transaction), `customer_detail.html` (Collect),
+   `product_detail.html` (Save product), `supplier_detail.html` (Pay supplier),
+   `purchase_detail.html` (Confirm ×2, Record payment ×2) and `sale_detail.html`
+   (Confirm, Record payment). Note that the record page's **Add line** is *not*
+   one of them: it is a bare `<button type="submit">` and therefore already
+   renders mint through the base element rule. Those ten are a decision the user
+   still owes, and the base-style fact is the argument: retiring the override
+   makes every action one colour without inventing one.
 2. **Starting a purchase costs a page.** `New purchase` navigates to
    `/purchases/new`, a four-field page, whose only required fields are the
    supplier and the date. Two of its four fields are the two the operator will
@@ -182,12 +191,23 @@ Order: T1 anywhere; T2 before T3 and T4, since both host the picker.
 - [ ] AC8: `cargo test` green and the FULL browser suite green at every slice,
       with the stylesheet regenerated wherever a class token was added.
 
+## Open decisions
+
+- **The ten remaining explicitly blue buttons.** They are the last override of
+  the base mint button style. Retiring the override in one pass makes every
+  action in the app one colour; leaving them makes the interface two-tone, with
+  the page action mint and the form submits blue. The user decides; it is
+  deliberately not folded into T1.
+
 ## Progress
 
 | Slice | Status | Commits / evidence |
 |-------|--------|--------------------|
-| T1 | not started | — |
-| T1b | not started | — |
+| T1 | **done** | `f1e27e7` — `page_header.html` to `bg-accent text-bg`, stylesheet regenerated. Verifier verdict *pass*: the whole-file stylesheet rule diff removes **zero** rules and adds exactly the two needed (so no other page lost a utility — checked mechanically over all 52 templates), the contrast goes from 2.54:1 (fails AA) to **12.40:1 (AAA)**, and the test asserts the rendered action tag in both directions. |
+| T1b | **done** | `ac49610` — the row anchor names `text-text`. The verifier measured mint = `--color-accent` (not the money green), confirmed the peek contract survived byte-identical apart from the added class, and confirmed the test asserts the **row's opening tag** rather than an inner span, which is the narrow check that let this ship. |
 | T2 | not started | — |
 | T3 | not started | — |
 | T4 | not started | — |
+
+Verified after both: `cargo test` 859 passed / 0 failed, full browser suite 85 passed / 0 failed / 4 skipped.
+
