@@ -55,7 +55,8 @@
              hx-trigger="input changed delay:250ms"
              hx-target="#supplier-search-results" hx-swap="innerHTML"
              hx-vals='{"action": "{{ action }}", "target": "{{ target }}", "include": "{{ include }}"}'
-             hx-on:keyup="if (event.key === 'Escape') this.value = ''" />
+             hx-on:keyup="if (event.key === 'Escape') this.value = ''"
+             hx-on:click="this.value = ''" />
     </div>
   </form>
   {# While the search request is in flight htmx adds `htmx-request` to this

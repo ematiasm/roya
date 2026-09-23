@@ -806,8 +806,20 @@ def test_a_typed_fragment_of_a_supplier_name_renders_the_search_results_and_pick
     expect(page.locator("#record-supplier")).to_have_value(homonym_a)
 
     # The header edit walks the SAME fragment-driven journey on the record:
-    # type a fragment, click a result, the header re-scopes to the pick.
+    # click the field, type a fragment, click a result, the header re-scopes
+    # to the pick.
     supplier_field = page.locator("#record-supplier")
+    # The header field arrives PRE-FILLED with the document's supplier, and
+    # clicking it must clear that default — the operator clicks to search for
+    # a DIFFERENT one. The click clears only the value: no debounced search
+    # fires for the emptied field, so the results region still shows its
+    # initial status rather than an empty-query reply.
+    expect(supplier_field).to_have_value(homonym_a)
+    supplier_field.click()
+    expect(supplier_field).to_have_value("")
+    expect(page.locator("#supplier-search-results")).to_contain_text(
+        "Type a supplier name."
+    )
     supplier_field.fill(fragment)
     header_results = page.locator("#supplier-search-results")
     expect(header_results).to_contain_text(homonym_b)
