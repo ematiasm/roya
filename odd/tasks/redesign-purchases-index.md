@@ -174,6 +174,22 @@ item out as domain work rather than presentation.
   so a green focused run hid a red suite until independent verification. For any
   slice that DELETES markup or renames a route, the focused filter must be chosen
   to include the tests that assert that markup, or the worker runs the full suite.
+- **Run the FULL browser suite for any slice that touches list markup.** Two
+  separate misses came from running one file: the focused filter above hid a red
+  Rust test in S4, and running only `tests/test_picker.py` hid a red browser
+  suite introduced by S3 that survived three slices — the purchase row became an
+  anchor while an e2e selector still expected a `div`. Both were found late and
+  by accident. The full browser suite takes about two minutes; there is no reason
+  to run less.
+- **Latent tag-based row selectors, left deliberately.** `e2e/tests/test_filters.py`
+  (`#sale-list-inner > div[id^="sale-"]`) and five in `e2e/tests/test_products.py`
+  assume their row is a `div`. They pass today because those rows still are divs,
+  and they will break loudly when a slice makes them anchors — the sale one when
+  S7 lands. Select on the row id, never on the tag.
+- **A latent template trap, recorded not fixed.** `purchase_list.html`'s chip
+  chain now ends in a muted `{% else %}` fallback. It is unreachable with the
+  three-variant enum, but Askama does not exhaustiveness-check templates, so a
+  future fourth variant would render a bare muted word with no compile error.
 
 ## Delivery strategy
 
@@ -250,10 +266,14 @@ item out as domain work rather than presentation.
       renders a server-rendered notice naming the product and the new quantity.
       The web route merges; the JSON API keeps the strict 400 deliberately. Done
       in `9eb8187`.
-- [ ] **S6 — List row + status palette.** Responsive grid row (identifier,
-      supplier, date/items, total, state); the total stops encoding payment
-      state; a status chip carries paid / pending / overdue; the new warning
-      token; the technical subtitle deleted from `/purchases` and `/sales`.
+- [x] **S6 — List row + status palette.** One row, three zones in reading order
+      (identifier, supplier with its meta line, money); the total is neutral; a
+      single status chip replaces the badge cloud and carries the residual
+      amount when something is owed; a new `--color-warning` token carries
+      "owed and not yet due"; the state is derived in the view layer with
+      `today` threaded in. The config subtitle went from `/purchases` and
+      `/sales`, and so did the list header's `totals derived (total − paid =
+      due)` clause. Done in `c0f6fc9`.
 - [ ] **S7 — Sales mirror.** The same row and peek on `/sales`.
 - [ ] **S8 — One language, one date format.** Centralized labels +
       `format_date`; English across the sidebar, the document groups, the peek's
@@ -268,9 +288,16 @@ item out as domain work rather than presentation.
 
 - [ ] AC1: no page renders a `REST API` card; the shell's `REST API ↗` link still
       renders exactly once.
-- [ ] AC2: `/purchases` and `/sales` render one row per record with aligned
-      columns at ≥900 px and a stacked reading order below, and no page scrolls
-      horizontally at 360 px.
+- [x] AC2: `/purchases` and `/sales` render one row per record with aligned
+      columns from `sm:` (640 px) up and a stacked reading order below, and no
+      page scrolls horizontally at 360 px. The columns arrive at `sm:`, not at
+      the `min-[900px]:` custom breakpoint the earlier draft named — a 360 px
+      row stacks cleanly either way and there is no reason to hold the aligned
+      form back to 900 px. Proven at runtime now, not argued: a browser test
+      sets a 360 px viewport, seeds a draft, an owed and a settled row plus a
+      deliberately long supplier name, and polls `scrollWidth <= clientWidth`
+      (nothing in the app hides horizontal overflow, so a real overflow fails
+      it).
 - [ ] AC3: the list total is not colored by payment state; a status chip carries
       paid / pending / overdue color.
 - [ ] AC4: a draft row shows a stable identifier when `purchase_number` is NULL.
@@ -297,7 +324,7 @@ item out as domain work rather than presentation.
 | S4b | not started | — |
 | S5a | **done** | `34b19ff` — 5 files, 614 changed lines (over the 400 budget; one indivisible work unit, reported not compressed). Verifier verdict **pass** on `cargo test` 849 passed / 0 failed **and** the browser suite: `uv run pytest tests/test_picker.py` → 6 passed in Chromium against the working-tree binary. The verifier confirmed the browser-silent contracts by source (the ids the results fragment's `hx-include` and htmx's id-based re-focus depend on, and the `hx-disinherit` rule), that the shared macro and the sale record are untouched, and that the preview test's narrowed slice is a strict subset that hides no payment input. It named one coverage gap — the record page-action slot was pinned in neither direction — closed before the commit. |
 | S5b | **done** | `9eb8187` — 5 files, 608 changed lines (over budget; one indivisible work unit). Verifier verdict *pass* on `cargo test` 854 passed / 0 failed and the browser suite 7 passed, having checked the equality branch (`Decimal` numeric equality, no tolerance), that the different-cost arm returns through the same function so the message cannot drift, that the `unreachable!` is genuinely unreachable, that the out-of-band notice cannot leak into the `hx-select` main swap (traced in the vendored htmx 1.9.12), and that `add_line` is byte-identical apart from the extracted helper. It raised three findings, all fixed before the commit: a new dead-code warning (`changed_with_entry_row` orphaned by `changed_with_notice`), the merge notice's escaping untested, and an undocumented ordering divergence — `add_or_increment_line` resolves the cost before the uniqueness check because the merge needs it, so a repeat with an invalid explicit cost reports the cost error rather than the duplicate one. |
-| S6 | not started | — |
+| S6 | **done** | `c0f6fc9` — 12 files. Verifier verdict *pass* on `cargo test` 858 passed / 0 failed and the full browser suite 85 passed / 0 failed / 4 skipped (pre-existing opt-in probes). The verifier proved the chip chain byte-identical for all three reachable states by diffing recovered Askama build artifacts, confirmed the two new browser tests are real gates (the 360 px one would fail on genuine overflow; the peek one fails if the row's `hx-get` goes), and confirmed the `Decimal::ZERO` bug was real. Findings fixed before the commit: a stale T3 comment, a stale README claim, the `Pending`/`Due` naming drift, and the two missing tests. |
 | S7 | not started | — |
 | S8 | not started | — |
 | S9 | not started (optional) | — |
