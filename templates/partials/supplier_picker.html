@@ -15,18 +15,22 @@
    - `action`   the caller's post target (the result forms post here too);
    - `target`   the region the caller's post swaps back (`hx-select`ed);
    - `field_id` the text input's id, so the caller can label and reach it;
-   - `current_name` / `current_id`  the current supplier rendered into the
-     field: the caller pre-fills (T3's last-used supplier, T4's stored one),
-     the name resolves server-side (`resolve_supplier_name`) and the hidden
-     input carries the current `supplier_id` as the fallback when the field
-     is cleared;
+   - `current_name`  the current supplier's name rendered into the field as
+     a real, editable value (T3's last-used supplier, T4's stored one): the
+     field's TEXT is the contract — the picker's own form posts only
+     `supplier_name`, which resolves server-side (`resolve_supplier_name`,
+     exact and case/diacritic-insensitive against a UNIQUE `suppliers.name`),
+     so Enter, the submit button and an accepted pre-fill all create the
+     RIGHT supplier. No hidden id rides in this form: an id wins only where
+     the operator explicitly clicked a result, whose own form carries its
+     `supplier_id` (partials/supplier_search_results.html);
    - `include`  the caller's other field(s) the posts must carry (T3's date
      and notes), passed through to the results so a clicked result submits
      the same fields; empty when the caller has none.
 
    The results container is a sibling of the form because a form inside a
    form is invalid HTML — the product picker's stated reason. #}
-{% macro supplier_picker(action, target, field_id, current_name, current_id, include) %}
+{% macro supplier_picker(action, target, field_id, current_name, include) %}
 {# Inheritance audit (the product picker's documented trap): the form's
    hx-target/hx-swap/hx-select leak into the field, and the inherited
    hx-select would filter the search GET to an element the results fragment
@@ -52,7 +56,6 @@
              hx-target="#supplier-search-results" hx-swap="innerHTML"
              hx-vals='{"action": "{{ action }}", "target": "{{ target }}", "include": "{{ include }}"}'
              hx-on:keyup="if (event.key === 'Escape') this.value = ''" />
-      <input type="hidden" name="supplier_id" value="{{ current_id }}" />
     </div>
   </form>
   {# While the search request is in flight htmx adds `htmx-request` to this

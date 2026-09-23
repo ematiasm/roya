@@ -33,7 +33,8 @@ use crate::models::{
     format_purchase_number, MovementReason, MovementType, NewMovement, NewPurchase,
     PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter,
     PurchasePayment, PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
-    PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, StaleLineCostView, UpdatePurchaseDraft,
+    PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, StaleLineCostView, Supplier,
+    UpdatePurchaseDraft,
 };
 
 /// What `add_or_increment_line` did with the request. The distinction matters
@@ -216,6 +217,24 @@ where
             )));
         }
         Ok(())
+    }
+
+    /// The supplier of the most recently created purchase (T3): the
+    /// creation dialog pre-fills its picker with it as the DEFAULT — a real,
+    /// visible, editable value, never a silent guess (the feature doc's
+    /// hazard: the supplier resolves every line's default cost, so a wrong
+    /// default would record the lines at the wrong supplier's cost and, at
+    /// confirm, overwrite that supplier's real price).
+    ///
+    /// Empty (None): no purchase has ever been created — an empty database
+    /// has no default, so the dialog opens with an empty supplier field and
+    /// the operator must choose.
+    pub async fn last_used_supplier(&self) -> AppResult<Option<Supplier>> {
+        let Some(supplier_id) = self.purchases.last_used_supplier_id().await? else {
+            return Ok(None);
+        };
+        let supplier = self.suppliers.get_supplier(supplier_id).await?;
+        Ok(Some(supplier))
     }
 
     // -- Draft -----------------------------------------------------------------

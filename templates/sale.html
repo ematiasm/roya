@@ -2,7 +2,16 @@
 {% block title %}Roya — {{ page_title }}{% endblock %}
 {% block content %}
 {# page_title, the breadcrumb and the action slot are struct fields, so the
-   shared page-header component reads them without locals. #}
+   shared page-header component reads them without locals. `page_action_dialog`
+   (T3) is NOT one of them: `SalePageTemplate` declares no such field, so this
+   local is the page's ONLY declaration — the component requires every
+   includer to provide the name, and this page's action navigates, so it is
+   empty. Trap for the next reader: if you ever add a `page_action_dialog`
+   field to `SalePageTemplate` (to open a dialog from this page), this local
+   would silently shadow it and the dialog would never open — route the new
+   value through this local or delete it, never add the field and assume it
+   wins. #}
+{% let page_action_dialog = "" %}
 {% include "partials/page_header.html" %}
 <div id="sale-record">
   {% include "partials/sale_detail.html" %}

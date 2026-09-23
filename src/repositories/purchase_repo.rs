@@ -115,6 +115,11 @@ pub trait PurchaseRepository: Send + Sync {
     async fn create_purchase(&self, actor: i64, input: &NewPurchase) -> AppResult<Purchase>;
     async fn find_purchase(&self, id: i64) -> AppResult<Option<Purchase>>;
     async fn find_purchase_by_number(&self, number: &str) -> AppResult<Option<Purchase>>;
+    /// The supplier of the most recently created purchase (T3's creation
+    /// dialog default), or None when no purchase exists yet — an empty
+    /// database has no default, and the dialog must open empty rather than
+    /// guess. `id DESC` matches the repo's id-ordered conventions.
+    async fn last_used_supplier_id(&self) -> AppResult<Option<i64>>;
     async fn list_purchases(&self) -> AppResult<Vec<Purchase>>;
     /// The same rows narrowed by the list filter, inside the repository query so
     /// only matching documents have their lines and payments loaded. The supplier
@@ -305,6 +310,16 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_purchase).collect())
+    }
+
+    async fn last_used_supplier_id(&self) -> AppResult<Option<i64>> {
+        #[cfg(test)]
+        self.tick();
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT supplier_id FROM purchases ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id,)| id))
     }
 
     async fn list_purchases_filtered(

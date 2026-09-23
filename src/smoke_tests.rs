@@ -98,6 +98,19 @@ async fn get(app: &Router, uri: &str) -> (StatusCode, String) {
     send(app, "GET", uri, None, false, String::new()).await
 }
 
+/// The opening tag that carries `needle`, for attribute assertions such as
+/// the creation action's `onclick` (the same helper the route tests use).
+fn element_tag_containing<'a>(html: &'a str, needle: &str) -> &'a str {
+    let pos = html
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle} not rendered: {html:.600}"));
+    let start = html[..pos]
+        .rfind('<')
+        .expect("the attribute must sit inside a tag");
+    let end = pos + html[pos..].find('>').expect("unterminated tag");
+    &html[start..=end]
+}
+
 /// FIX-4: a browser must be able to load the vendored assets before a session
 /// exists, so the property is asserted over HTTP and without any cookie. The
 /// route is on the public allowlist; `is_public` alone would not catch a
@@ -153,6 +166,29 @@ async fn post_form(app: &Router, uri: &str, body: &str) -> (StatusCode, String) 
         body.to_string(),
     )
     .await
+}
+
+/// POST a plain full-page form (no `HX-Request`): the redirect branch. The
+/// response's `Location` header is the assertion, not the body.
+async fn post_form_plain(app: &Router, uri: &str, body: &str) -> (StatusCode, String) {
+    let builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    let builder = test_support::with_cookie(builder);
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (status, location)
 }
 
 /// POST the way the drawer's inline edit form does: `HX-Request` plus
@@ -1442,16 +1478,9 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
             label: "purchases",
             path: "/purchases".to_string(),
             concrete_ids_are_defects: true,
-            external_selectors: vec![],
-        },
-        // The creation page: like the list, its URL carries no id and its form
-        // posts the collection endpoint (/web/purchases) with no data-bound id
-        // in any request target — the supplier roster renders as names/values,
-        // not as a typed id.
-        GuardedPage {
-            label: "purchase new page",
-            path: "/purchases/new".to_string(),
-            concrete_ids_are_defects: true,
+            // The creation dialog (T3) renders its own ids — the picker's
+            // results container and the dialog form's extra-fields wrapper —
+            // so every hx-include target resolves on the page itself.
             external_selectors: vec![],
         },
         GuardedPage {
@@ -3936,83 +3965,100 @@ async fn purchases_page_drops_the_rest_api_card() {
     );
 }
 
-/// The purchases-index redesign S4 (odd/tasks/redesign-purchases-index.md):
-/// "New purchase" is a real creation page at `/purchases/new` — a write gets a
-/// page, the list's primary action navigates to it, and the form posts the
-/// existing `POST /web/purchases` (payment type and due date are decided at
-/// confirm, invoice and notes are the two optional fields the POST accepts).
-/// The `#new-purchase` card leaves the list and the now-empty right column
-/// collapses, so the page renders a single column.
+/// The dialog creation flow (purchases-create-and-header T3): the `New
+/// purchase` primary action opens the creation dialog — a `<button>` with the
+/// mint classes the header component renders, onclick the dialog's
+/// `showModal()` — and the dialog holds the T2 supplier picker pre-filled
+/// with the LAST USED supplier plus the creation date. The form posts the
+/// existing `POST /web/purchases`, whose non-htmx branch lands the browser on
+/// the new draft's record.
 #[tokio::test]
-async fn purchases_new_page_renders_the_creation_form() {
+async fn purchases_dialog_offers_the_last_used_supplier_on_the_list_page() {
     let (app, pool) = test_app().await;
-    create_supplier_via_web(&app, &pool, "NewPageSup").await;
-    let (status, page) = get(&app, "/purchases/new").await;
-    assert_eq!(status, StatusCode::OK, "{page:.400}");
-    // The shell's page title, so the page header component drives the same
-    // h1 every other page renders.
-    assert!(
-        page.contains("data-page-title>New purchase</h1>"),
-        "the creation page must render the New purchase title in the shell: {page:.600}"
-    );
-    // The four fields, the same names `POST /web/purchases` already accepts.
-    for field in ["supplier_id", "purchase_date", "supplier_invoice_no", "notes"] {
-        assert!(
-            page.contains(&format!("name=\"{field}\"")),
-            "the creation form must render the {field} field: {page:.600}"
-        );
+    let first = create_supplier_via_web(&app, &pool, "FirstUsedSup").await;
+    let last = create_supplier_via_web(&app, &pool, "LastUsedSup").await;
+    // Two prior purchases, so the LAST used supplier is the one the dialog
+    // pre-fills. Created over the web with explicit dates to keep the rows
+    // deterministic; the drafts need no lines.
+    for (supplier, date) in [(first, "2024-05-01"), (last, "2024-05-02")] {
+        let body = format!("supplier_id={supplier}&purchase_date={date}");
+        let (status, location) = post_form_plain(&app, "/web/purchases", &body).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "create draft must redirect: {location}");
     }
-    // The form posts to the existing creation endpoint.
+
+    let (status, page) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    // The primary action is a button that opens the dialog — never a link to
+    // a creation page (AC2: none exists).
+    let tag = element_tag_containing(page.as_str(), "data-page-action");
     assert!(
-        page.contains("action=\"/web/purchases\""),
-        "the creation form must post to the existing /web/purchases endpoint: {page:.600}"
+        tag.contains("<button")
+            && tag.contains(
+                "onclick=\"document.getElementById('new-purchase-dialog').showModal()\""
+            )
+            && tag.contains("bg-accent"),
+        "the primary action must open the creation dialog with the mint classes: {tag}"
     );
-    // The supplier roster renders by name, like the old card did.
     assert!(
-        page.contains("NewPageSup"),
-        "the supplier select must list the roster: {page:.600}"
+        page.contains("data-page-action>New purchase</button>"),
+        "the action keeps its label: {page:.600}"
+    );
+    assert!(
+        !page.contains("/purchases/new"),
+        "nothing may link to the deleted creation page: {page:.600}"
+    );
+    // The dialog holds the shared supplier picker pre-filled with the LAST
+    // used supplier (the picker's text field carries the name — its form
+    // carries NO hidden id, so Enter resolves the field's text server-side).
+    assert!(
+        page.contains("id=\"new-purchase-dialog\""),
+        "the creation dialog must render: {page:.600}"
+    );
+    let field = element_tag_containing(page.as_str(), "id=\"new-purchase-supplier\"");
+    assert!(
+        field.contains("value=\"LastUsedSup\""),
+        "the picker must be pre-filled with the last used supplier's name: {field}"
+    );
+    assert!(
+        !page.contains("name=\"supplier_id\""),
+        "the picker's own form must not carry a hidden current id: {page:.600}"
+    );
+    assert!(
+        page.contains("name=\"purchase_date\""),
+        "the dialog must render the creation date: {page:.600}"
     );
 }
 
+/// With NO purchases yet there is no last used supplier: the dialog renders
+/// with an EMPTY supplier field and the operator must choose (never a silent
+/// guess — the feature doc's hazard).
 #[tokio::test]
-async fn purchases_new_page_replaces_the_list_card() {
+async fn purchases_dialog_with_no_purchases_opens_with_an_empty_supplier() {
     let (app, _pool) = test_app().await;
     let (status, page) = get(&app, "/purchases").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert!(
-        !page.contains("id=\"new-purchase\""),
-        "the New Purchase (Draft) card must not render on /purchases"
+        page.contains("id=\"new-purchase-dialog\""),
+        "the creation dialog must still render: {page:.600}"
     );
-    // The page action now points at the creation page (a plain <a>, the way
-    // page_header.html has always rendered it).
+    let field = element_tag_containing(page.as_str(), "id=\"new-purchase-supplier\"");
     assert!(
-        page.contains("href=\"/purchases/new\""),
-        "the page action must navigate to /purchases/new: {page:.600}"
+        field.contains("value=\"\""),
+        "with no purchases yet the picker must render empty: {field}"
     );
 }
 
+/// A plain (non-htmx) create posts the existing `POST /web/purchases` and
+/// lands the browser on the new draft's record (a 303 Location, not the htmx
+/// `HX-Redirect` header — that branch belongs to htmx callers and stays
+/// untouched). The explicit `supplier_id` here models a clicked result, the
+/// only path where an id wins.
 #[tokio::test]
-async fn purchases_new_page_collapses_the_list_to_one_column() {
-    let (app, _pool) = test_app().await;
-    let (status, page) = get(&app, "/purchases").await;
-    assert_eq!(status, StatusCode::OK, "{page:.400}");
-    // With the card gone the right column is empty, so the two-column grid
-    // class must not render at all.
-    assert!(
-        !page.contains("min-[900px]:grid-cols-[minmax(0,1fr)_360px]"),
-        "/purchases must not render the two-column grid class once the card is gone"
-    );
-}
-
-/// Creating through the new page's plain full-page form still lands on the new
-/// draft's record — a 303 Location, not the htmx `HX-Redirect` header (that
-/// branch belongs to the record page's own flows and stays untouched).
-#[tokio::test]
-async fn purchases_new_page_form_lands_on_the_record() {
+async fn dialog_create_lands_on_the_record() {
     let (app, pool) = test_app().await;
     let supplier = create_supplier_via_web(&app, &pool, "LandingSup").await;
     let body = format!(
-        "supplier_id={supplier}&purchase_date=2024-05-02&supplier_invoice_no=INV-9&notes=via+the+new+page"
+        "supplier_id={supplier}&purchase_date=2024-05-02&supplier_invoice_no=INV-9&notes=via+the+dialog"
     );
     let builder = test_support::with_cookie(
         Request::builder()
@@ -4044,7 +4090,7 @@ async fn purchases_new_page_form_lands_on_the_record() {
     let purchase_id: i64 = location["/purchases/".len()..]
         .parse()
         .unwrap_or_else(|_| panic!("the redirect must end in the purchase id: {location}"));
-    // The two optional fields the new page sends persist server-side.
+    // The two optional fields the dialog sends persist server-side.
     let (invoice, notes): (Option<String>, String) =
         sqlx::query_as("SELECT supplier_invoice_no, notes FROM purchases WHERE id = ?")
             .bind(purchase_id)
@@ -4052,7 +4098,340 @@ async fn purchases_new_page_form_lands_on_the_record() {
             .await
             .unwrap();
     assert_eq!(invoice.as_deref(), Some("INV-9"), "invoice no must persist");
-    assert_eq!(notes, "via the new page", "notes must persist");
+    assert_eq!(notes, "via the dialog", "notes must persist");
+}
+
+/// The two resolution refusals the dialog can hit (T3): a typed name that is
+/// not an exact supplier name is a 400 naming the value, and neither an id
+/// nor a name is the required-field refusal — in both cases NO purchase is
+/// created. The supplier is never silently guessed (the feature doc's
+/// hazard): an exact name resolves, anything else refuses.
+#[tokio::test]
+async fn web_create_purchase_resolves_a_typed_name_and_refuses_unknown_or_absent_suppliers() {
+    let (app, pool) = test_app().await;
+    create_supplier_via_web(&app, &pool, "Typed Name Sup").await;
+
+    // An exact typed name with no id resolves and creates.
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded"),
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from("supplier_name=Typed+Name+Sup"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "an exact typed name must resolve and create"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
+    let (supplier_id,): (i64,) =
+        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (name,): (String,) = sqlx::query_as("SELECT name FROM suppliers WHERE id = ?")
+        .bind(supplier_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        name, "Typed Name Sup",
+        "the draft must belong to the resolved supplier"
+    );
+
+    // An unknown name refuses with the 400 naming the value.
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded"),
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from("supplier_name=Missing+Supplier"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an unknown name must refuse");
+    let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let body = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        body.contains("Missing Supplier"),
+        "the refusal must name the value the operator typed: {body:.400}"
+    );
+
+    // Neither id nor name: the required-field refusal.
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded"),
+    );
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from("purchase_date=2024-05-02")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a post with neither id nor name must refuse"
+    );
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM purchases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        count, 1,
+        "the refusals must have created nothing: only the resolved-name draft exists"
+    );
+}
+
+/// The explicit supplier_id wins over a typed name (the picker's host
+/// contract, T2): a clicked result posts both, and the draft must belong to
+/// the id's supplier.
+#[tokio::test]
+async fn web_create_purchase_an_explicit_supplier_id_wins_over_the_typed_name() {
+    let (app, pool) = test_app().await;
+    let id_sup = create_supplier_via_web(&app, &pool, "IdSup").await;
+    create_supplier_via_web(&app, &pool, "NameSup").await;
+
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded"),
+    );
+    let body = format!("supplier_id={id_sup}&supplier_name=NameSup");
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "the post must succeed: {resp:?}"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
+    let (supplier_id,): (i64,) =
+        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(supplier_id, id_sup, "the explicit id must win over the typed name");
+}
+
+/// The picker's own rendered form (the Enter path, T3's hazard): the dialog
+/// arrives pre-filled with supplier A, the operator types a DIFFERENT exact
+/// name B and presses Enter inside the text field, and the created draft
+/// must belong to B. The body is built from the inputs the widget's own form
+/// actually carries — exactly what the browser submits — so a hidden
+/// `supplier_id` riding along in the picker's form would be seen here, and
+/// the pre-filled supplier must never win over the typed name.
+#[tokio::test]
+async fn dialog_enter_path_assigns_the_typed_supplier_not_the_pre_filled_one() {
+    let (app, pool) = test_app().await;
+    let prefilled = create_supplier_via_web(&app, &pool, "PrefilledEnterSup").await;
+    let typed = create_supplier_via_web(&app, &pool, "TypedEnterSup").await;
+    // A prior purchase, so the dialog pre-fills PrefilledEnterSup.
+    let (status, _) = post_form_plain(
+        &app,
+        "/web/purchases",
+        &format!("supplier_id={prefilled}&purchase_date=2024-05-01"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (_, page) = get(&app, "/purchases").await;
+    // The picker's OWN form (data-action "Save supplier") is what Enter
+    // submits; the Create draft button is the separate include form.
+    let pos = page
+        .find("data-action=\"Save supplier\"")
+        .expect("the picker's form renders in the dialog");
+    let form_start = page[..pos].rfind("<form").expect("the picker's form opens");
+    let form_end = form_start + page[form_start..].find("</form>").expect("the form closes");
+    let form = &page[form_start..form_end];
+
+    // Collect the form's inputs as (name, value) — the request Enter sends.
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut rest = form;
+    while let Some(i) = rest.find("<input") {
+        rest = &rest[i..];
+        let tag_end = rest.find('>').expect("unterminated input tag");
+        let tag = &rest[..=tag_end];
+        let name = tag
+            .split("name=\"")
+            .nth(1)
+            .map(|s| s.split('"').next().unwrap());
+        if let Some(name) = name {
+            let value = tag
+                .split("value=\"")
+                .nth(1)
+                .map(|s| s.split('"').next().unwrap())
+                .unwrap_or_default();
+            fields.push((name.to_string(), value.to_string()));
+        }
+        rest = &rest[tag_end..];
+    }
+    assert!(
+        fields.iter().any(|(n, _)| n == "supplier_name"),
+        "the picker's form must carry the text field: {fields:?}"
+    );
+
+    // The operator typed a different exact supplier: the text field's value
+    // is B; everything else travels as the widget rendered it.
+    let body = fields
+        .iter()
+        .map(|(name, value)| {
+            let value = if name == "supplier_name" {
+                "TypedEnterSup"
+            } else {
+                value
+            };
+            format!("{name}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let (status, location) = post_form_plain(&app, "/web/purchases", &body).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "Enter must create: {location}");
+    let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
+    let (supplier_id,): (i64,) =
+        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        supplier_id, typed,
+        "the draft must belong to the supplier the operator typed, never the pre-filled one"
+    );
+}
+
+/// The same Enter path with NO edit: the pre-filled text is the stored
+/// supplier's name and the form resolves it to that same supplier — the
+/// default keeps working without an id in the picker's form.
+#[tokio::test]
+async fn dialog_enter_path_with_the_unchanged_pre_fill_assigns_the_same_supplier() {
+    let (app, pool) = test_app().await;
+    let prefilled = create_supplier_via_web(&app, &pool, "UnchangedPrefillSup").await;
+    let (status, _) = post_form_plain(
+        &app,
+        "/web/purchases",
+        &format!("supplier_id={prefilled}&purchase_date=2024-05-01"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let (_, page) = get(&app, "/purchases").await;
+    let field = element_tag_containing(page.as_str(), "id=\"new-purchase-supplier\"");
+    assert!(
+        field.contains("value=\"UnchangedPrefillSup\""),
+        "the dialog must be pre-filled with the last used supplier: {field}"
+    );
+
+    // Enter submits the picker's own form carrying the pre-filled name —
+    // and nothing else but what the widget rendered.
+    let (status, location) = post_form_plain(
+        &app,
+        "/web/purchases",
+        "supplier_name=UnchangedPrefillSup",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "Enter must create: {location}");
+    let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
+    let (supplier_id,): (i64,) =
+        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        supplier_id, prefilled,
+        "the unchanged pre-fill must resolve to the same supplier"
+    );
+}
+
+/// The dialog may not carry a date, so an omitted `purchase_date` defaults to
+/// today server-side (the same default the collection endpoint always had —
+/// now load-bearing for the dialog).
+#[tokio::test]
+async fn web_create_purchase_omitting_the_date_defaults_to_today() {
+    let (app, pool) = test_app().await;
+    let supplier = create_supplier_via_web(&app, &pool, "DatelessSup").await;
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded"),
+    );
+    let resp = app
+        .clone()
+        .oneshot(
+            builder
+                .body(Body::from(format!("supplier_id={supplier}")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "an omitted date must still create"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
+    let (date,): (String,) = sqlx::query_as("SELECT purchase_date FROM purchases WHERE id = ?")
+        .bind(purchase_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    assert_eq!(date, today, "an omitted purchase_date must default to today");
+}
+
+/// `/purchases/new` is DELETED (AC2): the route answers 404 and nothing can
+/// link to a creation page that no longer exists.
+#[tokio::test]
+async fn purchases_new_page_is_deleted() {
+    let (app, _pool) = test_app().await;
+    let (status, body) = get(&app, "/purchases/new").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body:.400}");
 }
 
 #[tokio::test]

@@ -1,13 +1,23 @@
 {# Page header component: title, optional breadcrumb, exactly one primary action.
 
-   The including page declares the values as template locals before the include:
+   The including page declares the values as template locals before the include
+   (or as struct fields, the way the record pages carry them):
 
      {% let page_title = "Products" %}
      {% let page_breadcrumb_label = "Catalogue" %}   {# "" = no breadcrumb #}
      {% let page_breadcrumb_href = "" %}             {# "" = plain label #}
      {% let page_action_href = "#new-product" %}
      {% let page_action_label = "New product" %}     {# "" = no action #}
+     {% let page_action_dialog = "" %}               {# "" = the action navigates #}
      {% include "partials/page_header.html" %}
+
+   `page_action_dialog` (purchases-create-and-header T3): when non-empty the
+   action is a BUTTON that opens that dialog id (`showModal()`) instead of an
+   anchor that navigates — the same classes and the same `data-page-action`
+   marker, so the mint styling and the tests that read the marker are
+   untouched. An included template is compiled against every including page's
+   context, so EVERY page that includes this component must declare the name
+   (empty everywhere the action still navigates).
 
    Keeping one action slot is what keeps "the next obvious thing" in the same
    place on every page. #}
@@ -25,8 +35,14 @@
     <h1 class="m-0 truncate text-[26px] font-bold tracking-[-0.02em]" data-page-title>{{ page_title }}</h1>
   </div>
   {% if page_action_label != "" %}
+  {% if page_action_dialog != "" %}
+  <button type="button" onclick="document.getElementById('{{ page_action_dialog }}').showModal()"
+     class="rounded-[10px] bg-accent px-4 py-2 text-sm font-semibold text-bg"
+     data-page-action>{{ page_action_label }}</button>
+  {% else %}
   <a href="{{ page_action_href }}"
      class="rounded-[10px] bg-accent px-4 py-2 text-sm font-semibold text-bg no-underline hover:no-underline"
      data-page-action>{{ page_action_label }}</a>
+  {% endif %}
   {% endif %}
 </header>

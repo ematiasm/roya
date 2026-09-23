@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "partials/supplier_picker.html" as supplier_picker %}
 {% block title %}Roya — Purchases{% endblock %}
 {% block content %}
 {% let page_title = "Purchases" %}
@@ -61,6 +62,45 @@
     </div>
     {% endif %}
 </div>
+
+{# The creation dialog (purchases-create-and-header T3, locked decisions 5
+   and the hazard note): the primary action opens it, and CHOOSING is what
+   creates — the picker's post to the existing `POST /web/purchases` answers
+   `HX-Redirect` to `/purchases/{id}`, so a successful create lands on the
+   new draft's record.
+
+   The supplier is never silently guessed (the feature doc's hazard: the
+   supplier resolves every line's default cost): the picker arrives
+   pre-filled with the LAST USED supplier as a real, editable value (the
+   handler resolves the name server-side); with no purchases yet the field
+   renders empty and the operator must choose.
+
+   Host wiring, per the T2 picker's documented contract: the `include`
+   parameter is EMPTY — it must never carry a `supplier_id`, because htmx
+   accumulates colliding values instead of overwriting, and a clicked
+   result's own form already carries the explicit id that must win. The date
+   needs no field either: the route defaults an absent `purchase_date` to
+   today, and invoice/notes are edited on the record page. The Create draft
+   button posts only the picker's TEXT input (by id): the field's text is
+   the picker's whole contract — the picker's own form carries NO hidden
+   `supplier_id`, so Enter, the button and an accepted pre-fill all resolve
+   the typed (or pre-filled) name server-side and create the RIGHT supplier,
+   never the previous one. A clicked result posts its own explicit id, which
+   the route prefers. #}
+{% if page_action_dialog != "" %}
+<dialog id="new-purchase-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
+  <div class="flex flex-col gap-3">
+    <h2 class="text-lg font-semibold">New purchase</h2>
+    <p class="text-[13px] text-muted">The draft gets today's date; invoice and notes are edited on its page.</p>
+    {% call supplier_picker::supplier_picker("/web/purchases", "#new-purchase-dialog", "new-purchase-supplier", current_supplier_name, "") %}
+    <form hx-post="/web/purchases" hx-include="#new-purchase-supplier" hx-swap="none"
+          data-action="Create purchase" class="flex flex-col gap-2.5">
+      <button type="submit">Create draft</button>
+      <p class="text-[13px] text-muted">Creating opens the new draft's page.</p>
+    </form>
+  </div>
+</dialog>
+{% endif %}
 
 {# The purchase peek shell, the same pattern the documents drawer uses: a
    fixed right panel whose body the list rows swap the detail fragment into

@@ -533,9 +533,10 @@ def test_primary_actions_render_accent_colors_not_anchor_blue(
     confirm a purchase.
 
     One resolved-value nuance the assertion pins deliberately: the page action
-    is an anchor carrying `text-bg`, so its label resolves to `--color-bg`
-    (#0f1115 → rgb(15, 17, 21)) — a different dark than the base button's
-    #0a0f0d. Both are dark; neither is blue.
+    carries `text-bg` in both component shapes — a `<button>` on /purchases
+    (dialog mode, T3) and an `<a>` on pages whose action navigates — so its
+    label resolves to `--color-bg` (#0f1115 → rgb(15, 17, 21)) — a different
+    dark than the base button's #0a0f0d. Both are dark; neither is blue.
 
     The negative makes this a gate rather than a coincidence: no button on
     either page may compute to the old anchor blue, so any regression that
@@ -633,3 +634,107 @@ def test_purchase_list_row_renders_text_color_not_anchor_blue(
             f"the {kind} row renders the anchor blue — the exact defect this "
             "test exists to catch"
         )
+
+
+def test_new_purchase_opens_the_dialog_prefilled_with_the_last_used_supplier(
+    page: Page, api: ApiClient
+) -> None:
+    """The creation flow (purchases-create-and-header T3, AC3/AC4).
+
+    `New purchase` opens `#new-purchase-dialog` — no `/purchases/new` page
+    exists any more — and the dialog's supplier picker arrives pre-filled
+    with the LAST USED supplier as a real, editable value, never a silent
+    guess: the supplier is what resolves every line's default cost. Accepting
+    the pre-filled default (Create draft) posts the existing
+    `POST /web/purchases`, whose htmx branch answers `HX-Redirect`, so the
+    browser lands on the new draft's record page — where the supplier must
+    be the one the dialog offered. The stored record is read back through
+    the API so a draft created for the wrong supplier cannot pass.
+    """
+    # A purchase that already exists, so the dialog has a last used supplier
+    # to offer. Created through the API: the dialog flow itself is what the
+    # browser drives below.
+    supplier_name = "Dialog Default Supplier"
+    supplier_id = create_supplier(api, supplier_name)
+    create_purchase_draft(api, supplier_id, payment_type="Cash")
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+
+    action = page.locator("button[data-page-action]")
+    expect(action).to_have_text("New purchase")
+    action.click()
+    dialog = page.locator("#new-purchase-dialog")
+    expect(dialog).to_be_visible()
+
+    picker_input = dialog.locator("#new-purchase-supplier")
+    expect(picker_input).to_have_value(supplier_name)
+
+    # Arm the response expectation around the click: the listener must exist
+    # before the submit fires, or a fast response is missed and never seen.
+    with page.expect_response(_response_for("/web/purchases", method="POST")):
+        dialog.locator('form[data-action="Create purchase"]').get_by_role(
+            "button", name="Create draft"
+        ).click()
+    page.wait_for_url("**/purchases/*")
+    new_id = int(urlparse(page.url).path.rsplit("/", 1)[1])
+
+    # The record page IS the new draft's, and its supplier is the pre-filled
+    # one — the choosing created the right purchase.
+    record = api.get_json(f"/api/purchases/{new_id}")
+    assert int(record["purchase"]["supplier_id"]) == supplier_id, (
+        "the draft must belong to the supplier the dialog pre-filled"
+    )
+    expect(page.get_by_role("heading", name="Draft purchase")).to_be_visible()
+    expect(page.locator("#purchase-record")).to_contain_text(supplier_name)
+
+
+def test_typing_a_different_supplier_and_pressing_enter_creates_the_typed_one(
+    page: Page, api: ApiClient
+) -> None:
+    """The Enter path (purchases-create-and-header T3, the hazard).
+
+    The dialog arrives pre-filled with the LAST USED supplier; the operator
+    types a DIFFERENT exact name and presses Enter inside the text field.
+    That submits the picker's OWN form, whose only field is the text input:
+    the field's text resolves server-side, so the draft must belong to the
+    typed supplier — never the pre-filled one. The stored record is read
+    back through the API, so a draft created for the wrong supplier cannot
+    pass. (The picker's form once carried a hidden `supplier_id` for the
+    pre-filled supplier, which silently won over the typed name — this test
+    is the regression proof that the text is the contract.)
+    """
+    prefilled_name = "Enter Prefilled Supplier"
+    prefilled_id = create_supplier(api, prefilled_name)
+    create_purchase_draft(api, prefilled_id, payment_type="Cash")
+    typed_name = "Enter Typed Supplier"
+    typed_id = create_supplier(api, typed_name)
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+
+    page.locator("button[data-page-action]").click()
+    dialog = page.locator("#new-purchase-dialog")
+    expect(dialog).to_be_visible()
+    picker_input = dialog.locator("#new-purchase-supplier")
+    expect(picker_input).to_have_value(prefilled_name)
+
+    # Type the other supplier's exact name and press Enter: the picker's own
+    # form posts, the htmx branch answers `HX-Redirect` and the browser lands
+    # on the new draft's record.
+    picker_input.fill(typed_name)
+    # Arm the expectation around the Enter press: if the response lands
+    # before the listener is armed, expect_response times out waiting for an
+    # event that already happened.
+    with page.expect_response(_response_for("/web/purchases", method="POST")):
+        picker_input.press("Enter")
+    page.wait_for_url("**/purchases/*")
+    new_id = int(urlparse(page.url).path.rsplit("/", 1)[1])
+
+    record = api.get_json(f"/api/purchases/{new_id}")
+    assert int(record["purchase"]["supplier_id"]) == typed_id, (
+        "the draft must belong to the supplier the operator typed, "
+        f"not the pre-filled one ({prefilled_name})"
+    )
+    expect(page.get_by_role("heading", name="Draft purchase")).to_be_visible()
+    expect(page.locator("#purchase-record")).to_contain_text(typed_name)

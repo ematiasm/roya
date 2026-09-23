@@ -1910,22 +1910,28 @@ mod tests {
 
     /// The picker macro is shared by two hosts that do not exist yet (T3's
     /// creation dialog and T4's inline header), so its contract is pinned
-    /// the way the wiring drift tests pin source: the field is a text input
-    /// that searches as you type, a hidden input carries the current
-    /// supplier_id, and the macro takes the caller's action/target plus the
-    /// current name and id.
+    /// the way the wiring drift tests pin source: the field's TEXT is the
+    /// contract — the picker's own form carries only the text input and
+    /// NO hidden supplier_id (an id wins only on a clicked result, whose
+    /// own form carries it) — and the macro takes the caller's
+    /// action/target plus the current name.
     #[tokio::test]
-    async fn supplier_picker_macro_carries_the_field_search_hidden_id_and_caller_context() {
+    async fn supplier_picker_macro_carries_the_field_search_and_caller_context() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("templates/partials/supplier_picker.html");
         let picker = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
         // The macro's signature: caller's post target, swap target, field id,
-        // current name and id (plus the caller's extra fields to include).
+        // current name (plus the caller's extra fields to include) — and no
+        // current-id parameter: the field's text is the whole contract.
         assert!(
-            picker.contains("macro supplier_picker(action, target, field_id, current_name, current_id, include)"),
+            picker.contains("macro supplier_picker(action, target, field_id, current_name, include)"),
             "the macro takes the caller's context: {picker:.400}"
+        );
+        assert!(
+            !picker.contains("current_id"),
+            "no current-id parameter may remain: {picker:.400}"
         );
 
         // The field is a text input that searches as you type.
@@ -1941,10 +1947,13 @@ mod tests {
             "results swap into the picker's own results container: {picker:.400}"
         );
 
-        // A hidden input carries the current supplier_id.
+        // The picker's OWN form carries no supplier_id at all: the field's
+        // text resolves server-side, so Enter can never post a stale current
+        // id that would silently win over the typed name. A clicked result
+        // keeps its own explicit id (partials/supplier_search_results.html).
         assert!(
-            picker.contains("type=\"hidden\" name=\"supplier_id\" value=\"{{ current_id }}\""),
-            "the hidden input carries the current supplier_id: {picker:.400}"
+            !picker.contains("name=\"supplier_id\""),
+            "the picker's form must not carry any supplier_id input: {picker:.400}"
         );
 
         // The caller's post target and swap target drive the widget's form.
