@@ -219,11 +219,12 @@ by its own test, so the surviving path is pinned rather than assumed.
       `requestSubmit`), the Tailwind `@source` line and rebuilt stylesheet, the
       `line_picker` shell rewrite, the `sale_detail.html` call sites, and the e2e
       test. Vertical slice, red first. Closed in `db57ecf`.
-- [ ] T4 — The **purchase** page cutover: cut the entry row in
+- [x] T4 — The **purchase** page cutover: cut the entry row in
       `purchase_detail.html` over to the island shell, delete the `base.html`
       focus and in-flight handlers, rewrite the structural Rust tests in
       `purchases_web.rs` that assert the smuggled `hx-vals`, and correct the
       `static/picker.js` `htmx:load` comment to cover the purchase case.
+      Closed in `ef4d194`.
       **Rescoped twice.** First: the sale page's structural tests (`sales_web.rs`
       `n4_sale_record_offers_the_picker_instead_of_the_catalogue_select` and the
       sale half of `smoke_tests.rs` `line_picker_loads_a_sale_without_a_click`)
@@ -291,6 +292,34 @@ large ones and the review workload guard applies:
   worth keeping — **the plan's own instructions get checked against the code
   before they are delegated**, and two of the three corrections in this feature
   came from that check rather than from a failing test.
+- 2026-09-24: T4 closed in `ef4d194`. Both record pages are on the island. The
+  third and last rescope surfaced here, and it is the one worth generalising —
+  see "Lesson: scope shared test files per half" below.
+
+## Lesson: scope shared test files per half, not per file
+
+Three rescopes in this feature, all the same shape: I listed a **file** in a task
+when the thing that breaks is a **half of a test inside that file**, and the two
+halves belong to different pages, so they break in different tasks.
+
+- `src/smoke_tests.rs` holds `line_picker_loads_a_sale_without_a_click` (sale
+  half breaks in T3) **and** `purchase_line_picker_adds_lines_without_a_click`
+  (purchase half breaks in T4). Both times the file was out of scope when its
+  half broke.
+- `src/routes/sales_web.rs` and `src/routes/purchases_web.rs` are per-page, so
+  they were scoped correctly by accident.
+- Worse, both smoke tests are **multi-part**: each has a route-fragment half
+  asserting the `/web/product-search` response body and a record-page half
+  asserting the page markup. The route-fragment half is shared by both pages and
+  must stay byte-identical until T4b, so a rewrite scoped "to the file" or even
+  "to the test" would have destroyed the pin that the purchase-facing route body
+  was undisturbed.
+
+The generalisation, for the next feature: **when a task changes a page's markup,
+grep the whole test tree for that page's transport attributes and enumerate each
+matching assertion with its enclosing test name, not just the file.** A file that
+covers two pages is two surfaces. And when a test has parts, name the part in the
+scope — "rewrite the record-page half of X" — never the file or the test.
 
 ## Accepted debt
 
@@ -356,3 +385,26 @@ large ones and the review workload guard applies:
   `subtree: true`, which the island's own `render()` fed on every keystroke. It
   now rides `htmx:load`, with the vendored htmx 1.9.12 source read to confirm it
   fires for OOB content rather than assumed.
+- **T4, red first**: the new e2e test failed with the field still carrying
+  `hx-get=/web/product-search`, exactly the transport the change removes.
+- **T4, green (orchestrator-verified)**: `cargo test` → **890 passed, 0 failed**;
+  `scripts/e2e.sh` → **93 passed, 4 skipped, 0 failed** (the +1 over T3 is the new
+  purchase island test).
+- **T4, by inspection**: `base.html` has zero occurrences of
+  `pendingResultFocus`, `searchFailed`, and the picker `beforeRequest`/
+  beforeSwap/afterSwap target checks, while the Escape-clearing keydown handler
+  is intact; `purchase_detail.html` carries `data-picker` and
+  `data-price-kind="cost"` and the hidden `product_id`, with no transport on the
+  field and no `hx-swap-oob` on the row (the only two `hx-swap-oob` in that file
+  belong to the action bar); the Escape stand-down is still at
+  `purchase.html:99`; and the `static/picker.js` diff is comment-only, confirmed
+  by grepping the diff for class changes (none), so the committed stylesheet is
+  still current.
+- **T4, a helper that survived**: `assert_entry_row_is_empty_and_focused` needed
+  no change and passes, which makes it the pin that the entry-row contract came
+  through the cutover intact. Predicting this before delegating was the payoff of
+  reading the test first.
+- **T4, a brief that was wrong in the worker's favour**: the brief told the
+  worker to update the purchase parts of `e2e/tests/test_search_ux.py`, which has
+  none — every picker test in it runs against the sale page. The worker said so
+  instead of inventing work.
