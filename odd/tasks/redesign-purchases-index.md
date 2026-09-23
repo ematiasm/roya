@@ -290,10 +290,22 @@ item out as domain work rather than presentation.
       learned apply: the sale row becomes an anchor, so the tag-based e2e
       selector in `e2e/tests/test_filters.py` will break loudly, and the full
       browser suite must run for the slice that changes the row.
-- [ ] **S8 — One language, one date format. MEASURED: this is its own feature,
-      not a sub-slice of this one.** It amends two canonical specs and reaches
-      the identity module's error contract, so it needs its own feature doc and
-      its own OpenSpec change. The inventory, read from the tree on 2026-09-22:
+- [ ] **S8 — Localization. REFRAMED by user decision (2026-09-22), deferred to
+      its own planning session. This is no longer "translate the strings".** The
+      user's plan: a **new database table for business settings** holding the
+      business configuration (name, address, phone, email, tax id) and, in the
+      same place, the localization configuration — language, date format, number
+      format. Everything reads from there instead of from hardcoded strings.
+
+      That makes it a feature with a migration, a settings surface and a data
+      model, not a sweep of templates, and it deserves its own feature doc and
+      its own OpenSpec change. The open decision below still has to be answered
+      before any code: whether the localization setting governs **only visible UI
+      copy** or **also the API and identity error contract**, which today is
+      Spanish by spec.
+
+      Measured surface, read from the tree on 2026-09-22 — the inventory the
+      planning session starts from:
 
       **Operator copy in templates — 17 files:** `login.html`, `password.html`,
       `users.html`, `roles.html`, `account_detail.html` and the partials
@@ -375,9 +387,19 @@ and the full browser suite is 85 passed / 4 skipped; run both before touching
 anything, and run the FULL browser suite for any slice that changes list
 markup.
 
-If the user says "one language" or "centralized English", that is **S8** — and
-its checklist entry above says why it should start as its own feature with its
-own OpenSpec change rather than as a sub-slice here.
+If the user says "one language" or "centralized English", that is **S8** — but
+S8 is **reframed and deferred**: the user plans a business-settings table (name,
+address, phone, email, tax id) that also holds the localization configuration
+(language, date and number format), so it is a feature with a migration and its
+own planning session, not a sub-slice of this one. See its checklist entry for
+the measured surface and the open decision it must settle first.
+
+**Merge status**: nothing on this branch is merged, and nothing is pushed. All
+18 commits exist only in the local clone on `feat/redesign-purchases-index`;
+`main` still points at `3805380` and `origin` has no branch for this work. The
+tree was branched from `main` and `main` has not moved since, so merging is a
+clean fast-forward with no conflicts — a push plus a PR under the repo's normal
+convention.
 
 ## Progress
 
