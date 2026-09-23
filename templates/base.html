@@ -6,6 +6,7 @@
   <title>{% block title %}Roya{% endblock %}</title>
   <link rel="stylesheet" href="/static/tailwind.css" />
   <script src="/static/htmx.min.js"></script>
+  <script src="/static/picker.js"></script>
   {% block head %}{% endblock %}
 </head>
 <body class="bg-bg font-sans text-text">
@@ -224,11 +225,12 @@
           evt.preventDefault();
           picker.value = '';
           picker.focus();
-          // The field's own `hx-on:keyup` clears it when Escape is pressed there;
-          // setting the value programmatically does not fire `input`, so tell the
-          // debounced search that the field changed. Without this the field would be
-          // empty while the results still showed the previous matches.
           picker.dispatchEvent(new Event('input', { bubbles: true }));
+          // The dispatch is the whole handoff now: this handler's `input` event is
+          // what the picker island (static/picker.js) listens for, so a cleared
+          // field always asks the island for a fresh search. The purchase page's
+          // inline mirror still carries its own `hx-on:keyup` Escape clearing,
+          // which stays there until its own cutover.
         } else if (
           index >= 0 &&
           evt.key.length === 1 &&

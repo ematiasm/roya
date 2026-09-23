@@ -402,7 +402,9 @@ def test_focus_stays_on_the_same_product_across_a_replaced_result(
     # A first search establishes the results the operator can arrow into.
     picker.fill("Harn")
     expect(buttons).to_have_count(2)
-    first_product = buttons.nth(0).inner_text()
+    # The focused thing is a product, not a row: compare by the id the results
+    # carry, not the row text (whose whitespace depends on who rendered it).
+    first_product = buttons.nth(0).get_attribute("data-product-id")
 
     held = _hold_next_search(page)
     with page.expect_request("**/web/product-search*"):
@@ -420,7 +422,7 @@ def test_focus_stays_on_the_same_product_across_a_replaced_result(
     # to document.body.
     expect(buttons).to_have_count(2)
     expect(buttons.nth(0)).to_be_focused()
-    expect(buttons.nth(0)).to_contain_text(first_product)
+    expect(buttons.nth(0)).to_have_attribute("data-product-id", first_product)
     expect(page.locator("#product-search-status")).to_have_text("2 matches.")
 
     # Traversal still works from the restored focus: the next ArrowDown moves on to
@@ -607,9 +609,10 @@ def test_a_failed_search_resets_the_announced_state(
 ) -> None:
     """A failed request must not look like a search that never finishes.
 
-    The single live region is set to "Searching…" when the request goes out. If the
-    request fails there is no swap, so something has to replace that text or a
-    screen reader is told the search is still running forever.
+    The single live region carries "Searching…" while the request is in flight
+    (the island sets it from state when its fetch goes out). If the request
+    fails there is no swap, so the island must replace that text or a screen
+    reader is told the search is still running forever.
     """
     data = seed_harness_data(api)
     page.goto(f"{api.base_url}/sales/{data.sale_id}")

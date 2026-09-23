@@ -20,6 +20,7 @@ added a line" is always distinguishable from "the seed did".
 from __future__ import annotations
 
 import re
+import time
 from decimal import Decimal
 
 from playwright.sync_api import Page, expect
@@ -42,6 +43,20 @@ def _purchase_line_row(page: Page, product_name: str):
 def _line_for(api: ApiClient, sale_id: int, product_id: int) -> dict:
     detail = api.get_json(f"/api/sales/{sale_id}")
     return next(line for line in detail["lines"] if int(line["product_id"]) == product_id)
+
+
+def _wait_for_held(page: Page, held: list, count: int, message: str) -> None:
+    """Wait until `count` searches sit paused at the route handler.
+
+    Route interception hands the paused route to the test asynchronously: the
+    browser has already issued the request when `expect_request` returns, but
+    the Python-side handler may not have appended yet. Poll the list instead of
+    asserting immediately or sleeping a fixed duration.
+    """
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and len(held) < count:
+        page.wait_for_timeout(25)
+    assert len(held) == count, f"{message}: {held}"
 
 
 def test_a_scan_adds_the_line_and_leaves_the_picker_empty_and_focused(
@@ -75,6 +90,101 @@ def test_a_scan_adds_the_line_and_leaves_the_picker_empty_and_focused(
 
     line = _line_for(api, data.sale_id, data.product_id)
     assert Decimal(str(line["qty"])) == Decimal("2"), line
+
+
+def test_the_picker_island_owns_the_sale_search(page: Page, api: ApiClient) -> None:
+    """Slice T3: the picker island owns the sale page's client state.
+
+    Three guarantees, in the order an operator meets them:
+
+    - typing reads the island's own JSON route (`/web/product-search.json`)
+      and renders the same name / SKU / sale price / stock content the old
+      server fragment carried — the field no longer carries any declarative
+      htmx read;
+    - focus follows the product across a re-search and returns to the field
+      when that product leaves the results;
+    - clicking a match adds the line with the product id the island
+      selected, not the text the field happens to hold: the hidden-id
+      defect stays dead because the id travels from island state.
+    """
+    data = seed_harness_data(api)
+    page.goto(f"{api.base_url}/sales/{data.sale_id}")
+
+    picker = page.locator("#product-picker")
+    results = page.locator("#product-search-results")
+    status = page.locator("#product-search-status")
+    buttons = results.locator("button")
+
+    # The island owns the search: the field carries no declarative htmx
+    # read, so a keystroke cannot be answered by the old HTML fragment route.
+    expect(picker).not_to_have_attribute("hx-get", re.compile(r".*"))
+    expect(picker).not_to_have_attribute("hx-trigger", re.compile(r".*"))
+
+    # The read is the island's JSON route, and the rendered content is what
+    # the operator needs for a sale: name, SKU, sale price and stock.
+    with page.expect_request("**/web/product-search.json*") as request_info:
+        picker.fill("Harness")
+    assert request_info.value.url.endswith("q=Harness")
+
+    expect(buttons).to_have_count(2)
+    expect(results).to_contain_text(data.product_name)
+    expect(results).to_contain_text("HARNESS-WIDGET • $25.00 • stock 5")
+    expect(results).to_contain_text("Harness Spare")
+    expect(status).to_have_text("2 matches.")
+
+    # Focus follows the product across a replaced search. The request is held
+    # open so real focus can enter the stale results while the search is in
+    # flight — the state a fast typist is in.
+    held: list = []
+
+    def hold(route) -> None:
+        held.append(route)
+
+    page.route("**/web/product-search.json*", hold)
+
+    with page.expect_request("**/web/product-search.json*"):
+        picker.fill("Harn")
+    _wait_for_held(page, held, 1, "the search request was not held")
+    held[0].continue_()
+    expect(buttons).to_have_count(2)
+    first_product = buttons.nth(0).get_attribute("data-product-id")
+
+    with page.expect_request("**/web/product-search.json*"):
+        picker.fill("Harness")
+    picker.press("ArrowDown")
+    expect(buttons.nth(0)).to_be_focused()
+    _wait_for_held(page, held, 2, "the re-search request was not held")
+    held[1].continue_()
+
+    # The same product is still a match, so focus stays on it.
+    expect(buttons).to_have_count(2)
+    expect(buttons.nth(0)).to_be_focused()
+    expect(buttons.nth(0)).to_have_attribute("data-product-id", first_product)
+    expect(status).to_have_text("2 matches.")
+
+    # When the focused product leaves the results, focus returns to the field.
+    with page.expect_request("**/web/product-search.json*"):
+        picker.fill("Widget")
+    picker.press("ArrowDown")
+    expect(buttons.nth(0)).to_be_focused()
+    expect(buttons.nth(0)).to_contain_text("Harness Spare")
+    _wait_for_held(page, held, 3, "the third search was not held")
+    held[2].continue_()
+    expect(buttons).to_have_count(1)
+    expect(picker).to_be_focused()
+
+    # Clicking the match adds the line with the island's selected id and the
+    # quantity the operator typed. The field held "Harness Widget"-ish text
+    # that is no exact match on its own, so only the island-selected id can
+    # have produced this line.
+    page.locator("#line-qty").fill("3")
+    buttons.nth(0).click()
+
+    row = _line_row(page, data.product_name)
+    expect(row).to_have_count(1)
+    expect(row).to_contain_text(re.compile(r"HARNESS-WIDGET\s+3\s+\$"))
+    line = _line_for(api, data.sale_id, data.product_id)
+    assert Decimal(str(line["qty"])) == Decimal("3"), line
 
 
 def test_choosing_a_result_carries_the_typed_quantity(page: Page, api: ApiClient) -> None:
@@ -161,10 +271,12 @@ def test_a_search_is_not_announced_as_an_added_line(
 ) -> None:
     """The shared notice names the action that actually completed.
 
-    The picker's debounced search request runs inside the add-line form, and the
-    notice used to read that form's data-action for any request in it, so every
-    keystroke pause announced "Add line saved". A successful search must stay
-    silent; the add itself must still be announced.
+    The picker's search read is now the island's own fetch (static/picker.js),
+    so it never touches the notice machinery at all; the form post is the only
+    request the notice sees, and it must still be announced. (The search used
+    to run as an htmx GET inside the add-line form, and the notice used to read
+    that form's data-action for any request in it, so every keystroke pause
+    announced "Add line saved".)
     """
     data = seed_harness_data(api)
     page.goto(f"{api.base_url}/sales/{data.sale_id}")

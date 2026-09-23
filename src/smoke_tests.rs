@@ -4593,18 +4593,86 @@ async fn line_picker_loads_a_sale_without_a_click() {
     assert_eq!(status, StatusCode::OK);
     assert!(!empty.contains("SCAN-P"), "{empty}");
 
-    // The record page offers the field, its debounced search, the sibling results
-    // container and no catalogue select.
+    // The record page offers the picker island, its sibling results container
+    // and no catalogue select. The island owns the search now, so the page
+    // carries no declarative transport: the field carries no hx-get, trigger,
+    // target, vals or keyup handler, and the debounce lives in
+    // static/picker.js, not in markup. Escape is base.html's document-level
+    // keydown handler, which serves both pickers.
     let (status, page) = get(&app, &format!("/sales/{sale}")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !page.contains("<select name=\"product_id\""),
         "the catalogue select must be gone: {page:.600}"
     );
-    assert!(page.contains("hx-get=\"/web/product-search\""), "{page:.600}");
+
+    // The island's mount point carries its calling context: one picker,
+    // priced for a sale.
+    assert_eq!(
+        page.matches("data-picker").count(),
+        1,
+        "one island mount point: {page:.600}"
+    );
+    let container_pos = page
+        .find("data-picker")
+        .expect("the record page renders the island mount point");
+    let container_start = page[..container_pos]
+        .rfind('<')
+        .expect("the attribute must sit inside a tag");
+    let container_end =
+        container_start + page[container_start..].find('>').expect("unterminated tag");
+    let container_tag = &page[container_start..=container_end];
+    assert!(
+        container_tag.contains("id=\"line-picker\"")
+            && container_tag.contains("data-price-kind=\"sale\""),
+        "{container_tag}"
+    );
+
+    // The field carries no declarative search transport.
+    let input_pos = page
+        .find("id=\"product-picker\"")
+        .expect("the record page renders the picker field");
+    let input_start = page[..input_pos].rfind('<').expect("the id must sit inside a tag");
+    let input_end = input_pos + page[input_pos..].find('>').expect("unterminated tag");
+    let input_tag = &page[input_start..=input_end];
+    for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+        assert!(
+            !input_tag.contains(transport),
+            "the field must not carry {transport}: {input_tag}"
+        );
+    }
+
+    // The single add-line form keeps the server's contract: the post, the
+    // hidden island-owned product id and the default quantity.
+    let form_pos = page[..input_pos]
+        .rfind("<form")
+        .expect("the field sits in the add-line form");
+    let form_end = form_pos + page[form_pos..]
+        .find("</form>")
+        .expect("unterminated form");
+    let form = &page[form_pos..form_end];
+    assert!(
+        form.contains(&format!("hx-post=\"/web/sales/{sale}/lines\"")),
+        "{form:.600}"
+    );
+    assert!(form.contains("name=\"product_id\""), "{form:.600}");
+    assert!(
+        form.contains("name=\"qty\"") && form.contains("value=\"1\""),
+        "a scan and a click must both carry the default quantity: {form:.600}"
+    );
+
+    // The results container is a sibling of the form, never inside it.
+    assert!(
+        !form.contains("id=\"product-search-results\""),
+        "the results container must be a sibling of the picker form, never inside it: {form:.600}"
+    );
     assert!(page.contains("id=\"product-search-results\""), "{page:.600}");
-    assert!(page.contains("delay:"), "the search must be debounced");
-    assert!(page.contains("Escape"), "Escape must clear the field");
+
+    // The debounce moved with the island: the island file declares it.
+    assert!(
+        include_str!("../static/picker.js").contains("DEBOUNCE_MS = 250"),
+        "the search must be debounced by static/picker.js"
+    );
 
     // Scan 1: the reader types the barcode and presses Enter. The form carries the
     // field and the quantity, never a product id.
