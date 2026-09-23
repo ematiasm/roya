@@ -240,12 +240,12 @@ by its own test, so the surviving path is pinned rather than assumed.
       it asserts one `line-picker`, no `hx-swap-oob` on the row tag, `autofocus`,
       an empty value and the qty/cost ids, all of which the island shell
       preserves, so it becomes the pin that the entry-row contract survived.
-- [ ] T4b — Move the search coverage onto the route that survives. The HTML
-      route has **nine consumers**, not the two the earlier note assumed, and
-      they do not share one fate: some cover behaviour that moved to the island
-      and is already proven in e2e, one is a shared fixture, and one needs
-      retargeting to the JSON route. Dispositions, enumerated so no coverage is
-      dropped silently:
+- [x] T4b — Move the search coverage onto the route that survives. Closed in
+      `3227470`. The HTML route has **nine consumers**, not the two the earlier
+      note assumed, and they do not share one fate: some cover behaviour that
+      moved to the island and is already proven in e2e, one is a shared fixture,
+      and one needed retargeting to the JSON route. Dispositions, enumerated so
+      no coverage was dropped silently:
       - **Delete** the two `GuardedPage` entries for the product-search fragment
         in `seed_wiring_fixture`, and the product-search part of
         `fragment_external_selectors_resolve_on_their_host_record_pages`. The
@@ -330,6 +330,45 @@ coverage loss inside the same diff.
 - 2026-09-24: T4 closed in `ef4d194`. Both record pages are on the island. The
   third and last rescope surfaced here, and it is the one worth generalising —
   see "Lesson: scope shared test files per half" below.
+- 2026-09-24: T4b closed in `3227470`. The plan called this "pure deletion" and
+  that was wrong in kind, not just in size: it is a coverage move with judgment
+  in it, because nine consumers use the HTML route and only some of them cover
+  behaviour that is now dead. The order was inverted — move the coverage first,
+  delete the path second — and T4c was split out for the deletion alone.
+
+## Lesson: a vacuous test is settled by mutation, not by argument
+
+This feature produced **three** tests that were green while unable to distinguish
+the correct state from the broken one:
+
+1. `n5_product_search_json_money_is_the_fragments_display_form` passed because
+   `"$25"` is a substring of the rendered `"$25.00"`. Caught by the author
+   re-reading the assertion and terminating it on the ` •` separator.
+2. `n5_product_search_json_folds_accents_and_case` passed because the seeded SKUs
+   echoed the query text (`CAFE-1` for `"Café"`) and `match_catalogue` matches
+   **name OR sku**, so every case matched through the SKU branch. The written
+   non-vacuity argument was confident and wrong: it reasoned about the name and
+   ignored the other half of the matcher. Caught by the orchestrator reading the
+   seeded data against the matcher — not by a test.
+3. The same test's inverted case: an accented query (`cafÉ` → `Café`) passes even
+   without folding, so only the unaccented query can carry the gate. Recorded
+   because "add an accent test" is the obvious move and it is the wrong one on
+   its own.
+
+The reusable rule: **the only thing that settles non-vacuity is running the
+mutation.** For case 2 the fix (opaque SKUs `P-001`/`P-002`) makes the name branch
+the only path to a match, and then breaking `normalize_search` to a plain
+`to_lowercase()` makes the test fail with `products: []` for `q=CAFE`. That
+mutation was run twice — once by the writer and once independently by the
+orchestrator — in both cases with `src/models.rs` restored and verified
+byte-identical afterwards. An argument about why a test cannot be vacuous is a
+hypothesis; the mutation is the evidence.
+
+Corollary for briefs: when a test asserts that a **substring** matched or a
+**search** found something, name the alternate match paths in the brief (a second
+field, a second branch, a formatted variant) and require the test to close them.
+And when the mutation needs a file outside the writer's surfaces, the orchestrator
+runs it rather than accepting the argument.
 
 ## Lesson: scope shared test files per half, not per file
 
@@ -443,3 +482,26 @@ scope — "rewrite the record-page half of X" — never the file or the test.
   worker to update the purchase parts of `e2e/tests/test_search_ux.py`, which has
   none — every picker test in it runs against the sale page. The worker said so
   instead of inventing work.
+- **T4b, green (orchestrator-verified)**: `cargo test` → **889 passed, 0 failed**.
+  The arithmetic is exact and was checked against the plan: 890 before, − 2 whole
+  tests deleted, + 1 new gate = 889. The instruction given to the worker omitted
+  the +1, which the worker caught rather than silently matching the number.
+- **T4b, the vacuous gate, caught and settled**: the new
+  `n5_product_search_json_folds_accents_and_case` seeded SKUs that echoed the
+  query text, and `match_catalogue` matches **name OR sku**, so all four cases
+  matched through the SKU branch. The orchestrator found it by reading the seeded
+  data against the matcher; the written non-vacuity argument in the report had
+  reasoned about the name only. Fixed with opaque SKUs, then **proven by mutation
+  run twice** — writer and orchestrator independently — breaking
+  `normalize_search` to a plain `to_lowercase()` makes the test fail with
+  `{"products":[],"query":"CAFE"}`. `src/models.rs` was restored and verified
+  byte-identical to HEAD afterwards (`git diff` and `git status` both empty).
+- **T4b, kept invariants verified**: the four island-pin markers in the
+  record-page halves, the two host-page `id=` assertion loops, and the customer
+  and supplier parts of `search_matches_ignore_accents_and_case` (18 seed calls)
+  are all still present; the two deleted tests are gone; and the HTML route
+  handler plus its three `n4_product_search_*` tests are untouched, as T4c needs
+  them to still be there.
+- **T4b, auditability**: each deleted test is replaced by a one-line comment at
+  its former site naming the e2e test that now carries the coverage, so the
+  deletion is greppable rather than silent.
