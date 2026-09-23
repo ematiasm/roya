@@ -155,9 +155,15 @@ choosing is what creates the draft.**
   so it stops inheriting the anchor default, the way the products and suppliers
   rows already do. Independent, and small — but it is the visible half of the
   complaint.
-- **T2 — the supplier picker.** `GET /web/supplier-search?q=` (bounded, read-only,
-  gated like the supplier reads), a results fragment, the shared widget, and
-  name-to-id resolution in the handlers that accept a supplier.
+- **T1c — retire the blue overrides.** The base `button` element is already
+  mint with a dark label (`assets/tailwind.css`: `bg-accent … text-[#0a0f0d]`,
+  plus its own hover and disabled states), so the ten buttons carrying
+  `bg-accent2 text-white` are not a second palette — they are overrides fighting
+  the base style. Removing those two classes lets every action in the app inherit
+  one colour without inventing one. Decided by the user 2026-09-23.
+- **T2 — the supplier picker.** `GET /web/supplier-search?q=` (bounded,
+  read-only), a results fragment, the shared widget, and name-to-id resolution in
+  the handlers that accept a supplier.
 - **T3 — the creation flow.** `/purchases/new` deleted; the header component
   gains a dialog-opening action; the dialog holds the picker, pre-filled with the
   last-used supplier (a new read on the purchase repository); choosing creates the
@@ -166,7 +172,8 @@ choosing is what creates the draft.**
   form for drafts (supplier picker, date, invoice, notes) posting to the existing
   header route; the Edit header dialog and its `⋯` entry are deleted.
 
-Order: T1 anywhere; T2 before T3 and T4, since both host the picker.
+Order: T1, T1b and T1c are independent of everything else; T2 before T3 and T4,
+since both host the picker. T1, T1b and T2 are done; T1c, T3 and T4 remain.
 
 ## Acceptance criteria
 
@@ -193,21 +200,22 @@ Order: T1 anywhere; T2 before T3 and T4, since both host the picker.
 
 ## Open decisions
 
-- **The ten remaining explicitly blue buttons.** They are the last override of
-  the base mint button style. Retiring the override in one pass makes every
-  action in the app one colour; leaving them makes the interface two-tone, with
-  the page action mint and the form submits blue. The user decides; it is
-  deliberately not folded into T1.
-- **The picker gates disagree, and T3/T4 will run into it.** The product search
-  is gated `Require<InventoryRead>`; the supplier search is now an any-of over
-  the supplier read and `purchases.create`, because the person recording a
-  purchase is its reason to exist. A role holding `purchases.create` without
-  `inventory.read` can therefore pick a supplier and then find the **line**
-  picker refuses it — the same page, two halves of one flow, different gates.
-  This is pre-existing (the record page's picker always needed
-  `inventory.read`) but T3 makes it reachable from a fresh creation, so it should
-  be decided rather than discovered: either the product search widens the same
-  way, or the purchase flow states that loading lines needs the inventory read.
+- **The rest of the blue, after T1c.** Retiring the button overrides leaves
+  `--color-accent2` doing three other jobs, and they are a different kind of
+  thing from an action: it is the **base anchor colour** (`a { text-accent2 }`,
+  so every link in the app), the **input focus ring** (`focus:border-accent2`),
+  and the **row hover border** (`hover:border-accent2`, six of them: the user,
+  customer, role, supplier and account lists, plus the supplier drawer's purchase
+  rows). Read that way the palette is coherent — mint means "do this", blue
+  means "you can interact here" — and the purchase list row is the odd one out
+  because it has no hover border at all. The user's call: leave blue as the
+  affordance colour, or finish the job and make it all mint.
+- **The picker gates, resolved (2026-09-23).** The user's decision: loading lines
+  keeps requiring `inventory.read`, and a role that can create purchases without
+  it is the administrator's problem to fix from the role configuration. So the
+  product search is **not** widened, and the creation flow may legitimately end
+  for such a principal at the line picker. Recorded so the asymmetry is a
+  decision rather than a surprise.
 
 ## Progress
 
@@ -215,6 +223,7 @@ Order: T1 anywhere; T2 before T3 and T4, since both host the picker.
 |-------|--------|--------------------|
 | T1 | **done** | `f1e27e7` — `page_header.html` to `bg-accent text-bg`, stylesheet regenerated. Verifier verdict *pass*: the whole-file stylesheet rule diff removes **zero** rules and adds exactly the two needed (so no other page lost a utility — checked mechanically over all 52 templates), the contrast goes from 2.54:1 (fails AA) to **12.40:1 (AAA)**, and the test asserts the rendered action tag in both directions. |
 | T1b | **done** | `ac49610` — the row anchor names `text-text`. The verifier measured mint = `--color-accent` (not the money green), confirmed the peek contract survived byte-identical apart from the added class, and confirmed the test asserts the **row's opening tag** rather than an inner span, which is the narrow check that let this ship. |
+| T1c | not started | — |
 | T2 | **done** | `03d7a5a` — the endpoint, two bounded service reads, the shared widget and the results fragment. Verifier verdict *pass*: the gate is proven a **restatement, not a widening** (at HEAD a `purchases.create`-only principal already received the whole roster, id/name/active flag, from the creation page), the matching shape mirrors the product picker exactly (same fold, same ten-row bound, same ordering), and the htmx claim — `hx-vals` only fills missing keys, so relying on `hx-include` alone would post the hidden CURRENT supplier — was checked against the vendored htmx 1.9.12 source. Its one real finding was a genuine defect, fixed and pinned before the commit: resolution ran through the bounded search, so with more than ten partial matches two colliding exact names could straddle the bound and one would be **silently chosen**, or an existing name reported as missing. Both failure modes were red first. |
 | T3 | not started | — |
 | T4 | not started | — |
