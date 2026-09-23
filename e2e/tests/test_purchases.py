@@ -847,8 +847,10 @@ def test_editing_a_draft_header_in_place_updates_the_document(page: Page, api: A
     operator changes the supplier through the picker's field (its typed name
     resolves server-side, exactly as the creation flow does), edits the
     invoice and the notes, and saves through the existing
-    `POST /web/purchases/{id}/header`. The page must show the new values in
-    the swapped record, and the stored document is read back through the API
+    `POST /web/purchases/{id}/header` — now driven by each field's own
+    `change` (receiving-flow T2), with no button. Nothing is swapped: the
+    fields still show the operator's values precisely because the response
+    replaces nothing, and the stored document is read back through the API
     so a UI-only update cannot pass. The due date stays untouched: it is
     decided at confirm, and a header edit must not clear it.
     """
@@ -867,22 +869,25 @@ def test_editing_a_draft_header_in_place_updates_the_document(page: Page, api: A
     expect(supplier_field).to_have_value(stored_name)
     expect(page.locator("#record-invoice-no")).to_have_value("")
 
-    # Edit all three in place: supplier, invoice, notes.
+    # Edit all three in place: supplier, invoice, notes. Each fill blurs the
+    # previous field, so the invoice's `change` fires when the notes field
+    # takes focus; the notes' own `change` waits for a deliberate blur.
     supplier_field.fill(changed_name)
     page.locator("#record-invoice-no").fill("INV-E2E-4")
     page.locator("#record-notes").fill("changed in place")
 
-    # Arm the expectation around the save: a listener armed after the click
-    # races the response and times out (the T3 lesson).
+    # Arm the expectation around the save: a listener armed after the action
+    # races the response and times out (the T3 lesson). Filling the notes
+    # blurred the invoice, whose `change` already posted an earlier save
+    # that carried the notes still empty; this deliberate blur is the LAST
+    # post, the one that persists all three edits together.
     with page.expect_response(
         _response_for(f"/web/purchases/{purchase_id}/header", method="POST")
     ):
-        page.locator("#purchase-header-form").get_by_role(
-            "button", name="Save header"
-        ).click()
+        page.locator("#record-notes").press("Tab")
 
-    # The swapped record shows the new values, and the form carries them
-    # after the re-render.
+    # The fields carry the operator's values — nothing replaced them: the
+    # auto-save swaps nothing, so focus and the typed values survive.
     expect(page.locator("#record-supplier")).to_have_value(changed_name)
     expect(page.locator("#record-invoice-no")).to_have_value("INV-E2E-4")
     expect(page.locator("#record-notes")).to_have_value("changed in place")
@@ -974,3 +979,143 @@ def test_editing_a_line_inline_keeps_every_id_on_the_page_unique(
     expect(page.locator(f"#line-qty-{line_id}")).to_have_value("7")
     stored = api.get_json(f"/api/purchases/{purchase_id}")
     assert Decimal(str(stored["lines"][0]["qty"])) == Decimal("7"), stored
+
+
+def _seed_header_draft(api: ApiClient) -> int:
+    """A draft with a supplier and no lines: enough for the identity fields."""
+    supplier_id = create_supplier(api, "Autosave Supplier")
+    return create_purchase_draft(api, supplier_id, payment_type="Cash")
+
+
+def test_a_header_field_alone_saves_without_a_button(
+    page: Page, api: ApiClient
+) -> None:
+    """The identity fields save themselves, so the Save header button is gone.
+
+    Only the supplier field saved on its own before this: the picker's post
+    carries the whole header through `hx-include`, while the date, the invoice
+    number and the notes were plain inputs with no `hx-trigger` at all. So the
+    button was the only way to save those three alone — it read as redundant
+    because half the header really did auto-save, which is worse than either
+    extreme.
+    """
+    purchase_id = _seed_header_draft(api)
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    assert (
+        page.locator("#purchase-header-form")
+        .get_by_role("button", name="Save header")
+        .count()
+        == 0
+    ), "the Save header button must be gone"
+
+    invoice = page.locator("#record-invoice-no")
+    expect(invoice).to_have_value("")
+    with page.expect_response(
+        _response_for(f"/web/purchases/{purchase_id}/header", "POST")
+    ):
+        invoice.fill("INV-AUTO")
+        invoice.press("Tab")  # `change` fires on blur
+
+    page.wait_for_timeout(400)
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert stored["purchase"]["supplier_invoice_no"] == "INV-AUTO", stored
+
+
+def test_an_auto_saved_header_does_not_steal_focus(
+    page: Page, api: ApiClient
+) -> None:
+    """The save must not swap the record, or it eats the operator's next field.
+
+    This is the whole reason the answer is empty-plus-trigger instead of the
+    record body. A full-record swap on every blur would replace the field the
+    operator is tabbing into and pull focus back to the one they just left.
+    """
+    purchase_id = _seed_header_draft(api)
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    invoice = page.locator("#record-invoice-no")
+    invoice.fill("INV-FOCUS")
+    invoice.press("Tab")
+
+    # The operator keeps working while the save is in flight.
+    notes = page.locator("#record-notes")
+    notes.click()
+    notes.fill("typed while the save lands")
+    page.wait_for_timeout(900)
+
+    # The save must have actually happened, or "focus survived" means nothing:
+    # with no auto-save at all nothing swaps and focus survives trivially. This
+    # assertion is what makes the focus check a real gate.
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert stored["purchase"]["supplier_invoice_no"] == "INV-FOCUS", (
+        f"the save did not happen, so the focus check is vacuous: {stored}"
+    )
+
+    assert page.evaluate("document.activeElement.id") == "record-notes", (
+        "the auto-save stole focus: "
+        f"activeElement={page.evaluate('document.activeElement.id')}"
+    )
+    expect(notes).to_have_value("typed while the save lands")
+
+
+def test_an_auto_saved_header_does_not_spam_the_notice(
+    page: Page, api: ApiClient
+) -> None:
+    """One save per blur must not raise one global notice per blur.
+
+    `base.html` announces `"<action> saved"` for every successful form post
+    that carries a `data-action`. That is right for a button pressed once and
+    wrong for a field left once: the operator would get a stack of notices
+    while filling in three fields. The form opts out of the generic success
+    notice and shows a subtle indicator instead; its FAILURES must still be
+    named, so the `data-action` stays.
+    """
+    purchase_id = _seed_header_draft(api)
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    invoice = page.locator("#record-invoice-no")
+    with page.expect_response(
+        _response_for(f"/web/purchases/{purchase_id}/header", "POST")
+    ):
+        invoice.fill("INV-QUIET")
+        invoice.press("Tab")
+    page.wait_for_timeout(500)
+
+    expect(page.locator("#notice")).to_be_empty()
+
+
+def test_an_empty_required_date_posts_nothing_and_says_so_inline(
+    page: Page, api: ApiClient
+) -> None:
+    """Clearing the date to retype it must not fire a save that answers 400.
+
+    The date is `required`. With a save on every blur, emptying the field to
+    type a new one would post an empty date, the route would refuse it, and the
+    operator would be told the document failed to save for the crime of
+    retyping a date. The guard is client-side, and the hint is next to the
+    field rather than in the global notice region.
+    """
+    purchase_id = _seed_header_draft(api)
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    posted: list[str] = []
+    page.on(
+        "request",
+        lambda request: posted.append(request.url)
+        if "/header" in request.url
+        else None,
+    )
+
+    date = page.locator("#record-purchase-date")
+    date.fill("")
+    date.press("Tab")
+    page.wait_for_timeout(800)
+
+    assert posted == [], f"an empty date posted a save: {posted}"
+    expect(page.locator("#record-purchase-date-error")).to_be_visible()
+    expect(page.locator("#notice")).to_be_empty()
+
+    # And the document is untouched: the stored date is still the seeded one.
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert stored["purchase"]["purchase_date"], stored

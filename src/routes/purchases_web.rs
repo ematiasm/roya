@@ -3380,9 +3380,12 @@ mod tests {
             !html.contains("id=\"line-drawer\"") && !html.contains("id=\"line-picker\""),
             "a confirmed purchase cannot add lines: {html:.400}"
         );
+        // The bare id is not matched: the record page's shell script names
+        // #purchase-header-form as a selector string, so only the element
+        // itself (id="purchase-header-form") proves a rendered form.
         assert!(
             !html.contains("<dialog id=\"confirm-purchase\"")
-                && !html.contains("purchase-header-form")
+                && !html.contains("id=\"purchase-header-form\"")
                 && !html.contains("id=\"record-supplier\""),
             "the header form and the confirm dialog freeze once confirmed: {html:.400}"
         );

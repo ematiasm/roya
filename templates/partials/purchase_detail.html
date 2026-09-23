@@ -239,13 +239,29 @@
      non-draft; the branch is presentation only. #}
   <div id="purchase-header" class="mb-1">
     {% call supplier_picker::supplier_picker(header_action, "#purchase-record-inner", "record-supplier", record.supplier_name, header_include) %}
-    <form id="purchase-header-form" class="mt-2 flex flex-col gap-2.5" data-action="Save header"
+    {# Auto-saved identity (receiving-flow T2): the form posts on `change`, so
+       every field saves itself on blur and the Save header button is gone —
+       the same auto-save the supplier picker already had through hx-include.
+       The request attributes stay a form post so the picker's sibling include
+       keeps working unchanged; hx-target is gone because nothing is swapped:
+       hx-swap="none" keeps the response from replacing the field the operator
+       is tabbing into (a full-record swap would pull focus back to the one
+       they just left), and hx-sync="this:replace" makes a newer blur abort an
+       older in-flight save instead of racing it. data-silent-save opts the
+       form out of base.html's generic "Save header saved" notice — one save
+       per blur would raise one notice per blur — while data-action stays so
+       the failure notice still names it. #}
+    <form id="purchase-header-form" class="mt-2 flex flex-col gap-2.5" data-action="Save header" data-silent-save
+          hx-trigger="change"
           hx-post="/web/purchases/{{ record.purchase.id }}/header"
           hx-include="#record-supplier, #record-purchase-date, #record-invoice-no, #record-notes"
-          hx-target="#purchase-record" hx-swap="innerHTML">
+          hx-swap="none" hx-sync="this:replace">
       <div>
         <label for="record-purchase-date">Purchase date</label>
         <input type="date" id="record-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
+        <p id="record-purchase-date-error" class="mt-1 text-[13px] text-danger" hidden>
+          An empty date is not saved — the stored purchase date stays.
+        </p>
       </div>
       <div>
         <label for="record-invoice-no">Supplier invoice no (optional)</label>
@@ -255,8 +271,8 @@
         <label for="record-notes">Notes</label>
         <input type="text" id="record-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" />
       </div>
-      <button type="submit">Save header</button>
     </form>
+    <span id="header-saved" class="text-[13px] text-muted" aria-live="polite"></span>
   </div>
   {% if let Some(due) = record.purchase.due_date %}
   <div class="mb-1 text-[13px] text-muted">due {{ due }}</div>
