@@ -394,12 +394,13 @@ address, phone, email, tax id) that also holds the localization configuration
 own planning session, not a sub-slice of this one. See its checklist entry for
 the measured surface and the open decision it must settle first.
 
-**Merge status**: nothing on this branch is merged, and nothing is pushed. All
-18 commits exist only in the local clone on `feat/redesign-purchases-index`;
-`main` still points at `3805380` and `origin` has no branch for this work. The
-tree was branched from `main` and `main` has not moved since, so merging is a
-clean fast-forward with no conflicts — a push plus a PR under the repo's normal
-convention.
+**Merge status**: nothing on this branch is merged, and nothing is pushed. Every
+commit on this branch exists only in the local clone on
+`feat/redesign-purchases-index`; `main` still points at `3805380` and `origin`
+has no branch for this work. The tree was branched from `main` and `main` has
+not moved since, so merging is a clean fast-forward with no conflicts — a push
+plus a PR under the repo's normal convention. (Deliberately no commit count:
+stating one makes the statement stale, because writing it is itself a commit.)
 
 ## Progress
 
