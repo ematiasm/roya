@@ -198,6 +198,16 @@ Order: T1 anywhere; T2 before T3 and T4, since both host the picker.
   action in the app one colour; leaving them makes the interface two-tone, with
   the page action mint and the form submits blue. The user decides; it is
   deliberately not folded into T1.
+- **The picker gates disagree, and T3/T4 will run into it.** The product search
+  is gated `Require<InventoryRead>`; the supplier search is now an any-of over
+  the supplier read and `purchases.create`, because the person recording a
+  purchase is its reason to exist. A role holding `purchases.create` without
+  `inventory.read` can therefore pick a supplier and then find the **line**
+  picker refuses it — the same page, two halves of one flow, different gates.
+  This is pre-existing (the record page's picker always needed
+  `inventory.read`) but T3 makes it reachable from a fresh creation, so it should
+  be decided rather than discovered: either the product search widens the same
+  way, or the purchase flow states that loading lines needs the inventory read.
 
 ## Progress
 
@@ -205,7 +215,7 @@ Order: T1 anywhere; T2 before T3 and T4, since both host the picker.
 |-------|--------|--------------------|
 | T1 | **done** | `f1e27e7` — `page_header.html` to `bg-accent text-bg`, stylesheet regenerated. Verifier verdict *pass*: the whole-file stylesheet rule diff removes **zero** rules and adds exactly the two needed (so no other page lost a utility — checked mechanically over all 52 templates), the contrast goes from 2.54:1 (fails AA) to **12.40:1 (AAA)**, and the test asserts the rendered action tag in both directions. |
 | T1b | **done** | `ac49610` — the row anchor names `text-text`. The verifier measured mint = `--color-accent` (not the money green), confirmed the peek contract survived byte-identical apart from the added class, and confirmed the test asserts the **row's opening tag** rather than an inner span, which is the narrow check that let this ship. |
-| T2 | not started | — |
+| T2 | **done** | `03d7a5a` — the endpoint, two bounded service reads, the shared widget and the results fragment. Verifier verdict *pass*: the gate is proven a **restatement, not a widening** (at HEAD a `purchases.create`-only principal already received the whole roster, id/name/active flag, from the creation page), the matching shape mirrors the product picker exactly (same fold, same ten-row bound, same ordering), and the htmx claim — `hx-vals` only fills missing keys, so relying on `hx-include` alone would post the hidden CURRENT supplier — was checked against the vendored htmx 1.9.12 source. Its one real finding was a genuine defect, fixed and pinned before the commit: resolution ran through the bounded search, so with more than ten partial matches two colliding exact names could straddle the bound and one would be **silently chosen**, or an existing name reported as missing. Both failure modes were red first. |
 | T3 | not started | — |
 | T4 | not started | — |
 
