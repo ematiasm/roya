@@ -45,6 +45,13 @@ def _line_for(api: ApiClient, sale_id: int, product_id: int) -> dict:
     return next(line for line in detail["lines"] if int(line["product_id"]) == product_id)
 
 
+def _purchase_line_for(api: ApiClient, purchase_id: int, product_id: int) -> dict:
+    detail = api.get_json(f"/api/purchases/{purchase_id}")
+    return next(
+        line for line in detail["lines"] if int(line["product_id"]) == product_id
+    )
+
+
 def _wait_for_held(page: Page, held: list, count: int, message: str) -> None:
     """Wait until `count` searches sit paused at the route handler.
 
@@ -290,6 +297,66 @@ def test_a_search_is_not_announced_as_an_added_line(
     picker.fill(data.barcode)
     picker.press("Enter")
     expect(page.locator("#notice")).to_contain_text("Add line saved")
+
+
+def test_the_picker_island_owns_the_purchase_search(page: Page, api: ApiClient) -> None:
+    """Slice T4: the purchase entry row is the same island, priced for cost.
+
+    Three guarantees, in the order an operator meets them:
+
+    - typing reads the island's own JSON route (`/web/product-search.json`)
+      and renders the name / SKU / COST price / stock content the entry row
+      needs — the field no longer carries any declarative htmx read;
+    - clicking a match adds the line with the product id the island
+      selected, not the stale id a pre-filled hidden input could smuggle (the
+      hidden-id defect stays dead on this page too);
+    - the add response swaps the money region and the entry row comes back
+      empty and focused, so the next scan lands without a click.
+    """
+    data = seed_harness_data(api)
+    # The spare product the seed put on the *sale*; the purchase does not own it,
+    # so an added line for it below is unambiguously new.
+    spare_id = data.sale_line_product_id
+    page.goto(f"{api.base_url}/purchases/{data.purchase_id}")
+
+    picker = page.locator("#product-picker")
+    results = page.locator("#product-search-results")
+    buttons = results.locator("button")
+
+    # The island owns the search here too: the field carries no declarative
+    # htmx read, so a keystroke cannot be answered by the old HTML fragment
+    # route.
+    expect(picker).not_to_have_attribute("hx-get", re.compile(r".*"))
+    expect(picker).not_to_have_attribute("hx-trigger", re.compile(r".*"))
+
+    # The read is the island's JSON route, and the rendered content quotes
+    # COST — the purchase context's price kind, not the sale's.
+    with page.expect_request("**/web/product-search.json*") as request_info:
+        picker.fill("Harness")
+    assert request_info.value.url.endswith("q=Harness")
+
+    expect(buttons).to_have_count(2)
+    expect(results).to_contain_text("Harness Spare")
+    expect(results).to_contain_text("cost $")
+
+    # Clicking the match adds the line with the island's selected id and the
+    # quantity the operator typed. The field held "Harness" — no exact match
+    # for either seeded product — so only the island-selected id can have
+    # produced this line; a stale hidden id cannot smuggle one in.
+    page.locator("#line-qty").fill("3")
+    page.locator("#product-search-results button", has_text="Harness Spare").click()
+
+    row = _purchase_line_row(page, "Harness Spare")
+    expect(row).to_have_count(1)
+    expect(row.locator("input[name='qty']")).to_have_value("3")
+    line = _purchase_line_for(api, data.purchase_id, spare_id)
+    assert Decimal(str(line["qty"])) == Decimal("3"), line
+
+    # The entry row is persistent inside the swapped money region, not out of
+    # band: the add response re-renders it empty and focused, ready for the
+    # next scan.
+    expect(picker).to_have_value("")
+    expect(picker).to_be_focused()
 
 
 def test_choosing_a_result_on_the_purchase_page_renders_and_adds(

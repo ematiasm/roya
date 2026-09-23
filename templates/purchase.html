@@ -17,8 +17,10 @@
    the bar or the dialogs.
 
    Escape: a native <dialog> closes itself, so the handler stands down while
-   one is open; the picker input owns Escape to clear its own value, so the
-   handler stands down for that target too. Everything else closes the menu. #}
+   one is open; the picker field is one of the targets base.html's document-
+   level keydown handler owns Escape for (it clears the field there), so this
+   handler stands down for that target too — otherwise both would act and
+   Escape would also close the menu. Everything else closes the menu. #}
 <script>
   function openRecordDialog(id) {
     closeRecordMenu();

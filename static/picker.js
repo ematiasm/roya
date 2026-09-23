@@ -285,13 +285,17 @@
   document.addEventListener('DOMContentLoaded', function () {
     mountAll();
 
-    // The add-line response swaps the picker out of band, so a fresh island
-    // arrives after every added line. htmx:load is the signal: the vendored
-    // htmx 1.9.12 fires it from the settle task of every element it swaps in
-    // (the insert helper pushes the `htmx:load` trigger for each inserted
-    // node), including out-of-band content — `oobSwap` swaps through the same
-    // swap path and the event's `detail.elt` is the new element itself. Mount
-    // what arrives; the dataset marker keeps mounts idempotent.
+    // The add-line response brings a fresh picker island back. On the sale
+    // page the picker swaps OUT OF BAND, so `htmx:load`'s `detail.elt` is the
+    // new `#line-picker` itself; on the purchase page the picker travels
+    // inside the swapped `#purchase-record-money` region instead, so `elt` is
+    // the region and the island is found in its subtree. htmx:load is the
+    // signal: the vendored htmx 1.9.12 fires it from the settle task of every
+    // element it swaps in (the insert helper pushes the `htmx:load` trigger
+    // for each inserted node), including out-of-band content — `oobSwap`
+    // swaps through the same swap path and the event's `detail.elt` is the
+    // new element itself. Mount what arrives; the dataset marker keeps mounts
+    // idempotent.
     document.body.addEventListener('htmx:load', function (evt) {
       var elt = evt.detail && evt.detail.elt;
       if (!elt || !elt.matches) return;

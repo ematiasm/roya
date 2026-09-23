@@ -226,11 +226,11 @@
           picker.value = '';
           picker.focus();
           picker.dispatchEvent(new Event('input', { bubbles: true }));
-          // The dispatch is the whole handoff now: this handler's `input` event is
+          // The dispatch is the whole handoff: this handler's `input` event is
           // what the picker island (static/picker.js) listens for, so a cleared
-          // field always asks the island for a fresh search. The purchase page's
-          // inline mirror still carries its own `hx-on:keyup` Escape clearing,
-          // which stays there until its own cutover.
+          // field always asks the island for a fresh search. Escape clearing
+          // lives HERE for both record pages — the island owns no Escape of
+          // its own.
         } else if (
           index >= 0 &&
           evt.key.length === 1 &&
@@ -249,62 +249,6 @@
           picker.focus();
         }
       });
-
-      // Running the search must not drop focus. The swap replaces the focused result
-      // button, and htmx's own restore only knows elements with an id; the buttons
-      // have none, so focus fell to `document.body` and the next key went nowhere.
-      // Focus is on a *product*, not a row position, so the product id is the
-      // correspondence: the same product keeps focus while it is still a match, and
-      // when it is gone focus returns to the field, where the operator is typing.
-      // The capture runs before the swap, while the old buttons still exist.
-      var pendingResultFocus = null;
-      document.body.addEventListener('htmx:beforeSwap', function (evt) {
-        var target = evt.detail && evt.detail.target;
-        if (!target || target.id !== 'product-search-results') return;
-        var active = document.activeElement;
-        pendingResultFocus =
-          active && active.dataset ? active.dataset.productId || null : null;
-      });
-      document.body.addEventListener('htmx:afterSwap', function (evt) {
-        var target = evt.detail && evt.detail.target;
-        if (!target || target.id !== 'product-search-results') return;
-        var key = pendingResultFocus;
-        pendingResultFocus = null;
-        if (!key) return;
-        var again = target.querySelector('[data-product-id="' + key + '"]');
-        if (again) {
-          again.focus();
-          return;
-        }
-        var picker = document.getElementById('product-picker');
-        if (picker) picker.focus();
-      });
-
-      // One polite live region owns the search state. While the request is in flight
-      // the region says so, so a screen reader is never left with the previous count
-      // that is about to change; the count arrives with the swapped results, which
-      // replace this text. The visible busy cue is aria-hidden and does not announce.
-      document.body.addEventListener('htmx:beforeRequest', function (evt) {
-        var elt = evt.detail && evt.detail.elt;
-        if (!elt || elt.id !== 'product-picker') return;
-        var status = document.getElementById('product-search-status');
-        if (status) status.textContent = 'Searching…';
-      });
-
-      // A failed search has no swapped results to replace "Searching…", so without
-      // this the region would say the search is still running forever. Only real
-      // failures reset it: `htmx:sendAbort` is deliberately not handled, because a
-      // newer keystroke superseding an old request must not announce a failure.
-      function searchFailed(evt) {
-        var cfg = evt.detail && evt.detail.requestConfig;
-        var elt = cfg && cfg.elt;
-        if (!elt || elt.id !== 'product-picker') return;
-        var status = document.getElementById('product-search-status');
-        if (status) status.textContent = 'Search failed.';
-      }
-      document.body.addEventListener('htmx:responseError', searchFailed);
-      document.body.addEventListener('htmx:sendError', searchFailed);
-      document.body.addEventListener('htmx:timeout', searchFailed);
 
       // Existing cross-region refreshes.
       document.body.addEventListener('transaction-created', function(){ htmx.trigger('#account-list','refresh'); });
