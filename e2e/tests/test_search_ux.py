@@ -305,12 +305,12 @@ def test_an_in_flight_search_shows_a_busy_state(page: Page, api: ApiClient) -> N
     def hold(route) -> None:
         held.append(route)
 
-    page.route("**/web/product-search*", hold)
+    page.route("**/web/product-search.json*", hold)
 
     # Wait for the request to be issued (and therefore held by the route handler)
     # rather than sleeping: the request is paused, so the interface is in its
     # in-flight state.
-    with page.expect_request("**/web/product-search*"):
+    with page.expect_request("**/web/product-search.json*"):
         page.locator("#product-picker").fill("Harness")
 
     # The request is now paused at the route handler. The interface must say it
@@ -380,7 +380,7 @@ def _hold_next_search(page: Page) -> list:
     appended to the returned list; ``held[0].continue_()`` releases it.
     """
     held: list = []
-    page.route("**/web/product-search*", lambda route: held.append(route))
+    page.route("**/web/product-search.json*", lambda route: held.append(route))
     return held
 
 
@@ -407,7 +407,7 @@ def test_focus_stays_on_the_same_product_across_a_replaced_result(
     first_product = buttons.nth(0).get_attribute("data-product-id")
 
     held = _hold_next_search(page)
-    with page.expect_request("**/web/product-search*"):
+    with page.expect_request("**/web/product-search.json*"):
         picker.fill("Harness")
 
     # The old results are still on screen while the new search is in flight; move
@@ -450,7 +450,7 @@ def test_focus_returns_to_the_picker_when_the_focused_product_disappears(
     expect(buttons).to_have_count(2)
 
     held = _hold_next_search(page)
-    with page.expect_request("**/web/product-search*"):
+    with page.expect_request("**/web/product-search.json*"):
         picker.fill("Widget")
 
     # Harness Spare is focused; the new query matches only Harness Widget, so the
@@ -493,7 +493,7 @@ def test_the_live_region_announces_the_search_instead_of_a_stale_count(
     expect(status).to_have_text("2 matches.")
 
     held = _hold_next_search(page)
-    with page.expect_request("**/web/product-search*"):
+    with page.expect_request("**/web/product-search.json*"):
         picker.fill("Harness Spare")
 
     # In flight: the polite region describes the search, and the count that is
@@ -627,12 +627,12 @@ def test_a_failed_search_resets_the_announced_state(
     def fail(route) -> None:
         route.fulfill(status=500, content_type="text/html", body="search exploded")
 
-    page.route("**/web/product-search*", fail)
-    with page.expect_response("**/web/product-search*"):
+    page.route("**/web/product-search.json*", fail)
+    with page.expect_response("**/web/product-search.json*"):
         picker.fill("Harness Spare")
 
     # The region says what happened rather than staying on "Searching…", the busy cue
     # is gone, and the global notice still names the failed request.
     expect(status).to_have_text("Search failed.")
     expect(busy).to_be_hidden()
-    expect(page.locator("#notice")).to_contain_text("/web/product-search")
+    expect(page.locator("#notice")).to_contain_text("/web/product-search.json")
