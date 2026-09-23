@@ -1,23 +1,17 @@
-{# Product search results and the shared line picker (redesign-interface N4/N5).
+{# The product picker's island shell (redesign-interface N4/N5).
 
-   This file holds both halves of one widget, each owned by a different party:
-
-   1. `line_picker` is the record page's product field, now as the PICKER
-      ISLAND's shell. The island (`static/picker.js`) mounts into the
-      `[data-picker]` container and owns the client state — query, matches,
-      status, focus and the selected product id — derived in one render
-      function. The shell renders no search transport at all: the field
-      carries no `hx-get`/`hx-trigger`/`hx-target`/`hx-vals` because the
-      island reads `/web/product-search.json` itself. What remains on the
-      wire is the server's add-line contract, untouched: one `hx-post` form
-      whose hidden `product_id` the island sets from its own state (the
-      hidden-id defect died because that state moved from markup to the
-      island) and then submits with `requestSubmit()`, so htmx keeps doing
-      the swap, the out-of-band fragments and the `HX-Trigger` events.
-   2. The results body below still answers `GET /web/product-search?q=` for
-      the purchase record page, whose inline picker mirror predates the
-      island (cutover in a later slice). The results container is a sibling
-      of the picker form because a form inside a form is invalid HTML.
+   `line_picker` is the record page's product field, as the PICKER ISLAND's
+   shell. The island (`static/picker.js`) mounts into the `[data-picker]`
+   container and owns the client state — query, matches, status, focus and
+   the selected product id — derived in one render function. The shell
+   renders no search transport at all: the field carries no
+   `hx-get`/`hx-trigger`/`hx-target`/`hx-vals` because the island reads
+   `/web/product-search.json` itself. What remains on the wire is the
+   server's add-line contract, untouched: one `hx-post` form whose hidden
+   `product_id` the island sets from its own state (the hidden-id defect
+   died because that state moved from markup to the island) and then
+   submits with `requestSubmit()`, so htmx keeps doing the swap, the
+   out-of-band fragments and the `HX-Trigger` events.
 
    `price_kind` says which number the calling context works in: `cost` for a
    purchase line, `sale` (the default) for a sale line. The island picks the
@@ -97,42 +91,3 @@
   </div>
 </div>
 {% endmacro %}
-<p id="product-search-status" class="sr-only">
-  {% if matches.is_empty() %}
-    {% if query.is_empty() %}Type a name, SKU or barcode.{% else %}No products match "{{ query }}".{% endif %}
-  {% else %}
-    {{ matches.len() }} match{% if matches.len() != 1 %}es{% endif %}.
-  {% endif %}
-</p>
-<div aria-live="off">
-{% if matches.is_empty() %}
-  {% if query.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">Type a name, SKU or barcode.</div>
-  {% else %}
-    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">No products match "{{ query }}".</div>
-  {% endif %}
-{% else %}
-  <div class="flex flex-col gap-1.5">
-    {% for ps in matches %}
-      {% if !line_action.is_empty() && !line_target.is_empty() %}
-      <form data-action="Add line"
-            hx-post="{{ line_action }}" hx-include="#line-picker"
-            hx-vals='{"product_id": {{ ps.product.id }}}'
-            hx-target="{{ line_target }}" hx-swap="outerHTML" hx-select="{{ line_target }}">
-        <button type="submit"
-                data-product-id="{{ ps.product.id }}"
-                class="flex w-full items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-left text-sm text-text">
-          <span class="min-w-0 truncate font-semibold">{{ ps.product.name }}</span>
-          <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • {% if show_cost %}cost ${{ ps.product.cost_price_display() }}{% else %}${{ ps.product.sale_price_display() }}{% endif %} • stock {{ ps.stock }}</span>
-        </button>
-      </form>
-      {% else %}
-      <div class="flex items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-sm">
-        <span class="min-w-0 truncate font-semibold">{{ ps.product.name }}</span>
-        <span class="shrink-0 text-xs text-muted">{{ ps.product.sku }} • {% if show_cost %}cost ${{ ps.product.cost_price_display() }}{% else %}${{ ps.product.sale_price_display() }}{% endif %} • stock {{ ps.stock }}</span>
-      </div>
-      {% endif %}
-    {% endfor %}
-  </div>
-{% endif %}
-</div>

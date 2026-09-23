@@ -346,7 +346,7 @@ fn render_list(view: Vec<PurchaseView>, title: &str) -> AppResult<Html<String>> 
 
 /// Everything the record body renders: the resolved record plus the
 /// method-with-account options its action forms need. The product picker
-/// searches `/web/product-search` instead of carrying the whole catalogue.
+/// searches `/web/product-search.json` instead of carrying the whole catalogue.
 struct PurchaseRecordContext {
     record: PurchaseRecord,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,

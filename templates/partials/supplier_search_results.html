@@ -4,9 +4,8 @@
    list, separate because the search endpoint re-renders it on every
    keystroke while the field keeps its own markup.
 
-   The endpoint receives the caller's context through the search query (the
-   product search's `line_action`/`line_target` shape): `action` (the
-   caller's post target), `target` (the region the caller's post swaps) and
+   The endpoint receives the caller's context through the search query
+   itself: `action` (the caller's post target), `target` (the region the caller's post swaps) and
    `include` (the caller's other fields the post must carry). When they are
    present, every match becomes its own form posting the caller's target with
    the chosen `supplier_id` in a hidden input — the click submits without any
