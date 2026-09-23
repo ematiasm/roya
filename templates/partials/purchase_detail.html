@@ -113,13 +113,19 @@
             <td class="py-2.5 pr-3 text-right">
               {# T7 inline edit: both inputs share the PUT and include each
                  other, so either change submits the pair the handler needs.
-                 A refused value (server 400) reverts in the page shell. #}
+                 A refused value (server 400) reverts in the page shell.
+                 The line PUT answers with the whole record body, so the swap
+                 must carry both attributes together: `hx-select` without
+                 `outerHTML` nests the money region inside itself, and
+                 `outerHTML` without `hx-select` duplicates every id on the
+                 page. Pinned by the count test in test_purchases.py. #}
               <input type="number" id="line-qty-{{ line.id }}" name="qty"
                      class="w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
                      value="{{ line.qty }}" min="0.01" step="any" data-action="Edit line"
                      hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
                      hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
-                     hx-target="#purchase-record-money" hx-swap="innerHTML"
+                     hx-target="#purchase-record-money" hx-swap="outerHTML"
+                     hx-select="#purchase-record-money"
                      hx-trigger="change delay:400ms" />
             </td>
             <td class="py-2.5 pr-3 text-right">
@@ -128,7 +134,8 @@
                      value="{{ line.unit_cost }}" min="0" step="any" data-action="Edit line"
                      hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
                      hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
-                     hx-target="#purchase-record-money" hx-swap="innerHTML"
+                     hx-target="#purchase-record-money" hx-swap="outerHTML"
+                     hx-select="#purchase-record-money"
                      hx-trigger="change delay:400ms" />
             </td>
             {% else %}
