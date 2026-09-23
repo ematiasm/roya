@@ -27,6 +27,7 @@ not on a shrug.
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from urllib.parse import urlparse
 
@@ -34,11 +35,17 @@ from playwright.sync_api import Page, expect
 
 from helpers import (
     ApiClient,
+    account_method_id,
     add_purchase_line,
+    add_sale_line,
     confirm_purchase,
+    create_account_with_methods,
+    create_customer,
     create_product,
     create_purchase_draft,
+    create_sale_draft,
     create_supplier,
+    fund_account,
 )
 
 
@@ -267,3 +274,220 @@ def test_a_confirmed_purchase_with_equal_costs_shows_no_warning(
     page.goto(f"{api.base_url}/purchases/{purchase_id}")
 
     _assert_no_warning(page)
+
+
+# ---------------------------------------------------------------------------
+# S6 follow-ups: the rewritten row must survive a 360 px phone (no horizontal
+# scroll, even with a supplier name long enough to need truncation), and the
+# peek contract S3 shipped must actually open from /purchases — the drawer
+# tests only ever drove /documents, which is how a red suite shipped once.
+# ---------------------------------------------------------------------------
+
+
+# Deliberately longer than a 360 px viewport can show without truncating:
+# the row's supplier cell carries `truncate`, and this name proves truncation
+# is exercised rather than assumed (a wide unbreakable string would widen the
+# row and scroll the page if the grid ever lost its min-w-0).
+_LONG_SUPPLIER = "Distribuidora Mayorista de Almacen y Alimentos del Litoral SRL"
+
+
+def _seed_purchase_states(api: ApiClient) -> dict[str, int]:
+    """A draft, an owed confirmed purchase and a settled one, for one supplier.
+
+    The owed purchase is a confirmed Credit with a due date 30 days out
+    (the Due chip, something owed, not yet past); the settled one is a
+    confirmed Cash purchase through the seeded account — the confirm itself
+    posts the payment, so due lands at 0 in one call. Returns the ids the
+    tests assert against, including the owed purchase's due, read back
+    through the API so the chip's residual amount is never guessed.
+    """
+    product = create_product(
+        api,
+        sku="PEEK-S6-SKU",
+        name="Peek S6 Widget",
+        sale_price="20.00",
+        cost_price="5.00",
+        stock="30",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    supplier_id = create_supplier(api, _LONG_SUPPLIER)
+    # A due date relative to the day the test runs: fixed 2024 dates are
+    # already past, and the row would honestly render Overdue instead of Due.
+    future_due = (date.today() + timedelta(days=30)).isoformat()
+
+    account_id = create_account_with_methods(api, "Peek Caja", ("Cash",))
+    cash = account_method_id(api, account_id, "Cash")
+    fund_account(api, account_id, "1000")
+
+    draft_id = create_purchase_draft(
+        api, supplier_id, payment_type="Credit", due_date=future_due
+    )
+    add_purchase_line(api, draft_id, product_id, qty="1", unit_cost="6.00")
+
+    settled_id = create_purchase_draft(api, supplier_id, payment_type="Cash")
+    add_purchase_line(api, settled_id, product_id, qty="3", unit_cost="6.00")
+    # A Cash confirm pays the total at once (one payment posted), so this row
+    # settles to due = 0 without a second call.
+    confirm_purchase(api, settled_id, method_id=cash)
+    due = str(api.get_json(f"/api/purchases/{settled_id}")["due"])
+    assert Decimal(due) == 0, "the settled purchase must carry due = 0"
+
+    owed_id = create_purchase_draft(
+        api, supplier_id, payment_type="Credit", due_date=future_due
+    )
+    add_purchase_line(api, owed_id, product_id, qty="2", unit_cost="6.00")
+    confirm_purchase(api, owed_id)
+    owed_due = str(api.get_json(f"/api/purchases/{owed_id}")["due"])
+    assert Decimal(owed_due) > 0, "the owed purchase must carry due > 0"
+    return {
+        "draft": draft_id,
+        "owed": owed_id,
+        "settled": settled_id,
+        "owed_due": owed_due,
+    }
+
+
+def test_purchase_list_at_360px_never_scrolls_horizontally(page: Page, api: ApiClient):
+    """AC2, proven in a browser: no horizontal scroll at 360 px, on both lists.
+
+    The Rust suite can read classes, but only a real layout can prove the
+    rewrite's responsive claim: the row's grid must keep every column inside
+    a 360 px viewport even when the supplier name is far longer than the
+    viewport — the long name makes truncation load-bearing, so a lost
+    `min-w-0` or `truncate` would widen the page and fail the assertion.
+    Draft, owed and settled rows are all present, so every chip shape is
+    laid out, and /sales is checked with its own rows as the sibling list
+    the same viewport must hold.
+
+    The suite sets no viewport anywhere (no precedent in e2e/), so this test
+    uses Playwright's own idiom, `page.set_viewport_size`, on the shared
+    fixture's page. The scroll claim is polled as a resolved browser
+    condition via `page.wait_for_function`, never a sleep.
+    """
+    seeded = _seed_purchase_states(api)
+
+    # A sale row too: /sales must hold the same viewport, and a customer with
+    # a long name stresses its flex row the way the supplier stresses ours.
+    long_buyer = "Compradora con Nombre Notablemente Extenso para Moviles"
+    customer_id = create_customer(api, long_buyer)
+    product_id = int(create_product(
+        api,
+        sku="SALES360-SKU",
+        name="Sales 360 Widget",
+        sale_price="10.00",
+        cost_price="4.00",
+        stock="10",
+        min_stock="1",
+        max_stock="50",
+    )["id"])
+    sale_id = create_sale_draft(api, customer_id, payment_type="Credit", due_date="2024-06-01")
+    add_sale_line(api, sale_id, product_id, qty="1", unit_price="10.00")
+
+    page.set_viewport_size({"width": 360, "height": 740})
+
+    # The AC2 claim itself: the page must not be wider than its viewport.
+    # `wait_for_function` polls the resolved condition in the browser (no
+    # sleep): it returns as soon as the document fits, and times out — with
+    # the scrollWidth that broke it — when the layout overflows.
+    no_horizontal_scroll = (
+        "document.documentElement.scrollWidth <= "
+        "document.documentElement.clientWidth"
+    )
+
+    # /purchases first, all three seeded rows rendered before the claim is
+    # read: the wait is on the rows being visible, so the layout is final.
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+    for kind in ("draft", "owed", "settled"):
+        expect(page.locator(f"#purchase-{seeded[kind]}")).to_be_visible()
+    # The long supplier really is on the page being measured: truncation is
+    # exercised, not assumed.
+    expect(page.locator("#purchase-list-inner")).to_contain_text(_LONG_SUPPLIER)
+    page.wait_for_function(no_horizontal_scroll)
+
+    # The owed row's chip carries the residual amount, at this width too.
+    owed_row = page.locator(f"#purchase-{seeded['owed']}")
+    expect(owed_row).to_contain_text(f"Due {seeded['owed_due']}")
+
+    # /sales under the same viewport, its own long name in the row.
+    with page.expect_response(_response_for("/web/sales")):
+        page.goto(f"{api.base_url}/sales")
+    expect(page.locator(f"#sale-{sale_id}")).to_be_visible()
+    expect(page.locator("#sale-list-inner")).to_contain_text(long_buyer)
+    page.wait_for_function(no_horizontal_scroll)
+
+
+def test_clicking_a_purchase_row_opens_the_peek_and_escape_closes_it(
+    page: Page, api: ApiClient
+):
+    """On /purchases, a row click opens the read-only peek; Escape empties it.
+
+    S3 made the purchase row open the peek and S6 rewrote the row, but every
+    drawer test drove /documents — the gap that let a red browser suite ship
+    once. This proves the whole journey on the page operators live on: the
+    row's `hx-get` swaps the document detail into `#purchase-drawer-body`,
+    the page's `htmx:afterSwap` listener reveals `#purchase-drawer`, the
+    body carries THIS document's facts (its identifier — number or draft
+    handle — and the supplier's name), and Escape both hides the drawer and
+    empties the body so a next open can never flash the previous purchase.
+
+    The row is a confirmed credit purchase, so its drawer title is the
+    assigned `2024-PURCH-NNNNNN` number the API read back — a stable handle
+    the body must carry exactly once. Every wait is an `expect()` condition
+    or a `page.expect_response`; no sleeps.
+    """
+    product = create_product(
+        api,
+        sku="OPEN-S6-SKU",
+        name="Open S6 Widget",
+        sale_price="15.00",
+        cost_price="7.00",
+        stock="12",
+        min_stock="1",
+        max_stock="60",
+    )
+    product_id = int(product["id"])
+    supplier_name = "Peek Supplier"
+    supplier_id = create_supplier(api, supplier_name)
+    purchase_id = create_purchase_draft(
+        api, supplier_id, payment_type="Credit", due_date="2024-06-01"
+    )
+    add_purchase_line(api, purchase_id, product_id, qty="2", unit_cost="7.00")
+    confirm_purchase(api, purchase_id)
+    purchase_number = str(
+        api.get_json(f"/api/purchases/{purchase_id}")["purchase"]["purchase_number"]
+    )
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+    row = page.locator(f"#purchase-{purchase_id}")
+    expect(row).to_be_visible()
+
+    drawer = page.locator("#purchase-drawer")
+    drawer_body = page.locator("#purchase-drawer-body")
+    expect(drawer).not_to_be_visible()
+
+    # The click fires the row's hx-get; wait out its response, then the swap
+    # listener reveals the drawer. The row's href would navigate, so this is
+    # also the moment htmx's preventDefault is proven for real.
+    with page.expect_response(
+        _response_for(f"/web/documents/detail/purchase/{purchase_id}")
+    ):
+        row.click()
+    expect(drawer).to_be_visible()
+    expect(drawer_body).to_contain_text(purchase_number)
+    expect(drawer_body).to_contain_text(supplier_name)
+    # The URL never moved: the peek is an in-page swap, not a navigation.
+    assert urlparse(page.url).path == "/purchases", page.url
+
+    # Escape closes the drawer AND empties the body — the emptied body is the
+    # DOM property the page's close script owns, the same claim the documents
+    # drawer tests make for their sibling.
+    page.keyboard.press("Escape")
+    expect(drawer).not_to_be_visible()
+    assert (
+        page.evaluate("document.getElementById('purchase-drawer-body').innerHTML")
+        == ""
+    ), "Escape must empty the peek body, not just hide the drawer"

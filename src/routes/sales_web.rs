@@ -43,8 +43,6 @@ struct SalesTemplate {
     sales: Vec<SaleDetail>,
     debt: DebtSummary,
     customers: Vec<crate::models::Customer>,
-    allow_negative: bool,
-    allow_negative_stock: bool,
     today: String,
     nav_key: &'static str,
     /// Current filter values, so a bookmarkable `/sales?status=…` re-renders with
@@ -274,8 +272,6 @@ async fn sales_page(
         sales,
         debt,
         customers,
-        allow_negative: state.allow_negative,
-        allow_negative_stock: state.allow_negative_stock,
         today,
         nav_key: "sales",
         filter_status: query.status.trim().to_string(),

@@ -5,7 +5,6 @@
 {% let page_breadcrumb_label = "" %}
 {% let page_breadcrumb_href = "" %}
 {% include "partials/page_header.html" %}
-<div class="mb-4 text-[13px] text-muted">purchases • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %} • {% if allow_negative %}overdraft allowed{% else %}overdraft blocked{% endif %}</div>
 <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="mb-3 flex items-center justify-between">

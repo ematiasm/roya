@@ -678,7 +678,11 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
 
 `GET /purchases` — purchases (M3):
 
-- Purchase list with status/payable badges; each row links to its record (HTMX `GET /web/purchases`)
+- One row per purchase: identifier, supplier, date and item count, a neutral
+  total, and a single status chip carrying the residual amount when something
+  is owed (Draft · Paid · Due · Overdue · Cancelled); each row opens its
+  read-only peek (HTMX `GET /web/documents/detail/purchase/{id}`) and links
+  to its record (HTMX `GET /web/purchases`)
 - `/purchases/:id` — record page with the header (status, number or draft state,
   supplier, dates, totals, payment status), the lines table with product name and
   SKU, unit cost and subtotal, and the payments table with account and method

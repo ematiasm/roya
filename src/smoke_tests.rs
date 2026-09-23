@@ -5013,8 +5013,20 @@ async fn create_sale_draft_on_date(
 
 /// Create a purchase draft for an explicit supplier and date through the web form.
 async fn create_purchase_draft_on_date(app: &Router, supplier_id: i64, purchase_date: &str) -> i64 {
+    create_purchase_draft_with_due(app, supplier_id, "Credit", purchase_date, "2024-12-31").await
+}
+
+/// Create a purchase draft with an explicit payment type and due date through
+/// the web form, and return its id.
+async fn create_purchase_draft_with_due(
+    app: &Router,
+    supplier_id: i64,
+    payment_type: &str,
+    purchase_date: &str,
+    due_date: &str,
+) -> i64 {
     let body = format!(
-        "supplier_id={supplier_id}&payment_type=Credit&purchase_date={purchase_date}&due_date=2024-12-31"
+        "supplier_id={supplier_id}&payment_type={payment_type}&purchase_date={purchase_date}&due_date={due_date}"
     );
     let (status, resp) = post_form(app, "/web/purchases", &body).await;
     assert_eq!(status, StatusCode::OK, "create purchase: {resp}");
@@ -5029,6 +5041,20 @@ async fn create_purchase_draft_on_date(app: &Router, supplier_id: i64, purchase_
         .last()
         .and_then(|d| d["purchase"]["id"].as_i64())
         .unwrap_or_else(|| panic!("purchase for supplier {supplier_id} not found: {v}"))
+}
+
+/// The one purchase row's inner HTML, cut from the list fragment by the row's
+/// stable id (`id="purchase-{id}"`). Rows are anchors, so the cut ends at the
+/// first `</a>` — no nested anchor may live inside a row.
+fn purchase_row_html(html: &str, purchase_id: i64) -> String {
+    let start = html
+        .find(&format!("id=\"purchase-{purchase_id}\""))
+        .unwrap_or_else(|| panic!("purchase row {purchase_id} missing from the list"));
+    let end = html[start..]
+        .find("</a>")
+        .map(|i| start + i)
+        .expect("a purchase row is an anchor");
+    html[start..end].to_string()
 }
 
 async fn add_purchase_line_via_web(app: &Router, purchase_id: i64, product_id: i64, qty: &str) {
@@ -5196,7 +5222,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
         .to_string();
 
     let all = purchase_list_html(&app, "").await;
-    assert!(all.contains("draft #"), "{all}");
+    assert!(all.contains("Draft #"), "{all}");
     assert!(
         all.contains(&sur_number) && all.contains(&norte_number),
         "{all}"
@@ -5207,10 +5233,10 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
         confirmed.contains(&sur_number) && confirmed.contains(&norte_number),
         "{confirmed}"
     );
-    assert!(!confirmed.contains("draft #"), "{confirmed}");
+    assert!(!confirmed.contains("Draft #"), "{confirmed}");
 
     let drafts = purchase_list_html(&app, "?status=Draft").await;
-    assert!(drafts.contains("draft #"), "{drafts}");
+    assert!(drafts.contains("Draft #"), "{drafts}");
     assert!(!drafts.contains(&sur_number), "{drafts}");
 
     // Supplier alone, case-insensitive over the name the list shows.
@@ -5233,7 +5259,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
 
     let blank = purchase_list_html(&app, "?status=&supplier=&number=&from=&to=").await;
     assert!(
-        blank.contains("draft #")
+        blank.contains("Draft #")
             && blank.contains(&sur_number)
             && blank.contains(&norte_number),
         "{blank}"
@@ -5245,7 +5271,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
     let (status, page) = get(&app, "/purchases?status=Confirmed").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert!(page.contains(&sur_number), "{page:.600}");
-    assert!(!page.contains("draft #"), "{page:.600}");
+    assert!(!page.contains("Draft #"), "{page:.600}");
 
     // The form reflects the URL, so a shared link re-opens with the same filters.
     let (status, page) = get(
@@ -5262,6 +5288,214 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
         page.contains("<option value=\"Draft\" selected>Draft</option>"),
         "{page:.600}"
     );
+}
+
+/// S6: one purchase row, one reading order (identifier → supplier → money),
+/// one status chip. The chip carries the state colour the total used to
+/// shout: Draft/Cancelled stay muted, Confirmed+settled shows Paid, owed and
+/// not yet past due shows Due (warning), owed past the due date shows
+/// Overdue (expense). The owed chips also print the amount still owed as a
+/// bare number — what the old badge cloud's `payable …` used to say — while
+/// Paid stays a bare word because nothing is owed. The total itself is
+/// neutral text, the badge cloud (`payable …`, `settled`, `Cash`,
+/// `Confirmed`) is gone, and the row keeps the S3 peek contract (`hx-get`
+/// into the drawer, never a full navigation).
+#[tokio::test]
+async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "ROW-S6", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+    let sur = create_supplier_via_web(&app, &pool, "RowSur").await;
+
+    // Fund an account so the Cash confirm can pay the total immediately.
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "RowWallet", &[cash]).await;
+    let account_cash = account_method_id(&pool, account, "Cash").await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/transactions",
+        &format!("account_id={account}&type=Income&amount=1000&description=seed&date=2024-05-01"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fund account: {resp}");
+
+    let draft = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    let due_row = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", &chrono::Local::now().date_naive().to_string()).await;
+    let overdue = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    // Cash purchases carry no due date (the domain rejects one), and the Cash
+    // confirm pays the total immediately, so this row settles fully paid.
+    let paid = create_purchase_draft_with_due(&app, sur, "Cash", "2024-05-02", "").await;
+    for (id, qty) in [(due_row, "2"), (overdue, "1"), (paid, "1")] {
+        add_purchase_line_via_web(&app, id, product, qty).await;
+    }
+    confirm_purchase_via_web(&app, due_row).await;
+    confirm_purchase_via_web(&app, overdue).await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/purchases/confirm",
+        &format!("purchase_id={paid}&method_id={account_cash}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm Cash purchase: {resp}");
+    // A cancelled confirmed purchase still owes money past its due date; its
+    // chip must stay the muted Cancelled one — the lifecycle outranks money.
+    let cancelled = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    add_purchase_line_via_web(&app, cancelled, product, "1").await;
+    confirm_purchase_via_web(&app, cancelled).await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/purchases/cancel",
+        &format!("purchase_id={cancelled}&reason=triangulation"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cancel purchase: {resp}");
+    // A partial payment keeps the due row owed (due > 0) while some money is
+    // already down, so its meta line may name what was paid so far.
+    let (status, resp) = post_form(
+        &app,
+        "/web/purchases/payments",
+        &format!("purchase_id={due_row}&method_id={account_cash}&amount=1&date=2024-05-10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "partial payment: {resp}");
+
+    let all = purchase_list_html(&app, "").await;
+    let draft_row = purchase_row_html(&all, draft);
+    let due_row_html = purchase_row_html(&all, due_row);
+    let overdue_row = purchase_row_html(&all, overdue);
+    let paid_row = purchase_row_html(&all, paid);
+    let cancelled_row = purchase_row_html(&all, cancelled);
+
+    // Identifier zone first (AC4): the stable handle a draft actually has.
+    assert!(
+        draft_row.contains(&format!("Draft #{draft}")),
+        "the draft identifier must be the row's handle: {draft_row}"
+    );
+    assert!(
+        draft_row.contains("font-semibold tabular-nums"),
+        "the identifier reads first and is tabular: {draft_row}"
+    );
+
+    // The S3 peek contract must survive the row rewrite.
+    assert!(
+        draft_row.contains(&format!("hx-get=\"/web/documents/detail/purchase/{draft}\"")),
+        "{draft_row}"
+    );
+    assert!(
+        draft_row.contains("hx-target=\"#purchase-drawer-body\"")
+            && draft_row.contains("hx-swap=\"innerHTML\""),
+        "{draft_row}"
+    );
+    assert!(
+        draft_row.contains(&format!("href=\"/purchases/{draft}\"")),
+        "{draft_row}"
+    );
+
+    // Exactly one chip per row, and each state gets its own colour. The owed
+    // chips print the amount still owed — a bare number, like the row's other
+    // money — and a partially paid row shows what remains, not the total.
+    let pending_due = purchase_detail(&app, due_row).await["due"]
+        .as_str()
+        .expect("purchase due")
+        .to_string();
+    let overdue_due = purchase_detail(&app, overdue).await["due"]
+        .as_str()
+        .expect("purchase due")
+        .to_string();
+    let pending_total = purchase_detail(&app, due_row).await["total"]
+        .as_str()
+        .expect("purchase total")
+        .to_string();
+    assert!(
+        paid_row.contains(">Paid</span>") && paid_row.contains("text-income"),
+        "a fully paid row carries the bare-word Paid chip in income colour: {paid_row}"
+    );
+    assert!(
+        due_row_html.contains(&format!(">Due {pending_due}</span>"))
+            && due_row_html.contains("text-warning"),
+        "owed and not yet past due carries the Due chip with the amount owed in warning colour: {due_row_html}"
+    );
+    assert!(
+        pending_due != pending_total
+            && !due_row_html.contains(&format!(">Due {pending_total}</span>")),
+        "a partially paid row's Due chip names the remainder, not the total: {due_row_html}"
+    );
+    assert!(
+        overdue_row.contains(&format!(">Overdue {overdue_due}</span>"))
+            && overdue_row.contains("text-expense"),
+        "owed past the due date carries the Overdue chip with the amount owed in expense colour: {overdue_row}"
+    );
+    assert!(
+        draft_row.contains(">Draft</span>")
+            && !draft_row.contains("text-income")
+            && !draft_row.contains("text-warning"),
+        "a draft chip is muted, never coloured: {draft_row}"
+    );
+    assert!(
+        cancelled_row.contains(">Cancelled</span>")
+            && cancelled_row.contains("text-muted")
+            && !cancelled_row.contains("text-expense"),
+        "a cancelled row keeps the muted Cancelled chip, never the Overdue red: {cancelled_row}"
+    );
+
+    // AC3: the total is neutral — it never borrows income or expense colour
+    // (the old row painted it `text-expense">{total}` whenever due > 0).
+    for (id, row) in [(draft, &draft_row), (due_row, &due_row_html), (overdue, &overdue_row), (paid, &paid_row)] {
+        let total = purchase_detail(&app, id).await["total"]
+            .as_str()
+            .expect("purchase total")
+            .to_string();
+        assert!(
+            row.contains(&format!("font-bold tabular-nums text-text\">{total}")),
+            "the total must be bold, tabular and neutral: {row}"
+        );
+        assert!(
+            !row.contains(&format!("text-expense\">{total}"))
+                && !row.contains(&format!("text-income\">{total}")),
+            "the total must not be painted by payment state: {row}"
+        );
+    }
+
+    // AC5: the money is printed once — the old muted `total … paid … due`
+    // echo line is gone, and the total appears exactly once in the row.
+    let paid_total = purchase_detail(&app, paid).await["total"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        paid_row.matches(&paid_total).count(),
+        1,
+        "the total must render once per row: {paid_row}"
+    );
+
+    // The badge cloud is gone: no payable/settled badge, no payment-type chip,
+    // and no `Confirmed` chip — the normal state is not a status.
+    assert!(
+        !all.contains(">payable ") && !all.contains(">settled<"),
+        "{all}"
+    );
+    assert!(!all.contains(">Cash<"), "{all}");
+    assert!(!all.contains(">Confirmed<"), "{all}");
+    // The partial payment shows what is already down, once, in the meta line.
+    assert!(
+        due_row_html.matches("· paid ").count() == 1,
+        "partial payment meta renders once: {due_row_html}"
+    );
+    // Credit is the meta line's only payment-type mention (Cash is the default).
+    assert!(overdue_row.contains("· Credit"), "{overdue_row}");
+}
+
+/// S6: the per-page global-config echo is gone from both document lists (AC6).
+/// Nothing else on either page depends on it.
+#[tokio::test]
+async fn purchases_and_sales_pages_render_no_config_subtitle() {
+    let (app, _pool) = test_app().await;
+    for path in ["/purchases", "/sales"] {
+        let (status, page) = get(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{page:.400}");
+        assert!(!page.contains("negative stock"), "{page:.600}");
+        assert!(!page.contains("overdraft"), "{page:.600}");
+    }
 }
 
 /// AC14: the products list matches name, SKU and barcode through the same search

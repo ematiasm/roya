@@ -37,11 +37,54 @@ use crate::security::authz::{
 // Views + Askama templates
 // ---------------------------------------------------------------------------
 
-/// A purchase detail plus the resolved supplier name (purchases store only the id).
+/// A purchase detail plus the resolved supplier name (purchases store only the id),
+/// the row's payment state, derived against `today` so the template never parses
+/// a date, and whether some but not all of the money is already down (the meta
+/// line names what was paid only then — settled rows say it once in the chip).
 #[derive(Clone)]
 pub struct PurchaseView {
     pub detail: PurchaseDetail,
     pub supplier_name: String,
+    pub payment_state: PurchasePaymentState,
+    pub partially_paid: bool,
+}
+
+/// The one word a row's status chip starts with (S6): the chip replaces the
+/// badge cloud, so money and due date resolve to a single state per row. The
+/// owed states render the word plus the amount still owed ("Due 42",
+/// "Overdue 17"); Paid — nothing owed — is the one bare word. Draft and
+/// Cancelled purchases keep their lifecycle chip regardless of money, so the
+/// template branches on the status first, this second.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PurchasePaymentState {
+    Paid,
+    Due,
+    Overdue,
+}
+
+impl std::fmt::Display for PurchasePaymentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paid => write!(f, "Paid"),
+            Self::Due => write!(f, "Due"),
+            Self::Overdue => write!(f, "Overdue"),
+        }
+    }
+}
+
+/// Nothing owed — due is zero or a refund — is Paid; owed with the due date
+/// already past is Overdue; owed with the due date today or later — or absent
+/// — is Due. Derived in the view layer, never in the template. Zero must
+/// compare numerically, not by sign: `Decimal::ZERO.is_sign_positive()` is
+/// `true`, and a settled purchase (due exactly 0) is Paid, never Due.
+fn purchase_payment_state(detail: &PurchaseDetail, today: NaiveDate) -> PurchasePaymentState {
+    if detail.due <= Decimal::ZERO {
+        PurchasePaymentState::Paid
+    } else if detail.purchase.due_date.map(|d| d < today) == Some(true) {
+        PurchasePaymentState::Overdue
+    } else {
+        PurchasePaymentState::Due
+    }
 }
 
 #[derive(Template)]
@@ -51,8 +94,6 @@ struct PurchasesTemplate {
     purchases: Vec<PurchaseView>,
     suggestions: PurchaseSuggestions,
     has_suggestions: bool,
-    allow_negative: bool,
-    allow_negative_stock: bool,
     /// Live: the included `partials/suggestion_list.html` renders `{{ today }}`
     /// in its seed-options date input, so this is not the deleted creation
     /// card's leftover — the page include shares this struct's context.
@@ -240,6 +281,7 @@ fn clean_opt(s: &str) -> Option<String> {
 async fn purchase_views(
     state: &AppState,
     filter: &PurchaseListFilter,
+    today: NaiveDate,
 ) -> AppResult<Vec<PurchaseView>> {
     let details = state
         .purchases_service
@@ -252,6 +294,8 @@ async fn purchase_views(
             .get_supplier(detail.purchase.supplier_id)
             .await?;
         out.push(PurchaseView {
+            payment_state: purchase_payment_state(&detail, today),
+            partially_paid: detail.paid > Decimal::ZERO && detail.due > Decimal::ZERO,
             detail,
             supplier_name: supplier.name,
         });
@@ -371,7 +415,7 @@ async fn purchases_page(
     principal: axum::Extension<crate::security::authz::Principal>,
     Query(query): Query<PurchaseListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let purchases = purchase_views(&state, &query.to_filter()).await?;
+    let purchases = purchase_views(&state, &query.to_filter(), chrono::Local::now().date_naive()).await?;
     // The suggestion block renders only when the principal may refresh it:
     // the fragment (`/web/purchases/suggestions`) and the API twin are gated
     // `inventory.read` because the suggestion is stock-derived data, so the
@@ -403,8 +447,6 @@ async fn purchases_page(
         purchases,
         suggestions,
         has_suggestions,
-        allow_negative: state.allow_negative,
-        allow_negative_stock: state.allow_negative_stock,
         today,
         nav_key: "purchases",
         filter_status: query.status.trim().to_string(),
@@ -554,7 +596,7 @@ async fn web_purchase_list(
     _: Require<PurchasesRead>,
     Query(query): Query<PurchaseListQuery>,
 ) -> AppResult<Response> {
-    let view = purchase_views(&state, &query.to_filter()).await?;
+    let view = purchase_views(&state, &query.to_filter(), chrono::Local::now().date_naive()).await?;
     Ok(render_list(view, "All purchases")?.into_response())
 }
 
@@ -3539,10 +3581,12 @@ mod tests {
     }
 
     /// T3: payment is decided at confirm, so the stored type is invisible
-    /// while the purchase is a Draft — neither the record header nor the list
-    /// row shows a payment-type badge. Once confirmed the type is a fact and
-    /// the badge returns (the row it came from is proven by the exact-once
-    /// count: every draft this test seeded must still be badgeless).
+    /// while the purchase is a Draft — the record header shows no payment-type
+    /// badge until then. Since S6 the list row never shows one at all: Cash is
+    /// the default and Credit rides the meta line, so the row's only chip is
+    /// the status chip (the confirmed row proves which row the Paid chip came
+    /// from by the exact-once count: every draft this test seeded stays
+    /// badgeless too).
     #[tokio::test]
     async fn web_draft_hides_the_payment_type_badge_until_confirm() {
         let state = test_state().await;
@@ -3575,7 +3619,8 @@ mod tests {
             "draft rows carry no payment-type badge: {list:.600}"
         );
 
-        // -- Confirm: the badge returns on record and list -----------------
+        // -- Confirm: the badge returns on the record page only; the list
+        // keeps no type chip at all ---------------------------------------
         let (status, _, resp) = post_form_response(
             app.clone(),
             &format!("/web/purchases/{}/confirm", cash.purchase_id),
@@ -3597,12 +3642,19 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             list.matches("uppercase\">Cash</span>").count(),
-            1,
-            "the confirmed row shows the badge exactly once, drafts stay hidden: {list:.600}"
+            0,
+            "a confirmed row still shows no payment-type chip: {list:.600}"
         );
         assert!(
             !list.contains("uppercase\">Credit</span>"),
-            "the Credit draft row stays badgeless: {list:.600}"
+            "no row ever shows a payment-type chip: {list:.600}"
+        );
+        // The confirmed Cash purchase settled at confirm, so its one chip is
+        // the Paid state, never the type.
+        assert_eq!(
+            list.matches(">Paid</span>").count(),
+            1,
+            "the confirmed Cash row carries the Paid chip exactly once: {list:.600}"
         );
     }
 
@@ -4191,8 +4243,8 @@ mod tests {
             "list should contain the new draft: {html:.400}"
         );
         assert!(
-            html.contains("draft #"),
-            "draft without number should show as draft #id: {html:.400}"
+            html.contains("Draft #"),
+            "draft without number should show as Draft #id: {html:.400}"
         );
     }
 

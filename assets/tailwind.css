@@ -25,6 +25,10 @@
   --color-danger: #f87171;
   --color-income: #34d399;
   --color-expense: #f87171;
+  /* Warning carries "owed, not yet past due" — the pending state the old row
+     encoded by painting the total red. Red keeps its two existing meanings
+     (money out, error); amber is the only new colour the interface gains. */
+  --color-warning: #fbbf24;
 }
 
 /* Element defaults that keep the original visual language. */
