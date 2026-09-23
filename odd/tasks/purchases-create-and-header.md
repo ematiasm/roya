@@ -173,7 +173,7 @@ choosing is what creates the draft.**
   header route; the Edit header dialog and its `⋯` entry are deleted.
 
 Order: T1, T1b and T1c are independent of everything else; T2 before T3 and T4,
-since both host the picker. T1, T1b and T2 are done; T1c, T3 and T4 remain.
+since both host the picker. T1, T1b, T1c and T2 are done; T3 remains, then T4.
 
 ## Acceptance criteria
 
@@ -217,13 +217,28 @@ since both host the picker. T1, T1b and T2 are done; T1c, T3 and T4 remain.
   for such a principal at the line picker. Recorded so the asymmetry is a
   decision rather than a surprise.
 
+## Known pre-existing items, not fixed
+
+- **Destructive dialog submits are not danger-tinted.** The purchase record
+  page's `Discard draft` and `Cancel purchase` menu entries are `text-danger`,
+  but their dialog submit buttons are `border border-border bg-transparent
+  text-text` — neutral. They are also the two buttons that *lost* their blue
+  override in an earlier iteration of this design and were already neutral
+  before T1c, so T1c neither caused nor changed this; a destructive confirm
+  simply does not look destructive. Found by the T1c verification, out of its
+  scope, and worth deciding separately.
+- **Two dark labels, imperceptibly different.** The page action is an anchor
+  carrying `text-bg` (`#0f1115`); the base button's label is `#0a0f0d`. Both
+  near-black, both asserted exactly by the new browser tests so neither drifts.
+  Unifying them would be cosmetic.
+
 ## Progress
 
 | Slice | Status | Commits / evidence |
 |-------|--------|--------------------|
 | T1 | **done** | `f1e27e7` — `page_header.html` to `bg-accent text-bg`, stylesheet regenerated. Verifier verdict *pass*: the whole-file stylesheet rule diff removes **zero** rules and adds exactly the two needed (so no other page lost a utility — checked mechanically over all 52 templates), the contrast goes from 2.54:1 (fails AA) to **12.40:1 (AAA)**, and the test asserts the rendered action tag in both directions. |
 | T1b | **done** | `ac49610` — the row anchor names `text-text`. The verifier measured mint = `--color-accent` (not the money green), confirmed the peek contract survived byte-identical apart from the added class, and confirmed the test asserts the **row's opening tag** rather than an inner span, which is the narrow check that let this ship. |
-| T1c | not started | — |
+| T1c | **done** | `c6537d9` — the ten overrides retired, stylesheet regenerated, plus the browser colour assertions. Verifier verdict *pass*: the rule-level stylesheet diff is exactly three removals and zero additions (checked character-level), nothing anywhere uses a white utility so the dropped `--color-white` token had no other user, all ten buttons lost only those two classes (ids, `onclick` and the conditional `disabled` intact), and the two tests are real gates. Its one substantive note is now closed: no test asserted a **rendered** colour, which is the class of defect that let the blue row ship, so two browser tests read `getComputedStyle` off the real elements. They were written against the token values before their first run and passed unchanged. |
 | T2 | **done** | `03d7a5a` — the endpoint, two bounded service reads, the shared widget and the results fragment. Verifier verdict *pass*: the gate is proven a **restatement, not a widening** (at HEAD a `purchases.create`-only principal already received the whole roster, id/name/active flag, from the creation page), the matching shape mirrors the product picker exactly (same fold, same ten-row bound, same ordering), and the htmx claim — `hx-vals` only fills missing keys, so relying on `hx-include` alone would post the hidden CURRENT supplier — was checked against the vendored htmx 1.9.12 source. Its one real finding was a genuine defect, fixed and pinned before the commit: resolution ran through the bounded search, so with more than ten partial matches two colliding exact names could straddle the bound and one would be **silently chosen**, or an existing name reported as missing. Both failure modes were red first. |
 | T3 | not started | — |
 | T4 | not started | — |
