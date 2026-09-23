@@ -173,7 +173,7 @@ choosing is what creates the draft.**
   header route; the Edit header dialog and its `⋯` entry are deleted.
 
 Order: T1, T1b and T1c are independent of everything else; T2 before T3 and T4,
-since both host the picker. T1, T1b, T1c and T2 are done; T3 remains, then T4.
+since both host the picker. T1, T1b, T1c, T2 and T3 are done; **T4 remains**.
 
 ## Acceptance criteria
 
@@ -219,6 +219,12 @@ since both host the picker. T1, T1b, T1c and T2 are done; T3 remains, then T4.
 
 ## Known pre-existing items, not fixed
 
+- **The record route and its fragments disagree on a malformed id.**
+  `GET /purchases/<non-numeric>` answers 404 (the handler parses the segment
+  itself, so `/purchases/new` reads as a missing page rather than the
+  extractor's 400), while `/web/purchases/<non-numeric>` keeps `Path<i64>` and
+  answers 400. Deliberate, documented in the README, and listed here so the next
+  reader does not read it as an oversight.
 - **Destructive dialog submits are not danger-tinted.** The purchase record
   page's `Discard draft` and `Cancel purchase` menu entries are `text-danger`,
   but their dialog submit buttons are `border border-border bg-transparent
@@ -240,7 +246,7 @@ since both host the picker. T1, T1b, T1c and T2 are done; T3 remains, then T4.
 | T1b | **done** | `ac49610` — the row anchor names `text-text`. The verifier measured mint = `--color-accent` (not the money green), confirmed the peek contract survived byte-identical apart from the added class, and confirmed the test asserts the **row's opening tag** rather than an inner span, which is the narrow check that let this ship. |
 | T1c | **done** | `c6537d9` — the ten overrides retired, stylesheet regenerated, plus the browser colour assertions. Verifier verdict *pass*: the rule-level stylesheet diff is exactly three removals and zero additions (checked character-level), nothing anywhere uses a white utility so the dropped `--color-white` token had no other user, all ten buttons lost only those two classes (ids, `onclick` and the conditional `disabled` intact), and the two tests are real gates. Its one substantive note is now closed: no test asserted a **rendered** colour, which is the class of defect that let the blue row ship, so two browser tests read `getComputedStyle` off the real elements. They were written against the token values before their first run and passed unchanged. |
 | T2 | **done** | `03d7a5a` — the endpoint, two bounded service reads, the shared widget and the results fragment. Verifier verdict *pass*: the gate is proven a **restatement, not a widening** (at HEAD a `purchases.create`-only principal already received the whole roster, id/name/active flag, from the creation page), the matching shape mirrors the product picker exactly (same fold, same ten-row bound, same ordering), and the htmx claim — `hx-vals` only fills missing keys, so relying on `hx-include` alone would post the hidden CURRENT supplier — was checked against the vendored htmx 1.9.12 source. Its one real finding was a genuine defect, fixed and pinned before the commit: resolution ran through the bounded search, so with more than ten partial matches two colliding exact names could straddle the bound and one would be **silently chosen**, or an existing name reported as missing. Both failure modes were red first. |
-| T3 | not started | — |
+| T3 | **done** | `ef2bc89` — the dialog, the deletion, the last-used read, the component's dialog mode. Verifier verdict *pass* on `cargo test` 879 passed / 0 failed and the browser suite 89 passed / 0 failed / 4 skipped, run twice. Two real defects were found and fixed before the commit. **(1)** The picker's own form carried a hidden `supplier_id`, so pressing Enter after typing a different supplier posted the pre-filled id alongside the typed name, the route prefers the id, and the draft was created against the **previous** supplier — silently, and the supplier is what resolves every line's default cost. Red first (`left: 1 / right: 2`, the pre-filled one winning), fixed by making the field's text the contract, and the regression test builds its request body from the picker's **rendered** form so re-adding the input fails it. **(2)** A browser test armed `expect_response` *after* the action that triggers it — a race that timed out once and passed on re-run; both sites fixed by arming around the action, and a scan confirmed no other site in the tree has the pattern. The verifier also found the record route's malformed-id change (400 → 404) was undocumented and a comment in `sale.html` that inverted the real shadowing hazard; both fixed. |
 | T4 | not started | — |
 
 Verified after both: `cargo test` 859 passed / 0 failed, full browser suite 85 passed / 0 failed / 4 skipped.
