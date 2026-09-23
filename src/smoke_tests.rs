@@ -1158,6 +1158,22 @@ async fn probe_or_fail(
     Ok(())
 }
 
+/// The guard's non-vacuity decision, extracted so mutation tests can pin its
+/// boundary directly. A page is worth guarding when it renders at least one
+/// `hx-*` request target, or a native form whose action is a real URL:
+/// non-empty and not the placeholder `#` (an `action="#"` form posts nowhere,
+/// so it checks nothing). Extracted unchanged from the inline check the
+/// S4-widened guard carried; behaviour-preserving.
+fn wiring_is_vacuous(targets: &[RenderedTarget], forms: &[RenderedForm]) -> bool {
+    let renders_wired_native_form = forms.iter().any(|f| {
+        f.action
+            .as_deref()
+            .map(|a| !a.is_empty() && a != "#")
+            .unwrap_or(false)
+    });
+    targets.is_empty() && !renders_wired_native_form
+}
+
 /// Prove every rendered request target resolves to a registered route for the
 /// verb that will actually be sent.
 ///
@@ -1197,9 +1213,17 @@ async fn assert_htmx_targets_are_wired(
     }
 
     let targets = extract_htmx_targets(html);
-    if targets.is_empty() {
+    let forms = extract_rendered_forms(html)
+        .into_iter()
+        .collect::<Vec<_>>();
+    // A page renders wiring either as htmx request attributes or as a native
+    // form action (both are probed with real verbs below). A page with neither
+    // renders nothing this guard can check, so it must not be guarded — but a
+    // native-form-only page (the creation page posts the collection endpoint
+    // with a plain action/method) is fully checked and never vacuous.
+    if wiring_is_vacuous(&targets, &forms) {
         return Err(format!(
-            "{page}: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets rendered; guard would be vacuous"
+            "{page}: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets or native form action rendered; guard would be vacuous"
         ));
     }
     for target in &targets {
@@ -1232,8 +1256,8 @@ async fn assert_htmx_targets_are_wired(
         .await?;
     }
 
-    for form in extract_rendered_forms(html) {
-        check_native_form(page, &form, concrete_ids_are_defects)?;
+    for form in &forms {
+        check_native_form(page, form, concrete_ids_are_defects)?;
         if let Some(action) = &form.action {
             if !action.is_empty() && action != "#" {
                 probe_or_fail(probe_app, page, "form action", &form.method, action).await?;
@@ -1417,6 +1441,16 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
         GuardedPage {
             label: "purchases",
             path: "/purchases".to_string(),
+            concrete_ids_are_defects: true,
+            external_selectors: vec![],
+        },
+        // The creation page: like the list, its URL carries no id and its form
+        // posts the collection endpoint (/web/purchases) with no data-bound id
+        // in any request target — the supplier roster renders as names/values,
+        // not as a typed id.
+        GuardedPage {
+            label: "purchase new page",
+            path: "/purchases/new".to_string(),
             concrete_ids_are_defects: true,
             external_selectors: vec![],
         },
@@ -2933,6 +2967,63 @@ fn wiring_guard_catches_dead_native_form_action_rewrite() {
     assert!(err.contains("this.action"), "{err}");
 }
 
+/// The widened non-vacuity boundary (S4): a native form with a real,
+/// non-`#` action makes a target-free page guarded, not vacuous. Pinned on
+/// all three sides of the boundary, asserting the guard's exact vacuity
+/// text, so relaxing `wiring_is_vacuous` fails here before a page like
+/// `/purchases/new` can silently lose its only wiring.
+#[tokio::test]
+async fn wiring_guard_pins_the_non_vacuity_boundary_of_native_form_actions() {
+    let (app, _pool) = test_app().await;
+
+    // The predicate directly, on all three boundaries.
+    let form_with_action = extract_rendered_forms(r#"<form method="get" action="/login"></form>"#);
+    assert!(!wiring_is_vacuous(&[], &form_with_action));
+    let form_with_placeholder = extract_rendered_forms(r##"<form method="post" action="#"></form>"##);
+    assert!(wiring_is_vacuous(&[], &form_with_placeholder));
+    assert!(wiring_is_vacuous(&[], &[]));
+
+    // And end-to-end through the guard, whose vacuity error text the
+    // boundary pins assert verbatim.
+
+    // (a) No hx-* target, but a form with a real action: guarded, not
+    // vacuous — the form's action is probed and a real route answers.
+    assert_htmx_targets_are_wired(
+        &app,
+        "mutation-5a",
+        r#"<form method="get" action="/login"></form>"#,
+        false,
+    )
+    .await
+    .unwrap();
+
+    // (b) A form whose action is the `#` placeholder posts nowhere, so it
+    // checks nothing: vacuous.
+    let err = assert_htmx_targets_are_wired(
+        &app,
+        "mutation-5b",
+        r##"<form method="post" action="#"></form>"##,
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        err,
+        "mutation-5b: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets or native form action rendered; guard would be vacuous",
+        "{err}"
+    );
+
+    // (c) No form and no target at all: vacuous.
+    let err = assert_htmx_targets_are_wired(&app, "mutation-5c", "<p>nothing wired</p>", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "mutation-5c: no hx-get/hx-post/hx-put/hx-patch/hx-delete targets or native form action rendered; guard would be vacuous",
+        "{err}"
+    );
+}
+
 /// `data-action` names the failed action for the `#notice` region. It is not a
 /// native form `action`, so the guard must not read it as one and probe
 /// "Create product" as a URL.
@@ -3723,6 +3814,175 @@ async fn products_page_uses_modals_drawer_and_clickable_rows() {
     );
 }
 
+/// The purchases-index redesign S1 (odd/tasks/redesign-purchases-index.md):
+/// the four REST API cards left the operator's pages (`/`, `/purchases`,
+/// `/sales`, `/suppliers`). The endpoints themselves stay; the shell's
+/// `REST API ↗` link (`partials/sidebar.html`) remains the surviving API
+/// surface and is pinned separately by
+/// `sidebar_groups_navigation_into_operation_catalogue_and_cash`.
+#[tokio::test]
+async fn purchases_page_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, purchases) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !purchases.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /purchases"
+    );
+}
+
+/// The purchases-index redesign S4 (odd/tasks/redesign-purchases-index.md):
+/// "New purchase" is a real creation page at `/purchases/new` — a write gets a
+/// page, the list's primary action navigates to it, and the form posts the
+/// existing `POST /web/purchases` (payment type and due date are decided at
+/// confirm, invoice and notes are the two optional fields the POST accepts).
+/// The `#new-purchase` card leaves the list and the now-empty right column
+/// collapses, so the page renders a single column.
+#[tokio::test]
+async fn purchases_new_page_renders_the_creation_form() {
+    let (app, pool) = test_app().await;
+    create_supplier_via_web(&app, &pool, "NewPageSup").await;
+    let (status, page) = get(&app, "/purchases/new").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    // The shell's page title, so the page header component drives the same
+    // h1 every other page renders.
+    assert!(
+        page.contains("data-page-title>New purchase</h1>"),
+        "the creation page must render the New purchase title in the shell: {page:.600}"
+    );
+    // The four fields, the same names `POST /web/purchases` already accepts.
+    for field in ["supplier_id", "purchase_date", "supplier_invoice_no", "notes"] {
+        assert!(
+            page.contains(&format!("name=\"{field}\"")),
+            "the creation form must render the {field} field: {page:.600}"
+        );
+    }
+    // The form posts to the existing creation endpoint.
+    assert!(
+        page.contains("action=\"/web/purchases\""),
+        "the creation form must post to the existing /web/purchases endpoint: {page:.600}"
+    );
+    // The supplier roster renders by name, like the old card did.
+    assert!(
+        page.contains("NewPageSup"),
+        "the supplier select must list the roster: {page:.600}"
+    );
+}
+
+#[tokio::test]
+async fn purchases_new_page_replaces_the_list_card() {
+    let (app, _pool) = test_app().await;
+    let (status, page) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    assert!(
+        !page.contains("id=\"new-purchase\""),
+        "the New Purchase (Draft) card must not render on /purchases"
+    );
+    // The page action now points at the creation page (a plain <a>, the way
+    // page_header.html has always rendered it).
+    assert!(
+        page.contains("href=\"/purchases/new\""),
+        "the page action must navigate to /purchases/new: {page:.600}"
+    );
+}
+
+#[tokio::test]
+async fn purchases_new_page_collapses_the_list_to_one_column() {
+    let (app, _pool) = test_app().await;
+    let (status, page) = get(&app, "/purchases").await;
+    assert_eq!(status, StatusCode::OK, "{page:.400}");
+    // With the card gone the right column is empty, so the two-column grid
+    // class must not render at all.
+    assert!(
+        !page.contains("min-[900px]:grid-cols-[minmax(0,1fr)_360px]"),
+        "/purchases must not render the two-column grid class once the card is gone"
+    );
+}
+
+/// Creating through the new page's plain full-page form still lands on the new
+/// draft's record — a 303 Location, not the htmx `HX-Redirect` header (that
+/// branch belongs to the record page's own flows and stays untouched).
+#[tokio::test]
+async fn purchases_new_page_form_lands_on_the_record() {
+    let (app, pool) = test_app().await;
+    let supplier = create_supplier_via_web(&app, &pool, "LandingSup").await;
+    let body = format!(
+        "supplier_id={supplier}&purchase_date=2024-05-02&supplier_invoice_no=INV-9&notes=via+the+new+page"
+    );
+    let builder = test_support::with_cookie(
+        Request::builder()
+            .method("POST")
+            .uri("/web/purchases")
+            .header("content-type", "application/x-www-form-urlencoded"),
+    );
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "a plain full-page create must redirect"
+    );
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("a plain create must redirect to the record")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        location.starts_with("/purchases/"),
+        "the redirect must land on the new record: {location}"
+    );
+    let purchase_id: i64 = location["/purchases/".len()..]
+        .parse()
+        .unwrap_or_else(|_| panic!("the redirect must end in the purchase id: {location}"));
+    // The two optional fields the new page sends persist server-side.
+    let (invoice, notes): (Option<String>, String) =
+        sqlx::query_as("SELECT supplier_invoice_no, notes FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(invoice.as_deref(), Some("INV-9"), "invoice no must persist");
+    assert_eq!(notes, "via the new page", "notes must persist");
+}
+
+#[tokio::test]
+async fn sales_page_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, sales) = get(&app, "/sales").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !sales.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /sales"
+    );
+}
+
+#[tokio::test]
+async fn suppliers_page_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, suppliers) = get(&app, "/suppliers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !suppliers.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /suppliers"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_drops_the_rest_api_card() {
+    let (app, _pool) = test_app().await;
+    let (status, dashboard) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !dashboard.contains(">REST API</h2>"),
+        "the REST API card must not be rendered on /"
+    );
+}
+
 #[tokio::test]
 async fn converted_pages_expose_the_notice_region_and_named_actions() {
     let (app, _pool) = test_app().await;
@@ -3934,8 +4194,62 @@ async fn line_picker_loads_a_sale_without_a_click() {
 
 /// The same loop as the sale page, against the purchase record: the picker posts
 /// the typed value to the purchase line endpoint, the response carries the updated
-/// lines, the running total and the out-of-band picker, and the repeated-product
-/// rule surfaces as a clear 400 instead of a crash.
+/// lines, the running total and the entry row — persistent inside the swapped
+/// money region, empty and focused for the next scan (no out-of-band picker on
+/// purchases) — and the repeated-product rule surfaces as a clear 400 instead of
+/// a crash.
+
+/// The purchase add response must bring the entry row back inside the swapped
+/// money region, empty and ready for the next scan. The sale record keeps the
+/// out-of-band picker, so purchases get their own contract here: the entry
+/// row renders once, its tag carries NO `hx-swap-oob`, the product field is
+/// empty and `autofocus`, and the qty and cost fields travel with it.
+fn assert_purchase_entry_row_is_empty_and_ready(html: &str) {
+    assert_eq!(
+        html.matches("id=\"line-picker\"").count(),
+        1,
+        "the entry row renders exactly once, inside the money region: {html:.800}"
+    );
+    let row_pos = html
+        .find("id=\"line-picker\"")
+        .expect("the entry row renders on the add-line response");
+    let row_start = html[..row_pos].rfind('<').expect("the id must sit inside a tag");
+    let tag_end = row_start + html[row_start..].find('>').expect("unterminated tag");
+    let row_tag = &html[row_start..=tag_end];
+    assert!(
+        !row_tag.contains("hx-swap-oob"),
+        "the purchase picker is no longer out of band; it travels inside the money region: {row_tag}"
+    );
+    let row = &html[row_pos..];
+    let money_pos = html
+        .find("id=\"purchase-record-money\"")
+        .expect("the add response renders the money region");
+    assert!(
+        money_pos < row_pos,
+        "the entry row must render inside the swapped money region: money={money_pos} row={row_pos}"
+    );
+    let input_pos = row
+        .find("id=\"product-picker\"")
+        .expect("the entry row renders its product field");
+    let input_start = row[..input_pos].rfind('<').unwrap();
+    let input_end = input_pos + row[input_pos..].find('>').unwrap();
+    let input_tag = &row[input_start..=input_end];
+    assert!(
+        input_tag.contains("autofocus"),
+        "the entry row must come back focused: {input_tag}"
+    );
+    assert!(
+        !input_tag.contains("value="),
+        "the entry row must come back empty: {input_tag}"
+    );
+    for id in ["id=\"line-qty\"", "id=\"line-unit-cost\""] {
+        assert!(
+            row.contains(id),
+            "the entry row carries the qty and the cost field: {id}: {row:.600}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn purchase_line_picker_adds_lines_without_a_click() {
     let (app, pool) = test_app().await;
@@ -4020,8 +4334,9 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     );
 
     // Scan 1: the reader types the barcode and presses Enter. The form carries the
-    // field and the quantity, never a product id. The empty cost falls back to the
-    // product cost price (10).
+    // field and the quantity, never a product id. The fixture's supplier has no
+    // satellite row for the product, so the empty cost uses the product cost price
+    // (10).
     let (status, added) = post_form(
         &app,
         &format!("{base}/lines"),
@@ -4034,9 +4349,9 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
         added.contains("$20"),
         "running total after the scan: {added:.800}"
     );
-    assert_oob_picker_is_empty_and_focused(&added);
+    assert_purchase_entry_row_is_empty_and_ready(&added);
 
-    // Scan 2: a different product, and the picker comes back ready again.
+    // Scan 2: a different product, and the entry row comes back ready again.
     let (status, added) = post_form(
         &app,
         &format!("{base}/lines"),
@@ -4045,7 +4360,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     .await;
     assert_eq!(status, StatusCode::OK, "{added}");
     assert!(added.contains("$50"), "running total: {added:.800}");
-    assert_oob_picker_is_empty_and_focused(&added);
+    assert_purchase_entry_row_is_empty_and_ready(&added);
 
     // Removing a line updates the running total from the same response.
     let detail = purchase_detail(&app, purchase).await;
@@ -4075,14 +4390,60 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
         "the removed line is gone: {removed:.800}"
     );
 
-    // The repeated-product rule surfaces as a clear 400 with the actionable
-    // message, and the picker form names its action so the notice region can say
-    // which action failed. Product B is still on the purchase after the removal.
+    // S5b on the scan path: a repeat of product B with the same resolved cost
+    // (the product column again — the fixture supplier has no satellite row)
+    // MERGES into the existing line instead of answering 400: one line, the
+    // summed quantity, and a visible server notice naming the product. A
+    // silent quantity change would be magic.
     let before = purchase_detail(&app, purchase).await;
-    let (status, repeated) = post_form(
+    let (status, merged) = post_form(
         &app,
         &format!("{base}/lines"),
         "product=7791234567892&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert!(
+        merged.contains("data-notice-server"),
+        "the merge announces itself: {merged:.600}"
+    );
+    assert!(
+        merged.contains("merged"),
+        "the merge notice says what happened: {merged:.600}"
+    );
+    assert!(
+        merged.contains("product PSCAN-B"),
+        "the merge notice names the product: {merged:.600}"
+    );
+    let after = purchase_detail(&app, purchase).await;
+    assert_eq!(
+        after["lines"].as_array().unwrap().len(),
+        before["lines"].as_array().unwrap().len(),
+        "the merge keeps exactly one line for the product"
+    );
+    let b_line = after["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["product_id"] == json!(product_b))
+        .expect("product B's line");
+    assert_eq!(b_line["qty"], json!("4"), "qty 3 + 1 scanned = 4: {b_line}");
+    assert_eq!(b_line["unit_cost"], json!("10"));
+    assert_eq!(
+        after["total"],
+        json!("40"),
+        "the merged total is 4 x $10: {after}"
+    );
+
+    // The strict rule keeps its bite where it matters: a repeat at a DIFFERENT
+    // explicit cost is the clear 400, because one product cannot carry two
+    // prices on one purchase and a merge would silently discard one of them.
+    // The picker form still names its action so the notice region can say
+    // which action failed. Product B's merged line is untouched by the refusal.
+    let (status, repeated) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567892&qty=1&unit_cost=999",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{repeated}");
@@ -4104,9 +4465,16 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     assert_eq!(
         after["lines"].as_array().unwrap().len(),
         before["lines"].as_array().unwrap().len(),
-        "the repeated product adds nothing"
+        "the refused repeat adds nothing"
     );
-    assert_eq!(after["total"], before["total"]);
+    let b_line = after["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["product_id"] == json!(product_b))
+        .expect("product B's line");
+    assert_eq!(b_line["qty"], json!("4"), "the refusal leaves the merge intact");
+    assert_eq!(after["total"], json!("40"));
 
     // An unknown value is a clear 400 naming the search count, and adds nothing.
     let (status, err) = post_form(
@@ -4125,6 +4493,68 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
             .len(),
         after["lines"].as_array().unwrap().len(),
         "a failed resolution adds nothing"
+    );
+}
+
+/// The merge notice renders the product name through Askama's HTML escaping:
+/// a name made of markup characters must reach the operator as text, not HTML.
+/// Mirrors `create_notice_escapes_html_specials_in_the_product_name`, which
+/// pins the same guarantee for the create-under-filter box; this pins it for
+/// the S5b merge notice (`partials/purchase_merge_notice.html`), which no
+/// other test exercises with a markup-laden name.
+#[tokio::test]
+async fn merge_notice_escapes_html_specials_in_the_product_name() {
+    let (app, pool) = test_app().await;
+
+    // "Agua <500ml> & \"especial\"" URL-encoded, exactly what a browser form
+    // sends for that name.
+    let body = "sku=ESC-M&name=Agua+%3C500ml%3E+%26+%22especial%22&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50";
+    let (status, resp) = post_form(&app, "/web/products", body).await;
+    assert_eq!(status, StatusCode::OK, "create product ESC-M: {resp}");
+
+    let supplier = create_supplier_via_web(&app, &pool, "EscMergeSupplier").await;
+    let (status, body) = post_form(
+        &app,
+        "/web/purchases",
+        &format!("supplier_id={supplier}&payment_type=Cash&purchase_date=2024-05-10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let purchase = find_only_purchase_id(&app).await;
+
+    // The first add creates the line at the product cost price (10): the
+    // fixture supplier has no satellite row, so the empty cost falls back to
+    // the product column.
+    let (status, added) = post_form(
+        &app,
+        &format!("/web/purchases/{purchase}/lines"),
+        "product=ESC-M&qty=2&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(!added.contains("scanned again"), "the first add is not a merge: {added:.400}");
+
+    // The repeat resolves to the SAME cost, so the merge notice renders —
+    // with the escaped name, never the raw markup.
+    let (status, merged) = post_form(
+        &app,
+        &format!("/web/purchases/{purchase}/lines"),
+        "product=ESC-M&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert!(
+        merged.contains("data-notice-server=\"true\""),
+        "the merge notice must be present: {merged:.600}"
+    );
+    assert!(
+        merged
+            .contains("Agua &lt;500ml&gt; &amp; &quot;especial&quot; scanned again"),
+        "the notice must carry the escaped name: {merged:.600}"
+    );
+    assert!(
+        !merged.contains("<500ml>"),
+        "the raw markup must never reach the notice: {merged:.600}"
     );
 }
 
@@ -4583,8 +5013,20 @@ async fn create_sale_draft_on_date(
 
 /// Create a purchase draft for an explicit supplier and date through the web form.
 async fn create_purchase_draft_on_date(app: &Router, supplier_id: i64, purchase_date: &str) -> i64 {
+    create_purchase_draft_with_due(app, supplier_id, "Credit", purchase_date, "2024-12-31").await
+}
+
+/// Create a purchase draft with an explicit payment type and due date through
+/// the web form, and return its id.
+async fn create_purchase_draft_with_due(
+    app: &Router,
+    supplier_id: i64,
+    payment_type: &str,
+    purchase_date: &str,
+    due_date: &str,
+) -> i64 {
     let body = format!(
-        "supplier_id={supplier_id}&payment_type=Credit&purchase_date={purchase_date}&due_date=2024-12-31"
+        "supplier_id={supplier_id}&payment_type={payment_type}&purchase_date={purchase_date}&due_date={due_date}"
     );
     let (status, resp) = post_form(app, "/web/purchases", &body).await;
     assert_eq!(status, StatusCode::OK, "create purchase: {resp}");
@@ -4599,6 +5041,20 @@ async fn create_purchase_draft_on_date(app: &Router, supplier_id: i64, purchase_
         .last()
         .and_then(|d| d["purchase"]["id"].as_i64())
         .unwrap_or_else(|| panic!("purchase for supplier {supplier_id} not found: {v}"))
+}
+
+/// The one purchase row's inner HTML, cut from the list fragment by the row's
+/// stable id (`id="purchase-{id}"`). Rows are anchors, so the cut ends at the
+/// first `</a>` — no nested anchor may live inside a row.
+fn purchase_row_html(html: &str, purchase_id: i64) -> String {
+    let start = html
+        .find(&format!("id=\"purchase-{purchase_id}\""))
+        .unwrap_or_else(|| panic!("purchase row {purchase_id} missing from the list"));
+    let end = html[start..]
+        .find("</a>")
+        .map(|i| start + i)
+        .expect("a purchase row is an anchor");
+    html[start..end].to_string()
 }
 
 async fn add_purchase_line_via_web(app: &Router, purchase_id: i64, product_id: i64, qty: &str) {
@@ -4766,7 +5222,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
         .to_string();
 
     let all = purchase_list_html(&app, "").await;
-    assert!(all.contains("draft #"), "{all}");
+    assert!(all.contains("Draft #"), "{all}");
     assert!(
         all.contains(&sur_number) && all.contains(&norte_number),
         "{all}"
@@ -4777,10 +5233,10 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
         confirmed.contains(&sur_number) && confirmed.contains(&norte_number),
         "{confirmed}"
     );
-    assert!(!confirmed.contains("draft #"), "{confirmed}");
+    assert!(!confirmed.contains("Draft #"), "{confirmed}");
 
     let drafts = purchase_list_html(&app, "?status=Draft").await;
-    assert!(drafts.contains("draft #"), "{drafts}");
+    assert!(drafts.contains("Draft #"), "{drafts}");
     assert!(!drafts.contains(&sur_number), "{drafts}");
 
     // Supplier alone, case-insensitive over the name the list shows.
@@ -4803,7 +5259,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
 
     let blank = purchase_list_html(&app, "?status=&supplier=&number=&from=&to=").await;
     assert!(
-        blank.contains("draft #")
+        blank.contains("Draft #")
             && blank.contains(&sur_number)
             && blank.contains(&norte_number),
         "{blank}"
@@ -4815,7 +5271,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
     let (status, page) = get(&app, "/purchases?status=Confirmed").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert!(page.contains(&sur_number), "{page:.600}");
-    assert!(!page.contains("draft #"), "{page:.600}");
+    assert!(!page.contains("Draft #"), "{page:.600}");
 
     // The form reflects the URL, so a shared link re-opens with the same filters.
     let (status, page) = get(
@@ -4832,6 +5288,214 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
         page.contains("<option value=\"Draft\" selected>Draft</option>"),
         "{page:.600}"
     );
+}
+
+/// S6: one purchase row, one reading order (identifier → supplier → money),
+/// one status chip. The chip carries the state colour the total used to
+/// shout: Draft/Cancelled stay muted, Confirmed+settled shows Paid, owed and
+/// not yet past due shows Due (warning), owed past the due date shows
+/// Overdue (expense). The owed chips also print the amount still owed as a
+/// bare number — what the old badge cloud's `payable …` used to say — while
+/// Paid stays a bare word because nothing is owed. The total itself is
+/// neutral text, the badge cloud (`payable …`, `settled`, `Cash`,
+/// `Confirmed`) is gone, and the row keeps the S3 peek contract (`hx-get`
+/// into the drawer, never a full navigation).
+#[tokio::test]
+async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip() {
+    let (app, pool) = test_app().await;
+    let product = create_product_via_web(&app, &pool, "ROW-S6", "1", "50").await;
+    record_stock_via_web(&app, product, "20").await;
+    let sur = create_supplier_via_web(&app, &pool, "RowSur").await;
+
+    // Fund an account so the Cash confirm can pay the total immediately.
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "RowWallet", &[cash]).await;
+    let account_cash = account_method_id(&pool, account, "Cash").await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/transactions",
+        &format!("account_id={account}&type=Income&amount=1000&description=seed&date=2024-05-01"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fund account: {resp}");
+
+    let draft = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    let due_row = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", &chrono::Local::now().date_naive().to_string()).await;
+    let overdue = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    // Cash purchases carry no due date (the domain rejects one), and the Cash
+    // confirm pays the total immediately, so this row settles fully paid.
+    let paid = create_purchase_draft_with_due(&app, sur, "Cash", "2024-05-02", "").await;
+    for (id, qty) in [(due_row, "2"), (overdue, "1"), (paid, "1")] {
+        add_purchase_line_via_web(&app, id, product, qty).await;
+    }
+    confirm_purchase_via_web(&app, due_row).await;
+    confirm_purchase_via_web(&app, overdue).await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/purchases/confirm",
+        &format!("purchase_id={paid}&method_id={account_cash}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm Cash purchase: {resp}");
+    // A cancelled confirmed purchase still owes money past its due date; its
+    // chip must stay the muted Cancelled one — the lifecycle outranks money.
+    let cancelled = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    add_purchase_line_via_web(&app, cancelled, product, "1").await;
+    confirm_purchase_via_web(&app, cancelled).await;
+    let (status, resp) = post_form(
+        &app,
+        "/web/purchases/cancel",
+        &format!("purchase_id={cancelled}&reason=triangulation"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cancel purchase: {resp}");
+    // A partial payment keeps the due row owed (due > 0) while some money is
+    // already down, so its meta line may name what was paid so far.
+    let (status, resp) = post_form(
+        &app,
+        "/web/purchases/payments",
+        &format!("purchase_id={due_row}&method_id={account_cash}&amount=1&date=2024-05-10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "partial payment: {resp}");
+
+    let all = purchase_list_html(&app, "").await;
+    let draft_row = purchase_row_html(&all, draft);
+    let due_row_html = purchase_row_html(&all, due_row);
+    let overdue_row = purchase_row_html(&all, overdue);
+    let paid_row = purchase_row_html(&all, paid);
+    let cancelled_row = purchase_row_html(&all, cancelled);
+
+    // Identifier zone first (AC4): the stable handle a draft actually has.
+    assert!(
+        draft_row.contains(&format!("Draft #{draft}")),
+        "the draft identifier must be the row's handle: {draft_row}"
+    );
+    assert!(
+        draft_row.contains("font-semibold tabular-nums"),
+        "the identifier reads first and is tabular: {draft_row}"
+    );
+
+    // The S3 peek contract must survive the row rewrite.
+    assert!(
+        draft_row.contains(&format!("hx-get=\"/web/documents/detail/purchase/{draft}\"")),
+        "{draft_row}"
+    );
+    assert!(
+        draft_row.contains("hx-target=\"#purchase-drawer-body\"")
+            && draft_row.contains("hx-swap=\"innerHTML\""),
+        "{draft_row}"
+    );
+    assert!(
+        draft_row.contains(&format!("href=\"/purchases/{draft}\"")),
+        "{draft_row}"
+    );
+
+    // Exactly one chip per row, and each state gets its own colour. The owed
+    // chips print the amount still owed — a bare number, like the row's other
+    // money — and a partially paid row shows what remains, not the total.
+    let pending_due = purchase_detail(&app, due_row).await["due"]
+        .as_str()
+        .expect("purchase due")
+        .to_string();
+    let overdue_due = purchase_detail(&app, overdue).await["due"]
+        .as_str()
+        .expect("purchase due")
+        .to_string();
+    let pending_total = purchase_detail(&app, due_row).await["total"]
+        .as_str()
+        .expect("purchase total")
+        .to_string();
+    assert!(
+        paid_row.contains(">Paid</span>") && paid_row.contains("text-income"),
+        "a fully paid row carries the bare-word Paid chip in income colour: {paid_row}"
+    );
+    assert!(
+        due_row_html.contains(&format!(">Due {pending_due}</span>"))
+            && due_row_html.contains("text-warning"),
+        "owed and not yet past due carries the Due chip with the amount owed in warning colour: {due_row_html}"
+    );
+    assert!(
+        pending_due != pending_total
+            && !due_row_html.contains(&format!(">Due {pending_total}</span>")),
+        "a partially paid row's Due chip names the remainder, not the total: {due_row_html}"
+    );
+    assert!(
+        overdue_row.contains(&format!(">Overdue {overdue_due}</span>"))
+            && overdue_row.contains("text-expense"),
+        "owed past the due date carries the Overdue chip with the amount owed in expense colour: {overdue_row}"
+    );
+    assert!(
+        draft_row.contains(">Draft</span>")
+            && !draft_row.contains("text-income")
+            && !draft_row.contains("text-warning"),
+        "a draft chip is muted, never coloured: {draft_row}"
+    );
+    assert!(
+        cancelled_row.contains(">Cancelled</span>")
+            && cancelled_row.contains("text-muted")
+            && !cancelled_row.contains("text-expense"),
+        "a cancelled row keeps the muted Cancelled chip, never the Overdue red: {cancelled_row}"
+    );
+
+    // AC3: the total is neutral — it never borrows income or expense colour
+    // (the old row painted it `text-expense">{total}` whenever due > 0).
+    for (id, row) in [(draft, &draft_row), (due_row, &due_row_html), (overdue, &overdue_row), (paid, &paid_row)] {
+        let total = purchase_detail(&app, id).await["total"]
+            .as_str()
+            .expect("purchase total")
+            .to_string();
+        assert!(
+            row.contains(&format!("font-bold tabular-nums text-text\">{total}")),
+            "the total must be bold, tabular and neutral: {row}"
+        );
+        assert!(
+            !row.contains(&format!("text-expense\">{total}"))
+                && !row.contains(&format!("text-income\">{total}")),
+            "the total must not be painted by payment state: {row}"
+        );
+    }
+
+    // AC5: the money is printed once — the old muted `total … paid … due`
+    // echo line is gone, and the total appears exactly once in the row.
+    let paid_total = purchase_detail(&app, paid).await["total"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        paid_row.matches(&paid_total).count(),
+        1,
+        "the total must render once per row: {paid_row}"
+    );
+
+    // The badge cloud is gone: no payable/settled badge, no payment-type chip,
+    // and no `Confirmed` chip — the normal state is not a status.
+    assert!(
+        !all.contains(">payable ") && !all.contains(">settled<"),
+        "{all}"
+    );
+    assert!(!all.contains(">Cash<"), "{all}");
+    assert!(!all.contains(">Confirmed<"), "{all}");
+    // The partial payment shows what is already down, once, in the meta line.
+    assert!(
+        due_row_html.matches("· paid ").count() == 1,
+        "partial payment meta renders once: {due_row_html}"
+    );
+    // Credit is the meta line's only payment-type mention (Cash is the default).
+    assert!(overdue_row.contains("· Credit"), "{overdue_row}");
+}
+
+/// S6: the per-page global-config echo is gone from both document lists (AC6).
+/// Nothing else on either page depends on it.
+#[tokio::test]
+async fn purchases_and_sales_pages_render_no_config_subtitle() {
+    let (app, _pool) = test_app().await;
+    for path in ["/purchases", "/sales"] {
+        let (status, page) = get(&app, path).await;
+        assert_eq!(status, StatusCode::OK, "{page:.400}");
+        assert!(!page.contains("negative stock"), "{page:.600}");
+        assert!(!page.contains("overdraft"), "{page:.600}");
+    }
 }
 
 /// AC14: the products list matches name, SKU and barcode through the same search
@@ -8073,14 +8737,17 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     let (app, pool) = test_app().await;
     let f = seed_drawer_fixture(&app, &pool).await;
 
-    // Sale: identifier, customer, lines with product and SKU, totals, actors
-    // and the link to the owning page.
+    // Sale: identifier, customer, its line (product name and quantity),
+    // totals, actors and the link to the owning page.
     let (status, body) = get(&app, &format!("/web/documents/detail/sale/{}", f.sale)).await;
     assert_eq!(status, StatusCode::OK, "sale drawer: {body:.400}");
     assert!(body.contains(&f.sale_number), "{body:.800}");
     assert!(body.contains("DrawerBuyer"), "{body:.800}");
     assert!(body.contains("product DRAWER-P"), "{body:.800}");
-    assert!(body.contains("DRAWER-P"), "{body:.800}");
+    // The line's quantity cell: the drawer's line table renders the Cant.
+    // the sale line carries — there is no SKU column any more, and the
+    // product's name alone does not prove a line row rendered.
+    assert!(body.contains(">2</td>"), "{body:.800}");
     assert!(body.contains("Registrado por"), "{body:.800}");
     assert!(body.contains("Test Admin"), "{body:.800}");
     assert!(body.contains(&format!("/sales/{}", f.sale)), "{body:.800}");

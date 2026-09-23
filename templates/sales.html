@@ -7,7 +7,6 @@
 {% let page_action_href = "#new-sale" %}
 {% let page_action_label = "New sale" %}
 {% include "partials/page_header.html" %}
-<div class="mb-4 text-[13px] text-muted">sales • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %} • {% if allow_negative %}overdraft allowed{% else %}overdraft blocked{% endif %}</div>
 <div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
   <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
@@ -100,23 +99,6 @@
         <button type="submit">Create Draft</button>
         <div class="text-[13px] text-muted">Creating opens the new draft's page. Also at <code>POST /api/sales</code></div>
       </form>
-    </div>
-
-    <div class="rounded-2xl border border-border bg-card p-5">
-      <h2 class="mb-3 text-lg font-semibold">REST API</h2>
-      <div class="text-[13px] leading-[1.7] text-muted">
-        <code>GET /api/sales</code><br/>
-        <code>POST /api/sales</code><br/>
-        <code>GET /api/sales/debt</code><br/>
-        <code>GET /api/sales/:id</code><br/>
-        <code>PUT /api/sales/:id</code><br/>
-        <code>POST /api/sales/:id/lines</code><br/>
-        <code>PUT /api/sales/lines/:line_id</code><br/>
-        <code>DELETE /api/sales/lines/:line_id</code><br/>
-        <code>POST /api/sales/:id/payments</code><br/>
-        <code>POST /api/sales/:id/confirm</code><br/>
-        <code>POST /api/sales/:id/cancel</code><br/>
-      </div>
     </div>
   </div>
 </div>

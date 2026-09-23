@@ -23,6 +23,7 @@ use crate::models::{
     PurchaseSuggestions, UpdateProduct,
 };
 use crate::routes::AppState;
+use crate::services::purchases::LineAddOutcome;
 // S7 enforcement: every registered handler declares the permission its action
 // needs (AC10); the collection adapters and the path handlers share ungated
 // `*_impl` bodies so each registered boundary carries its own real gate. The
@@ -36,11 +37,54 @@ use crate::security::authz::{
 // Views + Askama templates
 // ---------------------------------------------------------------------------
 
-/// A purchase detail plus the resolved supplier name (purchases store only the id).
+/// A purchase detail plus the resolved supplier name (purchases store only the id),
+/// the row's payment state, derived against `today` so the template never parses
+/// a date, and whether some but not all of the money is already down (the meta
+/// line names what was paid only then — settled rows say it once in the chip).
 #[derive(Clone)]
 pub struct PurchaseView {
     pub detail: PurchaseDetail,
     pub supplier_name: String,
+    pub payment_state: PurchasePaymentState,
+    pub partially_paid: bool,
+}
+
+/// The one word a row's status chip starts with (S6): the chip replaces the
+/// badge cloud, so money and due date resolve to a single state per row. The
+/// owed states render the word plus the amount still owed ("Due 42",
+/// "Overdue 17"); Paid — nothing owed — is the one bare word. Draft and
+/// Cancelled purchases keep their lifecycle chip regardless of money, so the
+/// template branches on the status first, this second.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PurchasePaymentState {
+    Paid,
+    Due,
+    Overdue,
+}
+
+impl std::fmt::Display for PurchasePaymentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paid => write!(f, "Paid"),
+            Self::Due => write!(f, "Due"),
+            Self::Overdue => write!(f, "Overdue"),
+        }
+    }
+}
+
+/// Nothing owed — due is zero or a refund — is Paid; owed with the due date
+/// already past is Overdue; owed with the due date today or later — or absent
+/// — is Due. Derived in the view layer, never in the template. Zero must
+/// compare numerically, not by sign: `Decimal::ZERO.is_sign_positive()` is
+/// `true`, and a settled purchase (due exactly 0) is Paid, never Due.
+fn purchase_payment_state(detail: &PurchaseDetail, today: NaiveDate) -> PurchasePaymentState {
+    if detail.due <= Decimal::ZERO {
+        PurchasePaymentState::Paid
+    } else if detail.purchase.due_date.map(|d| d < today) == Some(true) {
+        PurchasePaymentState::Overdue
+    } else {
+        PurchasePaymentState::Due
+    }
 }
 
 #[derive(Template)]
@@ -50,9 +94,9 @@ struct PurchasesTemplate {
     purchases: Vec<PurchaseView>,
     suggestions: PurchaseSuggestions,
     has_suggestions: bool,
-    suppliers: Vec<crate::models::Supplier>,
-    allow_negative: bool,
-    allow_negative_stock: bool,
+    /// Live: the included `partials/suggestion_list.html` renders `{{ today }}`
+    /// in its seed-options date input, so this is not the deleted creation
+    /// card's leftover — the page include shares this struct's context.
     today: String,
     nav_key: &'static str,
     /// Current filter values, so a bookmarkable `/purchases?supplier=…`
@@ -70,6 +114,13 @@ struct PurchasesTemplate {
     /// half of the old consequence where a `purchases.read`-only principal
     /// saw suggestions it could not refresh.
     show_suggestions: bool,
+    /// The page header's primary action, the same way the record page carries
+    /// it (the shared component reads the struct fields without locals):
+    /// "New purchase" → `/purchases/new` when the principal holds
+    /// `purchases.create`, empty label = no action rendered (AC21: never an
+    /// entry the principal cannot open).
+    page_action_href: String,
+    page_action_label: String,
 }
 
 /// The `/purchases/{id}` record page. The page-header values are struct fields,
@@ -85,10 +136,13 @@ struct PurchasePageTemplate {
     page_action_href: String,
     page_action_label: String,
     record: PurchaseRecord,
-    oob_picker: bool,
-    /// Receiving-desk T3: the action bar rides out of band exactly when the
-    /// picker does — both only matter on the add-line response, whose main
-    /// swap takes just the money region (HTMX runs OOB before `hx-select`).
+    /// The entry row renders inside the money region and carries `autofocus`
+    /// only on the add-line response, so the swapped-in copy claims focus for
+    /// the next scan; the page itself always renders without it.
+    entry_row_focus: bool,
+    /// The action bar swaps out of band on the add-line response, so its
+    /// enabled state (Confirm disabled at zero lines) follows the line count
+    /// while the main swap only takes the money region.
     oob_action_bar: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
@@ -102,10 +156,32 @@ struct PurchasePageTemplate {
 }
 
 #[derive(Template)]
+#[template(path = "purchase_new.html")]
+struct PurchaseNewTemplate {
+    today: String,
+    suppliers: Vec<crate::models::Supplier>,
+    nav_key: &'static str,
+    /// The sidebar's nav view: the entries this principal may read (S7 part 2).
+    nav: Nav,
+}
+
+#[derive(Template)]
 #[template(path = "partials/purchase_list.html")]
 struct PurchaseListPartial {
     title: String,
     purchases: Vec<PurchaseView>,
+}
+
+/// The server-rendered merge notice (S5b): a repeat scan at the same resolved
+/// cost merged into the existing line, so the answer announces it instead of
+/// silently changing a quantity. Markup and contract are documented in
+/// `templates/partials/purchase_merge_notice.html`; the classes mirror
+/// `partials/notice.html` and reuse only tokens already present there.
+#[derive(Template)]
+#[template(path = "partials/purchase_merge_notice.html")]
+struct PurchaseMergeNotice {
+    product_name: String,
+    quantity: Decimal,
 }
 
 /// The record body, shared by the page and by every action response that swaps
@@ -114,7 +190,11 @@ struct PurchaseListPartial {
 #[template(path = "partials/purchase_detail.html")]
 struct PurchaseDetailPartial {
     record: PurchaseRecord,
-    oob_picker: bool,
+    /// The entry row is persistent inside the money region; this flag only
+    /// adds `autofocus` to its product field on the add-line response, so
+    /// the swapped-in row claims focus for the next scan (htmx restores
+    /// focus by id after the money-region swap).
+    entry_row_focus: bool,
     /// The action bar swaps out of band on the add-line response, so its
     /// enabled state (Confirm disabled at zero lines) follows the line count
     /// while the main swap only takes the money region.
@@ -201,6 +281,7 @@ fn clean_opt(s: &str) -> Option<String> {
 async fn purchase_views(
     state: &AppState,
     filter: &PurchaseListFilter,
+    today: NaiveDate,
 ) -> AppResult<Vec<PurchaseView>> {
     let details = state
         .purchases_service
@@ -213,6 +294,8 @@ async fn purchase_views(
             .get_supplier(detail.purchase.supplier_id)
             .await?;
         out.push(PurchaseView {
+            payment_state: purchase_payment_state(&detail, today),
+            partially_paid: detail.paid > Decimal::ZERO && detail.due > Decimal::ZERO,
             detail,
             supplier_name: supplier.name,
         });
@@ -265,12 +348,12 @@ async fn record_context(state: &AppState, purchase_id: i64) -> AppResult<Purchas
 
 fn render_record(
     context: PurchaseRecordContext,
-    oob_picker: bool,
+    entry_row_focus: bool,
     oob_action_bar: bool,
 ) -> AppResult<Html<String>> {
     let html = PurchaseDetailPartial {
         record: context.record,
-        oob_picker,
+        entry_row_focus,
         oob_action_bar,
         method_options: context.method_options,
         today: context.today,
@@ -285,25 +368,30 @@ fn render_record(
 /// Record-body response that keeps the cross-region `purchase-changed` refresh
 /// event, so the subscribed list region updates after an action.
 async fn changed(state: &AppState, purchase_id: i64) -> AppResult<Response> {
-    changed_with_picker(state, purchase_id, false).await
+    changed_with_notice(state, purchase_id, false, None).await
 }
 
-/// Line-add response: the same body plus the out-of-band picker, empty and
-/// focused, so the scanner can feed the next line without a click. Both OOB
-/// flags ride together: this response is only used where the request's
-/// `hx-select` takes the money region, so whatever else must refresh (the
-/// action bar) has to arrive out of band too.
-async fn changed_with_picker(
+/// The add-line response with an optional out-of-band server notice prepended
+/// to the body. The notice is a merge announcement (S5b): htmx strips the
+/// `hx-swap-oob` wrapper before the `hx-select` main swap, so the money region
+/// and the entry row's focus contract are untouched — the same mechanism the
+/// create-under-filter case uses (`hidden_by_filter_notice_html` in
+/// inventory_web.rs).
+async fn changed_with_notice(
     state: &AppState,
     purchase_id: i64,
-    oob_picker: bool,
+    entry_row_focus: bool,
+    notice_html: Option<String>,
 ) -> AppResult<Response> {
-    let html = render_record(
+    let mut html = render_record(
         record_context(state, purchase_id).await?,
-        oob_picker,
-        oob_picker,
+        entry_row_focus,
+        true,
     )?
     .0;
+    if let Some(notice) = notice_html {
+        html = notice + &html;
+    }
     let mut resp = Html(html).into_response();
     resp.headers_mut()
         .insert("HX-Trigger", "purchase-changed".parse().unwrap());
@@ -314,22 +402,20 @@ async fn changed_with_picker(
 // Page + fragments
 // ---------------------------------------------------------------------------
 
-/// The purchases page is a single `purchases.read` gate. The supplier roster
-/// (`suppliers.read` data) stays server-rendered for the create dialog — the
-/// recorded deliberate consequence: a purchases-only principal sees the
-/// roster it needs to record a purchase, and the supplier screens themselves
-/// refuse it. The reorder suggestions are the coherent half: the block now
-/// renders only when the principal holds `inventory.read`, the same gate the
-    /// suggestions fragment and API carry, so a purchases-only principal sees no
-    /// suggestions block it could not refresh (S7 part 2 closed the consequence the
-/// part 1 review recorded).
+/// The purchases page is a single `purchases.read` gate. Creation moved to
+/// its own page (`/purchases/new`, gated `purchases.create`), so the list no
+/// longer carries the supplier roster. The reorder suggestions are
+/// stock-derived data: the block renders only when the principal holds
+/// `inventory.read`, the same gate the suggestions fragment and API carry, so
+/// a purchases-only principal sees no suggestions block it could not refresh
+/// (S7 part 2 closed the consequence the part 1 review recorded).
 async fn purchases_page(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Query(query): Query<PurchaseListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let purchases = purchase_views(&state, &query.to_filter()).await?;
+    let purchases = purchase_views(&state, &query.to_filter(), chrono::Local::now().date_naive()).await?;
     // The suggestion block renders only when the principal may refresh it:
     // the fragment (`/web/purchases/suggestions`) and the API twin are gated
     // `inventory.read` because the suggestion is stock-derived data, so the
@@ -344,16 +430,23 @@ async fn purchases_page(
     } else {
         (PurchaseSuggestions::default(), false)
     };
-    let suppliers = state.supplier_service.list_suppliers().await?;
+    // The header's primary action navigates to the creation page, so it is
+    // offered only when the principal can open it (AC21, the same rule the
+    // sidebar applies): a `purchases.read`-only principal renders no action
+    // and never hits the creation page's 403.
+    let (page_action_href, page_action_label) = if principal.has_permission::<PurchasesCreate>() {
+        ("/purchases/new".to_string(), "New purchase".to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    // `today` stays: the included `partials/suggestion_list.html` renders it
+    // as the seed form's default purchase date (see the struct field comment).
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let tmpl = PurchasesTemplate {
         title: "All purchases".to_string(),
         purchases,
         suggestions,
         has_suggestions,
-        suppliers,
-        allow_negative: state.allow_negative,
-        allow_negative_stock: state.allow_negative_stock,
         today,
         nav_key: "purchases",
         filter_status: query.status.trim().to_string(),
@@ -363,6 +456,8 @@ async fn purchases_page(
         filter_to: query.to.trim().to_string(),
         nav: Nav::for_principal(&principal),
         show_suggestions,
+        page_action_href,
+        page_action_label,
     };
     Ok(Html(
         tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
@@ -441,9 +536,7 @@ async fn purchase_record_page(
         Some(number) => number.clone(),
         None => "Draft purchase".to_string(),
     };
-    let (action_href, action_label) = if context.record.purchase.status == PurchaseStatus::Draft {
-        ("#add-line".to_string(), "Add line".to_string())
-    } else if context.record.purchase.status == PurchaseStatus::Confirmed
+    let (action_href, action_label) = if context.record.purchase.status == PurchaseStatus::Confirmed
         && context.record.purchase.payment_type == PaymentType::Credit
     {
         ("#record-payment".to_string(), "Record payment".to_string())
@@ -457,7 +550,7 @@ async fn purchase_record_page(
         page_action_href: action_href,
         page_action_label: action_label,
         record: context.record,
-        oob_picker: false,
+        entry_row_focus: false,
         oob_action_bar: false,
         method_options: context.method_options,
         today: context.today,
@@ -471,12 +564,39 @@ async fn purchase_record_page(
     ))
 }
 
+/// `/purchases/new`: the creation page. A write gets a page — the list's
+/// primary action navigates here and the form posts the existing
+/// `POST /web/purchases`, whose non-htmx branch 303s the browser onto
+/// `/purchases/{id}`. The gate is the one the creation POST itself carries
+/// (`purchases.create`): a principal that could not create the draft would
+/// only hit the POST's 403 one submit later. The supplier roster is
+/// server-rendered for the select, the same recorded consequence the list
+/// page carries — a purchases-only principal sees the roster it needs to
+/// record a purchase; the supplier screens themselves refuse it.
+async fn purchases_new_page(
+    State(state): State<AppState>,
+    _: Require<PurchasesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+) -> Result<Html<String>, AppError> {
+    let suppliers = state.supplier_service.list_suppliers().await?;
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let tmpl = PurchaseNewTemplate {
+        today,
+        suppliers,
+        nav_key: "purchases",
+        nav: Nav::for_principal(&principal),
+    };
+    Ok(Html(
+        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+    ))
+}
+
 async fn web_purchase_list(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
     Query(query): Query<PurchaseListQuery>,
 ) -> AppResult<Response> {
-    let view = purchase_views(&state, &query.to_filter()).await?;
+    let view = purchase_views(&state, &query.to_filter(), chrono::Local::now().date_naive()).await?;
     Ok(render_list(view, "All purchases")?.into_response())
 }
 
@@ -696,12 +816,31 @@ async fn web_add_line_impl(
             .await?
             .id,
     };
-    state
+    // The web route takes the merging method (S5b): a repeat product at the
+    // same resolved cost increments the existing line, with a visible notice;
+    // a different cost still answers the same 400. The JSON API keeps the
+    // strict rule instead (`purchases_api.rs` add_line): a machine client is
+    // told to use the line-update endpoint rather than have its request
+    // silently reinterpreted. That asymmetry is deliberate and pinned by
+    // `web_purchase_line_same_cost_repeat_merges_and_different_cost_stays_400`
+    // and `api_purchase_line_repeated_product_is_still_a_clear_400`.
+    let outcome = state
         .purchases_service
-        .add_line(actor, id, product_id, qty, unit_cost)
+        .add_or_increment_line(actor, id, product_id, qty, unit_cost)
         .await?;
     if is_htmx(&headers) {
-        return changed_with_picker(&state, id, true).await;
+        let notice = match &outcome {
+            LineAddOutcome::Merged { line, product_name } => Some(
+                PurchaseMergeNotice {
+                    product_name: product_name.clone(),
+                    quantity: line.qty,
+                }
+                .render()
+                .map_err(|e| AppError::Internal(e.to_string()))?,
+            ),
+            LineAddOutcome::Added(_) => None,
+        };
+        return changed_with_notice(&state, id, true, notice).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1059,6 +1198,7 @@ async fn web_seed_from_suggestion(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/purchases", get(purchases_page))
+        .route("/purchases/new", get(purchases_new_page))
         .route("/purchases/{id}", get(purchase_record_page))
         .route(
             "/web/purchases",
@@ -1114,6 +1254,7 @@ mod tests {
     use crate::models::PaymentType;
     use crate::routes::AppState;
     use crate::security::test_support;
+    use rust_decimal::Decimal;
     // T5's markup test builds an `UpdateProduct` patch through the service.
     use crate::models::UpdateProduct;
 
@@ -1123,6 +1264,11 @@ mod tests {
     /// the point is telling two actors apart.
     async fn audit_actor(state: &AppState) -> i64 {
         test_support::audit_actor_id(&state.pool).await.unwrap()
+    }
+
+    /// A decimal literal for service-layer assertions.
+    fn dec_web(s: &str) -> Decimal {
+        s.parse().unwrap()
     }
 
     async fn test_state() -> AppState {
@@ -1314,43 +1460,49 @@ mod tests {
         &html[start..end]
     }
 
-    /// The line response must bring the picker back out of band, empty and
-    /// focused, so the next scan lands without a click.
-    fn assert_oob_picker_is_empty_and_focused(html: &str) {
-        // The response can carry more than one OOB element (the action bar
-        // rides out of band on add-line too) and more than one `#line-picker`
-        // (the in-place picker plus its OOB copy): locate the OOB picker by
-        // ITS tag carrying `hx-swap-oob`, never by the first OOB in the doc.
-        let mut from = 0usize;
-        let (tag_start, tag_end) = loop {
-            let rel = html[from..]
-                .find("id=\"line-picker\"")
-                .unwrap_or_else(|| panic!("the out-of-band picker must render: {html:.800}"));
-            let pos = from + rel;
-            let start = html[..pos].rfind('<').expect("the id must sit inside a tag");
-            let end_rel = html[start..].find('>').expect("unterminated tag");
-            if html[start..=start + end_rel].contains("hx-swap-oob") {
-                break (start, start + end_rel);
-            }
-            from = pos + 1;
-        };
-        let oob_tag = &html[tag_start..=tag_end];
-        assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
-        let oob = &html[tag_start..];
-        assert!(
-            oob.contains("autofocus"),
-            "the picker must come back focused: {oob:.400}"
+    /// The add-line response must bring the entry row back inside the swapped
+    /// money region, empty and focused, so the next scan lands without a
+    /// click. The picker is no longer out of band on purchases: it travels
+    /// inside `#purchase-record-money` (the action bar alone rides OOB).
+    fn assert_entry_row_is_empty_and_focused(html: &str) {
+        // Exactly one entry row renders per record, inside the money region
+        // the add response swaps — never out of band.
+        assert_eq!(
+            html.matches("id=\"line-picker\"").count(),
+            1,
+            "the entry row renders exactly once, inside the money region: {html:.800}"
         );
-        let input_pos = oob
+        let row_pos = html
+            .find("id=\"line-picker\"")
+            .expect("the entry row renders on the add-line response");
+        let row_start = html[..row_pos].rfind('<').expect("the id must sit inside a tag");
+        let tag_end = row_start + html[row_start..].find('>').expect("unterminated tag");
+        let row_tag = &html[row_start..=tag_end];
+        assert!(
+            !row_tag.contains("hx-swap-oob"),
+            "the picker is no longer out of band; it travels inside the money region: {row_tag}"
+        );
+        let row = &html[row_pos..];
+        let input_pos = row
             .find("id=\"product-picker\"")
-            .expect("the out-of-band picker renders its field");
-        let input_start = oob[..input_pos].rfind('<').unwrap();
-        let input_end = input_pos + oob[input_pos..].find('>').unwrap();
-        let input_tag = &oob[input_start..=input_end];
+            .expect("the entry row renders its product field");
+        let input_start = row[..input_pos].rfind('<').unwrap();
+        let input_end = input_pos + row[input_pos..].find('>').unwrap();
+        let input_tag = &row[input_start..=input_end];
+        assert!(
+            input_tag.contains("autofocus"),
+            "the entry row must come back focused: {input_tag}"
+        );
         assert!(
             !input_tag.contains("value="),
-            "the picker must come back empty: {input_tag}"
+            "the entry row must come back empty: {input_tag}"
         );
+        for id in ["id=\"line-qty\"", "id=\"line-unit-cost\""] {
+            assert!(
+                row.contains(id),
+                "the entry row carries the qty and the cost field: {id}: {row:.600}"
+            );
+        }
     }
 
     /// Everything a record-page test needs to address the seeded document.
@@ -1636,43 +1788,52 @@ mod tests {
         );
     }
 
-    /// Payment is imputed at confirm (purchase-payment-at-confirm T1): the
-    /// Create Draft form asks ONLY supplier + purchase date, and the
-    /// Sugerido seed options ask ONLY purchase date. No Type, Due date,
-    /// invoice or notes input may appear anywhere on the purchases page —
-    /// the confirm dialog that owns the type lives on the record page.
+    /// The creation form (`/purchases/new`) asks the required pair — supplier
+    /// and purchase date — plus the optional supplier invoice no and notes,
+    /// both editable later on the record page. It must NOT ask payment type
+    /// or due date: the payment decision is made in the record page's confirm
+    /// dialog (purchase-payment-at-confirm). The list page still carries no
+    /// payment-decision input anywhere: the Sugerido seed options ask
+    /// purchase date only.
     #[tokio::test]
-    async fn web_create_draft_form_asks_only_supplier_and_purchase_date() {
+    async fn web_new_purchase_form_asks_supplier_and_date_with_optional_invoice_notes_not_payment() {
         let state = test_state().await;
-        let app = crate::routes::router(state);
-        let (status, html) = get_html(app, "/purchases").await;
-        assert_eq!(status, StatusCode::OK);
+        let app = crate::routes::router(state.clone());
 
+        // The creation page's form: the required pair plus the two optional
+        // fields, and never a payment input.
+        let (status, html) = get_html(app.clone(), "/purchases/new").await;
+        assert_eq!(status, StatusCode::OK);
         let form = enclosing_form(&html, "data-action=\"Create purchase\"");
-        assert!(
-            form.contains("name=\"supplier_id\"") && form.contains("name=\"purchase_date\""),
-            "Create Draft keeps supplier + purchase date: {form:.600}"
-        );
-        for input in ["payment_type", "due_date", "supplier_invoice_no", "notes"] {
+        for input in ["supplier_id", "purchase_date", "supplier_invoice_no", "notes"] {
+            assert!(
+                form.contains(&format!("name=\"{input}\"")),
+                "the creation form must ask {input}: {form:.600}"
+            );
+        }
+        for input in ["payment_type", "due_date"] {
             assert!(
                 !form.contains(&format!("name=\"{input}\"")),
-                "the Create Draft form must not ask {input}: {form:.600}"
+                "the creation form must not ask {input}: the payment decision stays in the \
+                 record page's confirm dialog: {form:.600}"
             );
         }
 
-        // The whole page carries no payment-decision input at all: the seed
-        // options lost Type + Due date, and nothing else on this page asks one.
+        // The list page carries no payment-decision input at all: the seed
+        // options ask purchase date only, and nothing else on it asks one.
+        let (status, list_html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK);
         assert!(
-            !html.contains("name=\"payment_type\""),
-            "no payment-type input on the purchases page: {html:.600}"
+            !list_html.contains("name=\"payment_type\""),
+            "no payment-type input on the purchases page: {list_html:.600}"
         );
         assert!(
-            !html.contains("name=\"due_date\""),
-            "no due-date input on the purchases page: {html:.600}"
+            !list_html.contains("name=\"due_date\""),
+            "no due-date input on the purchases page: {list_html:.600}"
         );
         assert!(
-            !html.contains("Draft type") && !html.contains("Due date"),
-            "the seed options ask purchase date only: {html:.600}"
+            !list_html.contains("Draft type") && !list_html.contains("Due date"),
+            "the seed options ask purchase date only: {list_html:.600}"
         );
     }
 
@@ -3017,12 +3178,14 @@ mod tests {
     /// Receiving-desk T3: the four-card action grid is replaced by a sticky
     /// action bar (one primary action per status plus a `⋯` secondary menu),
     /// and every action form lives in a `<dialog>` the bar opens. The legacy
-    /// ids keep their meaning so in-page anchors still resolve: `#add-line`
-    /// is the bar's drawer button, `#confirm-purchase` / `#edit-header` /
-    /// `#discard-purchase` / `#record-payment` / `#cancel-purchase` are the
-    /// dialogs. Cancelled is read-only: no bar, no menu, no dialogs. The
-    /// add-line response carries the bar out of band, because its main swap
-    /// only takes the money region (HTMX processes OOB before `hx-select`).
+    /// ids keep their meaning so in-page anchors still resolve: `#confirm-
+    /// purchase` / `#edit-header` / `#discard-purchase` / `#record-payment` /
+    /// `#cancel-purchase` are the dialogs. The add-line drawer is gone: the
+    /// entry row is persistent inside the money region, so the bar carries no
+    /// drawer button and the page offers no `#add-line` anchor. Cancelled is
+    /// read-only: no bar, no menu, no dialogs, no entry row. The add-line
+    /// response carries the bar out of band, because its main swap only takes
+    /// the money region (HTMX processes OOB before `hx-select`).
     #[tokio::test]
     async fn web_purchase_record_renders_sticky_action_bar_and_status_dialogs() {
         let state = test_state().await;
@@ -3030,7 +3193,7 @@ mod tests {
         let app = crate::routes::router(state.clone());
         let base = format!("/web/purchases/{}", fixture.purchase_id);
 
-        // -- Draft: sticky bar + secondary menu + drawer + dialogs ----------
+        // -- Draft: sticky bar + secondary menu + entry row + dialogs --------
         let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
             .await;
         assert_eq!(status, StatusCode::OK);
@@ -3044,8 +3207,21 @@ mod tests {
             "the secondary menu renders: {html:.400}"
         );
         assert!(
-            html.contains("id=\"line-drawer\""),
-            "the add-line drawer hosts the picker: {html:.400}"
+            !html.contains("id=\"line-drawer\""),
+            "the add-line drawer is deleted; the entry row replaces it: {html:.400}"
+        );
+        assert!(
+            !html.contains("id=\"add-line\""),
+            "the bar carries no drawer button and the page no drawer anchor: {html:.400}"
+        );
+        // The entry row is persistent: product, qty, cost and the Add action
+        // render without any click, inside the money region adds swap.
+        assert!(
+            html.contains("id=\"line-picker\"")
+                && html.contains("id=\"product-picker\"")
+                && html.contains("id=\"line-qty\"")
+                && html.contains("id=\"line-unit-cost\""),
+            "the entry row renders its fields persistent: {html:.600}"
         );
         for dialog in ["confirm-purchase", "edit-header", "discard-purchase"] {
             assert!(
@@ -3053,10 +3229,6 @@ mod tests {
                 "the draft renders the {dialog} dialog: {html:.400}"
             );
         }
-        assert!(
-            element_tag_containing(&html, "id=\"add-line\"").contains("openLineDrawer"),
-            "the bar's add-line button opens the drawer"
-        );
         assert!(
             !html.contains("min-[760px]:grid-cols-2"),
             "the four-card action grid is gone: {html:.400}"
@@ -3116,7 +3288,7 @@ mod tests {
             "cancelling a confirmed purchase asks via its dialog: {html:.400}"
         );
         assert!(
-            !html.contains("id=\"line-drawer\""),
+            !html.contains("id=\"line-drawer\"") && !html.contains("id=\"line-picker\""),
             "a confirmed purchase cannot add lines: {html:.400}"
         );
         assert!(
@@ -3140,7 +3312,7 @@ mod tests {
         for id in [
             "purchase-action-bar",
             "record-menu",
-            "line-drawer",
+            "line-picker",
             "confirm-purchase",
             "record-payment",
         ] {
@@ -3149,6 +3321,82 @@ mod tests {
                 "a cancelled purchase is read-only, found {id}: {html:.400}"
             );
         }
+    }
+
+    /// The record page's header action slot holds the next obvious action,
+    /// and for a draft that action is no longer the header's to offer: S5a
+    /// removed the add-line drawer, so a draft's line entry lives in the
+    /// entry row inside the document and its primary action is Confirm in
+    /// the sticky action bar — the header renders no `data-page-action` at
+    /// all (an empty slot pair, so the partial drops the anchor; the old
+    /// `#add-line` target no longer exists). A confirmed credit purchase's
+    /// next obvious action IS the header's: "Record payment" anchored at
+    /// `#record-payment`. A confirmed cash purchase was settled at confirm,
+    /// so nothing is left to pay and it too renders none. Pinned in both
+    /// directions: a dead anchor must not creep back, and the payment
+    /// action must not silently drop.
+    #[tokio::test]
+    async fn web_purchase_record_page_action_draft_offers_none_and_confirmed_credit_offers_record_payment() {
+        let state = test_state().await;
+        let credit = seed_record_fixture(&state, PaymentType::Credit).await;
+        let cash = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        // -- Draft: no page action; lines go through the entry row ----------
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("data-page-action"),
+            "a draft's line entry lives in the document's entry row and its primary \
+             action is Confirm in the sticky bar, so the header offers no action: {html:.400}"
+        );
+
+        // -- Confirmed credit: the next obvious action is paying ------------
+        state
+            .purchases_service
+            .confirm(audit_actor(&state).await, credit.purchase_id, None)
+            .await
+            .unwrap();
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let header_start = html
+            .find("data-page-header")
+            .expect("the record page renders its page header");
+        let header_end = header_start
+            + html[header_start..]
+                .find("</header>")
+                .expect("the page header closes");
+        let header = &html[header_start..header_end];
+        let action = element_tag_containing(header, "data-page-action");
+        assert!(
+            action.contains("href=\"#record-payment\""),
+            "a confirmed credit purchase's next obvious action opens the payment \
+             dialog: {action}"
+        );
+        assert!(
+            header.contains(">Record payment</a>"),
+            "the confirmed credit action must be labelled Record payment: {header:.600}"
+        );
+
+        // -- Confirmed cash: settled at confirm, nothing left to pay --------
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                cash.purchase_id,
+                Some(cash.method_id),
+            )
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/purchases/{}", cash.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("data-page-action"),
+            "a confirmed cash purchase has nothing left to pay, so the header \
+             offers no action: {html:.400}"
+        );
     }
 
     /// Receiving-desk T4: a draft's money region carries an effects preview —
@@ -3241,8 +3489,8 @@ mod tests {
             .unwrap_or_else(|| panic!("the draft renders an effects preview: {html:.600}"));
         let preview_end = preview_start
             + html[preview_start..]
-                .find(">Lines (")
-                .expect("the preview sits in the money region, before the lines heading");
+                .find("id=\"line-picker\"")
+                .expect("the preview sits before the persistent entry row");
         let preview = &html[preview_start..preview_end];
         assert!(
             preview.contains("+3 units (tracked)"),
@@ -3291,8 +3539,8 @@ mod tests {
             .expect("the credit draft renders its preview too");
         let preview_end = preview_start
             + html[preview_start..]
-                .find(">Lines (")
-                .expect("the preview sits before the lines heading");
+                .find("id=\"line-picker\"")
+                .expect("the preview sits before the persistent entry row");
         let preview = &html[preview_start..preview_end];
         let credit_total = state
             .purchases_service
@@ -3333,10 +3581,12 @@ mod tests {
     }
 
     /// T3: payment is decided at confirm, so the stored type is invisible
-    /// while the purchase is a Draft — neither the record header nor the list
-    /// row shows a payment-type badge. Once confirmed the type is a fact and
-    /// the badge returns (the row it came from is proven by the exact-once
-    /// count: every draft this test seeded must still be badgeless).
+    /// while the purchase is a Draft — the record header shows no payment-type
+    /// badge until then. Since S6 the list row never shows one at all: Cash is
+    /// the default and Credit rides the meta line, so the row's only chip is
+    /// the status chip (the confirmed row proves which row the Paid chip came
+    /// from by the exact-once count: every draft this test seeded stays
+    /// badgeless too).
     #[tokio::test]
     async fn web_draft_hides_the_payment_type_badge_until_confirm() {
         let state = test_state().await;
@@ -3369,7 +3619,8 @@ mod tests {
             "draft rows carry no payment-type badge: {list:.600}"
         );
 
-        // -- Confirm: the badge returns on record and list -----------------
+        // -- Confirm: the badge returns on the record page only; the list
+        // keeps no type chip at all ---------------------------------------
         let (status, _, resp) = post_form_response(
             app.clone(),
             &format!("/web/purchases/{}/confirm", cash.purchase_id),
@@ -3391,12 +3642,19 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             list.matches("uppercase\">Cash</span>").count(),
-            1,
-            "the confirmed row shows the badge exactly once, drafts stay hidden: {list:.600}"
+            0,
+            "a confirmed row still shows no payment-type chip: {list:.600}"
         );
         assert!(
             !list.contains("uppercase\">Credit</span>"),
-            "the Credit draft row stays badgeless: {list:.600}"
+            "no row ever shows a payment-type chip: {list:.600}"
+        );
+        // The confirmed Cash purchase settled at confirm, so its one chip is
+        // the Paid state, never the type.
+        assert_eq!(
+            list.matches(">Paid</span>").count(),
+            1,
+            "the confirmed Cash row carries the Paid chip exactly once: {list:.600}"
         );
     }
 
@@ -3454,49 +3712,60 @@ mod tests {
         );
     }
 
-    /// The add-line drawer carries a "Keep open after adding" preference:
-    /// the checkbox lives OUTSIDE `#line-picker` (the picker OOB-swaps on
-    /// every add and would wipe it), its state persists in localStorage, and
-    /// the page shell closes the drawer — returning focus to the bar's
-    /// add-line button — after a successful POST when the preference is off.
+    /// The entry row replaces the add-line drawer: it renders persistent
+    /// inside the money region — product, qty, cost and the Add action,
+    /// visible without any click — and the drawer's "Keep open after adding"
+    /// preference is gone with the drawer: no checkbox, no localStorage key,
+    /// and no page-shell code that opened, closed or focused a drawer.
     #[tokio::test]
-    async fn web_purchase_add_line_drawer_carries_keep_open_preference_outside_the_picker() {
+    async fn web_purchase_entry_row_replaces_the_drawer_and_drops_the_keep_open_preference() {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         let app = crate::routes::router(state.clone());
         let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
 
-        // The checkbox renders in the drawer, before the picker subtree, so
-        // the picker's out-of-band clear+focus swap cannot destroy it.
-        let drawer_start = html
-            .find("<div id=\"line-drawer\"")
-            .expect("the add-line drawer renders");
-        let keep = html
-            .find("id=\"keep-open-lines\"")
-            .expect("the keep-open checkbox renders");
-        let picker = html
-            .find("id=\"line-picker\"")
-            .expect("the drawer hosts the picker");
+        // The drawer and its keep-open preference are deleted outright.
         assert!(
-            keep > drawer_start && keep < picker,
-            "the keep-open checkbox sits in the drawer, outside the picker: keep={keep} picker={picker} drawer={drawer_start}"
+            !html.contains("id=\"line-drawer\"") && !html.contains("closeLineDrawer"),
+            "the add-line drawer is deleted: {html:.600}"
+        );
+        assert!(
+            !html.contains("keep-open-lines") && !html.contains("keepOpen"),
+            "the keep-open preference is gone with the drawer: {html:.600}"
+        );
+        assert!(
+            !html.contains("purchases.addLine.keepOpen"),
+            "the localStorage preference is gone: {html:.600}"
+        );
+        assert!(
+            !html.contains("openLineDrawer"),
+            "no code opens a drawer that no longer exists: {html:.600}"
         );
 
-        // The preference persists across swaps: the page shell owns the
-        // localStorage key and the after-request close.
+        // The entry row sits inside the money region every add response
+        // swaps, above the lines: results appearing below cannot move the
+        // Add button, and the region swap re-renders it empty and focused.
+        let money = html
+            .find("id=\"purchase-record-money\"")
+            .expect("the money region renders");
+        let row = html
+            .find("id=\"line-picker\"")
+            .expect("the entry row renders");
+        let results = html
+            .find("id=\"product-search-results\"")
+            .expect("the entry row renders the results container");
+        let lines = html
+            .find(">Lines (")
+            .expect("the lines heading renders");
         assert!(
-            html.contains("purchases.addLine.keepOpen"),
-            "the page shell persists the preference: {html:.600}"
+            money < row && row < results && results < lines,
+            "the entry row and its results sit inside the money region, above the lines: money={money} row={row} results={results} lines={lines}"
         );
+        let form = enclosing_form(&html, "id=\"product-picker\"");
         assert!(
-            html.contains("htmx:afterRequest"),
-            "the page shell reacts to the add-line response: {html:.600}"
-        );
-        // Focus return: closing the drawer hands focus back to the bar button.
-        assert!(
-            html.contains("getElementById('add-line')") && html.contains("addBtn.focus()"),
-            "closing the drawer returns focus to Add line: {html:.600}"
+            form.contains("data-action=\"Add line\"") && form.contains("type=\"submit\""),
+            "the entry row carries the Add action in its flex row: {form:.600}"
         );
     }
 
@@ -3643,7 +3912,8 @@ mod tests {
     /// The catalogue `<select>` is replaced by one field that searches with a
     /// debounce, submits on Enter and clears on Escape; the results container is a
     /// sibling of the form, and every result is its own add action against the
-    /// purchase line endpoint.
+    /// purchase line endpoint. The entry row is persistent inside the money
+    /// region, above the lines.
     #[tokio::test]
     async fn n4_purchase_record_offers_the_picker_instead_of_the_catalogue_select() {
         let state = test_state().await;
@@ -3697,12 +3967,22 @@ mod tests {
             html.contains("id=\"purchase-record-money\""),
             "adding a line swaps the money region, which carries the total and the lines"
         );
+        // Placement: the entry row and its results live inside the money
+        // region, above the lines heading — one flex row, then the results.
+        let money = html.find("id=\"purchase-record-money\"").unwrap();
+        let row = html.find("id=\"line-picker\"").unwrap();
+        let results = html.find("id=\"product-search-results\"").unwrap();
+        let lines = html.find(">Lines (").unwrap();
+        assert!(
+            money < row && row < results && results < lines,
+            "the entry row and its results sit inside the money region, above the lines: money={money} row={row} results={results} lines={lines}"
+        );
     }
 
-    /// AC9 + AC10: an exact barcode submits the line in one step, the same response
-    /// carries the updated lines, the running total and an out-of-band picker that
-    /// is empty and focused, and an empty cost falls back to the product's cost
-    /// price.
+    /// AC9 + AC10: an exact barcode submits the line in one step, the same
+    /// response carries the updated lines, the running total and the entry
+    /// row — inside the swapped money region, empty and focused — and an
+    /// empty cost falls back to the product's cost price.
     #[tokio::test]
     async fn n4_purchase_line_scan_adds_in_one_step_and_resets_the_picker() {
         use rust_decimal::Decimal;
@@ -3737,17 +4017,17 @@ mod tests {
         assert_eq!(
             line.unit_cost,
             Decimal::from(10),
-            "an empty cost falls back to the product cost price"
+            "an empty cost uses the product cost price only when the supplier has no satellite row"
         );
 
-        // One response carries the lines, the running total and the OOB picker, so
-        // lines and total can never drift.
+        // One response carries the lines, the running total and the entry row
+        // (inside the money region), so lines and total can never drift.
         assert!(added.contains(&scanned.name), "{added:.600}");
         assert!(
             added.contains("$40"),
             "the running total travels with the lines: {added:.800}"
         );
-        assert_oob_picker_is_empty_and_focused(&added);
+        assert_entry_row_is_empty_and_focused(&added);
     }
 
     /// AC10 (clicked result): a result is its own add action; the request includes
@@ -3827,11 +4107,13 @@ mod tests {
         assert_eq!(after.total, before.total);
     }
 
-    /// The repeated-product rule is a deliberate rejection, not a crash: the route
-    /// answers 400 with the actionable message, and the picker form names its action
-    /// so the notice region reads "Add line failed — …" instead of a bare error.
+    /// S5b rewrote the old `web_purchase_line_repeated_product_is_a_clear_400`
+    /// pin: a same-cost repeat through the web route now merges, so this test
+    /// pins the split — the 400 (same message, same status) survives only for a
+    /// different explicit cost, and the merge is announced with a visible
+    /// notice. The strict rule-for-machines is pinned on the API twin below.
     #[tokio::test]
-    async fn web_purchase_line_repeated_product_is_a_clear_400() {
+    async fn web_purchase_line_same_cost_repeat_merges_and_different_cost_stays_400() {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         let app = crate::routes::router(state.clone());
@@ -3841,19 +4123,20 @@ mod tests {
             .await
             .unwrap();
 
+        // The fixture line was priced from the product column (10) with an empty
+        // cost, so a repeat scan with an empty cost resolves to the same cost:
+        // merging loses nothing.
         let (status, _, body) = post_form_response(
             app.clone(),
             &format!("/web/purchases/{}/lines", fixture.purchase_id),
-            &format!("product={}&qty=1&unit_cost=", fixture.product_sku),
+            &format!("product={}&qty=3&unit_cost=", fixture.product_sku),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("already has a line"), "{body}");
-        assert!(
-            body.contains("separate purchase"),
-            "the message must point at the supported path: {body}"
-        );
-
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The merge is a visible success notice, not a silent quantity change.
+        assert!(body.contains("data-notice-server"), "{body}");
+        assert!(body.contains("merged"), "{body}");
+        assert!(body.contains(&fixture.product_name), "{body}");
         let after = state
             .purchases_service
             .get_detail(fixture.purchase_id)
@@ -3862,9 +4145,76 @@ mod tests {
         assert_eq!(
             after.lines.len(),
             before.lines.len(),
-            "the repeated product adds no line"
+            "the repeat adds no second line"
         );
-        assert_eq!(after.total, before.total);
+        let line = after
+            .lines
+            .iter()
+            .find(|l| l.product_id == fixture.product_id)
+            .unwrap();
+        assert_eq!(line.qty, dec_web("5"), "the merged quantity is the sum");
+        assert_eq!(line.unit_cost, dec_web("10"), "the stored cost does not move");
+
+        // The 400 survives only for a different explicit cost, with the exact
+        // message the strict rule always produced.
+        let (status, _, body) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            &format!("product={}&qty=1&unit_cost=99", fixture.product_sku),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("already has a line"), "{body}");
+        assert!(
+            body.contains("separate purchase"),
+            "the message must point at the supported path: {body}"
+        );
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.lines.len(),
+            before.lines.len(),
+            "the refused repeat adds no line"
+        );
+        let line = after
+            .lines
+            .iter()
+            .find(|l| l.product_id == fixture.product_id)
+            .unwrap();
+        assert_eq!(line.qty, dec_web("5"), "the refusal leaves the quantity untouched");
+    }
+
+    // The asymmetry is deliberate (S5b): the web route merges a same-cost
+    // repeat because the operator is a scanner, but the JSON API keeps the
+    // strict rule — a machine client is told to use the line-update endpoint
+    // instead of having its request silently reinterpreted.
+    #[tokio::test]
+    async fn api_purchase_line_repeated_product_is_still_a_clear_400() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, v) = post_json(
+            app.clone(),
+            &format!("/api/purchases/{}/lines", fixture.purchase_id),
+            serde_json::json!({ "product_id": fixture.product_id, "qty": "1" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        let msg = v.to_string();
+        assert!(msg.contains("already has a line"), "{msg}");
+        assert!(msg.contains("separate purchase"), "{msg}");
+
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(after.lines.len(), 1, "the refused repeat adds no line");
+        assert_eq!(after.lines[0].qty, dec_web("2"), "quantity unchanged");
     }
 
     #[tokio::test]
@@ -3893,8 +4243,8 @@ mod tests {
             "list should contain the new draft: {html:.400}"
         );
         assert!(
-            html.contains("draft #"),
-            "draft without number should show as draft #id: {html:.400}"
+            html.contains("Draft #"),
+            "draft without number should show as Draft #id: {html:.400}"
         );
     }
 
@@ -4128,6 +4478,107 @@ mod tests {
         );
     }
 
+    // -- S4: creation is a full page, so the list's primary action is a gate --
+
+    /// The list page is gated `purchases.read`, but its header action now
+    /// navigates to `/purchases/new`, gated `purchases.create` — creation is a
+    /// full page, not a card on the list. The repo's rule (AC21, the same one
+    /// the sidebar's `nav.visible(key)` applies) extends to the primary
+    /// action: a principal without `purchases.create` renders no page action
+    /// at all; a principal holding it sees "New purchase" → `/purchases/new`.
+    #[tokio::test]
+    async fn s4_purchases_page_offers_the_new_purchase_action_only_when_the_principal_can_create() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state.clone());
+
+        let (status, html) = get_html_as(app.clone(), "/purchases", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("data-page-action"),
+            "a principal without purchases.create must not be offered the primary \
+             action it could not open: {html:.600}"
+        );
+
+        // The same page for a principal holding BOTH codes: the action is
+        // back, pointing at the creation page.
+        let holder = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "purchases.create"],
+        )
+        .await
+        .unwrap();
+        let (status, html) =
+            get_html_as(app, "/purchases", Some(&test_support::cookie_for(&holder))).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("data-page-action"),
+            "a principal that may create must see the primary action: {html:.600}"
+        );
+        assert!(
+            html.contains("href=\"/purchases/new\"") && html.contains("New purchase"),
+            "the action must navigate to the creation page: {html:.600}"
+        );
+    }
+
+    // -- S3: the purchases list opens the read-only document peek -------------
+
+    /// The peek shell lives on `/purchases` and mirrors the documents drawer:
+    /// a fixed right panel whose body the row swaps the detail fragment into.
+    #[tokio::test]
+    async fn s3_purchase_list_shell_the_purchases_page_renders_the_read_only_peek() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("id=\"purchase-drawer\""),
+            "the page must render the peek shell: {html:.600}"
+        );
+        assert!(
+            html.contains("id=\"purchase-drawer-body\""),
+            "the shell must render the swap target: {html:.600}"
+        );
+        assert!(
+            html.contains("closePurchaseDrawer()"),
+            "the shell's close button must be wired: {html:.600}"
+        );
+    }
+
+    /// The whole list row is the trigger: it carries the peek's `hx-get` over
+    /// its existing `href` (the no-JavaScript fallback), and the old `Open`
+    /// anchor is gone — an `<a>` inside an `<a>` is invalid HTML.
+    #[tokio::test]
+    async fn s3_the_purchase_list_row_opens_the_peek_instead_of_navigating() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let id = fixture.purchase_id;
+        assert!(
+            html.contains(&format!("href=\"/purchases/{id}\"")),
+            "the row keeps its no-JavaScript fallback: {html:.800}"
+        );
+        assert!(
+            html.contains(&format!("hx-get=\"/web/documents/detail/purchase/{id}\"")),
+            "the row opens the peek over HTMX: {html:.800}"
+        );
+        assert!(
+            html.contains("hx-target=\"#purchase-drawer-body\""),
+            "the peek fragment lands in the drawer body: {html:.800}"
+        );
+        assert!(
+            !html.contains(">Open</a>"),
+            "the row is the trigger; the Open anchor must not render: {html:.800}"
+        );
+    }
+
     /// A principal holding ONLY `purchases.read` opens the reads and is
     /// refused every web mutation, each in the shape its caller reads and
     /// naming its own code: the draft lifecycle `purchases.create`, paying
@@ -4153,6 +4604,16 @@ mod tests {
             let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
             assert_eq!(status, StatusCode::OK, "{uri}: {html:.200}");
         }
+
+        // The creation page is its own gated read (S4): without
+        // `purchases.create` it answers the same 403 refusal the POST
+        // carries, while the list above still rendered for this principal.
+        let (status, body) = get_html_as(app.clone(), "/purchases/new", Some(&cookie)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.200}");
+        assert!(
+            body.contains("purchases.create"),
+            "the creation page's refusal must name purchases.create: {body:.400}"
+        );
 
         // Creating a purchase over HTMX: JSON naming the recording gate.
         let (status, body) = post_form_as(

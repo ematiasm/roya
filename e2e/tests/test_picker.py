@@ -24,7 +24,7 @@ from decimal import Decimal
 
 from playwright.sync_api import Page, expect
 
-from helpers import ApiClient, seed_harness_data
+from helpers import ApiClient, create_purchase_draft, seed_harness_data
 
 _LINES_TABLE = "#sale-record-money table tbody"
 _PURCHASE_LINES_TABLE = "#purchase-record-money table tbody"
@@ -183,23 +183,22 @@ def test_a_search_is_not_announced_as_an_added_line(
 def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     page: Page, api: ApiClient
 ) -> None:
-    """The purchase record hosts the same picker, but through its own form.
+    """The purchase record hosts the same picker, but through its own entry row.
 
     The sales test above would still pass if only the sale host were fixed, so the
-    purchase page needs its own results-based check: its host form passes a
-    different swap target and asks for cost instead of sale price. Here the results
-    must render, show the purchase context's cost, and a chosen result must add a
-    purchase line with the quantity typed. The seeded purchase already owns a line
-    for the other product, so the new row is unambiguous.
+    purchase page needs its own results-based check: its entry row passes a
+    different swap target and asks for cost instead of sale price. Here the
+    results must render, show the purchase context's cost, and a chosen result
+    must add a purchase line with the quantity typed. The seeded purchase already
+    owns a line for the other product, so the new row is unambiguous.
     """
     data = seed_harness_data(api)
     # The spare product the seed put on the *sale*; the purchase does not own it.
     spare_id = data.sale_line_product_id
     page.goto(f"{api.base_url}/purchases/{data.purchase_id}")
 
-    # The purchase picker lives in the add-line drawer now: open it the way
-    # the operator does (the bar's Add line button) before touching the field.
-    page.locator("#add-line").click()
+    # The entry row is persistent: the product field is already on the page,
+    # no click reveals it.
     picker = page.locator("#product-picker")
     picker.fill("Harness")
     results = page.locator("#product-search-results")
@@ -221,12 +220,59 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     expect(row.locator("input[name='qty']")).to_have_value("4")
     expect(row.locator("input[name='unit_cost']")).to_have_value("2.00")
     expect(row).to_contain_text("$8.00")
-    # The keep-open preference defaults to OFF, so a successful add closes the
-    # drawer and the line is what remains on screen.
-    expect(page.locator("#line-drawer")).to_be_hidden()
 
     detail = api.get_json(f"/api/purchases/{data.purchase_id}")
     line = next(
         line for line in detail["lines"] if int(line["product_id"]) == spare_id
     )
     assert Decimal(str(line["qty"])) == Decimal("4"), line
+
+
+def test_a_repeat_scan_on_a_draft_purchase_merges_into_one_line(
+    page: Page, api: ApiClient
+) -> None:
+    """Scanning the same barcode twice on a draft purchase increments the line.
+
+    S5b: a repeat product is a legal scan, not an error — when the resolved
+    cost equals the existing line's cost (here the supplier's satellite cost,
+    the case a receiving desk actually hits) the second scan increments the
+    line and the answer says so in the notice region. One row, quantity 2, a
+    visible merge notice: nothing happens silently.
+    """
+    data = seed_harness_data(api)
+    # A draft of our own: the seeded purchase already carries a line for this
+    # product, and this test needs the increment's before-state to be exact.
+    purchase_id = create_purchase_draft(api, data.supplier_id)
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    picker = page.locator("#product-picker")
+
+    # Scan 1: an empty cost resolves to the supplier's satellite cost, so the
+    # line is created at it.
+    page.locator("#line-qty").fill("1")
+    picker.fill(data.barcode)
+    picker.press("Enter")
+    row = _purchase_line_row(page, data.product_name)
+    expect(row).to_have_count(1)
+    expect(row.locator("input[name='qty']")).to_have_value("1")
+
+    # Scan 2: the same barcode, the same resolved cost — the line increments.
+    page.locator("#line-qty").fill("1")
+    picker.fill(data.barcode)
+    picker.press("Enter")
+    rows = _purchase_line_row(page, data.product_name)
+    expect(rows).to_have_count(1)
+    expect(rows.locator("input[name='qty']")).to_have_value("2")
+
+    # The merge is announced, not silent: the server-rendered success notice
+    # names the product and lands in the page's notice region.
+    notice = page.locator("#notice [data-notice='success']")
+    expect(notice).to_be_visible()
+    expect(notice).to_contain_text(data.product_name)
+    expect(notice).to_contain_text("merged")
+
+    detail = api.get_json(f"/api/purchases/{purchase_id}")
+    assert len(detail["lines"]) == 1, detail["lines"]
+    line = detail["lines"][0]
+    assert int(line["product_id"]) == data.product_id
+    assert Decimal(str(line["qty"])) == Decimal("2"), line

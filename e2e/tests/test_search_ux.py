@@ -38,11 +38,15 @@ from helpers import (
 
 # ---------------------------------------------------------------------------
 # Selectors, copied from the list partials and the picker macro. Tests address
-# the interface through the ids it already exposes (R5).
+# the interface through the ids it already exposes (R5). Rows are matched by
+# their `id="{kind}-{id}"` handle inside the inner list, not by tag: the
+# purchase row has been an anchor since S3 (the whole row opens the peek),
+# and the sale row is expected to follow in the sales mirror slice, so a
+# tag-scoped selector would silently match nothing.
 # ---------------------------------------------------------------------------
 
 _SALES_ROWS = '#sale-list-inner > div[id^="sale-"]'
-_PURCHASES_ROWS = '#purchase-list-inner > div[id^="purchase-"]'
+_PURCHASES_ROWS = '#purchase-list-inner > [id^="purchase-"]'
 _PRODUCTS_ROWS = '#product-list-inner > div[id^="product-"]'
 
 _SALES_FRAGMENT = "/web/sales"

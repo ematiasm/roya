@@ -36,6 +36,19 @@ use crate::models::{
     PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, StaleLineCostView, UpdatePurchaseDraft,
 };
 
+/// What `add_or_increment_line` did with the request. The distinction matters
+/// because the web route announces a merge with a visible notice, while an
+/// ordinary add keeps the existing silent success path.
+#[derive(Debug)]
+pub enum LineAddOutcome {
+    /// The product had no line in this purchase: a new one was created.
+    Added(PurchaseLine),
+    /// The product already had a line at the same resolved cost: its quantity
+    /// was incremented through the update path, so exactly one line remains.
+    /// `product_name` feeds the merge notice the route renders.
+    Merged { line: PurchaseLine, product_name: String },
+}
+
 #[derive(Clone)]
 pub struct PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM>
 where
@@ -308,17 +321,7 @@ where
         // Duplicate product on the same purchase is a 400 before any write.
         let lines = self.purchases.list_lines(purchase_id).await?;
         Self::ensure_unique_product(&lines, product_id, &product.name, None)?;
-        let cost = match unit_cost {
-            Some(c) => {
-                if c < Decimal::ZERO {
-                    return Err(AppError::Validation("unit_cost cannot be negative".into()));
-                }
-                c
-            }
-            // Manual line with no supplier cost yet: fall back to the product
-            // column, which purchases never write.
-            None => product.cost_price,
-        };
+        let cost = self.resolve_line_cost(product_id, product.cost_price, purchase.supplier_id, unit_cost).await?;
         let line = self
             .purchases
             .create_line(purchase_id, product_id, qty, cost)
@@ -328,6 +331,99 @@ where
         // `updated_by` with this request's actor.
         self.purchases.touch_draft(purchase_id, actor).await?;
         Ok(line)
+    }
+
+    /// Cost resolution shared by the strict and the merging line-add: an
+    /// explicit cost wins (and cannot be negative); an empty cost uses this
+    /// supplier's satellite cost, and only falls back to the product column
+    /// when no satellite row exists (the fallback purchases never write).
+    async fn resolve_line_cost(
+        &self,
+        product_id: i64,
+        product_cost_price: Decimal,
+        supplier_id: i64,
+        unit_cost: Option<Decimal>,
+    ) -> AppResult<Decimal> {
+        match unit_cost {
+            Some(c) => {
+                if c < Decimal::ZERO {
+                    return Err(AppError::Validation("unit_cost cannot be negative".into()));
+                }
+                Ok(c)
+            }
+            None => Ok(match self.suppliers.find_cost(product_id, supplier_id).await? {
+                Some(row) => row.current_cost,
+                None => product_cost_price,
+            }),
+        }
+    }
+
+    /// The web scan path (S5b): a repeat product whose resolved cost equals the
+    /// existing line's cost increments that line instead of failing. The
+    /// domain rule stays — a product appears at most once per purchase, so one
+    /// product can never carry two prices — but merging the SAME price loses
+    /// nothing, while merging a DIFFERENT price would silently discard one of
+    /// them, so that case keeps the strict 400 unchanged. The JSON API keeps
+    /// the strict `add_line` contract: a machine client should use the
+    /// line-update endpoint rather than have its request reinterpreted.
+    pub async fn add_or_increment_line(
+        &self,
+        actor: i64,
+        purchase_id: i64,
+        product_id: i64,
+        qty: Decimal,
+        unit_cost: Option<Decimal>,
+    ) -> AppResult<LineAddOutcome> {
+        let purchase = self
+            .purchases
+            .find_purchase(purchase_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("purchase {purchase_id} not found")))?;
+        Self::ensure_draft(&purchase)?;
+        if qty <= Decimal::ZERO {
+            return Err(AppError::Validation("qty must be > 0".into()));
+        }
+        // 404 on unknown product (AC5).
+        let product = self.inventory.get_product(product_id).await?;
+        // Cost resolution runs BEFORE the uniqueness check, the one point
+        // where this method and `add_line` diverge: the merge decision needs
+        // the resolved cost. A visible consequence: a repeat product submitted
+        // with an invalid explicit cost (negative) answers
+        // "unit_cost cannot be negative", not the duplicate-product 400
+        // `add_line` would have answered first. Both are 400 and only invalid
+        // input is affected.
+        let cost = self.resolve_line_cost(product_id, product.cost_price, purchase.supplier_id, unit_cost).await?;
+        let lines = self.purchases.list_lines(purchase_id).await?;
+        match lines.iter().find(|l| l.product_id == product_id) {
+            None => {
+                let line = self
+                    .purchases
+                    .create_line(purchase_id, product_id, qty, cost)
+                    .await?;
+                self.purchases.touch_draft(purchase_id, actor).await?;
+                Ok(LineAddOutcome::Added(line))
+            }
+            // Same product at the same price: sum the quantities through the
+            // existing update path (which re-runs the draft and validation
+            // guards), keeping exactly one line for the product.
+            Some(existing) if existing.unit_cost == cost => {
+                let line = self
+                    .update_line(actor, existing.id, existing.qty + qty, cost)
+                    .await?;
+                Ok(LineAddOutcome::Merged {
+                    line,
+                    product_name: product.name,
+                })
+            }
+            // Same product at a DIFFERENT price: exactly the case the rule
+            // exists to catch. The rejection is the same 400
+            // `ensure_unique_product` produces, so message and status do not
+            // change; the merge would discard one of the two prices.
+            Some(_) => {
+                Self::ensure_unique_product(&lines, product_id, &product.name, None)?;
+                unreachable!("the product's line exists, so ensure_unique_product rejects")
+            }
+        }
     }
 
     pub async fn update_line(
@@ -2440,6 +2536,253 @@ mod tests {
         let other_stored = s.inventory.get_product(other.id).await.unwrap();
         assert_eq!(other_stored.cost_price, dec("7"));
         let _ = pool;
+    }
+
+    // -- add_line empty-cost default: satellite for THIS supplier wins -------------
+
+    #[tokio::test]
+    async fn add_line_empty_cost_records_satellite_cost_for_this_supplier() {
+        let (s, _pool) = svc().await;
+        // Column says 5; the satellite says this supplier charges 9.50.
+        let prod = seed_product(&s, "LINE-DEF", "5").await;
+        let sup = seed_supplier(&s, "LINE-DEF SUP").await;
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let purchase = draft_credit(&s, sup.id).await;
+        let line = s
+            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(line.unit_cost, dec("9.50"), "empty cost must default to the supplier's satellite cost");
+    }
+
+    #[tokio::test]
+    async fn add_line_empty_cost_falls_back_to_product_column_without_satellite_row() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "LINE-FB", "5").await;
+        let sup = seed_supplier(&s, "LINE-FB SUP").await;
+
+        let purchase = draft_credit(&s, sup.id).await;
+        let line = s
+            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(line.unit_cost, dec("5"), "no satellite row => the product column is the fallback");
+    }
+
+    #[tokio::test]
+    async fn add_line_explicit_cost_wins_over_satellite_row() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "LINE-EXPL", "5").await;
+        let sup = seed_supplier(&s, "LINE-EXPL SUP").await;
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let purchase = draft_credit(&s, sup.id).await;
+        let line = s
+            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("12")))
+            .await
+            .unwrap();
+
+        assert_eq!(line.unit_cost, dec("12"), "an explicit cost must not be replaced by the satellite");
+    }
+
+    #[tokio::test]
+    async fn add_line_empty_cost_does_not_leak_another_suppliers_row() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "LINE-LEAK", "5").await;
+        let sup_a = seed_supplier(&s, "LINE-LEAK A").await;
+        let sup_b = seed_supplier(&s, "LINE-LEAK B").await;
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup_a.id, dec("8"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup_b.id, dec("6.25"), d(2024, 5, 1))
+            .await
+            .unwrap();
+
+        let purchase_b = draft_credit(&s, sup_b.id).await;
+        let line_b = s
+            .add_line(audit_actor(&s).await, purchase_b.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(line_b.unit_cost, dec("6.25"), "a purchase for B must default to B's cost, not A's");
+    }
+
+    // -- add_or_increment_line (S5b): a same-cost repeat merges into the
+    //    existing line, a different cost keeps the exact 400 ---------------
+
+    /// Unwraps an `Added` outcome, so each test states which branch it means.
+    fn assert_added(outcome: LineAddOutcome) -> PurchaseLine {
+        match outcome {
+            LineAddOutcome::Added(line) => line,
+            LineAddOutcome::Merged { .. } => panic!("expected Added, got Merged"),
+        }
+    }
+
+    /// Unwraps a `Merged` outcome and checks the notice payload.
+    fn assert_merged(outcome: LineAddOutcome, product_name: &str) -> PurchaseLine {
+        match outcome {
+            LineAddOutcome::Merged { line, product_name: name } => {
+                assert_eq!(name, product_name);
+                line
+            }
+            LineAddOutcome::Added(_) => panic!("expected Merged, got Added"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_or_increment_line_without_a_line_creates_it() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "MERGE-NEW", "5").await;
+        let sup = seed_supplier(&s, "MERGE-NEW SUP").await;
+        let purchase = draft_credit(&s, sup.id).await;
+
+        let line = assert_added(
+            s.add_or_increment_line(
+                audit_actor(&s).await,
+                purchase.id,
+                prod.id,
+                dec("2"),
+                Some(dec("5")),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(line.product_id, prod.id);
+        assert_eq!(line.qty, dec("2"));
+        assert_eq!(line.unit_cost, dec("5"));
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.lines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn add_or_increment_line_same_cost_merges_and_keeps_one_line() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "MERGE-SAME", "5").await;
+        let sup = seed_supplier(&s, "MERGE-SAME SUP").await;
+        let actor = audit_actor(&s).await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(actor, purchase.id, prod.id, dec("2"), Some(dec("5")))
+            .await
+            .unwrap();
+
+        let line = assert_merged(
+            s.add_or_increment_line(actor, purchase.id, prod.id, dec("3"), Some(dec("5")))
+                .await
+                .unwrap(),
+            &prod.name,
+        );
+        assert_eq!(line.product_id, prod.id);
+        assert_eq!(line.qty, dec("5"), "the merged quantity is the sum");
+        assert_eq!(line.unit_cost, dec("5"), "the stored cost does not move");
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.lines.len(), 1, "exactly ONE line stays for the product");
+    }
+
+    #[tokio::test]
+    async fn add_or_increment_line_different_cost_keeps_the_existing_400() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "MERGE-DIFF", "5").await;
+        let sup = seed_supplier(&s, "MERGE-DIFF SUP").await;
+        let actor = audit_actor(&s).await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(actor, purchase.id, prod.id, dec("2"), Some(dec("5")))
+            .await
+            .unwrap();
+
+        let err = s
+            .add_or_increment_line(actor, purchase.id, prod.id, dec("1"), Some(dec("7")))
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("already has a line"), "{msg}");
+                assert!(msg.contains("separate purchase"), "{msg}");
+            }
+            other => panic!("expected the same Validation 400, got {other:?}"),
+        }
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.lines.len(), 1);
+        assert_eq!(detail.lines[0].qty, dec("2"), "the line's quantity is unchanged");
+        assert_eq!(detail.lines[0].unit_cost, dec("5"), "the stored cost is unchanged");
+    }
+
+    #[tokio::test]
+    async fn add_or_increment_line_empty_cost_merges_through_the_satellite_row() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "MERGE-SAT", "5").await;
+        let sup = seed_supplier(&s, "MERGE-SAT SUP").await;
+        s.suppliers
+            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        let actor = audit_actor(&s).await;
+        let purchase = draft_credit(&s, sup.id).await;
+        // The first scan carries an empty cost: the satellite row prices the line.
+        s.add_line(actor, purchase.id, prod.id, dec("1"), None).await.unwrap();
+
+        // The case a receiving desk actually hits: the same scan again, still
+        // with an empty cost, resolving to the same satellite cost.
+        let line = assert_merged(
+            s.add_or_increment_line(actor, purchase.id, prod.id, dec("2"), None)
+                .await
+                .unwrap(),
+            &prod.name,
+        );
+        assert_eq!(line.qty, dec("3"));
+        assert_eq!(line.unit_cost, dec("9.50"));
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.lines.len(), 1, "exactly ONE line stays for the product");
+    }
+
+    /// Ordering pin: `add_or_increment_line` resolves the cost BEFORE the
+    /// uniqueness check (the merge decision needs it), so a repeat product
+    /// with an INVALID explicit cost answers the cost error, not the
+    /// duplicate-product 400 `add_line` would have answered first. Both are
+    /// 400 and only invalid input is affected — this test records that
+    /// consequence so a reorder cannot change it silently.
+    #[tokio::test]
+    async fn add_or_increment_line_negative_explicit_cost_reports_the_cost_error() {
+        let (s, _pool) = svc().await;
+        let prod = seed_product(&s, "MERGE-NEG", "5").await;
+        let sup = seed_supplier(&s, "MERGE-NEG SUP").await;
+        let actor = audit_actor(&s).await;
+        let purchase = draft_credit(&s, sup.id).await;
+        s.add_line(actor, purchase.id, prod.id, dec("2"), Some(dec("5")))
+            .await
+            .unwrap();
+
+        let err = s
+            .add_or_increment_line(actor, purchase.id, prod.id, dec("1"), Some(dec("-3")))
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("unit_cost cannot be negative"),
+                    "the cost error wins over the duplicate error: {msg}"
+                );
+                assert!(
+                    !msg.contains("already has a line"),
+                    "the duplicate message must not appear: {msg}"
+                );
+            }
+            other => panic!("expected the cost Validation 400, got {other:?}"),
+        }
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.lines.len(), 1);
+        assert_eq!(detail.lines[0].qty, dec("2"), "the line's quantity is unchanged");
+        assert_eq!(detail.lines[0].unit_cost, dec("5"), "the stored cost is unchanged");
     }
 
     // -- AC11: references ---------------------------------------------------------
