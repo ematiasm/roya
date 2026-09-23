@@ -268,18 +268,29 @@ by its own test, so the surviving path is pinned rather than assumed.
         are already the island pins.
       The HTML route itself **stays** in T4b, so this is a coverage move and the
       tree stays green.
-- [ ] T4c — Delete the now-dead server path: `web_product_search`, the
-      `/web/product-search` route registration, `ProductSearchResultsPartial`,
-      the `line_action`/`line_target`/`price` fields of `ProductSearchQuery`, the
-      route-rendered results body at the bottom of `product_search_results.html`
-      (everything after `{% endmacro %}`), the `n4_product_search_*` tests that
-      pinned it, and the four stale comments that describe the product search's
-      `line_action`/`line_target` shape (three in `src/routes/suppliers_web.rs`,
-      one in `templates/partials/supplier_search_results.html` — the supplier
-      picker has its own query context now that the product search has none).
-      Genuinely pure deletion, only after T4b has moved the coverage that
-      survives.
-- [ ] T5 — e2e sweep (`test_picker.py`, `test_search_ux.py`) and README.
+- [x] T4c — Delete the now-dead server path. Closed in `07f3ba4`. The diff is
+      37 insertions against 219 deletions. It also had to dispose of one test the
+      plan did not foresee: `n5_product_search_json_money_is_the_fragments_display_form`
+      pinned the JSON's money **against the HTML fragment's rendering**, so
+      deleting the route removed its referent and the plan's own keep-list ("every
+      `n5_*` test") contradicted its delete-list. Resolved by deleting it, because
+      both things it protected survive: the wire's display form is pinned
+      literally by its sibling `n5_product_search_json_matches_name_sku_and_barcode`
+      (`sale_price == "25.00"`), and the rendered form is pinned exactly by e2e's
+      full-row assertion (`"HARNESS-WIDGET • $25.00 • stock 5"`), which is a
+      stronger pin than the cross-check was. A comment at its former site names
+      both. The deletions:
+- [ ] T5 — e2e sweep and README.
+      - `e2e/tests/test_search_ux.py:638` asserts the failure notice contains
+        `/web/product-search`. It passes today only because the island's URL
+        (`/web/product-search.json`) contains that string; after T4c the HTML
+        route is gone, so the substring refers to the JSON path alone. Tighten it
+        to `/web/product-search.json` so the assertion says what it means.
+      - Sweep `test_picker.py` and the rest of `test_search_ux.py` for any other
+        assertion left over from the declarative transport.
+      - README does not mention `/web/product-search` (verified), so its work is
+        the picker's own description: the island, its state, its boundary, and
+        the split where search is JSON while the add-line contract is unchanged.
 
 ## Delivery strategy
 
@@ -335,6 +346,11 @@ coverage loss inside the same diff.
   in it, because nine consumers use the HTML route and only some of them cover
   behaviour that is now dead. The order was inverted — move the coverage first,
   delete the path second — and T4c was split out for the deletion alone.
+- 2026-09-24: T4c closed in `07f3ba4`. Now genuinely pure deletion, and the
+  second time a worker stopped on a contradiction in my brief rather than
+  deciding it: the keep-list said every `n5_*` test stays while the delete-list
+  removed that test's referent. The contradiction was real, the resolution was
+  mine to make, and the worker was right to refuse it.
 
 ## Lesson: a vacuous test is settled by mutation, not by argument
 
@@ -505,3 +521,30 @@ scope — "rewrite the record-page half of X" — never the file or the test.
 - **T4b, auditability**: each deleted test is replaced by a one-line comment at
   its former site naming the e2e test that now carries the coverage, so the
   deletion is greppable rather than silent.
+- **T4c, green (orchestrator-verified)**: `cargo test` → **885 passed, 0 failed**
+  (889 − 3 `n4_*` − 1 `n5` money test); `scripts/e2e.sh` → **93 passed,
+  4 skipped, 0 failed**. Diff: 37 insertions, 219 deletions.
+- **T4c, the plan's own contradiction**: the brief told the worker to keep every
+  `n5_product_search_json_*` test **and** to delete the HTML route; the money test
+  pinned one against the other, so both instructions could not hold. The worker
+  stopped and reported rather than picking one. Verified before deciding: the
+  referent is gone by design and both protections survive elsewhere (literal
+  `"25.00"` in the sibling test; the exact full rendered row in
+  `e2e/tests/test_picker.py:138`). This is the second time a worker refused to
+  make a decision my brief had left contradictory, and both times that was the
+  correct behaviour.
+- **T4c, by inspection**: the grep for the bare `/web/product-search` in `src/`
+  and `templates/` is empty (every remaining reference is the `.json` route); the
+  `line_picker` macro and its `sale_detail.html` import both survive; the three
+  files added to the surfaces mid-task changed **only** their one comment line
+  each (3 insertions, 3 deletions, all comment text).
+- **T4c, a warning count that looked like a defect and was not**: the worker
+  reported 57 warnings and a raw `grep -c '^warning'` over
+  `cargo check --all-targets` gives 59. The difference is the counting unit, not
+  a regression — `--all-targets` compiles the bin (47 warnings) and the bin as a
+  test (32, of which 22 duplicate the bin's), so the unique count is
+  `47 + (32 − 22) = 57`. The decisive check is the direct one, and it is clean:
+  no warning anywhere mentions `product_search`, `ProductSearchResults`,
+  `web_product_search`, `line_action` or `line_target`, so the deletion left no
+  newly dead code. Recorded because a count that disagrees with the report is
+  worth resolving rather than accepting or dismissing.
