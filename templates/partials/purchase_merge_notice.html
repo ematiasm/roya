@@ -1,0 +1,32 @@
+{# The server-rendered notice for a merged repeat scan (S5b): scanning a
+   product that already has a line at the SAME resolved cost increments that
+   line instead of answering 400. The web add-line answer swaps this wrapper
+   out of band into the page's `#notice` region with
+   hx-swap-oob="innerHTML:#notice", the same mechanism
+   `templates/partials/notice.html` uses for the create-under-filter case:
+   htmx removes the wrapper from the main swap (the money region selected by
+   `hx-select`) and replaces the region's content with this element's
+   children, and the `data-notice-server` marker keeps `base.html`'s generic
+   "Add line saved" client notice from overwriting it. The merge therefore
+   rides the normal add-line response — the money-region swap and the entry
+   row's focus contract are untouched. Rendered by `PurchaseMergeNotice` in
+   `src/routes/purchases_web.rs`, which names this file in its own comment.
+
+   The box markup mirrors `notice.html` exactly — the same classes,
+   `data-notice="success"`, `role="status"` and the same dismiss button — with
+   only the copy parametrized (product name, new quantity). `base.html`
+   cross-references `notice.html` as the JS-side twin of that box; this
+   template reuses only class tokens already present in `notice.html`, so it
+   needs no new Tailwind output and no `scripts/build-css.sh` run. Keep the
+   three copies in step: `notice.html`, this file, and the `notice()` JS box
+   in `base.html`.
+
+   Askama escapes both `{{ product_name }}` and `{{ quantity }}` on output, so
+   a name made of markup characters (`<`, `>`, `&`, `"`) reaches the operator
+   as text, not HTML. #}
+<div hx-swap-oob="innerHTML:#notice">
+  <div class="mb-4 flex items-start justify-between gap-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3 text-sm text-accent" data-notice="success" data-notice-server="true" role="status">
+    <div class="min-w-0 flex-1 break-words">{{ product_name }} scanned again — merged into the existing line; its quantity is now {{ quantity }}.</div>
+    <button type="button" class="shrink-0 rounded border border-current px-2 py-0.5 text-xs" data-notice-dismiss="true" aria-label="Dismiss">✕</button>
+  </div>
+</div>

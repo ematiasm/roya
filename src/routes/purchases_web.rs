@@ -23,6 +23,7 @@ use crate::models::{
     PurchaseSuggestions, UpdateProduct,
 };
 use crate::routes::AppState;
+use crate::services::purchases::LineAddOutcome;
 // S7 enforcement: every registered handler declares the permission its action
 // needs (AC10); the collection adapters and the path handlers share ungated
 // `*_impl` bodies so each registered boundary carries its own real gate. The
@@ -128,6 +129,18 @@ struct PurchaseNewTemplate {
 struct PurchaseListPartial {
     title: String,
     purchases: Vec<PurchaseView>,
+}
+
+/// The server-rendered merge notice (S5b): a repeat scan at the same resolved
+/// cost merged into the existing line, so the answer announces it instead of
+/// silently changing a quantity. Markup and contract are documented in
+/// `templates/partials/purchase_merge_notice.html`; the classes mirror
+/// `partials/notice.html` and reuse only tokens already present there.
+#[derive(Template)]
+#[template(path = "partials/purchase_merge_notice.html")]
+struct PurchaseMergeNotice {
+    product_name: String,
+    quantity: Decimal,
 }
 
 /// The record body, shared by the page and by every action response that swaps
@@ -311,27 +324,30 @@ fn render_record(
 /// Record-body response that keeps the cross-region `purchase-changed` refresh
 /// event, so the subscribed list region updates after an action.
 async fn changed(state: &AppState, purchase_id: i64) -> AppResult<Response> {
-    changed_with_entry_row(state, purchase_id, false).await
+    changed_with_notice(state, purchase_id, false, None).await
 }
 
-/// Line-add response: the entry row is now persistent inside the money region
-/// the add swaps, so no out-of-band picker is needed — the flag only adds
-/// `autofocus` to the entry row's product field, so the swapped-in region
-/// claims focus and the scanner can feed the next line without a click. The
-/// action bar still rides out of band: its enabled state (Confirm disabled at
-/// zero lines) must follow the line count while the main swap only takes the
-/// money region (HTMX processes OOB before `hx-select`).
-async fn changed_with_entry_row(
+/// The add-line response with an optional out-of-band server notice prepended
+/// to the body. The notice is a merge announcement (S5b): htmx strips the
+/// `hx-swap-oob` wrapper before the `hx-select` main swap, so the money region
+/// and the entry row's focus contract are untouched — the same mechanism the
+/// create-under-filter case uses (`hidden_by_filter_notice_html` in
+/// inventory_web.rs).
+async fn changed_with_notice(
     state: &AppState,
     purchase_id: i64,
     entry_row_focus: bool,
+    notice_html: Option<String>,
 ) -> AppResult<Response> {
-    let html = render_record(
+    let mut html = render_record(
         record_context(state, purchase_id).await?,
         entry_row_focus,
         true,
     )?
     .0;
+    if let Some(notice) = notice_html {
+        html = notice + &html;
+    }
     let mut resp = Html(html).into_response();
     resp.headers_mut()
         .insert("HX-Trigger", "purchase-changed".parse().unwrap());
@@ -758,12 +774,31 @@ async fn web_add_line_impl(
             .await?
             .id,
     };
-    state
+    // The web route takes the merging method (S5b): a repeat product at the
+    // same resolved cost increments the existing line, with a visible notice;
+    // a different cost still answers the same 400. The JSON API keeps the
+    // strict rule instead (`purchases_api.rs` add_line): a machine client is
+    // told to use the line-update endpoint rather than have its request
+    // silently reinterpreted. That asymmetry is deliberate and pinned by
+    // `web_purchase_line_same_cost_repeat_merges_and_different_cost_stays_400`
+    // and `api_purchase_line_repeated_product_is_still_a_clear_400`.
+    let outcome = state
         .purchases_service
-        .add_line(actor, id, product_id, qty, unit_cost)
+        .add_or_increment_line(actor, id, product_id, qty, unit_cost)
         .await?;
     if is_htmx(&headers) {
-        return changed_with_entry_row(&state, id, true).await;
+        let notice = match &outcome {
+            LineAddOutcome::Merged { line, product_name } => Some(
+                PurchaseMergeNotice {
+                    product_name: product_name.clone(),
+                    quantity: line.qty,
+                }
+                .render()
+                .map_err(|e| AppError::Internal(e.to_string()))?,
+            ),
+            LineAddOutcome::Added(_) => None,
+        };
+        return changed_with_notice(&state, id, true, notice).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1177,6 +1212,7 @@ mod tests {
     use crate::models::PaymentType;
     use crate::routes::AppState;
     use crate::security::test_support;
+    use rust_decimal::Decimal;
     // T5's markup test builds an `UpdateProduct` patch through the service.
     use crate::models::UpdateProduct;
 
@@ -1186,6 +1222,11 @@ mod tests {
     /// the point is telling two actors apart.
     async fn audit_actor(state: &AppState) -> i64 {
         test_support::audit_actor_id(&state.pool).await.unwrap()
+    }
+
+    /// A decimal literal for service-layer assertions.
+    fn dec_web(s: &str) -> Decimal {
+        s.parse().unwrap()
     }
 
     async fn test_state() -> AppState {
@@ -4014,11 +4055,13 @@ mod tests {
         assert_eq!(after.total, before.total);
     }
 
-    /// The repeated-product rule is a deliberate rejection, not a crash: the route
-    /// answers 400 with the actionable message, and the picker form names its action
-    /// so the notice region reads "Add line failed — …" instead of a bare error.
+    /// S5b rewrote the old `web_purchase_line_repeated_product_is_a_clear_400`
+    /// pin: a same-cost repeat through the web route now merges, so this test
+    /// pins the split — the 400 (same message, same status) survives only for a
+    /// different explicit cost, and the merge is announced with a visible
+    /// notice. The strict rule-for-machines is pinned on the API twin below.
     #[tokio::test]
-    async fn web_purchase_line_repeated_product_is_a_clear_400() {
+    async fn web_purchase_line_same_cost_repeat_merges_and_different_cost_stays_400() {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         let app = crate::routes::router(state.clone());
@@ -4028,19 +4071,20 @@ mod tests {
             .await
             .unwrap();
 
+        // The fixture line was priced from the product column (10) with an empty
+        // cost, so a repeat scan with an empty cost resolves to the same cost:
+        // merging loses nothing.
         let (status, _, body) = post_form_response(
             app.clone(),
             &format!("/web/purchases/{}/lines", fixture.purchase_id),
-            &format!("product={}&qty=1&unit_cost=", fixture.product_sku),
+            &format!("product={}&qty=3&unit_cost=", fixture.product_sku),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("already has a line"), "{body}");
-        assert!(
-            body.contains("separate purchase"),
-            "the message must point at the supported path: {body}"
-        );
-
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The merge is a visible success notice, not a silent quantity change.
+        assert!(body.contains("data-notice-server"), "{body}");
+        assert!(body.contains("merged"), "{body}");
+        assert!(body.contains(&fixture.product_name), "{body}");
         let after = state
             .purchases_service
             .get_detail(fixture.purchase_id)
@@ -4049,9 +4093,76 @@ mod tests {
         assert_eq!(
             after.lines.len(),
             before.lines.len(),
-            "the repeated product adds no line"
+            "the repeat adds no second line"
         );
-        assert_eq!(after.total, before.total);
+        let line = after
+            .lines
+            .iter()
+            .find(|l| l.product_id == fixture.product_id)
+            .unwrap();
+        assert_eq!(line.qty, dec_web("5"), "the merged quantity is the sum");
+        assert_eq!(line.unit_cost, dec_web("10"), "the stored cost does not move");
+
+        // The 400 survives only for a different explicit cost, with the exact
+        // message the strict rule always produced.
+        let (status, _, body) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            &format!("product={}&qty=1&unit_cost=99", fixture.product_sku),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("already has a line"), "{body}");
+        assert!(
+            body.contains("separate purchase"),
+            "the message must point at the supported path: {body}"
+        );
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.lines.len(),
+            before.lines.len(),
+            "the refused repeat adds no line"
+        );
+        let line = after
+            .lines
+            .iter()
+            .find(|l| l.product_id == fixture.product_id)
+            .unwrap();
+        assert_eq!(line.qty, dec_web("5"), "the refusal leaves the quantity untouched");
+    }
+
+    // The asymmetry is deliberate (S5b): the web route merges a same-cost
+    // repeat because the operator is a scanner, but the JSON API keeps the
+    // strict rule — a machine client is told to use the line-update endpoint
+    // instead of having its request silently reinterpreted.
+    #[tokio::test]
+    async fn api_purchase_line_repeated_product_is_still_a_clear_400() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, v) = post_json(
+            app.clone(),
+            &format!("/api/purchases/{}/lines", fixture.purchase_id),
+            serde_json::json!({ "product_id": fixture.product_id, "qty": "1" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        let msg = v.to_string();
+        assert!(msg.contains("already has a line"), "{msg}");
+        assert!(msg.contains("separate purchase"), "{msg}");
+
+        let after = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        assert_eq!(after.lines.len(), 1, "the refused repeat adds no line");
+        assert_eq!(after.lines[0].qty, dec_web("2"), "quantity unchanged");
     }
 
     #[tokio::test]

@@ -4390,14 +4390,60 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
         "the removed line is gone: {removed:.800}"
     );
 
-    // The repeated-product rule surfaces as a clear 400 with the actionable
-    // message, and the picker form names its action so the notice region can say
-    // which action failed. Product B is still on the purchase after the removal.
+    // S5b on the scan path: a repeat of product B with the same resolved cost
+    // (the product column again — the fixture supplier has no satellite row)
+    // MERGES into the existing line instead of answering 400: one line, the
+    // summed quantity, and a visible server notice naming the product. A
+    // silent quantity change would be magic.
     let before = purchase_detail(&app, purchase).await;
-    let (status, repeated) = post_form(
+    let (status, merged) = post_form(
         &app,
         &format!("{base}/lines"),
         "product=7791234567892&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert!(
+        merged.contains("data-notice-server"),
+        "the merge announces itself: {merged:.600}"
+    );
+    assert!(
+        merged.contains("merged"),
+        "the merge notice says what happened: {merged:.600}"
+    );
+    assert!(
+        merged.contains("product PSCAN-B"),
+        "the merge notice names the product: {merged:.600}"
+    );
+    let after = purchase_detail(&app, purchase).await;
+    assert_eq!(
+        after["lines"].as_array().unwrap().len(),
+        before["lines"].as_array().unwrap().len(),
+        "the merge keeps exactly one line for the product"
+    );
+    let b_line = after["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["product_id"] == json!(product_b))
+        .expect("product B's line");
+    assert_eq!(b_line["qty"], json!("4"), "qty 3 + 1 scanned = 4: {b_line}");
+    assert_eq!(b_line["unit_cost"], json!("10"));
+    assert_eq!(
+        after["total"],
+        json!("40"),
+        "the merged total is 4 x $10: {after}"
+    );
+
+    // The strict rule keeps its bite where it matters: a repeat at a DIFFERENT
+    // explicit cost is the clear 400, because one product cannot carry two
+    // prices on one purchase and a merge would silently discard one of them.
+    // The picker form still names its action so the notice region can say
+    // which action failed. Product B's merged line is untouched by the refusal.
+    let (status, repeated) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567892&qty=1&unit_cost=999",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{repeated}");
@@ -4419,9 +4465,16 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     assert_eq!(
         after["lines"].as_array().unwrap().len(),
         before["lines"].as_array().unwrap().len(),
-        "the repeated product adds nothing"
+        "the refused repeat adds nothing"
     );
-    assert_eq!(after["total"], before["total"]);
+    let b_line = after["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["product_id"] == json!(product_b))
+        .expect("product B's line");
+    assert_eq!(b_line["qty"], json!("4"), "the refusal leaves the merge intact");
+    assert_eq!(after["total"], json!("40"));
 
     // An unknown value is a clear 400 naming the search count, and adds nothing.
     let (status, err) = post_form(
@@ -4440,6 +4493,68 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
             .len(),
         after["lines"].as_array().unwrap().len(),
         "a failed resolution adds nothing"
+    );
+}
+
+/// The merge notice renders the product name through Askama's HTML escaping:
+/// a name made of markup characters must reach the operator as text, not HTML.
+/// Mirrors `create_notice_escapes_html_specials_in_the_product_name`, which
+/// pins the same guarantee for the create-under-filter box; this pins it for
+/// the S5b merge notice (`partials/purchase_merge_notice.html`), which no
+/// other test exercises with a markup-laden name.
+#[tokio::test]
+async fn merge_notice_escapes_html_specials_in_the_product_name() {
+    let (app, pool) = test_app().await;
+
+    // "Agua <500ml> & \"especial\"" URL-encoded, exactly what a browser form
+    // sends for that name.
+    let body = "sku=ESC-M&name=Agua+%3C500ml%3E+%26+%22especial%22&kind=Product&unit=un&sale_price=25&cost_price=10&track_stock=1&min_stock=1&max_stock=50";
+    let (status, resp) = post_form(&app, "/web/products", body).await;
+    assert_eq!(status, StatusCode::OK, "create product ESC-M: {resp}");
+
+    let supplier = create_supplier_via_web(&app, &pool, "EscMergeSupplier").await;
+    let (status, body) = post_form(
+        &app,
+        "/web/purchases",
+        &format!("supplier_id={supplier}&payment_type=Cash&purchase_date=2024-05-10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let purchase = find_only_purchase_id(&app).await;
+
+    // The first add creates the line at the product cost price (10): the
+    // fixture supplier has no satellite row, so the empty cost falls back to
+    // the product column.
+    let (status, added) = post_form(
+        &app,
+        &format!("/web/purchases/{purchase}/lines"),
+        "product=ESC-M&qty=2&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{added}");
+    assert!(!added.contains("scanned again"), "the first add is not a merge: {added:.400}");
+
+    // The repeat resolves to the SAME cost, so the merge notice renders —
+    // with the escaped name, never the raw markup.
+    let (status, merged) = post_form(
+        &app,
+        &format!("/web/purchases/{purchase}/lines"),
+        "product=ESC-M&qty=1&unit_cost=",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{merged}");
+    assert!(
+        merged.contains("data-notice-server=\"true\""),
+        "the merge notice must be present: {merged:.600}"
+    );
+    assert!(
+        merged
+            .contains("Agua &lt;500ml&gt; &amp; &quot;especial&quot; scanned again"),
+        "the notice must carry the escaped name: {merged:.600}"
+    );
+    assert!(
+        !merged.contains("<500ml>"),
+        "the raw markup must never reach the notice: {merged:.600}"
     );
 }
 
