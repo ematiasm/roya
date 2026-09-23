@@ -1,0 +1,64 @@
+{# The supplier picker's results body (purchases-create-and-header T2): the
+   fragment `GET /web/supplier-search?q=` answers. The widget
+   (`partials/supplier_picker.html`) is the field; this is the bounded match
+   list, separate because the search endpoint re-renders it on every
+   keystroke while the field keeps its own markup.
+
+   The endpoint receives the caller's context through the search query (the
+   product search's `line_action`/`line_target` shape): `action` (the
+   caller's post target), `target` (the region the caller's post swaps) and
+   `include` (the caller's other fields the post must carry). When they are
+   present, every match becomes its own form posting the caller's target with
+   the chosen `supplier_id` in a hidden input — the click submits without any
+   JavaScript, and the forms live here, outside the widget's form, because a
+   form inside a form is invalid HTML.
+
+   Each result reports whether its supplier is active: the name renders muted
+   with an `(inactive)` suffix, the same convention the supplier roster and
+   the creation `<select>` use. An inactive supplier stays searchable — the
+   operator sees what they would be picking, never a silently hidden row.
+
+   The status carries both states of a search — the empty prompt, the
+   no-match message or the match count — the product results fragment's one
+   polite live region, announced by the picker input through
+   `aria-describedby`. The visible list sits under `aria-live="off"`, so
+   typing does not read the roster out loud on every keystroke. #}
+<p id="supplier-search-status" class="sr-only">
+  {% if matches.is_empty() %}
+    {% if query.is_empty() %}Type a supplier name.{% else %}No suppliers match "{{ query }}".{% endif %}
+  {% else %}
+    {{ matches.len() }} match{% if matches.len() != 1 %}es{% endif %}.
+  {% endif %}
+</p>
+<div aria-live="off">
+{% if matches.is_empty() %}
+  {% if query.is_empty() %}
+    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">Type a supplier name.</div>
+  {% else %}
+    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">No suppliers match "{{ query }}".</div>
+  {% endif %}
+{% else %}
+  <div class="flex flex-col gap-1.5">
+    {% for s in matches %}
+      {% if !action.is_empty() && !target.is_empty() %}
+      <form hx-post="{{ action }}"
+            {% if !include.is_empty() %}hx-include="{{ include }}"{% endif %}
+            hx-target="{{ target }}" hx-swap="outerHTML" hx-select="{{ target }}">
+        <input type="hidden" name="supplier_id" value="{{ s.id }}" />
+        <button type="submit"
+                data-supplier-id="{{ s.id }}"
+                class="flex w-full items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-left text-sm {% if s.is_active %}text-text{% else %}text-muted{% endif %}">
+          <span class="min-w-0 truncate font-semibold">{{ s.name }}</span>
+          {% if !s.is_active %}<span class="shrink-0 text-xs text-muted">inactive</span>{% endif %}
+        </button>
+      </form>
+      {% else %}
+      <div class="flex items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-sm">
+        <span class="min-w-0 truncate font-semibold {% if s.is_active %}text-text{% else %}text-muted{% endif %}">{{ s.name }}</span>
+        {% if !s.is_active %}<span class="shrink-0 text-xs text-muted">inactive</span>{% endif %}
+      </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+{% endif %}
+</div>
