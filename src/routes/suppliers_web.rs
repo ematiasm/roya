@@ -220,8 +220,7 @@ async fn web_supplier_list(
 
 /// The supplier picker's search query: `q` is the documented query name; the
 /// caller's context (`action`, `target`, `include`) travels through the same
-/// query the product search's `line_action`/`line_target` do, so the results
-/// fragment stays generic over its hosts.
+/// query, so the results fragment stays generic over its hosts.
 #[derive(Debug, Deserialize, Default)]
 struct SupplierSearchQuery {
     #[serde(default)]
@@ -1775,8 +1774,7 @@ mod tests {
     // -- the supplier picker (purchases T2) ----------------------------------
 
     /// Seed suppliers directly through the service and answer the search
-    /// endpoint with the caller context a picker host passes (the same shape
-    /// the product search's line_action/line_target use).
+    /// endpoint with the caller context a picker host passes through the query.
     async fn seeded_suppliers(state: &AppState, count: usize) -> Vec<crate::models::Supplier> {
         use crate::models::NewSupplier;
         let mut out = Vec::new();
@@ -1832,7 +1830,7 @@ mod tests {
         );
 
         // The swap wiring the picker macro hands in travels to the result
-        // forms, the way the product search's line_target does.
+        // forms, through the caller's `target`.
         assert!(
             html.contains("hx-target=\"#purchase-header\""),
             "result forms swap the caller's target: {html:.800}"

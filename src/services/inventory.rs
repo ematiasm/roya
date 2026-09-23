@@ -488,7 +488,7 @@ where
     /// whole catalogue into a fragment.
     pub const PRODUCT_SEARCH_LIMIT: i64 = 10;
 
-    /// Bounded read behind `GET /web/product-search`: normalized name, SKU and
+    /// Bounded read behind `GET /web/product-search.json`: normalized name, SKU and
     /// barcode matching over the small catalogue, with derived stock. The empty
     /// query is not a search and never returns the catalogue.
     pub async fn search_products(&self, query: &str) -> AppResult<Vec<ProductStock>> {

@@ -346,7 +346,7 @@ fn render_list(view: Vec<PurchaseView>, title: &str) -> AppResult<Html<String>> 
 
 /// Everything the record body renders: the resolved record plus the
 /// method-with-account options its action forms need. The product picker
-/// searches `/web/product-search` instead of carrying the whole catalogue.
+/// searches `/web/product-search.json` instead of carrying the whole catalogue.
 struct PurchaseRecordContext {
     record: PurchaseRecord,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
@@ -4450,11 +4450,11 @@ mod tests {
 
     // -- N4: the product picker on the purchase record page --------------------
 
-    /// The catalogue `<select>` is replaced by one field that searches with a
-    /// debounce, submits on Enter and clears on Escape; the results container is a
-    /// sibling of the form, and every result is its own add action against the
-    /// purchase line endpoint. The entry row is persistent inside the money
-    /// region, above the lines.
+    /// The catalogue `<select>` is replaced by the PICKER ISLAND's entry row:
+    /// one field that searches with the island's debounced JSON read, submits on
+    /// Enter and clears on Escape (base.html's keydown handler), and the
+    /// results container is a sibling of the form. The entry row is persistent
+    /// inside the money region, above the lines.
     #[tokio::test]
     async fn n4_purchase_record_offers_the_picker_instead_of_the_catalogue_select() {
         let state = test_state().await;
@@ -4477,24 +4477,53 @@ mod tests {
             picker.contains("data-action=\"Add line\""),
             "the notice must name the failed line action: {picker}"
         );
-        assert!(picker.contains("hx-get=\"/web/product-search\""), "{picker}");
         assert!(
-            picker.contains("delay:"),
-            "the search must be debounced: {picker}"
-        );
-        assert!(
-            picker.contains("hx-target=\"#product-search-results\""),
-            "{picker}"
-        );
-        assert!(
-            picker.contains("hx-on:keyup")
-                && picker.contains("Escape")
-                && picker.contains("this.value"),
-            "Escape must clear the field declaratively: {picker}"
+            picker.contains("name=\"product_id\""),
+            "the form carries the island-owned hidden product id: {picker}"
         );
         assert!(
             picker.contains("name=\"qty\"") && picker.contains("value=\"1\""),
             "a scan and a click must both carry the default quantity: {picker}"
+        );
+
+        // The field carries no declarative search transport: the island owns
+        // the read, the debounce and the Escape semantics.
+        let input_pos = html
+            .find("id=\"product-picker\"")
+            .expect("the record page renders the picker field");
+        let input_start = html[..input_pos].rfind('<').expect("the id must sit inside a tag");
+        let input_end = input_pos + html[input_pos..].find('>').expect("unterminated tag");
+        let input_tag = &html[input_start..=input_end];
+        for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+            assert!(
+                !input_tag.contains(transport),
+                "the field must not carry {transport}: {input_tag}"
+            );
+        }
+
+        // The island's mount point carries its calling context: one picker,
+        // priced for a purchase — the island renders cost where the old
+        // `show_cost` fragment rendered it.
+        let container_pos = html
+            .find("data-picker")
+            .expect("the record page renders the island mount point");
+        let container_start = html[..container_pos]
+            .rfind('<')
+            .expect("the attribute must sit inside a tag");
+        let container_end =
+            container_start + html[container_start..].find('>').expect("unterminated tag");
+        let container_tag = &html[container_start..=container_end];
+        assert!(
+            container_tag.contains("id=\"line-picker\"")
+                && container_tag.contains("data-price-kind=\"cost\""),
+            "{container_tag}"
+        );
+
+        // The debounce moved with the island: the island file declares it, so
+        // the search cannot lose its debounce by a markup edit alone.
+        assert!(
+            include_str!("../../static/picker.js").contains("DEBOUNCE_MS = 250"),
+            "the search must be debounced by static/picker.js"
         );
         assert!(
             !picker.contains("id=\"product-search-results\""),

@@ -2,7 +2,7 @@ use askama::Template;
 use axum::{
     extract::{Form, Path, Query, State},
     http::HeaderMap,
-    response::{Html, IntoResponse, Redirect},
+    response::{Html, IntoResponse, Json, Redirect},
     routing::{get, post},
     Router,
 };
@@ -95,17 +95,27 @@ struct StockRow {
     updated_by_name: Option<String>,
 }
 
-/// The picker results fragment. Generic on purpose: the record page supplies the
-/// line action and swap target, so the purchase record page reuses it unchanged.
-#[derive(Template)]
-#[template(path = "partials/product_search_results.html")]
-struct ProductSearchResultsPartial {
-    query: String,
-    matches: Vec<ProductStock>,
-    line_action: String,
-    line_target: String,
-    /// True when the calling context buys: show the cost, not the sale price.
-    show_cost: bool,
+/// The picker island's wire row (N5). Flattened on purpose: the island renders a
+/// name, a SKU, one price and a stock figure, so the wire carries exactly that
+/// instead of the whole `ProductStock` with its nested product.
+///
+/// The money fields are already in display form. The island renders them
+/// verbatim, so the server keeps the single formatting rule (`money_display`
+/// normalises a stored value up to exactly two decimals) instead of the island
+/// reimplementing it in JS and drifting. `stock` is deliberately NOT normalised:
+/// the fragment renders the raw decimal (`stock {{ ps.stock }}`), so the wire
+/// carries the same raw form and the island shows the same digits.
+///
+/// Both prices travel and the island picks by its own context, which is what
+/// keeps the `price` parameter off the request entirely.
+#[derive(Debug, Serialize)]
+struct ProductSearchRow {
+    id: i64,
+    name: String,
+    sku: String,
+    sale_price: String,
+    cost_price: String,
+    stock: String,
 }
 
 /// One satellite cost row with the supplier fields the drawer needs to render it.
@@ -426,41 +436,56 @@ pub struct ProductSearchQuery {
     /// form; both names reach the same search.
     #[serde(default)]
     pub product: String,
-    /// The record's line endpoint and swap target, supplied by the picker form so
-    /// the fragment stays generic (sales and purchases share it).
-    #[serde(default)]
-    pub line_action: String,
-    #[serde(default)]
-    pub line_target: String,
-    /// Which price the calling context works in: `cost` for a purchase line,
-    /// `sale` (the default) for a sale line. Only that number is shown.
-    #[serde(default)]
-    pub price: String,
 }
 
-/// `GET /web/product-search?q=`: the bounded picker read. Matching and stock
-/// derivation live in the inventory service; the route only renders.
-async fn web_product_search(
+/// The picker input is named `product` because the same field feeds the line
+/// form, while `q` is the documented name; both reach the same read. Shared by
+/// the JSON route so its two names cannot resolve differently.
+fn resolve_search_query(params: &ProductSearchQuery) -> String {
+    if params.q.trim().is_empty() {
+        params.product.clone()
+    } else {
+        params.q.clone()
+    }
+}
+
+/// `GET /web/product-search.json?q=`: the picker island's read (N5). The same
+/// bounded service read as the HTML fragment, flattened to the row shape the
+/// island actually renders. No `line_action`, `line_target` or `price` on this
+/// route: the island owns its own context, so none of it needs to travel.
+///
+/// The typed-name resolution the island deliberately leaves to the server (Enter
+/// posts `product` to the line route) is unaffected by this read — this route
+/// only feeds the dropdown.
+async fn web_product_search_json(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Query(params): Query<ProductSearchQuery>,
-) -> Result<Html<String>, AppError> {
-    let raw = if params.q.trim().is_empty() {
-        params.product
-    } else {
-        params.q
-    };
+) -> Result<Json<serde_json::Value>, AppError> {
+    let raw = resolve_search_query(&params);
     let matches = state.inventory_service.search_products(&raw).await?;
-    let html = ProductSearchResultsPartial {
-        query: raw.trim().to_string(),
-        matches,
-        line_action: params.line_action.trim().to_string(),
-        line_target: params.line_target.trim().to_string(),
-        show_cost: params.price.trim().eq_ignore_ascii_case("cost"),
-    }
-    .render()
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Html(html))
+    let products: Vec<ProductSearchRow> = matches
+        .into_iter()
+        .map(|ps| {
+            // The same helpers the fragment calls, so the island's verbatim
+            // render cannot differ from today's markup. Computed before the
+            // fields are moved out of `ps.product`, which the borrow needs.
+            let sale_price = ps.product.sale_price_display();
+            let cost_price = ps.product.cost_price_display();
+            ProductSearchRow {
+                id: ps.product.id,
+                name: ps.product.name,
+                sku: ps.product.sku,
+                sale_price,
+                cost_price,
+                stock: ps.stock.to_string(),
+            }
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "query": raw.trim(),
+        "products": products,
+    })))
 }
 
 /// `GET /web/products/detail/{id}`: the drawer fragment. Concrete ids sit last in
@@ -1184,7 +1209,7 @@ pub fn router() -> Router<AppState> {
         .route("/web/categories", post(web_create_category))
         .route("/web/category-options", get(web_category_options))
         .route("/web/product-options", get(web_product_options))
-        .route("/web/product-search", get(web_product_search))
+        .route("/web/product-search.json", get(web_product_search_json))
         .route("/web/products/detail/{id}", get(web_product_detail))
         .route("/web/products/edit", post(web_edit_product))
         .route("/web/products/activate", post(web_activate_product))
@@ -1244,6 +1269,15 @@ mod tests {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The picker island reads JSON, so a body that is not JSON is a failure of
+    /// the route, not of the test: report what actually came back.
+    async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let (status, body) = get_html(app, uri).await;
+        let json = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("expected JSON from {uri}, got: {body} ({e})"));
+        (status, json)
     }
 
     // -- S5 enforcement (AC10): the permission gate on the real handlers ------
@@ -1766,71 +1800,145 @@ mod tests {
         product
     }
 
-    /// AC8: name, SKU and barcode all find the product in one fragment, and the
-    /// fragment carries price and current stock.
+    /// N5: the picker island reads the search as JSON, so the same name, SKU and
+    /// barcode matching the HTML fragment proves must hold on the wire. Both
+    /// prices travel — the island picks by its own context, which is what keeps
+    /// the `price` parameter off the request entirely.
     #[tokio::test]
-    async fn n4_product_search_matches_name_sku_and_barcode() {
-        let state = test_state().await;
-        seed_search_product(&state).await;
-        let app = crate::routes::router(state);
-
-        for needle in ["picker", "PICK-1", "7791234567890"] {
-            let (status, html) =
-                get_html(app.clone(), &format!("/web/product-search?q={needle}")).await;
-            assert_eq!(status, StatusCode::OK, "{needle}: {html}");
-            assert!(html.contains("Yerba Picker"), "{needle}: {html}");
-            assert!(html.contains("PICK-1"), "{needle}: {html}");
-            assert!(html.contains("$25"), "price rides along: {html}");
-            assert!(html.contains("stock 0"), "stock rides along: {html}");
-        }
-    }
-
-    /// AC8 (negative): an empty query returns no results, not the catalogue.
-    #[tokio::test]
-    async fn n4_product_search_empty_query_returns_no_results() {
-        let state = test_state().await;
-        seed_search_product(&state).await;
-        let app = crate::routes::router(state);
-
-        let (status, html) = get_html(app, "/web/product-search?q=").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            !html.contains("Yerba Picker"),
-            "empty query must not dump the catalogue: {html}"
-        );
-    }
-
-    /// The fragment is generic: when the caller names the record's line action,
-    /// every match becomes its own add form that includes the picker form and
-    /// supplies its own product id. Without an action there are no dead controls.
-    #[tokio::test]
-    async fn n4_product_search_fragment_renders_one_add_action_per_match() {
+    async fn n5_product_search_json_matches_name_sku_and_barcode() {
         let state = test_state().await;
         let product = seed_search_product(&state).await;
         let app = crate::routes::router(state);
 
-        let (status, plain) = get_html(app.clone(), "/web/product-search?q=picker").await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            !plain.contains("hx-post"),
-            "without an action the fragment must not render dead controls: {plain}"
-        );
+        for needle in ["picker", "PICK-1", "7791234567890"] {
+            let (status, json) =
+                get_json(app.clone(), &format!("/web/product-search.json?q={needle}")).await;
+            assert_eq!(status, StatusCode::OK, "{needle}: {json}");
+            assert_eq!(json["query"], needle, "{needle}: {json}");
 
-        let (status, html) = get_html(
-            app,
-            "/web/product-search?q=picker&line_action=/web/sales/7/lines&line_target=%23sale-record-money",
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{html}");
-        assert_eq!(html.matches("<form").count(), 1, "{html}");
-        assert!(html.contains("hx-post=\"/web/sales/7/lines\""), "{html}");
-        assert!(html.contains("hx-include=\"#line-picker\""), "{html}");
-        assert!(html.contains("hx-target=\"#sale-record-money\""), "{html}");
-        let vals = format!("hx-vals='{{\"product_id\": {}}}'", product.id);
-        assert!(
-            html.contains(&vals),
-            "result must supply its own product id: {html}"
+            let products = json["products"].as_array().expect("products array");
+            assert_eq!(products.len(), 1, "{needle}: {json}");
+            let row = &products[0];
+            assert_eq!(row["id"], product.id, "{needle}: {json}");
+            assert_eq!(row["name"], "Yerba Picker", "{needle}: {json}");
+            assert_eq!(row["sku"], "PICK-1", "{needle}: {json}");
+
+            // The island renders these strings verbatim, so they must be the
+            // display form and not a raw decimal: `money_display` normalises a
+            // stored value up to exactly two decimals, so a raw "25" would
+            // render "$25" where the fragment shows "$25.00".
+            assert_eq!(row["sale_price"], "25.00", "{needle}: {json}");
+            assert_eq!(row["cost_price"], "10.00", "{needle}: {json}");
+
+            let stock = row["stock"].as_str().expect("stock as string");
+            assert_eq!(stock.parse::<f64>().unwrap(), 0.0, "{needle}: {json}");
+        }
+    }
+
+    // Deleted with the HTML route (T4c): `n5_product_search_json_money_is_the_fragments_display_form`
+    // pinned the wire money against that fragment. The display form is now pinned
+    // literally by `n5_product_search_json_matches_name_sku_and_barcode` and exactly
+    // by e2e `test_picker.py`'s full-row assertion ("HARNESS-WIDGET • $25.00 • stock 5").
+
+    /// N5 negative: an empty query returns no products, not the catalogue. The
+    /// island renders the empty state from this, so a catalogue dump here would
+    /// be a silent data leak on a keystroke.
+    #[tokio::test]
+    async fn n5_product_search_json_empty_query_returns_no_products() {
+        let state = test_state().await;
+        seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        let (status, json) = get_json(app, "/web/product-search.json?q=").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["products"].as_array().expect("products array").len(),
+            0,
+            "empty query must not dump the catalogue: {json}"
         );
+    }
+
+    /// N5: the island's search field is named `product` on the wire because the
+    /// same input feeds the line form, so both names must reach the same read.
+    /// The HTML route resolves them in one place; this pins that the JSON route
+    /// shares it instead of drifting.
+    #[tokio::test]
+    async fn n5_product_search_json_resolves_both_query_names() {
+        let state = test_state().await;
+        seed_search_product(&state).await;
+        let app = crate::routes::router(state);
+
+        let (status, json) = get_json(app, "/web/product-search.json?product=PICK-1").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["products"].as_array().expect("products array").len(),
+            1,
+            "the `product` alias must reach the same read: {json}"
+        );
+    }
+
+    /// N5: matching folds accents and case on both sides — the same behaviour
+    /// the party searches share (N6) — now pinned on the route the island
+    /// reads. The gate is paired so it cannot pass vacuously, in both of the
+    /// ways a match test can be vacuous:
+    ///
+    /// - The SKUs are opaque (`P-001`, `P-002`): `match_catalogue` matches on
+    ///   name OR sku, so a SKU that echoed the query text (e.g. `CAFE-1`) would
+    ///   let every case pass through the SKU branch with the folding deleted.
+    ///   With opaque SKUs the name branch is the only path to a match, and
+    ///   neither `CAFE` nor `cafÉ` can match the unfolded `Café`/`cafÉ` — so a
+    ///   broken fold fails on the query side AND on the stored side.
+    /// - The exact-one-match check plus the other-name exclusion fails if the
+    ///   read stopped discriminating and matched everything.
+    #[tokio::test]
+    async fn n5_product_search_json_folds_accents_and_case() {
+        use crate::models::{NewProduct, ProductKind};
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        for (sku, name) in [("P-001", "Café"), ("P-002", "Ñandú")] {
+            state
+                .inventory_service
+                .create_product(
+                    audit_actor_id(&state).await,
+                    NewProduct {
+                        sku: sku.into(),
+                        name: name.into(),
+                        kind: ProductKind::Product,
+                        category_id: None,
+                        unit: "un".into(),
+                        sale_price: Decimal::from(25),
+                        cost_price: Decimal::from(10),
+                        track_stock: false,
+                        min_stock: None,
+                        max_stock: None,
+                        location: None,
+                        notes: None,
+                        markup_pct: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let app = crate::routes::router(state);
+
+        for (needle, name, other) in [
+            ("CAFE", "Café", "Ñandú"),
+            ("cafÉ", "Café", "Ñandú"),
+            ("nandu", "Ñandú", "Café"),
+            ("ÑANDÚ", "Ñandú", "Café"),
+        ] {
+            let (status, json) =
+                get_json(app.clone(), &format!("/web/product-search.json?q={needle}")).await;
+            assert_eq!(status, StatusCode::OK, "{needle}: {json}");
+            let products = json["products"].as_array().expect("products array");
+            assert_eq!(products.len(), 1, "{needle}: exactly one match: {json}");
+            assert_eq!(products[0]["name"], name, "{needle}: {json}");
+            assert!(
+                !json.to_string().contains(other),
+                "{needle}: {other} must not match: {json}"
+            );
+        }
     }
 
     // -- T2 redesign-products: the product drawer routes -----------------------

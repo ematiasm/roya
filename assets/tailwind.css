@@ -9,6 +9,12 @@
 /* Only scan the Askama templates; nothing else in the repo defines classes. */
 @source "../templates";
 
+/* The picker island renders its classes from JS, so the stylesheet must scan it
+   too: with `source(none)` every class that exists only in static/picker.js
+   would be purged from this build. The same trap as base.html's notice builder,
+   whose classes are deliberately duplicated into a template for this reason. */
+@source "../static/picker.js";
+
 /* Dark palette (kept in sync with the original hand-written stylesheet). */
 @theme {
   --font-sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,

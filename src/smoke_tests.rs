@@ -1520,42 +1520,6 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
             }],
         },
         GuardedPage {
-            label: "product search fragment",
-            path: format!(
-                "/web/product-search?q=GUARD-P&price=sale&line_action=/web/sales/{}/lines&line_target=%23sale-record-money",
-                fixture.sale
-            ),
-            concrete_ids_are_defects: false,
-            external_selectors: vec![
-                ExternalSelector {
-                    selector: "#line-picker",
-                    host: "sale record page",
-                },
-                ExternalSelector {
-                    selector: "#sale-record-money",
-                    host: "sale record page",
-                },
-            ],
-        },
-        GuardedPage {
-            label: "purchase product search fragment",
-            path: format!(
-                "/web/product-search?q=GUARD-P&price=cost&line_action=/web/purchases/{}/lines&line_target=%23purchase-record-money",
-                fixture.purchase
-            ),
-            concrete_ids_are_defects: false,
-            external_selectors: vec![
-                ExternalSelector {
-                    selector: "#line-picker",
-                    host: "purchase record page",
-                },
-                ExternalSelector {
-                    selector: "#purchase-record-money",
-                    host: "purchase record page",
-                },
-            ],
-        },
-        GuardedPage {
             label: "purchase detail fragment",
             path: format!("/web/purchases/{}", fixture.purchase),
             concrete_ids_are_defects: false,
@@ -2909,26 +2873,6 @@ async fn fragment_external_selectors_resolve_on_their_host_record_pages() {
             "the purchase host page must render #{id} for its fragments"
         );
     }
-
-    // The shared search fragment is guarded in its purchase context too: it adds
-    // against the purchase money region and shows the cost.
-    let (status, purchase_search) = get(
-        &app,
-        &format!(
-            "/web/product-search?q=GUARD-P&price=cost&line_action=/web/purchases/{}/lines&line_target=%23purchase-record-money",
-            fixture.purchase
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{purchase_search}");
-    assert!(
-        purchase_search.contains("hx-target=\"#purchase-record-money\""),
-        "the purchase results add against the purchase money region: {purchase_search}"
-    );
-    assert!(
-        purchase_search.contains("cost $10"),
-        "the purchase results show the cost: {purchase_search}"
-    );
 
     // Without the declared exemption the fragment genuinely fails, so the
     // exemption is not decorative.
@@ -4563,48 +4507,86 @@ async fn line_picker_loads_a_sale_without_a_click() {
     let sale = create_sale_draft_via_web(&app, &pool, "ScanBuyer", "Cash", "").await;
     let base = format!("/web/sales/{sale}");
 
-    // Typing a name, a SKU or a barcode each find the product, through the same
-    // search path the field uses.
-    let search = format!(
-        "/web/product-search?price=sale&line_action={base}/lines&line_target=%23sale-record-money"
-    );
-    for needle in ["scan", "SCAN-P", "7791234567890"] {
-        let (status, fragment) = get(&app, &format!("{search}&q={needle}")).await;
-        assert_eq!(status, StatusCode::OK, "{fragment}");
-        assert!(fragment.contains("product SCAN-P"), "{needle}: {fragment}");
-        assert!(fragment.contains("SCAN-P"), "{needle}: {fragment}");
-        assert!(fragment.contains("$25"), "{needle}: price travels: {fragment}");
-        assert!(fragment.contains("stock 20"), "{needle}: stock travels: {fragment}");
-        // A result is its own add action: it includes the picker form and carries
-        // its own product id.
-        assert!(
-            fragment.contains(&format!("hx-post=\"{base}/lines\"")),
-            "{fragment}"
-        );
-        assert!(fragment.contains("hx-include=\"#line-picker\""), "{fragment}");
-        assert!(
-            fragment.contains(&format!("hx-vals='{{\"product_id\": {product}}}'")),
-            "{fragment}"
-        );
-    }
-
-    // An empty query returns nothing, not the whole catalogue.
-    let (status, empty) = get(&app, "/web/product-search?q=").await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(!empty.contains("SCAN-P"), "{empty}");
-
-    // The record page offers the field, its debounced search, the sibling results
-    // container and no catalogue select.
+    // The record page offers the picker island, its sibling results container
+    // and no catalogue select. The island owns the search now, so the page
+    // carries no declarative transport: the field carries no hx-get, trigger,
+    // target, vals or keyup handler, and the debounce lives in
+    // static/picker.js, not in markup. Escape is base.html's document-level
+    // keydown handler, which serves both pickers.
     let (status, page) = get(&app, &format!("/sales/{sale}")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !page.contains("<select name=\"product_id\""),
         "the catalogue select must be gone: {page:.600}"
     );
-    assert!(page.contains("hx-get=\"/web/product-search\""), "{page:.600}");
+
+    // The island's mount point carries its calling context: one picker,
+    // priced for a sale.
+    assert_eq!(
+        page.matches("data-picker").count(),
+        1,
+        "one island mount point: {page:.600}"
+    );
+    let container_pos = page
+        .find("data-picker")
+        .expect("the record page renders the island mount point");
+    let container_start = page[..container_pos]
+        .rfind('<')
+        .expect("the attribute must sit inside a tag");
+    let container_end =
+        container_start + page[container_start..].find('>').expect("unterminated tag");
+    let container_tag = &page[container_start..=container_end];
+    assert!(
+        container_tag.contains("id=\"line-picker\"")
+            && container_tag.contains("data-price-kind=\"sale\""),
+        "{container_tag}"
+    );
+
+    // The field carries no declarative search transport.
+    let input_pos = page
+        .find("id=\"product-picker\"")
+        .expect("the record page renders the picker field");
+    let input_start = page[..input_pos].rfind('<').expect("the id must sit inside a tag");
+    let input_end = input_pos + page[input_pos..].find('>').expect("unterminated tag");
+    let input_tag = &page[input_start..=input_end];
+    for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+        assert!(
+            !input_tag.contains(transport),
+            "the field must not carry {transport}: {input_tag}"
+        );
+    }
+
+    // The single add-line form keeps the server's contract: the post, the
+    // hidden island-owned product id and the default quantity.
+    let form_pos = page[..input_pos]
+        .rfind("<form")
+        .expect("the field sits in the add-line form");
+    let form_end = form_pos + page[form_pos..]
+        .find("</form>")
+        .expect("unterminated form");
+    let form = &page[form_pos..form_end];
+    assert!(
+        form.contains(&format!("hx-post=\"/web/sales/{sale}/lines\"")),
+        "{form:.600}"
+    );
+    assert!(form.contains("name=\"product_id\""), "{form:.600}");
+    assert!(
+        form.contains("name=\"qty\"") && form.contains("value=\"1\""),
+        "a scan and a click must both carry the default quantity: {form:.600}"
+    );
+
+    // The results container is a sibling of the form, never inside it.
+    assert!(
+        !form.contains("id=\"product-search-results\""),
+        "the results container must be a sibling of the picker form, never inside it: {form:.600}"
+    );
     assert!(page.contains("id=\"product-search-results\""), "{page:.600}");
-    assert!(page.contains("delay:"), "the search must be debounced");
-    assert!(page.contains("Escape"), "Escape must clear the field");
+
+    // The debounce moved with the island: the island file declares it.
+    assert!(
+        include_str!("../static/picker.js").contains("DEBOUNCE_MS = 250"),
+        "the search must be debounced by static/picker.js"
+    );
 
     // Scan 1: the reader types the barcode and presses Enter. The form carries the
     // field and the quantity, never a product id.
@@ -4767,51 +4749,87 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     let purchase = find_only_purchase_id(&app).await;
     let base = format!("/web/purchases/{purchase}");
 
-    // Typing a name, a SKU or a barcode each find the product through the same
-    // search path the field uses; the result is its own add action against the
-    // purchase line endpoint and carries the current stock.
-    let search = format!(
-        "/web/product-search?price=cost&line_action={base}/lines&line_target=%23purchase-record-money"
-    );
-    for needle in ["PSCAN-A", "7791234567891"] {
-        let (status, fragment) = get(&app, &format!("{search}&q={needle}")).await;
-        assert_eq!(status, StatusCode::OK, "{fragment}");
-        assert!(fragment.contains("product PSCAN-A"), "{needle}: {fragment}");
-        assert!(
-            fragment.contains("stock 20"),
-            "{needle}: stock travels: {fragment}"
-        );
-        assert!(
-            fragment.contains(&format!("hx-post=\"{base}/lines\"")),
-            "{needle}: {fragment}"
-        );
-        assert!(fragment.contains("hx-include=\"#line-picker\""), "{fragment}");
-        assert!(
-            fragment.contains(&format!("hx-vals='{{\"product_id\": {product_a}}}'")),
-            "{fragment}"
-        );
-        assert!(
-            fragment.contains("cost $10"),
-            "{needle}: the purchase picker must show the cost: {fragment}"
-        );
-        assert!(
-            !fragment.contains("$25"),
-            "{needle}: the purchase picker must not show the sale price: {fragment}"
-        );
-    }
-
-    // The record page offers the field, its debounced search and the sibling
-    // results container, and no catalogue select.
+    // The record page offers the picker island's entry row, its sibling
+    // results container and no catalogue select. The island owns the search
+    // now, so the page carries no declarative transport: the field carries no
+    // hx-get, trigger, target, vals or keyup handler, and the debounce lives
+    // in static/picker.js, not in markup. Escape is base.html's
+    // document-level keydown handler, which serves both pickers.
     let (status, page) = get(&app, &format!("/purchases/{purchase}")).await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert!(
         !page.contains("<select name=\"product_id\""),
         "the catalogue select must be gone: {page:.600}"
     );
-    assert!(
-        page.contains("hx-get=\"/web/product-search\""),
-        "{page:.600}"
+
+    // The island's mount point carries its calling context: one picker,
+    // priced for a purchase — the entry row quotes cost, not the sale price.
+    assert_eq!(
+        page.matches("data-picker").count(),
+        1,
+        "one island mount point: {page:.600}"
     );
+    let container_pos = page
+        .find("data-picker")
+        .expect("the record page renders the island mount point");
+    let container_start = page[..container_pos]
+        .rfind('<')
+        .expect("the attribute must sit inside a tag");
+    let container_end =
+        container_start + page[container_start..].find('>').expect("unterminated tag");
+    let container_tag = &page[container_start..=container_end];
+    assert!(
+        container_tag.contains("id=\"line-picker\"")
+            && container_tag.contains("data-price-kind=\"cost\""),
+        "{container_tag}"
+    );
+
+    // The field carries no declarative search transport.
+    let input_pos = page
+        .find("id=\"product-picker\"")
+        .expect("the record page renders the picker field");
+    let input_start = page[..input_pos].rfind('<').expect("the id must sit inside a tag");
+    let input_end = input_pos + page[input_pos..].find('>').expect("unterminated tag");
+    let input_tag = &page[input_start..=input_end];
+    for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+        assert!(
+            !input_tag.contains(transport),
+            "the field must not carry {transport}: {input_tag}"
+        );
+    }
+
+    // The single add-line form keeps the server's contract: the post, the
+    // hidden island-owned product id and the default quantity.
+    let form_pos = page[..input_pos]
+        .rfind("<form")
+        .expect("the field sits in the add-line form");
+    let form_end = form_pos + page[form_pos..]
+        .find("</form>")
+        .expect("unterminated form");
+    let form = &page[form_pos..form_end];
+    assert!(
+        form.contains(&format!("hx-post=\"/web/purchases/{purchase}/lines\"")),
+        "{form:.600}"
+    );
+    assert!(form.contains("name=\"product_id\""), "{form:.600}");
+    assert!(
+        form.contains("name=\"qty\"") && form.contains("value=\"1\""),
+        "a scan and a click must both carry the default quantity: {form:.600}"
+    );
+
+    // The results container is a sibling of the form, never inside it.
+    assert!(
+        !form.contains("id=\"product-search-results\""),
+        "the results container must be a sibling of the picker form, never inside it: {form:.600}"
+    );
+    assert!(page.contains("id=\"product-search-results\""), "{page:.600}");
+
+    // The debounce moved with the island: the island file declares it.
+    assert!(
+        include_str!("../static/picker.js").contains("DEBOUNCE_MS = 250"),
+        "the search must be debounced by static/picker.js"
+    );
+
     assert!(
         page.contains("id=\"purchase-record-money\""),
         "{page:.600}"
@@ -5042,39 +5060,7 @@ async fn merge_notice_escapes_html_specials_in_the_product_name() {
     );
 }
 
-/// The shared results fragment shows the price the calling context works in:
-/// a sale line is sold at the sale price, a purchase line is bought at the
-/// cost. The endpoint takes the price kind from the picker, so the number can
-/// never be the other context's price.
-#[tokio::test]
-async fn product_search_shows_the_context_price() {
-    let (app, pool) = test_app().await;
-    create_product_via_web(&app, &pool, "PRICE-P", "1", "50").await;
-
-    let (status, sale) = get(
-        &app,
-        "/web/product-search?q=PRICE-P&price=sale&line_action=/web/sales/1/lines&line_target=%23sale-record-money",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{sale}");
-    assert!(sale.contains("$25"), "a sale shows its sale price: {sale}");
-    assert!(!sale.contains("$10"), "a sale must not show the cost: {sale}");
-
-    let (status, purchase) = get(
-        &app,
-        "/web/product-search?q=PRICE-P&price=cost&line_action=/web/purchases/1/lines&line_target=%23purchase-record-money",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{purchase}");
-    assert!(
-        purchase.contains("cost $10"),
-        "a purchase shows the cost price: {purchase}"
-    );
-    assert!(
-        !purchase.contains("$25"),
-        "a purchase must not show the sale price: {purchase}"
-    );
-}
+// The price context moved to the island (`data-price-kind` picks it client-side); e2e's test_the_picker_island_owns_the_purchase_search and its sale sibling carry this coverage.
 
 // ---------------------------------------------------------------------------
 // N4 accessibility: named controls and a polite announcement for the picker
@@ -5091,26 +5077,6 @@ fn enclosing_tag(html: &str, pos: usize) -> &str {
         .find('>')
         .unwrap_or_else(|| panic!("unterminated tag at byte {pos}"));
     &html[start..=end]
-}
-
-/// The full element carrying `id`, opening tag through closing tag, for the
-/// small elements this check inspects.
-fn element_with_id<'a>(html: &'a str, id: &str) -> &'a str {
-    let pos = html
-        .find(&format!("id=\"{id}\""))
-        .unwrap_or_else(|| panic!("no element renders id={id:?}"));
-    let start = html[..pos].rfind('<').expect("an id must sit inside a tag");
-    let name_start = start + 1;
-    let name_end = name_start
-        + html[name_start..]
-            .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-            .expect("unterminated opening tag");
-    let name = &html[name_start..name_end];
-    let close = format!("</{name}>");
-    let end = html[start..]
-        .find(&close)
-        .unwrap_or_else(|| panic!("no {close} for id={id:?}"));
-    &html[start..start + end + close.len()]
 }
 
 /// The earliest native form control in `body`, if any.
@@ -5233,79 +5199,7 @@ async fn sale_record_controls_resolve_accessible_names() {
     );
 }
 
-/// The picker's results container is a polite live region the input is wired
-/// to, and only the match count is announced; the visual list is explicitly
-/// not live, so typing does not read the catalogue out loud on every keystroke.
-#[tokio::test]
-async fn product_search_results_announce_a_polite_match_count() {
-    let (app, pool) = test_app().await;
-    create_product_via_web(&app, &pool, "A11Y-P", "1", "50").await;
-    create_product_via_web(&app, &pool, "A11Y-Q", "1", "50").await;
-    let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
-    let base = format!("/web/sales/{sale}");
-
-    let (status, page) = get(&app, &format!("/sales/{sale}")).await;
-    assert_eq!(status, StatusCode::OK, "{page:.400}");
-
-    let results_pos = page
-        .find("id=\"product-search-results\"")
-        .expect("the picker renders its results container");
-    let results = enclosing_tag(&page, results_pos);
-    assert!(
-        results.contains("aria-live=\"polite\""),
-        "the results container must be a polite live region: {results}"
-    );
-    assert!(results.contains("role=\"status\""), "{results}");
-    assert!(
-        results.contains("aria-atomic=\"false\""),
-        "the region must announce the count, not replace its whole content: {results}"
-    );
-
-    let input_pos = page
-        .find("id=\"product-picker\"")
-        .expect("the picker input");
-    let input = enclosing_tag(&page, input_pos);
-    assert!(
-        input.contains("aria-controls=\"product-search-results\""),
-        "the input must say what it controls: {input}"
-    );
-    assert!(
-        input.contains("aria-describedby=\"product-search-status\""),
-        "the input must point at the announced state: {input}"
-    );
-    assert!(
-        page.contains("id=\"product-search-status\""),
-        "the described status element must exist on the page"
-    );
-
-    let search = |query: &str| {
-        format!(
-            "/web/product-search?q={query}&line_action={base}/lines&line_target=%23sale-record-money"
-        )
-    };
-
-    // One match: the announced text is the count.
-    let (status, fragment) = get(&app, &search("A11Y-P")).await;
-    assert_eq!(status, StatusCode::OK, "{fragment}");
-    let status_text = element_with_id(&fragment, "product-search-status");
-    assert!(status_text.contains("1 match"), "{status_text}");
-    assert!(
-        fragment.contains("aria-live=\"off\""),
-        "the visual list must stay out of the live announcement: {fragment}"
-    );
-
-    // Two matches pluralize.
-    let (status, fragment) = get(&app, &search("A11Y")).await;
-    assert_eq!(status, StatusCode::OK, "{fragment}");
-    let status_text = element_with_id(&fragment, "product-search-status");
-    assert!(status_text.contains("2 matches"), "{status_text}");
-
-    // No matches is a state, not silence.
-    let (status, fragment) = get(&app, &search("does-not-exist")).await;
-    assert_eq!(status, StatusCode::OK, "{fragment}");
-    let status_text = element_with_id(&fragment, "product-search-status");
-    assert!(status_text.contains("No products match"), "{status_text}");
-}
+// The match count and the polite announcement are derived in the island's render now; e2e's test_the_results_announce_the_match_count carries this coverage.
 
 // ---------------------------------------------------------------------------
 // N5 — the referenced-id guard
@@ -6719,11 +6613,25 @@ async fn search_matches_ignore_accents_and_case() {
         assert!(!html.contains("Ñandú"), "{needle:?} must not match Ñandú: {html}");
     }
 
-    // Catalogue: the picker and the list both fold accents and case.
+    // Catalogue: the picker reads the JSON route now, and it folds accents and
+    // case on both sides, like the list.
     create_product_full_via_web(&app, &pool, "CAFE-P", "Café", None).await;
-    let (status, search) = get(&app, "/web/product-search?q=CAFE").await;
-    assert_eq!(status, StatusCode::OK, "{search}");
-    assert!(search.contains("Café"), "the picker must find Café by CAFE: {search}");
+    for needle in ["CAFE", "CAFÉ"] {
+        let (status, search) =
+            get(&app, &format!("/web/product-search.json?q={needle}")).await;
+        assert_eq!(status, StatusCode::OK, "{needle}: {search}");
+        let body = json_body(&search);
+        let names: Vec<&str> = body["products"]
+            .as_array()
+            .expect("products array")
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"Café"),
+            "the picker must find Café by {needle}: {search}"
+        );
+    }
     let list = product_list_html(&app, "?q=cafe").await;
     assert!(list.contains("Café"), "the catalogue must find Café by cafe: {list}");
     let list = product_list_html(&app, "?q=CAFÉ").await;
