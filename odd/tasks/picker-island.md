@@ -166,24 +166,45 @@ by its own test, so the surviving path is pinned rather than assumed.
 
 ## Acceptance criteria
 
-- [ ] The picker has one state object; no picker state lives in `base.html`.
-- [ ] `base.html` no longer contains `pendingResultFocus`, the picker
+All verified on 2026-09-24 against the tree, not against a report.
+
+- [x] The picker has one state object; no picker state lives in `base.html`.
+      `static/picker.js` holds the single `state`; `base.html` has zero
+      occurrences of `pendingResultFocus`, `searchFailed` and
+      `product-search-status`.
+- [x] `base.html` no longer contains `pendingResultFocus`, the picker
       `beforeSwap`/`afterSwap` handlers, or the picker `htmx:beforeRequest`
-      handler.
-- [ ] No `hx-vals` carries `product_id`, `line_action`, `line_target` or `price`
-      for the picker; no per-row forms exist.
-- [ ] Typing renders results from JSON, with the same name / SKU / price / stock
-      content as today.
-- [ ] Focus stays on the same product across a re-search; when it disappears,
-      focus returns to the input.
-- [ ] The live region announces "Searching…" while in flight and the match count
-      when it lands, from state, with no extra announcements.
-- [ ] Clicking a match adds the line with `product_id` taken from island state;
+      handler. The keydown handler and the generic notice handler are kept on
+      purpose and the island depends on both.
+- [x] No `hx-vals` carries `product_id`, `line_action`, `line_target` or `price`
+      for the picker; no per-row forms exist. The only remaining `hx-vals`
+      mentions in the picker templates are comments that document the absence.
+- [x] Typing renders results from JSON, with the same name / SKU / price / stock
+      content as today. e2e asserts the exact rendered row
+      (`"HARNESS-WIDGET • $25.00 • stock 5"`) and the cost-priced purchase
+      sibling.
+- [x] Focus stays on the same product across a re-search; when it disappears,
+      focus returns to the input. Derived in `render()` from
+      `state.focusedProductId`; no `beforeSwap`/`afterSwap` remains.
+- [x] The live region announces "Searching…" while in flight and the match count
+      when it lands, from state, with no extra announcements. Derived by
+      `statusMessage()`; e2e's `test_the_results_announce_the_match_count`
+      carries it now that the server no longer renders that text.
+- [x] Clicking a match adds the line with `product_id` taken from island state;
       the server response contract is unchanged (money region + OOB + triggers).
-- [ ] A class that appears only in `static/picker.js` survives
-      `scripts/build-css.sh` (proves the Tailwind scan path).
-- [ ] `cargo test` green; `scripts/e2e.sh` green.
-- [ ] README documents the island, its state and its boundary.
+      One form, not one per row; the hidden input is `disabled` while nothing is
+      selected, which is what keeps the two resolution paths from competing.
+- [x] A class that appears only in `static/picker.js` survives
+      `scripts/build-css.sh` (proves the Tailwind scan path). `select-none`
+      appears once in the island, zero times in `templates/`, and is present in
+      the compiled `static/tailwind.css`.
+- [x] `cargo test` green; `scripts/e2e.sh` green. **885 passed / 0 failed** and
+      **93 passed / 4 skipped / 0 failed** (the skips are pre-existing opt-in
+      probes).
+- [x] README documents the island, its state and its boundary — the stack
+      paragraph, the purchase record page, the `Styles & local assets` section
+      (including the operational fact that the island is a Tailwind scan
+      source), and the repo tree.
 
 ## Applicable checks
 
@@ -280,7 +301,14 @@ by its own test, so the surviving path is pinned rather than assumed.
       full-row assertion (`"HARNESS-WIDGET • $25.00 • stock 5"`), which is a
       stronger pin than the cross-check was. A comment at its former site names
       both. The deletions:
-- [ ] T5 — e2e sweep and README.
+- [x] T5 — e2e sweep and README. Closed in `012f6c1` (e2e) and the docs commit
+      that follows it. The sweep came back clean: the only transport-adjacent
+      assertions left in either suite are the four `not_to_have_attribute` pins
+      that assert the picker field carries no `hx-get`/`hx-trigger`, which are
+      the island pins themselves. One thing beyond the plan was found and fixed:
+      the README's repo tree listed `assets/tailwind.css` as
+      `@source templates/` and did not list `static/picker.js` at all, which
+      contradicted the new scan-source note two sections above it.
       - `e2e/tests/test_search_ux.py:638` asserts the failure notice contains
         `/web/product-search`. It passes today only because the island's URL
         (`/web/product-search.json`) contains that string; after T4c the HTML
@@ -548,3 +576,43 @@ scope — "rewrite the record-page half of X" — never the file or the test.
   `web_product_search`, `line_action` or `line_target`, so the deletion left no
   newly dead code. Recorded because a count that disagrees with the report is
   worth resolving rather than accepting or dismissing.
+- **T5, green (orchestrator-verified)**: `cargo test` → **885 passed, 0 failed**;
+  `scripts/e2e.sh` → **93 passed, 4 skipped, 0 failed**.
+- **T5, honesty about the tightened assertion**: it did **pass** before the
+  tightening, because `/web/product-search` is a substring of
+  `/web/product-search.json`, so it was green under both states. No bug was
+  caught here and none should be claimed. What the tightening buys is that the
+  assertion names the route that exists, and that the eight route globs now pin
+  the hold/fail/expect interceptors to the JSON path — so a future regression to
+  a non-JSON route would stop intercepting and fail loudly instead of silently
+  exercising the wrong transport.
+- **T5, the acceptance criteria were verified against the tree, not the
+  reports**: the `select-none` purge assertion, the `hx-vals` absence (the only
+  remaining mentions in the picker templates are comments documenting that
+  absence), and the zero occurrences of `pendingResultFocus`, `searchFailed` and
+  `product-search-status` in `base.html`.
+
+## Outcome
+
+What changed for the operator: nothing visible, by design. The picker looks and
+behaves as it did, and that is the point — the work removed a class of bug rather
+than a bug.
+
+The state that used to be spread across the DOM, `base.html`, the Askama
+fragment and smuggled `hx-vals` now has one owner in `static/picker.js`: one
+state object, one render function, derived focus and derived status. Because the
+island owns `product_id` and disables the hidden input while nothing is selected,
+the two resolution paths (click a match, or press Enter and let the server
+resolve the typed name) can no longer compete for it — which is what made the
+hidden-id defect reachable in the first place.
+
+What was deleted: the second search transport, the hand-written focus
+restoration in `base.html`, the in-flight status handler, the failure handler,
+and every piece of markup-carried search state. What was deliberately kept: the
+keyboard and Escape handling and the one notice authority in `base.html`, both of
+which the island depends on rather than duplicates.
+
+The numbers: `cargo test` **885 passed / 0 failed**; `scripts/e2e.sh` **93
+passed / 4 skipped / 0 failed**; the island is 305 lines of plain JavaScript with
+no dependency and no build step, and the dead-path deletion was 37 insertions
+against 219 deletions.

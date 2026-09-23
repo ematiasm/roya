@@ -4,7 +4,7 @@ Local business manager for a polirrubro (goods and services): sales of products 
 
 Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + HTMX 1.9.12 + Tailwind CSS 4.3.3 + rust_decimal + chrono**.
 
-The front end is server-rendered: **HTMX 1.9.12** and the compiled **Tailwind CSS 4.3.3** stylesheet are vendored under `static/` and served by Axum, so there is no CDN, no npm and no runtime network dependency. See [Styles & local assets](#styles--local-assets).
+The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4.3.3** stylesheet and the product picker island (**`static/picker.js`**, plain JavaScript) are vendored under `static/` and served by Axum, so there is no CDN, no npm and no runtime network dependency. The island is the one client-side widget: the product line picker's client state (its query, its matches, its focus, its selected product) has one owner, one state object and one render function, instead of being spread across the DOM, `base.html` and `hx-vals`. See [Styles & local assets](#styles--local-assets).
 
 ## Features
 
@@ -686,7 +686,9 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
 - `/purchases/:id` — record page with the header (status, number or draft state,
   supplier, dates, totals, payment status), the lines table with product name and
   SKU, unit cost and subtotal, and the payments table with account and method
-  names; the product picker matches name, SKU and barcode and shows current stock;
+  names; the product picker is the same client-side island as the sale page's,
+  priced for cost — it matches name, SKU and barcode and shows the cost price
+  and current stock;
   an unknown id is a 404, and so is a malformed one (`/purchases/abc`
   answers 404, not the path extractor's 400 — the route takes `Path<String>`
   and parses the id itself, which is also what let `/purchases/new` be
@@ -791,8 +793,9 @@ The UI is styled with **Tailwind CSS 4.3.3** utilities (Tailwind v4 syntax: CSS-
 
 - `static/tailwind.css` — compiled Tailwind 4.3.3 stylesheet (~13 KB, only the classes in use)
 - `static/htmx.min.js` — HTMX 1.9.12
+- `static/picker.js` — the product picker island (plain JavaScript, no dependency, no build step)
 
-Rebuild the CSS after changing templates or the entrypoint. The standalone Tailwind CLI is a dev-time tool only; it is not a Rust dependency and is not committed:
+Rebuild the CSS after changing templates, the entrypoint or the island's class names: `static/picker.js` is a Tailwind **scan source** — `assets/tailwind.css` declares `@source "../static/picker.js"` alongside `@source "../templates"`, because the entrypoint imports Tailwind with `source(none)` and would otherwise purge every class that exists only in the island. Editing the island's class names means rebuilding the stylesheet, exactly as editing a template does. The standalone Tailwind CLI is a dev-time tool only; it is not a Rust dependency and is not committed:
 
 ```bash
 # Standalone CLI in PATH
@@ -805,7 +808,7 @@ TAILWINDCSS=~/.local/bin/tailwindcss scripts/build-css.sh
 tailwindcss --input assets/tailwind.css --output static/tailwind.css --minify
 ```
 
-The entrypoint imports Tailwind, scans only `templates/` (`@source`), and defines the dark palette as `@theme` tokens (`bg`, `surface`, `card`, `border`, `text`, `muted`, `accent`, `accent2`, `danger`, `income`, `expense`). Commit the regenerated `static/tailwind.css` together with the template change so `cargo run` keeps working without the CLI installed.
+The entrypoint imports Tailwind, scans `templates/` and `static/picker.js` (`@source`), and defines the dark palette as `@theme` tokens (`bg`, `surface`, `card`, `border`, `text`, `muted`, `accent`, `accent2`, `danger`, `income`, `expense`). Commit the regenerated `static/tailwind.css` together with the template change so `cargo run` keeps working without the CLI installed.
 
 ## Configuration
 
@@ -1062,9 +1065,11 @@ templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_
                              role_list.html, user_roles_form.html, user_password_form.html,
                              document_list.html
 migrations/*.sql
-assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/, @theme palette)
+assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/ + static/picker.js,
+                             @theme palette)
 static/tailwind.css        — compiled stylesheet (committed; rebuild via scripts/build-css.sh)
 static/htmx.min.js         — HTMX 1.9.12 served locally (no CDN)
+static/picker.js           — the product picker island (plain JS, no dependency, no build step)
 scripts/build-css.sh       — regenerates static/tailwind.css with the standalone CLI
 ```
 
