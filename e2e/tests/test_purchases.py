@@ -491,3 +491,145 @@ def test_clicking_a_purchase_row_opens_the_peek_and_escape_closes_it(
         page.evaluate("document.getElementById('purchase-drawer-body').innerHTML")
         == ""
     ), "Escape must empty the peek body, not just hide the drawer"
+
+
+# ---------------------------------------------------------------------------
+# Rendered-colour gate: computed styles, not class lists.
+#
+# Every colour claim a class assertion makes can pass while the page still
+# reads wrong — an earlier slice shipped a list row that read blue (the
+# stylesheet colours anchors) while every class check passed, because the
+# check looked at a span's classes instead of the element's rendered colour.
+# getComputedStyle on the real element sees that class of defect, so the
+# tests below read the browser's resolved colours against the design tokens:
+#
+#   --color-accent  #6ee7b7 → rgb(110, 231, 183)  (mint background)
+#   base button label #0a0f0d → rgb(10, 15, 13)   (dark button label)
+#   --color-bg      #0f1115 → rgb(15, 17, 21)     (page-action label, text-bg)
+#   --color-text    #e6e8eb → rgb(230, 232, 235)  (normal text colour)
+#   --color-accent2 #60a5fa → rgb(96, 165, 250)   (anchor blue — must NOT appear)
+# ---------------------------------------------------------------------------
+
+_MINT = "rgb(110, 231, 183)"
+_BUTTON_LABEL = "rgb(10, 15, 13)"
+_PAGE_ACTION_LABEL = "rgb(15, 17, 21)"
+_TEXT = "rgb(230, 232, 235)"
+_ANCHOR_BLUE = "rgb(96, 165, 250)"
+
+
+def test_primary_actions_render_accent_colors_not_anchor_blue(
+    page: Page, api: ApiClient
+) -> None:
+    """Buttons render mint with dark labels — proven by computed style, not class.
+
+    The base `button` rule in the stylesheet sets `background-color:
+    var(--color-accent)` and `color: #0a0f0d`, and the classes that once
+    overrode it are gone, so the cascade is deterministic — but only a
+    computed-style assertion can prove the cascade actually resolved that way
+    in a real browser. This test checks both primary-button shapes operators
+    touch: the shared page-header action (`[data-page-action]`) on /purchases,
+    and a form submit button — the Confirm dialog's `<button type="submit">`
+    on the purchase record page, the same button the journey test clicks to
+    confirm a purchase.
+
+    One resolved-value nuance the assertion pins deliberately: the page action
+    is an anchor carrying `text-bg`, so its label resolves to `--color-bg`
+    (#0f1115 → rgb(15, 17, 21)) — a different dark than the base button's
+    #0a0f0d. Both are dark; neither is blue.
+
+    The negative makes this a gate rather than a coincidence: no button on
+    either page may compute to the old anchor blue, so any regression that
+    re-colours a primary control fails loudly here.
+    """
+    supplier_id = create_supplier(api, "Colour Supplier")
+    product = create_product(
+        api,
+        sku="COLOR-SKU-01",
+        name="Colour Widget",
+        sale_price="10.00",
+        cost_price="5.00",
+        stock="5",
+        min_stock="1",
+        max_stock="20",
+    )
+    purchase_id = create_purchase_draft(
+        api, supplier_id, payment_type="Credit", due_date="2024-06-01"
+    )
+    add_purchase_line(
+        api, purchase_id, int(product["id"]), qty="1", unit_cost="5.00"
+    )
+
+    # The page action on /purchases (the admin principal holds create
+    # permission, so the "New purchase" action renders).
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+    action = page.locator("[data-page-action]")
+    expect(action).to_be_visible()
+    assert (
+        action.evaluate("el => getComputedStyle(el).backgroundColor") == _MINT
+    ), "the page action must render the mint accent background"
+    assert action.evaluate("el => getComputedStyle(el).color") == _PAGE_ACTION_LABEL
+
+    # The Confirm dialog's submit button on the record page: an unclassed
+    # `<button type="submit">`, so the base button rule decides both colours.
+    with page.expect_response(_response_for(f"/purchases/{purchase_id}")):
+        page.goto(f"{api.base_url}/purchases/{purchase_id}")
+    page.locator("#open-confirm").click()
+    submit = page.locator("#confirm-purchase button[type='submit']")
+    expect(submit).to_be_visible()
+    assert (
+        submit.evaluate("el => getComputedStyle(el).backgroundColor") == _MINT
+    ), "the confirm submit button must render the mint accent background"
+    assert submit.evaluate("el => getComputedStyle(el).color") == _BUTTON_LABEL
+
+    # Negative gate: the old anchor blue must not be any button's background
+    # on either page (transparent controls resolve to rgba(0, 0, 0, 0), which
+    # also fails this check — as they should).
+    for url in (
+        f"{api.base_url}/purchases",
+        f"{api.base_url}/purchases/{purchase_id}",
+    ):
+        page.goto(url)
+        backgrounds = page.eval_on_selector_all(
+            "button", "els => els.map(el => getComputedStyle(el).backgroundColor)"
+        )
+        assert _ANCHOR_BLUE not in backgrounds, (
+            f"a button on {url} renders the old anchor blue: {backgrounds}"
+        )
+
+
+def test_purchase_list_row_renders_text_color_not_anchor_blue(
+    page: Page, api: ApiClient
+) -> None:
+    """The row element itself renders in normal text colour, never anchor blue.
+
+    This is the defect class the last red suite exposed: purchase rows are
+    `<a>` elements, and the stylesheet colours anchors blue — so a row that
+    lost its `text-text` utility reads blue while every class-level assertion
+    still passes. The assertion here targets the ROW element
+    (`#purchase-{id}`, the anchor itself) rather than a span inside it, which
+    is exactly the check that would have caught the original defect: if the
+    row went back to inheriting the anchor colour, `getComputedStyle` on the
+    row would return rgb(96, 165, 250) and fail both assertions below.
+
+    All three row shapes (draft, owed, settled) are seeded through the
+    existing `_seed_purchase_states` helper and checked, so no chip state can
+    hide a colour regression.
+    """
+    seeded = _seed_purchase_states(api)
+
+    with page.expect_response(_response_for("/web/purchases")):
+        page.goto(f"{api.base_url}/purchases")
+
+    for kind in ("draft", "owed", "settled"):
+        # The row anchor element itself — not a span inside it.
+        row = page.locator(f"#purchase-{seeded[kind]}")
+        expect(row).to_be_visible()
+        colour = row.evaluate("el => getComputedStyle(el).color")
+        assert colour == _TEXT, (
+            f"the {kind} row must render in the normal text colour, got {colour}"
+        )
+        assert colour != _ANCHOR_BLUE, (
+            f"the {kind} row renders the anchor blue — the exact defect this "
+            "test exists to catch"
+        )

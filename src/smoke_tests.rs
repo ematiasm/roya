@@ -3598,6 +3598,111 @@ fn template_suite_never_calls_the_blocking_alert() {
     );
 }
 
+// Mint actions: the blue button overrides retire (purchases-create-and-header T1c)
+// -------------------------------------------------------------------------------
+
+/// The opening tag of the element whose markup contains `needle`.
+fn opening_tag_containing<'a>(html: &'a str, needle: &str) -> &'a str {
+    let marker = html
+        .find(needle)
+        .unwrap_or_else(|| panic!("nothing carries {needle}: {html:.600}"));
+    let start = html[..marker]
+        .rfind('<')
+        .expect("the needle must sit inside a tag");
+    let end = marker + html[marker..].find('>').expect("unterminated opening tag");
+    &html[start..=end]
+}
+
+/// T1c drift pin: the base `button` element is already mint with a dark label
+/// (`assets/tailwind.css`, the `button { @apply ... bg-accent ... }` rule, with
+/// its own hover and disabled states), so any template still writing
+/// `bg-accent2` on a button is an override fighting the base style, not a
+/// second palette. Walk the whole template tree so an eleventh blue button
+/// cannot be added unnoticed.
+#[test]
+fn no_template_still_writes_the_bg_accent2_button_override() {
+    fn collect(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("templates directory") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                collect(&path, offenders);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("html") {
+                let text = std::fs::read_to_string(&path).expect("read template");
+                if text.contains("bg-accent2") {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    collect(std::path::Path::new("templates"), &mut offenders);
+    assert!(
+        offenders.is_empty(),
+        "the base button is already mint: retire the bg-accent2 button overrides: {offenders:?}"
+    );
+}
+
+/// T1c rendered assertion: buttons that used to carry `bg-accent2 text-white`
+/// must now inherit the base mint button style — their tags name neither
+/// override — while every identifying attribute (type, id, label, the
+/// disabled state) survives untouched.
+#[tokio::test]
+async fn rendered_action_buttons_inherit_the_base_mint_not_the_accent2_override() {
+    let (app, pool) = test_app().await;
+
+    // The dashboard's Add Transaction button: a plain submit button with no id,
+    // so pin its type and its label.
+    let (status, html) = get(&app, "/").await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    let tag = opening_tag_containing(&html, ">Add Transaction<");
+    assert!(
+        tag.contains("<button"),
+        "the action must stay a button element: {tag}"
+    );
+    assert!(
+        tag.contains("type=\"submit\""),
+        "the action's type must survive: {tag}"
+    );
+    assert!(
+        !tag.contains("bg-accent2"),
+        "the action must not override the mint base style: {tag}"
+    );
+    assert!(
+        !tag.contains("text-white"),
+        "the label must not override the dark base label: {tag}"
+    );
+
+    // A purchase draft's record page: the action bar's Confirm button carries
+    // an id and a disabled state (no lines yet) that must both survive.
+    let supplier = create_supplier_via_web(&app, &pool, "MintSur").await;
+    let draft =
+        create_purchase_draft_with_due(&app, supplier, "Credit", "2024-05-02", "2024-12-31").await;
+    let (status, html) = get(&app, &format!("/purchases/{draft}")).await;
+    assert_eq!(status, StatusCode::OK, "{html:.400}");
+    let tag = opening_tag_containing(&html, "id=\"open-confirm\"");
+    let tag_end = html.find(tag).expect("the tag came from this html") + tag.len();
+    assert!(
+        tag.contains("<button"),
+        "the action must stay a button element: {tag}"
+    );
+    assert!(
+        html[tag_end..].starts_with("Confirm \u{25be}"),
+        "the action's label must survive: {tag}..."
+    );
+    assert!(
+        tag.contains("disabled"),
+        "a draft with no lines keeps its disabled Confirm: {tag}"
+    );
+    assert!(
+        !tag.contains("bg-accent2"),
+        "the action must not override the mint base style: {tag}"
+    );
+    assert!(
+        !tag.contains("text-white"),
+        "the label must not override the dark base label: {tag}"
+    );
+}
+
 #[tokio::test]
 async fn sidebar_marks_the_active_entry_from_the_server_on_every_page() {
     let (app, pool) = test_app().await;

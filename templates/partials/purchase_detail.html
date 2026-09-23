@@ -230,7 +230,7 @@
   {% if record.purchase.status.to_string() == "Draft" %}
   <div id="purchase-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
        class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
-    <button type="button" id="open-confirm" class="bg-accent2 text-white"{% if record.lines.is_empty() %} disabled{% endif %}
+    <button type="button" id="open-confirm"{% if record.lines.is_empty() %} disabled{% endif %}
             onclick="openRecordDialog('confirm-purchase')">Confirm ▾</button>
     <div class="relative ml-auto">
       <button type="button" id="record-menu-toggle" aria-label="More actions"
@@ -251,7 +251,7 @@
   <div id="purchase-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
        class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
     {% if record.purchase.payment_type.to_string() == "Credit" %}
-    <button type="button" class="bg-accent2 text-white"
+    <button type="button"
             onclick="openRecordDialog('record-payment')">+ Record payment</button>
     {% endif %}
     <div class="relative ml-auto">
@@ -369,7 +369,7 @@
           {% endfor %}
         </select>
       </div>
-      <button type="submit" class="bg-accent2 text-white">Confirm</button>
+      <button type="submit">Confirm</button>
     </form>
   </dialog>
 
@@ -452,7 +452,7 @@
           <input type="date" id="payment-date" name="date" required value="{{ today }}" />
         </div>
       </div>
-      <button type="submit" class="bg-accent2 text-white">Record payment</button>
+      <button type="submit">Record payment</button>
     </form>
   </dialog>
   {% endif %}
