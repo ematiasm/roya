@@ -705,7 +705,15 @@ Machine clients use the same surface over JSON: `POST /api/sessions` with `{"use
 - Actions, gated by status and offered in context on the record page:
   - Add line (Draft): `POST /web/purchases/:id/lines` (HTMX, scanner or picker; the
     repeated-product rule is a clear 400)
-  - Edit header (Draft): `POST /web/purchases/:id/header` (HTMX)
+  - Draft header (in place): on a draft the record page's header is the edit
+    form itself — supplier (through the T2 picker, same contract as the
+    creation dialog), purchase date, supplier invoice no and notes — posting to
+    `POST /web/purchases/:id/header` (HTMX); on a confirmed or cancelled
+    purchase the header stays read-only text. The Edit header dialog and its
+    `⋯` menu entry are gone. Since the header can now change the supplier, a
+    purchase's supplier is no longer fixed at creation — on a draft it
+    resolves exactly like the creation flow (explicit picker id wins, else the
+    typed name must resolve, or the route refuses)
   - Confirm: `POST /web/purchases/:id/confirm` (HTMX)
   - Record payment (Confirmed, Credit): `POST /web/purchases/:id/payments` (HTMX)
   - Cancel (Confirmed) / discard (Draft): `POST /web/purchases/:id/cancel` (HTMX,

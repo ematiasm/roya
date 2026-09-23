@@ -13,9 +13,11 @@
    region — the add-line response marks the bar `hx-swap-oob` so it refreshes
    with the same swap (HTMX processes OOB before `hx-select`), while the
    dialogs keep their ids as the record's legacy anchors: `#confirm-purchase`
-   / `#edit-header` / `#discard-purchase` / `#record-payment` /
-   `#cancel-purchase` are the forms' dialogs. #}
+   / `#discard-purchase` / `#record-payment` / `#cancel-purchase` are the
+   forms' dialogs. The Edit header dialog is DELETED (T4): a draft's identity
+   fields are the always-visible inline header form below. #}
 {% import "partials/purchase_effects_preview.html" as effects %}
+{% import "partials/supplier_picker.html" as supplier_picker %}
 {% macro record_money(record, entry_row_focus) %}
 <div id="purchase-record-money">
   <div class="my-2 text-2xl font-bold">${{ record.total }} <span class="text-[13px] text-muted">paid {{ record.paid }} • due {{ record.due }}</span></div>
@@ -201,6 +203,52 @@
       {% if let Some(n) = record.purchase.purchase_number %}{{ n }}{% else %}Draft purchase{% endif %}
     </span>
   </div>
+  {% if record.purchase.status.to_string() == "Draft" %}
+  {# T4 (purchases-create-and-header): on a DRAFT the identity fields are an
+     always-visible editable form — the T2 supplier picker, purchase date,
+     supplier invoice no and notes — posting to the existing header route the
+     way the deleted dialog did. The picker's `include` carries the three
+     sibling field ids so every post (Enter in the supplier field, a clicked
+     result) travels the same field set the Save button posts: the route maps
+     invoice and notes unconditionally, so an ABSENT field would arrive as an
+     empty string and WIPE the stored value. The include must NEVER carry a
+     supplier_id — htmx accumulates colliding values instead of overwriting,
+     and the field's text is the picker's whole contract (T3's defect); an id
+     wins only on a clicked result, whose own form carries it. The picker
+     targets `#purchase-record-inner` because the macro's fixed
+     `hx-swap="outerHTML" hx-select` needs a target the RESPONSE fragment
+     actually contains (the record body's root), not the page-shell wrapper.
+
+     Read-only facts stay facts: the status and payment chips, the number and
+     the due date (decided at confirm — this form never touches it). A
+     confirmed or cancelled purchase renders the read-only header below,
+     exactly as before: the service is the authority and refuses edits to a
+     non-draft; the branch is presentation only. #}
+  <div id="purchase-header" class="mb-1">
+    {% call supplier_picker::supplier_picker(header_action, "#purchase-record-inner", "record-supplier", record.supplier_name, header_include) %}
+    <form id="purchase-header-form" class="mt-2 flex flex-col gap-2.5" data-action="Save header"
+          hx-post="/web/purchases/{{ record.purchase.id }}/header"
+          hx-include="#record-supplier, #record-purchase-date, #record-invoice-no, #record-notes"
+          hx-target="#purchase-record" hx-swap="innerHTML">
+      <div>
+        <label for="record-purchase-date">Purchase date</label>
+        <input type="date" id="record-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
+      </div>
+      <div>
+        <label for="record-invoice-no">Supplier invoice no (optional)</label>
+        <input type="text" id="record-invoice-no" name="supplier_invoice_no" maxlength="64" value="{% if let Some(inv) = record.purchase.supplier_invoice_no %}{{ inv }}{% endif %}" />
+      </div>
+      <div>
+        <label for="record-notes">Notes</label>
+        <input type="text" id="record-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" />
+      </div>
+      <button type="submit">Save header</button>
+    </form>
+  </div>
+  {% if let Some(due) = record.purchase.due_date %}
+  <div class="mb-1 text-[13px] text-muted">due {{ due }}</div>
+  {% endif %}
+  {% else %}
   <div class="mb-1 text-[13px] text-muted">
     {{ record.supplier_name }}
     • {{ record.purchase.purchase_date }}{% if let Some(due) = record.purchase.due_date %} • due {{ due }}{% endif %}
@@ -208,11 +256,12 @@
   {% if let Some(inv) = record.purchase.supplier_invoice_no %}
     <div class="text-[13px] text-muted">invoice {{ inv }}</div>
   {% endif %}
+  {% endif %}
   {# Audit attribution (slice S12): the purchase's creator and its last editor
      (a header edit, a line change, the confirm or the cancel), rendered as
      display names the wiring layer resolved. #}
   <div class="text-[13px] text-muted" data-purchase-actor>Registered by {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Updated by {{ editor }}{% endif %}</div>
-  {% if !record.purchase.notes.is_empty() %}
+  {% if !record.purchase.notes.is_empty() && record.purchase.status.to_string() != "Draft" %}
     <div class="text-[13px] text-muted">{{ record.purchase.notes }}</div>
   {% endif %}
   {% if let Some(c) = record.purchase.cancel_reason %}
@@ -238,9 +287,6 @@
               class="rounded-[10px] border border-border bg-transparent px-3.5 py-2 text-text"
               onclick="toggleRecordMenu(event)">⋯</button>
       <div id="record-menu" class="hidden absolute right-0 top-full z-30 mt-1 min-w-[160px] rounded-[10px] border border-border bg-card p-1 shadow-xl">
-        <button type="button"
-                class="block w-full rounded-[10px] bg-transparent px-3 py-2 text-left text-sm text-text"
-                onclick="openRecordDialog('edit-header')">Edit header</button>
         <button type="button"
                 class="block w-full rounded-[10px] bg-transparent px-3 py-2 text-left text-sm text-danger"
                 onclick="openRecordDialog('discard-purchase')">Discard draft</button>
@@ -370,35 +416,6 @@
         </select>
       </div>
       <button type="submit">Confirm</button>
-    </form>
-  </dialog>
-
-  <dialog id="edit-header" class="rounded-2xl border border-border bg-card p-5 text-text">
-    <div class="mb-3 flex items-center justify-between gap-6">
-      <h2 class="text-lg font-semibold">Edit header</h2>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
-              aria-label="Close dialog" onclick="document.getElementById('edit-header').close()">✕</button>
-    </div>
-    <form class="flex flex-col gap-2.5" data-action="Edit header"
-          hx-post="/web/purchases/{{ record.purchase.id }}/header"
-          hx-target="#purchase-record" hx-swap="innerHTML">
-      {# Due date is decided at confirm (purchase-payment-at-confirm T4):
-         the edit header keeps purchase date, invoice and notes only. #}
-      <div class="flex gap-2.5 [&>*]:flex-1">
-        <div>
-          <label for="header-purchase-date">Purchase date</label>
-          <input type="date" id="header-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
-        </div>
-      </div>
-      <div>
-        <label for="header-supplier-invoice-no">Supplier invoice no (optional)</label>
-        <input type="text" id="header-supplier-invoice-no" name="supplier_invoice_no" maxlength="64" value="{% if let Some(inv) = record.purchase.supplier_invoice_no %}{{ inv }}{% endif %}" />
-      </div>
-      <div>
-        <label for="header-notes">Notes</label>
-        <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" />
-      </div>
-      <button type="submit">Save header</button>
     </form>
   </dialog>
 

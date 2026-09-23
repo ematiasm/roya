@@ -680,13 +680,15 @@ def test_new_purchase_opens_the_dialog_prefilled_with_the_last_used_supplier(
     new_id = int(urlparse(page.url).path.rsplit("/", 1)[1])
 
     # The record page IS the new draft's, and its supplier is the pre-filled
-    # one — the choosing created the right purchase.
+    # one — the choosing created the right purchase. T4: the draft's supplier
+    # renders in the inline header's picker FIELD (its value is the fact; the
+    # old read-only text line is gone).
     record = api.get_json(f"/api/purchases/{new_id}")
     assert int(record["purchase"]["supplier_id"]) == supplier_id, (
         "the draft must belong to the supplier the dialog pre-filled"
     )
     expect(page.get_by_role("heading", name="Draft purchase")).to_be_visible()
-    expect(page.locator("#purchase-record")).to_contain_text(supplier_name)
+    expect(page.locator("#record-supplier")).to_have_value(supplier_name)
 
 
 def test_typing_a_different_supplier_and_pressing_enter_creates_the_typed_one(
@@ -737,4 +739,64 @@ def test_typing_a_different_supplier_and_pressing_enter_creates_the_typed_one(
         f"not the pre-filled one ({prefilled_name})"
     )
     expect(page.get_by_role("heading", name="Draft purchase")).to_be_visible()
-    expect(page.locator("#purchase-record")).to_contain_text(typed_name)
+    # T4: the draft's supplier renders in the inline header's picker FIELD —
+    # the typed name, not the pre-filled one.
+    expect(page.locator("#record-supplier")).to_have_value(typed_name)
+
+
+def test_editing_a_draft_header_in_place_updates_the_document(page: Page, api: ApiClient) -> None:
+    """The inline header (purchases-create-and-header T4, AC5).
+
+    On a draft's record page the supplier, the purchase date, the supplier
+    invoice no and the notes are editable where the work happens — the
+    always-visible header form that replaced the Edit header dialog. The
+    operator changes the supplier through the picker's field (its typed name
+    resolves server-side, exactly as the creation flow does), edits the
+    invoice and the notes, and saves through the existing
+    `POST /web/purchases/{id}/header`. The page must show the new values in
+    the swapped record, and the stored document is read back through the API
+    so a UI-only update cannot pass. The due date stays untouched: it is
+    decided at confirm, and a header edit must not clear it.
+    """
+    stored_name = "Header Stored Supplier"
+    stored_id = create_supplier(api, stored_name)
+    changed_name = "Header Changed Supplier"
+    changed_id = create_supplier(api, changed_name)
+    purchase_id = create_purchase_draft(
+        api, stored_id, payment_type="Credit", due_date="2024-06-01"
+    )
+
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    # The draft's header form arrives pre-filled with the document's values.
+    supplier_field = page.locator("#record-supplier")
+    expect(supplier_field).to_have_value(stored_name)
+    expect(page.locator("#record-invoice-no")).to_have_value("")
+
+    # Edit all three in place: supplier, invoice, notes.
+    supplier_field.fill(changed_name)
+    page.locator("#record-invoice-no").fill("INV-E2E-4")
+    page.locator("#record-notes").fill("changed in place")
+
+    # Arm the expectation around the save: a listener armed after the click
+    # races the response and times out (the T3 lesson).
+    with page.expect_response(
+        _response_for(f"/web/purchases/{purchase_id}/header", method="POST")
+    ):
+        page.locator("#purchase-header-form").get_by_role(
+            "button", name="Save header"
+        ).click()
+
+    # The swapped record shows the new values, and the form carries them
+    # after the re-render.
+    expect(page.locator("#record-supplier")).to_have_value(changed_name)
+    expect(page.locator("#record-invoice-no")).to_have_value("INV-E2E-4")
+    expect(page.locator("#record-notes")).to_have_value("changed in place")
+
+    # Stored state, read back through the API.
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert int(stored["purchase"]["supplier_id"]) == changed_id, stored
+    assert stored["purchase"]["supplier_invoice_no"] == "INV-E2E-4", stored
+    assert stored["purchase"]["notes"] == "changed in place", stored
+    # The due date is decided at confirm: a header edit must not touch it.
+    assert stored["purchase"]["due_date"] == "2024-06-01", stored
