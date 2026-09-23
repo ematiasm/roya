@@ -1119,3 +1119,157 @@ def test_an_empty_required_date_posts_nothing_and_says_so_inline(
     # And the document is untouched: the stored date is still the seeded one.
     stored = api.get_json(f"/api/purchases/{purchase_id}")
     assert stored["purchase"]["purchase_date"], stored
+
+
+def test_editing_a_line_inline_keeps_focus_and_updates_the_totals(
+    page: Page, api: ApiClient
+) -> None:
+    """An inline edit keeps the operator's place and moves the derived numbers.
+
+    The inline qty/cost inputs swap `#purchase-record-money` with `outerHTML`,
+    so editing one replaces the whole money region — including the inputs
+    themselves. Two things could therefore break, and neither does:
+
+    1. **Focus survives.** The swap destroys the focused field, but htmx
+       restores focus for elements that carry an id, and these inputs do. The
+       operator tabs from a quantity to the next field and stays there.
+    2. **The totals follow.** The row subtotal and the running total are
+       re-rendered from the new quantity.
+
+    Written while scoping the entry-row island task, to find out whether that
+    task had any behaviour behind it. It measured both, both held, and the task
+    was dropped. It stays as the regression guard for behaviour that had **no
+    browser test at all** before — the same coverage gap that let the
+    duplicate-region defect live two days.
+    """
+    first = create_product(
+        api,
+        sku="INLINE-A",
+        name="Inline Alpha",
+        sale_price="20.00",
+        cost_price="5.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    second = create_product(
+        api,
+        sku="INLINE-B",
+        name="Inline Beta",
+        sale_price="20.00",
+        cost_price="5.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    supplier_id = create_supplier(api, "Inline Rows Supplier")
+    purchase_id = create_purchase_draft(api, supplier_id, payment_type="Cash")
+    add_purchase_line(api, purchase_id, int(first["id"]), qty="2", unit_cost="6.00")
+    add_purchase_line(api, purchase_id, int(second["id"]), qty="1", unit_cost="6.00")
+
+    detail = api.get_json(f"/api/purchases/{purchase_id}")
+    by_product = {int(line["product_id"]): int(line["id"]) for line in detail["lines"]}
+    alpha_line = by_product[int(first["id"])]
+
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    qty = page.locator(f"#line-qty-{alpha_line}")
+    cost = page.locator(f"#line-cost-{alpha_line}")
+    expect(qty).to_have_value("2")
+
+    def snapshot(label: str) -> None:
+        print(
+            f"\n[{label}] active={page.evaluate('document.activeElement.id')!r}"
+            f" row_subtotal={page.locator(f'#purchase-line-{alpha_line} td.text-expense').inner_text()!r}"
+            f" total={page.locator('#purchase-record-money div.text-2xl').first.inner_text()!r}",
+            flush=True,
+        )
+
+    snapshot("before")
+
+    qty.fill("5")
+    # The operator moves on to the next field. This is what fires `change` on
+    # the quantity and, with `delay:400ms`, schedules the PUT.
+    cost.click()
+    snapshot("right after moving focus")
+
+    page.wait_for_timeout(1400)  # debounce + response + swap
+    snapshot("after the swap settles")
+
+    # 1. The operator is still where they left off.
+    assert page.evaluate("document.activeElement.id") == f"line-cost-{alpha_line}", (
+        "the inline edit destroyed the focused field: "
+        f"active={page.evaluate('document.activeElement.id')!r}"
+    )
+
+    # 2. The derived numbers followed the edit (5 x 6.00 = 30.00, plus 1 x 6.00).
+    expect(page.locator(f"#purchase-line-{alpha_line} td.text-expense")).to_contain_text(
+        "30.00"
+    )
+    expect(page.locator("#purchase-record-money div.text-2xl").first).to_contain_text(
+        "36.00"
+    )
+
+
+def test_a_refused_inline_line_edit_reverts_and_stores_nothing(
+    page: Page, api: ApiClient
+) -> None:
+    """A value the domain refuses must not stay in the field or in the document.
+
+    `purchase.html` carries hand-written rollback glue for this: on
+    `htmx:responseError` it restores `elt.value = elt.defaultValue`, the value
+    the last render wrote. That is state ownership in the page shell, and it was
+    the last candidate for the entry-row island task.
+
+    Measuring it settled that task instead of refactoring it. htmx does issue
+    the PUT for an HTML-invalid quantity despite the `min` constraint, the route
+    refuses it, the glue reverts the field, and nothing is stored. All three
+    parts are asserted here, because the glue is only worth keeping if the whole
+    path works.
+    """
+    product = create_product(
+        api,
+        sku="ROLLBACK-A",
+        name="Rollback Alpha",
+        sale_price="20.00",
+        cost_price="5.00",
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    supplier_id = create_supplier(api, "Rollback Supplier")
+    purchase_id = create_purchase_draft(api, supplier_id, payment_type="Cash")
+    add_purchase_line(api, purchase_id, int(product["id"]), qty="2", unit_cost="6.00")
+
+    detail = api.get_json(f"/api/purchases/{purchase_id}")
+    line_id = int(detail["lines"][0]["id"])
+
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    puts: list[str] = []
+    page.on(
+        "request",
+        lambda request: puts.append(f"{request.method} {request.url}")
+        if request.method == "PUT"
+        else None,
+    )
+
+    qty = page.locator(f"#line-qty-{line_id}")
+    expect(qty).to_have_value("2")
+
+    for bad in ["-5", "0"]:
+        qty.fill(bad)
+        page.locator(f"#line-cost-{line_id}").click()
+        page.wait_for_timeout(700)
+
+    # The request did leave the browser: the HTML `min` does not stop htmx, so
+    # the server really is the one refusing. Without this the test could pass on
+    # a build where the browser silently blocked the value and the glue never ran.
+    assert puts, "htmx issued no PUT, so the rollback path was never reached"
+
+    # The field does not keep a value the domain rejected.
+    expect(qty).to_have_value("2")
+
+    # And nothing was written.
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert Decimal(str(stored["lines"][0]["qty"])) == Decimal("2"), stored

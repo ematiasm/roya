@@ -200,11 +200,28 @@ counts before any fix existed. T2 and T3 write their failing browser checks firs
         actually mattered, the empty required date, is client-side and is
         covered. Server failures keep the global notice, which is what they do
         today.
-- [ ] T3 — **The entry row island.** `static/entry-row.js` following the
-      `picker-island` pattern, the Tailwind `@source` line and a rebuilt
-      stylesheet, the shell rewrite in `purchase_detail.html`, and the removal of
-      the entry-row glue from `purchase.html`. Red-first browser test for the
-      island's guarantees.
+- [x] T3 — **The entry row island → DROPPED, and replaced by what the
+      measurement found.** Closed in `181c7a7`. The task as written was wrong in
+      two ways, and both were settled by measuring instead of refactoring:
+      - **The entry row is already an island.** `picker-island` T4 cut it over in
+        this same line of work: `#line-picker` carries `data-picker` and
+        `data-price-kind="cost"`, and `static/picker.js` owns its query, matches,
+        focus, selected product and submit. The task was written from an
+        inventory that predated the picker island and never re-checked.
+      - **The inline line edit — the real remaining candidate — holds up.** The
+        swap replaces the whole money region, so focus loss and stale totals were
+        both plausible. Both measurements refuted it: htmx restores focus for
+        elements carrying an id (measured `active='line-cost-1'` before and
+        after), and the derived numbers follow (`$12.00`→`$30.00`,
+        `$18.00`→`$36.00`). The rollback glue is reachable too: htmx issues the
+        PUT for an HTML-invalid quantity despite the `min`, the route refuses,
+        `elt.value = elt.defaultValue` reverts the field, and nothing is stored.
+      What is left is style, not behaviour — eight lines of glue and two inputs
+      duplicating their `hx-put`/`hx-include` — so the island is dropped rather
+      than performed. **What was kept is the coverage**: these three behaviours
+      had no browser test at all, pinned only by markup assertions, which is the
+      same gap that let the duplicate-region defect live two days. Two tests now
+      drive them, and each asserts that the thing it guards actually happened.
 
 ## Delivery strategy
 
@@ -213,7 +230,9 @@ Three slices, in the order the user chose, each independently revertible:
 - **Slice 1 — T1.** A defect fix with its regression test. Ship it alone and
   first: the page is corrupt today and the fix carries no design decision.
 - **Slice 2 — T2.** The identity auto-save and the retired button.
-- **Slice 3 — T3.** The island.
+- **Slice 3 — T3 (dropped).** The entry row island was already done by
+  `picker-island`, and the inline line edit it was standing in for measured clean.
+  What shipped instead is the browser coverage those behaviours never had.
 
 ## Progress
 
@@ -280,6 +299,47 @@ Three slices, in the order the user chose, each independently revertible:
   (`mt-1`, `text-[13px]`, `text-danger`, `text-muted`) already exists in
   `templates/`, and the new script adds no styling class, so the committed
   `static/tailwind.css` stays current. Verified rather than assumed.
+- **T3, the task was dropped because the measurement said so, and the first
+  measurement refuted its own hypothesis.** The inline edit swaps the whole
+  money region with `outerHTML`, so the focused field being destroyed looked
+  certain. It is not: `active='line-cost-1'` before and after the swap, because
+  htmx restores focus for elements carrying an id. **Inference from markup has
+  now been wrong twice in this feature** (the focus loss here, and the OOB
+  question in T2) and right zero times; the measurements were right both times.
+- **T3, the rollback glue is reachable, which I also got wrong by inference.**
+  Both inputs carry HTML constraints (`min="0.01"`, `min="0"`), so the values
+  the domain refuses looked unreachable from the browser. htmx issues the PUT
+  anyway: two PUTs for `-5` and `0`, the route refuses, the field reverts to
+  `2`, the stored quantity stays `2`.
+- **T3, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **100 passed, 4 skipped, 0 failed** (98 plus
+  the two new tests).
+- **T3, a test bug worth recording**: the first version of the rollback
+  measurement tried `"abc"` as an invalid quantity and failed with
+  `Cannot type text into input[type=number]` — a defect in the test, not the
+  app. Removed the case rather than working around it; a number input cannot
+  carry text and pretending otherwise would have been a test that lies.
+
+## Outcome
+
+The operator-visible result: the identity fields save themselves and the `Save
+header` button is gone; a line edit no longer duplicates the page; and three
+behaviours of the lines table are now covered by a browser instead of by markup
+assertions.
+
+What was deliberately **not** built: the entry-row island, because it already
+existed, and the inline-edit island, because measuring showed there is no
+behaviour left to own. Both are recorded above with the measurements that settled
+them, so the next person does not re-open the same question from the same stale
+inventory.
+
+What was deleted: the second search transport (T1's slice), the `Save header`
+button, the generic success notice for that one form, and the `innerHTML` swap
+contract that duplicated the record body.
+
+What was kept on purpose: the keydown and Escape handling and the single notice
+authority in `base.html`, the rollback glue in `purchase.html`, and the page
+order the user chose.
 
 - **T1, the coverage gap that let it live two days**: the inline line edit had
   **no browser test at all**. The only thing mentioning it was a Rust test
