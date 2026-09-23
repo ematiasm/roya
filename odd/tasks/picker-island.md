@@ -250,8 +250,8 @@ large ones and the review workload guard applies:
   addition, so nothing on screen changed and it is independently revertible.
   The `q`/`product` alias resolution was extracted into `resolve_search_query`
   and is now shared by both routes.
-- 2026-09-24: the wire format refined in `2e5051c`. Money now travels in display
-  form (decision 4). The refinement was caught by asking what the island would
+- 2026-09-24: the wire format refined (commit `refactor(picker): send the display
+  form of money on the wire`). Money now travels in display form (decision 4). The refinement was caught by asking what the island would
   actually render: a raw decimal string would have silently changed `$25.00`
   into `$25` on cutover.
 
