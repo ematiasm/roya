@@ -274,7 +274,13 @@ item out as domain work rather than presentation.
       `today` threaded in. The config subtitle went from `/purchases` and
       `/sales`, and so did the list header's `totals derived (total − paid =
       due)` clause. Done in `c0f6fc9`.
-- [ ] **S7 — Sales mirror.** The same row and peek on `/sales`.
+- [ ] **S7 — Sales mirror. PARKED by user decision (2026-09-22).** Editing sales
+      is left to a future restructuring, so the sale list keeps its badge cloud,
+      its red total, its `totals derived` clause and its row that does not open a
+      peek. When that restructuring happens, the two things this branch already
+      learned apply: the sale row becomes an anchor, so the tag-based e2e
+      selector in `e2e/tests/test_filters.py` will break loudly, and the full
+      browser suite must run for the slice that changes the row.
 - [ ] **S8 — One language, one date format.** Centralized labels +
       `format_date`; English across the sidebar, the document groups, the peek's
       operator copy (`Editar cabecera`, `Abrir el documento`, `Proveedor`,
@@ -325,7 +331,7 @@ item out as domain work rather than presentation.
 | S5a | **done** | `34b19ff` — 5 files, 614 changed lines (over the 400 budget; one indivisible work unit, reported not compressed). Verifier verdict **pass** on `cargo test` 849 passed / 0 failed **and** the browser suite: `uv run pytest tests/test_picker.py` → 6 passed in Chromium against the working-tree binary. The verifier confirmed the browser-silent contracts by source (the ids the results fragment's `hx-include` and htmx's id-based re-focus depend on, and the `hx-disinherit` rule), that the shared macro and the sale record are untouched, and that the preview test's narrowed slice is a strict subset that hides no payment input. It named one coverage gap — the record page-action slot was pinned in neither direction — closed before the commit. |
 | S5b | **done** | `9eb8187` — 5 files, 608 changed lines (over budget; one indivisible work unit). Verifier verdict *pass* on `cargo test` 854 passed / 0 failed and the browser suite 7 passed, having checked the equality branch (`Decimal` numeric equality, no tolerance), that the different-cost arm returns through the same function so the message cannot drift, that the `unreachable!` is genuinely unreachable, that the out-of-band notice cannot leak into the `hx-select` main swap (traced in the vendored htmx 1.9.12), and that `add_line` is byte-identical apart from the extracted helper. It raised three findings, all fixed before the commit: a new dead-code warning (`changed_with_entry_row` orphaned by `changed_with_notice`), the merge notice's escaping untested, and an undocumented ordering divergence — `add_or_increment_line` resolves the cost before the uniqueness check because the merge needs it, so a repeat with an invalid explicit cost reports the cost error rather than the duplicate one. |
 | S6 | **done** | `c0f6fc9` — 12 files. Verifier verdict *pass* on `cargo test` 858 passed / 0 failed and the full browser suite 85 passed / 0 failed / 4 skipped (pre-existing opt-in probes). The verifier proved the chip chain byte-identical for all three reachable states by diffing recovered Askama build artifacts, confirmed the two new browser tests are real gates (the 360 px one would fail on genuine overflow; the peek one fails if the row's `hx-get` goes), and confirmed the `Decimal::ZERO` bug was real. Findings fixed before the commit: a stale T3 comment, a stale README claim, the `Pending`/`Due` naming drift, and the two missing tests. |
-| S7 | not started | — |
+| S7 | **parked** | Deferred by user decision (2026-09-22): editing sales waits for a future restructuring. The purchase side is complete without it. |
 | S8 | not started | — |
 | S9 | not started (optional) | — |
 
