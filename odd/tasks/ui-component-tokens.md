@@ -151,17 +151,23 @@ are addressed in the design decisions below, not silently dropped.
 
 ## Acceptance criteria
 
-- [ ] `@layer base` no longer styles `a`, `button`, `label` or
-      `input`/`select`/`textarea`.
-- [ ] Every `<button>` and `<a>` in the templates carries a component class, or
-      is deliberately unstyled with a comment saying why.
-- [ ] The three notice copies carry the same class, and the
-      "keep the three copies in step" instruction is no longer needed.
-- [ ] The 61-occurrence secondary-button string appears **zero** times.
-- [ ] **No screen changes.** Proven by a computed-style comparison, not by
-      inspection.
-- [ ] The compiled stylesheet is regenerated and committed.
-- [ ] `cargo test` green; `scripts/e2e.sh` green; CI green.
+All seven verified on 2026-09-24 against the tree, not against a report.
+
+- [x] `@layer base` no longer styles `a`, `button`, `label` or
+      `input`/`select`/`textarea`. It holds `body` and `dialog`, nothing else.
+- [x] Every `<button>` and `<a>` in the templates carries a component class, or
+      is deliberately unstyled **with a comment saying why**. Six were not and
+      now are; a seventh candidate was a false positive inside a JS comment.
+- [x] The three notice copies carry the same class, and the "keep the three
+      copies in step" instruction is no longer needed — the copies now cite it
+      as the old instruction rather than as a rule to follow.
+- [x] The 61-occurrence secondary-button string appears **zero** times.
+- [x] **No screen changes**, proven by a computed-style comparison rather than
+      by inspection: 3,609 fingerprinted elements across the pages, states and
+      their hover, passing after every step of every task.
+- [x] The compiled stylesheet is regenerated and committed, and it shrank.
+- [x] `cargo test` green (**885 passed, 0 failed**); `scripts/e2e.sh` green
+      (**101 passed, 4 skipped, 0 failed**); CI green on the pull request.
 
 ## Applicable checks
 
@@ -244,15 +250,19 @@ would record whatever the refactor produced and prove nothing.
       Add the missing pages and the notice state, capture their fingerprints from
       the current tree (the rendering is correct today), and only then is the base
       removal provable.
-- [ ] T6 — **Remove the `@layer base` `a`, `button`, `label` and
-      `input`/`select`/`textarea` rules — LAST, after T3, T4, T5 and T2c.** It was
-      written as "T2c, part two of the buttons" and that was wrong: the base
-      cannot go while any control still depends on it, and the notice dismiss
-      buttons are T4's job. When everything carries a component this is a pure
-      deletion and the net is the whole proof. The six rows and logos carry
-      `no-underline hover:no-underline` as load-bearing against the base `a` rule;
-      **that override can only be dropped after this deletion**, and the net will
-      say whether dropping it is safe.
+- [x] T6 — **Remove the `@layer base` element rules.** Closed in `0c3491e`, plus
+      the guard fix and the six rationale comments in `8dd5e33`. Four of the six
+      base rules are gone; `body` and `dialog` stay. The eleven
+      `no-underline hover:no-underline` overrides went with them, in two groups
+      with the net after each and nothing going back. The stylesheet shrank from
+      28,855 to 27,571 bytes and the compiled output shed `.no-underline` and
+      `.hover\:no-underline` entirely.
+      **The guard that blocked it was pinning a fight that was already over**: it
+      asserted the literal `no-underline hover:no-underline` under a comment
+      saying the stylesheet makes every anchor blue, and the baseline says **214
+      anchors, zero of them blue** — before this refactor. The comment described
+      a mechanism with no effect. Both are gone; `text-text` stays because it
+      still pins real markup and the row's colour is now asserted by the net.
 - [ ] T3 — **The chip component.** `.chip` plus its four variants, 37
       occurrences.
 - [ ] T4 — **The boxes.** `.notice` (all three copies), `.notice-success`,
@@ -400,3 +410,59 @@ live.
   This is the finding of the task, and it is the reason the base removal moved to
   last: it is a pure deletion only once **every** component exists, and the chip,
   the boxes and the form controls do not yet.
+- **T6, the inverse mutation passed**: with the `label` and `input, select,
+  textarea` base rules removed and the stylesheet rebuilt, the net **passed** —
+  reproduced by the orchestrator independently, with the CSS reverted and the
+  base rules verified back in place. That pass is the evidence the deletion was
+  safe rather than hopeful.
+- **T6, a prediction of the brief was falsified by the same experiment**: the
+  brief said `type="hidden"` inputs could be skipped because they are not
+  painted. The net failed on exactly those, because `getComputedStyle` resolves
+  the base rule's properties for a `display:none` element and the net
+  fingerprints every element. **Not painted is not the same as not computed.**
+  All 27 now carry `.field`.
+- **T6, the guard was pinning a fight that was already over**: it asserted the
+  literal `no-underline hover:no-underline` under a comment claiming the
+  stylesheet makes every anchor blue. The baseline says **214 anchors, zero of
+  them blue** — measured before this refactor. The comment described a mechanism
+  with no effect in practice, and the assertion defended its defence.
+- **T6, green (orchestrator-verified)**: `cargo test` → **885 passed, 0 failed**;
+  `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed**; the net passes;
+  `@layer base` holds only `body` and `dialog`; the stylesheet is 27,571 bytes
+  from 28,855; and `no-underline` greps zero across `templates/`.
+
+## Outcome
+
+**Visible result: nothing.** That was the criterion and it held — 3,609
+fingerprinted elements across thirteen pages, four record states, three notice
+states, three purchase-list payment states and a picker no-match state, each with
+their hover, and none of them moved at any point.
+
+What changed is where a styling decision lives. `@layer base` used to give every
+bare element an opinion — every anchor blue and underlined on hover, every button
+a mint primary, every label uppercase grey, every field full-width and bordered —
+and every screen that wanted something else overrode it by hand: 62% of buttons
+and 48% of anchors did, and the same nine-class string was re-typed 61 times.
+That is now 19 components, and a control that wants something else says so at the
+call site instead of fighting a default.
+
+**The defect class is gone rather than fixed.** The anchor has no colour any
+more, so the row that inherited the anchor's blue cannot happen again. Three
+previous fixes had been symptoms; this one removes the mechanism.
+
+Deleted: the four base element rules, 61 copies of the secondary-button string,
+37 re-typed chips, the notice box duplicated in three places along with the
+instruction to keep them in step, six identical dismiss buttons, and eleven
+overrides whose only job was to fight the base. The compiled stylesheet went from
+28,855 to 27,571 bytes.
+
+Kept on purpose: `body` and `dialog` in the base, the six controls that are rows
+or wordmarks rather than controls (now each saying why), and the components'
+self-sufficiency — every one carries what the base gave its element, which is
+what made the deletion provable instead of hopeful.
+
+**Left for a separate decision, reported rather than fixed**: the 7 checkboxes
+and 2 radios carry `.field`, because the base styled them as text fields today —
+`w-full`, a 1px border, a 10px radius and field padding. That is the current
+rendering and this refactor preserves it exactly, but it is odd design and
+deserves its own decision.
