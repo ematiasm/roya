@@ -85,7 +85,7 @@ def test_a_scan_adds_the_line_and_leaves_the_picker_empty_and_focused(
 
     row = _line_row(page, data.product_name)
     expect(row).to_have_count(1)
-    expect(row).to_contain_text(re.compile(r"HARNESS-WIDGET\s+2\s+\$"))
+    expect(row).to_contain_text(re.compile(r"HARNESS-WIDGET\s+2\s+25\.00 USD"))
 
     # The point of the test: the field is ready for the next scan without a click.
     # This asserts the real document.activeElement, not the `autofocus` attribute:
@@ -135,7 +135,7 @@ def test_the_picker_island_owns_the_sale_search(page: Page, api: ApiClient) -> N
 
     expect(buttons).to_have_count(2)
     expect(results).to_contain_text(data.product_name)
-    expect(results).to_contain_text("HARNESS-WIDGET • $25.00 • stock 5")
+    expect(results).to_contain_text("HARNESS-WIDGET • 25.00 USD • stock 5")
     expect(results).to_contain_text("Harness Spare")
     expect(status).to_have_text("2 matches.")
 
@@ -189,7 +189,7 @@ def test_the_picker_island_owns_the_sale_search(page: Page, api: ApiClient) -> N
 
     row = _line_row(page, data.product_name)
     expect(row).to_have_count(1)
-    expect(row).to_contain_text(re.compile(r"HARNESS-WIDGET\s+3\s+\$"))
+    expect(row).to_contain_text(re.compile(r"HARNESS-WIDGET\s+3\s+25\.00 USD"))
     line = _line_for(api, data.sale_id, data.product_id)
     assert Decimal(str(line["qty"])) == Decimal("3"), line
 
@@ -212,7 +212,7 @@ def test_choosing_a_result_carries_the_typed_quantity(page: Page, api: ApiClient
 
     row = _line_row(page, data.product_name)
     expect(row).to_have_count(1)
-    expect(row).to_contain_text(re.compile(r"HARNESS-WIDGET\s+3\s+\$"))
+    expect(row).to_contain_text(re.compile(r"HARNESS-WIDGET\s+3\s+25\.00 USD"))
 
     line = _line_for(api, data.sale_id, data.product_id)
     assert Decimal(str(line["qty"])) == Decimal("3"), line
@@ -337,7 +337,7 @@ def test_the_picker_island_owns_the_purchase_search(page: Page, api: ApiClient) 
 
     expect(buttons).to_have_count(2)
     expect(results).to_contain_text("Harness Spare")
-    expect(results).to_contain_text("cost $")
+    expect(results).to_contain_text("cost 2.00 USD")
 
     # Clicking the match adds the line with the island's selected id and the
     # quantity the operator typed. The field held "Harness" — no exact match
@@ -385,7 +385,7 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     expect(results).to_contain_text("Harness Spare")
     # The purchase picker quotes cost, not the sale price, so the fragment really
     # travelled through the purchase host's parameters.
-    expect(results).to_contain_text("cost $")
+    expect(results).to_contain_text("cost 2.00 USD")
 
     page.locator("#line-qty").fill("4")
     page.locator("#product-search-results button", has_text="Harness Spare").click()
@@ -398,7 +398,7 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     # inputs while the derived subtotal stays plain text.
     expect(row.locator("input[name='qty']")).to_have_value("4")
     expect(row.locator("input[name='unit_cost']")).to_have_value("2.00")
-    expect(row).to_contain_text("$8.00")
+    expect(row).to_contain_text("8.00 USD")
 
     detail = api.get_json(f"/api/purchases/{data.purchase_id}")
     line = next(

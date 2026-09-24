@@ -28,7 +28,13 @@ from typing import Iterator
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page
 
-from helpers import ApiClient, SeedError
+from helpers import (
+    E2E_ADMIN_PASSWORD,
+    E2E_ADMIN_USERNAME,
+    ApiClient,
+    SeedError,
+    setup_fresh_server,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 E2E_ROOT = Path(__file__).resolve().parent
@@ -143,13 +149,10 @@ def _wait_until_ready(server: LiveServer) -> None:
 # Server fixtures
 # ---------------------------------------------------------------------------
 
-# Fixed credentials for the spawned server; the username is the application's
-# bootstrap administrator. Setting ROYA_ADMIN_PASSWORD makes the login
-# reproducible: no test scrapes the once-logged generated password, and the
-# env-password bootstrap leaves must_change_password false, so the first
-# session lands on the dashboard instead of the password-change route.
-TEST_ADMIN_USERNAME = "admin"
-TEST_ADMIN_PASSWORD = "roya-e2e-fixed-password"
+# Fixed credentials created by the first-run setup form. They are shared by the
+# setup helper and the harness login so no test scrapes generated credentials.
+TEST_ADMIN_USERNAME = E2E_ADMIN_USERNAME
+TEST_ADMIN_PASSWORD = E2E_ADMIN_PASSWORD
 
 
 def _login_session(server: LiveServer) -> tuple[str, str]:
@@ -241,9 +244,6 @@ def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
             "DATABASE_URL": f"sqlite://{db_path}",
             "PORT": str(port),
             "RUST_LOG": "info",
-            # A fixed bootstrap password: the login gate is deny-by-default, so
-            # without it no seeded request or browser navigation would get in.
-            "ROYA_ADMIN_PASSWORD": TEST_ADMIN_PASSWORD,
         }
     )
 
@@ -269,9 +269,10 @@ def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
     try:
         _wait_until_ready(server)
         _assert_throwaway_database(server, dev_before)
-        # Login immediately after readiness, before any test body runs: the
-        # ordering is explicit here, so no seed helper can ever run before a
-        # session exists. Every client below shares the resulting cookie.
+        # Startup no longer creates an administrator. Complete the real first-run
+        # form before logging in, before any test body runs or seed helper can use
+        # the shared session.
+        setup_fresh_server(ApiClient(server.url))
         server.session_cookie = _login_session(server)
     except Exception:
         process.kill()

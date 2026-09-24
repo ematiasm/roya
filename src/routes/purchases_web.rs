@@ -6,7 +6,7 @@
 // callers.
 use askama::Template;
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Extension, Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post, put},
@@ -15,9 +15,9 @@ use axum::{
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{
     NewPurchase, PaymentType, PurchaseDetail, PurchaseListFilter, PurchaseRecord, PurchaseStatus,
     PurchaseSuggestions, UpdateProduct,
@@ -99,6 +99,7 @@ fn purchase_payment_state(detail: &PurchaseDetail, today: NaiveDate) -> Purchase
 #[template(path = "purchases.html")]
 struct PurchasesTemplate {
     title: String,
+    localization: LocalizationContext,
     purchases: Vec<PurchaseView>,
     suggestions: PurchaseSuggestions,
     has_suggestions: bool,
@@ -164,6 +165,9 @@ struct PurchasePageTemplate {
     /// empty and the component renders the anchor.
     page_action_dialog: String,
     record: PurchaseRecord,
+    /// Visible confirm-dialog default. This is presentation derived from the
+    /// supplier term; it is not written until the operator submits the form.
+    confirm_due_date: Option<NaiveDate>,
     /// The entry row renders inside the money region and carries `autofocus`
     /// only on the add-line response, so the swapped-in copy claims focus for
     /// the next scan; the page itself always renders without it.
@@ -174,6 +178,7 @@ struct PurchasePageTemplate {
     oob_action_bar: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    localization: LocalizationContext,
     /// Audit display names for the record body the page includes: resolved in
     /// the wiring layer (AC20).
     created_by_name: Option<String>,
@@ -191,6 +196,7 @@ struct PurchasePageTemplate {
 #[template(path = "partials/purchase_list.html")]
 struct PurchaseListPartial {
     title: String,
+    localization: LocalizationContext,
     purchases: Vec<PurchaseView>,
 }
 
@@ -212,6 +218,9 @@ struct PurchaseMergeNotice {
 #[template(path = "partials/purchase_detail.html")]
 struct PurchaseDetailPartial {
     record: PurchaseRecord,
+    /// Visible confirm-dialog default. An explicit draft due date wins;
+    /// otherwise this is purchase_date + the supplier's default term.
+    confirm_due_date: Option<NaiveDate>,
     /// The entry row is persistent inside the money region; this flag only
     /// adds `autofocus` to its product field on the add-line response, so
     /// the swapped-in row claims focus for the next scan (htmx restores
@@ -223,6 +232,7 @@ struct PurchaseDetailPartial {
     oob_action_bar: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    localization: LocalizationContext,
     /// The purchase's creator and its last editor, as display names the
     /// wiring layer resolved (never the ids).
     created_by_name: Option<String>,
@@ -241,6 +251,7 @@ struct PurchaseDetailPartial {
 #[derive(Template)]
 #[template(path = "partials/suggestion_list.html")]
 struct SuggestionListPartial {
+    localization: LocalizationContext,
     suggestions: PurchaseSuggestions,
     has_suggestions: bool,
     today: String,
@@ -257,16 +268,27 @@ fn is_htmx(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_required_decimal(s: &str, field: &str) -> AppResult<Decimal> {
-    Decimal::from_str(s.trim()).map_err(|_| AppError::Validation(format!("invalid {field}")))
+fn parse_required_decimal(
+    s: &str,
+    field: &str,
+    localization: &LocalizationContext,
+) -> AppResult<Decimal> {
+    localization
+        .parse_decimal(s.trim())
+        .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
-fn parse_opt_decimal(s: &str, field: &str) -> AppResult<Option<Decimal>> {
+fn parse_opt_decimal(
+    s: &str,
+    field: &str,
+    localization: &LocalizationContext,
+) -> AppResult<Option<Decimal>> {
     let t = s.trim();
     if t.is_empty() {
         return Ok(None);
     }
-    Decimal::from_str(t)
+    localization
+        .parse_decimal(t)
         .map(Some)
         .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
@@ -281,10 +303,13 @@ fn parse_opt_i64(s: &str, field: &str) -> AppResult<Option<i64>> {
         .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
-fn parse_date_or_today(s: &str) -> AppResult<NaiveDate> {
+fn parse_date_or_today(s: &str, localization: &LocalizationContext) -> AppResult<NaiveDate> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(chrono::Local::now().date_naive());
+        return localization
+            .today_iso()
+            .parse()
+            .map_err(|_| AppError::Internal("invalid localized date".into()));
     }
     t.parse()
         .map_err(|_| AppError::Validation("invalid date (YYYY-MM-DD)".into()))
@@ -334,9 +359,14 @@ async fn purchase_views(
     Ok(out)
 }
 
-fn render_list(view: Vec<PurchaseView>, title: &str) -> AppResult<Html<String>> {
+fn render_list(
+    view: Vec<PurchaseView>,
+    title: &str,
+    localization: LocalizationContext,
+) -> AppResult<Html<String>> {
     let html = PurchaseListPartial {
         title: title.to_string(),
+        localization,
         purchases: view,
     }
     .render()
@@ -349,8 +379,10 @@ fn render_list(view: Vec<PurchaseView>, title: &str) -> AppResult<Html<String>> 
 /// searches `/web/product-search.json` instead of carrying the whole catalogue.
 struct PurchaseRecordContext {
     record: PurchaseRecord,
+    confirm_due_date: Option<NaiveDate>,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
+    localization: LocalizationContext,
     /// Audit display names: the purchase's creator and its last editor (a
     /// header edit, a line change, the confirm or the cancel), resolved here
     /// in the wiring layer (AC20: the service never reads identity).
@@ -358,10 +390,23 @@ struct PurchaseRecordContext {
     updated_by_name: Option<String>,
 }
 
-async fn record_context(state: &AppState, purchase_id: i64) -> AppResult<PurchaseRecordContext> {
+async fn record_context(
+    state: &AppState,
+    purchase_id: i64,
+    localization: LocalizationContext,
+) -> AppResult<PurchaseRecordContext> {
     let record = state.purchases_service.get_record(purchase_id).await?;
+    let supplier = state
+        .supplier_service
+        .get_supplier(record.purchase.supplier_id)
+        .await?;
+    let confirm_due_date = record.purchase.due_date.or_else(|| {
+        supplier
+            .due_days
+            .map(|days| record.purchase.purchase_date + chrono::Duration::days(days))
+    });
     let method_options = state.payment_method_service.methods_with_accounts().await?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = localization.today_iso();
     let mut actor_ids = vec![record.purchase.created_by];
     actor_ids.extend(record.purchase.updated_by);
     let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
@@ -370,8 +415,10 @@ async fn record_context(state: &AppState, purchase_id: i64) -> AppResult<Purchas
     let updated_by_name = record.purchase.updated_by.and_then(name_for);
     Ok(PurchaseRecordContext {
         record,
+        confirm_due_date,
         method_options,
         today,
+        localization,
         created_by_name,
         updated_by_name,
     })
@@ -385,10 +432,12 @@ fn render_record(
     let header_action = format!("/web/purchases/{}/header", context.record.purchase.id);
     let html = PurchaseDetailPartial {
         record: context.record,
+        confirm_due_date: context.confirm_due_date,
         entry_row_focus,
         oob_action_bar,
         method_options: context.method_options,
         today: context.today,
+        localization: context.localization,
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
         header_action,
@@ -401,8 +450,12 @@ fn render_record(
 
 /// Record-body response that keeps the cross-region `purchase-changed` refresh
 /// event, so the subscribed list region updates after an action.
-async fn changed(state: &AppState, purchase_id: i64) -> AppResult<Response> {
-    changed_with_notice(state, purchase_id, false, None).await
+async fn changed(
+    state: &AppState,
+    purchase_id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<Response> {
+    changed_with_notice(state, purchase_id, localization, false, None).await
 }
 
 /// The add-line response with an optional out-of-band server notice prepended
@@ -414,11 +467,12 @@ async fn changed(state: &AppState, purchase_id: i64) -> AppResult<Response> {
 async fn changed_with_notice(
     state: &AppState,
     purchase_id: i64,
+    localization: &LocalizationContext,
     entry_row_focus: bool,
     notice_html: Option<String>,
 ) -> AppResult<Response> {
     let mut html = render_record(
-        record_context(state, purchase_id).await?,
+        record_context(state, purchase_id, localization.clone()).await?,
         entry_row_focus,
         true,
     )?
@@ -446,10 +500,15 @@ async fn changed_with_notice(
 async fn purchases_page(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Query(query): Query<PurchaseListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let purchases = purchase_views(&state, &query.to_filter(), chrono::Local::now().date_naive()).await?;
+    let today = localization
+        .today_iso()
+        .parse()
+        .map_err(|_| AppError::Internal("invalid localized date".into()))?;
+    let purchases = purchase_views(&state, &query.to_filter(), today).await?;
     // The suggestion block renders only when the principal may refresh it:
     // the fragment (`/web/purchases/suggestions`) and the API twin are gated
     // `inventory.read` because the suggestion is stock-derived data, so the
@@ -487,9 +546,10 @@ async fn purchases_page(
         };
     // `today` stays: the included `partials/suggestion_list.html` renders it
     // as the seed form's default purchase date (see the struct field comment).
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = today.to_string();
     let tmpl = PurchasesTemplate {
         title: "All purchases".to_string(),
+        localization,
         purchases,
         suggestions,
         has_suggestions,
@@ -508,7 +568,8 @@ async fn purchases_page(
         current_supplier_name,
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
@@ -577,6 +638,7 @@ async fn purchase_record_page(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(raw_id): Path<String>,
 ) -> Result<Html<String>, AppError> {
     // The id is parsed here rather than in the `Path<i64>` extractor so a
@@ -584,11 +646,9 @@ async fn purchase_record_page(
     // page was deleted (T3, AC2) — answers the 404 a missing record answers,
     // not the extractor's 400.
     let Ok(id) = raw_id.parse::<i64>() else {
-        return Err(AppError::NotFound(format!(
-            "purchase {raw_id} not found"
-        )));
+        return Err(AppError::NotFound(format!("purchase {raw_id} not found")));
     };
-    let context = record_context(&state, id).await?;
+    let context = record_context(&state, id, localization).await?;
     let label = match &context.record.purchase.purchase_number {
         Some(number) => number.clone(),
         None => "Draft purchase".to_string(),
@@ -608,10 +668,12 @@ async fn purchase_record_page(
         page_action_label: action_label,
         page_action_dialog: String::new(),
         record: context.record,
+        confirm_due_date: context.confirm_due_date,
         entry_row_focus: false,
         oob_action_bar: false,
         method_options: context.method_options,
         today: context.today,
+        localization: context.localization,
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
         header_action: format!("/web/purchases/{}/header", id),
@@ -620,25 +682,37 @@ async fn purchase_record_page(
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
 async fn web_purchase_list(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<PurchaseListQuery>,
 ) -> AppResult<Response> {
-    let view = purchase_views(&state, &query.to_filter(), chrono::Local::now().date_naive()).await?;
-    Ok(render_list(view, "All purchases")?.into_response())
+    let today = localization
+        .today_iso()
+        .parse()
+        .map_err(|_| AppError::Internal("invalid localized date".into()))?;
+    let view = purchase_views(&state, &query.to_filter(), today).await?;
+    Ok(render_list(view, "All purchases", localization)?.into_response())
 }
 
 async fn web_purchase_detail(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    let html = render_record(record_context(&state, id).await?, false, false)?.0;
+    let html = render_record(
+        record_context(&state, id, localization).await?,
+        false,
+        false,
+    )?
+    .0;
     Ok(Html(html).into_response())
 }
 
@@ -666,12 +740,14 @@ async fn web_delete_draft(
 async fn web_purchase_suggestions(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> AppResult<Html<String>> {
     let suggestions = state.purchases_service.suggestions().await?;
     let has_suggestions =
         !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = localization.today_iso();
     let html = SuggestionListPartial {
+        localization,
         suggestions,
         has_suggestions,
         today,
@@ -818,6 +894,7 @@ async fn web_create_purchase(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CreatePurchaseForm>,
 ) -> AppResult<Response> {
@@ -829,22 +906,27 @@ async fn web_create_purchase(
     // defaults to today when absent (the dialog carries no date field).
     let supplier_id = match form.supplier_id.filter(|id| *id > 0) {
         Some(id) => id,
-        None => state
-            .supplier_service
-            .resolve_supplier_name(&form.supplier_name)
-            .await?
-            .id,
+        None => {
+            state
+                .supplier_service
+                .resolve_supplier_name(&form.supplier_name)
+                .await?
+                .id
+        }
     };
     let purchase = state
         .purchases_service
-        .create_draft(principal.user_id, NewPurchase {
-            supplier_id,
-            payment_type: parse_payment_type(&form.payment_type)?,
-            purchase_date: parse_date_or_today(&form.purchase_date)?,
-            due_date: parse_opt_date(&form.due_date, "due_date")?,
-            supplier_invoice_no: clean_opt(&form.supplier_invoice_no),
-            notes: clean_opt(&form.notes),
-        })
+        .create_draft(
+            principal.user_id,
+            NewPurchase {
+                supplier_id,
+                payment_type: parse_payment_type(&form.payment_type)?,
+                purchase_date: parse_date_or_today(&form.purchase_date, &localization)?,
+                due_date: parse_opt_date(&form.due_date, "due_date")?,
+                supplier_invoice_no: clean_opt(&form.supplier_invoice_no),
+                notes: clean_opt(&form.notes),
+            },
+        )
         .await?;
     let location = format!("/purchases/{}", purchase.id);
     if is_htmx(&headers) {
@@ -864,30 +946,34 @@ async fn web_add_line(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
 ) -> AppResult<Response> {
-    web_add_line_impl(state, principal.user_id, headers, id, form).await
+    web_add_line_impl(state, principal.user_id, headers, localization, id, form).await
 }
 
 async fn web_add_line_impl(
     state: AppState,
     actor: i64,
     headers: HeaderMap,
+    localization: LocalizationContext,
     id: i64,
     form: AddLineForm,
 ) -> AppResult<Response> {
-    let qty = parse_required_decimal(&form.qty, "qty")?;
-    let unit_cost = parse_opt_decimal(&form.unit_cost, "unit_cost")?;
+    let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
+    let unit_cost = parse_opt_decimal(&form.unit_cost, "unit_cost", &localization)?;
     // An explicit product id (a clicked result) wins over the typed text; a scan
     // or an Enter carries only the value and resolves through inventory.
     let product_id = match form.product_id.filter(|id| *id > 0) {
         Some(id) => id,
-        None => state
-            .inventory_service
-            .resolve_product_ref(&form.product)
-            .await?
-            .id,
+        None => {
+            state
+                .inventory_service
+                .resolve_product_ref(&form.product)
+                .await?
+                .id
+        }
     };
     // The web route takes the merging method (S5b): a repeat product at the
     // same resolved cost increments the existing line, with a visible notice;
@@ -913,7 +999,7 @@ async fn web_add_line_impl(
             ),
             LineAddOutcome::Added(_) => None,
         };
-        return changed_with_notice(&state, id, true, notice).await;
+        return changed_with_notice(&state, id, &localization, true, notice).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -925,9 +1011,18 @@ async fn web_add_line_collection(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<AddLineForm>,
 ) -> AppResult<Response> {
-    web_add_line_impl(state, principal.user_id, headers, form.purchase_id, form).await
+    web_add_line_impl(
+        state,
+        principal.user_id,
+        headers,
+        localization,
+        form.purchase_id,
+        form,
+    )
+    .await
 }
 
 async fn web_update_line(
@@ -935,17 +1030,18 @@ async fn web_update_line(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path((purchase_id, line_id)): Path<(i64, i64)>,
     Form(form): Form<UpdateLineForm>,
 ) -> AppResult<Response> {
-    let qty = parse_required_decimal(&form.qty, "qty")?;
-    let unit_cost = parse_required_decimal(&form.unit_cost, "unit_cost")?;
+    let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
+    let unit_cost = parse_required_decimal(&form.unit_cost, "unit_cost", &localization)?;
     state
         .purchases_service
         .update_line(principal.user_id, line_id, qty, unit_cost)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, purchase_id).await;
+        return changed(&state, purchase_id, &localization).await;
     }
     Ok(Redirect::to(&format!("/purchases/{purchase_id}")).into_response())
 }
@@ -954,10 +1050,14 @@ async fn web_remove_line(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     Path((purchase_id, line_id)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
-    state.purchases_service.remove_line(principal.user_id, line_id).await?;
-    changed(&state, purchase_id).await
+    state
+        .purchases_service
+        .remove_line(principal.user_id, line_id)
+        .await?;
+    changed(&state, purchase_id, &localization).await
 }
 
 /// Cost-freshness T5 (gate corrected in T9): the stale-cost warning's action.
@@ -999,6 +1099,7 @@ async fn web_apply_line_cost(
     _: Require<InventoryWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path((purchase_id, line_id)): Path<(i64, i64)>,
 ) -> AppResult<Response> {
     let detail = state.purchases_service.get_detail(purchase_id).await?;
@@ -1029,7 +1130,7 @@ async fn web_apply_line_cost(
         )
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, purchase_id).await;
+        return changed(&state, purchase_id, &localization).await;
     }
     Ok(Redirect::to(&format!("/purchases/{purchase_id}")).into_response())
 }
@@ -1039,16 +1140,18 @@ async fn web_confirm_purchase(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<ConfirmPurchaseForm>,
 ) -> AppResult<Response> {
-    web_confirm_purchase_impl(state, principal.user_id, headers, id, form).await
+    web_confirm_purchase_impl(state, principal.user_id, headers, &localization, id, form).await
 }
 
 async fn web_confirm_purchase_impl(
     state: AppState,
     actor: i64,
     headers: HeaderMap,
+    localization: &LocalizationContext,
     id: i64,
     form: ConfirmPurchaseForm,
 ) -> AppResult<Response> {
@@ -1077,9 +1180,12 @@ async fn web_confirm_purchase_impl(
             )
             .await?;
     }
-    state.purchases_service.confirm(actor, id, method_id).await?;
+    state
+        .purchases_service
+        .confirm(actor, id, method_id)
+        .await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1089,9 +1195,18 @@ async fn web_confirm_purchase_collection(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<ConfirmPurchaseForm>,
 ) -> AppResult<Response> {
-    web_confirm_purchase_impl(state, principal.user_id, headers, form.purchase_id, form).await
+    web_confirm_purchase_impl(
+        state,
+        principal.user_id,
+        headers,
+        &localization,
+        form.purchase_id,
+        form,
+    )
+    .await
 }
 
 async fn web_record_payment(
@@ -1099,27 +1214,29 @@ async fn web_record_payment(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
 ) -> AppResult<Response> {
-    web_record_payment_impl(state, principal.user_id, headers, id, form).await
+    web_record_payment_impl(state, principal.user_id, headers, localization, id, form).await
 }
 
 async fn web_record_payment_impl(
     state: AppState,
     actor: i64,
     headers: HeaderMap,
+    localization: LocalizationContext,
     id: i64,
     form: RecordPaymentForm,
 ) -> AppResult<Response> {
-    let amount = parse_required_decimal(&form.amount, "amount")?;
-    let date = parse_date_or_today(&form.date)?;
+    let amount = parse_required_decimal(&form.amount, "amount", &localization)?;
+    let date = parse_date_or_today(&form.date, &localization)?;
     state
         .purchases_service
         .record_payment(actor, id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1129,9 +1246,18 @@ async fn web_record_payment_collection(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<RecordPaymentForm>,
 ) -> AppResult<Response> {
-    web_record_payment_impl(state, principal.user_id, headers, form.purchase_id, form).await
+    web_record_payment_impl(
+        state,
+        principal.user_id,
+        headers,
+        localization,
+        form.purchase_id,
+        form,
+    )
+    .await
 }
 
 async fn web_cancel_purchase(
@@ -1139,16 +1265,18 @@ async fn web_cancel_purchase(
     _: Require<PurchasesCancel>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<CancelPurchaseForm>,
 ) -> AppResult<Response> {
-    web_cancel_purchase_impl(state, principal.user_id, headers, id, form).await
+    web_cancel_purchase_impl(state, principal.user_id, headers, &localization, id, form).await
 }
 
 async fn web_cancel_purchase_impl(
     state: AppState,
     actor: i64,
     headers: HeaderMap,
+    localization: &LocalizationContext,
     id: i64,
     form: CancelPurchaseForm,
 ) -> AppResult<Response> {
@@ -1157,7 +1285,7 @@ async fn web_cancel_purchase_impl(
         .cancel(actor, id, clean_opt(&form.reason))
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1167,9 +1295,18 @@ async fn web_cancel_purchase_collection(
     _: Require<PurchasesCancel>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<CancelPurchaseForm>,
 ) -> AppResult<Response> {
-    web_cancel_purchase_impl(state, principal.user_id, headers, form.purchase_id, form).await
+    web_cancel_purchase_impl(
+        state,
+        principal.user_id,
+        headers,
+        &localization,
+        form.purchase_id,
+        form,
+    )
+    .await
 }
 
 /// Edit the draft header in place (purchases-create-and-header T4): the
@@ -1188,6 +1325,7 @@ async fn web_update_purchase_header(
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<UpdatePurchaseHeaderForm>,
 ) -> AppResult<Response> {
@@ -1197,11 +1335,13 @@ async fn web_update_purchase_header(
     // same refusal, never a silent keep-or-guess.
     let supplier_id = match form.supplier_id.filter(|id| *id > 0) {
         Some(id) => id,
-        None => state
-            .supplier_service
-            .resolve_supplier_name(&form.supplier_name)
-            .await?
-            .id,
+        None => {
+            state
+                .supplier_service
+                .resolve_supplier_name(&form.supplier_name)
+                .await?
+                .id
+        }
     };
     state
         .purchases_service
@@ -1219,7 +1359,7 @@ async fn web_update_purchase_header(
         )
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1234,6 +1374,7 @@ async fn web_seed_from_suggestion(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<SeedSuggestionForm>,
 ) -> AppResult<Response> {
@@ -1255,14 +1396,17 @@ async fn web_seed_from_suggestion(
     }
     let purchase = state
         .purchases_service
-        .create_draft(principal.user_id, NewPurchase {
-            supplier_id: item.supplier_id,
-            payment_type: parse_payment_type(&form.payment_type)?,
-            purchase_date: parse_date_or_today(&form.purchase_date)?,
-            due_date: parse_opt_date(&form.due_date, "due_date")?,
-            supplier_invoice_no: None,
-            notes: None,
-        })
+        .create_draft(
+            principal.user_id,
+            NewPurchase {
+                supplier_id: item.supplier_id,
+                payment_type: parse_payment_type(&form.payment_type)?,
+                purchase_date: parse_date_or_today(&form.purchase_date, &localization)?,
+                due_date: parse_opt_date(&form.due_date, "due_date")?,
+                supplier_invoice_no: None,
+                notes: None,
+            },
+        )
         .await?;
     state
         .purchases_service
@@ -1312,11 +1456,16 @@ pub fn router() -> Router<AppState> {
             "/web/purchases/cancel",
             post(web_cancel_purchase_collection),
         )
-        .route("/web/purchases/{id}", get(web_purchase_detail).delete(web_delete_draft))
+        .route(
+            "/web/purchases/{id}",
+            get(web_purchase_detail).delete(web_delete_draft),
+        )
         .route("/web/purchases/{id}/lines", post(web_add_line))
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}",
-            put(web_update_line).post(web_update_line).delete(web_remove_line),
+            put(web_update_line)
+                .post(web_update_line)
+                .delete(web_remove_line),
         )
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}/apply-cost",
@@ -1471,7 +1620,11 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        (status, redirect, String::from_utf8_lossy(&bytes).to_string())
+        (
+            status,
+            redirect,
+            String::from_utf8_lossy(&bytes).to_string(),
+        )
     }
 
     /// `post_form_response` with the PUT verb: the inline line edit.
@@ -1496,7 +1649,11 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        (status, redirect, String::from_utf8_lossy(&bytes).to_string())
+        (
+            status,
+            redirect,
+            String::from_utf8_lossy(&bytes).to_string(),
+        )
     }
 
     /// The opening tag that carries `needle`, for attribute assertions such as
@@ -1530,7 +1687,9 @@ mod tests {
         let pos = html
             .find(needle)
             .unwrap_or_else(|| panic!("{needle} not rendered: {html:.600}"));
-        let start = html[..pos].rfind("<form").expect("needle must sit in a form");
+        let start = html[..pos]
+            .rfind("<form")
+            .expect("needle must sit in a form");
         let end = html[pos..].find("</form>").expect("form must close");
         &html[start..pos + end + "</form>".len()]
     }
@@ -1542,11 +1701,8 @@ mod tests {
         let start = html
             .find(&start_tag)
             .unwrap_or_else(|| panic!("the {id} dialog renders: {html:.400}"));
-        let end = html[start..]
-            .find("</dialog>")
-            .expect("the dialog closes")
-            + start
-            + "</dialog>".len();
+        let end =
+            html[start..].find("</dialog>").expect("the dialog closes") + start + "</dialog>".len();
         &html[start..end]
     }
 
@@ -1565,7 +1721,9 @@ mod tests {
         let row_pos = html
             .find("id=\"line-picker\"")
             .expect("the entry row renders on the add-line response");
-        let row_start = html[..row_pos].rfind('<').expect("the id must sit inside a tag");
+        let row_start = html[..row_pos]
+            .rfind('<')
+            .expect("the id must sit inside a tag");
         let tag_end = row_start + html[row_start..].find('>').expect("unterminated tag");
         let row_tag = &html[row_start..=tag_end];
         assert!(
@@ -1628,49 +1786,63 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku,
-                name: "Record purchase product".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(10),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku,
+                    name: "Record purchase product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: format!("Record Supplier {seq}"),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: format!("Record Supplier {seq}"),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let purchase = state
             .purchases_service
-            .create_draft(audit_actor(&state).await, NewPurchase {
-                supplier_id: supplier.id,
-                payment_type,
-                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                due_date: match payment_type {
-                    PaymentType::Credit => Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
-                    PaymentType::Cash => None,
+            .create_draft(
+                audit_actor(&state).await,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type,
+                    purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: match payment_type {
+                        PaymentType::Credit => Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                        PaymentType::Cash => None,
+                    },
+                    supplier_invoice_no: None,
+                    notes: None,
                 },
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            )
             .await
             .unwrap();
         let line = state
             .purchases_service
-            .add_line(audit_actor(&state).await, purchase.id, product.id, Decimal::from(2), None)
+            .add_line(
+                audit_actor(&state).await,
+                purchase.id,
+                product.id,
+                Decimal::from(2),
+                None,
+            )
             .await
             .unwrap();
         // accounts.name is UNIQUE: suffix it per fixture, and still pass the
@@ -1684,7 +1856,6 @@ mod tests {
         // test is the record shape, not a zero balance.
         state
             .transaction_service
-
             .create(
                 audit_actor(&state).await,
                 account.id,
@@ -1739,20 +1910,21 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: sku.into(),
-                name: format!("prod {sku}"),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(10),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: sku.into(),
+                    name: format!("prod {sku}"),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         if let Some(code) = barcode {
@@ -1844,7 +2016,10 @@ mod tests {
         let (status, html) = get_html(app, "/purchases").await;
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("Purchases"), "page should mention Purchases");
-        assert!(html.contains("Suggestions"), "page should have the suggestion panel");
+        assert!(
+            html.contains("Suggestions"),
+            "page should have the suggestion panel"
+        );
     }
 
     // -- N3: the purchase record page ------------------------------------------
@@ -1917,11 +2092,15 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, crate::models::NewSupplier {
-                name: "Default Cash Sup".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                crate::models::NewSupplier {
+                    name: "Default Cash Sup".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state.clone());
@@ -1959,21 +2138,24 @@ mod tests {
         let actor = audit_actor(&state).await;
         let product = state
             .inventory_service
-            .create_product(actor, NewProduct {
-                sku: "SEED-NOTYPE".into(),
-                name: "seed no type".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(10),
-                track_stock: true,
-                min_stock: Some(Decimal::from(5)),
-                max_stock: Some(Decimal::from(50)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "SEED-NOTYPE".into(),
+                    name: "seed no type".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: true,
+                    min_stock: Some(Decimal::from(5)),
+                    max_stock: Some(Decimal::from(50)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         state
@@ -1993,11 +2175,15 @@ mod tests {
             .unwrap();
         let supplier = state
             .supplier_service
-            .create_supplier(actor, crate::models::NewSupplier {
-                name: "Seed NoType Sup".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                actor,
+                crate::models::NewSupplier {
+                    name: "Seed NoType Sup".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         state
@@ -2049,8 +2235,8 @@ mod tests {
 
         // -- Cash draft: Cash checked, method active, due block inert -------
         let cash = seed_record_fixture(&state, PaymentType::Cash).await;
-        let (_, cash_html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
-            .await;
+        let (_, cash_html) =
+            get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id)).await;
         let cash_dialog = slice_dialog(&cash_html, "confirm-purchase");
         assert!(
             cash_dialog.contains("name=\"payment_type\""),
@@ -2058,7 +2244,10 @@ mod tests {
         );
         let cash_radio = element_tag_containing(cash_dialog, "value=\"Cash\"");
         let credit_radio = element_tag_containing(cash_dialog, "value=\"Credit\"");
-        assert!(cash_radio.contains("checked"), "Cash prefills: {cash_radio}");
+        assert!(
+            cash_radio.contains("checked"),
+            "Cash prefills: {cash_radio}"
+        );
         assert!(
             !credit_radio.contains("checked"),
             "only the stored type is checked: {credit_radio}"
@@ -2081,12 +2270,15 @@ mod tests {
 
         // -- Credit draft: Credit checked, due active + prefilled, method inert
         let credit = seed_record_fixture(&state, PaymentType::Credit).await;
-        let (_, credit_html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
-            .await;
+        let (_, credit_html) =
+            get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id)).await;
         let credit_dialog = slice_dialog(&credit_html, "confirm-purchase");
         let credit_radio = element_tag_containing(credit_dialog, "value=\"Credit\"");
         let cash_radio = element_tag_containing(credit_dialog, "value=\"Cash\"");
-        assert!(credit_radio.contains("checked"), "Credit prefills: {credit_radio}");
+        assert!(
+            credit_radio.contains("checked"),
+            "Credit prefills: {credit_radio}"
+        );
         assert!(!cash_radio.contains("checked"), "{cash_radio}");
         let due_tag = element_tag_containing(credit_dialog, "id=\"confirm-due-date\"");
         assert!(
@@ -2136,7 +2328,10 @@ mod tests {
             .get_detail(fixture.purchase_id)
             .await
             .unwrap();
-        assert_eq!(detail.purchase.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(
+            detail.purchase.status,
+            crate::models::PurchaseStatus::Confirmed
+        );
         assert_eq!(detail.purchase.payment_type, PaymentType::Cash);
         assert!(
             detail.purchase.due_date.is_none(),
@@ -2166,7 +2361,10 @@ mod tests {
             .get_detail(fixture.purchase_id)
             .await
             .unwrap();
-        assert_eq!(detail.purchase.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(
+            detail.purchase.status,
+            crate::models::PurchaseStatus::Confirmed
+        );
         assert_eq!(detail.purchase.payment_type, PaymentType::Credit);
         assert_eq!(
             detail.purchase.due_date.map(|d| d.to_string()),
@@ -2196,7 +2394,10 @@ mod tests {
             .get_detail(fixture.purchase_id)
             .await
             .unwrap();
-        assert_eq!(detail.purchase.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(
+            detail.purchase.status,
+            crate::models::PurchaseStatus::Confirmed
+        );
         assert_eq!(detail.purchase.payment_type, PaymentType::Credit);
         assert_eq!(
             detail.purchase.due_date.map(|d| d.to_string()),
@@ -2254,11 +2455,15 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, crate::models::NewSupplier {
-                name: "Redirect Sup".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                crate::models::NewSupplier {
+                    name: "Redirect Sup".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state.clone());
@@ -2288,11 +2493,15 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, crate::models::NewSupplier {
-                name: "Plain Sup".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                crate::models::NewSupplier {
+                    name: "Plain Sup".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state);
@@ -2335,8 +2544,8 @@ mod tests {
             .unwrap();
         state
             .purchases_service
-
-            .record_payment(audit_actor(&state).await, 
+            .record_payment(
+                audit_actor(&state).await,
                 fixture.purchase_id,
                 fixture.method_id,
                 Decimal::from(10),
@@ -2357,13 +2566,13 @@ mod tests {
             .expect("a confirmed purchase carries its number");
         let app = crate::routes::router(state);
 
-        let (status, html) = get_html(
-            app.clone(),
-            &format!("/purchases/{}", fixture.purchase_id),
-        )
-        .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
-        assert!(html.contains("data-page-header"), "record uses the page header");
+        assert!(
+            html.contains("data-page-header"),
+            "record uses the page header"
+        );
         assert!(
             html.contains("data-nav=\"purchases\"") && html.contains("aria-current=\"page\""),
             "record page keeps the purchases nav key"
@@ -2399,11 +2608,8 @@ mod tests {
         let app = crate::routes::router(state.clone());
         let base = format!("/web/purchases/{}", fixture.purchase_id);
 
-        let (status, html) = get_html(
-            app.clone(),
-            &format!("/purchases/{}", fixture.purchase_id),
-        )
-        .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         for target in [
             format!("{base}/lines"),
@@ -2426,11 +2632,8 @@ mod tests {
             .confirm(audit_actor(&state).await, fixture.purchase_id, None)
             .await
             .unwrap();
-        let (status, html) = get_html(
-            app.clone(),
-            &format!("/purchases/{}", fixture.purchase_id),
-        )
-        .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains(&format!("{base}/payments")),
@@ -2448,7 +2651,11 @@ mod tests {
 
         state
             .purchases_service
-            .cancel(audit_actor(&state).await, fixture.purchase_id, Some("wrong order".to_string()))
+            .cancel(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some("wrong order".to_string()),
+            )
             .await
             .unwrap();
         let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
@@ -2479,8 +2686,8 @@ mod tests {
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         state
             .purchases_service
-
-            .confirm(audit_actor(&state).await, 
+            .confirm(
+                audit_actor(&state).await,
                 fixture.purchase_id,
                 Some(fixture.method_id),
             )
@@ -2564,22 +2771,23 @@ mod tests {
             "the confirm response must carry the warning inside #purchase-record-money: {money:.800}"
         );
         assert!(
-            money.contains("line cost $12.00") && money.contains("stored $10.00"),
+            money.contains("line cost 12 USD") && money.contains("stored 10 USD"),
             "the fragment must show both numbers: {money:.800}"
         );
 
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains(">stale cost<"),
             "a rising line cost must be flagged on the confirmed record page: {html:.800}"
         );
         assert!(
-            html.contains("line cost $12.00"),
+            html.contains("line cost 12 USD"),
             "the warning must show the line's cost: {html:.800}"
         );
         assert!(
-            html.contains("stored $10.00"),
+            html.contains("stored 10 USD"),
             "the warning must show the stored cost it is behind: {html:.800}"
         );
 
@@ -2668,8 +2876,8 @@ mod tests {
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         state
             .purchases_service
-
-            .confirm(audit_actor(&state).await, 
+            .confirm(
+                audit_actor(&state).await,
                 fixture.purchase_id,
                 Some(fixture.method_id),
             )
@@ -3047,7 +3255,7 @@ mod tests {
         );
         let row = row_with_id(&body, &format!("purchase-line-{}", fixture.line_id));
         assert!(
-            row.contains("$12"),
+            row.contains("12 USD"),
             "the refreshed fragment still shows the line at its applied cost: {row}"
         );
     }
@@ -3221,11 +3429,8 @@ mod tests {
         let app = crate::routes::router(state.clone());
 
         let cancel_needle = format!("hx-post=\"/web/purchases/{}/cancel\"", fixture.purchase_id);
-        let (status, html) = get_html(
-            app.clone(),
-            &format!("/purchases/{}", fixture.purchase_id),
-        )
-        .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         let discard = element_tag_containing(&html, &cancel_needle);
         assert!(
@@ -3268,8 +3473,8 @@ mod tests {
         let base = format!("/web/purchases/{}", fixture.purchase_id);
 
         // -- Draft: sticky bar + secondary menu + entry row + dialogs --------
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
-            .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         let bar_tag = element_tag_containing(&html, "id=\"purchase-action-bar\"");
         assert!(
@@ -3361,8 +3566,8 @@ mod tests {
             .confirm(audit_actor(&state).await, fixture.purchase_id, None)
             .await
             .unwrap();
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
-            .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("id=\"purchase-action-bar\"") && html.contains("id=\"record-menu\""),
@@ -3392,7 +3597,7 @@ mod tests {
         // The read-only facts stay: the supplier name, the due date and the
         // audit line render exactly as before.
         assert!(
-            html.contains(&fixture.supplier_name) && html.contains("due 2024-06-02"),
+            html.contains(&fixture.supplier_name) && html.contains("due 06/02/2024"),
             "a confirmed purchase still shows its header facts: {html:.400}"
         );
         assert!(
@@ -3428,7 +3633,7 @@ mod tests {
         }
         // Read-only facts stay on the cancelled record too.
         assert!(
-            html.contains(&fixture.supplier_name) && html.contains("due 2024-06-02"),
+            html.contains(&fixture.supplier_name) && html.contains("due 06/02/2024"),
             "a cancelled purchase still shows its header facts: {html:.400}"
         );
     }
@@ -3446,7 +3651,8 @@ mod tests {
     /// directions: a dead anchor must not creep back, and the payment
     /// action must not silently drop.
     #[tokio::test]
-    async fn web_purchase_record_page_action_draft_offers_none_and_confirmed_credit_offers_record_payment() {
+    async fn web_purchase_record_page_action_draft_offers_none_and_confirmed_credit_offers_record_payment(
+    ) {
         let state = test_state().await;
         let credit = seed_record_fixture(&state, PaymentType::Credit).await;
         let cash = seed_record_fixture(&state, PaymentType::Cash).await;
@@ -3554,6 +3760,7 @@ mod tests {
                     name: "FX Preview Sup".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -3588,7 +3795,13 @@ mod tests {
         let cash = new_draft(&state, actor, supplier.id, PaymentType::Cash, false).await;
         state
             .purchases_service
-            .add_line(actor, cash.id, product.id, Decimal::from(3), Some(Decimal::from(10)))
+            .add_line(
+                actor,
+                cash.id,
+                product.id,
+                Decimal::from(3),
+                Some(Decimal::from(10)),
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state.clone());
@@ -3614,12 +3827,12 @@ mod tests {
             .total
             .to_string();
         assert!(
-            preview.contains(&format!("Cash scenario · -${total} at confirm")),
+            preview.contains(&format!("Cash scenario · −{total} USD at confirm")),
             "the cash projection is the document total: {preview}"
         );
         assert!(
             preview.contains(&format!(
-                "Credit scenario · no cash movement · due +${total} at confirm"
+                "Credit scenario · no cash movement · due +{total} USD at confirm"
             )),
             "a draft previews BOTH scenarios until confirm: {preview}"
         );
@@ -3628,8 +3841,7 @@ mod tests {
             "the preview is projections only, no payment inputs: {preview}"
         );
         // A draft with a line may confirm.
-        let confirm_btn =
-            element_tag_containing(&html, "openRecordDialog('confirm-purchase')");
+        let confirm_btn = element_tag_containing(&html, "openRecordDialog('confirm-purchase')");
         assert!(
             !confirm_btn.contains("disabled"),
             "one line is enough to confirm: {confirm_btn}"
@@ -3639,7 +3851,13 @@ mod tests {
         let credit = new_draft(&state, actor, supplier.id, PaymentType::Credit, true).await;
         state
             .purchases_service
-            .add_line(actor, credit.id, product.id, Decimal::from(2), Some(Decimal::from(10)))
+            .add_line(
+                actor,
+                credit.id,
+                product.id,
+                Decimal::from(2),
+                Some(Decimal::from(10)),
+            )
             .await
             .unwrap();
         let (status, html) = get_html(app.clone(), &format!("/purchases/{}", credit.id)).await;
@@ -3661,12 +3879,12 @@ mod tests {
             .to_string();
         assert!(
             preview.contains(&format!(
-                "Credit scenario · no cash movement · due +${credit_total} at confirm"
+                "Credit scenario · no cash movement · due +{credit_total} USD at confirm"
             )),
             "the due projection is what confirm establishes: {preview}"
         );
         assert!(
-            preview.contains(&format!("Cash scenario · -${credit_total} at confirm")),
+            preview.contains(&format!("Cash scenario · −{credit_total} USD at confirm")),
             "the preview does not trust the stored type: both scenarios show: {preview}"
         );
         assert!(
@@ -3678,8 +3896,7 @@ mod tests {
         let empty = new_draft(&state, actor, supplier.id, PaymentType::Cash, false).await;
         let (status, html) = get_html(app, &format!("/purchases/{}", empty.id)).await;
         assert_eq!(status, StatusCode::OK);
-        let confirm_btn =
-            element_tag_containing(&html, "openRecordDialog('confirm-purchase')");
+        let confirm_btn = element_tag_containing(&html, "openRecordDialog('confirm-purchase')");
         assert!(
             confirm_btn.contains("disabled"),
             "confirm must be disabled with zero lines: {confirm_btn}"
@@ -3704,16 +3921,16 @@ mod tests {
 
         // -- Draft record pages: no type badge -----------------------------
         let cash = seed_record_fixture(&state, PaymentType::Cash).await;
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
-            .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             !html.contains("uppercase\">Cash</span>"),
             "a Cash draft shows no payment-type badge: {html:.600}"
         );
         let credit = seed_record_fixture(&state, PaymentType::Credit).await;
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
-            .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             !html.contains("uppercase\">Credit</span>"),
@@ -3734,15 +3951,12 @@ mod tests {
         let (status, _, resp) = post_form_response(
             app.clone(),
             &format!("/web/purchases/{}/confirm", cash.purchase_id),
-            &format!(
-                "payment_type=Cash&due_date=&method_id={}",
-                cash.method_id
-            ),
+            &format!("payment_type=Cash&due_date=&method_id={}", cash.method_id),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{resp:.400}");
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
-            .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("uppercase\">Cash</span>"),
@@ -3783,8 +3997,8 @@ mod tests {
 
         // -- Cash draft: the method select lives in the confirm dialog -----
         let cash = seed_record_fixture(&state, PaymentType::Cash).await;
-        let (_, cash_html) = get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id))
-            .await;
+        let (_, cash_html) =
+            get_html(app.clone(), &format!("/purchases/{}", cash.purchase_id)).await;
         let cash_dialog = slice_dialog(&cash_html, "confirm-purchase");
         let method_tag = element_tag_containing(&cash_dialog, "id=\"confirm-method\"");
         assert!(
@@ -3803,8 +4017,8 @@ mod tests {
 
         // -- Credit draft: the method control is present but inert ---------
         let credit = seed_record_fixture(&state, PaymentType::Credit).await;
-        let (_, credit_html) = get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id))
-            .await;
+        let (_, credit_html) =
+            get_html(app.clone(), &format!("/purchases/{}", credit.purchase_id)).await;
         let credit_dialog = slice_dialog(&credit_html, "confirm-purchase");
         let method_tag = element_tag_containing(&credit_dialog, "id=\"confirm-method\"");
         assert!(
@@ -3865,9 +4079,7 @@ mod tests {
         let results = html
             .find("id=\"product-search-results\"")
             .expect("the entry row renders the results container");
-        let lines = html
-            .find(">Lines (")
-            .expect("the lines heading renders");
+        let lines = html.find(">Lines (").expect("the lines heading renders");
         assert!(
             money < row && row < results && results < lines,
             "the entry row and its results sit inside the money region, above the lines: money={money} row={row} results={results} lines={lines}"
@@ -3895,7 +4107,8 @@ mod tests {
         );
 
         // -- The route accepts PUT ------------------------------------------
-        let (status, _, body) = put_form_response(app.clone(), &edit_url, "qty=3&unit_cost=6").await;
+        let (status, _, body) =
+            put_form_response(app.clone(), &edit_url, "qty=3&unit_cost=6").await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -3904,11 +4117,14 @@ mod tests {
 
         // -- The server still refuses invalid values (authority unchanged) --
         let (status, _, _) = put_form_response(app.clone(), &edit_url, "qty=0&unit_cost=6").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "qty must stay > 0 server-side");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "qty must stay > 0 server-side"
+        );
 
         // -- The draft page renders the inputs ------------------------------
-        let (_, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
-            .await;
+        let (_, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert!(
             html.contains(&format!("hx-put=\"{edit_url}\"")),
             "the qty/cost cells PUT inline: {html:.900}"
@@ -3942,8 +4158,8 @@ mod tests {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Credit).await;
         let app = crate::routes::router(state.clone());
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id))
-            .await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
 
         // -- The inline header region: no due input, the four editable
@@ -3970,7 +4186,10 @@ mod tests {
             "name=\"supplier_invoice_no\"",
             "name=\"notes\"",
         ] {
-            assert!(form.contains(field), "the header form keeps {field}: {form:.600}");
+            assert!(
+                form.contains(field),
+                "the header form keeps {field}: {form:.600}"
+            );
         }
         // The supplier field arrives pre-filled with the stored supplier's
         // name, and the other fields with the stored values.
@@ -4091,6 +4310,7 @@ mod tests {
                     name: "Enter Header Supplier".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -4111,7 +4331,8 @@ mod tests {
             .unwrap();
         let app = crate::routes::router(state.clone());
 
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
 
         // The picker's OWN form is what Enter submits. Collect its inputs —
@@ -4126,9 +4347,9 @@ mod tests {
         let mut scope = form.to_string();
         for id in include.split(", ") {
             let needle = format!("id=\"{}\"", id.trim_start_matches('#'));
-            let pos = html
-                .find(&needle)
-                .unwrap_or_else(|| panic!("the include names {needle} but the page does not render it"));
+            let pos = html.find(&needle).unwrap_or_else(|| {
+                panic!("the include names {needle} but the page does not render it")
+            });
             let start = html[..pos].rfind('<').expect("the id sits inside a tag");
             let end = start + html[start..].find('>').expect("unterminated tag");
             scope.push_str(&html[start..=end]);
@@ -4141,7 +4362,11 @@ mod tests {
             rest = &rest[i..];
             let tag_end = rest.find('>').expect("unterminated input tag");
             let tag = &rest[..=tag_end];
-            if let Some(name) = tag.split("name=\"").nth(1).map(|s| s.split('"').next().unwrap()) {
+            if let Some(name) = tag
+                .split("name=\"")
+                .nth(1)
+                .map(|s| s.split('"').next().unwrap())
+            {
                 let value = tag
                     .split("value=\"")
                     .nth(1)
@@ -4220,6 +4445,7 @@ mod tests {
                     name: "Header Change Supplier".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -4242,7 +4468,10 @@ mod tests {
             .unwrap();
         assert_eq!(detail.purchase.supplier_id, other.id);
         assert_eq!(detail.purchase.purchase_date.to_string(), "2024-05-03");
-        assert_eq!(detail.purchase.supplier_invoice_no.as_deref(), Some("INV-77"));
+        assert_eq!(
+            detail.purchase.supplier_invoice_no.as_deref(),
+            Some("INV-77")
+        );
         assert_eq!(
             detail.purchase.notes, "changed header",
             "the header post carries the notes: {:?}",
@@ -4308,6 +4537,7 @@ mod tests {
                     name: "Header Typed Supplier".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -4320,6 +4550,7 @@ mod tests {
                     name: "Header Clicked Supplier".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -4434,7 +4665,9 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("HX-Trigger").map(|v| v.to_str().unwrap()),
+            resp.headers()
+                .get("HX-Trigger")
+                .map(|v| v.to_str().unwrap()),
             Some("purchase-changed")
         );
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
@@ -4473,7 +4706,10 @@ mod tests {
 
         let picker = enclosing_form(&html, "id=\"product-picker\"");
         assert!(
-            picker.contains(&format!("hx-post=\"/web/purchases/{}/lines\"", fixture.purchase_id)),
+            picker.contains(&format!(
+                "hx-post=\"/web/purchases/{}/lines\"",
+                fixture.purchase_id
+            )),
             "{picker}"
         );
         assert!(
@@ -4494,10 +4730,18 @@ mod tests {
         let input_pos = html
             .find("id=\"product-picker\"")
             .expect("the record page renders the picker field");
-        let input_start = html[..input_pos].rfind('<').expect("the id must sit inside a tag");
+        let input_start = html[..input_pos]
+            .rfind('<')
+            .expect("the id must sit inside a tag");
         let input_end = input_pos + html[input_pos..].find('>').expect("unterminated tag");
         let input_tag = &html[input_start..=input_end];
-        for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+        for transport in [
+            "hx-get",
+            "hx-trigger",
+            "hx-target",
+            "hx-vals",
+            "hx-on:keyup",
+        ] {
             assert!(
                 !input_tag.contains(transport),
                 "the field must not carry {transport}: {input_tag}"
@@ -4597,7 +4841,7 @@ mod tests {
         // (inside the money region), so lines and total can never drift.
         assert!(added.contains(&scanned.name), "{added:.600}");
         assert!(
-            added.contains("$40"),
+            added.contains("40 USD"),
             "the running total travels with the lines: {added:.800}"
         );
         assert_entry_row_is_empty_and_focused(&added);
@@ -4638,7 +4882,7 @@ mod tests {
         assert_eq!(clicked.qty, Decimal::from(3));
         assert_eq!(clicked.unit_cost, Decimal::from(10));
         assert_eq!(detail.total, Decimal::from(50));
-        assert!(body.contains("$50"), "{body:.800}");
+        assert!(body.contains("50 USD"), "{body:.800}");
     }
 
     /// AC12: an unresolvable value is a clear 400 that names the number of partial
@@ -4726,7 +4970,11 @@ mod tests {
             .find(|l| l.product_id == fixture.product_id)
             .unwrap();
         assert_eq!(line.qty, dec_web("5"), "the merged quantity is the sum");
-        assert_eq!(line.unit_cost, dec_web("10"), "the stored cost does not move");
+        assert_eq!(
+            line.unit_cost,
+            dec_web("10"),
+            "the stored cost does not move"
+        );
 
         // The 400 survives only for a different explicit cost, with the exact
         // message the strict rule always produced.
@@ -4757,7 +5005,11 @@ mod tests {
             .iter()
             .find(|l| l.product_id == fixture.product_id)
             .unwrap();
-        assert_eq!(line.qty, dec_web("5"), "the refusal leaves the quantity untouched");
+        assert_eq!(
+            line.qty,
+            dec_web("5"),
+            "the refusal leaves the quantity untouched"
+        );
     }
 
     // The asymmetry is deliberate (S5b): the web route merges a same-cost
@@ -4881,7 +5133,9 @@ mod tests {
         let (st, html) = get_html(app.clone(), "/web/purchases/suggestions").await;
         assert_eq!(st, StatusCode::OK);
         assert!(
-            html.contains("Seed Sup") && html.contains("48") && html.contains("Without supplier cost"),
+            html.contains("Seed Sup")
+                && html.contains("48")
+                && html.contains("Without supplier cost"),
             "suggestion fragment should render costed and unsourced rows: {html:.400}"
         );
 
@@ -4989,16 +5243,16 @@ mod tests {
 
         for (uri, code) in [
             ("/purchases".to_string(), "purchases.read"),
-            (format!("/purchases/{}", fixture.purchase_id), "purchases.read"),
+            (
+                format!("/purchases/{}", fixture.purchase_id),
+                "purchases.read",
+            ),
             ("/web/purchases".to_string(), "purchases.read"),
             (
                 format!("/web/purchases/{}", fixture.purchase_id),
                 "purchases.read",
             ),
-            (
-                "/web/purchases/suggestions".to_string(),
-                "inventory.read",
-            ),
+            ("/web/purchases/suggestions".to_string(), "inventory.read"),
         ] {
             let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
@@ -5454,7 +5708,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(purchases_after, purchases_before, "a refused create must write nothing");
+        assert_eq!(
+            purchases_after, purchases_before,
+            "a refused create must write nothing"
+        );
 
         let (status, body) = post_form_as(
             app.clone(),
@@ -5498,7 +5755,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(payments_after, payments_before, "a refused payment must write nothing");
+        assert_eq!(
+            payments_after, payments_before,
+            "a refused payment must write nothing"
+        );
     }
 
     /// A principal holding the permissions gets the normal answers: the
@@ -5778,8 +6038,11 @@ mod tests {
 
         let app = crate::routes::router(state);
 
-        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", discarded.purchase_id))
-            .await;
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/purchases/{}", discarded.purchase_id),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let needle = format!("hx-delete=\"/web/purchases/{}\"", discarded.purchase_id);
         assert!(
@@ -5794,7 +6057,10 @@ mod tests {
         let (status, html) = get_html(app, &format!("/purchases/{}", annulled.purchase_id)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            !html.contains(&format!("hx-delete=\"/web/purchases/{}\"", annulled.purchase_id)),
+            !html.contains(&format!(
+                "hx-delete=\"/web/purchases/{}\"",
+                annulled.purchase_id
+            )),
             "a confirmed-then-cancelled record must offer no delete: {html:.400}"
         );
     }

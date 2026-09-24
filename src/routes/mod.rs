@@ -11,30 +11,46 @@ pub mod purchases_web;
 pub mod roles_web;
 pub mod sales_api;
 pub mod sales_web;
+pub mod settings_web;
+pub mod setup_web;
 pub mod suppliers_web;
 pub mod users_web;
 pub mod web;
 
-use axum::{http::StatusCode, response::IntoResponse, Json, Router};
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json, Router,
+};
 use sqlx::{Row as _, SqlitePool};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tower_http::services::ServeDir;
 
 use crate::error::AppResult;
+use crate::localization::load_context;
 
 use crate::repositories::{
-    SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-    SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
-    SqlitePaymentMethodRepository, SqliteProductRepository,
-    SqliteProductSupplierCostRepository, SqlitePurchaseRepository, SqliteRoleRepository,
-    SqliteSaleRepository, SqliteStockMovementRepository, SqliteSupplierRepository,
-    SqliteSessionRepository, SqliteTransactionRepository, SqliteUserRepository,
+    SqliteAccountRepository, SqliteBarcodeRepository, SqliteBusinessConfigurationRepository,
+    SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
+    SqliteDocSequenceRepository,
+    SqlitePaymentMethodRepository, SqliteProductRepository, SqliteProductSupplierCostRepository,
+    SqliteProductTaxRepository, SqlitePurchaseRepository, SqliteRoleRepository,
+    SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
+    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxRepository,
+    SqliteTransactionRepository, SqliteUserRepository,
 };
+use crate::routes::setup_web::setup_gate;
 use crate::security::auth_middleware;
 use crate::services::identity::{SystemClock, ThrottleConfig};
 use crate::services::{
     AccountService, CustomerReceiptService, CustomerService, DocumentService, IdentityService,
-    InventoryService, PaymentMethodService, PurchasesService, SalesService, SupplierService,
-    TransactionService,
+    InventoryService, PaymentMethodService, PurchasesService, SalesService, SettingsService,
+    SetupService, SupplierService, TaxService, TransactionService,
 };
 
 pub type InventorySvc = InventoryService<
@@ -87,6 +103,9 @@ pub type ReceiptSvc = CustomerReceiptService<
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
 
+pub type TaxSvc =
+    TaxService<SqliteProductRepository, SqliteTaxRepository, SqliteProductTaxRepository>;
+
 pub type SupplierSvc =
     SupplierService<SqliteSupplierRepository, SqliteProductSupplierCostRepository>;
 
@@ -114,6 +133,10 @@ pub type IdentitySvc = IdentityService<
     crate::security::PasswordHasher,
 >;
 
+pub type SetupSvc = SetupService<SqliteSetupRepository, crate::security::PasswordHasher>;
+
+pub type SettingsSvc = SettingsService<SqliteBusinessConfigurationRepository>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -125,11 +148,15 @@ pub struct AppState {
     pub customer_service: CustomerSvc,
     pub customer_receipt_service: ReceiptSvc,
     pub payment_method_service: MethodSvc,
+    pub tax_service: TaxSvc,
     pub supplier_service: SupplierSvc,
     pub purchases_service: PurchasesSvc,
     /// Identity kernel service (S1b): the single session-validity opinion the
     /// guard and the login/logout routes share.
     pub identity_service: IdentitySvc,
+    pub setup_service: SetupSvc,
+    pub settings_service: SettingsSvc,
+    setup_required: Arc<AtomicBool>,
     /// The documents index (`/documents`): the four families' read paths,
     /// every filter already permission-narrowed by the route. Wired exactly
     /// like the sibling services (it derives `Clone`, so no `Arc` wrapper).
@@ -218,10 +245,14 @@ impl AppState {
             SqliteStockMovementRepository::new(pool.clone()),
             allow_negative_stock,
         );
+        let tax_service = TaxService::new(
+            SqliteProductRepository::new(pool.clone()),
+            SqliteTaxRepository::new(pool.clone()),
+            SqliteProductTaxRepository::new(pool.clone()),
+        );
         let method_repo = SqlitePaymentMethodRepository::new(pool.clone());
         let payment_method_service = PaymentMethodService::new(method_repo.clone());
-        let customer_service =
-            CustomerService::new(SqliteCustomerRepository::new(pool.clone()));
+        let customer_service = CustomerService::new(SqliteCustomerRepository::new(pool.clone()));
         let sales_service = SalesService::new(
             SqliteSaleRepository::new(pool.clone()),
             SqliteDocSequenceRepository::new(pool.clone()),
@@ -262,6 +293,13 @@ impl AppState {
             SqliteCustomerReceiptRepository::new(pool.clone()),
             SqliteStockMovementRepository::new(pool.clone()),
         );
+        let setup_service = SetupService::new(
+            SqliteSetupRepository::new(pool.clone()),
+            crate::security::PasswordHasher::production(),
+        );
+        let settings_service = SettingsService::new(
+            SqliteBusinessConfigurationRepository::new(pool.clone()),
+        );
         Self {
             pool,
             account_service,
@@ -271,14 +309,33 @@ impl AppState {
             customer_service,
             customer_receipt_service,
             payment_method_service,
+            tax_service,
             supplier_service,
             purchases_service,
             identity_service,
+            setup_service,
+            settings_service,
+            setup_required: Arc::new(AtomicBool::new(false)),
             document_service,
             allow_negative,
             allow_negative_stock,
             enforce_credit_limit,
         }
+    }
+
+    /// Refresh the startup gate from the business configuration singleton.
+    pub async fn refresh_setup_requirement(&self) -> AppResult<()> {
+        self.setup_required
+            .store(self.setup_service.is_required().await?, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn setup_required(&self) -> bool {
+        self.setup_required.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_setup_complete(&self) {
+        self.setup_required.store(false, Ordering::Release);
     }
 }
 
@@ -302,7 +359,11 @@ pub async fn audit_actor_names(
     // small and the ids are integers; dedupe keeps the statement small.
     let distinct: Vec<i64> = {
         let mut seen = std::collections::BTreeSet::new();
-        actor_ids.iter().copied().filter(|id| seen.insert(*id)).collect()
+        actor_ids
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id))
+            .collect()
     };
     let mut names: std::collections::BTreeMap<i64, String> = Default::default();
     if distinct.is_empty() {
@@ -347,11 +408,10 @@ pub async fn audit_actor_ids(pool: &SqlitePool, needle: &str) -> AppResult<Optio
         return Ok(None);
     }
     let needle = crate::models::normalize_search(trimmed);
-    let rows = sqlx::query_as::<_, (i64, String, String)>(
-        "SELECT id, display_name, username FROM users",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query_as::<_, (i64, String, String)>("SELECT id, display_name, username FROM users")
+            .fetch_all(pool)
+            .await?;
     Ok(Some(
         rows.into_iter()
             .filter(|(_, display_name, username)| {
@@ -363,10 +423,24 @@ pub async fn audit_actor_ids(pool: &SqlitePool, needle: &str) -> AppResult<Optio
     ))
 }
 
+/// Resolve presentation metadata once per request and make it available to
+/// full pages, HTMX fragments, and the static picker boundary. The context is
+/// an extension only: repositories and domain services remain locale-free.
+async fn localization_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> AppResult<Response> {
+    let context = load_context(&state.pool).await?;
+    request.extensions_mut().insert(context);
+    Ok(next.run(request).await)
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(api::router())
         .merge(web::router())
+        .merge(setup_web::router())
         .merge(identity_web::router())
         .merge(identity_api::router())
         .merge(customers_api::router())
@@ -381,6 +455,7 @@ pub fn router(state: AppState) -> Router {
         .merge(suppliers_web::router())
         .merge(users_web::router())
         .merge(roles_web::router())
+        .merge(settings_web::router())
         .nest_service("/static", ServeDir::new("static"))
         .fallback(route_not_found)
         // Deny by default (S1b part 2): one gate in front of every route and
@@ -388,6 +463,14 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            setup_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            localization_middleware,
         ))
         .with_state(state)
 }
@@ -470,7 +553,10 @@ mod tests {
             let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
                 .await
                 .unwrap();
-            assert!(!bytes.is_empty(), "{uri} must serve real bytes, not an empty body");
+            assert!(
+                !bytes.is_empty(),
+                "{uri} must serve real bytes, not an empty body"
+            );
         }
     }
 }

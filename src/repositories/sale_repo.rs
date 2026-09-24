@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    DocumentKind, DocumentQuery, DocumentRow, NewSale, PaymentType, Sale, SaleLine,
-    SaleListFilter, SalePayment, SaleStatus, UpdateSaleDraft,
+    DocumentKind, DocumentQuery, DocumentRow, NewSale, PaymentType, Sale, SaleLine, SaleListFilter,
+    SalePayment, SaleStatus, UpdateSaleDraft,
 };
 
 fn parse_decimal(s: &str) -> Decimal {
@@ -78,6 +78,8 @@ fn row_to_line(row: sqlx::sqlite::SqliteRow) -> SaleLine {
 
 fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> SalePayment {
     let amt_str: String = row.get("amount");
+    let created_at = row.get("created_at");
+    let updated_at = row.try_get("updated_at").unwrap_or(created_at);
     SalePayment {
         id: row.get("id"),
         sale_id: row.get("sale_id"),
@@ -90,10 +92,13 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> SalePayment {
         receipt_id: row.get("receipt_id"),
         // Only the receipt-allocation query selects `sale_number`; every other
         // payment read leaves it `None`.
-        sale_number: row.try_get::<Option<String>, _>("sale_number").unwrap_or(None),
+        sale_number: row
+            .try_get::<Option<String>, _>("sale_number")
+            .unwrap_or(None),
         created_by: row.get("created_by"),
         updated_by: row.get("updated_by"),
-        created_at: row.get("created_at"),
+        created_at,
+        updated_at,
     }
 }
 
@@ -118,7 +123,12 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 pub trait SaleRepository: Send + Sync {
     /// `customer_name` is the snapshot resolved by the service through
     /// `CustomerService`; this layer never reads the `customers` table.
-    async fn create_sale(&self, actor: i64, input: &NewSale, customer_name: &str) -> AppResult<Sale>;
+    async fn create_sale(
+        &self,
+        actor: i64,
+        input: &NewSale,
+        customer_name: &str,
+    ) -> AppResult<Sale>;
     async fn find_sale(&self, id: i64) -> AppResult<Option<Sale>>;
     async fn find_sale_by_number(&self, number: &str) -> AppResult<Option<Sale>>;
     async fn list_sales(&self) -> AppResult<Vec<Sale>>;
@@ -161,8 +171,7 @@ pub trait SaleRepository: Send + Sync {
     ) -> AppResult<SaleLine>;
     async fn find_line(&self, id: i64) -> AppResult<Option<SaleLine>>;
     async fn list_lines(&self, sale_id: i64) -> AppResult<Vec<SaleLine>>;
-    async fn update_line(&self, id: i64, qty: Decimal, unit_price: Decimal)
-        -> AppResult<SaleLine>;
+    async fn update_line(&self, id: i64, qty: Decimal, unit_price: Decimal) -> AppResult<SaleLine>;
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
     /// Delete a DRAFT sale — or a DISCARDED one (Cancelled while never
@@ -220,8 +229,10 @@ pub trait SaleRepository: Send + Sync {
     /// The SALE-PAYMENTS family of the documents index: the payment joined to
     /// its sale so the row names the sale the way the operator does (number, or
     /// `Draft #id`) and shows the frozen customer name.
-    async fn list_payment_document_rows(&self, query: &DocumentQuery)
-        -> AppResult<Vec<DocumentRow>>;
+    async fn list_payment_document_rows(
+        &self,
+        query: &DocumentQuery,
+    ) -> AppResult<Vec<DocumentRow>>;
 
     /// `receipt_id -> Σ amount` for every payment grouped under the given
     /// receipts. The receipt family's total comes from here so
@@ -254,8 +265,7 @@ impl SqliteSaleRepository {
     /// Count one repository read (test builds only).
     #[cfg(test)]
     fn tick(&self) {
-        self.reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Reset and read the test-only read counter.
@@ -272,7 +282,12 @@ impl SqliteSaleRepository {
 
 #[async_trait]
 impl SaleRepository for SqliteSaleRepository {
-    async fn create_sale(&self, actor: i64, input: &NewSale, customer_name: &str) -> AppResult<Sale> {
+    async fn create_sale(
+        &self,
+        actor: i64,
+        input: &NewSale,
+        customer_name: &str,
+    ) -> AppResult<Sale> {
         let receipt = input.receipt_no.clone().and_then(|s| {
             let t = s.trim().to_string();
             if t.is_empty() {
@@ -442,7 +457,7 @@ impl SaleRepository for SqliteSaleRepository {
         self.tick();
 
         let mut payments_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at FROM sale_payments WHERE sale_id IN (",
+            "SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at, updated_at FROM sale_payments WHERE sale_id IN (",
         );
         {
             let mut separated = payments_qb.separated(", ");
@@ -614,12 +629,7 @@ impl SaleRepository for SqliteSaleRepository {
         Ok(rows.into_iter().map(row_to_line).collect())
     }
 
-    async fn update_line(
-        &self,
-        id: i64,
-        qty: Decimal,
-        unit_price: Decimal,
-    ) -> AppResult<SaleLine> {
+    async fn update_line(&self, id: i64, qty: Decimal, unit_price: Decimal) -> AppResult<SaleLine> {
         let row = sqlx::query(
             r#"UPDATE sale_lines SET qty = ?, unit_price = ? WHERE id = ?
                RETURNING id, sale_id, product_id, qty, unit_price, created_at"#,
@@ -657,8 +667,8 @@ impl SaleRepository for SqliteSaleRepository {
                       OR (status = 'Cancelled' AND sale_number IS NULL))"#,
         )
         .bind(id)
-            .execute(&self.pool)
-            .await?;
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -676,7 +686,7 @@ impl SaleRepository for SqliteSaleRepository {
         let row = sqlx::query(
             r#"INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, transaction_id, receipt_id, created_by)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at"#,
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(sale_id)
         .bind(account_id)
@@ -699,8 +709,11 @@ impl SaleRepository for SqliteSaleRepository {
         refund_transaction_id: i64,
     ) -> AppResult<SalePayment> {
         let row = sqlx::query(
-            r#"UPDATE sale_payments SET refund_transaction_id = ?, updated_by = ? WHERE id = ?
-               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at"#,
+            r#"UPDATE sale_payments
+               SET refund_transaction_id = ?, updated_by = ?,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ?
+               RETURNING id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(refund_transaction_id)
         .bind(actor)
@@ -715,7 +728,7 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
         let rows = sqlx::query(
-            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at, updated_at
                FROM sale_payments WHERE sale_id = ? ORDER BY id"#,
         )
         .bind(sale_id)
@@ -728,7 +741,7 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
         let row = sqlx::query(
-            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at
+            r#"SELECT id, sale_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, receipt_id, created_by, updated_by, created_at, updated_at
                FROM sale_payments WHERE id = ?"#,
         )
         .bind(id)
@@ -927,9 +940,8 @@ impl SaleRepository for SqliteSaleRepository {
             // Nothing was asked: no query, no rows, an empty map.
             return Ok(std::collections::BTreeMap::new());
         }
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT receipt_id, amount FROM sale_payments WHERE receipt_id IN (",
-        );
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new("SELECT receipt_id, amount FROM sale_payments WHERE receipt_id IN (");
         {
             let mut separated = qb.separated(", ");
             for id in receipt_ids {
@@ -941,8 +953,7 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
 
-        let mut out: std::collections::BTreeMap<i64, Decimal> =
-            std::collections::BTreeMap::new();
+        let mut out: std::collections::BTreeMap<i64, Decimal> = std::collections::BTreeMap::new();
         for row in rows {
             let receipt_id: i64 = row.get("receipt_id");
             let amount_str: String = row.get("amount");
@@ -1008,17 +1019,15 @@ mod tests {
         );
 
         // Legacy data going through the rebuild: sale + line + payment.
-        let (walkin_id,): (i64,) =
-            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+        let (walkin_id,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (account_id,): (i64,) =
+            sqlx::query_as("INSERT INTO accounts (name) VALUES ('legacy wallet') RETURNING id")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let (account_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO accounts (name) VALUES ('legacy wallet') RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
         let (method_id,): (i64,) =
             sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
                 .fetch_one(&pool)
@@ -1065,10 +1074,7 @@ mod tests {
             .iter()
             .find(|m| m.description.contains("add sales customer"))
             .expect("add_sales_customer migration is missing");
-        sqlx::raw_sql(k2.sql.clone())
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::raw_sql(k2.sql.clone()).execute(&pool).await.unwrap();
 
         // K2 owns `sales.customer_id`; only now can the migrations that depend on
         // it (customer receipts and the receipt-link triggers) be replayed.
@@ -1100,12 +1106,11 @@ mod tests {
         );
 
         // Child rows survived the parent rebuild.
-        let (lines,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?")
-                .bind(legacy_sale_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (lines,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?")
+            .bind(legacy_sale_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (payments,): (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
                 .bind(legacy_sale_id)
@@ -1149,7 +1154,10 @@ mod tests {
         .unwrap();
         assert_eq!(kept_idx, 2, "pre-existing sales indexes must survive");
         assert!(
-            sqlx::query("PRAGMA foreign_key_check").execute(&pool).await.is_ok(),
+            sqlx::query("PRAGMA foreign_key_check")
+                .execute(&pool)
+                .await
+                .is_ok(),
             "the rebuilt database must pass the foreign key check"
         );
     }
@@ -1180,7 +1188,6 @@ mod tests {
         }
     }
 
-
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
@@ -1204,17 +1211,15 @@ mod tests {
             .unwrap()
         {
             Some(id) => id,
-            None => {
-                sqlx::query_scalar(
-                    r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+            None => sqlx::query_scalar(
+                r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
                        VALUES ('DOC-P', 'doc prod', 'Product', 'un', '10', 1, ?)
                        RETURNING id"#,
-                )
-                .bind(actor)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-            }
+            )
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
         }
     }
 
@@ -1227,11 +1232,10 @@ mod tests {
         date: NaiveDate,
         actor: i64,
     ) -> i64 {
-        let (walkin,): (i64,) =
-            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let (walkin,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap();
         sqlx::query_scalar(
             r#"INSERT INTO sales (sale_number, status, payment_type, customer_id, customer_name, sale_date, created_by)
                VALUES (?, 'Confirmed', 'Credit', ?, ?, ?, ?)
@@ -1254,35 +1258,36 @@ mod tests {
             .await
             .unwrap();
         let product = product_id(pool, actor).await;
-        sqlx::query("INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) VALUES (?, ?, ?, ?)")
-            .bind(sale_id)
-            .bind(product)
-            .bind(qty)
-            .bind(price)
-            .execute(pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) VALUES (?, ?, ?, ?)",
+        )
+        .bind(sale_id)
+        .bind(product)
+        .bind(qty)
+        .bind(price)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     async fn account_and_method(pool: &SqlitePool, actor: i64) -> (i64, i64) {
         // One wallet per test database: the name is UNIQUE, so reuse it when a
         // second payment in the same test needs the pair.
-        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
-            .fetch_optional(pool)
-            .await
-            .unwrap()
-        {
-            Some(id) => id,
-            None => {
-                sqlx::query_scalar(
+        let account: i64 =
+            match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
+                .fetch_optional(pool)
+                .await
+                .unwrap()
+            {
+                Some(id) => id,
+                None => sqlx::query_scalar(
                     "INSERT INTO accounts (name, created_by) VALUES ('doc wallet', ?) RETURNING id",
                 )
                 .bind(actor)
                 .fetch_one(pool)
                 .await
-                .unwrap()
-            }
-        };
+                .unwrap(),
+            };
         let (method,): (i64,) =
             sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
                 .fetch_one(pool)
@@ -1325,7 +1330,14 @@ mod tests {
         let repo = SqliteSaleRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
 
-        let confirmed = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        let confirmed = seed_sale(
+            &pool,
+            Some("2024-SALE-000001"),
+            "Pérez",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         seed_line(&pool, confirmed, "2", "10").await;
         seed_line(&pool, confirmed, "3", "2.5").await; // Σ = 20 + 7.5 = 27.5
         let draft = seed_sale(&pool, None, "Díaz", d(2024, 5, 3), actor).await;
@@ -1374,8 +1386,22 @@ mod tests {
             .unwrap();
         assert_ne!(sistema, other);
 
-        let mine = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), sistema).await;
-        let theirs = seed_sale(&pool, Some("2024-SALE-000002"), "Díaz", d(2024, 5, 3), other).await;
+        let mine = seed_sale(
+            &pool,
+            Some("2024-SALE-000001"),
+            "Pérez",
+            d(2024, 5, 2),
+            sistema,
+        )
+        .await;
+        let theirs = seed_sale(
+            &pool,
+            Some("2024-SALE-000002"),
+            "Díaz",
+            d(2024, 5, 3),
+            other,
+        )
+        .await;
 
         let only_sistema = repo
             .list_document_rows(&DocumentQuery {
@@ -1426,10 +1452,38 @@ mod tests {
         let pool = documents_pool().await;
         let repo = SqliteSaleRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let early = seed_sale(&pool, Some("2024-SALE-000001"), "Early", d(2024, 5, 1), actor).await;
-        let first = seed_sale(&pool, Some("2024-SALE-000002"), "First", d(2024, 5, 2), actor).await;
-        let last = seed_sale(&pool, Some("2024-SALE-000003"), "Last", d(2024, 5, 4), actor).await;
-        let late = seed_sale(&pool, Some("2024-SALE-000004"), "Late", d(2024, 5, 5), actor).await;
+        let early = seed_sale(
+            &pool,
+            Some("2024-SALE-000001"),
+            "Early",
+            d(2024, 5, 1),
+            actor,
+        )
+        .await;
+        let first = seed_sale(
+            &pool,
+            Some("2024-SALE-000002"),
+            "First",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        let last = seed_sale(
+            &pool,
+            Some("2024-SALE-000003"),
+            "Last",
+            d(2024, 5, 4),
+            actor,
+        )
+        .await;
+        let late = seed_sale(
+            &pool,
+            Some("2024-SALE-000004"),
+            "Late",
+            d(2024, 5, 5),
+            actor,
+        )
+        .await;
 
         let rows = repo
             .list_document_rows(&DocumentQuery {
@@ -1454,8 +1508,22 @@ mod tests {
         let pool = documents_pool().await;
         let repo = SqliteSaleRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        seed_sale(&pool, Some("2024-SALE-000001"), "González", d(2024, 5, 2), actor).await;
-        seed_sale(&pool, Some("2024-SALE-000002"), "Pérez", d(2024, 5, 3), actor).await;
+        seed_sale(
+            &pool,
+            Some("2024-SALE-000001"),
+            "González",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        seed_sale(
+            &pool,
+            Some("2024-SALE-000002"),
+            "Pérez",
+            d(2024, 5, 3),
+            actor,
+        )
+        .await;
 
         // Partial, case-insensitive number match.
         let rows = repo
@@ -1582,7 +1650,14 @@ mod tests {
         let repo = SqliteSaleRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
 
-        let confirmed = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        let confirmed = seed_sale(
+            &pool,
+            Some("2024-SALE-000001"),
+            "Pérez",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         let draft = seed_sale(&pool, None, "Díaz", d(2024, 5, 3), actor).await;
         seed_payment(&pool, confirmed, "10", d(2024, 5, 10), actor, None).await;
         seed_payment(&pool, draft, "5", d(2024, 5, 11), actor, None).await;
@@ -1630,11 +1705,22 @@ mod tests {
         let pool = documents_pool().await;
         let repo = SqliteSaleRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let sale = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        let sale = seed_sale(
+            &pool,
+            Some("2024-SALE-000001"),
+            "Pérez",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         let payment_id = seed_payment(&pool, sale, "10", d(2024, 5, 10), actor, None).await;
 
         repo.reset_reads();
-        let found = repo.find_payment(payment_id).await.unwrap().expect("payment exists");
+        let found = repo
+            .find_payment(payment_id)
+            .await
+            .unwrap()
+            .expect("payment exists");
         assert_eq!(found.id, payment_id);
         assert_eq!(found.sale_id, sale);
         assert_eq!(found.amount, dec("10"));
@@ -1658,11 +1744,10 @@ mod tests {
         let repo = SqliteSaleRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let (account, method) = account_and_method(&pool, actor).await;
-        let (walkin,): (i64,) =
-            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (walkin,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let receipt_a: i64 = sqlx::query_scalar(
             r#"INSERT INTO customer_receipts (customer_id, account_id, method_id, date, created_by)
                VALUES (?, ?, ?, '2024-06-01', ?) RETURNING id"#,
@@ -1685,7 +1770,14 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let sale = seed_sale(&pool, Some("2024-SALE-000001"), "Pérez", d(2024, 5, 2), actor).await;
+        let sale = seed_sale(
+            &pool,
+            Some("2024-SALE-000001"),
+            "Pérez",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         seed_payment(&pool, sale, "10", d(2024, 6, 1), actor, Some(receipt_a)).await;
         seed_payment(&pool, sale, "2.5", d(2024, 6, 1), actor, Some(receipt_a)).await;
         seed_payment(&pool, sale, "7", d(2024, 6, 2), actor, Some(receipt_b)).await;
@@ -1729,11 +1821,10 @@ mod tests {
         date: NaiveDate,
         actor: i64,
     ) -> i64 {
-        let (walkin,): (i64,) =
-            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let (walkin,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap();
         sqlx::query_scalar(
             r#"INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date, created_by)
                VALUES (?, 'Cash', ?, ?, ?, ?)
@@ -1790,8 +1881,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let other =
-            seed_sale_with_status(&pool, "Draft", "Keep Buyer", d(2024, 5, 3), actor).await;
+        let other = seed_sale_with_status(&pool, "Draft", "Keep Buyer", d(2024, 5, 3), actor).await;
         sqlx::query(
             "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) VALUES (?, ?, '3', '10')",
         )
@@ -1808,7 +1898,12 @@ mod tests {
             "the draft row must be gone"
         );
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?", draft).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?",
+                draft
+            )
+            .await,
             0,
             "the draft's lines must be gone with it"
         );
@@ -1818,7 +1913,12 @@ mod tests {
             "the other document must survive"
         );
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?", other).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?",
+                other
+            )
+            .await,
             1,
             "the other document's lines must survive"
         );
@@ -1835,14 +1935,9 @@ mod tests {
         let repo = SqliteSaleRepository::new(pool.clone());
         let product = seed_delete_product(&pool, actor).await;
 
-        let confirmed = seed_sale_with_status(
-            &pool,
-            "Confirmed",
-            "Confirmed Buyer",
-            d(2024, 5, 2),
-            actor,
-        )
-        .await;
+        let confirmed =
+            seed_sale_with_status(&pool, "Confirmed", "Confirmed Buyer", d(2024, 5, 2), actor)
+                .await;
         sqlx::query(
             "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price) VALUES (?, ?, '1', '10')",
         )
@@ -1859,7 +1954,12 @@ mod tests {
             "a confirmed sale must survive a direct repository delete attempt"
         );
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?", confirmed).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?",
+                confirmed
+            )
+            .await,
             1,
             "the confirmed sale's lines must survive too"
         );
@@ -1876,14 +1976,9 @@ mod tests {
         let pool = migrated_pool().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let repo = SqliteSaleRepository::new(pool.clone());
-        let cancelled = seed_sale_with_status(
-            &pool,
-            "Cancelled",
-            "Cancelled Buyer",
-            d(2024, 5, 2),
-            actor,
-        )
-        .await;
+        let cancelled =
+            seed_sale_with_status(&pool, "Cancelled", "Cancelled Buyer", d(2024, 5, 2), actor)
+                .await;
         sqlx::query("UPDATE sales SET sale_number = '2024-SALE-000001' WHERE id = ?")
             .bind(cancelled)
             .execute(&pool)
@@ -1939,7 +2034,12 @@ mod tests {
             "the discarded row must be gone"
         );
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?", discarded).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?",
+                discarded
+            )
+            .await,
             0,
             "its lines must be gone with it"
         );
@@ -1949,7 +2049,12 @@ mod tests {
             "the sibling discarded sale must survive"
         );
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?", other).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM sale_lines WHERE sale_id = ?",
+                other
+            )
+            .await,
             1,
             "the sibling's lines must survive"
         );

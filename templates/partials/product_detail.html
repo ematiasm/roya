@@ -22,14 +22,14 @@
       <span class="chip {% if product.kind.to_string() == "Service" %}chip-expense{% else %}chip-income{% endif %}">{{ product.kind }}</span>
       <span class="chip {% if product.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if product.is_active %}active{% else %}inactive{% endif %}</span>
       {% if let Some(sug) = suggested %}
-      <span class="chip chip-expense">low • suggest {{ sug }}</span>
+      <span class="chip chip-expense">low • suggest {{ localization.format_quantity(sug.clone()) }}</span>
       {% endif %}
       {% if stock.is_sign_negative() %}
       <span class="chip chip-expense">negative</span>
       {% endif %}
     </div>
-    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • ${{ product.sale_price_display() }}</div>
-    <div class="text-[13px] text-muted">stock {{ stock }}{% if let Some(min) = product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = product.max_stock %} • max {{ max }}{% endif %}</div>
+    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • {{ localization.format_currency(product.sale_price.clone()) }}</div>
+    <div class="text-[13px] text-muted">stock {{ localization.format_quantity(stock.clone()) }}{% if let Some(min) = product.min_stock %} • min {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • max {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
     {# Audit attribution (M5 Phase B): who registered the product and who last
        changed it, shown as a display name resolved in the wiring layer — the
        same rows the finance detail shows. The sentinel renders as its own
@@ -101,22 +101,22 @@
              enforcement — whenever a markup is present the server ignores
              this field and derives the price from the cost, so the readonly
              state here only mirrors what the server already does. #}
-          <input id="edit-product-sale-price" type="number" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ product.sale_price_display() }}" class="field" />
+          <input id="edit-product-sale-price" type="text" inputmode="decimal" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ localization.format_decimal(product.sale_price.clone()) }}" class="field" />
           {% if product.markup_pct.is_some() %}
           {# The readonly field shows the stored price from the last save; the
              derivation from the cost is server-side, so the number only moves
              when the product is saved. #}
-          <div class="text-[13px] text-muted">Recalculated from the cost and the {{ product.markup_pct.unwrap() }}% markup when you save.</div>
+          <div class="text-[13px] text-muted">Recalculated from the cost and the {{ localization.format_percentage(product.markup_pct.unwrap()) }} markup when you save.</div>
           {% endif %}
         </div>
         <div>
           <label class="field-label">Cost price</label>
-          <input type="number" name="cost_price" step="0.01" value="{{ product.cost_price_display() }}" class="field" />
+          <input type="text" inputmode="decimal" name="cost_price" step="0.01" value="{{ localization.format_decimal(product.cost_price.clone()) }}" class="field" />
         </div>
       </div>
       <div>
         <label class="field-label">Markup % (optional)</label>
-        <input id="edit-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ m }}"{% endif %} class="field" />
+        <input id="edit-product-markup" type="text" inputmode="decimal" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ localization.format_decimal(m.clone()) }}"{% endif %} class="field" />
       </div>
       <div>
         <label class="field-label">Category</label>
@@ -135,11 +135,11 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label class="field-label">Min stock</label>
-          <input type="number" name="min_stock" step="0.01" {% if let Some(v) = product.min_stock %}value="{{ v }}"{% endif %} class="field" />
+          <input type="text" inputmode="decimal" name="min_stock" step="0.01" {% if let Some(v) = product.min_stock %}value="{{ localization.format_decimal(v.clone()) }}"{% endif %} class="field" />
         </div>
         <div>
           <label class="field-label">Max stock</label>
-          <input type="number" name="max_stock" step="0.01" {% if let Some(v) = product.max_stock %}value="{{ v }}"{% endif %} class="field" />
+          <input type="text" inputmode="decimal" name="max_stock" step="0.01" {% if let Some(v) = product.max_stock %}value="{{ localization.format_decimal(v.clone()) }}"{% endif %} class="field" />
         </div>
       </div>
       <div>
@@ -174,6 +174,45 @@
     </script>
   </section>
 
+  <section class="rounded-2xl border border-border bg-card p-5">
+    <div class="mb-1.5 font-bold text-[13px] text-muted">Taxes ({{ product_taxes.len() }})</div>
+    {% if product_taxes.is_empty() %}
+    <div class="mb-3 text-[13px] text-muted">No taxes linked to this product.</div>
+    {% else %}
+    <div class="mb-3 flex flex-col gap-2">
+      {% for linked in product_taxes %}
+      <div class="flex items-center justify-between gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-2.5">
+        <div>
+          <div class="font-semibold">{{ linked.tax.code }} — {{ linked.tax.name }}</div>
+          <div class="text-[13px] text-muted">{{ localization.format_percentage(linked.tax.rate.clone()) }}{% if !linked.tax.is_active %} • inactive{% endif %}</div>
+        </div>
+        <form hx-post="/web/product-taxes/unlink" hx-target="#product-drawer-body" hx-swap="innerHTML">
+          <input type="hidden" name="product_id" value="{{ product.id }}" />
+          <input type="hidden" name="tax_id" value="{{ linked.tax.id }}" />
+          <button class="btn-secondary" type="submit">Unlink</button>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <form class="flex items-end gap-2"
+          data-action="Link product tax"
+          hx-post="/web/product-taxes"
+          hx-target="#product-drawer-body"
+          hx-swap="innerHTML">
+      <input type="hidden" name="product_id" value="{{ product.id }}" />
+      <div class="flex-1">
+        <label class="field-label">Active tax</label>
+        <select class="field" name="tax_id" required {% if available_taxes.is_empty() %}disabled{% endif %}>
+          {% for tax in available_taxes %}
+          <option value="{{ tax.id }}">{{ tax.code }} — {{ tax.name }} ({{ localization.format_percentage(tax.rate.clone()) }})</option>
+          {% endfor %}
+        </select>
+      </div>
+      <button class="btn-primary" type="submit" {% if available_taxes.is_empty() %}disabled{% endif %}>Link tax</button>
+    </form>
+  </section>
+
   {# Card B: the per-supplier cost satellite, read from the product side. The
      alert is derived (previous vs current), never stored; `products.cost_price`
      is only the fallback when this list is empty. #}
@@ -188,7 +227,7 @@
     {% if let Some(stale) = stale_cost %}
     <div class="mb-3 flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
       <span class="chip chip-muted">stale cost</span>
-      <span class="text-[13px] text-muted">reference ${{ stale.reference_display() }} • stored ${{ stale.stored_display() }}</span>
+      <span class="text-[13px] text-muted">reference {{ localization.format_currency(stale.reference.clone()) }} • stored {{ localization.format_currency(stale.stored.clone()) }}</span>
     </div>
     {% endif %}
     {% if supplier_costs.is_empty() %}
@@ -203,7 +242,7 @@
             <span class="chip {% if cost.cost.price_alert().to_string() == "Raised" %}chip-expense{% else if cost.cost.price_alert().to_string() == "Lowered" %}chip-income{% else %}chip-muted{% endif %}">{{ cost.cost.price_alert() }}</span>
             {% endif %}
           </div>
-          <span class="text-[13px] text-muted">${{ cost.cost.current_cost }}{% if let Some(prev) = cost.cost.previous_cost %} • previous {{ prev }}{% endif %} • since {{ cost.cost.current_cost_updated_at }}</span>
+          <span class="text-[13px] text-muted">{{ localization.format_currency(cost.cost.current_cost.clone()) }}{% if let Some(prev) = cost.cost.previous_cost %} • previous {{ localization.format_currency(prev.clone()) }}{% endif %} • since {{ localization.format_date(cost.cost.current_cost_date.clone()) }}</span>
         </div>
         <div>
           {% if cost.cost.is_preferred %}
@@ -239,7 +278,7 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label class="field-label">Cost</label>
-          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
+          <input type="text" inputmode="decimal" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
         </div>
         <div>
           <label class="field-label">Date</label>
@@ -276,7 +315,7 @@
         </div>
         <div>
           <label class="field-label">Qty</label>
-          <input type="number" name="qty" step="0.01" required placeholder="10.00" class="field" />
+          <input type="text" inputmode="decimal" name="qty" step="0.01" required placeholder="10.00" class="field" />
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
@@ -303,7 +342,7 @@
       <div class="text-[13px] text-muted">In=+qty, Out=−qty, Adjust=signed delta.</div>
     </form>
     {% else %}
-    <div class="text-[13px] text-muted">Stock movement is not available for services and untracked products. Derived stock: {{ stock }}</div>
+    <div class="text-[13px] text-muted">Stock movement is not available for services and untracked products. Derived stock: {{ localization.format_quantity(stock.clone()) }}</div>
     {% endif %}
   </section>
 </div>

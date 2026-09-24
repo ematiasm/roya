@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% block html_lang %}{{ localization.locale_code }}{% endblock %}
 {% block title %}Roya — Products{% endblock %}
 {% block content %}
 {# The one-action page_header cannot host two modal buttons, so the page uses the
@@ -62,6 +63,36 @@
       <div class="text-[13px] text-muted">Loading…</div>
     </div>
     <div class="mt-2 text-[13px] text-muted">Suggested reorder = max − stock when stock ≤ min.</div>
+  </div>
+
+  <div class="rounded-2xl border border-border bg-card p-5" id="tax-catalog-section">
+    <div class="mb-3 flex items-center justify-between">
+      <h2 class="text-lg font-semibold">Taxes</h2>
+      <button class="btn-secondary" hx-get="/web/taxes" hx-target="#tax-list" hx-swap="innerHTML">↻ Refresh</button>
+    </div>
+    <div id="tax-list">
+      {% include "partials/tax_list.html" %}
+    </div>
+    <form class="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-[100px_1fr_120px_auto]"
+          data-action="Create tax"
+          hx-post="/web/taxes"
+          hx-target="#tax-list"
+          hx-swap="innerHTML"
+          hx-on::after-request="if(event.detail.successful) this.reset()">
+      <div>
+        <label class="field-label">Code</label>
+        <input class="field" type="text" name="code" required maxlength="32" />
+      </div>
+      <div>
+        <label class="field-label">Name</label>
+        <input class="field" type="text" name="name" required maxlength="128" />
+      </div>
+      <div>
+        <label class="field-label">Rate %</label>
+        <input class="field" type="text" inputmode="decimal" name="rate" required />
+      </div>
+      <button class="btn-primary self-end" type="submit">Create tax</button>
+    </form>
   </div>
 </div>
 
@@ -134,16 +165,16 @@
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
         <label class="field-label">Sale price</label>
-        <input id="new-product-sale-price" type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required class="field" />
+        <input id="new-product-sale-price" type="text" inputmode="decimal" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required class="field" />
       </div>
       <div>
         <label class="field-label">Cost price</label>
-        <input type="number" name="cost_price" step="0.01" min="0" placeholder="0" value="0" class="field" />
+        <input type="text" inputmode="decimal" name="cost_price" step="0.01" min="0" placeholder="0" value="0" class="field" />
       </div>
     </div>
     <div>
       <label class="field-label">Markup % (optional)</label>
-      <input id="new-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" class="field" />
+      <input id="new-product-markup" type="text" inputmode="decimal" name="markup_pct" step="0.01" min="-99" placeholder="25" class="field" />
       <div class="text-[13px] text-muted">With a markup the sale price is derived from the cost; leave empty to set it manually.</div>
     </div>
     <div>
@@ -161,11 +192,11 @@
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
         <label class="field-label">Min stock</label>
-        <input type="number" name="min_stock" step="0.01" min="0" placeholder="5" value="5" class="field" />
+        <input type="text" inputmode="decimal" name="min_stock" step="0.01" min="0" placeholder="5" value="5" class="field" />
       </div>
       <div>
         <label class="field-label">Max stock</label>
-        <input type="number" name="max_stock" step="0.01" min="0" placeholder="50" value="50" class="field" />
+        <input type="text" inputmode="decimal" name="max_stock" step="0.01" min="0" placeholder="50" value="50" class="field" />
       </div>
     </div>
     <div>

@@ -63,14 +63,16 @@ itself always runs headless; nothing in the repository depends on `--headed`.
 - Seeds data through the HTTP API, on the same endpoints a browser calls, so a
   broken endpoint fails the seed loudly instead of being papered over; each seed
   step also reads back the effect, so a 2xx that stored nothing still fails.
-- Logs in once per spawned server: the login gate is deny-by-default, so the
-  harness spawns the binary with a fixed `ROYA_ADMIN_PASSWORD` (no test ever
-  scrapes the once-logged generated password), calls `POST /api/sessions` once
-  right after the server is ready, and both clients then share that session
-  cookie — the HTTP-API seeder sends it on every request and the Playwright
-  browser context is created with it. No test performs a login step of its own;
-  the gate-behaviour tests in `tests/test_identity.py` are the deliberate
-  exception and use an anonymous context.
+- Completes first-run setup once per spawned server by posting the real `/setup`
+  form with fixed business configuration and the initial administrator, then logs
+  in through `POST /api/sessions`. Both clients then share that session cookie —
+  the HTTP-API seeder sends it on every request and the Playwright browser context
+  is created with it. No test performs a login step of its own; the gate-behaviour
+  tests in `tests/test_identity.py` are the deliberate exception and use an
+  anonymous context.
+- Uses the `en-US` browser baseline, with USD and UTC, so dot-decimal form input
+  and server-rendered currency-code text remain stable. Locale-specific parsing
+  and presentation coverage belongs to the Rust localization tests.
 - Uses Playwright's auto-waiting and explicit expectations. No fixed-duration
   sleep ever stands in for a condition: a fixed sleep turns a real failure into a
   slow pass. The only sleeps are the two bounded polling loops that re-check a

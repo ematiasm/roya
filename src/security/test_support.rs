@@ -110,8 +110,8 @@ const _: () = assert!(test_cookie_name_matches_production());
 ///
 /// Since S5 the user holds every permission in the catalog through a real
 /// role grant, so the department routes' `Require<P>` is satisfied for the
-/// shared fixture. The role is a custom one (`probe_all`) holding all 23
-/// codes, granted through the real `SqliteRoleRepository` write path — the
+/// shared fixture. The role is a custom one (`probe_all`) holding the full
+/// catalog, granted through the real `SqliteRoleRepository` write path — the
 /// same grant shape the bootstrap performs (`roles.grant` with
 /// `granted_by` = the user itself, idempotent). Deliberately NOT the
 /// protected `admin` role: the identity screens' fixtures bootstrap the one
@@ -417,7 +417,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             effective.len(),
-            23,
+            24,
             "the seeded test principal must hold the whole catalog"
         );
         assert!(

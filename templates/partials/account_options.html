@@ -1,3 +1,3 @@
 {% for acc in accounts %}
-<option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+<option value="{{ acc.id }}">{{ acc.name }} — {{ localization.format_currency(acc.balance.clone()) }}</option>
 {% endfor %}

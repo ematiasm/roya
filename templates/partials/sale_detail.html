@@ -9,9 +9,9 @@
    both: adding a line swaps that region while the picker is replaced out of
    band, empty and focused, ready for the next scan. #}
 {% import "partials/product_search_results.html" as picker %}
-{% macro record_money(record) %}
+{% macro record_money(record, localization) %}
 <div id="sale-record-money">
-  <div class="my-2 text-2xl font-bold">${{ record.total }} <span class="text-[13px] text-muted">paid {{ record.paid }} • due {{ record.due }}</span></div>
+  <div class="my-2 text-2xl font-bold">{{ localization.format_currency(record.total.clone()) }} <span class="text-[13px] text-muted">paid {{ localization.format_currency(record.paid.clone()) }} • due {{ localization.format_currency(record.due.clone()) }}</span></div>
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
   {% if record.lines.is_empty() %}
@@ -35,9 +35,9 @@
               <span class="font-semibold">{{ line.product_name }}</span>
               <span class="text-[13px] text-muted"> · {{ line.product_sku }}</span>
             </td>
-            <td class="py-2.5 pr-3 text-right tabular-nums">{{ line.qty }}</td>
-            <td class="py-2.5 pr-3 text-right tabular-nums">${{ line.unit_price }}</td>
-            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">${{ line.subtotal }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_quantity(line.qty.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.unit_price.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">{{ localization.format_currency(line.subtotal.clone()) }}</td>
             {% if record.sale.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
               <button class="btn-secondary"
@@ -66,7 +66,7 @@
   </div>
   <div class="mb-1 text-[13px] text-muted">
     {% if record.sale.customer_name.is_empty() %}Walk-in{% else %}{{ record.sale.customer_name }}{% endif %}
-    • {{ record.sale.sale_date }}{% if let Some(due) = record.sale.due_date %} • due {{ due }}{% endif %}
+     • {{ localization.format_date(record.sale.sale_date.clone()) }}{% if let Some(due) = record.sale.due_date %} • due {{ localization.format_date(due.clone()) }}{% endif %}
   </div>
   {% if let Some(r) = record.sale.receipt_no %}
     <div class="text-[13px] text-muted">receipt {{ r }}</div>
@@ -83,7 +83,7 @@
   {% endif %}
 
 
-  {% call record_money(record) %}
+           {% call record_money(record, localization) %}
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ record.payments.len() }})</div>
   {% if record.payments.is_empty() %}
@@ -102,10 +102,10 @@
         <tbody>
           {% for pay in record.payments %}
           <tr class="border-b border-border/60" id="sale-payment-{{ pay.id }}">
-            <td class="py-2.5 pr-3 tabular-nums">{{ pay.date }}</td>
+             <td class="py-2.5 pr-3 tabular-nums">{{ localization.format_date(pay.date.clone()) }}</td>
             <td class="py-2.5 pr-3">{{ pay.account_name }}</td>
             <td class="py-2.5 pr-3">{{ pay.method_name }}</td>
-            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">${{ pay.amount }}</td>
+             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">{{ localization.format_currency(pay.amount.clone()) }}</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -200,7 +200,7 @@
           <div class="flex gap-2.5 [&>*]:flex-1">
             <div>
               <label for="payment-amount" class="field-label">Amount</label>
-              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
+              <input type="text" inputmode="decimal" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
             </div>
             <div>
               <label for="payment-date" class="field-label">Date</label>

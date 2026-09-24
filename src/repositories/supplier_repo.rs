@@ -11,6 +11,7 @@ fn row_to_supplier(row: sqlx::sqlite::SqliteRow) -> Supplier {
         name: row.get("name"),
         phone: row.get("phone"),
         notes: row.get("notes"),
+        due_days: row.get("due_days"),
         is_active: active == 1,
         created_by: row.get("created_by"),
         updated_by: row.get("updated_by"),
@@ -64,13 +65,14 @@ impl SqliteSupplierRepository {
 impl SupplierRepository for SqliteSupplierRepository {
     async fn create(&self, actor: i64, input: &NewSupplier) -> AppResult<Supplier> {
         let row = sqlx::query(
-            r#"INSERT INTO suppliers (name, phone, notes, created_by)
-               VALUES (?, ?, ?, ?)
-               RETURNING id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at"#,
+            r#"INSERT INTO suppliers (name, phone, notes, due_days, created_by)
+               VALUES (?, ?, ?, ?, ?)
+               RETURNING id, name, phone, notes, due_days, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.name)
         .bind(input.phone.clone())
         .bind(input.notes.clone())
+        .bind(input.due_days)
         .bind(actor)
         .fetch_one(&self.pool)
         .await
@@ -80,7 +82,7 @@ impl SupplierRepository for SqliteSupplierRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Supplier>> {
         let row = sqlx::query(
-            r#"SELECT id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at
+            r#"SELECT id, name, phone, notes, due_days, is_active, created_by, updated_by, created_at, updated_at
                FROM suppliers WHERE id = ?"#,
         )
         .bind(id)
@@ -91,7 +93,7 @@ impl SupplierRepository for SqliteSupplierRepository {
 
     async fn find_by_name(&self, name: &str) -> AppResult<Option<Supplier>> {
         let row = sqlx::query(
-            r#"SELECT id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at
+            r#"SELECT id, name, phone, notes, due_days, is_active, created_by, updated_by, created_at, updated_at
                FROM suppliers WHERE name = ?"#,
         )
         .bind(name)
@@ -102,7 +104,7 @@ impl SupplierRepository for SqliteSupplierRepository {
 
     async fn list(&self) -> AppResult<Vec<Supplier>> {
         let rows = sqlx::query(
-            r#"SELECT id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at
+            r#"SELECT id, name, phone, notes, due_days, is_active, created_by, updated_by, created_at, updated_at
                FROM suppliers ORDER BY id"#,
         )
         .fetch_all(&self.pool)
@@ -125,18 +127,23 @@ impl SupplierRepository for SqliteSupplierRepository {
             Some(inner) => inner.clone(),
             None => existing.notes,
         };
+        let due_days = match patch.due_days {
+            Some(inner) => inner,
+            None => existing.due_days,
+        };
 
         let row = sqlx::query(
             r#"UPDATE suppliers
-               SET name = ?, phone = ?, notes = ?,
+               SET name = ?, phone = ?, notes = ?, due_days = ?,
                    updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
-               RETURNING id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at"#,
+               RETURNING id, name, phone, notes, due_days, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(name)
         .bind(phone)
         .bind(notes)
+        .bind(due_days)
         .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
@@ -152,7 +159,7 @@ impl SupplierRepository for SqliteSupplierRepository {
                    updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
-               RETURNING id, name, phone, notes, is_active, created_by, updated_by, created_at, updated_at"#,
+               RETURNING id, name, phone, notes, due_days, is_active, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(if active { 1i64 } else { 0i64 })
         .bind(actor)

@@ -37,6 +37,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{Permission, Role, RoleWithHolders};
 use crate::routes::AppState;
 use crate::security::authz::{IdentityRolesManage, Nav, Principal, Require};
@@ -59,6 +60,7 @@ pub struct RoleRowView {
 #[derive(Template)]
 #[template(path = "roles.html")]
 struct RolesTemplate {
+    localization: LocalizationContext,
     roles: Vec<RoleRowView>,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
@@ -182,11 +184,13 @@ async fn list_response(state: &AppState) -> AppResult<Response> {
 async fn roles_page(
     State(state): State<AppState>,
     _: Require<IdentityRolesManage>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<Principal>,
 ) -> Result<Html<String>, AppError> {
     let roles = state.identity_service.list_roles_with_holders().await?;
     let roles = resolve_role_rows(&state, roles).await?;
     let tmpl = RolesTemplate {
+        localization,
         roles,
         nav_key: "roles",
         nav: Nav::for_principal(&principal),
@@ -1137,7 +1141,7 @@ mod tests {
     }
 
     /// The full catalog still reaches the protected role's read-only matrix:
-    /// the 23 codes grouped by module, every one with its Spanish description
+    /// every code grouped by module, each with its Spanish description
     /// (the seeded descriptions corrected in the previous slice are what the
     /// operator finally reads here).
     #[tokio::test]
@@ -1449,13 +1453,13 @@ mod tests {
         for code in sales {
             assert!(held.contains(&code.to_string()), "{code} must be held");
         }
-        // The full matrix read carries the whole 23-row catalog.
+        // The full matrix read carries the whole catalog.
         let matrix = state
             .identity_service
             .role_matrix(&SqlitePermissionRepository::new(state.pool.clone()), visor_id)
             .await
             .unwrap();
-        assert_eq!(matrix.catalog.len(), 23, "the catalog is the whole 23");
+        assert_eq!(matrix.catalog.len(), 24, "the catalog is the whole catalog");
         assert_eq!(matrix.held_ids.len(), 2, "the held ids are the submitted set");
     }
 }

@@ -31,13 +31,16 @@ pub trait CategoryRepository: Send + Sync {
 }
 
 fn row_to_category(row: sqlx::sqlite::SqliteRow) -> Category {
+    let created_at = row.get("created_at");
+    let updated_at = row.try_get("updated_at").unwrap_or(created_at);
     Category {
         id: row.get("id"),
         name: row.get("name"),
         parent_id: row.get("parent_id"),
         created_by: row.get("created_by"),
         updated_by: row.get("updated_by"),
-        created_at: row.get("created_at"),
+        created_at,
+        updated_at,
     }
 }
 
@@ -68,7 +71,7 @@ impl CategoryRepository for SqliteCategoryRepository {
     async fn create(&self, actor: i64, name: &str, parent_id: Option<i64>) -> AppResult<Category> {
         let row = sqlx::query(
             r#"INSERT INTO categories (name, parent_id, created_by) VALUES (?, ?, ?)
-               RETURNING id, name, parent_id, created_by, updated_by, created_at"#,
+               RETURNING id, name, parent_id, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(name)
         .bind(parent_id)
@@ -81,7 +84,7 @@ impl CategoryRepository for SqliteCategoryRepository {
 
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Category>> {
         let row = sqlx::query(
-            r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories WHERE id = ?"#,
+            r#"SELECT id, name, parent_id, created_by, updated_by, created_at, updated_at FROM categories WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -99,7 +102,7 @@ impl CategoryRepository for SqliteCategoryRepository {
         let row = match parent_id {
             Some(pid) => {
                 sqlx::query(
-                    r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories
+                    r#"SELECT id, name, parent_id, created_by, updated_by, created_at, updated_at FROM categories
                        WHERE parent_id = ? AND name = ?"#,
                 )
                 .bind(pid)
@@ -109,7 +112,7 @@ impl CategoryRepository for SqliteCategoryRepository {
             }
             None => {
                 sqlx::query(
-                    r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories
+                    r#"SELECT id, name, parent_id, created_by, updated_by, created_at, updated_at FROM categories
                        WHERE parent_id IS NULL AND name = ?"#,
                 )
                 .bind(name)
@@ -122,7 +125,7 @@ impl CategoryRepository for SqliteCategoryRepository {
 
     async fn list(&self) -> AppResult<Vec<Category>> {
         let rows =
-            sqlx::query(r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories ORDER BY id"#)
+            sqlx::query(r#"SELECT id, name, parent_id, created_by, updated_by, created_at, updated_at FROM categories ORDER BY id"#)
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows.into_iter().map(row_to_category).collect())
@@ -130,7 +133,7 @@ impl CategoryRepository for SqliteCategoryRepository {
 
     async fn list_children(&self, parent_id: i64) -> AppResult<Vec<Category>> {
         let rows = sqlx::query(
-            r#"SELECT id, name, parent_id, created_by, updated_by, created_at FROM categories WHERE parent_id = ? ORDER BY id"#,
+            r#"SELECT id, name, parent_id, created_by, updated_by, created_at, updated_at FROM categories WHERE parent_id = ? ORDER BY id"#,
         )
         .bind(parent_id)
         .fetch_all(&self.pool)
@@ -146,8 +149,11 @@ impl CategoryRepository for SqliteCategoryRepository {
         parent_id: Option<i64>,
     ) -> AppResult<Category> {
         let row = sqlx::query(
-            r#"UPDATE categories SET name = ?, parent_id = ?, updated_by = ? WHERE id = ?
-               RETURNING id, name, parent_id, created_by, updated_by, created_at"#,
+            r#"UPDATE categories
+               SET name = ?, parent_id = ?, updated_by = ?,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ?
+               RETURNING id, name, parent_id, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(name)
         .bind(parent_id)
@@ -169,11 +175,10 @@ impl CategoryRepository for SqliteCategoryRepository {
     }
 
     async fn count_children(&self, id: i64) -> AppResult<i64> {
-        let row: (i64,) =
-            sqlx::query_as(r#"SELECT COUNT(*) FROM categories WHERE parent_id = ?"#)
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await?;
+        let row: (i64,) = sqlx::query_as(r#"SELECT COUNT(*) FROM categories WHERE parent_id = ?"#)
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.0)
     }
 

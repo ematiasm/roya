@@ -30,6 +30,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{Role, User, UserWithRoles};
 use crate::routes::AppState;
 use crate::security::authz::{
@@ -69,6 +70,7 @@ pub struct UserRowView {
 #[derive(Template)]
 #[template(path = "users.html")]
 struct UsersTemplate {
+    localization: LocalizationContext,
     users: Vec<UserRowView>,
     /// Whether the principal may act on credentials (`identity.users.manage`):
     /// decides which actions the markup offers. The handlers refuse regardless.
@@ -217,11 +219,13 @@ async fn list_response(
 
 async fn users_page(
     State(state): State<AppState>,
+    Extension(localization): Extension<LocalizationContext>,
     Extension(principal): Extension<Principal>,
     _: Require<IdentityUsersRead>,
 ) -> Result<Html<String>, AppError> {
     let users = user_rows(&state).await?;
     let tmpl = UsersTemplate {
+        localization,
         users,
         can_manage: principal.has_permission::<IdentityUsersManage>(),
         can_manage_roles: principal.has_permission::<IdentityRolesManage>(),

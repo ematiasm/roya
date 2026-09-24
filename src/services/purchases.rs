@@ -30,9 +30,9 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    format_purchase_number, MovementReason, MovementType, NewMovement, NewPurchase,
-    PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter,
-    PurchasePayment, PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
+    format_purchase_number, MovementReason, MovementType, NewMovement, NewPurchase, PaymentType,
+    Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter, PurchasePayment,
+    PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
     PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, StaleLineCostView, Supplier,
     UpdatePurchaseDraft,
 };
@@ -47,7 +47,10 @@ pub enum LineAddOutcome {
     /// The product already had a line at the same resolved cost: its quantity
     /// was incremented through the update path, so exactly one line remains.
     /// `product_name` feeds the merge notice the route renders.
-    Merged { line: PurchaseLine, product_name: String },
+    Merged {
+        line: PurchaseLine,
+        product_name: String,
+    },
 }
 
 #[derive(Clone)]
@@ -141,7 +144,9 @@ where
         match payment_type {
             PaymentType::Cash => {
                 if due_date.is_some() {
-                    return Err(AppError::Validation("due_date must be NULL for Cash".into()));
+                    return Err(AppError::Validation(
+                        "due_date must be NULL for Cash".into(),
+                    ));
                 }
             }
             PaymentType::Credit => {
@@ -310,9 +315,9 @@ where
             payment_type: patch.payment_type,
             purchase_date: patch.purchase_date,
             due_date: patch.due_date,
-            supplier_invoice_no: patch.supplier_invoice_no.map(|opt| {
-                opt.map(|s| s.trim().to_string())
-            }),
+            supplier_invoice_no: patch
+                .supplier_invoice_no
+                .map(|opt| opt.map(|s| s.trim().to_string())),
             notes: patch.notes.map(|s| s.trim().to_string()),
         };
         self.purchases.update_draft(id, actor, &norm).await
@@ -340,7 +345,14 @@ where
         // Duplicate product on the same purchase is a 400 before any write.
         let lines = self.purchases.list_lines(purchase_id).await?;
         Self::ensure_unique_product(&lines, product_id, &product.name, None)?;
-        let cost = self.resolve_line_cost(product_id, product.cost_price, purchase.supplier_id, unit_cost).await?;
+        let cost = self
+            .resolve_line_cost(
+                product_id,
+                product.cost_price,
+                purchase.supplier_id,
+                unit_cost,
+            )
+            .await?;
         let line = self
             .purchases
             .create_line(purchase_id, product_id, qty, cost)
@@ -370,10 +382,12 @@ where
                 }
                 Ok(c)
             }
-            None => Ok(match self.suppliers.find_cost(product_id, supplier_id).await? {
-                Some(row) => row.current_cost,
-                None => product_cost_price,
-            }),
+            None => Ok(
+                match self.suppliers.find_cost(product_id, supplier_id).await? {
+                    Some(row) => row.current_cost,
+                    None => product_cost_price,
+                },
+            ),
         }
     }
 
@@ -411,7 +425,14 @@ where
         // "unit_cost cannot be negative", not the duplicate-product 400
         // `add_line` would have answered first. Both are 400 and only invalid
         // input is affected.
-        let cost = self.resolve_line_cost(product_id, product.cost_price, purchase.supplier_id, unit_cost).await?;
+        let cost = self
+            .resolve_line_cost(
+                product_id,
+                product.cost_price,
+                purchase.supplier_id,
+                unit_cost,
+            )
+            .await?;
         let lines = self.purchases.list_lines(purchase_id).await?;
         match lines.iter().find(|l| l.product_id == product_id) {
             None => {
@@ -778,11 +799,11 @@ where
                 .find_cost(line.product_id, purchase.supplier_id)
                 .await?
             {
-                if purchase.purchase_date < existing.current_cost_updated_at {
+                if purchase.purchase_date < existing.current_cost_date {
                     return Err(AppError::Validation(format!(
                         "purchase_date {} precedes the recorded cost date {} for product {} and supplier {}",
                         purchase.purchase_date,
-                        existing.current_cost_updated_at,
+                        existing.current_cost_date,
                         line.product_id,
                         purchase.supplier_id
                     )));
@@ -790,10 +811,7 @@ where
             }
         }
 
-        let (total, _, _) = Self::totals(
-            &lines,
-            &self.purchases.list_payments(purchase_id).await?,
-        );
+        let (total, _, _) = Self::totals(&lines, &self.purchases.list_payments(purchase_id).await?);
 
         // The cash account is derived from the method, which belongs to exactly
         // one account: an invalid combination is impossible by construction.
@@ -803,7 +821,9 @@ where
                     AppError::Validation("cash purchase requires a payment method".into())
                 })?;
                 if purchase.due_date.is_some() {
-                    return Err(AppError::Validation("due_date must be NULL for Cash".into()));
+                    return Err(AppError::Validation(
+                        "due_date must be NULL for Cash".into(),
+                    ));
                 }
                 // Ownership resolved before any stock/sequence/finance touch.
                 Some(self.payment_methods.resolve_account(method_id).await?)
@@ -959,12 +979,9 @@ where
                 "overpay rejected: paid {paid} + {amount} exceeds total {total}"
             )));
         }
-        let purchase_number = purchase
-            .purchase_number
-            .clone()
-            .ok_or_else(|| {
-                AppError::Internal("confirmed purchase missing purchase_number".into())
-            })?;
+        let purchase_number = purchase.purchase_number.clone().ok_or_else(|| {
+            AppError::Internal("confirmed purchase missing purchase_number".into())
+        })?;
         // Each payment generates one M0 Expense stamped with reference =
         // purchase_number and linked from the payment row it produced.
         let expense = self
@@ -1101,12 +1118,9 @@ where
         // Confirmed -> Cancelled: goods back to the supplier + refunds.
         let lines = self.purchases.list_lines(purchase_id).await?;
         let payments = self.purchases.list_payments(purchase_id).await?;
-        let purchase_number = purchase
-            .purchase_number
-            .clone()
-            .ok_or_else(|| {
-                AppError::Internal("confirmed purchase missing purchase_number".into())
-            })?;
+        let purchase_number = purchase.purchase_number.clone().ok_or_else(|| {
+            AppError::Internal("confirmed purchase missing purchase_number".into())
+        })?;
 
         // Pre-validate products (for the return movement) and refund accounts.
         // Invariant 10: a partially-applied annulment (an earlier attempt failed
@@ -1216,8 +1230,7 @@ where
             .await?
             .ok_or_else(|| AppError::NotFound(format!("purchase {id} not found")))?;
         let deletable = purchase.status == PurchaseStatus::Draft
-            || (purchase.status == PurchaseStatus::Cancelled
-                && purchase.purchase_number.is_none());
+            || (purchase.status == PurchaseStatus::Cancelled && purchase.purchase_number.is_none());
         if !deletable {
             return Err(AppError::Validation(format!(
                 "purchase {id} is {}: only a draft or a discarded (never-confirmed) cancelled purchase can be deleted",
@@ -1260,7 +1273,11 @@ where
             let chosen = costs
                 .iter()
                 .find(|c| c.is_preferred)
-                .or_else(|| costs.iter().min_by(|a, b| a.current_cost.cmp(&b.current_cost)))
+                .or_else(|| {
+                    costs
+                        .iter()
+                        .min_by(|a, b| a.current_cost.cmp(&b.current_cost))
+                })
                 .expect("costs is not empty");
             let supplier = self
                 .suppliers
@@ -1306,10 +1323,10 @@ mod tests {
         SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTransactionRepository,
         StockMovementRepository, TransactionRepository,
     };
+    use crate::security::test_support;
     use crate::services::{
         InventoryService, PaymentMethodService, SupplierService, TransactionService,
     };
-    use crate::security::test_support;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
 
@@ -1386,11 +1403,6 @@ mod tests {
         svc_with_flags(true, true).await
     }
 
-
-
-
-
-
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
     }
@@ -1418,20 +1430,21 @@ mod tests {
             .create_product(
                 audit_actor(s).await,
                 NewProduct {
-                sku: sku.into(),
-                name: format!("prod {sku}"),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: dec("10"),
-                cost_price: dec(cost),
-                track_stock: true,
-                min_stock: Some(dec(min)),
-                max_stock: Some(dec(max)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: sku.into(),
+                    name: format!("prod {sku}"),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec("10"),
+                    cost_price: dec(cost),
+                    track_stock: true,
+                    min_stock: Some(dec(min)),
+                    max_stock: Some(dec(max)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap()
     }
@@ -1441,20 +1454,21 @@ mod tests {
             .create_product(
                 audit_actor(s).await,
                 NewProduct {
-                sku: sku.into(),
-                name: format!("svc {sku}"),
-                kind: ProductKind::Service,
-                category_id: None,
-                unit: "hr".into(),
-                sale_price: dec("30"),
-                cost_price: dec(cost),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: sku.into(),
+                    name: format!("svc {sku}"),
+                    kind: ProductKind::Service,
+                    category_id: None,
+                    unit: "hr".into(),
+                    sale_price: dec("30"),
+                    cost_price: dec(cost),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap()
     }
@@ -1464,24 +1478,29 @@ mod tests {
             .record_movement(
                 audit_actor(s).await,
                 NewMovement {
-                product_id,
-                qty: dec(qty),
-                movement_type: MovementType::In,
-                reason: MovementReason::Initial,
-                reference: "".into(),
-                date: d(2024, 5, 1),
-            })
+                    product_id,
+                    qty: dec(qty),
+                    movement_type: MovementType::In,
+                    reason: MovementReason::Initial,
+                    reference: "".into(),
+                    date: d(2024, 5, 1),
+                },
+            )
             .await
             .unwrap();
     }
 
     async fn seed_supplier(s: &Svc, name: &str) -> crate::models::Supplier {
         s.suppliers
-            .create_supplier(audit_actor(s).await, NewSupplier {
-                name: name.into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(s).await,
+                NewSupplier {
+                    name: name.into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap()
     }
@@ -1539,27 +1558,33 @@ mod tests {
     }
 
     async fn draft_cash(s: &Svc, supplier_id: i64) -> Purchase {
-        s.create_draft(audit_actor(s).await, NewPurchase {
-            supplier_id,
-            payment_type: PaymentType::Cash,
-            purchase_date: purchase_date(),
-            due_date: None,
-            supplier_invoice_no: None,
-            notes: None,
-        })
+        s.create_draft(
+            audit_actor(s).await,
+            NewPurchase {
+                supplier_id,
+                payment_type: PaymentType::Cash,
+                purchase_date: purchase_date(),
+                due_date: None,
+                supplier_invoice_no: None,
+                notes: None,
+            },
+        )
         .await
         .unwrap()
     }
 
     async fn draft_credit(s: &Svc, supplier_id: i64) -> Purchase {
-        s.create_draft(audit_actor(s).await, NewPurchase {
-            supplier_id,
-            payment_type: PaymentType::Credit,
-            purchase_date: purchase_date(),
-            due_date: Some(d(2024, 6, 1)),
-            supplier_invoice_no: None,
-            notes: None,
-        })
+        s.create_draft(
+            audit_actor(s).await,
+            NewPurchase {
+                supplier_id,
+                payment_type: PaymentType::Credit,
+                purchase_date: purchase_date(),
+                due_date: Some(d(2024, 6, 1)),
+                supplier_invoice_no: None,
+                notes: None,
+            },
+        )
         .await
         .unwrap()
     }
@@ -1579,16 +1604,27 @@ mod tests {
         let prod = seed_product(&s, "CF-HIGH", "5").await;
         let sup = seed_supplier(&s, "CF HIGH SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("7")),
+        )
+        .await
+        .unwrap();
         // Confirmed: the warning exists only after the document does. A credit
         // purchase confirms with no payment method.
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
-        let stale = views[0].stale_cost.as_ref().expect("a rising cost must be flagged");
+        let stale = views[0]
+            .stale_cost
+            .as_ref()
+            .expect("a rising cost must be flagged");
         // Both numbers asserted so the fields cannot be swapped silently.
         assert_eq!(stale.line_cost, dec("7"));
         assert_eq!(stale.stored_cost, dec("5"));
@@ -1600,10 +1636,18 @@ mod tests {
         let prod = seed_product(&s, "CF-EQ", "5").await;
         let sup = seed_supplier(&s, "CF EQ SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("5")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
@@ -1616,14 +1660,25 @@ mod tests {
         let prod = seed_product(&s, "CF-LOW", "5").await;
         let sup = seed_supplier(&s, "CF LOW SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("3")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("3")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
-        assert!(views[0].stale_cost.is_none(), "a decrease is not what this warns about");
+        assert!(
+            views[0].stale_cost.is_none(),
+            "a decrease is not what this warns about"
+        );
     }
 
     #[tokio::test]
@@ -1632,14 +1687,25 @@ mod tests {
         let prod = seed_product(&s, "CF-ZERO", "0").await;
         let sup = seed_supplier(&s, "CF ZERO SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("4")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
-        assert!(views[0].stale_cost.is_none(), "zero stored cost means none recorded yet");
+        assert!(
+            views[0].stale_cost.is_none(),
+            "zero stored cost means none recorded yet"
+        );
     }
 
     #[tokio::test]
@@ -1652,31 +1718,65 @@ mod tests {
         let sup = seed_supplier(&s, "CF MIX SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
         let l_rising = s
-            .add_line(audit_actor(&s).await, purchase.id, rising.id, dec("1"), Some(dec("9")))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                rising.id,
+                dec("1"),
+                Some(dec("9")),
+            )
             .await
             .unwrap();
         // The other three lines exist only to prove they are NOT flagged, so
         // their ids are not needed: the assertion below pins the flagged set
         // to exactly the rising one.
-        s.add_line(audit_actor(&s).await, purchase.id, equal.id, dec("1"), Some(dec("5")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            equal.id,
+            dec("1"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            no_cost.id,
+            dec("1"),
+            Some(dec("8")),
+        )
+        .await
+        .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            lowering.id,
+            dec("1"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.add_line(audit_actor(&s).await, purchase.id, no_cost.id, dec("1"), Some(dec("8")))
-            .await
-            .unwrap();
-        s.add_line(audit_actor(&s).await, purchase.id, lowering.id, dec("1"), Some(dec("4")))
-            .await
-            .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let views = line_views(&s, purchase.id).await;
-        assert_eq!(views.len(), 4, "every line renders; only qualifying ones are flagged");
+        assert_eq!(
+            views.len(),
+            4,
+            "every line renders; only qualifying ones are flagged"
+        );
         let flagged: Vec<i64> = views
             .iter()
             .filter(|v| v.stale_cost.is_some())
             .map(|v| v.id)
             .collect();
-        assert_eq!(flagged, vec![l_rising.id], "only the rising-cost line is flagged");
+        assert_eq!(
+            flagged,
+            vec![l_rising.id],
+            "only the rising-cost line is flagged"
+        );
         let stale = views
             .iter()
             .find(|v| v.id == l_rising.id)
@@ -1701,9 +1801,15 @@ mod tests {
         let sup = seed_supplier(&s, "CF DRAFT SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
         // Same shape as the confirmed positive case: line cost 7 over stored 5.
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("7")),
+        )
+        .await
+        .unwrap();
 
         let views = line_views(&s, purchase.id).await;
         assert_eq!(views.len(), 1);
@@ -1729,10 +1835,18 @@ mod tests {
         let sup = seed_supplier(&s, "CF CANCEL SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
         // Same shape as the confirmed positive case: line cost 7 over stored 5.
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("7")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("7")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         // Positive control: while confirmed, this same purchase DID flag.
         let views = line_views(&s, purchase.id).await;
@@ -1772,12 +1886,24 @@ mod tests {
         let service = seed_service(&s, "TU-SVC", "8").await;
         let sup = seed_supplier(&s, "TU SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, tracked.id, dec("3"), Some(dec("5")))
-            .await
-            .unwrap();
-        s.add_line(audit_actor(&s).await, purchase.id, service.id, dec("4"), Some(dec("8")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            tracked.id,
+            dec("3"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            service.id,
+            dec("4"),
+            Some(dec("8")),
+        )
+        .await
+        .unwrap();
 
         let detail = s.get_detail(purchase.id).await.unwrap();
         let record = s.record_from_detail(detail).await.unwrap();
@@ -1819,14 +1945,24 @@ mod tests {
         let purchase = draft_cash(&s, sup.id).await;
         assert!(purchase.purchase_number.is_none());
         let line = s
-            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("4")))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                prod.id,
+                dec("2"),
+                Some(dec("4")),
+            )
             .await
             .unwrap();
-        let updated = s.update_line(audit_actor(&s).await, line.id, dec("3"), dec("4.5")).await.unwrap();
+        let updated = s
+            .update_line(audit_actor(&s).await, line.id, dec("3"), dec("4.5"))
+            .await
+            .unwrap();
         assert_eq!(updated.qty, dec("3"));
         assert_eq!(updated.unit_cost, dec("4.5"));
         let edited = s
-            .update_draft(audit_actor(&s).await, 
+            .update_draft(
+                audit_actor(&s).await,
                 purchase.id,
                 UpdatePurchaseDraft {
                     notes: Some(" pedido ".into()),
@@ -1840,9 +1976,18 @@ mod tests {
         assert_eq!(edited.supplier_invoice_no.as_deref(), Some("A-001"));
         s.remove_line(audit_actor(&s).await, line.id).await.unwrap();
 
-        assert_eq!(movement_count(&pool).await, 1, "only the initial stock move");
+        assert_eq!(
+            movement_count(&pool).await,
+            1,
+            "only the initial stock move"
+        );
         assert_eq!(tx_count(&pool).await, 0);
-        assert!(s.suppliers.find_cost(prod.id, sup.id).await.unwrap().is_none());
+        assert!(s
+            .suppliers
+            .find_cost(prod.id, sup.id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(
             s.sequences.current("PURCH", 2024).await.unwrap().is_none(),
             "Draft must not consume a document number"
@@ -1864,9 +2009,15 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("3"), Some(dec("4")))
-            .await
-            .unwrap(); // total 12
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("3"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap(); // total 12
 
         let detail = s
             .confirm(audit_actor(&s).await, purchase.id, Some(cash))
@@ -1883,7 +2034,12 @@ mod tests {
 
         // Stock In reason Purchase, reference = purchase_number.
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("13"));
-        let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
+        let moves = s
+            .inventory
+            .movements
+            .list_by_product(prod.id)
+            .await
+            .unwrap();
         let received = moves
             .iter()
             .find(|m| m.reason == MovementReason::Purchase)
@@ -1921,11 +2077,20 @@ mod tests {
         let sup = seed_supplier(&s, "AC3 SUP").await;
 
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("12")))
-            .await
-            .unwrap(); // total 24
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("12")),
+        )
+        .await
+        .unwrap(); // total 24
 
-        let detail = s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+        let detail = s
+            .confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
         assert!(detail.purchase.purchase_number.is_some());
         assert_eq!(detail.total, dec("24"));
         assert_eq!(detail.paid, Decimal::ZERO);
@@ -1934,7 +2099,12 @@ mod tests {
         assert_eq!(detail.purchase.due_date, Some(d(2024, 6, 1)));
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("12"));
         assert_eq!(tx_count(&pool).await, 0, "Credit confirm posts no Expense");
-        assert!(s.purchases.list_payments(purchase.id).await.unwrap().is_empty());
+        assert!(s
+            .purchases
+            .list_payments(purchase.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // -- AC4: Credit payments ---------------------------------------------------
@@ -1950,15 +2120,30 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("20")))
-            .await
-            .unwrap(); // total 40
-        let detail = s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
-        let number = detail.purchase.purchase_number.clone().unwrap();
-
-        s.record_payment(audit_actor(&s).await, purchase.id, cash, dec("15"), d(2024, 5, 10))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("20")),
+        )
+        .await
+        .unwrap(); // total 40
+        let detail = s
+            .confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
+        let number = detail.purchase.purchase_number.clone().unwrap();
+
+        s.record_payment(
+            audit_actor(&s).await,
+            purchase.id,
+            cash,
+            dec("15"),
+            d(2024, 5, 10),
+        )
+        .await
+        .unwrap();
         let d1 = s.get_detail(purchase.id).await.unwrap();
         assert_eq!(d1.paid, dec("15"));
         assert_eq!(d1.due, dec("25"));
@@ -1967,16 +2152,28 @@ mod tests {
 
         // Overpay rejected with no extra finance row.
         let err = s
-            .record_payment(audit_actor(&s).await, purchase.id, cash, dec("30"), d(2024, 5, 11))
+            .record_payment(
+                audit_actor(&s).await,
+                purchase.id,
+                cash,
+                dec("30"),
+                d(2024, 5, 11),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert_eq!(tx_count(&pool).await, 1);
 
         // Paying the remainder closes the payable.
-        s.record_payment(audit_actor(&s).await, purchase.id, cash, dec("25"), d(2024, 5, 12))
-            .await
-            .unwrap();
+        s.record_payment(
+            audit_actor(&s).await,
+            purchase.id,
+            cash,
+            dec("25"),
+            d(2024, 5, 12),
+        )
+        .await
+        .unwrap();
         let d2 = s.get_detail(purchase.id).await.unwrap();
         assert_eq!(d2.paid, dec("40"));
         assert_eq!(d2.due, Decimal::ZERO);
@@ -1995,14 +2192,17 @@ mod tests {
     // -- T5: pay_supplier (oldest-first across purchases, no receipt) --------
 
     async fn draft_credit_due(s: &Svc, supplier_id: i64, due: NaiveDate) -> Purchase {
-        s.create_draft(audit_actor(s).await, NewPurchase {
-            supplier_id,
-            payment_type: PaymentType::Credit,
-            purchase_date: purchase_date(),
-            due_date: Some(due),
-            supplier_invoice_no: None,
-            notes: None,
-        })
+        s.create_draft(
+            audit_actor(s).await,
+            NewPurchase {
+                supplier_id,
+                payment_type: PaymentType::Credit,
+                purchase_date: purchase_date(),
+                due_date: Some(due),
+                supplier_invoice_no: None,
+                notes: None,
+            },
+        )
         .await
         .unwrap()
     }
@@ -2020,19 +2220,37 @@ mod tests {
         // Two Confirmed credit purchases: A due 2024-06-01 (2 × 20 = 40),
         // B due 2024-07-01 (3 × 10 = 30).
         let a = draft_credit_due(&s, sup.id, d(2024, 6, 1)).await;
-        s.add_line(audit_actor(&s).await, a.id, prod.id, dec("2"), Some(dec("20")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            a.id,
+            prod.id,
+            dec("2"),
+            Some(dec("20")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, a.id, None).await.unwrap();
         let b = draft_credit_due(&s, sup.id, d(2024, 7, 1)).await;
-        s.add_line(audit_actor(&s).await, b.id, prod.id, dec("3"), Some(dec("10")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            b.id,
+            prod.id,
+            dec("3"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, b.id, None).await.unwrap();
 
         // Pay 55: A covered exactly, B partial — one payment per purchase.
         let payments = s
-            .pay_supplier(audit_actor(&s).await, sup.id, cash, dec("55"), d(2024, 6, 20))
+            .pay_supplier(
+                audit_actor(&s).await,
+                sup.id,
+                cash,
+                dec("55"),
+                d(2024, 6, 20),
+            )
             .await
             .unwrap();
         assert_eq!(payments.len(), 2);
@@ -2051,7 +2269,13 @@ mod tests {
 
         // Pay the exact remainder: B closes, nothing more is planned.
         let rest = s
-            .pay_supplier(audit_actor(&s).await, sup.id, cash, dec("15"), d(2024, 6, 21))
+            .pay_supplier(
+                audit_actor(&s).await,
+                sup.id,
+                cash,
+                dec("15"),
+                d(2024, 6, 21),
+            )
             .await
             .unwrap();
         assert_eq!(rest.len(), 1);
@@ -2073,19 +2297,37 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let a = draft_credit_due(&s, sup.id, d(2024, 6, 1)).await;
-        s.add_line(audit_actor(&s).await, a.id, prod.id, dec("2"), Some(dec("20")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            a.id,
+            prod.id,
+            dec("2"),
+            Some(dec("20")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, a.id, None).await.unwrap();
         let b = draft_credit_due(&s, sup.id, d(2024, 7, 1)).await;
-        s.add_line(audit_actor(&s).await, b.id, prod.id, dec("3"), Some(dec("10")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            b.id,
+            prod.id,
+            dec("3"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, b.id, None).await.unwrap();
 
         // Outstanding is 70: paying 71 is a 400 naming both figures.
         let err = s
-            .pay_supplier(audit_actor(&s).await, sup.id, cash, dec("71"), d(2024, 6, 20))
+            .pay_supplier(
+                audit_actor(&s).await,
+                sup.id,
+                cash,
+                dec("71"),
+                d(2024, 6, 20),
+            )
             .await
             .unwrap_err();
         match &err {
@@ -2105,7 +2347,13 @@ mod tests {
     async fn t5_pay_supplier_unknown_supplier_is_404() {
         let (s, _) = svc().await;
         let err = s
-            .pay_supplier(audit_actor(&s).await, 999_999, 1, dec("10"), purchase_date())
+            .pay_supplier(
+                audit_actor(&s).await,
+                999_999,
+                1,
+                dec("10"),
+                purchase_date(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
@@ -2121,11 +2369,19 @@ mod tests {
         let cash = cash_method(&s).await;
 
         let a = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, a.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, a.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         s.confirm(audit_actor(&s).await, a.id, None).await.unwrap();
 
         let err = s
-            .pay_supplier(audit_actor(&s).await, sup.id, cash, dec("5"), purchase_date())
+            .pay_supplier(
+                audit_actor(&s).await,
+                sup.id,
+                cash,
+                dec("5"),
+                purchase_date(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -2148,20 +2404,24 @@ mod tests {
 
         // Unknown supplier on create/update => 404.
         let err = s
-            .create_draft(audit_actor(&s).await, NewPurchase {
-                supplier_id: 999_999,
-                payment_type: PaymentType::Cash,
-                purchase_date: purchase_date(),
-                due_date: None,
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&s).await,
+                NewPurchase {
+                    supplier_id: 999_999,
+                    payment_type: PaymentType::Cash,
+                    purchase_date: purchase_date(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
         let purchase = draft_cash(&s, sup.id).await;
         let err = s
-            .update_draft(audit_actor(&s).await, 
+            .update_draft(
+                audit_actor(&s).await,
                 purchase.id,
                 UpdatePurchaseDraft {
                     supplier_id: Some(999_999),
@@ -2188,19 +2448,37 @@ mod tests {
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         }
         let err = s
-            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("-0.01")))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                prod.id,
+                dec("1"),
+                Some(dec("-0.01")),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // unit_cost = 0 is legal.
         let zero = s
-            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(Decimal::ZERO))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                prod.id,
+                dec("1"),
+                Some(Decimal::ZERO),
+            )
             .await
             .unwrap();
         assert_eq!(zero.unit_cost, Decimal::ZERO);
-        let err = s.update_line(audit_actor(&s).await, zero.id, dec("0"), dec("1")).await.unwrap_err();
+        let err = s
+            .update_line(audit_actor(&s).await, zero.id, dec("0"), dec("1"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        let err = s.update_line(audit_actor(&s).await, zero.id, dec("1"), dec("-1")).await.unwrap_err();
+        let err = s
+            .update_line(audit_actor(&s).await, zero.id, dec("1"), dec("-1"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         // Unknown method on Cash confirm => 404.
@@ -2212,10 +2490,18 @@ mod tests {
 
         // Unknown method on payment => 404.
         let cp = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, cp.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, cp.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         s.confirm(audit_actor(&s).await, cp.id, None).await.unwrap();
         let err = s
-            .record_payment(audit_actor(&s).await, cp.id, 999_999, dec("5"), purchase_date())
+            .record_payment(
+                audit_actor(&s).await,
+                cp.id,
+                999_999,
+                dec("5"),
+                purchase_date(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
@@ -2234,9 +2520,15 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("10")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("1"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, purchase.id, Some(cash))
             .await
             .unwrap();
@@ -2257,12 +2549,19 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let detail = s.get_detail(purchase.id).await.unwrap();
         let line_id = detail.lines[0].id;
-        let err = s.update_line(audit_actor(&s).await, line_id, dec("2"), dec("9")).await.unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        let err = s.remove_line(audit_actor(&s).await, line_id).await.unwrap_err();
+        let err = s
+            .update_line(audit_actor(&s).await, line_id, dec("2"), dec("9"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
-            .update_draft(audit_actor(&s).await, 
+            .remove_line(audit_actor(&s).await, line_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        let err = s
+            .update_draft(
+                audit_actor(&s).await,
                 purchase.id,
                 UpdatePurchaseDraft {
                     notes: Some("otro".into()),
@@ -2301,9 +2600,15 @@ mod tests {
             .unwrap();
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("4"), Some(dec("10")))
-            .await
-            .unwrap(); // total 40
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("4"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap(); // total 40
         let detail = s
             .confirm(audit_actor(&s).await, purchase.id, Some(cash))
             .await
@@ -2325,11 +2630,18 @@ mod tests {
             .unwrap();
 
         let cancelled = s
-            .cancel(audit_actor(&s).await, purchase.id, Some(" devuelvo ".into()))
+            .cancel(
+                audit_actor(&s).await,
+                purchase.id,
+                Some(" devuelvo ".into()),
+            )
             .await
             .unwrap();
         assert_eq!(cancelled.purchase.status, PurchaseStatus::Cancelled);
-        assert_eq!(cancelled.purchase.cancel_reason.as_deref(), Some("devuelvo"));
+        assert_eq!(
+            cancelled.purchase.cancel_reason.as_deref(),
+            Some("devuelvo")
+        );
         assert!(cancelled.purchase.cancelled_at.is_some());
         assert_eq!(
             cancelled.purchase.purchase_number.as_deref(),
@@ -2338,7 +2650,12 @@ mod tests {
 
         // Goods go back: 14 - 4 = 10, Out reason Purchase-return.
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("10"));
-        let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
+        let moves = s
+            .inventory
+            .movements
+            .list_by_product(prod.id)
+            .await
+            .unwrap();
         let back = moves
             .iter()
             .find(|m| m.reason == MovementReason::PurchaseReturn)
@@ -2390,10 +2707,18 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("4"), Some(dec("10")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("4"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap(); // total 40
+        s.confirm(audit_actor(&s).await, purchase.id, Some(cash))
             .await
-            .unwrap(); // total 40
-        s.confirm(audit_actor(&s).await, purchase.id, Some(cash)).await.unwrap();
+            .unwrap();
         let payments = s.purchases.list_payments(purchase.id).await.unwrap();
         assert_eq!(payments.len(), 1);
 
@@ -2431,7 +2756,10 @@ mod tests {
             msg.contains("already linked"),
             "message must name the partial state: {msg}"
         );
-        assert!(msg.contains("1 of 1"), "message must name how many refunds: {msg}");
+        assert!(
+            msg.contains("1 of 1"),
+            "message must name how many refunds: {msg}"
+        );
 
         // Nothing new was written: no additional return movement, status intact.
         assert_eq!(
@@ -2439,7 +2767,12 @@ mod tests {
             movements_before,
             "a refused partial annulment must not write another movement"
         );
-        let still = s.purchases.find_purchase(purchase.id).await.unwrap().unwrap();
+        let still = s
+            .purchases
+            .find_purchase(purchase.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(still.status, PurchaseStatus::Confirmed);
     }
 
@@ -2451,31 +2784,53 @@ mod tests {
         let prod = seed_product(&s, "AC9", "5").await;
         let sup = seed_supplier(&s, "AC9 SUP").await;
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("10"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup.id,
+                dec("10"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
         let purchase = s
-            .create_draft(audit_actor(&s).await, NewPurchase {
-                supplier_id: sup.id,
-                payment_type: PaymentType::Credit,
-                purchase_date: d(2024, 5, 10),
-                due_date: Some(d(2024, 6, 1)),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&s).await,
+                NewPurchase {
+                    supplier_id: sup.id,
+                    payment_type: PaymentType::Credit,
+                    purchase_date: d(2024, 5, 10),
+                    due_date: Some(d(2024, 6, 1)),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("12")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("12")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
-        let row = s.suppliers.find_cost(prod.id, sup.id).await.unwrap().unwrap();
+        let row = s
+            .suppliers
+            .find_cost(prod.id, sup.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.current_cost, dec("12"));
-        assert_eq!(row.current_cost_updated_at, d(2024, 5, 10));
+        assert_eq!(row.current_cost_date, d(2024, 5, 10));
         assert_eq!(row.previous_cost, Some(dec("10")));
-        assert_eq!(row.previous_cost_updated_at, Some(d(2024, 5, 1)));
+        assert_eq!(row.previous_cost_date, Some(d(2024, 5, 1)));
         assert_eq!(row.price_alert(), PriceAlert::Raised);
     }
 
@@ -2495,17 +2850,35 @@ mod tests {
 
         // Satellite for B is newer than the purchase date; A has no row yet.
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod_b.id, sup.id, dec("10"), d(2024, 5, 10))
+            .record_cost(
+                audit_actor(&s).await,
+                prod_b.id,
+                sup.id,
+                dec("10"),
+                d(2024, 5, 10),
+            )
             .await
             .unwrap();
 
         let purchase = draft_cash(&s, sup.id).await; // 2024-05-02, before 05-10
-        s.add_line(audit_actor(&s).await, purchase.id, prod_a.id, dec("1"), Some(dec("3")))
-            .await
-            .unwrap();
-        s.add_line(audit_actor(&s).await, purchase.id, prod_b.id, dec("1"), Some(dec("4")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod_a.id,
+            dec("1"),
+            Some(dec("3")),
+        )
+        .await
+        .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod_b.id,
+            dec("1"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
 
         let moves_before = movement_count(&pool).await;
         let err = s
@@ -2520,11 +2893,21 @@ mod tests {
         let detail = s.get_detail(purchase.id).await.unwrap();
         assert_eq!(detail.purchase.status, PurchaseStatus::Draft);
         assert!(detail.purchase.purchase_number.is_none());
-        assert!(s.suppliers.find_cost(prod_a.id, sup.id).await.unwrap().is_none());
+        assert!(s
+            .suppliers
+            .find_cost(prod_a.id, sup.id)
+            .await
+            .unwrap()
+            .is_none());
         assert!(s.sequences.current("PURCH", 2024).await.unwrap().is_none());
-        let b_row = s.suppliers.find_cost(prod_b.id, sup.id).await.unwrap().unwrap();
+        let b_row = s
+            .suppliers
+            .find_cost(prod_b.id, sup.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(b_row.current_cost, dec("10"));
-        assert_eq!(b_row.current_cost_updated_at, d(2024, 5, 10));
+        assert_eq!(b_row.current_cost_date, d(2024, 5, 10));
     }
 
     // -- AC10: purchase never writes products.cost_price ---------------------------
@@ -2536,20 +2919,41 @@ mod tests {
         let other = seed_product(&s, "AC10-2", "7").await;
         let sup = seed_supplier(&s, "AC10 SUP").await;
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup.id,
+                dec("9.50"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("12")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("1"),
+            Some(dec("12")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
 
         let stored = s.inventory.get_product(prod.id).await.unwrap();
-        assert_eq!(stored.cost_price, dec("5"), "cost_price must stay untouched");
+        assert_eq!(
+            stored.cost_price,
+            dec("5"),
+            "cost_price must stay untouched"
+        );
         // Satellite wins after the confirm recorded the line cost.
-        assert_eq!(s.suppliers.reference_cost(prod.id).await.unwrap(), Some(dec("12")));
+        assert_eq!(
+            s.suppliers.reference_cost(prod.id).await.unwrap(),
+            Some(dec("12"))
+        );
         // No satellite rows => None, caller falls back to the column.
         assert_eq!(s.suppliers.reference_cost(other.id).await.unwrap(), None);
         let other_stored = s.inventory.get_product(other.id).await.unwrap();
@@ -2566,7 +2970,13 @@ mod tests {
         let prod = seed_product(&s, "LINE-DEF", "5").await;
         let sup = seed_supplier(&s, "LINE-DEF SUP").await;
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup.id,
+                dec("9.50"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
@@ -2576,7 +2986,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(line.unit_cost, dec("9.50"), "empty cost must default to the supplier's satellite cost");
+        assert_eq!(
+            line.unit_cost,
+            dec("9.50"),
+            "empty cost must default to the supplier's satellite cost"
+        );
     }
 
     #[tokio::test]
@@ -2591,7 +3005,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(line.unit_cost, dec("5"), "no satellite row => the product column is the fallback");
+        assert_eq!(
+            line.unit_cost,
+            dec("5"),
+            "no satellite row => the product column is the fallback"
+        );
     }
 
     #[tokio::test]
@@ -2600,17 +3018,33 @@ mod tests {
         let prod = seed_product(&s, "LINE-EXPL", "5").await;
         let sup = seed_supplier(&s, "LINE-EXPL SUP").await;
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup.id,
+                dec("9.50"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
         let purchase = draft_credit(&s, sup.id).await;
         let line = s
-            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("12")))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                prod.id,
+                dec("1"),
+                Some(dec("12")),
+            )
             .await
             .unwrap();
 
-        assert_eq!(line.unit_cost, dec("12"), "an explicit cost must not be replaced by the satellite");
+        assert_eq!(
+            line.unit_cost,
+            dec("12"),
+            "an explicit cost must not be replaced by the satellite"
+        );
     }
 
     #[tokio::test]
@@ -2620,21 +3054,43 @@ mod tests {
         let sup_a = seed_supplier(&s, "LINE-LEAK A").await;
         let sup_b = seed_supplier(&s, "LINE-LEAK B").await;
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup_a.id, dec("8"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup_a.id,
+                dec("8"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup_b.id, dec("6.25"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup_b.id,
+                dec("6.25"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
         let purchase_b = draft_credit(&s, sup_b.id).await;
         let line_b = s
-            .add_line(audit_actor(&s).await, purchase_b.id, prod.id, dec("1"), None)
+            .add_line(
+                audit_actor(&s).await,
+                purchase_b.id,
+                prod.id,
+                dec("1"),
+                None,
+            )
             .await
             .unwrap();
 
-        assert_eq!(line_b.unit_cost, dec("6.25"), "a purchase for B must default to B's cost, not A's");
+        assert_eq!(
+            line_b.unit_cost,
+            dec("6.25"),
+            "a purchase for B must default to B's cost, not A's"
+        );
     }
 
     // -- add_or_increment_line (S5b): a same-cost repeat merges into the
@@ -2651,7 +3107,10 @@ mod tests {
     /// Unwraps a `Merged` outcome and checks the notice payload.
     fn assert_merged(outcome: LineAddOutcome, product_name: &str) -> PurchaseLine {
         match outcome {
-            LineAddOutcome::Merged { line, product_name: name } => {
+            LineAddOutcome::Merged {
+                line,
+                product_name: name,
+            } => {
                 assert_eq!(name, product_name);
                 line
             }
@@ -2705,7 +3164,11 @@ mod tests {
         assert_eq!(line.qty, dec("5"), "the merged quantity is the sum");
         assert_eq!(line.unit_cost, dec("5"), "the stored cost does not move");
         let detail = s.get_detail(purchase.id).await.unwrap();
-        assert_eq!(detail.lines.len(), 1, "exactly ONE line stays for the product");
+        assert_eq!(
+            detail.lines.len(),
+            1,
+            "exactly ONE line stays for the product"
+        );
     }
 
     #[tokio::test]
@@ -2732,8 +3195,16 @@ mod tests {
         }
         let detail = s.get_detail(purchase.id).await.unwrap();
         assert_eq!(detail.lines.len(), 1);
-        assert_eq!(detail.lines[0].qty, dec("2"), "the line's quantity is unchanged");
-        assert_eq!(detail.lines[0].unit_cost, dec("5"), "the stored cost is unchanged");
+        assert_eq!(
+            detail.lines[0].qty,
+            dec("2"),
+            "the line's quantity is unchanged"
+        );
+        assert_eq!(
+            detail.lines[0].unit_cost,
+            dec("5"),
+            "the stored cost is unchanged"
+        );
     }
 
     #[tokio::test]
@@ -2742,13 +3213,21 @@ mod tests {
         let prod = seed_product(&s, "MERGE-SAT", "5").await;
         let sup = seed_supplier(&s, "MERGE-SAT SUP").await;
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("9.50"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup.id,
+                dec("9.50"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
         let actor = audit_actor(&s).await;
         let purchase = draft_credit(&s, sup.id).await;
         // The first scan carries an empty cost: the satellite row prices the line.
-        s.add_line(actor, purchase.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(actor, purchase.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
 
         // The case a receiving desk actually hits: the same scan again, still
         // with an empty cost, resolving to the same satellite cost.
@@ -2761,7 +3240,11 @@ mod tests {
         assert_eq!(line.qty, dec("3"));
         assert_eq!(line.unit_cost, dec("9.50"));
         let detail = s.get_detail(purchase.id).await.unwrap();
-        assert_eq!(detail.lines.len(), 1, "exactly ONE line stays for the product");
+        assert_eq!(
+            detail.lines.len(),
+            1,
+            "exactly ONE line stays for the product"
+        );
     }
 
     /// Ordering pin: `add_or_increment_line` resolves the cost BEFORE the
@@ -2800,8 +3283,16 @@ mod tests {
         }
         let detail = s.get_detail(purchase.id).await.unwrap();
         assert_eq!(detail.lines.len(), 1);
-        assert_eq!(detail.lines[0].qty, dec("2"), "the line's quantity is unchanged");
-        assert_eq!(detail.lines[0].unit_cost, dec("5"), "the stored cost is unchanged");
+        assert_eq!(
+            detail.lines[0].qty,
+            dec("2"),
+            "the line's quantity is unchanged"
+        );
+        assert_eq!(
+            detail.lines[0].unit_cost,
+            dec("5"),
+            "the stored cost is unchanged"
+        );
     }
 
     // -- AC11: references ---------------------------------------------------------
@@ -2812,13 +3303,27 @@ mod tests {
         let prod = seed_product(&s, "AC11", "5").await;
         let sup = seed_supplier(&s, "AC11 SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("6")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("6")),
+        )
+        .await
+        .unwrap();
+        let detail = s
+            .confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        let detail = s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
 
-        let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
+        let moves = s
+            .inventory
+            .movements
+            .list_by_product(prod.id)
+            .await
+            .unwrap();
         let received = moves
             .iter()
             .find(|m| m.reason == MovementReason::Purchase)
@@ -2828,9 +3333,15 @@ mod tests {
         let acc = seed_account(&s, "caja11").await;
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
-        s.record_payment(audit_actor(&s).await, purchase.id, cash, dec("5"), d(2024, 5, 20))
-            .await
-            .unwrap();
+        s.record_payment(
+            audit_actor(&s).await,
+            purchase.id,
+            cash,
+            dec("5"),
+            d(2024, 5, 20),
+        )
+        .await
+        .unwrap();
         let rows = s
             .transactions
             .transactions
@@ -2863,22 +3374,49 @@ mod tests {
 
         // Preferred beats cheaper for pref_prod.
         s.suppliers
-            .record_cost(audit_actor(&s).await, pref_prod.id, sup_a.id, dec("9"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                pref_prod.id,
+                sup_a.id,
+                dec("9"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
         s.suppliers
-            .record_cost(audit_actor(&s).await, pref_prod.id, sup_b.id, dec("7"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                pref_prod.id,
+                sup_b.id,
+                dec("7"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
-        s.suppliers.set_preferred(audit_actor(&s).await, pref_prod.id, sup_a.id).await.unwrap();
+        s.suppliers
+            .set_preferred(audit_actor(&s).await, pref_prod.id, sup_a.id)
+            .await
+            .unwrap();
 
         // No preferred for cheap_prod: the cheapest current cost wins.
         s.suppliers
-            .record_cost(audit_actor(&s).await, cheap_prod.id, sup_a.id, dec("6.50"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                cheap_prod.id,
+                sup_a.id,
+                dec("6.50"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
         s.suppliers
-            .record_cost(audit_actor(&s).await, cheap_prod.id, sup_b.id, dec("6"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                cheap_prod.id,
+                sup_b.id,
+                dec("6"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
@@ -2932,9 +3470,15 @@ mod tests {
 
         // Cash confirm with an unassigned method => 400, nothing applied.
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("10")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
         let moves_before = movement_count(&pool).await;
         let err = s
             .confirm(audit_actor(&s).await, purchase.id, Some(qr))
@@ -2949,13 +3493,27 @@ mod tests {
 
         // Payment with an unassigned method => 400, no finance row.
         let credit = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, credit.id, prod.id, dec("2"), Some(dec("10")))
+        s.add_line(
+            audit_actor(&s).await,
+            credit.id,
+            prod.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, credit.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, credit.id, None).await.unwrap();
         let tx_before = tx_count(&pool).await;
         let err = s
-            .record_payment(audit_actor(&s).await, credit.id, qr, dec("5"), purchase_date())
+            .record_payment(
+                audit_actor(&s).await,
+                credit.id,
+                qr,
+                dec("5"),
+                purchase_date(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -2977,9 +3535,15 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, svc_prod.id, dec("3"), Some(dec("20")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            svc_prod.id,
+            dec("3"),
+            Some(dec("20")),
+        )
+        .await
+        .unwrap();
         let before = movement_count(&pool).await;
         let detail = s
             .confirm(audit_actor(&s).await, purchase.id, Some(cash))
@@ -2991,7 +3555,12 @@ mod tests {
         assert_eq!(s.inventory.stock(svc_prod.id).await.unwrap(), dec("0"));
         assert_eq!(tx_count(&pool).await, 1);
         // Satellite cost still recorded for the service.
-        let row = s.suppliers.find_cost(svc_prod.id, sup.id).await.unwrap().unwrap();
+        let row = s
+            .suppliers
+            .find_cost(svc_prod.id, sup.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.current_cost, dec("20"));
     }
 
@@ -3002,20 +3571,37 @@ mod tests {
         seed_stock(&s, prod.id, "5").await;
         let sup = seed_supplier(&s, "TRI DRAFT SUP").await;
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("4")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
         let moves_before = movement_count(&pool).await;
         let tx_before = tx_count(&pool).await;
 
-        let cancelled = s.cancel(audit_actor(&s).await, purchase.id, Some("ya no".into())).await.unwrap();
+        let cancelled = s
+            .cancel(audit_actor(&s).await, purchase.id, Some("ya no".into()))
+            .await
+            .unwrap();
         assert_eq!(cancelled.purchase.status, PurchaseStatus::Cancelled);
         assert!(cancelled.purchase.purchase_number.is_none());
         assert_eq!(movement_count(&pool).await, moves_before);
         assert_eq!(tx_count(&pool).await, tx_before);
-        assert!(s.suppliers.find_cost(prod.id, sup.id).await.unwrap().is_none());
+        assert!(s
+            .suppliers
+            .find_cost(prod.id, sup.id)
+            .await
+            .unwrap()
+            .is_none());
         // Cancelling again => 400.
-        let err = s.cancel(audit_actor(&s).await, purchase.id, None).await.unwrap_err();
+        let err = s
+            .cancel(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
@@ -3025,9 +3611,25 @@ mod tests {
         let prod = seed_product(&s, "TRI-NUM", "5").await;
         let sup = seed_supplier(&s, "TRI NUM SUP").await;
         let a = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, a.id, prod.id, dec("1"), Some(dec("5"))).await.unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            a.id,
+            prod.id,
+            dec("1"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
         let b = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, b.id, prod.id, dec("1"), Some(dec("5"))).await.unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            b.id,
+            prod.id,
+            dec("1"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
         let da = s.confirm(audit_actor(&s).await, a.id, None).await.unwrap();
         let db = s.confirm(audit_actor(&s).await, b.id, None).await.unwrap();
         let na = da.purchase.purchase_number.clone().unwrap();
@@ -3038,7 +3640,10 @@ mod tests {
 
         // Cancelling keeps the assigned number (immutable).
         let cancelled = s.cancel(audit_actor(&s).await, a.id, None).await.unwrap();
-        assert_eq!(cancelled.purchase.purchase_number.as_deref(), Some(na.as_str()));
+        assert_eq!(
+            cancelled.purchase.purchase_number.as_deref(),
+            Some(na.as_str())
+        );
     }
 
     #[tokio::test]
@@ -3051,9 +3656,15 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("10")))
-            .await
-            .unwrap(); // total 20, account has 0
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap(); // total 20, account has 0
         let moves_before = movement_count(&pool).await;
         let err = s
             .confirm(audit_actor(&s).await, purchase.id, Some(cash))
@@ -3080,19 +3691,42 @@ mod tests {
         allow(&s, acc_b.id, transfer).await;
 
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("20")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("20")),
+        )
+        .await
+        .unwrap(); // total 40
+        let detail = s
+            .confirm(audit_actor(&s).await, purchase.id, None)
             .await
-            .unwrap(); // total 40
-        let detail = s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+            .unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
-        s.record_payment(audit_actor(&s).await, purchase.id, cash, dec("15"), d(2024, 5, 10))
-            .await
-            .unwrap();
-        s.record_payment(audit_actor(&s).await, purchase.id, transfer, dec("25"), d(2024, 5, 11))
-            .await
-            .unwrap();
+        s.record_payment(
+            audit_actor(&s).await,
+            purchase.id,
+            cash,
+            dec("15"),
+            d(2024, 5, 10),
+        )
+        .await
+        .unwrap();
+        s.record_payment(
+            audit_actor(&s).await,
+            purchase.id,
+            transfer,
+            dec("25"),
+            d(2024, 5, 11),
+        )
+        .await
+        .unwrap();
 
-        s.cancel(audit_actor(&s).await, purchase.id, None).await.unwrap();
+        s.cancel(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
         let rows_a = s
             .transactions
             .transactions
@@ -3128,19 +3762,38 @@ mod tests {
         let cash = cash_method(&s).await;
         allow(&s, acc.id, cash).await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("5")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("1"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
-        s.cancel(audit_actor(&s).await, purchase.id, None).await.unwrap();
+        s.cancel(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
         let tx_before = tx_count(&pool).await;
         let err = s
-            .record_payment(audit_actor(&s).await, purchase.id, cash, dec("5"), purchase_date())
+            .record_payment(
+                audit_actor(&s).await,
+                purchase.id,
+                cash,
+                dec("5"),
+                purchase_date(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert_eq!(tx_count(&pool).await, tx_before);
-        let err = s.cancel(audit_actor(&s).await, purchase.id, None).await.unwrap_err();
+        let err = s
+            .cancel(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
@@ -3152,27 +3805,33 @@ mod tests {
 
         // Cash with a due_date is invalid.
         let err = s
-            .create_draft(audit_actor(&s).await, NewPurchase {
-                supplier_id: sup_a.id,
-                payment_type: PaymentType::Cash,
-                purchase_date: purchase_date(),
-                due_date: Some(d(2024, 6, 1)),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&s).await,
+                NewPurchase {
+                    supplier_id: sup_a.id,
+                    payment_type: PaymentType::Cash,
+                    purchase_date: purchase_date(),
+                    due_date: Some(d(2024, 6, 1)),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // Credit without due_date is invalid.
         let err = s
-            .create_draft(audit_actor(&s).await, NewPurchase {
-                supplier_id: sup_a.id,
-                payment_type: PaymentType::Credit,
-                purchase_date: purchase_date(),
-                due_date: None,
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&s).await,
+                NewPurchase {
+                    supplier_id: sup_a.id,
+                    payment_type: PaymentType::Credit,
+                    purchase_date: purchase_date(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -3180,7 +3839,8 @@ mod tests {
         let purchase = draft_credit(&s, sup_a.id).await;
         // Switching to Cash must clear the due_date in the same patch.
         let err = s
-            .update_draft(audit_actor(&s).await, 
+            .update_draft(
+                audit_actor(&s).await,
                 purchase.id,
                 UpdatePurchaseDraft {
                     payment_type: Some(PaymentType::Cash),
@@ -3191,7 +3851,8 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let switched = s
-            .update_draft(audit_actor(&s).await, 
+            .update_draft(
+                audit_actor(&s).await,
                 purchase.id,
                 UpdatePurchaseDraft {
                     payment_type: Some(PaymentType::Cash),
@@ -3215,9 +3876,15 @@ mod tests {
         let prod = seed_product(&s, "TRI-RESTR", "5").await;
         let sup = seed_supplier(&s, "TRI RESTR SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("5")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("1"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
 
         // Draft history alone is enough for the DB RESTRICT (no cost rows yet).
         let err = s.suppliers.delete_supplier(sup.id).await.unwrap_err();
@@ -3235,15 +3902,27 @@ mod tests {
         let other = seed_product(&s, "TRI-DUP-OK", "5").await;
         let sup = seed_supplier(&s, "TRI DUP SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("4")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("1"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
 
         // A purchase cannot repeat a product: the satellite holds one cost per
         // (product, supplier), so two different line costs have no defined
         // answer. The second add is rejected and the purchase is unchanged.
         let err = s
-            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("6")))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                prod.id,
+                dec("2"),
+                Some(dec("6")),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -3261,9 +3940,15 @@ mod tests {
             .is_empty());
 
         // A different product still fits on the same purchase.
-        s.add_line(audit_actor(&s).await, purchase.id, other.id, dec("1"), Some(dec("9")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            other.id,
+            dec("1"),
+            Some(dec("9")),
+        )
+        .await
+        .unwrap();
         assert_eq!(s.get_detail(purchase.id).await.unwrap().lines.len(), 2);
     }
 
@@ -3275,11 +3960,23 @@ mod tests {
         let sup = seed_supplier(&s, "TRI UPD DUP SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
         let first = s
-            .add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("4")))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                prod.id,
+                dec("1"),
+                Some(dec("4")),
+            )
             .await
             .unwrap();
         let ok_line = s
-            .add_line(audit_actor(&s).await, purchase.id, other.id, dec("1"), Some(dec("5")))
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                other.id,
+                dec("1"),
+                Some(dec("5")),
+            )
             .await
             .unwrap();
         // Fabricate the duplicate state outside the service (defensive path).
@@ -3318,9 +4015,15 @@ mod tests {
         let prod = seed_product(&s, "TRI-CONF-DUP", "5").await;
         let sup = seed_supplier(&s, "TRI CONF DUP SUP").await;
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("1"), Some(dec("4")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("1"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
         s.purchases
             .create_line(purchase.id, prod.id, dec("1"), dec("6"))
             .await
@@ -3328,7 +4031,10 @@ mod tests {
 
         // Defensive: add_line/update_line already reject duplicates, but a
         // confirm must never accept a repeated product either.
-        let err = s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap_err();
+        let err = s
+            .confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         let after = s.get_detail(purchase.id).await.unwrap();
@@ -3352,16 +4058,33 @@ mod tests {
         let sup = seed_supplier(&s, "TRI DIFF SUP").await;
 
         let first = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, first.id, prod.id, dec("1"), Some(dec("4")))
+        s.add_line(
+            audit_actor(&s).await,
+            first.id,
+            prod.id,
+            dec("1"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, first.id, None)
             .await
             .unwrap();
-        s.confirm(audit_actor(&s).await, first.id, None).await.unwrap();
 
         let second = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, second.id, prod.id, dec("2"), Some(dec("6")))
+        s.add_line(
+            audit_actor(&s).await,
+            second.id,
+            prod.id,
+            dec("2"),
+            Some(dec("6")),
+        )
+        .await
+        .unwrap();
+        let detail = s
+            .confirm(audit_actor(&s).await, second.id, None)
             .await
             .unwrap();
-        let detail = s.confirm(audit_actor(&s).await, second.id, None).await.unwrap();
 
         assert_eq!(detail.total, dec("12"));
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("3"));
@@ -3383,7 +4106,13 @@ mod tests {
         seed_stock(&s, prod.id, "2").await; // suggested 18
         let sup = seed_supplier(&s, "TRI PEDIDO SUP").await;
         s.suppliers
-            .record_cost(audit_actor(&s).await, prod.id, sup.id, dec("4"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                prod.id,
+                sup.id,
+                dec("4"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
@@ -3398,7 +4127,8 @@ mod tests {
 
         // Draft the pedido from the suggestion and confirm it (Credit).
         let purchase = draft_credit(&s, item.supplier_id).await;
-        s.add_line(audit_actor(&s).await, 
+        s.add_line(
+            audit_actor(&s).await,
             purchase.id,
             item.product.id,
             item.suggested_qty,
@@ -3406,7 +4136,9 @@ mod tests {
         )
         .await
         .unwrap();
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
         assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("20"));
 
         let after = s.suggestions().await.unwrap();
@@ -3508,9 +4240,15 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("10")))
-            .await
-            .unwrap(); // total 20
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap(); // total 20
 
         let detail = s
             .confirm(audit_actor(&s).await, purchase.id, Some(cash))
@@ -3548,14 +4286,29 @@ mod tests {
         allow(&s, acc.id, cash).await;
 
         let purchase = draft_credit(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("20")))
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("20")),
+        )
+        .await
+        .unwrap(); // total 40
+        let detail = s
+            .confirm(audit_actor(&s).await, purchase.id, None)
             .await
-            .unwrap(); // total 40
-        let detail = s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+            .unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
 
         let paid = s
-            .record_payment(audit_actor(&s).await, purchase.id, cash, dec("15"), d(2024, 5, 10))
+            .record_payment(
+                audit_actor(&s).await,
+                purchase.id,
+                cash,
+                dec("15"),
+                d(2024, 5, 10),
+            )
             .await
             .unwrap();
         let paid_tx_id = paid
@@ -3572,7 +4325,9 @@ mod tests {
         assert_eq!(expense.kind, TransactionKind::Expense);
         assert_eq!(expense.reference.as_deref(), Some(number.as_str()));
 
-        s.cancel(audit_actor(&s).await, purchase.id, Some("return".into())).await.unwrap();
+        s.cancel(audit_actor(&s).await, purchase.id, Some("return".into()))
+            .await
+            .unwrap();
 
         let payments = s.purchases.list_payments(purchase.id).await.unwrap();
         assert_eq!(payments.len(), 1);
@@ -3614,14 +4369,17 @@ mod tests {
                 other_supplier.id
             };
             let purchase = s
-                .create_draft(audit_actor(&s).await, NewPurchase {
-                    supplier_id,
-                    payment_type: PaymentType::Cash,
-                    purchase_date: purchase_date(),
-                    due_date: None,
-                    supplier_invoice_no: None,
-                    notes: None,
-                })
+                .create_draft(
+                    audit_actor(&s).await,
+                    NewPurchase {
+                        supplier_id,
+                        payment_type: PaymentType::Cash,
+                        purchase_date: purchase_date(),
+                        due_date: None,
+                        supplier_invoice_no: None,
+                        notes: None,
+                    },
+                )
                 .await
                 .unwrap();
             if i == 3 {
@@ -3639,7 +4397,11 @@ mod tests {
             .unwrap();
         let reads = s.purchases.read_count();
 
-        assert_eq!(details.len(), 1, "the supplier filter narrows to its purchase");
+        assert_eq!(
+            details.len(),
+            1,
+            "the supplier filter narrows to its purchase"
+        );
         assert_eq!(details[0].purchase.id, matching);
         assert_eq!(
             reads, 3,
@@ -3654,8 +4416,12 @@ mod tests {
     #[tokio::test]
     async fn ac18_the_purchase_flow_movement_carries_the_flows_actor() {
         let (s, pool) = svc().await;
-        let creator = test_support::seed_audit_user(&pool, "pur-alice", "Alice").await.unwrap();
-        let operator = test_support::seed_audit_user(&pool, "pur-bob", "Bob").await.unwrap();
+        let creator = test_support::seed_audit_user(&pool, "pur-alice", "Alice")
+            .await
+            .unwrap();
+        let operator = test_support::seed_audit_user(&pool, "pur-bob", "Bob")
+            .await
+            .unwrap();
 
         let acc = seed_account(&s, "purstock").await;
         let cash = cash_method(&s).await;
@@ -3670,26 +4436,46 @@ mod tests {
             "the fixture's actor is the sentinel"
         );
         assert_ne!(prod.created_by, creator);
-        assert_ne!(prod.created_by, operator, "the two actors are distinguishable");
+        assert_ne!(
+            prod.created_by, operator,
+            "the two actors are distinguishable"
+        );
         let sup = seed_supplier(&s, "Pur Flow Sup").await;
 
         let purchase = draft_cash(&s, sup.id).await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("3"), Some(dec("4")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("3"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
 
         let _detail = s.confirm(operator, purchase.id, Some(cash)).await.unwrap();
-        let moves = s.inventory.movements.list_by_product(prod.id).await.unwrap();
+        let moves = s
+            .inventory
+            .movements
+            .list_by_product(prod.id)
+            .await
+            .unwrap();
         let purchase_move = moves
             .iter()
             .find(|m| m.reason == MovementReason::Purchase)
             .unwrap_or_else(|| panic!("the purchase confirm produced its own movement"));
-        assert_eq!(purchase_move.created_by, operator, "the flow's actor, not a fresh one");
+        assert_eq!(
+            purchase_move.created_by, operator,
+            "the flow's actor, not a fresh one"
+        );
         assert_ne!(
             purchase_move.created_by, prod.created_by,
             "distinct from the product's creator"
         );
-        assert_eq!(purchase_move.updated_by, None, "an append-only movement has no editor");
+        assert_eq!(
+            purchase_move.updated_by, None,
+            "an append-only movement has no editor"
+        );
     }
 
     // -- AC18 (purchases audit, slice S12): two actors, the flow's payment, and
@@ -3702,8 +4488,12 @@ mod tests {
     #[tokio::test]
     async fn ac18_the_purchase_records_two_different_actors_and_its_payment_the_flows_actor() {
         let (s, pool) = svc().await;
-        let creator = test_support::seed_audit_user(&pool, "purch-alice", "Alice").await.unwrap();
-        let editor = test_support::seed_audit_user(&pool, "purch-bob", "Bob").await.unwrap();
+        let creator = test_support::seed_audit_user(&pool, "purch-alice", "Alice")
+            .await
+            .unwrap();
+        let editor = test_support::seed_audit_user(&pool, "purch-bob", "Bob")
+            .await
+            .unwrap();
 
         let prod = seed_product(&s, "PURCH-AUD", "5").await;
         let sup = seed_supplier(&s, "PURCH AUD SUP").await;
@@ -3713,14 +4503,17 @@ mod tests {
 
         // Alice creates the draft: the row names her and no editor yet.
         let purchase = s
-            .create_draft(creator, NewPurchase {
-                supplier_id: sup.id,
-                payment_type: PaymentType::Credit,
-                purchase_date: purchase_date(),
-                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                creator,
+                NewPurchase {
+                    supplier_id: sup.id,
+                    payment_type: PaymentType::Credit,
+                    purchase_date: purchase_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(purchase.created_by, creator, "the draft's creator");
@@ -3733,15 +4526,23 @@ mod tests {
             .unwrap();
         let after_line = s.get_detail(purchase.id).await.unwrap().purchase;
         assert_eq!(after_line.created_by, creator);
-        assert_eq!(after_line.updated_by, Some(creator), "the line change edits the draft");
+        assert_eq!(
+            after_line.updated_by,
+            Some(creator),
+            "the line change edits the draft"
+        );
 
         // Bob edits the header: the same document now names its last editor,
         // and the creator is untouched.
         let edited = s
-            .update_draft(editor, purchase.id, UpdatePurchaseDraft {
-                notes: Some("edited".into()),
-                ..Default::default()
-            })
+            .update_draft(
+                editor,
+                purchase.id,
+                UpdatePurchaseDraft {
+                    notes: Some("edited".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(edited.created_by, creator);
@@ -3753,9 +4554,20 @@ mod tests {
         let confirmed = s.confirm(editor, purchase.id, None).await.unwrap();
         assert_eq!(confirmed.purchase.created_by, creator);
         assert_eq!(confirmed.purchase.updated_by, Some(editor));
-        let cost = s.suppliers.find_cost(prod.id, sup.id).await.unwrap().unwrap();
-        assert_eq!(cost.created_by, editor, "the confirm's cost row names the confirming actor");
-        assert_ne!(cost.created_by, creator, "distinct from the draft's creator");
+        let cost = s
+            .suppliers
+            .find_cost(prod.id, sup.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cost.created_by, editor,
+            "the confirm's cost row names the confirming actor"
+        );
+        assert_ne!(
+            cost.created_by, creator,
+            "distinct from the draft's creator"
+        );
 
         // Alice records a payment: the payment row carries the recording
         // request's actor, not the sale's creator and not a fresh one.
@@ -3764,7 +4576,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(payment.created_by, creator, "the flow's actor");
-        assert_ne!(payment.created_by, editor, "distinct from the confirming user");
+        assert_ne!(
+            payment.created_by, editor,
+            "distinct from the confirming user"
+        );
         assert_eq!(payment.updated_by, None, "a fresh payment has no editor");
         let stored = s.purchases.list_payments(purchase.id).await.unwrap();
         assert_eq!(stored[0].created_by, creator, "the stored row keeps it");
@@ -3778,7 +4593,11 @@ mod tests {
         assert_eq!(cancelled.purchase.created_by, creator);
         assert_eq!(cancelled.purchase.updated_by, Some(creator));
         let payments = s.purchases.list_payments(purchase.id).await.unwrap();
-        assert_eq!(payments[0].updated_by, Some(creator), "the refund link names its writer");
+        assert_eq!(
+            payments[0].updated_by,
+            Some(creator),
+            "the refund link names its writer"
+        );
         assert_eq!(payments[0].created_by, creator, "the creator never changes");
     }
 
@@ -3790,13 +4609,29 @@ mod tests {
         let sup = seed_supplier(&s, "FindPay Supplier").await;
         let purchase = draft_credit(&s, sup.id).await;
         let prod = seed_product(&s, "FINDPAY-P", "4").await;
-        s.add_line(audit_actor(&s).await, purchase.id, prod.id, dec("2"), Some(dec("4"))).await.unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("4")),
+        )
+        .await
+        .unwrap();
         let cash = cash_method(&s).await;
         let wallet = seed_account(&s, "findpay wallet").await;
         allow(&s, wallet.id, cash).await;
-        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
         let recorded = s
-            .record_payment(audit_actor(&s).await, purchase.id, cash, dec("5"), purchase_date())
+            .record_payment(
+                audit_actor(&s).await,
+                purchase.id,
+                cash,
+                dec("5"),
+                purchase_date(),
+            )
             .await
             .unwrap();
 

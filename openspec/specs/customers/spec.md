@@ -8,7 +8,7 @@ of money that covers several invoices at once.
 
 ### customers
 `id`, `name` (≤ 128, **not** UNIQUE), `phone`, `address`, `tax_id`, `notes`, `is_walkin`, `is_active`,
-`credit_limit` (nullable Decimal; null means no limit), `payment_days` (nullable), `created_at`,
+`credit_limit` (nullable Decimal; null means no limit), `due_days` (nullable), `created_at`,
 `updated_at`.
 
 One row is seeded: `Consumidor final`, with `is_walkin = 1`. A partial unique index enforces at most one
@@ -44,7 +44,7 @@ direct payment on a single sale and remains fully valid.
   projected debt exceeds the customer's limit returns 400 quoting the projected figure. With the flag
   false the sale is confirmed and the customer reports `over_limit`. A null limit is never checked, so the
   flag is never a silent bypass. The check runs before any document number, stock or finance write.
-- **Payment term.** A credit sale without a due date defaults to `sale_date + payment_days`; with no term
+- **Payment term.** A credit sale without a due date defaults to `sale_date + due_days`; with no term
   and no due date it returns 400.
 - **Derived balance:** credit sales total minus the payments received on them. A cancelled sale
   contributes nothing to either side even though its payment rows are kept, and a cash sale never counts.

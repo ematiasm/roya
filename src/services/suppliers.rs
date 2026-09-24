@@ -82,6 +82,17 @@ where
         }
     }
 
+    /// NULL means no default term; zero is due immediately; explicit terms
+    /// must be non-negative.
+    fn clean_due_days(days: Option<i64>) -> AppResult<Option<i64>> {
+        match days {
+            Some(value) if value < 0 => Err(AppError::Validation(
+                "supplier due days must be >= 0".into(),
+            )),
+            other => Ok(other),
+        }
+    }
+
     // -- supplier CRUD --------------------------------------------------------
 
     /// Create a supplier. `actor` is the acting user's id the route resolves
@@ -92,11 +103,17 @@ where
             name: Self::clean_name(&input.name)?,
             phone: Self::clean_phone(&input.phone)?,
             notes: Self::clean_notes(&input.notes)?,
+            due_days: Self::clean_due_days(input.due_days)?,
         };
         self.suppliers.create(actor, &clean).await
     }
 
-    pub async fn update_supplier(&self, actor: i64, id: i64, patch: UpdateSupplier) -> AppResult<Supplier> {
+    pub async fn update_supplier(
+        &self,
+        actor: i64,
+        id: i64,
+        patch: UpdateSupplier,
+    ) -> AppResult<Supplier> {
         self.get_supplier(id).await?;
         let mut clean = UpdateSupplier::default();
         if let Some(ref name) = patch.name {
@@ -107,6 +124,9 @@ where
         }
         if let Some(ref notes) = patch.notes {
             clean.notes = Some(Self::clean_notes(notes)?);
+        }
+        if let Some(days) = patch.due_days {
+            clean.due_days = Some(Self::clean_due_days(days)?);
         }
         self.suppliers.update(id, actor, &clean).await
     }
@@ -227,7 +247,7 @@ where
     /// Record a (product, supplier) cost. First call creates the row. A later
     /// call with a different cost shifts current -> previous with its date and
     /// stores the new value with `when`; a later call with the same cost only
-    /// refreshes `current_cost_updated_at`, keeping the last distinct previous.
+    /// refreshes `current_cost_date`, keeping the last distinct previous.
     /// Unknown product/supplier surface as Validation through the repository FK
     /// mapping. `products.cost_price` is deliberately untouched.
     pub async fn record_cost(
@@ -248,7 +268,7 @@ where
                     .await
             }
             Some(existing) => {
-                if when < existing.current_cost_updated_at {
+                if when < existing.current_cost_date {
                     return Err(AppError::Validation(
                         "cost date cannot precede the current cost date".into(),
                     ));
@@ -301,7 +321,9 @@ where
                     "cost row for product {product_id} and supplier {supplier_id} not found"
                 ))
             })?;
-        self.costs.set_preferred(actor, product_id, supplier_id).await
+        self.costs
+            .set_preferred(actor, product_id, supplier_id)
+            .await
     }
 
     pub async fn clear_preferred(&self, actor: i64, product_id: i64) -> AppResult<()> {
@@ -339,14 +361,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewProduct, NewSupplier, PriceAlert, ProductKind, Supplier, UpdateSupplier};
+    use crate::models::{
+        NewProduct, NewSupplier, PriceAlert, ProductKind, Supplier, UpdateSupplier,
+    };
     use crate::repositories::{
         ProductRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
         SqliteProductRepository, SqliteProductSupplierCostRepository,
         SqliteStockMovementRepository, SqliteSupplierRepository,
     };
-    use crate::services::InventoryService;
     use crate::security::test_support;
+    use crate::services::InventoryService;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use sqlx::SqlitePool;
     use std::str::FromStr;
@@ -395,34 +419,43 @@ mod tests {
     }
 
     async fn seed_product(pool: &SqlitePool, sku: &str, cost_price: &str) -> i64 {
-        let actor = crate::security::test_support::audit_actor_id(pool).await.unwrap();
+        let actor = crate::security::test_support::audit_actor_id(pool)
+            .await
+            .unwrap();
         SqliteProductRepository::new(pool.clone())
-            .create(actor, &NewProduct {
-                sku: sku.into(),
-                name: format!("prod {sku}"),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: dec("10"),
-                cost_price: dec(cost_price),
-                track_stock: true,
-                min_stock: Some(dec("0")),
-                max_stock: Some(dec("10")),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+            .create(
+                actor,
+                &NewProduct {
+                    sku: sku.into(),
+                    name: format!("prod {sku}"),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec("10"),
+                    cost_price: dec(cost_price),
+                    track_stock: true,
+                    min_stock: Some(dec("0")),
+                    max_stock: Some(dec("10")),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap()
             .id
     }
 
     async fn seed_supplier(s: &Svc, name: &str) -> Supplier {
-        s.create_supplier(audit_actor(s).await, NewSupplier {
-            name: name.into(),
-            phone: None,
-            notes: None,
-        })
+        s.create_supplier(
+            audit_actor(s).await,
+            NewSupplier {
+                name: name.into(),
+                phone: None,
+                notes: None,
+                due_days: None,
+            },
+        )
         .await
         .unwrap()
     }
@@ -436,14 +469,20 @@ mod tests {
         let sup = seed_supplier(&s, "AC9 SUP").await;
 
         let row = s
-            .record_cost(audit_actor(&s).await, p, sup.id, dec("10.50"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                p,
+                sup.id,
+                dec("10.50"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap();
 
         assert_eq!(row.current_cost, dec("10.50"));
-        assert_eq!(row.current_cost_updated_at, d(2024, 5, 1));
+        assert_eq!(row.current_cost_date, d(2024, 5, 1));
         assert_eq!(row.previous_cost, None);
-        assert_eq!(row.previous_cost_updated_at, None);
+        assert_eq!(row.previous_cost_date, None);
         assert!(!row.is_preferred);
     }
 
@@ -457,14 +496,20 @@ mod tests {
             .await
             .unwrap();
         let row = s
-            .record_cost(audit_actor(&s).await, p, sup.id, dec("12.25"), d(2024, 5, 10))
+            .record_cost(
+                audit_actor(&s).await,
+                p,
+                sup.id,
+                dec("12.25"),
+                d(2024, 5, 10),
+            )
             .await
             .unwrap();
 
         assert_eq!(row.current_cost, dec("12.25"));
-        assert_eq!(row.current_cost_updated_at, d(2024, 5, 10));
+        assert_eq!(row.current_cost_date, d(2024, 5, 10));
         assert_eq!(row.previous_cost, Some(dec("10")));
-        assert_eq!(row.previous_cost_updated_at, Some(d(2024, 5, 1)));
+        assert_eq!(row.previous_cost_date, Some(d(2024, 5, 1)));
     }
 
     #[tokio::test]
@@ -533,7 +578,7 @@ mod tests {
 
         assert_eq!(repeated.current_cost, dec("120"));
         assert_eq!(repeated.previous_cost, Some(dec("100")));
-        assert_eq!(repeated.previous_cost_updated_at, Some(d(2024, 5, 1)));
+        assert_eq!(repeated.previous_cost_date, Some(d(2024, 5, 1)));
     }
 
     #[tokio::test]
@@ -551,7 +596,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(refreshed.current_cost, dec("120"));
-        assert_eq!(refreshed.current_cost_updated_at, d(2024, 5, 7));
+        assert_eq!(refreshed.current_cost_date, d(2024, 5, 7));
         assert_eq!(refreshed.previous_cost, None);
     }
 
@@ -569,7 +614,13 @@ mod tests {
             .unwrap();
         for day in [5, 6, 7] {
             let repeated = s
-                .record_cost(audit_actor(&s).await, p, sup.id, dec("120"), d(2024, 5, day))
+                .record_cost(
+                    audit_actor(&s).await,
+                    p,
+                    sup.id,
+                    dec("120"),
+                    d(2024, 5, day),
+                )
                 .await
                 .unwrap();
             assert_eq!(repeated.previous_cost, Some(dec("100")));
@@ -681,22 +732,40 @@ mod tests {
         let other = seed_product(&pool, "PREF-2", "5").await;
         let a = seed_supplier(&s, "PREF A").await;
         let b = seed_supplier(&s, "PREF B").await;
-        s.record_cost(audit_actor(&s).await, p, a.id, dec("9"), d(2024, 5, 1)).await.unwrap();
-        s.record_cost(audit_actor(&s).await, p, b.id, dec("8"), d(2024, 5, 1)).await.unwrap();
+        s.record_cost(audit_actor(&s).await, p, a.id, dec("9"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.record_cost(audit_actor(&s).await, p, b.id, dec("8"), d(2024, 5, 1))
+            .await
+            .unwrap();
         s.record_cost(audit_actor(&s).await, other, a.id, dec("9"), d(2024, 5, 1))
             .await
             .unwrap();
-        s.set_preferred(audit_actor(&s).await, other, a.id).await.unwrap();
+        s.set_preferred(audit_actor(&s).await, other, a.id)
+            .await
+            .unwrap();
 
-        let first = s.set_preferred(audit_actor(&s).await, p, a.id).await.unwrap();
+        let first = s
+            .set_preferred(audit_actor(&s).await, p, a.id)
+            .await
+            .unwrap();
         assert!(first.is_preferred);
-        let second = s.set_preferred(audit_actor(&s).await, p, b.id).await.unwrap();
+        let second = s
+            .set_preferred(audit_actor(&s).await, p, b.id)
+            .await
+            .unwrap();
         assert!(second.is_preferred);
 
         assert!(!s.find_cost(p, a.id).await.unwrap().unwrap().is_preferred);
         assert!(s.find_cost(p, b.id).await.unwrap().unwrap().is_preferred);
         // Another product keeps its own preferred supplier.
-        assert!(s.find_cost(other, a.id).await.unwrap().unwrap().is_preferred);
+        assert!(
+            s.find_cost(other, a.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_preferred
+        );
     }
 
     // -- triangulation --------------------------------------------------------
@@ -705,11 +774,15 @@ mod tests {
     async fn tri_supplier_name_is_trimmed_and_duplicate_is_conflict() {
         let (s, _pool) = svc().await;
         let created = s
-            .create_supplier(audit_actor(&s).await, NewSupplier {
-                name: "  Distribuidora Sur  ".into(),
-                phone: Some("  555-1234  ".into()),
-                notes: Some("  entrega martes  ".into()),
-            })
+            .create_supplier(
+                audit_actor(&s).await,
+                NewSupplier {
+                    name: "  Distribuidora Sur  ".into(),
+                    phone: Some("  555-1234  ".into()),
+                    notes: Some("  entrega martes  ".into()),
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(created.name, "Distribuidora Sur");
@@ -717,15 +790,24 @@ mod tests {
         assert_eq!(created.notes.as_deref(), Some("entrega martes"));
 
         let err = s
-            .create_supplier(audit_actor(&s).await, NewSupplier {
-                name: "Distribuidora Sur".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&s).await,
+                NewSupplier {
+                    name: "Distribuidora Sur".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
-        assert!(s.suppliers.find_by_name("Distribuidora Sur").await.unwrap().is_some());
+        assert!(s
+            .suppliers
+            .find_by_name("Distribuidora Sur")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]
@@ -733,11 +815,15 @@ mod tests {
         let (s, _pool) = svc().await;
         for bad in ["", "   "] {
             let err = s
-                .create_supplier(audit_actor(&s).await, NewSupplier {
-                    name: bad.into(),
-                    phone: None,
-                    notes: None,
-                })
+                .create_supplier(
+                    audit_actor(&s).await,
+                    NewSupplier {
+                        name: bad.into(),
+                        phone: None,
+                        notes: None,
+                        due_days: None,
+                    },
+                )
                 .await
                 .unwrap_err();
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -746,29 +832,41 @@ mod tests {
         let long_phone = "9".repeat(33);
         let long_notes = "x".repeat(513);
         let err = s
-            .create_supplier(audit_actor(&s).await, NewSupplier {
-                name: long_name,
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&s).await,
+                NewSupplier {
+                    name: long_name,
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
-            .create_supplier(audit_actor(&s).await, NewSupplier {
-                name: "Largo".into(),
-                phone: Some(long_phone),
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&s).await,
+                NewSupplier {
+                    name: "Largo".into(),
+                    phone: Some(long_phone),
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
-            .create_supplier(audit_actor(&s).await, NewSupplier {
-                name: "Largo".into(),
-                phone: None,
-                notes: Some(long_notes),
-            })
+            .create_supplier(
+                audit_actor(&s).await,
+                NewSupplier {
+                    name: "Largo".into(),
+                    phone: None,
+                    notes: Some(long_notes),
+                    due_days: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -778,22 +876,28 @@ mod tests {
     async fn tri_update_supplier_changes_conflicts_and_clears_fields() {
         let (s, _pool) = svc().await;
         let a = s
-            .create_supplier(audit_actor(&s).await, NewSupplier {
-                name: "A".into(),
-                phone: Some("111".into()),
-                notes: Some("n".into()),
-            })
+            .create_supplier(
+                audit_actor(&s).await,
+                NewSupplier {
+                    name: "A".into(),
+                    phone: Some("111".into()),
+                    notes: Some("n".into()),
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let _b = seed_supplier(&s, "B").await;
 
         let updated = s
-            .update_supplier(audit_actor(&s).await, 
+            .update_supplier(
+                audit_actor(&s).await,
                 a.id,
                 UpdateSupplier {
                     name: Some("A2".into()),
                     phone: Some(Some("  222  ".into())),
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -804,7 +908,8 @@ mod tests {
 
         // Renaming onto another supplier's name is a conflict.
         let err = s
-            .update_supplier(audit_actor(&s).await, 
+            .update_supplier(
+                audit_actor(&s).await,
                 a.id,
                 UpdateSupplier {
                     name: Some("B".into()),
@@ -817,7 +922,8 @@ mod tests {
 
         // Some(None) clears the field.
         let cleared = s
-            .update_supplier(audit_actor(&s).await, 
+            .update_supplier(
+                audit_actor(&s).await,
                 a.id,
                 UpdateSupplier {
                     phone: Some(None),
@@ -844,7 +950,10 @@ mod tests {
             .await
             .unwrap();
 
-        let off = s.set_active(audit_actor(&s).await, sup.id, false).await.unwrap();
+        let off = s
+            .set_active(audit_actor(&s).await, sup.id, false)
+            .await
+            .unwrap();
         assert!(!off.is_active);
         assert!(s.find_cost(p, sup.id).await.unwrap().is_some());
         assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("6")));
@@ -862,7 +971,13 @@ mod tests {
         let p = seed_product(&pool, "TRI-NEG", "5").await;
         let sup = seed_supplier(&s, "TRI NEG").await;
         let err = s
-            .record_cost(audit_actor(&s).await, p, sup.id, dec("-0.01"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                p,
+                sup.id,
+                dec("-0.01"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -885,7 +1000,7 @@ mod tests {
 
         let row = s.find_cost(p, sup.id).await.unwrap().unwrap();
         assert_eq!(row.current_cost, dec("10"));
-        assert_eq!(row.current_cost_updated_at, d(2024, 5, 10));
+        assert_eq!(row.current_cost_date, d(2024, 5, 10));
         assert_eq!(row.previous_cost, None);
     }
 
@@ -896,7 +1011,13 @@ mod tests {
         let sup = seed_supplier(&s, "TRI FK").await;
 
         let err = s
-            .record_cost(audit_actor(&s).await, 999_999, sup.id, dec("1"), d(2024, 5, 1))
+            .record_cost(
+                audit_actor(&s).await,
+                999_999,
+                sup.id,
+                dec("1"),
+                d(2024, 5, 1),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -914,9 +1035,15 @@ mod tests {
         let p = seed_product(&pool, "TRI-PREF", "5").await;
         let a = seed_supplier(&s, "TRI PREF A").await;
         let b = seed_supplier(&s, "TRI PREF B").await;
-        s.record_cost(audit_actor(&s).await, p, a.id, dec("9"), d(2024, 5, 1)).await.unwrap();
-        s.record_cost(audit_actor(&s).await, p, b.id, dec("8"), d(2024, 5, 1)).await.unwrap();
-        s.set_preferred(audit_actor(&s).await, p, a.id).await.unwrap();
+        s.record_cost(audit_actor(&s).await, p, a.id, dec("9"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.record_cost(audit_actor(&s).await, p, b.id, dec("8"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        s.set_preferred(audit_actor(&s).await, p, a.id)
+            .await
+            .unwrap();
 
         let err = sqlx::query(
             r#"UPDATE product_supplier_costs SET is_preferred = 1
@@ -948,7 +1075,9 @@ mod tests {
 
         // No preferred yet: lowest wins.
         assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("7")));
-        s.set_preferred(audit_actor(&s).await, p, marked.id).await.unwrap();
+        s.set_preferred(audit_actor(&s).await, p, marked.id)
+            .await
+            .unwrap();
         // Preferred wins even when it is not the cheapest.
         assert_eq!(s.reference_cost(p).await.unwrap(), Some(dec("9")));
         s.clear_preferred(audit_actor(&s).await, p).await.unwrap();
@@ -960,7 +1089,10 @@ mod tests {
         let (s, pool) = svc().await;
         let p = seed_product(&pool, "TRI-PREF-MISS", "5").await;
         let sup = seed_supplier(&s, "TRI PREF MISS").await;
-        let err = s.set_preferred(audit_actor(&s).await, p, sup.id).await.unwrap_err();
+        let err = s
+            .set_preferred(audit_actor(&s).await, p, sup.id)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 
@@ -972,34 +1104,54 @@ mod tests {
     #[tokio::test]
     async fn ac18_a_supplier_records_two_different_actors() {
         let (s, pool) = svc().await;
-        let creator = test_support::seed_audit_user(&pool, "sup-alice", "Alice").await.unwrap();
-        let editor = test_support::seed_audit_user(&pool, "sup-bob", "Bob").await.unwrap();
+        let creator = test_support::seed_audit_user(&pool, "sup-alice", "Alice")
+            .await
+            .unwrap();
+        let editor = test_support::seed_audit_user(&pool, "sup-bob", "Bob")
+            .await
+            .unwrap();
 
         let supplier = s
-            .create_supplier(creator, NewSupplier {
-                name: "Audit Supplier".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                creator,
+                NewSupplier {
+                    name: "Audit Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(supplier.created_by, creator, "the creator");
         assert_eq!(supplier.updated_by, None, "a fresh supplier has no editor");
 
         let renamed = s
-            .update_supplier(editor, supplier.id, UpdateSupplier {
-                name: Some("Renamed Supplier".into()),
-                ..Default::default()
-            })
+            .update_supplier(
+                editor,
+                supplier.id,
+                UpdateSupplier {
+                    name: Some("Renamed Supplier".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(renamed.created_by, creator, "the creator never changes");
-        assert_eq!(renamed.updated_by, Some(editor), "the edit names its editor");
+        assert_eq!(
+            renamed.updated_by,
+            Some(editor),
+            "the edit names its editor"
+        );
 
         // Deactivation is an edit too: the toggle carries the acting user.
         let deactivated = s.set_active(creator, supplier.id, false).await.unwrap();
         assert_eq!(deactivated.created_by, creator);
-        assert_eq!(deactivated.updated_by, Some(creator), "the toggle names its actor");
+        assert_eq!(
+            deactivated.updated_by,
+            Some(creator),
+            "the toggle names its actor"
+        );
     }
 
     /// The cost row records, shifts and refreshes with the requesting actors,
@@ -1008,16 +1160,24 @@ mod tests {
     #[tokio::test]
     async fn ac18_the_supplier_cost_and_its_preferred_flag_carry_their_actors() {
         let (s, pool) = svc().await;
-        let alice = test_support::seed_audit_user(&pool, "cost-alice", "Alice").await.unwrap();
-        let bob = test_support::seed_audit_user(&pool, "cost-bob", "Bob").await.unwrap();
+        let alice = test_support::seed_audit_user(&pool, "cost-alice", "Alice")
+            .await
+            .unwrap();
+        let bob = test_support::seed_audit_user(&pool, "cost-bob", "Bob")
+            .await
+            .unwrap();
 
         let product_id = seed_product(&pool, "COST AUD", "5").await;
         let supplier = s
-            .create_supplier(bob, NewSupplier {
-                name: "Cost Audit Supplier".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                bob,
+                NewSupplier {
+                    name: "Cost Audit Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -1042,22 +1202,31 @@ mod tests {
             .record_cost(alice, product_id, supplier.id, dec("12"), d(2024, 5, 20))
             .await
             .unwrap();
-        assert_eq!(refreshed.updated_by, Some(alice), "the refresh names its writer");
+        assert_eq!(
+            refreshed.updated_by,
+            Some(alice),
+            "the refresh names its writer"
+        );
 
         // Bob prefers this supplier: the promoted row names him; the demoted
         // one (none here) would name him too.
-        let preferred = s
-            .set_preferred(bob, product_id, supplier.id)
-            .await
-            .unwrap();
+        let preferred = s.set_preferred(bob, product_id, supplier.id).await.unwrap();
         assert_eq!(preferred.is_preferred, true);
-        assert_eq!(preferred.updated_by, Some(bob), "the promotion names its writer");
+        assert_eq!(
+            preferred.updated_by,
+            Some(bob),
+            "the promotion names its writer"
+        );
 
         // Alice clears it: the demoted row names her, like any edit.
         s.clear_preferred(alice, product_id).await.unwrap();
         let cleared = s.find_cost(product_id, supplier.id).await.unwrap().unwrap();
         assert_eq!(cleared.is_preferred, false);
-        assert_eq!(cleared.updated_by, Some(alice), "the demotion names its writer");
+        assert_eq!(
+            cleared.updated_by,
+            Some(alice),
+            "the demotion names its writer"
+        );
     }
 
     // -- picker reads (the supplier half of the product picker) --------------
@@ -1089,7 +1258,9 @@ mod tests {
         let (s, _pool) = svc().await;
         let live = seed_supplier(&s, "Live Supplier").await;
         let gone = seed_supplier(&s, "Gone Supplier").await;
-        s.set_active(audit_actor(&s).await, gone.id, false).await.unwrap();
+        s.set_active(audit_actor(&s).await, gone.id, false)
+            .await
+            .unwrap();
 
         let matches = s.search_suppliers("supplier").await.unwrap();
         let ids: Vec<(i64, bool)> = matches.iter().map(|x| (x.id, x.is_active)).collect();
@@ -1138,7 +1309,10 @@ mod tests {
         let (s, _pool) = svc().await;
         seed_supplier(&s, "Pérez & Hijos").await;
 
-        let err = s.resolve_supplier_name("Missing Supplier").await.unwrap_err();
+        let err = s
+            .resolve_supplier_name("Missing Supplier")
+            .await
+            .unwrap_err();
         match err {
             AppError::Validation(msg) => {
                 assert!(
@@ -1165,10 +1339,7 @@ mod tests {
         let partial = s.resolve_supplier_name("Pérez").await.unwrap_err();
         match partial {
             AppError::Validation(msg) => {
-                assert!(
-                    msg.contains("Pérez"),
-                    "the refusal names the value: {msg}"
-                );
+                assert!(msg.contains("Pérez"), "the refusal names the value: {msg}");
             }
             other => panic!("a non-exact name is a 400 Validation, not {other:?}"),
         }

@@ -40,7 +40,7 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label class="field-label">Amount</label>
-          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
+          <input type="text" inputmode="decimal" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
           <label class="field-label">Date</label>
@@ -77,9 +77,9 @@
             <span class="chip chip-expense">{{ d.payment_status }}</span>
             <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}sale #{{ d.sale.id }}{% endif %}</span>
           </div>
-          <span class="text-[13px] text-muted">{{ d.sale.sale_date }}{% if let Some(due) = d.sale.due_date %} • due {{ due }}{% endif %} • total {{ d.total }} • paid {{ d.paid }}</span>
+           <span class="text-[13px] text-muted">{{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due) = d.sale.due_date %} • due {{ localization.format_date(due.clone()) }}{% endif %} • total {{ localization.format_currency(d.total.clone()) }} • paid {{ localization.format_currency(d.paid.clone()) }}</span>
         </div>
-        <span class="font-bold tabular-nums text-expense">{{ d.due }}</span>
+         <span class="font-bold tabular-nums text-expense">{{ localization.format_currency(d.due.clone()) }}</span>
       </div>
       {% endfor %}
     {% endif %}
@@ -97,12 +97,12 @@
             <span class="text-xs text-muted">{{ n }}</span>
             {% endif %}
           </div>
-          <span class="text-[13px] text-muted">{{ e.date }}</span>
+           <span class="text-[13px] text-muted">{{ localization.format_date(e.date.clone()) }}</span>
         </div>
         <div class="flex items-center gap-2">
-          <span class="text-[13px] tabular-nums text-expense">+{{ e.debit }}</span>
-          <span class="text-[13px] tabular-nums text-income">−{{ e.credit }}</span>
-          <span class="font-bold tabular-nums">{{ e.balance }}</span>
+           <span class="text-[13px] tabular-nums text-expense">+{{ localization.format_currency(e.debit.clone()) }}</span>
+           <span class="text-[13px] tabular-nums text-income">−{{ localization.format_currency(e.credit.clone()) }}</span>
+           <span class="font-bold tabular-nums">{{ localization.format_currency(e.balance.clone()) }}</span>
         </div>
       </div>
       {% endfor %}

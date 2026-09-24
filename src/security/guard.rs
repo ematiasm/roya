@@ -31,7 +31,17 @@ use crate::security::authz::Principal;
 /// The public allowlist: every entry carries the one-line reason it is public,
 /// and anything not listed requires a valid session — deny by default. A new
 /// entry needs the same argument written down here.
-const PUBLIC_ROUTES: [(Method, &'static str, &'static str); 6] = [
+const PUBLIC_ROUTES: [(Method, &'static str, &'static str); 8] = [
+    (
+        Method::GET,
+        "/setup",
+        "the first-run setup form is available only while configuration is missing",
+    ),
+    (
+        Method::POST,
+        "/setup",
+        "the first-run setup transaction is the only public write before a session exists",
+    ),
     (
         Method::GET,
         "/login",
@@ -74,7 +84,9 @@ fn is_public(method: &Method, path: &str) -> bool {
 
 fn pattern_matches(pattern: &str, path: &str) -> bool {
     match pattern.strip_suffix("/*") {
-        Some(prefix) => path == prefix || (path.starts_with(prefix) && path[prefix.len()..].starts_with('/')),
+        Some(prefix) => {
+            path == prefix || (path.starts_with(prefix) && path[prefix.len()..].starts_with('/'))
+        }
         None => path == pattern,
     }
 }
@@ -263,7 +275,11 @@ fn confine(path: &str, htmx: bool) -> Response {
 /// preserves the intended destination when it is local.
 fn refuse(path: &str, target: &str, htmx: bool) -> Response {
     if path.starts_with("/api/") {
-        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" }))).into_response();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        )
+            .into_response();
     }
     if htmx {
         // htmx 1.9.12 performs the navigation itself on `HX-Redirect`.
@@ -325,7 +341,9 @@ fn forbidden_origin() -> Response {
 /// DEL and the whole C1 range in one rule, so a future stripped character cannot
 /// slip through a hand-written list.
 pub fn local_next(next: &str) -> Option<&str> {
-    if next.starts_with('/') && !next.starts_with("//") && !next.contains('\\')
+    if next.starts_with('/')
+        && !next.starts_with("//")
+        && !next.contains('\\')
         && !next.chars().any(char::is_control)
     {
         Some(next)
@@ -433,7 +451,10 @@ mod tests {
             ("POST", "/logout"),
             ("GET", "/loginx"),
         ] {
-            assert!(!is_public(&method.parse().unwrap(), path), "{method} {path}");
+            assert!(
+                !is_public(&method.parse().unwrap(), path),
+                "{method} {path}"
+            );
         }
     }
 
@@ -585,11 +606,19 @@ mod tests {
 
         // The change form itself, read and (elsewhere) submit.
         let form = send(&app, "GET", "/password", &[("cookie", cookie.as_str())]).await;
-        assert_eq!(form.status(), StatusCode::OK, "GET /password stays reachable");
+        assert_eq!(
+            form.status(),
+            StatusCode::OK,
+            "GET /password stays reachable"
+        );
 
         // Logout must always work, confinement included.
         let logout = send(&app, "POST", "/logout", &[("cookie", cookie.as_str())]).await;
-        assert_eq!(logout.status(), StatusCode::SEE_OTHER, "POST /logout stays reachable");
+        assert_eq!(
+            logout.status(),
+            StatusCode::SEE_OTHER,
+            "POST /logout stays reachable"
+        );
         assert_eq!(logout.headers().get(header::LOCATION).unwrap(), "/login");
 
         // The public allowlist is untouched: static assets load.
@@ -597,7 +626,13 @@ mod tests {
         assert_eq!(asset.status(), StatusCode::OK);
 
         // The JSON logout endpoint is public by design and stays reachable.
-        let json_logout = send(&app, "DELETE", "/api/sessions", &[("cookie", cookie.as_str())]).await;
+        let json_logout = send(
+            &app,
+            "DELETE",
+            "/api/sessions",
+            &[("cookie", cookie.as_str())],
+        )
+        .await;
         assert_eq!(json_logout.status(), StatusCode::NO_CONTENT);
     }
 
@@ -698,8 +733,7 @@ mod tests {
             let result = local_next(hostile);
             eprintln!("hostile unit next {hostile:?} -> {result:?}");
             assert_eq!(
-                result,
-                None,
+                result, None,
                 "hostile next must not be honoured: {hostile:?}"
             );
         }

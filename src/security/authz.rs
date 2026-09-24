@@ -21,6 +21,7 @@ use axum::{
 use askama::Template;
 
 use crate::error::AppError;
+use crate::localization::LocalizationContext;
 use crate::models::User;
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,11 @@ permission!(
     "identity.roles.manage",
     "Create roles, edit the permission matrix and change other accounts' role sets."
 );
+permission!(
+    SettingsManage,
+    "settings.manage",
+    "Manage post-setup business configuration."
+);
 
 /// The whole catalog. This constant is the single source of truth: the drift
 /// test (AC12) fails if the database holds a code this list does not, or this
@@ -109,7 +115,9 @@ permission!(
 /// `20240101000029_clarify_identity_permission_descriptions.sql` corrects the
 /// two identity rows whose original wording overclaimed (it promised role
 /// assignment on the users tier, which the endpoint gates behind the roles
-/// tier); a fresh database and a pre-existing one end on the same texts.
+/// tier). Migration `20240101000037_add_settings_manage_permission.sql` seeds
+/// the T8 settings permission with the same code/description contract; a fresh
+/// database and a pre-existing one end on the same texts.
 pub const PERMISSION_DESCRIPTIONS: &[(&str, &str)] = &[
     (DashboardRead::CODE, "Ver el panel principal"),
     (FinanceRead::CODE, "Ver cuentas y movimientos"),
@@ -139,6 +147,10 @@ pub const PERMISSION_DESCRIPTIONS: &[(&str, &str)] = &[
     (
         IdentityRolesManage::CODE,
         "Crear roles, editar la matriz de permisos y cambiar los roles de otras cuentas",
+    ),
+    (
+        SettingsManage::CODE,
+        "Administrar la configuración del negocio",
     ),
 ];
 
@@ -171,18 +183,19 @@ pub const PERMISSIONS: &[&str] = &[
     IdentityUsersRead::CODE,
     IdentityUsersManage::CODE,
     IdentityRolesManage::CODE,
+    SettingsManage::CODE,
 ];
 
 /// Compile-time census: a marker type whose `CODE` is missing from the array
 /// (or a list entry without its marker) fails to build. The runtime database
 /// comparison stays in the drift test; this only keeps the list itself honest.
-const _: () = assert!(PERMISSIONS.len() == 23, "the catalog holds 23 permissions");
+const _: () = assert!(PERMISSIONS.len() == 24, "the catalog holds 24 permissions");
 
 /// Compile-time census for the description mirror: every code appears exactly
-/// once with its description, and the pair list covers the same 23 codes.
+/// once with its description, and the pair list covers the same 24 codes.
 const _: () = assert!(
-    PERMISSION_DESCRIPTIONS.len() == 23,
-    "the description mirror covers all 23 permissions"
+    PERMISSION_DESCRIPTIONS.len() == 24,
+    "the description mirror covers all 24 permissions"
 );
 
 // ---------------------------------------------------------------------------
@@ -378,6 +391,11 @@ pub fn forbidden_response(parts: &Parts, message: String) -> Response {
         return AppError::Forbidden(message).into_response();
     }
     match (ForbiddenTemplate {
+        localization: parts
+            .extensions
+            .get::<LocalizationContext>()
+            .cloned()
+            .unwrap_or_else(LocalizationContext::fallback),
         nav_key: String::new(),
         // The shell obeys the same nav rule every page renders: the entries
         // this principal may read, or the anonymous fallback when the
@@ -461,6 +479,7 @@ const NAV_ENTRIES: &[NavEntry] = &[
     NavEntry { key: "accounts", visibility: NavVisibility::All(&[DashboardRead::CODE, FinanceRead::CODE]), group: "cash" },
     NavEntry { key: "users", visibility: NavVisibility::All(&[IdentityUsersRead::CODE]), group: "account" },
     NavEntry { key: "roles", visibility: NavVisibility::All(&[IdentityRolesManage::CODE]), group: "account" },
+    NavEntry { key: "settings", visibility: NavVisibility::All(&[SettingsManage::CODE]), group: "account" },
     // No permission gates the password page: every signed-in operator — a
     // confined session included — must always be able to reach it. The empty
     // `All` list is vacuously true: that entry is the one visible to every
@@ -582,6 +601,7 @@ impl Nav {
 #[derive(Template)]
 #[template(path = "forbidden.html")]
 struct ForbiddenTemplate {
+    localization: LocalizationContext,
     /// The sidebar partial's active-entry key; empty so the refusal marks no
     /// entry as current (the shell renders, nothing is highlighted).
     nav_key: String,
@@ -621,9 +641,13 @@ mod tests {
     use std::path::Path;
     use tower::ServiceExt;
 
-    use crate::models::NewUserRole;
+    use crate::models::{NewBusinessLocale, NewBusinessSettings, NewUserRole};
     use crate::repositories::permission_repo::{PermissionRepository, SqlitePermissionRepository};
     use crate::repositories::role_repo::{RoleRepository, SqliteRoleRepository};
+    use crate::repositories::{
+        BusinessLocaleRepository, BusinessSettingsRepository, SqliteBusinessLocaleRepository,
+        SqliteBusinessSettingsRepository,
+    };
     use crate::routes::AppState;
     use crate::security::auth_middleware;
     use crate::security::test_support;
@@ -1133,7 +1157,7 @@ mod tests {
             .fetch_one(&db)
             .await
             .unwrap();
-        assert_eq!(count.0, 23, "the catalog table must hold exactly 23 rows");
+        assert_eq!(count.0, 24, "the catalog table must hold exactly 24 rows");
     }
 
     #[test]
@@ -1437,6 +1461,26 @@ mod tests {
                 .map(|(_, href)| href.clone())
                 .unwrap_or_else(|| panic!("the sidebar never renders {:?}", entry.key));
             let db = pool().await;
+            if entry.key == "settings" {
+                SqliteBusinessSettingsRepository::new(db.clone())
+                    .create(&NewBusinessSettings {
+                        business_name: "Test Store".into(),
+                        default_locale_code: "en-US".into(),
+                        currency_code: "USD".into(),
+                        timezone: "UTC".into(),
+                    })
+                    .await
+                    .unwrap();
+                SqliteBusinessLocaleRepository::new(db.clone())
+                    .create(&NewBusinessLocale {
+                        locale_code: "en-US".into(),
+                        language_code: "en".into(),
+                        display_name: "English (United States)".into(),
+                        is_enabled: true,
+                    })
+                    .await
+                    .unwrap();
+            }
             test_support::seed_session(&db).await.unwrap();
             match entry.visibility {
                 NavVisibility::All(codes) => {

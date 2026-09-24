@@ -13,11 +13,11 @@
           {% endif %}
           <span class="text-xs text-muted">acct #{{ tx.account_id }}</span>
         </div>
-        <span class="text-[13px] text-muted">{{ tx.date }} • #{{ tx.id }}</span>
+        <span class="text-[13px] text-muted">{{ localization.format_date(tx.date.clone()) }} • #{{ tx.id }}</span>
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums {% if tx.is_income() %}text-income{% else %}text-expense{% endif %}">
-          {% if tx.is_expense() %}-{% endif %}${{ tx.amount }}
+          {% if tx.is_expense() %}-{% endif %}{{ localization.format_currency(tx.amount.clone()) }}
         </span>
         <button class="btn-secondary"
                 hx-delete="/web/transactions/{{ tx.id }}"

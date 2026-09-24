@@ -18,10 +18,10 @@
    fields are the always-visible inline header form below. #}
 {% import "partials/purchase_effects_preview.html" as effects %}
 {% import "partials/supplier_picker.html" as supplier_picker %}
-{% macro record_money(record, entry_row_focus) %}
+{% macro record_money(record, entry_row_focus, localization) %}
 <div id="purchase-record-money">
-  <div class="my-2 text-2xl font-bold">${{ record.total }} <span class="text-[13px] text-muted">paid {{ record.paid }} • due {{ record.due }}</span></div>
-  {% if record.purchase.status.to_string() == "Draft" %}{% call effects::effects_preview(record) %}{% endif %}
+  <div class="my-2 text-2xl font-bold">{{ localization.format_currency(record.total.clone()) }} <span class="text-[13px] text-muted">paid {{ localization.format_currency(record.paid.clone()) }} • due {{ localization.format_currency(record.due.clone()) }}</span></div>
+  {% if record.purchase.status.to_string() == "Draft" %}{% call effects::effects_preview(record, localization) %}{% endif %}
 
   {# The entry row (S5a): one persistent flex row above the lines — product,
      qty, cost and the Add button — so the results appearing below can never
@@ -65,11 +65,11 @@
       </div>
       <div class="w-20">
         <label for="line-qty" class="field-label">Qty</label>
-        <input type="number" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" class="field" />
+        <input type="text" inputmode="decimal" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" class="field" />
       </div>
       <div class="min-w-[110px]">
         <label for="line-unit-cost" class="field-label">Unit cost (empty = supplier cost)</label>
-        <input type="number" id="line-unit-cost" name="unit_cost" step="0.01" min="0" placeholder="supplier cost" class="field" />
+        <input type="text" inputmode="decimal" id="line-unit-cost" name="unit_cost" step="0.01" min="0" placeholder="supplier cost" class="field" />
       </div>
       <button type="submit" class="btn-primary">Add line</button>
     </form>
@@ -119,9 +119,9 @@
                  `outerHTML` nests the money region inside itself, and
                  `outerHTML` without `hx-select` duplicates every id on the
                  page. Pinned by the count test in test_purchases.py. #}
-              <input type="number" id="line-qty-{{ line.id }}" name="qty"
+              <input type="text" inputmode="decimal" id="line-qty-{{ line.id }}" name="qty"
                      class="field w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
-                     value="{{ line.qty }}" min="0.01" step="any" data-action="Edit line"
+                     value="{{ localization.format_quantity(line.qty.clone()) }}" min="0.01" step="any" data-action="Edit line"
                      hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
                      hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
                      hx-target="#purchase-record-money" hx-swap="outerHTML"
@@ -129,9 +129,9 @@
                      hx-trigger="change delay:400ms" />
             </td>
             <td class="py-2.5 pr-3 text-right">
-              <span class="text-muted">$</span><input type="number" id="line-cost-{{ line.id }}" name="unit_cost"
+              <input type="text" inputmode="decimal" id="line-cost-{{ line.id }}" name="unit_cost"
                      class="field w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
-                     value="{{ line.unit_cost }}" min="0" step="any" data-action="Edit line"
+                     value="{{ localization.format_decimal(line.unit_cost.clone()) }}" min="0" step="any" data-action="Edit line"
                      hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
                      hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
                      hx-target="#purchase-record-money" hx-swap="outerHTML"
@@ -139,10 +139,10 @@
                      hx-trigger="change delay:400ms" />
             </td>
             {% else %}
-            <td class="py-2.5 pr-3 text-right tabular-nums">{{ line.qty }}</td>
-            <td class="py-2.5 pr-3 text-right tabular-nums">${{ line.unit_cost }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_quantity(line.qty.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.unit_cost.clone()) }}</td>
             {% endif %}
-            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">${{ line.subtotal }}</td>
+             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">{{ localization.format_currency(line.subtotal.clone()) }}</td>
             {% if record.purchase.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
               <button class="btn-secondary"
@@ -186,7 +186,7 @@
             <td colspan="4" class="py-2.5 pr-3">
               <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
                 <span class="chip chip-muted">stale cost</span>
-                <span class="text-[13px] text-muted">line cost ${{ stale.line_cost_display() }} • stored ${{ stale.stored_cost_display() }}</span>
+                 <span class="text-[13px] text-muted">line cost {{ localization.format_currency(stale.line_cost.clone()) }} • stored {{ localization.format_currency(stale.stored_cost.clone()) }}</span>
                 <button class="btn-secondary"
                         hx-post="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}/apply-cost"
                         hx-target="#purchase-record" hx-swap="innerHTML"
@@ -275,12 +275,12 @@
     <span id="header-saved" class="text-[13px] text-muted" aria-live="polite"></span>
   </div>
   {% if let Some(due) = record.purchase.due_date %}
-  <div class="mb-1 text-[13px] text-muted">due {{ due }}</div>
+   <div class="mb-1 text-[13px] text-muted">due {{ localization.format_date(due.clone()) }}</div>
   {% endif %}
   {% else %}
   <div class="mb-1 text-[13px] text-muted">
     {{ record.supplier_name }}
-    • {{ record.purchase.purchase_date }}{% if let Some(due) = record.purchase.due_date %} • due {{ due }}{% endif %}
+     • {{ localization.format_date(record.purchase.purchase_date.clone()) }}{% if let Some(due) = record.purchase.due_date %} • due {{ localization.format_date(due.clone()) }}{% endif %}
   </div>
   {% if let Some(inv) = record.purchase.supplier_invoice_no %}
     <div class="text-[13px] text-muted">invoice {{ inv }}</div>
@@ -360,7 +360,7 @@
   {% endif %}
   {% endif %}
 
-  {% call record_money(record, entry_row_focus) %}
+   {% call record_money(record, entry_row_focus, localization) %}
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ record.payments.len() }})</div>
   {% if record.payments.is_empty() %}
@@ -379,10 +379,10 @@
         <tbody>
           {% for pay in record.payments %}
           <tr class="border-b border-border/60" id="purchase-payment-{{ pay.id }}">
-            <td class="py-2.5 pr-3 tabular-nums">{{ pay.date }}</td>
+             <td class="py-2.5 pr-3 tabular-nums">{{ localization.format_date(pay.date.clone()) }}</td>
             <td class="py-2.5 pr-3">{{ pay.account_name }}</td>
             <td class="py-2.5 pr-3">{{ pay.method_name }}</td>
-            <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">${{ pay.amount }}</td>
+             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">{{ localization.format_currency(pay.amount.clone()) }}</td>
           </tr>
           {% endfor %}
         </tbody>
@@ -399,7 +399,8 @@
   {# Payment is decided HERE (purchase-payment-at-confirm T2): the type radio
      prefills from the stored value (REST or legacy drafts may carry one),
      the due input is active only for Credit (required, prefilled from
-     storage) and the method select only for Cash — the shell's
+     storage or the visible supplier-term suggestion) and the method select
+     only for Cash — the shell's
      toggleConfirmPaymentType flips hidden+disabled+required on switch, so
      the inactive side is neither shown nor submitted. The posts reach a
      route that updates the draft header, then confirms. #}
@@ -432,8 +433,8 @@
       <div id="confirm-due-block"{% if record.purchase.payment_type.to_string() == "Cash" %} hidden{% endif %}>
         <label for="confirm-due-date" class="field-label">Due date</label>
         <input type="date" id="confirm-due-date" name="due_date"
-               value="{% if let Some(due) = record.purchase.due_date %}{{ due }}{% endif %}"
-               {% if record.purchase.payment_type.to_string() == "Credit" %}required{% endif %} class="field" />
+               value="{% if let Some(due) = confirm_due_date %}{{ due }}{% endif %}"
+               {% if record.purchase.payment_type.to_string() == "Credit" %}required{% else %}disabled{% endif %} class="field" />
       </div>
       <div id="confirm-method-block"{% if record.purchase.payment_type.to_string() == "Credit" %} hidden{% endif %}>
         <label for="confirm-method" class="field-label">Method (the cash account is derived from it)</label>
@@ -491,7 +492,7 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label for="payment-amount" class="field-label">Amount</label>
-          <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
+          <input type="text" inputmode="decimal" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
           <label for="payment-date" class="field-label">Date</label>

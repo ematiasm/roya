@@ -59,7 +59,7 @@ different accounts over time. The customer, the credit rules and the receivable 
   a different price. A purchase does not allow it, for the reason stated in that capability's spec.
 
 - **Credit sale with no customer term:** a credit sale without a due date defaults to
-  `sale_date + payment_days`; with no term and no due date it returns 400. Credit to the walk-in is
+  `sale_date + due_days`; with no term and no due date it returns 400. Credit to the walk-in is
   refused. See the `customers` capability for the walk-in, the credit limit and the receivables.
 - **A payment may be grouped under a receipt**, which is how one handover of money is recorded across
   several sales. A payment without a receipt is a direct payment on one sale and stays valid. See the

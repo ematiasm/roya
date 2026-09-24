@@ -16,8 +16,8 @@ use chrono::{Duration, NaiveDateTime};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewRole, NewSession, NewUser, NewUserRole, ResolvedSession, Role, RoleMatrix,
-    RoleWithHolders, Session, User, UserWithRoles,
+    NewRole, NewSession, NewUser, NewUserRole, ResolvedSession, Role, RoleMatrix, RoleWithHolders,
+    Session, User, UserWithRoles,
 };
 use crate::repositories::{
     PermissionRepository, RoleRepository, SessionRepository, UserRepository,
@@ -52,7 +52,8 @@ const DISPLAY_NAME_MESSAGE: &str = "El nombre para mostrar debe tener entre 1 y 
 /// The one Spanish message for the rule that closes the assignment takeover:
 /// nobody — with any permission — changes their own roles. The interface
 /// hides the action for self; the refusal must be real regardless.
-const SELF_ROLE_CHANGE_MESSAGE: &str = "No podés cambiar tus propios roles: pedí el cambio a otro administrador.";
+const SELF_ROLE_CHANGE_MESSAGE: &str =
+    "No podés cambiar tus propios roles: pedí el cambio a otro administrador.";
 /// The tier rule of the admin password reset (spec, "Admin password reset"):
 /// taking over an account that administers the instance is a decision about
 /// the administration, so it belongs to the `identity.roles.manage` tier. An
@@ -71,7 +72,8 @@ const ROLE_CODE_MESSAGE: &str = "El código del rol debe tener entre 2 y 64 cara
 /// Role display name rule (schema: 1-128 characters).
 const ROLE_NAME_MESSAGE: &str = "El nombre del rol debe tener entre 1 y 128 caracteres.";
 /// Role description rule (schema: at most 256 characters).
-const ROLE_DESCRIPTION_MESSAGE: &str = "La descripción del rol no puede superar los 256 caracteres.";
+const ROLE_DESCRIPTION_MESSAGE: &str =
+    "La descripción del rol no puede superar los 256 caracteres.";
 /// The rule that closes the matrix self-lockout (S4): an actor stripping
 /// `identity.roles.manage` from a role it itself holds would lock itself —
 /// and everyone sharing the role — out of the roles administration on the
@@ -83,11 +85,13 @@ const MATRIX_SELF_LOCKOUT_MESSAGE: &str = "No podés quitar «identity.roles.man
 /// granting the protected role, stripping it, creating administrators — is
 /// the decision about the administration, so the rule is checked in the
 /// service too, not only at the endpoint's gate.
-const ASSIGN_TIER_MESSAGE: &str = "Cambiar el conjunto de roles de otro usuario requiere «identity.roles.manage».";
+const ASSIGN_TIER_MESSAGE: &str =
+    "Cambiar el conjunto de roles de otro usuario requiere «identity.roles.manage».";
 /// The users screen never exists without it, and neither does the actor: the
 /// permission code the assignment tier gates (kept as a constant so the
 /// service never hardcodes a literal).
-const ROLES_MANAGE_CODE: &str = <crate::security::authz::IdentityRolesManage as crate::security::authz::Permission>::CODE;
+const ROLES_MANAGE_CODE: &str =
+    <crate::security::authz::IdentityRolesManage as crate::security::authz::Permission>::CODE;
 
 /// The one Spanish message every "the target user does not exist" refusal in
 /// the administration flow carries (the interface never shows an id).
@@ -117,8 +121,7 @@ fn is_valid_role_code(code: &str) -> bool {
         return false;
     }
     let alnum = |c: u8| c.is_ascii_lowercase() || c.is_ascii_digit();
-    bytes[0].is_ascii_lowercase()
-        && bytes[1..].iter().all(|c| alnum(*c) || *c == b'_')
+    bytes[0].is_ascii_lowercase() && bytes[1..].iter().all(|c| alnum(*c) || *c == b'_')
 }
 /// Maximum number of distinct usernames the throttle map tracks at once.
 /// Entries only stay while they are load-bearing — an open cooldown window,
@@ -364,7 +367,6 @@ where
         self.lock_attempts().remove(key);
     }
 
-
     // -- bootstrap (AC1) --------------------------------------------------------
 
     /// Seed the admin when no active admin exists. `env_password` is used as-is
@@ -420,15 +422,15 @@ where
             let credential = self.bootstrap_credential(env_password)?;
             // The recovery is the SYSTEM's work: the audit columns stay NULL
             // ("the system"), never attributed to a person who did not act.
-            self.users.update_password_hash(id, &credential.password_hash, None).await?;
-            self.users.set_must_change_password(id, credential.must_change, None).await?;
+            self.users
+                .update_password_hash(id, &credential.password_hash, None)
+                .await?;
+            self.users
+                .set_must_change_password(id, credential.must_change, None)
+                .await?;
             self.users.set_active(id, true, None).await?;
             self.grant_protected_role(id).await?;
-            let user = self
-                .users
-                .find_by_id(id)
-                .await?
-                .unwrap_or(existing.user);
+            let user = self.users.find_by_id(id).await?.unwrap_or(existing.user);
             return Ok(BootstrapOutcome {
                 created: true,
                 user: Some(user),
@@ -441,12 +443,15 @@ where
         // interface renders that honestly (slice S13).
         let user = self
             .users
-            .create(&crate::models::NewUser {
-                username: BOOTSTRAP_ADMIN_USERNAME.into(),
-                display_name: BOOTSTRAP_ADMIN_DISPLAY_NAME.into(),
-                password_hash: credential.password_hash,
-                must_change_password: credential.must_change,
-            }, None)
+            .create(
+                &crate::models::NewUser {
+                    username: BOOTSTRAP_ADMIN_USERNAME.into(),
+                    display_name: BOOTSTRAP_ADMIN_DISPLAY_NAME.into(),
+                    password_hash: credential.password_hash,
+                    must_change_password: credential.must_change,
+                },
+                None,
+            )
             .await?;
         self.grant_protected_role(user.id).await?;
         Ok(BootstrapOutcome {
@@ -561,11 +566,7 @@ where
             })
             .await?;
         self.users.touch_last_login(user.id, now).await?;
-        let user = self
-            .users
-            .find_by_id(user.id)
-            .await?
-            .unwrap_or(user);
+        let user = self.users.find_by_id(user.id).await?.unwrap_or(user);
         self.clear_attempts(&user.username.to_lowercase());
         Ok(LoginOutcome {
             user,
@@ -583,8 +584,7 @@ where
     pub async fn resolve_session(&self, token: &str) -> AppResult<Option<ResolvedSession>> {
         let token_hash = hash_token(token);
         let now = self.clock.now();
-        let Some((mut session, user)) = self.sessions.resolve_valid(&token_hash, now).await?
-        else {
+        let Some((mut session, user)) = self.sessions.resolve_valid(&token_hash, now).await? else {
             return Ok(None);
         };
         if self.policy.renewal_due(session.last_seen_at, now) {
@@ -657,7 +657,10 @@ where
             // be distinguishable from a failed attempt.
             return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.into()));
         }
-        if !self.hasher.verify(current_password, &with_hash.password_hash) {
+        if !self
+            .hasher
+            .verify(current_password, &with_hash.password_hash)
+        {
             self.record_failure(&key, now);
             return Err(AppError::Unauthorized(GENERIC_LOGIN_FAILURE.into()));
         }
@@ -672,8 +675,12 @@ where
             ));
         }
         let new_hash = self.hasher.hash(new_password)?;
-        self.users.update_password_hash(user_id, &new_hash, Some(user_id)).await?;
-        self.users.set_must_change_password(user_id, false, Some(user_id)).await?;
+        self.users
+            .update_password_hash(user_id, &new_hash, Some(user_id))
+            .await?;
+        self.users
+            .set_must_change_password(user_id, false, Some(user_id))
+            .await?;
         self.clear_attempts(&key);
         self.users
             .find_by_id(user_id)
@@ -764,7 +771,12 @@ where
     /// the trigger string. `actor_id` is the request's principal: the
     /// toggle is an edit of the target's row, so it stamps the target's
     /// `updated_by` (slice S13).
-    pub async fn set_user_active(&self, actor_id: i64, user_id: i64, active: bool) -> AppResult<User> {
+    pub async fn set_user_active(
+        &self,
+        actor_id: i64,
+        user_id: i64,
+        active: bool,
+    ) -> AppResult<User> {
         let existing = self
             .users
             .find_by_id(user_id)
@@ -774,7 +786,9 @@ where
             // Idempotent: nothing to write and nothing to revoke.
             return Ok(existing);
         }
-        self.users.set_active(user_id, active, Some(actor_id)).await?;
+        self.users
+            .set_active(user_id, active, Some(actor_id))
+            .await?;
         if !active {
             self.revoke_all_sessions(user_id).await?;
         }
@@ -834,8 +848,12 @@ where
             }
         }
         let hash = self.hasher.hash(new_password)?;
-        self.users.update_password_hash(target_id, &hash, Some(actor_id)).await?;
-        self.users.set_must_change_password(target_id, true, Some(actor_id)).await?;
+        self.users
+            .update_password_hash(target_id, &hash, Some(actor_id))
+            .await?;
+        self.users
+            .set_must_change_password(target_id, true, Some(actor_id))
+            .await?;
         // No revocation: the target's live sessions stay valid but are
         // confined to the change form by the flag gate from their very next
         // request — they can change it right there.
@@ -907,7 +925,9 @@ where
                 ));
             }
         }
-        self.roles.replace_user_roles(user_id, &unique, actor_id).await
+        self.roles
+            .replace_user_roles(user_id, &unique, actor_id)
+            .await
     }
 
     /// The users-screen read (spec, "users list"): every user with the roles
@@ -923,7 +943,11 @@ where
             // `list_for_user` — both are identity tables, the boundary the
             // service owns.
             let grants = self.roles.list_grants_for_user(user.id).await?;
-            out.push(UserWithRoles { user, roles, grants });
+            out.push(UserWithRoles {
+                user,
+                roles,
+                grants,
+            });
         }
         Ok(out)
     }
@@ -1057,7 +1081,11 @@ where
             .update_details(
                 role_id,
                 name,
-                if description.is_empty() { None } else { Some(description) },
+                if description.is_empty() {
+                    None
+                } else {
+                    Some(description)
+                },
                 actor_id,
             )
             .await?;
@@ -1131,7 +1159,11 @@ where
         let held_codes = permissions.codes_for_role(role_id).await?;
         let held_ids = catalog
             .iter()
-            .filter(|permission| held_codes.iter().any(|code| code == permission.code.as_str()))
+            .filter(|permission| {
+                held_codes
+                    .iter()
+                    .any(|code| code == permission.code.as_str())
+            })
             .map(|permission| permission.id)
             .collect();
         Ok(RoleMatrix {
@@ -1210,7 +1242,9 @@ where
         if holds_this_role {
             let current = permissions.codes_for_role(role_id).await?;
             let removing_tier = current.iter().any(|code| code == ROLES_MANAGE_CODE)
-                && !found.iter().any(|permission| permission.code == ROLES_MANAGE_CODE);
+                && !found
+                    .iter()
+                    .any(|permission| permission.code == ROLES_MANAGE_CODE);
             if removing_tier {
                 return Err(AppError::Forbidden(MATRIX_SELF_LOCKOUT_MESSAGE.into()));
             }
@@ -1218,7 +1252,9 @@ where
         // The matrix edit attributes itself to the acting principal: the
         // permission repository stamps the role's `updated_by` in the same
         // transaction (slice S13).
-        permissions.set_role_permissions(role_id, &unique, actor_id).await
+        permissions
+            .set_role_permissions(role_id, &unique, actor_id)
+            .await
     }
 
     // -- mass revocation -------------------------------------------------------------
@@ -1412,9 +1448,10 @@ mod tests {
         async fn delete(&self, id: i64) -> AppResult<()> {
             self.inner.delete(id).await
         }
-        async fn list_grants_for_user(&self, user_id: i64)
-            -> AppResult<Vec<crate::models::RoleGrant>>
-        {
+        async fn list_grants_for_user(
+            &self,
+            user_id: i64,
+        ) -> AppResult<Vec<crate::models::RoleGrant>> {
             self.inner.list_grants_for_user(user_id).await
         }
         async fn replace_user_roles(
@@ -1423,7 +1460,9 @@ mod tests {
             role_ids: &[i64],
             granted_by: i64,
         ) -> AppResult<Vec<Role>> {
-            self.inner.replace_user_roles(user_id, role_ids, granted_by).await
+            self.inner
+                .replace_user_roles(user_id, role_ids, granted_by)
+                .await
         }
         async fn create(&self, input: &NewRole, created_by: i64) -> AppResult<Role> {
             self.inner.create(input, created_by).await
@@ -1435,7 +1474,9 @@ mod tests {
             description: Option<&str>,
             updated_by: i64,
         ) -> AppResult<()> {
-            self.inner.update_details(id, name, description, updated_by).await
+            self.inner
+                .update_details(id, name, description, updated_by)
+                .await
         }
         async fn holder_names(&self, role_id: i64) -> AppResult<Vec<String>> {
             self.inner.holder_names(role_id).await
@@ -1507,7 +1548,18 @@ mod tests {
         (service, pool, clock)
     }
 
-    async fn spy_svc() -> (IdentityService<SqliteUserRepository, SqliteSessionRepository, SqliteRoleRepository, FakeClock, SpyHasher>, SqlitePool, FakeClock, SpyHasher) {
+    async fn spy_svc() -> (
+        IdentityService<
+            SqliteUserRepository,
+            SqliteSessionRepository,
+            SqliteRoleRepository,
+            FakeClock,
+            SpyHasher,
+        >,
+        SqlitePool,
+        FakeClock,
+        SpyHasher,
+    ) {
         let pool = test_pool().await;
         let clock = FakeClock::new(base_time());
         let hasher = SpyHasher::new();
@@ -1683,7 +1735,10 @@ mod tests {
         assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 0);
 
         let recovery = s.bootstrap_admin(Some("second password 2")).await.unwrap();
-        assert!(recovery.created, "the inactive admin must be recovered, not collided");
+        assert!(
+            recovery.created,
+            "the inactive admin must be recovered, not collided"
+        );
         assert!(recovery.generated_password.is_none());
         let stored = s
             .users
@@ -1709,9 +1764,17 @@ mod tests {
         let recovery = s.bootstrap_admin(None).await.unwrap();
         assert!(recovery.created);
         let generated = recovery.generated_password.clone().unwrap();
-        let stored = s.users.find_with_hash_by_username("admin").await.unwrap().unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_username("admin")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stored.user.is_active);
-        assert!(stored.user.must_change_password, "generated recovery flags the change");
+        assert!(
+            stored.user.must_change_password,
+            "generated recovery flags the change"
+        );
         assert!(s.hasher.verify(&generated, &stored.password_hash));
         // D2: the generated-password recovery also ends with the role granted.
         assert_eq!(held_role_codes(&s, admin_id).await, vec!["admin"]);
@@ -1812,7 +1875,14 @@ mod tests {
             .await
             .unwrap();
         s.users.set_active(admin_id, false, None).await.unwrap();
-        assert!(!s.users.find_by_id(admin_id).await.unwrap().unwrap().is_active);
+        assert!(
+            !s.users
+                .find_by_id(admin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
         // ... and the first administrator's grant can now be removed too.
         s.roles.revoke(admin_id, admin_role.id).await.unwrap();
         assert!(held_role_codes(&s, admin_id).await.is_empty());
@@ -1841,11 +1911,19 @@ mod tests {
             .unwrap();
 
         let outcome = s.bootstrap_admin(Some("whatever password")).await.unwrap();
-        assert!(outcome.created, "the seeding completes the upgrade by granting");
+        assert!(
+            outcome.created,
+            "the seeding completes the upgrade by granting"
+        );
         assert!(outcome.generated_password.is_none());
         // The credential was NOT reset: the placeholder hash survives, and the
         // bootstrap password must not verify against it.
-        let stored = s.users.find_with_hash_by_username("admin").await.unwrap().unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_username("admin")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.password_hash, "placeholder-not-a-real-argon2-hash");
         assert!(
             !s.hasher.verify("whatever password", &stored.password_hash),
@@ -1862,7 +1940,8 @@ mod tests {
     /// second protected role in play, a holder of just that role satisfies
     /// the bootstrap and is protected by the same arithmetic.
     #[tokio::test]
-    async fn ac14_the_protected_holder_predicate_agrees_with_the_triggers_across_two_protected_roles() {
+    async fn ac14_the_protected_holder_predicate_agrees_with_the_triggers_across_two_protected_roles(
+    ) {
         let (s, pool, _clock) = svc().await;
         // A second protected role, as an operator could create one by direct
         // SQL (the flag is writable at INSERT time; the trigger refuses to
@@ -1925,7 +2004,10 @@ mod tests {
         // ... and the bootstrap agrees too: with a protected-role holder
         // active, it seeds nothing.
         let second = s.bootstrap_admin(Some("whatever password")).await.unwrap();
-        assert!(!second.created, "a protected-role holder is an administrator");
+        assert!(
+            !second.created,
+            "a protected-role holder is an administrator"
+        );
 
         // A second holder makes the same refusals lift — both protected roles
         // share the arithmetic.
@@ -1938,7 +2020,10 @@ mod tests {
             })
             .await
             .unwrap();
-        s.users.set_active(holder.id, false, Some(partner.id)).await.unwrap();
+        s.users
+            .set_active(holder.id, false, Some(partner.id))
+            .await
+            .unwrap();
         assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
     }
 
@@ -1951,7 +2036,12 @@ mod tests {
         assert!(!second.created, "an active admin keeps the no-op");
         assert!(second.user.is_none());
         assert!(second.generated_password.is_none());
-        let stored = s.users.find_with_hash_by_username("admin").await.unwrap().unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_username("admin")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(s.hasher.verify("first password 1", &stored.password_hash));
     }
 
@@ -1963,7 +2053,10 @@ mod tests {
         let known = seed_user(&s, "teller", "known password 1", true).await;
         seed_user(&s, "fired", "fired password 1", false).await;
 
-        let unknown = s.login("ghost", "whatever long password").await.unwrap_err();
+        let unknown = s
+            .login("ghost", "whatever long password")
+            .await
+            .unwrap_err();
         let wrong = s.login("teller", "wrong password 12").await.unwrap_err();
         let inactive = s.login("fired", "fired password 1").await.unwrap_err();
 
@@ -1988,7 +2081,10 @@ mod tests {
         let before_hash = spy.hash_calls.load(Ordering::SeqCst);
         let before_verify = spy.verify_calls.load(Ordering::SeqCst);
 
-        let err = s.login("ghost", "whatever long password").await.unwrap_err();
+        let err = s
+            .login("ghost", "whatever long password")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Unauthorized(_)));
 
         // The unknown-username path performed full-cost hashing work (the
@@ -2034,7 +2130,10 @@ mod tests {
         C: Clock,
         H: PasswordHashing,
     {
-        let err = s.login(username, "whatever long password").await.unwrap_err();
+        let err = s
+            .login(username, "whatever long password")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Unauthorized(_)));
     }
 
@@ -2191,11 +2290,21 @@ mod tests {
 
         // Deactivate the owner: the live session must be refused from now on,
         // with exactly the outcome an unknown token gets.
-        s.users.set_active(outcome.user.id, false, None).await.unwrap();
+        s.users
+            .set_active(outcome.user.id, false, None)
+            .await
+            .unwrap();
         let inactive = s.resolve_session(&outcome.token).await.unwrap();
         let unknown = s.resolve_session("no such token").await.unwrap();
-        assert!(inactive.is_none(), "deactivated owner's session must be refused");
-        assert_eq!(inactive.is_none(), unknown.is_none(), "must match the unknown-token outcome");
+        assert!(
+            inactive.is_none(),
+            "deactivated owner's session must be refused"
+        );
+        assert_eq!(
+            inactive.is_none(),
+            unknown.is_none(),
+            "must match the unknown-token outcome"
+        );
     }
 
     // -- AC8: sliding renewal -----------------------------------------------------------
@@ -2217,7 +2326,10 @@ mod tests {
         clock.advance(Duration::minutes(2));
         let renewed = s.resolve_session(&outcome.token).await.unwrap().unwrap();
         assert_eq!(renewed.session.last_seen_at, clock.now_value());
-        assert_eq!(renewed.session.expires_at, clock.now_value() + Duration::hours(12));
+        assert_eq!(
+            renewed.session.expires_at,
+            clock.now_value() + Duration::hours(12)
+        );
     }
 
     // -- AC9: logout ----------------------------------------------------------------------
@@ -2330,14 +2442,24 @@ mod tests {
             .await
             .unwrap()
             .expect("the acting session must survive its own password change");
-        assert_eq!(kept.session.id, acting_resolved.session.id, "same row, same id");
+        assert_eq!(
+            kept.session.id, acting_resolved.session.id,
+            "same row, same id"
+        );
         assert_eq!(kept.session.expires_at, acting_resolved.session.expires_at);
         assert!(!kept.user.must_change_password, "the flag must be cleared");
         // ... the other session of the same user is dead ...
         assert!(s.resolve_session(&other.token).await.unwrap().is_none());
         // ... and the stored hash verifies the NEW password only.
-        let stored = s.users.find_with_hash_by_id(user_id).await.unwrap().unwrap();
-        assert!(s.hasher.verify("una contraseña nueva larga", &stored.password_hash));
+        let stored = s
+            .users
+            .find_with_hash_by_id(user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(s
+            .hasher
+            .verify("una contraseña nueva larga", &stored.password_hash));
         assert!(!s.hasher.verify(&generated, &stored.password_hash));
     }
 
@@ -2363,7 +2485,12 @@ mod tests {
         // Nothing moved: both sessions still resolve and the flag still holds.
         assert!(s.resolve_session(&acting.token).await.unwrap().is_some());
         assert!(s.resolve_session(&other.token).await.unwrap().is_some());
-        let stored = s.users.find_with_hash_by_id(acting.user.id).await.unwrap().unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_id(acting.user.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stored.user.must_change_password);
         assert!(s.hasher.verify(&generated, &stored.password_hash));
     }
@@ -2422,7 +2549,10 @@ mod tests {
         // Login outcome: token redacted from Debug.
         let outcome = s.login("teller", password).await.unwrap();
         let debug = format!("{outcome:?}");
-        assert!(!debug.contains(&outcome.token), "token leaked in Debug: {debug}");
+        assert!(
+            !debug.contains(&outcome.token),
+            "token leaked in Debug: {debug}"
+        );
         assert!(!debug.contains(password));
 
         // Bootstrap outcome: generated password redacted from Debug.
@@ -2430,7 +2560,10 @@ mod tests {
         let boot = fresh.bootstrap_admin(None).await.unwrap();
         let generated = boot.generated_password.clone().unwrap();
         let debug = format!("{boot:?}");
-        assert!(!debug.contains(&generated), "generated password leaked: {debug}");
+        assert!(
+            !debug.contains(&generated),
+            "generated password leaked: {debug}"
+        );
 
         // Error output (message and Debug) carries neither secret.
         let err = s.login("teller", wrong).await.unwrap_err();
@@ -2450,7 +2583,12 @@ mod tests {
         // F5: the Debug of the credential-bearing structs redacts the stored
         // verifier — neither the PHC string nor the plaintext of the password
         // used to build them may appear.
-        let with_hash = s.users.find_with_hash_by_username("teller").await.unwrap().unwrap();
+        let with_hash = s
+            .users
+            .find_with_hash_by_username("teller")
+            .await
+            .unwrap()
+            .unwrap();
         let with_hash_debug = format!("{with_hash:?}");
         assert!(
             !with_hash_debug.contains("$argon2"),
@@ -2689,7 +2827,10 @@ mod tests {
         // teller is still throttled: the CORRECT password is refused before
         // any verification happens.
         let before = hasher.verify_calls.load(Ordering::SeqCst);
-        let err = service.login("teller", "the right password").await.unwrap_err();
+        let err = service
+            .login("teller", "the right password")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Unauthorized(_)));
         assert_eq!(
             hasher.verify_calls.load(Ordering::SeqCst),
@@ -2842,7 +2983,10 @@ mod tests {
             .unwrap_err();
         let msg = conflict_text(err);
         assert!(msg.contains("ya existe"), "{msg}");
-        assert!(msg.contains("teller"), "the refusal names the taken name: {msg}");
+        assert!(
+            msg.contains("teller"),
+            "the refusal names the taken name: {msg}"
+        );
 
         // Every refusal above wrote nothing: exactly one user beyond the
         // pre-existing rows and the acting administrator exists. The
@@ -2853,8 +2997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deactivation_revokes_sessions_and_the_last_protected_holder_refusal_explains_itself(
-    ) {
+    async fn deactivation_revokes_sessions_and_the_last_protected_holder_refusal_explains_itself() {
         let (s, _pool, _clock) = svc().await;
         let admin = s
             .bootstrap_admin(Some("bootstrap pw 12"))
@@ -2870,7 +3013,14 @@ mod tests {
 
         // Deactivating an ordinary user works and drops their live session.
         s.set_user_active(admin.id, target.id, false).await.unwrap();
-        assert!(!s.users.find_by_id(target.id).await.unwrap().unwrap().is_active);
+        assert!(
+            !s.users
+                .find_by_id(target.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
         assert!(
             s.resolve_session(&login.token).await.unwrap().is_none(),
             "a deactivated user cannot hold a session"
@@ -2894,7 +3044,14 @@ mod tests {
             !msg.contains("cannot deactivate"),
             "the trigger string must not reach the operator: {msg}"
         );
-        assert!(s.users.find_by_id(admin.id).await.unwrap().unwrap().is_active);
+        assert!(
+            s.users
+                .find_by_id(admin.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
 
         // A second administrator makes the same deactivation succeed.
         let second = s
@@ -2911,7 +3068,14 @@ mod tests {
             .await
             .unwrap();
         s.set_user_active(second.id, admin.id, false).await.unwrap();
-        assert!(!s.users.find_by_id(admin.id).await.unwrap().unwrap().is_active);
+        assert!(
+            !s.users
+                .find_by_id(admin.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_active
+        );
         assert_eq!(s.roles.count_active_protected_holders().await.unwrap(), 1);
     }
 
@@ -2938,7 +3102,12 @@ mod tests {
             .unwrap_err();
         let msg = validation_text(err);
         assert!(msg.contains("Cambiar contraseña"), "{msg}");
-        let stored = s.users.find_with_hash_by_id(admin.id).await.unwrap().unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_id(admin.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             s.hasher.verify("bootstrap pw 12", &stored.password_hash),
             "a refused self-reset must not touch the credential"
@@ -2950,7 +3119,12 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)));
-        let stored = s.users.find_with_hash_by_id(target.id).await.unwrap().unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_id(target.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             s.hasher.verify("initial password 1", &stored.password_hash),
             "the refused reset must not touch the stored hash"
@@ -2961,13 +3135,21 @@ mod tests {
             .await
             .unwrap();
         let target_after = s.users.find_by_id(target.id).await.unwrap().unwrap();
-        assert!(target_after.must_change_password, "the target owes the change");
+        assert!(
+            target_after.must_change_password,
+            "the target owes the change"
+        );
         let admin_after = s.users.find_by_id(admin.id).await.unwrap().unwrap();
         assert!(
             !admin_after.must_change_password,
             "the actor's flag must never be touched"
         );
-        let stored = s.users.find_with_hash_by_id(target.id).await.unwrap().unwrap();
+        let stored = s
+            .users
+            .find_with_hash_by_id(target.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(s.hasher.verify("temp password 34", &stored.password_hash));
         assert!(!s.hasher.verify("initial password 1", &stored.password_hash));
     }
@@ -2999,7 +3181,10 @@ mod tests {
             vec!["vendedor"]
         );
         let (granted_by, granted_at) = grant_trail(&pool, target.id, vendedor.id).await;
-        assert_eq!(granted_by, admin.id, "the grant records the acting principal");
+        assert_eq!(
+            granted_by, admin.id,
+            "the grant records the acting principal"
+        );
         assert!(granted_at.is_some(), "the database wrote the grant instant");
 
         // A role id that does not exist is a form error, not a 500.
@@ -3080,13 +3265,21 @@ mod tests {
         assert_eq!(list.len(), 3);
         let admin_row = list.iter().find(|r| r.user.id == admin.id).unwrap();
         assert_eq!(
-            admin_row.roles.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            admin_row
+                .roles
+                .iter()
+                .map(|r| r.code.as_str())
+                .collect::<Vec<_>>(),
             vec!["admin"]
         );
         assert!(admin_row.user.is_active);
         let target_row = list.iter().find(|r| r.user.id == target.id).unwrap();
         assert_eq!(
-            target_row.roles.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            target_row
+                .roles
+                .iter()
+                .map(|r| r.code.as_str())
+                .collect::<Vec<_>>(),
             vec!["vendedor"]
         );
 
@@ -3113,11 +3306,11 @@ mod tests {
             "INSERT INTO roles (code, name, created_by) VALUES (?, ?, \
              (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
         )
-            .bind(&code)
-            .bind(username)
-            .execute(pool)
-            .await
-            .unwrap();
+        .bind(&code)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
         for perm in codes {
             sqlx::query(
                 "INSERT INTO role_permissions (role_id, permission_id) \
@@ -3130,12 +3323,11 @@ mod tests {
             .await
             .unwrap();
         }
-        let role_id: i64 =
-            sqlx::query_scalar("SELECT id FROM roles WHERE code = ?")
-                .bind(&code)
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let role_id: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = ?")
+            .bind(&code)
+            .fetch_one(pool)
+            .await
+            .unwrap();
         s.roles
             .grant(&NewUserRole {
                 user_id: user.id,
@@ -3215,7 +3407,11 @@ mod tests {
             &s,
             &pool,
             "gestor_roles",
-            &["identity.users.read", "identity.users.manage", "identity.roles.manage"],
+            &[
+                "identity.users.read",
+                "identity.users.manage",
+                "identity.roles.manage",
+            ],
         )
         .await;
         s.admin_reset_password(&permissions, gestor_roles.id, admin.id, "temp password 77")
@@ -3235,7 +3431,8 @@ mod tests {
     /// refuse the next attempt BEFORE verification, and a success clears
     /// the counter so a real user is never stuck behind stale failures.
     #[tokio::test]
-    async fn wrong_current_passwords_throttle_before_verification_and_a_success_clears_the_counter() {
+    async fn wrong_current_passwords_throttle_before_verification_and_a_success_clears_the_counter()
+    {
         let (s, _pool, clock, hasher) = spy_svc().await;
         let boot = s.bootstrap_admin(None).await.unwrap();
         let generated = boot.generated_password.clone().unwrap();
@@ -3300,20 +3497,19 @@ mod tests {
         let permissions = SqlitePermissionRepository::new(pool.clone());
         for i in 0..120 {
             sqlx::query(
-            "INSERT INTO roles (code, name, created_by) VALUES (?, ?, \
+                "INSERT INTO roles (code, name, created_by) VALUES (?, ?, \
              (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
-        )
-                .bind(format!("tmp{i}"))
-                .bind(format!("Temporal {i}"))
-                .execute(&pool)
-                .await
-                .unwrap();
+            )
+            .bind(format!("tmp{i}"))
+            .bind(format!("Temporal {i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
         }
-        let mut ids: Vec<i64> =
-            sqlx::query_scalar("SELECT id FROM roles ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let mut ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM roles ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         // One duplicated id in the middle: the set is what counts.
         ids.push(ids[60]);
         let held = s
@@ -3334,8 +3530,7 @@ mod tests {
     /// green tests otherwise) fails here. The call must happen exactly once
     /// and carry the whole submitted set, deduplicated.
     #[tokio::test]
-    async fn assign_roles_resolves_the_whole_submitted_set_through_find_by_ids_exactly_once(
-    ) {
+    async fn assign_roles_resolves_the_whole_submitted_set_through_find_by_ids_exactly_once() {
         let pool = test_pool().await;
         let clock = FakeClock::new(base_time());
         let calls: Arc<Mutex<Vec<Vec<i64>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3367,12 +3562,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let cajero = service
-            .roles
-            .find_by_code("cajero")
-            .await
-            .unwrap()
-            .unwrap();
+        let cajero = service.roles.find_by_code("cajero").await.unwrap().unwrap();
         let permissions = FixedPermissions(vec![ROLES_MANAGE_CODE.to_string()]);
 
         // Duplicated id included: the one call must carry the deduplicated
@@ -3436,7 +3626,9 @@ mod tests {
             permission_ids: &[i64],
             updated_by: i64,
         ) -> AppResult<()> {
-            self.inner.set_role_permissions(role_id, permission_ids, updated_by).await
+            self.inner
+                .set_role_permissions(role_id, permission_ids, updated_by)
+                .await
         }
         async fn find_by_ids(&self, ids: &[i64]) -> AppResult<Vec<crate::models::Permission>> {
             self.calls.lock().unwrap().push(ids.to_vec());
@@ -3471,7 +3663,10 @@ mod tests {
         // The list read: four seeded roles, nobody holds anything yet.
         let listed = service.list_roles_with_holders().await.unwrap();
         assert_eq!(
-            listed.iter().map(|r| r.role.code.as_str()).collect::<Vec<_>>(),
+            listed
+                .iter()
+                .map(|r| r.role.code.as_str())
+                .collect::<Vec<_>>(),
             vec!["admin", "vendedor", "cajero", "deposito"]
         );
         assert!(listed.iter().all(|r| r.holders.is_empty()));
@@ -3482,7 +3677,12 @@ mod tests {
             ("Vendedor", "Otro", "", "código del rol"),
             ("a", "Otro", "", "código del rol"),
             ("supervisor", "", "", "nombre del rol"),
-            ("supervisor", "Supervisor", &"x".repeat(257), "descripción del rol"),
+            (
+                "supervisor",
+                "Supervisor",
+                &"x".repeat(257),
+                "descripción del rol",
+            ),
         ] {
             let err = service
                 .create_role(&permissions, actor.id, code, name, description)
@@ -3491,7 +3691,9 @@ mod tests {
             match err {
                 AppError::Conflict(m) if m.contains("Ya existe") => {}
                 AppError::Validation(m) if m.contains(expected) => {}
-                other => panic!("create {code}: expected Spanish refusal naming {expected:?}, got {other:?}"),
+                other => panic!(
+                    "create {code}: expected Spanish refusal naming {expected:?}, got {other:?}"
+                ),
             }
         }
         assert_eq!(
@@ -3505,7 +3707,13 @@ mod tests {
 
         // The successful create: an ordinary role with its description.
         let created = service
-            .create_role(&permissions, actor.id, "supervisor", "Supervisor", "Vende y supervisa")
+            .create_role(
+                &permissions,
+                actor.id,
+                "supervisor",
+                "Supervisor",
+                "Vende y supervisa",
+            )
             .await
             .unwrap();
         assert!(!created.is_system);
@@ -3518,10 +3726,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(edited.name, "Supervisión");
-        assert_eq!(edited.description, None, "an empty description clears the field");
+        assert_eq!(
+            edited.description, None,
+            "an empty description clears the field"
+        );
         let admin_role = service.roles.find_by_code("admin").await.unwrap().unwrap();
         let renamed = service
-            .update_role(&permissions, actor.id, admin_role.id, "Administración", "El rol de la administración")
+            .update_role(
+                &permissions,
+                actor.id,
+                admin_role.id,
+                "Administración",
+                "El rol de la administración",
+            )
             .await
             .unwrap();
         assert_eq!(renamed.name, "Administración");
@@ -3539,7 +3756,11 @@ mod tests {
         }
         service
             .roles
-            .grant(&NewUserRole { user_id: actor.id, role_id: created.id, granted_by: actor.id })
+            .grant(&NewUserRole {
+                user_id: actor.id,
+                role_id: created.id,
+                granted_by: actor.id,
+            })
             .await
             .unwrap();
         let err = service
@@ -3548,16 +3769,32 @@ mod tests {
             .unwrap_err();
         match err {
             AppError::Conflict(m) => {
-                assert!(m.contains(actor.username.as_str()), "the refusal must NAME the blocking user: {m}");
+                assert!(
+                    m.contains(actor.username.as_str()),
+                    "the refusal must NAME the blocking user: {m}"
+                );
                 assert!(m.contains("No se puede eliminar"), "{m}");
             }
             other => panic!("expected the holders conflict, got {other:?}"),
         }
-        assert!(service.roles.find_by_id(created.id).await.unwrap().is_some());
+        assert!(service
+            .roles
+            .find_by_id(created.id)
+            .await
+            .unwrap()
+            .is_some());
         // Nobody holds it now: the deletion goes through.
         service.roles.revoke(actor.id, created.id).await.unwrap();
-        service.delete_role(&permissions, actor.id, created.id).await.unwrap();
-        assert!(service.roles.find_by_id(created.id).await.unwrap().is_none());
+        service
+            .delete_role(&permissions, actor.id, created.id)
+            .await
+            .unwrap();
+        assert!(service
+            .roles
+            .find_by_id(created.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// The matrix read and its replacement: the whole 23-row catalog with the
@@ -3574,12 +3811,23 @@ mod tests {
         let others = seed_user(&service, "external", "initial password 1", true).await;
         let visor = service
             .roles
-            .create(&crate::models::NewRole { code: "visor".into(), name: "Visor".into(), description: None }, holder.id)
+            .create(
+                &crate::models::NewRole {
+                    code: "visor".into(),
+                    name: "Visor".into(),
+                    description: None,
+                },
+                holder.id,
+            )
             .await
             .unwrap();
         service
             .roles
-            .grant(&NewUserRole { user_id: holder.id, role_id: visor.id, granted_by: holder.id })
+            .grant(&NewUserRole {
+                user_id: holder.id,
+                role_id: visor.id,
+                granted_by: holder.id,
+            })
             .await
             .unwrap();
         let roles_manage = permission_id(&pool, "identity.roles.manage").await;
@@ -3592,10 +3840,19 @@ mod tests {
             .unwrap();
 
         // The read: the whole catalog, the held ids marked.
-        let matrix = service.role_matrix(&SqlitePermissionRepository::new(pool.clone()), visor.id).await.unwrap();
-        assert_eq!(matrix.catalog.len(), 23, "the matrix read is the whole catalog");
+        let matrix = service
+            .role_matrix(&SqlitePermissionRepository::new(pool.clone()), visor.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            matrix.catalog.len(),
+            24,
+            "the matrix read is the whole catalog"
+        );
         assert_eq!(matrix.held_ids, vec![roles_manage]);
-        let unknown = service.role_matrix(&SqlitePermissionRepository::new(pool.clone()), 999_999).await;
+        let unknown = service
+            .role_matrix(&SqlitePermissionRepository::new(pool.clone()), 999_999)
+            .await;
         match unknown {
             Err(AppError::NotFound(m)) => assert!(m.contains("El rol no existe"), "{m}"),
             other => panic!("expected the Spanish not-found, got {other:?}"),
@@ -3616,7 +3873,11 @@ mod tests {
                 &permissions,
                 holder.id,
                 visor.id,
-                &[users_read, permission_id(&pool, "dashboard.read").await, users_read],
+                &[
+                    users_read,
+                    permission_id(&pool, "dashboard.read").await,
+                    users_read,
+                ],
             )
             .await
             .unwrap_err();
@@ -3658,7 +3919,14 @@ mod tests {
         // different role, never the one being edited.
         let manager = service
             .roles
-            .create(&crate::models::NewRole { code: "gestor".into(), name: "Gestor".into(), description: None }, others.id)
+            .create(
+                &crate::models::NewRole {
+                    code: "gestor".into(),
+                    name: "Gestor".into(),
+                    description: None,
+                },
+                others.id,
+            )
             .await
             .unwrap();
         SqlitePermissionRepository::new(pool.clone())
@@ -3667,12 +3935,23 @@ mod tests {
             .unwrap();
         service
             .roles
-            .grant(&NewUserRole { user_id: others.id, role_id: manager.id, granted_by: others.id })
+            .grant(&NewUserRole {
+                user_id: others.id,
+                role_id: manager.id,
+                granted_by: others.id,
+            })
             .await
             .unwrap();
         let target_role = service
             .roles
-            .create(&crate::models::NewRole { code: "libre".into(), name: "Libre".into(), description: None }, others.id)
+            .create(
+                &crate::models::NewRole {
+                    code: "libre".into(),
+                    name: "Libre".into(),
+                    description: None,
+                },
+                others.id,
+            )
             .await
             .unwrap();
         SqlitePermissionRepository::new(pool.clone())
@@ -3711,9 +3990,9 @@ mod tests {
         let admin = service.roles.find_by_code("admin").await.unwrap().unwrap();
         let users_read = permission_id(&pool, "identity.users.read").await;
         for submitted in [
-            vec![],              // the empty replacement: the removal half
-            vec![users_read],    // a real id: still refused, nothing written
-            vec![999_999],       // a non-existent id: refused BEFORE the form validation
+            vec![],           // the empty replacement: the removal half
+            vec![users_read], // a real id: still refused, nothing written
+            vec![999_999],    // a non-existent id: refused BEFORE the form validation
         ] {
             let err = service
                 .set_role_matrix(&permissions, actor.id, admin.id, &submitted)
@@ -3725,7 +4004,10 @@ mod tests {
                         m.contains("editar la matriz de un rol protegido"),
                         "the service's own reason, not the database backstop's: {m}"
                     );
-                    assert!(!m.contains("quitar permisos"), "no trigger-mapped text here: {m}");
+                    assert!(
+                        !m.contains("quitar permisos"),
+                        "no trigger-mapped text here: {m}"
+                    );
                 }
                 other => panic!("expected the protected matrix conflict, got {other:?}"),
             }
@@ -3736,7 +4018,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            23,
+            24,
             "the protected role's matrix is untouched"
         );
     }

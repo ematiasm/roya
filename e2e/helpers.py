@@ -34,6 +34,23 @@ from typing import Any
 # a wedged server from hanging the suite without a message.
 _REQUEST_TIMEOUT_SECONDS = 10.0
 
+# Fixed first-run setup values for every fresh throwaway server. The application
+# no longer bootstraps an administrator during startup, so the E2E harness must
+# exercise the real setup form before it can log in. The browser baseline is
+# en-US: its server-rendered money uses dot-decimal input and the USD code.
+# Locale-specific parsing remains covered by the Rust localization tests.
+E2E_ADMIN_USERNAME = "admin"
+E2E_ADMIN_PASSWORD = "roya-e2e-fixed-password"
+E2E_SETUP_FORM = {
+    "business_name": "Roya E2E",
+    "default_locale_code": "en-US",
+    "currency_code": "USD",
+    "timezone": "UTC",
+    "username": E2E_ADMIN_USERNAME,
+    "display_name": "Roya E2E Administrator",
+    "password": E2E_ADMIN_PASSWORD,
+}
+
 
 class SeedError(RuntimeError):
     """A seed request failed; the endpoint is broken and the suite must say so."""
@@ -190,6 +207,15 @@ class ApiClient:
         except json.JSONDecodeError:
             # Form endpoints answer with HTML; the caller decides what to do.
             return {"raw": text}
+
+
+def setup_fresh_server(api: ApiClient) -> None:
+    """Complete the real first-run setup form for a fresh throwaway server.
+
+    This intentionally uses ``ApiClient.post_form`` rather than writing to the
+    database, so the harness proves the same public setup contract a person uses.
+    """
+    api.post_form("/setup", E2E_SETUP_FORM)
 
 
 @dataclass(frozen=True)
@@ -373,7 +399,7 @@ def create_customer(
     *,
     phone: str | None = None,
     credit_limit: str | None = None,
-    payment_days: int | None = None,
+    due_days: int | None = None,
     address: str | None = None,
     notes: str | None = None,
 ) -> int:
@@ -386,7 +412,7 @@ def create_customer(
             "tax_id": None,
             "notes": notes,
             "credit_limit": credit_limit,
-            "payment_days": payment_days,
+            "due_days": due_days,
         },
     )
     # Customer creation answers with the created customer plus any name matches

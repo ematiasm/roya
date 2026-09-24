@@ -11,7 +11,7 @@
 // the database trigger stays a backstop instead of a 500.
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -22,9 +22,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{
-    Ageing, Customer, NewCustomer, UpdateCustomer,
-};
+use crate::localization::LocalizationContext;
+use crate::models::{Ageing, Customer, NewCustomer, UpdateCustomer};
 use crate::routes::AppState;
 
 // S6 enforcement (AC10): the entity and its derived receivable are read with
@@ -82,7 +81,7 @@ pub struct UpdateCustomerRequest {
     #[serde(default)]
     pub credit_limit: Option<Option<Decimal>>,
     #[serde(default)]
-    pub payment_days: Option<Option<i64>>,
+    pub due_days: Option<Option<i64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +112,11 @@ fn over_limit(customer: &Customer, balance: Decimal) -> bool {
         .unwrap_or(false)
 }
 
-fn today() -> NaiveDate {
-    chrono::Local::now().date_naive()
+fn today(localization: &LocalizationContext) -> AppResult<NaiveDate> {
+    localization
+        .today_iso()
+        .parse()
+        .map_err(|_| AppError::Internal("invalid localized date".into()))
 }
 
 /// All customers with the derived receivable folded in. `ageing_all` already
@@ -123,8 +125,9 @@ fn today() -> NaiveDate {
 async fn customer_views(
     state: &AppState,
     only_active: bool,
+    localization: &LocalizationContext,
 ) -> AppResult<Vec<CustomerBalanceView>> {
-    let ageing = state.sales_service.ageing_all(today()).await?;
+    let ageing = state.sales_service.ageing_all(today(localization)?).await?;
     let balances: HashMap<i64, Decimal> = ageing
         .iter()
         .map(|row| (row.customer_id, row.balance))
@@ -161,9 +164,10 @@ async fn customer_view(state: &AppState, customer: Customer) -> AppResult<Custom
 async fn list_customers(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<ListCustomersQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let customers = customer_views(&state, query.only_active.unwrap_or(false)).await?;
+    let customers = customer_views(&state, query.only_active.unwrap_or(false), &localization).await?;
     Ok(Json(serde_json::json!({ "customers": customers })))
 }
 
@@ -211,7 +215,7 @@ async fn update_customer(
                 tax_id: payload.tax_id,
                 notes: payload.notes,
                 credit_limit: payload.credit_limit,
-                payment_days: payload.payment_days,
+                due_days: payload.due_days,
             },
         )
         .await?;
@@ -267,14 +271,16 @@ async fn delete_customer(
 async fn customer_statement(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Query(query): Query<AsOfQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
     let customer = state.customer_service.get_customer(id).await?;
-    let statement = state
-        .sales_service
-        .customer_statement(id, query.as_of.unwrap_or_else(today))
-        .await?;
+    let as_of = match query.as_of {
+        Some(date) => date,
+        None => today(&localization)?,
+    };
+    let statement = state.sales_service.customer_statement(id, as_of).await?;
     Ok(Json(
         serde_json::json!({ "customer": customer, "statement": statement }),
     ))
@@ -285,9 +291,13 @@ async fn customer_statement(
 async fn customer_ageing(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<AsOfQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let as_of = query.as_of.unwrap_or_else(today);
+    let as_of = match query.as_of {
+        Some(date) => date,
+        None => today(&localization)?,
+    };
     let rows = state.sales_service.ageing_all(as_of).await?;
     let customers: HashMap<i64, Customer> = state
         .customer_service
@@ -327,7 +337,10 @@ async fn list_receipts(
         .customer_id
         .ok_or_else(|| AppError::Validation("customer_id is required".into()))?;
     state.customer_service.get_customer(customer_id).await?;
-    let receipts = state.customer_receipt_service.list_receipts(customer_id).await?;
+    let receipts = state
+        .customer_receipt_service
+        .list_receipts(customer_id)
+        .await?;
     Ok(Json(serde_json::json!({ "receipts": receipts })))
 }
 
@@ -369,7 +382,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/customers/ageing", get(customer_ageing))
         .route(
             "/api/customers/{id}",
-            get(get_customer).put(update_customer).delete(delete_customer),
+            get(get_customer)
+                .put(update_customer)
+                .delete(delete_customer),
         )
         .route("/api/customers/{id}/statement", get(customer_statement))
         .route("/api/customers/{id}/activate", post(activate_customer))
@@ -497,11 +512,10 @@ mod tests {
     }
 
     async fn allow_cash(pool: &SqlitePool, account_id: i64) -> i64 {
-        let (cash,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let (cash,): (i64,) = sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
         // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
         // the name when it is already owned elsewhere in this pool.
         let assigned = sqlx::query(
@@ -533,14 +547,14 @@ mod tests {
         app: &axum::Router,
         name: &str,
         limit: Option<&str>,
-        payment_days: Option<i64>,
+        due_days: Option<i64>,
     ) -> i64 {
         let mut body = json!({ "name": name });
         if let Some(limit) = limit {
             body["credit_limit"] = json!(limit);
         }
-        if let Some(days) = payment_days {
-            body["payment_days"] = json!(days);
+        if let Some(days) = due_days {
+            body["due_days"] = json!(days);
         }
         let (st, v) = post(app, "/api/customers", body).await;
         assert_eq!(st, StatusCode::CREATED, "seed customer {name}: {v}");
@@ -601,7 +615,7 @@ mod tests {
             "/api/customers",
             json!({
                 "name": "  Ana Pérez  ", "phone": "  555-1234  ",
-                "credit_limit": "100", "payment_days": 30
+                "credit_limit": "100", "due_days": 30
             }),
         )
         .await;
@@ -610,7 +624,7 @@ mod tests {
         assert_eq!(v["customer"]["name"], json!("Ana Pérez"));
         assert_eq!(v["customer"]["phone"], json!("555-1234"));
         assert_eq!(dec(&v["customer"]["credit_limit"]), dec(&json!("100")));
-        assert_eq!(v["customer"]["payment_days"], json!(30));
+        assert_eq!(v["customer"]["due_days"], json!(30));
         assert!(v["name_matches"].as_array().unwrap().is_empty());
 
         // A duplicate name is accepted and the existing matches are reported.
@@ -635,16 +649,11 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "update: {v}");
         assert_eq!(v["customer"]["name"], json!("Ana P."));
         assert_eq!(dec(&v["customer"]["credit_limit"]), dec(&json!("50")));
-        assert_eq!(v["customer"]["payment_days"], json!(30));
+        assert_eq!(v["customer"]["due_days"], json!(30));
         assert!(v["customer"]["is_active"].as_bool().unwrap());
 
         // Activate/deactivate.
-        let (st, v) = post(
-            &app,
-            &format!("/api/customers/{id}/deactivate"),
-            json!({}),
-        )
-        .await;
+        let (st, v) = post(&app, &format!("/api/customers/{id}/deactivate"), json!({})).await;
         assert_eq!(st, StatusCode::OK, "deactivate: {v}");
         assert_eq!(v["customer"]["is_active"], json!(false));
 
@@ -700,11 +709,10 @@ mod tests {
         );
 
         // The walk-in can never be deactivated or deleted.
-        let (walkin,): (i64,) =
-            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (walkin,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (st, v) = post(
             &app,
             &format!("/api/customers/{walkin}/deactivate"),
@@ -729,7 +737,10 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
-        assert_eq!(get(&app, "/api/customers/999999").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(&app, "/api/customers/999999").await.0,
+            StatusCode::NOT_FOUND
+        );
         assert_eq!(
             delete(&app, "/api/customers/999999").await.0,
             StatusCode::NOT_FOUND
@@ -934,7 +945,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned method: {v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("not assigned"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not assigned"),
             "the message must name the fix: {v}"
         );
         assert_eq!(receipt_count(&pool).await, 0);
@@ -1128,7 +1142,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("customers.write"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("customers.write"),
             "the refusal must name customers.write: {v}"
         );
         let (st, v) = request_as(
@@ -1141,7 +1158,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("customers.write"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("customers.write"),
             "the refusal must name customers.write: {v}"
         );
         for action in ["activate", "deactivate"] {
@@ -1155,16 +1175,27 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::FORBIDDEN, "{action}: {v}");
             assert!(
-                v["error"].as_str().unwrap_or_default().contains("customers.write"),
+                v["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("customers.write"),
                 "{action} must name customers.write: {v}"
             );
         }
-        let (st, v) =
-            request_as(&app, "DELETE", &format!("/api/customers/{customer}"), Some(&cookie), None)
-                .await;
+        let (st, v) = request_as(
+            &app,
+            "DELETE",
+            &format!("/api/customers/{customer}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("customers.write"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("customers.write"),
             "the refusal must name customers.write: {v}"
         );
 
@@ -1182,7 +1213,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("customers.collect"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("customers.collect"),
             "the refusal must name customers.collect: {v}"
         );
     }
@@ -1198,16 +1232,15 @@ mod tests {
         let (customer, _sale, _product) = seeded_receivable(&app).await;
         let acc = seed_account(&app, "cajaCust").await;
         let cash = allow_cash(&pool, acc).await;
-        let probe = test_support::seed_session_with_permissions(
-            &pool,
-            &["customers.read"],
-        )
-        .await
-        .unwrap();
+        let probe = test_support::seed_session_with_permissions(&pool, &["customers.read"])
+            .await
+            .unwrap();
         let cookie = test_support::cookie_for(&probe);
 
-        let customers_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM customers").fetch_one(&pool).await.unwrap();
+        let customers_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (st, v) = request_as(
             &app,
             "POST",
@@ -1217,13 +1250,23 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-        let customers_after: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM customers").fetch_one(&pool).await.unwrap();
-        assert_eq!(customers_after, customers_before, "a refused create must write nothing");
+        let customers_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            customers_after, customers_before,
+            "a refused create must write nothing"
+        );
 
-        let (st, v) =
-            request_as(&app, "DELETE", &format!("/api/customers/{customer}"), Some(&cookie), None)
-                .await;
+        let (st, v) = request_as(
+            &app,
+            "DELETE",
+            &format!("/api/customers/{customer}"),
+            Some(&cookie),
+            None,
+        )
+        .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         let (st, v) = request_as(
             &app,
@@ -1233,10 +1276,16 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(st, StatusCode::OK, "the customer must survive the refused delete: {v}");
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the customer must survive the refused delete: {v}"
+        );
 
-        let receipts_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM customer_receipts").fetch_one(&pool).await.unwrap();
+        let receipts_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customer_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (st, v) = request_as(
             &app,
             "POST",
@@ -1250,12 +1299,20 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("customers.collect"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("customers.collect"),
             "the refusal must name customers.collect: {v}"
         );
-        let receipts_after: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM customer_receipts").fetch_one(&pool).await.unwrap();
-        assert_eq!(receipts_after, receipts_before, "a refused collect must write nothing");
+        let receipts_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customer_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            receipts_after, receipts_before,
+            "a refused collect must write nothing"
+        );
     }
 
     /// A principal holding the permissions gets the normal answers: the
@@ -1317,7 +1374,11 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(dec(&v["balance"]), dec(&json!("30")), "the collect must drop the balance: {v}");
+        assert_eq!(
+            dec(&v["balance"]),
+            dec(&json!("30")),
+            "the collect must drop the balance: {v}"
+        );
     }
 
     /// The gate order must not change: an anonymous request gets the JSON
@@ -1355,16 +1416,29 @@ mod tests {
             let (st, v) = request_as(&app, "GET", uri, Some(&cookie), None).await;
             assert_eq!(st, StatusCode::FORBIDDEN, "{uri}: {v}");
             assert!(
-                v["error"].as_str().unwrap_or_default().contains("customers.read"),
+                v["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("customers.read"),
                 "{uri} must name customers.read: {v}"
             );
         }
 
         // One receipt read: an unknown id still refuses the permission first.
-        let (st, v) = request_as(&app, "GET", "/api/customer-receipts/999999", Some(&cookie), None).await;
+        let (st, v) = request_as(
+            &app,
+            "GET",
+            "/api/customer-receipts/999999",
+            Some(&cookie),
+            None,
+        )
+        .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("customers.read"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("customers.read"),
             "{v}"
         );
     }

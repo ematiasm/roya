@@ -544,6 +544,12 @@ def test_visual_baseline(
         want, got = expected.get(name, {}), current.get(name, {})
         if want == got:
             continue
+        if name.endswith(":hover-skipped"):
+            problems.append(f"{name}: {want!r} -> {got!r}")
+            if len(problems) > 40:
+                problems.append("... (stopping after 40 differences)")
+                break
+            continue
         for dom_path in sorted(set(want) | set(got)):
             if want.get(dom_path) == got.get(dom_path):
                 continue

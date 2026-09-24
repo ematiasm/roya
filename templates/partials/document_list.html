@@ -19,14 +19,14 @@
           <button type="button" class="btn-primary font-semibold underline-offset-2 hover:underline" hx-get="/web/documents/detail/{{ v.kind_token }}/{{ v.id }}" hx-target="#document-drawer-body" hx-swap="innerHTML">{{ v.reference }}</button>
           <span class="text-xs text-muted">{{ v.party }}</span>
         </div>
-        <span class="text-[13px] text-muted">{{ v.date }} • {{ v.detail }}{% if let Some(name) = v.actor_name %} • {{ name }}{% endif %}</span>
+        <span class="text-[13px] text-muted">{{ localization.format_date(v.date.clone()) }} • {{ v.detail }}{% if let Some(name) = v.actor_name %} • {{ name }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
         {% if let Some(amount) = v.amount %}
-        <span class="font-bold tabular-nums">{{ amount }}</span>
+        <span class="font-bold tabular-nums">{{ localization.format_currency(amount.clone()) }}</span>
         {% endif %}
         {% if let Some(quantity) = v.quantity %}
-        <span class="font-bold tabular-nums">{{ quantity }}</span>
+        <span class="font-bold tabular-nums">{{ localization.format_quantity(quantity.clone()) }}</span>
         {% endif %}
         <a href="{{ v.href }}" class="btn-secondary bg-card font-normal hover:opacity-100">Open</a>
       </div>

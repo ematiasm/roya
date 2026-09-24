@@ -15,7 +15,7 @@
 // the operator back to the app.
 use askama::Template;
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -24,6 +24,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::routes::AppState;
 use crate::security::authz::Nav;
 use crate::security::guard::{current_session, local_next};
@@ -38,6 +39,7 @@ use crate::security::guard::{current_session, local_next};
 #[derive(Template)]
 #[template(path = "login.html")]
 struct LoginTemplate {
+    localization: LocalizationContext,
     next: String,
     error: Option<String>,
 }
@@ -49,6 +51,7 @@ struct LoginTemplate {
 #[derive(Template)]
 #[template(path = "password.html")]
 struct PasswordTemplate {
+    localization: LocalizationContext,
     error: Option<String>,
     /// The sidebar partial's active-entry key: the page marks its own entry.
     nav_key: &'static str,
@@ -81,6 +84,7 @@ struct LoginForm {
 
 async fn login_page(
     State(state): State<AppState>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<LoginQuery>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
@@ -91,6 +95,7 @@ async fn login_page(
         Err(e) => return Err(AppError::Internal(format!("session check failed: {e}"))),
     }
     let template = LoginTemplate {
+        localization,
         next: next_value(query.next.as_deref()),
         error: None,
     };
@@ -100,6 +105,7 @@ async fn login_page(
 
 async fn login_submit(
     State(state): State<AppState>,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<LoginForm>,
 ) -> Result<Response, AppError> {
     match state
@@ -125,6 +131,7 @@ async fn login_submit(
         // throttled attempt): re-render the form, same message, `next` kept.
         Err(AppError::Unauthorized(message)) => {
             let template = LoginTemplate {
+                localization,
                 next: next_value(form.next.as_deref()),
                 error: Some(message),
             };
@@ -171,8 +178,10 @@ struct PasswordForm {
 
 async fn password_page(
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Response, AppError> {
     let html = render_password(PasswordTemplate {
+        localization,
         error: None,
         nav_key: PASSWORD_NAV_KEY,
         nav: Nav::for_principal(&principal),
@@ -188,6 +197,7 @@ async fn password_submit(
     State(state): State<AppState>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<PasswordForm>,
 ) -> Result<Response, AppError> {
     // The guard guarantees a session here; the handler still resolves it
@@ -202,7 +212,7 @@ async fn password_submit(
     // Confirmation matching is the form's own job (two fields, one value);
     // the credential rules live in the service, the one layer that owns them.
     if form.new_password != form.confirm_password {
-        return password_refusal(&principal, "Las contraseñas nuevas no coinciden.", StatusCode::BAD_REQUEST);
+        return password_refusal(&principal, localization.clone(), "Las contraseñas nuevas no coinciden.", StatusCode::BAD_REQUEST);
     }
     match state
         .identity_service
@@ -218,12 +228,12 @@ async fn password_submit(
         // The current password did not verify: same card, precise reason, and
         // nothing was written (the service verifies before its first write).
         Err(AppError::Unauthorized(_)) => {
-            password_refusal(&principal, "La contraseña actual no es correcta.", StatusCode::UNAUTHORIZED)
+            password_refusal(&principal, localization.clone(), "La contraseña actual no es correcta.", StatusCode::UNAUTHORIZED)
         }
         // The service's validation (length, difference) speaks Spanish: the
         // message is operator-facing through this form.
         Err(AppError::Validation(message)) => {
-            password_refusal(&principal, &message, StatusCode::BAD_REQUEST)
+            password_refusal(&principal, localization.clone(), &message, StatusCode::BAD_REQUEST)
         }
         Err(other) => Err(other),
     }
@@ -231,10 +241,12 @@ async fn password_submit(
 
 fn password_refusal(
     principal: &crate::security::authz::Principal,
+    localization: LocalizationContext,
     message: &str,
     status: StatusCode,
 ) -> Result<Response, AppError> {
     let html = render_password(PasswordTemplate {
+        localization,
         error: Some(message.to_owned()),
         nav_key: PASSWORD_NAV_KEY,
         nav: Nav::for_principal(principal),

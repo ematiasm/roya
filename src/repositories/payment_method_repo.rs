@@ -40,7 +40,12 @@ pub trait PaymentMethodRepository: Send + Sync {
     ) -> AppResult<()>;
     /// Create a fresh method row owned by `account_id` (duplicates of a
     /// same-named method on another account are allowed by design).
-    async fn create_in_account(&self, actor: i64, name: &str, account_id: i64) -> AppResult<PaymentMethod>;
+    async fn create_in_account(
+        &self,
+        actor: i64,
+        name: &str,
+        account_id: i64,
+    ) -> AppResult<PaymentMethod>;
     /// Account ids with no owned methods (self-diagnosing UI warning).
     async fn list_accounts_without_methods(&self) -> AppResult<Vec<i64>>;
 }
@@ -51,6 +56,8 @@ pub trait PaymentMethodRepository: Send + Sync {
 
 fn row_to_method(row: sqlx::sqlite::SqliteRow) -> PaymentMethod {
     let active_int: i64 = row.get("is_active");
+    let created_at = row.get("created_at");
+    let updated_at = row.try_get("updated_at").unwrap_or(created_at);
     PaymentMethod {
         id: row.get("id"),
         name: row.get("name"),
@@ -58,7 +65,8 @@ fn row_to_method(row: sqlx::sqlite::SqliteRow) -> PaymentMethod {
         is_active: active_int != 0,
         created_by: row.get("created_by"),
         updated_by: row.get("updated_by"),
-        created_at: row.get("created_at"),
+        created_at,
+        updated_at,
     }
 }
 
@@ -102,14 +110,14 @@ impl SqlitePaymentMethodRepository {
 #[async_trait]
 impl PaymentMethodRepository for SqlitePaymentMethodRepository {
     async fn list_methods(&self) -> AppResult<Vec<PaymentMethod>> {
-        let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at FROM payment_methods ORDER BY id"#)
+        let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods ORDER BY id"#)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_method).collect())
     }
 
     async fn find_method(&self, id: i64) -> AppResult<Option<PaymentMethod>> {
-        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at FROM payment_methods WHERE id = ?"#)
+        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE id = ?"#)
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -117,7 +125,7 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
     }
 
     async fn find_method_by_name(&self, name: &str) -> AppResult<Option<PaymentMethod>> {
-        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at FROM payment_methods WHERE name = ? ORDER BY id LIMIT 1"#)
+        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE name = ? ORDER BY id LIMIT 1"#)
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
@@ -129,7 +137,7 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         account_id: i64,
         name: &str,
     ) -> AppResult<Option<PaymentMethod>> {
-        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at FROM payment_methods WHERE account_id = ? AND name = ?"#)
+        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE account_id = ? AND name = ?"#)
         .bind(account_id)
         .bind(name)
         .fetch_optional(&self.pool)
@@ -138,7 +146,7 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
     }
 
     async fn find_unassigned_by_name(&self, name: &str) -> AppResult<Option<PaymentMethod>> {
-        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at FROM payment_methods WHERE account_id IS NULL AND name = ? ORDER BY id LIMIT 1"#)
+        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE account_id IS NULL AND name = ? ORDER BY id LIMIT 1"#)
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
@@ -146,7 +154,7 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
     }
 
     async fn list_by_account(&self, account_id: i64) -> AppResult<Vec<PaymentMethod>> {
-        let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at FROM payment_methods WHERE account_id = ? ORDER BY id"#)
+        let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE account_id = ? ORDER BY id"#)
         .bind(account_id)
         .fetch_all(&self.pool)
         .await?;
@@ -154,7 +162,7 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
     }
 
     async fn list_unassigned(&self) -> AppResult<Vec<PaymentMethod>> {
-        let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at FROM payment_methods WHERE account_id IS NULL ORDER BY id"#)
+        let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE account_id IS NULL ORDER BY id"#)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_method).collect())
@@ -179,7 +187,10 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         account_id: Option<i64>,
     ) -> AppResult<()> {
         let result = sqlx::query(
-            "UPDATE payment_methods SET account_id = ?, updated_by = ? WHERE id = ?",
+            "UPDATE payment_methods
+             SET account_id = ?, updated_by = ?,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?",
         )
         .bind(account_id)
         .bind(actor)
@@ -193,10 +204,15 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         Ok(())
     }
 
-    async fn create_in_account(&self, actor: i64, name: &str, account_id: i64) -> AppResult<PaymentMethod> {
+    async fn create_in_account(
+        &self,
+        actor: i64,
+        name: &str,
+        account_id: i64,
+    ) -> AppResult<PaymentMethod> {
         let row = sqlx::query(r#"INSERT INTO payment_methods (name, account_id, is_active, created_by)
                VALUES (?, ?, 1, ?)
-               RETURNING id, name, account_id, is_active, created_by, updated_by, created_at"#)
+               RETURNING id, name, account_id, is_active, created_by, updated_by, created_at, updated_at"#)
         .bind(name)
         .bind(account_id)
         .bind(actor)
@@ -339,9 +355,21 @@ mod tests {
                 if stmt.trim().is_empty() {
                     continue;
                 }
-                sqlx::raw_sql(sqlx::AssertSqlSafe(stmt)).execute(pool).await.unwrap();
+                sqlx::raw_sql(sqlx::AssertSqlSafe(stmt))
+                    .execute(pool)
+                    .await
+                    .unwrap();
             }
         }
+        // The current repository also returns the technical update timestamp
+        // introduced by migration 36. This focused migration-24 fixture does
+        // not need the rest of that migration, only the matching column shape.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(
+            "ALTER TABLE payment_methods ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'",
+        ))
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -372,12 +400,14 @@ mod tests {
                 .await
                 .unwrap();
         for (acc, m) in [(a.0, shared.0), (b.0, shared.0), (a.0, solo.0)] {
-            sqlx::query("INSERT INTO account_payment_methods (account_id, method_id) VALUES (?, ?)")
-                .bind(acc)
-                .bind(m)
-                .execute(&pool)
-                .await
-                .unwrap();
+            sqlx::query(
+                "INSERT INTO account_payment_methods (account_id, method_id) VALUES (?, ?)",
+            )
+            .bind(acc)
+            .bind(m)
+            .execute(&pool)
+            .await
+            .unwrap();
         }
 
         apply_migration_file(&pool).await;
@@ -389,7 +419,11 @@ mod tests {
                 .fetch_all(&pool)
                 .await
                 .unwrap();
-        assert_eq!(rows.len(), 4, "one duplicate row for the shared method: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            4,
+            "one duplicate row for the shared method: {rows:?}"
+        );
         assert_eq!(rows[0], (shared.0, "Shared".into(), Some(a.0)));
         assert_eq!(rows[1], (solo.0, "Solo".into(), Some(a.0)));
         assert_eq!(rows[2], (orphan.0, "Orphan".into(), None));
@@ -398,8 +432,13 @@ mod tests {
         assert!(rows[3].0 > orphan.0, "the duplicate gets a new id");
 
         // Same name on two accounts is allowed; twice on one account is not.
-        repo.create_in_account(audit_actor(&repo).await, "Solo", b.0).await.unwrap();
-        let dup = repo.create_in_account(audit_actor(&repo).await, "Solo", b.0).await.unwrap_err();
+        repo.create_in_account(audit_actor(&repo).await, "Solo", b.0)
+            .await
+            .unwrap();
+        let dup = repo
+            .create_in_account(audit_actor(&repo).await, "Solo", b.0)
+            .await
+            .unwrap_err();
         assert!(matches!(dup, AppError::Conflict(_)), "got {dup:?}");
 
         // The allowlist table is gone.
@@ -413,8 +452,18 @@ mod tests {
         let a_methods = repo.list_by_account(a.0).await.unwrap();
         assert_eq!(a_methods.len(), 2);
         let unassigned = repo.list_unassigned().await.unwrap();
-        assert_eq!(unassigned.iter().map(|m| m.name.clone()).collect::<Vec<_>>(), vec!["Orphan"]);
-        assert!(repo.list_accounts_without_methods().await.unwrap().is_empty());
+        assert_eq!(
+            unassigned
+                .iter()
+                .map(|m| m.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["Orphan"]
+        );
+        assert!(repo
+            .list_accounts_without_methods()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -424,23 +473,40 @@ mod tests {
         // The fixture account is system-planted data: the actor is the
         // migration's sentinel account.
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let acc: (i64,) = sqlx::query_as("INSERT INTO accounts (name, created_by) VALUES ('A', ?) RETURNING id")
-            .bind(actor)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let acc: (i64,) =
+            sqlx::query_as("INSERT INTO accounts (name, created_by) VALUES ('A', ?) RETURNING id")
+                .bind(actor)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         // Seeded methods are unassigned on a fresh DB.
         let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
         assert_eq!(cash.account_id, None);
 
-        repo.set_method_account(audit_actor(&repo).await, cash.id, Some(acc.0)).await.unwrap();
-        assert_eq!(repo.find_method(cash.id).await.unwrap().unwrap().account_id, Some(acc.0));
-        repo.set_method_account(audit_actor(&repo).await, cash.id, None).await.unwrap();
-        assert_eq!(repo.find_method(cash.id).await.unwrap().unwrap().account_id, None);
+        repo.set_method_account(audit_actor(&repo).await, cash.id, Some(acc.0))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.find_method(cash.id).await.unwrap().unwrap().account_id,
+            Some(acc.0)
+        );
+        repo.set_method_account(audit_actor(&repo).await, cash.id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.find_method(cash.id).await.unwrap().unwrap().account_id,
+            None
+        );
 
-        let err = repo.set_method_account(audit_actor(&repo).await, 999_999, Some(acc.0)).await.unwrap_err();
+        let err = repo
+            .set_method_account(audit_actor(&repo).await, 999_999, Some(acc.0))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
-        let err = repo.set_method_account(audit_actor(&repo).await, cash.id, Some(999_999)).await.unwrap_err();
+        let err = repo
+            .set_method_account(audit_actor(&repo).await, cash.id, Some(999_999))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 }
