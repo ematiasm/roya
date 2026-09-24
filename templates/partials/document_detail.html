@@ -106,7 +106,7 @@
       </div>
       {% endfor %}
     </div>
-    <a class="btn-secondary font-normal mt-3 inline-block no-underline hover:no-underline hover:opacity-100" href="{{ p.href }}">Abrir</a>
+    <a class="btn-secondary font-normal mt-3 inline-block hover:opacity-100" href="{{ p.href }}">Abrir</a>
   </section>
   {% endif %}
 
@@ -117,7 +117,7 @@
   {% if !links.is_empty() %}
   <section class="flex flex-wrap gap-2">
     {% for link in links %}
-    <a class="btn-secondary font-normal no-underline hover:no-underline hover:opacity-100" href="{{ link.href }}">{{ link.label }}</a>
+    <a class="btn-secondary font-normal hover:opacity-100" href="{{ link.href }}">{{ link.label }}</a>
     {% endfor %}
   </section>
   {% endif %}

@@ -5792,11 +5792,10 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         "{draft_row}"
     );
 
-    // AC1b: the row anchor names the normal text colour itself. The stylesheet
-    // makes every anchor blue (`a { @apply text-accent2 … }`), and because the
-    // whole row is an anchor, the identifier, the supplier and the meta line
-    // inherit that blue unless the row's own class says otherwise — the same
-    // `text-text` products and suppliers name on their rows. Read on the
+    // AC1b: the row anchor names the normal text colour itself. The
+    // `@layer base` `a` rule is deleted, so an anchor can no longer inherit a
+    // colour at all; the row's computed colour is asserted by the
+    // visual-neutrality net, which covers `/purchases`. Read on the
     // row's OPENING tag, not a span inside it: the total's class once passed
     // for the row's colour.
     let draft_tag = purchase_row_opening_tag(&all, draft);
@@ -5804,10 +5803,6 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         draft_tag.contains("text-text"),
         "the row anchor must name the normal text colour so identifier, supplier \
          and meta line stop inheriting the anchor blue: {draft_tag}"
-    );
-    assert!(
-        draft_tag.contains("no-underline hover:no-underline"),
-        "the row keeps its no-underline peek contract: {draft_tag}"
     );
 
     // Exactly one chip per row, and each state gets its own colour. The owed

@@ -23,7 +23,7 @@
    data-nav="{{ key }}"
    {% if nav_key == key %}aria-current="page" data-nav-active="true"{% endif %}
    title="{{ label }}"
-   class="flex items-center gap-3 rounded-[10px] px-3 py-2 text-sm no-underline hover:no-underline md:justify-center lg:justify-start {% if nav_key == key %}bg-accent/10 font-semibold text-accent{% else %}text-muted hover:bg-card hover:text-text{% endif %}">
+   class="flex items-center gap-3 rounded-[10px] px-3 py-2 text-sm md:justify-center lg:justify-start {% if nav_key == key %}bg-accent/10 font-semibold text-accent{% else %}text-muted hover:bg-card hover:text-text{% endif %}">
   <svg class="h-5 w-5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="{{ icon_d }}"/></svg>
   <span class="truncate md:hidden lg:inline">{{ label }}</span>
 </a>
@@ -33,7 +33,7 @@
 <aside id="sidebar" data-sidebar
        class="fixed top-0 bottom-0 left-0 z-40 flex w-64 -translate-x-full flex-col border-r border-border bg-surface transition-transform duration-200 md:sticky md:bottom-auto md:h-screen md:w-16 md:translate-x-0 lg:w-64">
   <div class="flex h-14 shrink-0 items-center border-b border-border px-4 md:justify-center md:px-2 lg:justify-start lg:px-4">
-    <a href="/" class="text-lg font-bold tracking-[-0.02em] text-text no-underline hover:no-underline">
+    <a href="/" class="text-lg font-bold tracking-[-0.02em] text-text">
       <span class="md:hidden lg:inline">roya </span><span class="text-accent">◆</span>
     </a>
   </div>

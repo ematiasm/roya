@@ -19,7 +19,7 @@
         <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}Draft sale{% endif %}</span>
         <span class="text-[13px] text-muted">{% if d.sale.customer_name.is_empty() %}Walk-in{% else %}{{ d.sale.customer_name }}{% endif %} • {{ d.sale.sale_date }}{% if let Some(due) = d.sale.due_date %} • due {{ due }}{% endif %} • owed {{ d.due }}</span>
       </div>
-      <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal no-underline hover:no-underline hover:opacity-100">Open</a>
+      <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">Open</a>
     </div>
     {% endfor %}
   {% endif %}

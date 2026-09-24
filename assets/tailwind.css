@@ -44,24 +44,6 @@
     @apply bg-bg font-sans text-text;
   }
 
-  a {
-    @apply text-accent2 no-underline hover:underline;
-  }
-
-  label {
-    @apply block text-[13px] font-semibold tracking-[0.04em] text-muted uppercase;
-  }
-
-  input,
-  select,
-  textarea {
-    @apply w-full rounded-[10px] border border-border bg-bg px-3 py-2.5 text-sm text-text focus:border-accent2 focus:outline-none;
-  }
-
-  button {
-    @apply cursor-pointer rounded-[10px] border-0 bg-accent px-3.5 py-2.5 font-bold text-[#0a0f0d] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
-  }
-
   /* Tailwind's preflight resets `* { margin: 0 }`, which wins over the UA
      stylesheet's `dialog { margin: auto }`. A modal dialog therefore pins to the
      top-left corner over the sidebar instead of centring — the backdrop still

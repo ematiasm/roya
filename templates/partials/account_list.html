@@ -4,7 +4,7 @@
     <div class="empty">No accounts yet — create one on the right.</div>
   {% else %}
     {% for acc in accounts %}
-    <a href="/accounts/{{ acc.id }}" class="block text-inherit no-underline hover:no-underline">
+    <a href="/accounts/{{ acc.id }}" class="block text-inherit">
       <div class="card mb-2.5 flex items-center justify-between bg-surface px-4 py-3.5 transition-colors hover:border-accent2">
         <div>
           <div class="font-semibold">{{ acc.name }}</div>
