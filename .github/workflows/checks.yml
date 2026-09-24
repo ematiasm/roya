@@ -66,7 +66,12 @@ jobs:
       # `uv` builds `e2e/.venv` from `e2e/pyproject.toml`, the same way the
       # one-time setup in `e2e/README.md` does, so no Node toolchain is needed
       # and the repository's no-Node posture is untouched.
-      - uses: astral-sh/setup-uv@v10
+      # Pinned to an exact version, not a floating major: this action
+      # publishes only exact tags (`v10.2.0`), so `@v10` does not resolve
+      # and the job dies at "Set up job" before running anything. Verified
+      # against the tag list rather than the release list - the release
+      # `v10.2.0` existing does not mean a `v10` tag exists.
+      - uses: astral-sh/setup-uv@v10.2.0
       - name: Install Chromium
         working-directory: e2e
         # `--only-shell` fetches the headless shell instead of the full browser
