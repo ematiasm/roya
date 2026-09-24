@@ -96,6 +96,8 @@
       <div class="text-[13px] text-muted">No purchases from this supplier yet.</div>
     {% else %}
       {% for d in purchases %}
+      {# A row, not a control: the anchor is the row, carrying the flex layout
+         and its colour — the row's appearance is the layout rather than a control's. #}
       <a href="/purchases/{{ d.purchase.id }}" class="mb-2 flex items-center justify-between gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-text hover:border-accent2">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">

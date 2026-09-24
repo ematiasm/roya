@@ -4,6 +4,8 @@
     <div class="empty">No accounts yet — create one on the right.</div>
   {% else %}
     {% for acc in accounts %}
+    {# A row, not a control: the anchor is the row, carrying the flex layout
+       and its colour — the row's appearance is the layout rather than a control's. #}
     <a href="/accounts/{{ acc.id }}" class="block text-inherit">
       <div class="card mb-2.5 flex items-center justify-between bg-surface px-4 py-3.5 transition-colors hover:border-accent2">
         <div>
