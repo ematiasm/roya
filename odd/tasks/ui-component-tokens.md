@@ -231,12 +231,28 @@ would record whatever the refactor produced and prove nothing.
       A latent weakness fell out: `contains("bg-accent")` also matches
       `bg-accent2`, so the smoke guard could never have caught the blue
       regression it named.
-- [ ] T2c — **Remove the `@layer base` `a` and `button` rules.** Now that every
-      real control carries a component, this is a pure deletion and the net is
-      the whole proof. The six rows and logos deliberately left unstyled still
-      carry `no-underline hover:no-underline` as load-bearing against the base
-      `a` rule; **that override can only be dropped after this deletion**, and
-      the net will say whether dropping it is safe.
+- [ ] T2c — **Close the net's page gap.** Not a refactor task: a verification task
+      that must land before the base rules can go. The net covers nine pages plus
+      the two drawers and the two record pages, and it does **not** cover `/login`,
+      `/password`, `/forbidden`, or any state where a notice box renders. The five
+      notice dismiss buttons live only there, so the net is blind to them — and it
+      proved it: removing the `@layer base` `a` and `button` rules, the net
+      **passed**, while those five controls depend on the base for their `bg-accent`,
+      dark label, weight and cursor. Verified rather than argued: the baseline
+      contains **zero** elements with the dismiss button's signature (4px radius,
+      1px border, 8/8 padding), so nothing there is covered.
+      Add the missing pages and the notice state, capture their fingerprints from
+      the current tree (the rendering is correct today), and only then is the base
+      removal provable.
+- [ ] T6 — **Remove the `@layer base` `a`, `button`, `label` and
+      `input`/`select`/`textarea` rules — LAST, after T3, T4, T5 and T2c.** It was
+      written as "T2c, part two of the buttons" and that was wrong: the base
+      cannot go while any control still depends on it, and the notice dismiss
+      buttons are T4's job. When everything carries a component this is a pure
+      deletion and the net is the whole proof. The six rows and logos carry
+      `no-underline hover:no-underline` as load-bearing against the base `a` rule;
+      **that override can only be dropped after this deletion**, and the net will
+      say whether dropping it is safe.
 - [ ] T3 — **The chip component.** `.chip` plus its four variants, 37
       occurrences.
 - [ ] T4 — **The boxes.** `.notice` (all three copies), `.notice-success`,
@@ -285,6 +301,33 @@ of the original.** And when a baseline must be regenerated, make the failing run
 prove the correction first — a baseline regenerated to make a red test green is
 not evidence, but one regenerated after confirming the failure is exactly the
 intended correction is.
+
+## Lesson: a net is only as wide as the pages it visits
+
+T2c was written as "remove the base `a` and `button` rules, now that every
+control has a component". Removing them to test that claim, the net **passed** —
+and the pass was worthless. The five notice dismiss buttons depend on the base
+for their background, label colour, weight and cursor, and they live on
+`/login`, `/password`, `/forbidden` and the two notice templates, **none of which
+the net visits**. Verified rather than argued: the baseline holds **zero**
+elements with the dismiss button's signature.
+
+Two separate failures, and both had to be named:
+
+1. **A coverage gap.** A net that does not visit a page cannot protect it, and a
+green run over an uncovered page is indistinguishable from a correct one. This
+is the same shape as the vacuous test, one level up: not "the assertion cannot
+fail", but "the assertion was never made".
+2. **A task ordered by dependency it did not have.** The base removal was placed
+as the second half of the buttons task because it is about buttons. It actually
+depends on **every** component existing, including the chip, the boxes and the
+form controls, so it belongs last.
+
+The reusable rule: **when a refactor ends by deleting the thing everything
+leaned on, the deletion is the last task and its precondition is a count, not an
+intuition** — every call site has the new thing. And before trusting the net to
+prove that count, check that the net visits every page where those call sites
+live.
 
 ## Verification evidence
 
@@ -346,3 +389,14 @@ intended correction is.
   restating `bg-accent` to satisfy the old grep would have preserved the exact
   anti-pattern the repository's own commit messages call *"an override fighting
   the base style"*.
+- **T2c is blocked, and the net proved its own blindness**: with the `@layer base`
+  `a` and `button` rules removed and the stylesheet rebuilt, the net **passed**.
+  It passed because the five notice dismiss buttons — which depend on the base for
+  `bg-accent`, the dark label, the weight and the cursor — live on `/login`,
+  `/password`, `/forbidden` and the two notice templates, and the net visits none
+  of them. Confirmed by counting: **zero** elements in the baseline carry the
+  dismiss button's signature (4px radius, 1px border, 8/8 padding). The temporary
+  removal was reverted and both CSS files verified byte-identical.
+  This is the finding of the task, and it is the reason the base removal moved to
+  last: it is a pure deletion only once **every** component exists, and the chip,
+  the boxes and the form controls do not yet.
