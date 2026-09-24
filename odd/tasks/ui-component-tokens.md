@@ -211,14 +211,32 @@ would record whatever the refactor produced and prove nothing.
       `cursor-pointer`, `font-bold`, `hover:opacity-90` and the `disabled:` pair
       that the bare `button` rule gave every button and the repeated pattern never
       restated — so removing the base rule later moves nothing.
-- [ ] T2b — **Buttons and links, part two.** The three remaining secondary
-      variants (medium, default-size, icon), `.btn-primary`, `.btn-danger`,
-      `.btn-plain`, `.menu-item`, `.link`, the 29 anchors, and **then** the
-      removal of the `@layer base` `a` and `button` rules. Two pieces of debt this
-      task created and must settle: the seven `font-normal` overrides at
-      anchor-as-button sites (decide whether a navigational anchor-as-button is
-      bold, or whether the component needs a non-bold variant), and the three
-      `bg-card` near-variants plus one input found and deliberately left.
+- [x] T2b — **Buttons and links, part two.** Closed in `bdd87bd`. `.link`,
+      `.btn-primary`, `.btn-danger`, `.btn-plain` and `.menu-item` added and
+      applied to every control still leaning on the base: 135 of 141 now carry a
+      component. The twelve without are five notice dismiss buttons (T4's job),
+      six rows and logos unstyled by design, and one false positive from a
+      comment.
+      **The net disagreed with the plan in four places, which is the useful
+      part**: three `bg-card` anchor-as-buttons would have gone 400 → 700 weight
+      (they keep `font-normal`) and gained `hover:opacity-90` where the baseline
+      says 1 (they opt out with `hover:opacity-100`); and five medium/default
+      secondaries needed `text-base`, because the base button computes **16px**
+      and the component's `text-xs` is not what they were.
+      **The two Rust guards moved to the component.** `f1e27e7` pinned the page
+      action's colour by grepping markup for `bg-accent`, because Rust cannot
+      compute a style. It can be computed by the net now, so the guards assert
+      `btn-primary` and the colour is left to the net; a call site restating
+      `bg-accent` would have preserved the anti-pattern this refactor removes.
+      A latent weakness fell out: `contains("bg-accent")` also matches
+      `bg-accent2`, so the smoke guard could never have caught the blue
+      regression it named.
+- [ ] T2c — **Remove the `@layer base` `a` and `button` rules.** Now that every
+      real control carries a component, this is a pure deletion and the net is
+      the whole proof. The six rows and logos deliberately left unstyled still
+      carry `no-underline hover:no-underline` as load-bearing against the base
+      `a` rule; **that override can only be dropped after this deletion**, and
+      the net will say whether dropping it is safe.
 - [ ] T3 — **The chip component.** `.chip` plus its four variants, 37
       occurrences.
 - [ ] T4 — **The boxes.** `.notice` (all three copies), `.notice-success`,
@@ -244,6 +262,29 @@ last.
 - 2026-09-24: T1 closed in `97c04de`. The net is in place and proven by mutation
   before a single class was touched, which is the only order that works: a
   baseline captured after the refactor records the refactor and proves nothing.
+
+## Lesson: a net dimension added after changes landed records those changes as correct
+
+T1 built the resting-state net and captured its baseline before anything moved,
+which is the only order that works. The hover dimension was added later — in
+`4d33edb`, after T2a had already landed — and the baseline therefore recorded
+T2a's own hover change as if it were the original: seven anchors gained
+`hover:opacity-90` from `.btn-secondary` and the net called that correct.
+
+It was caught by a worker reasoning about the ordering, then **verified against
+the pre-refactor CSS rather than by argument**: the only opacity rule that can
+touch a control at `f1610a6` is
+`@media (hover:hover){button:hover{opacity:.9}}`, which does not match an
+anchor, so the correct value is 1. The seven sites were fixed, the net was run
+and **failed with exactly the four contaminated paths moving 0.9 → 1 and
+nothing else**, and only then was the baseline regenerated.
+
+The generalisation: **extend a net in the same commit as the baseline it
+needs, or accept that the baseline is a record of the tree at capture time, not
+of the original.** And when a baseline must be regenerated, make the failing run
+prove the correction first — a baseline regenerated to make a red test green is
+not evidence, but one regenerated after confirming the failure is exactly the
+intended correction is.
 
 ## Verification evidence
 
@@ -286,3 +327,22 @@ last.
   0 failed**; `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed**; the net
   passes. The old pattern greps empty and `btn-secondary` appears exactly 61
   times.
+- **T2b, the net disagreed with the plan four times, and each is a rendering
+  change the plan would have shipped**: three `bg-card` anchor-as-buttons
+  400 → 700 weight; the same three gaining `hover:opacity-90` where the baseline
+  says 1; and five medium/default secondaries needing `text-base` because the
+  base button computes 16px. None of the four is visible by reading a diff.
+- **T2b, the baseline regeneration was controlled**: the net failed with
+  **exactly four entries**, all `opacity: 0.9 → 1` on anchor hover paths, no
+  resting-state entry and no other property. Verified by diffing the baseline
+  before and after, not by trusting the report.
+- **T2b, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed**; the net
+  passes; `bg-accent` greps empty in `page_header.html`; both guards assert
+  `btn-primary`.
+- **T2b, the guards' reason for existing changed**: they were built because Rust
+  cannot compute a style. The net can, so they now pin the component and the
+  colour is asserted where it is actually visible. Keeping a call site
+  restating `bg-accent` to satisfy the old grep would have preserved the exact
+  anti-pattern the repository's own commit messages call *"an override fighting
+  the base style"*.
