@@ -184,11 +184,22 @@ would record whatever the refactor produced and prove nothing.
 
 ## Tasks
 
-- [ ] T1 — **The visual-neutrality net.** A browser test that, for a fixed set of
-      pages and a fixed set of selectors, records a computed-style fingerprint
-      (colour, background, border, padding, font, radius, display, gap) and
-      compares it to a committed golden file. Captured from the pre-refactor
-      tree. This lands first and is what every later task is verified against.
+- [x] T1 — **The visual-neutrality net.** Closed in `97c04de`. A browser test
+      fingerprints every element's computed style on thirteen screens and
+      compares it to a committed baseline: 2,341 elements, 36 KB compressed,
+      deterministic across consecutive runs. Elements are keyed by **DOM path,
+      not by class** — the classes are what the refactor rewrites, so keying by
+      them would make every entry look changed and the comparison useless — and
+      the baseline was captured from the **pre-refactor tree**, with regeneration
+      behind an environment variable CI never sets.
+      **Proven by mutation, because a net that catches nothing is the vacuous
+      test problem in a new costume**: changing `--color-accent` from `#6ee7b7`
+      to `#6ee7b8`, one digit and invisible to the eye, makes it fail with a
+      readable diff, and it catches the derived `oklab` values of the `/10`
+      opacity variants too. Reverted and verified byte-identical afterwards.
+      The two drawers are reached by clicking rather than by URL: they are
+      fragments, and navigating straight to `/products/detail/{id}` snapshots
+      three elements and proves nothing.
 - [ ] T2 — **The button and link components.** `.btn-primary`,
       `.btn-secondary`, `.btn-danger`, `.btn-plain`, `.menu-item`, `.link`; the
       `a` and `button` base rules removed. The 61 secondary occurrences replaced.
@@ -215,3 +226,29 @@ last.
   be as large as the button (37 occurrences), and the notice duplication across
   three files turned out to be a bigger win than the class-list length alone
   suggested.
+- 2026-09-24: T1 closed in `97c04de`. The net is in place and proven by mutation
+  before a single class was touched, which is the only order that works: a
+  baseline captured after the refactor records the refactor and proves nothing.
+
+## Verification evidence
+
+- **T1, the net catches a real change**: `--color-accent` `#6ee7b7` → `#6ee7b8`
+  (one digit, invisible to the eye) failed with
+  `color: 'rgb(110, 231, 183)' -> 'rgb(110, 231, 184)'` and the same for
+  `border-top-color` and `background-color`, plus
+  `background-color: 'oklab(0.845178 -0.125467 0.0336939 / 0.1)' ->
+  'oklab(0.845427 -0.125022 0.0324349 / 0.1)'` — so a token change propagates
+  into the alpha-composited colours where reading would never find it. Reverted
+  and both CSS files verified byte-identical.
+- **T1, determinism checked rather than assumed**: two consecutive runs both
+  pass in the same 9.03s. A flaky net would be worse than none, because it
+  would teach people to re-run until green.
+- **T1, size**: 1,391,684 bytes uncompressed, **36 KB gzipped**, which is what
+  lands in the repository — smaller than the committed `Cargo.lock`.
+- **T1, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed** (100 plus
+  the net).
+- **T1, the message outlives the refactor**: it says that an unintended change
+  means the diff is the defect, an intended one means regenerating deliberately
+  and saying so in the commit, and that a baseline regenerated to make a red
+  test green is not evidence.
