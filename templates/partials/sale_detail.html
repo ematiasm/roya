@@ -57,8 +57,8 @@
 
 <div id="sale-record-inner" data-sale-record>
   <div class="mb-3 flex flex-wrap items-center gap-2">
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.sale.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if record.sale.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.sale.status }}</span>
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.payment_status }}</span>
+    <span class="chip {% if record.sale.status.to_string() == "Confirmed" %}chip-income{% else if record.sale.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{{ record.sale.status }}</span>
+    <span class="chip {% if record.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{{ record.payment_status }}</span>
     <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.sale.payment_type }}</span>
     <span class="text-base font-bold">
       {% if let Some(n) = record.sale.sale_number %}{{ n }}{% else %}Draft sale{% endif %}

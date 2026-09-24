@@ -113,6 +113,31 @@
     @apply text-accent2 no-underline hover:underline;
   }
 
+  /* The chip: the repeated badge on statuses, kinds and payment states. No
+     `display` — these are <span>s and their display is inline today; adding
+     one would re-layout every chip and the visual-neutrality net would say so.
+     The variant names come from the palette tokens so the semantic link is
+     visible at the call site. */
+  .chip {
+    @apply rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase;
+  }
+
+  .chip-income {
+    @apply border-income/30 bg-income/15 text-income;
+  }
+
+  .chip-expense {
+    @apply border-expense/30 bg-expense/12 text-expense;
+  }
+
+  .chip-warning {
+    @apply border-warning/30 bg-warning/15 text-warning;
+  }
+
+  .chip-muted {
+    @apply border-border bg-card text-muted;
+  }
+
   /* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The
      busy indicator must be genuinely absent when idle (display:none), not merely
      transparent: an opacity-only indicator has a non-empty box, so layout, assistive

@@ -12,7 +12,7 @@
 <div id="document-detail-inner" class="flex flex-col gap-4">
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1 flex flex-wrap items-center gap-2">
-      <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ kind_label }}</span>
+      <span class="chip border-border">{{ kind_label }}</span>
       <span class="text-sm font-semibold">{{ title }}</span>
     </div>
     <div class="mb-3 text-[13px] text-muted">{{ status_line }}</div>
@@ -94,7 +94,7 @@
   {% if let Some(p) = parent %}
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1 flex flex-wrap items-center gap-2">
-      <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ p.label }}</span>
+      <span class="chip border-border">{{ p.label }}</span>
       <span class="text-sm font-semibold">{{ p.title }}</span>
     </div>
     <div class="mb-3 text-[13px] text-muted">{{ p.status_line }}</div>

@@ -2,7 +2,7 @@
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="flex flex-wrap items-center gap-2">
       <span class="text-lg font-semibold">{{ supplier.name }}</span>
-      <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if supplier.is_active %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{% if supplier.is_active %}active{% else %}inactive{% endif %}</span>
+      <span class="chip {% if supplier.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if supplier.is_active %}active{% else %}inactive{% endif %}</span>
     </div>
     {% if let Some(phone) = supplier.phone %}
     <div class="text-[13px] text-muted">phone {{ phone }}</div>
@@ -99,7 +99,7 @@
       <a href="/purchases/{{ d.purchase.id }}" class="mb-2 flex items-center justify-between gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-text hover:border-accent2">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ d.purchase.status }}</span>
+            <span class="chip chip-muted">{{ d.purchase.status }}</span>
             <span class="font-semibold">{% if let Some(n) = d.purchase.purchase_number %}{{ n }}{% else %}purchase #{{ d.purchase.id }}{% endif %}</span>
           </div>
           <span class="text-[13px] text-muted">{{ d.purchase.purchase_date }} • total {{ d.total }} • paid {{ d.paid }}</span>

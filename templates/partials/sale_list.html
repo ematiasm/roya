@@ -7,8 +7,8 @@
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-{{ d.sale.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if d.sale.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if d.sale.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ d.sale.status }}</span>
-          <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if d.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ d.payment_status }}</span>
+          <span class="chip {% if d.sale.status.to_string() == "Confirmed" %}chip-income{% else if d.sale.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{{ d.sale.status }}</span>
+          <span class="chip {% if d.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{{ d.payment_status }}</span>
           <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ d.sale.payment_type }}</span>
           <span class="font-semibold">{% if d.sale.customer_name.is_empty() %}Walk-in{% else %}{{ d.sale.customer_name }}{% endif %}</span>
           {% if let Some(n) = d.sale.sale_number %}

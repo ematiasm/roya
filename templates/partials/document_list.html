@@ -12,7 +12,7 @@
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" data-document-kind="{{ v.kind.token() }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ v.kind_label }}</span>
+          <span class="chip border-border">{{ v.kind_label }}</span>
           {# The identifier opens the drawer: the detail fragment swaps into the
              page's `#document-drawer-body` (the route is registered for GET,
              so the wiring guard can prove the target). #}

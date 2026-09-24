@@ -3,7 +3,7 @@
   <section class="rounded-2xl border border-border bg-card p-5">
     {% if over_limit %}
     <div class="mb-3">
-      <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">over limit</span>
+      <span class="chip chip-expense">over limit</span>
     </div>
     {% endif %}
     {% include "partials/customer_statement.html" %}
@@ -74,7 +74,7 @@
       <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">{{ d.payment_status }}</span>
+            <span class="chip chip-expense">{{ d.payment_status }}</span>
             <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}sale #{{ d.sale.id }}{% endif %}</span>
           </div>
           <span class="text-[13px] text-muted">{{ d.sale.sale_date }}{% if let Some(due) = d.sale.due_date %} • due {{ due }}{% endif %} • total {{ d.total }} • paid {{ d.paid }}</span>
@@ -92,7 +92,7 @@
       <div class="mb-1.5 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3 py-2">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if e.debit.is_sign_positive() %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{{ e.description }}</span>
+            <span class="chip {% if e.debit.is_sign_positive() %}chip-expense{% else %}chip-income{% endif %}">{{ e.description }}</span>
             {% if let Some(n) = e.document_number %}
             <span class="text-xs text-muted">{{ n }}</span>
             {% endif %}

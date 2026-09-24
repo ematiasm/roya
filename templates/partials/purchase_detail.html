@@ -185,7 +185,7 @@
           <tr class="border-b border-border/60">
             <td colspan="4" class="py-2.5 pr-3">
               <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
-                <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">stale cost</span>
+                <span class="chip chip-muted">stale cost</span>
                 <span class="text-[13px] text-muted">line cost ${{ stale.line_cost_display() }} • stored ${{ stale.stored_cost_display() }}</span>
                 <button class="btn-secondary"
                         hx-post="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}/apply-cost"
@@ -209,8 +209,8 @@
    four-card grid used, and hx-confirm stays on the destructive forms. #}
 <div id="purchase-record-inner" data-purchase-record>
   <div class="mb-3 flex flex-wrap items-center gap-2">
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.purchase.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if record.purchase.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.purchase.status }}</span>
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.payment_status }}</span>
+    <span class="chip {% if record.purchase.status.to_string() == "Confirmed" %}chip-income{% else if record.purchase.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{{ record.purchase.status }}</span>
+    <span class="chip {% if record.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{{ record.payment_status }}</span>
     {% if record.purchase.status.to_string() != "Draft" %}<span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.purchase.payment_type }}</span>{% endif %}
     <span class="text-base font-bold">
       {% if let Some(n) = record.purchase.purchase_number %}{{ n }}{% else %}Draft purchase{% endif %}

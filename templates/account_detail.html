@@ -59,7 +59,7 @@
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="tx-{{ tx.tx.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if tx.tx.is_income() %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ tx.tx.kind }}</span>
+          <span class="chip {% if tx.tx.is_income() %}chip-income{% else %}chip-expense{% endif %}">{{ tx.tx.kind }}</span>
           <span class="font-semibold">{{ tx.tx.description }}</span>
         </div>
         <span class="text-[13px] text-muted">{{ tx.tx.date }} • #{{ tx.tx.id }} • Registrado por {{ tx.created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = tx.updated_by_name %} • Actualizado por {{ editor }}{% endif %}</span>

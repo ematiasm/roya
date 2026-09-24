@@ -37,13 +37,26 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import Page, expect
 
 from conftest import TEST_ADMIN_USERNAME
-from helpers import ApiClient, HarnessData, seed_harness_data
+from helpers import (
+    ApiClient,
+    HarnessData,
+    account_method_id,
+    add_purchase_line,
+    confirm_purchase,
+    create_product,
+    create_purchase_draft,
+    create_supplier,
+    fund_account,
+    seed_harness_data,
+)
 from test_identity import (
     CHANGED_PASSWORD,
     INITIAL_PASSWORD,
@@ -144,6 +157,15 @@ _STATE_NAMES = [
     "purchase-record-notice",
     "purchase-record-merge",
     "products-create-under-filter",
+    # The purchase list's three payment states (added with T3): chip-warning
+    # exists only on a confirmed credit purchase owed inside its due date and
+    # the Overdue chip only past it, and the harness seed's purchase is a
+    # Draft — a pages-only net renders neither colour. Each state rides its
+    # own supplier so the list filter isolates the one row whose chip colour
+    # it protects.
+    "purchase-list-paid",
+    "purchase-list-due",
+    "purchase-list-overdue",
 ]
 
 
@@ -242,6 +264,59 @@ def test_visual_baseline(
         page.locator(row).first.click()
         page.wait_for_timeout(400)
         current[name] = _fingerprint(page)
+
+    # -- The purchase list's payment states ----------------------------------
+    # The Rust guard `purchase_list_row_reads_identifier_supplier_money_with_
+    # one_status_chip` seeds exactly the Paid/Due/Overdue triad; the same
+    # recipe through the API helpers seeds it here. The harness account
+    # already owns Cash (a second account cannot claim the method), so it is
+    # funded and the confirm pays through it. Paid is a Cash confirm
+    # (it posts the payment itself, so due lands at 0); Due is a confirmed
+    # Credit with a due date 30 days out — a fixed date would honestly render
+    # Overdue; Overdue is a confirmed Credit already past its due date. One
+    # supplier per state so `?supplier=` filters the list down to the one row
+    # whose chip colour the state exists to protect.
+    state_cash = account_method_id(api, data.account_id, "Cash")
+    fund_account(api, data.account_id, "1000")
+    state_product = create_product(
+        api,
+        sku="NET-STATE-SKU",
+        name="Net State Widget",
+        sale_price="20.00",
+        cost_price="6.00",
+        stock="30",
+        min_stock="1",
+        max_stock="100",
+    )
+    state_specs = (
+        ("purchase-list-paid", "Net Paid Supplier", None, "Cash"),
+        (
+            "purchase-list-due",
+            "Net Due Supplier",
+            (date.today() + timedelta(days=30)).isoformat(),
+            "Credit",
+        ),
+        ("purchase-list-overdue", "Net Overdue Supplier", "2024-05-02", "Credit"),
+    )
+    for state_name, supplier_name, due_date, payment_type in state_specs:
+        state_supplier = create_supplier(api, supplier_name)
+        state_purchase = create_purchase_draft(
+            api,
+            state_supplier,
+            payment_type=payment_type,
+            due_date=due_date,
+        )
+        add_purchase_line(api, state_purchase, int(state_product["id"]), qty="1")
+        confirm_purchase(
+            api,
+            state_purchase,
+            method_id=state_cash if payment_type == "Cash" else None,
+        )
+        page.goto(
+            f"{api.base_url}/purchases?supplier={urllib.parse.quote(supplier_name)}"
+        )
+        page.wait_for_load_state("networkidle")
+        capture(page, state_name)
 
     # -- The notice states -----------------------------------------------------
     # The purchase record is the cheapest route into two of the three notice

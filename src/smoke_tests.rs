@@ -5697,6 +5697,10 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
 /// neutral text, the badge cloud (`payable …`, `settled`, `Cash`,
 /// `Confirmed`) is gone, and the row keeps the S3 peek contract (`hx-get`
 /// into the drawer, never a full navigation).
+///
+/// As T2b, the guard pins the component, not the colour: Rust cannot compute
+/// a style, so the colours themselves are asserted by the visual-neutrality
+/// net's purchase-list-paid/due/overdue states.
 #[tokio::test]
 async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip() {
     let (app, pool) = test_app().await;
@@ -5822,12 +5826,12 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         .expect("purchase total")
         .to_string();
     assert!(
-        paid_row.contains(">Paid</span>") && paid_row.contains("text-income"),
+        paid_row.contains(">Paid</span>") && paid_row.contains("chip-income"),
         "a fully paid row carries the bare-word Paid chip in income colour: {paid_row}"
     );
     assert!(
         due_row_html.contains(&format!(">Due {pending_due}</span>"))
-            && due_row_html.contains("text-warning"),
+            && due_row_html.contains("chip-warning"),
         "owed and not yet past due carries the Due chip with the amount owed in warning colour: {due_row_html}"
     );
     assert!(
@@ -5837,7 +5841,7 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
     );
     assert!(
         overdue_row.contains(&format!(">Overdue {overdue_due}</span>"))
-            && overdue_row.contains("text-expense"),
+            && overdue_row.contains("chip-expense"),
         "owed past the due date carries the Overdue chip with the amount owed in expense colour: {overdue_row}"
     );
     assert!(

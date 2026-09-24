@@ -19,13 +19,13 @@
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="flex flex-wrap items-center gap-2">
       <span class="text-lg font-semibold">{{ product.name }}</span>
-      <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if product.kind.to_string() == "Service" %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{{ product.kind }}</span>
-      <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if product.is_active %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{% if product.is_active %}active{% else %}inactive{% endif %}</span>
+      <span class="chip {% if product.kind.to_string() == "Service" %}chip-expense{% else %}chip-income{% endif %}">{{ product.kind }}</span>
+      <span class="chip {% if product.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if product.is_active %}active{% else %}inactive{% endif %}</span>
       {% if let Some(sug) = suggested %}
-      <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">low • suggest {{ sug }}</span>
+      <span class="chip chip-expense">low • suggest {{ sug }}</span>
       {% endif %}
       {% if stock.is_sign_negative() %}
-      <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">negative</span>
+      <span class="chip chip-expense">negative</span>
       {% endif %}
     </div>
     <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • ${{ product.sale_price_display() }}</div>
@@ -189,7 +189,7 @@
        variant), no new Tailwind classes. #}
     {% if let Some(stale) = stale_cost %}
     <div class="mb-3 flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
-      <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">stale cost</span>
+      <span class="chip chip-muted">stale cost</span>
       <span class="text-[13px] text-muted">reference ${{ stale.reference_display() }} • stored ${{ stale.stored_display() }}</span>
     </div>
     {% endif %}
@@ -202,14 +202,14 @@
           <div class="flex flex-wrap items-center gap-2">
             <span class="font-semibold">{{ cost.supplier_name }}</span>
             {% if cost.cost.previous_cost.is_some() %}
-            <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if cost.cost.price_alert().to_string() == "Raised" %}border-expense/30 bg-expense/12 text-expense{% else if cost.cost.price_alert().to_string() == "Lowered" %}border-income/30 bg-income/15 text-income{% else %}border-border bg-card text-muted{% endif %}">{{ cost.cost.price_alert() }}</span>
+            <span class="chip {% if cost.cost.price_alert().to_string() == "Raised" %}chip-expense{% else if cost.cost.price_alert().to_string() == "Lowered" %}chip-income{% else %}chip-muted{% endif %}">{{ cost.cost.price_alert() }}</span>
             {% endif %}
           </div>
           <span class="text-[13px] text-muted">${{ cost.cost.current_cost }}{% if let Some(prev) = cost.cost.previous_cost %} • previous {{ prev }}{% endif %} • since {{ cost.cost.current_cost_updated_at }}</span>
         </div>
         <div>
           {% if cost.cost.is_preferred %}
-          <span class="rounded-full border border-income/30 bg-income/15 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-income">preferred</span>
+          <span class="chip chip-income">preferred</span>
           {% else %}
           <form hx-post="/web/product-costs/preferred" hx-include="#product-filters" hx-target="#product-drawer-body" hx-swap="innerHTML">
             <input type="hidden" name="product_id" value="{{ product.id }}" />
