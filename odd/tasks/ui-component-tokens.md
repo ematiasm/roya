@@ -200,10 +200,25 @@ would record whatever the refactor produced and prove nothing.
       The two drawers are reached by clicking rather than by URL: they are
       fragments, and navigating straight to `/products/detail/{id}` snapshots
       three elements and proves nothing.
-- [ ] T2 — **The button and link components.** `.btn-primary`,
-      `.btn-secondary`, `.btn-danger`, `.btn-plain`, `.menu-item`, `.link`; the
-      `a` and `button` base rules removed. The 61 secondary occurrences replaced.
-      Largest single win, and the one that kills the anchor-blue class.
+- [x] T2a — **The button and link components, part one: `.btn-secondary`.**
+      Closed in `755b634`. The 61-occurrence pattern across 29 templates is now
+      one class, and the string appears zero times. **Split from T2 by the
+      inventory**, which found the secondary button has **four sizes**, not one:
+      the small one is 63 of 70 occurrences and is uniform, while the other seven
+      are three variants in three files. Collapsing them would have changed the
+      rendering, and the net would have said so.
+      The component is **self-sufficient from the start** — it carries
+      `cursor-pointer`, `font-bold`, `hover:opacity-90` and the `disabled:` pair
+      that the bare `button` rule gave every button and the repeated pattern never
+      restated — so removing the base rule later moves nothing.
+- [ ] T2b — **Buttons and links, part two.** The three remaining secondary
+      variants (medium, default-size, icon), `.btn-primary`, `.btn-danger`,
+      `.btn-plain`, `.menu-item`, `.link`, the 29 anchors, and **then** the
+      removal of the `@layer base` `a` and `button` rules. Two pieces of debt this
+      task created and must settle: the seven `font-normal` overrides at
+      anchor-as-button sites (decide whether a navigational anchor-as-button is
+      bold, or whether the component needs a non-bold variant), and the three
+      `bg-card` near-variants plus one input found and deliberately left.
 - [ ] T3 — **The chip component.** `.chip` plus its four variants, 37
       occurrences.
 - [ ] T4 — **The boxes.** `.notice` (all three copies), `.notice-success`,
@@ -252,3 +267,22 @@ last.
   means the diff is the defect, an intended one means regenerating deliberately
   and saying so in the commit, and that a baseline regenerated to make a red
   test green is not evidence.
+- **T2a, the net earned its keep on its first real task.** `font-bold` on the
+  component changed **seven call sites that are anchors wearing button clothes**
+  — the drawer "All products / All customers / Todos los documentos" links, the
+  filter bar's "Clear", the notice's "Clear filter", the document "Abrir" link.
+  The bare `button` rule made buttons bold, but the bare `a` rule sets no
+  font-weight, so those anchors were 400 and the component made them 700. The net
+  reported `font-weight: '400' -> '700'` with the exact DOM paths. Fixed with
+  `font-normal` at those seven sites, **not** by regenerating the baseline.
+  This is the case the whole net was built for: a one-property change on seven
+  elements out of 2,341, invisible to any reading of the diff.
+- **T2a, a layering mistake caught before it could matter**: the first draft put
+  the component rule *outside* `@layer components`, and the compiled bytes showed
+  it landing unlayered after the utilities — which would have inverted the
+  precedence the refactor depends on. Found by inspecting the compiled output
+  rather than by a failing test.
+- **T2a, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed**; the net
+  passes. The old pattern greps empty and `btn-secondary` appears exactly 61
+  times.
