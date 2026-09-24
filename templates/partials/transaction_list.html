@@ -1,6 +1,6 @@
 <div id="tx-list-inner">
   {% if transactions.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No transactions for this filter.</div>
+    <div class="empty">No transactions for this filter.</div>
   {% else %}
     {% for tx in transactions %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="tx-{{ tx.id }}">

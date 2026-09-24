@@ -9,7 +9,7 @@
     </div>
   </div>
   {% if !has_suggestions %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">Stock OK — nothing to reorder.</div>
+    <div class="empty">Stock OK — nothing to reorder.</div>
   {% else %}
     {% for s in suggestions.suggestions %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="suggestion-{{ s.product.id }}">

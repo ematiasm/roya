@@ -17,7 +17,7 @@
 <div class="mt-6 rounded-2xl border border-border bg-card p-5" id="payment-methods">
   <h2 class="mb-3 text-lg font-semibold">Payment methods</h2>
   {% if !has_methods %}
-  <div class="mb-3 rounded-xl border border-danger/40 bg-danger/10 p-3 text-[13px] text-danger" data-payment-methods-warning="true">
+  <div class="notice notice-error mb-3 p-3 text-[13px] block" data-payment-methods-warning="true">
     No payment methods configured — this account cannot record payments. Select at least one method and save.
   </div>
   {% endif %}
@@ -53,7 +53,7 @@
     <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">{{ transactions.len() }} transactions</span>
   </div>
   {% if transactions.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No transactions yet. Add one from the dashboard.</div>
+    <div class="empty">No transactions yet. Add one from the dashboard.</div>
   {% else %}
     {% for tx in transactions %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="tx-{{ tx.tx.id }}">

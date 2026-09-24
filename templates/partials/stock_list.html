@@ -1,6 +1,6 @@
 <div id="stock-list-inner">
   {% if items.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">Stock OK — nothing to reorder.</div>
+    <div class="empty">Stock OK — nothing to reorder.</div>
   {% else %}
     {% for row in items %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="stock-{{ row.ps.product.id }}">

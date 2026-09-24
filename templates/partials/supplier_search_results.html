@@ -32,9 +32,9 @@
 <div aria-live="off">
 {% if matches.is_empty() %}
   {% if query.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">Type a supplier name.</div>
+    <div class="empty px-3.5 py-2.5 text-start">Type a supplier name.</div>
   {% else %}
-    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">No suppliers match "{{ query }}".</div>
+    <div class="empty px-3.5 py-2.5 text-start">No suppliers match "{{ query }}".</div>
   {% endif %}
 {% else %}
   <div class="flex flex-col gap-1.5">

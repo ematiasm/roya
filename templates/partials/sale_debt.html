@@ -4,7 +4,7 @@
    panel. #}
 <div id="sale-debt-summary">
   {% if debt.count == 0 %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No outstanding debt.</div>
+    <div class="empty">No outstanding debt.</div>
   {% else %}
     <div class="mb-2 flex flex-wrap items-baseline gap-2">
       <span class="text-2xl font-bold tabular-nums text-expense">{{ debt.total }}</span>

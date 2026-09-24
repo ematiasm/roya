@@ -10,7 +10,7 @@
    segment from an input value). #}
 <div id="user-list-inner">
   {% if users.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No hay usuarios — usá «Nuevo usuario» arriba.</div>
+    <div class="empty">No hay usuarios — usá «Nuevo usuario» arriba.</div>
   {% else %}
     <div class="flex flex-col gap-1.5">
       {% for r in users %}

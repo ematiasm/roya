@@ -1,7 +1,7 @@
 <div id="purchase-list-inner">
   <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ purchases.len() }} purchases</div>
   {% if purchases.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">Nothing here yet.</div>
+    <div class="empty">Nothing here yet.</div>
   {% else %}
     {% for v in purchases %}
     {# One row, three zones in reading order: identifier → supplier → money.

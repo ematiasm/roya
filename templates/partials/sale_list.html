@@ -1,7 +1,7 @@
 <div id="sale-list-inner">
   <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ sales.len() }} sales</div>
   {% if sales.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">Nothing here yet.</div>
+    <div class="empty">Nothing here yet.</div>
   {% else %}
     {% for d in sales %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-{{ d.sale.id }}">

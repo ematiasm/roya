@@ -3,7 +3,7 @@
     <div class="mb-3 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger">{{ w }}</div>
   {% endif %}
   {% if customers.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No customers yet — use New customer above.</div>
+    <div class="empty">No customers yet — use New customer above.</div>
   {% else %}
     <div class="flex flex-col gap-1.5">
       {% for r in customers %}

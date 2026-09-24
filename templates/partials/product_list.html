@@ -1,7 +1,7 @@
 <div id="product-list-inner">
   <div class="mb-2.5 text-[13px] text-muted">{{ products.len() }} products • stock derived from movements</div>
   {% if products.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No products yet — use the New product button.</div>
+    <div class="empty">No products yet — use the New product button.</div>
   {% else %}
     {% for ps in products %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="product-{{ ps.product.id }}">

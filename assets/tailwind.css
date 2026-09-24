@@ -11,8 +11,9 @@
 
 /* The picker island renders its classes from JS, so the stylesheet must scan it
    too: with `source(none)` every class that exists only in static/picker.js
-   would be purged from this build. The same trap as base.html's notice builder,
-   whose classes are deliberately duplicated into a template for this reason. */
+   would be purged from this build. The notice builder in base.html faces the
+   same constraint; its boxes now use the `.notice` component classes defined
+   below, which live in this file and are therefore always compiled. */
 @source "../static/picker.js";
 
 /* Dark palette (kept in sync with the original hand-written stylesheet). */
@@ -136,6 +137,51 @@
 
   .chip-muted {
     @apply border-border bg-card text-muted;
+  }
+
+  /* The notice box. All three copies — templates/partials/notice.html,
+     templates/partials/purchase_merge_notice.html and base.html's notice()
+     JS builder — carry this class plus a colour variant, so the copies share
+     one class list instead of being told to keep in step. The flex trio
+     (items-start/justify-between/gap-3) belongs to the shape that carries a
+     dismiss button; the two text-only boxes keep the component and undo the
+     flex with a plain `block` beside it rather than growing a variant per
+     padding. */
+  .notice {
+    @apply mb-4 flex items-start justify-between gap-3 rounded-xl border px-4 py-3 text-sm;
+  }
+
+  .notice-error {
+    @apply border-danger/40 bg-danger/10 text-danger;
+  }
+
+  .notice-success {
+    @apply border-accent/40 bg-accent/10 text-accent;
+  }
+
+  /* The dismiss button inside a notice box. Like .btn-secondary it carries the
+     base-button properties (cursor-pointer, bg-accent, the dark label,
+     font-bold, hover:opacity-90 and the disabled: pair) that the bare
+     `button` rule gives every button and that the old class list never
+     restated: it is a small mint button with a border-current border, which
+     is what it was under the base rule. */
+  .notice-dismiss {
+    @apply cursor-pointer shrink-0 rounded border border-current bg-accent px-2 py-0.5 text-xs font-bold text-[#0a0f0d] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  /* The dashed empty-state box. The p-4 centred shape is the common one; the
+     tighter paddings keep their difference beside the component at the call
+     site (sale_detail.html, purchase_detail.html, supplier_search_results.html
+     and the picker's own copy in static/picker.js). */
+  .empty {
+    @apply rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted;
+  }
+
+  /* The bordered panel: the login/password/forbidden card. Bg and padding that
+     differ (the dashboard fieldset is transparent, the surface rows are
+     bg-surface) are overridden beside the component, not made into variants. */
+  .card {
+    @apply rounded-xl border border-border bg-card p-6;
   }
 
   /* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The

@@ -89,7 +89,7 @@
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
   {% if record.lines.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet{% if record.purchase.status.to_string() == "Draft" %} — use Add line.{% else %}.{% endif %}</div>
+    <div class="empty p-3">No lines yet{% if record.purchase.status.to_string() == "Draft" %} — use Add line.{% else %}.{% endif %}</div>
   {% else %}
     <div class="overflow-x-auto">
       <table class="w-full border-collapse text-sm">
