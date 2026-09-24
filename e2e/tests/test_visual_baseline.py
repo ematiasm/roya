@@ -112,6 +112,62 @@ def _fingerprint(page: Page) -> dict[str, Any]:
     return page.evaluate(_WALK, STYLE_PROPERTIES)
 
 
+# The resting state is not the whole story: the `@layer base` rules this refactor
+# removes also carry `a:hover { text-decoration: underline }` and
+# `button:hover { opacity: .9 }`. Those live in a state no resting snapshot can
+# see, and they are exactly what disappears when the base rules go. So the hover
+# state of every anchor and button is captured too.
+#
+# Real hovers, not a synthetic event: CSS `:hover` needs a pointer position, and
+# no element in this app triggers htmx on a mouse event, so hovering has no side
+# effects (checked, not assumed).
+_HOVERED = """
+(props) => {
+  const chain = document.querySelectorAll(':hover');
+  if (!chain.length) return null;
+  const el = chain[chain.length - 1];
+  const cs = getComputedStyle(el);
+  const fp = {};
+  for (const p of props) fp[p] = cs.getPropertyValue(p);
+  const parts = [];
+  let node = el;
+  while (node && node !== document.body) {
+    const parent = node.parentElement;
+    parts.unshift(node.tagName.toLowerCase() + "[" +
+      (parent ? Array.from(parent.children).indexOf(node) : 0) + "]");
+    node = parent;
+  }
+  return {path: "body/" + parts.join("/"), style: fp};
+}
+"""
+
+
+def _hover_fingerprint(page: Page) -> tuple[dict[str, Any], list[str]]:
+    """Hover every anchor and button and record what the browser computes.
+
+    Returns the fingerprints plus the elements whose hover could not be
+    performed, so a change in that set is visible rather than silent.
+    """
+    out: dict[str, Any] = {}
+    skipped: list[str] = []
+    targets = page.locator("a, button")
+    for i in range(targets.count()):
+        el = targets.nth(i)
+        try:
+            # `force` skips Playwright's stability wait, which costs ~340ms per
+            # element because this app transitions colours and transforms. The
+            # wait buys nothing here: a hover that lands on the wrong element
+            # would make the run non-deterministic, and determinism is checked.
+            el.hover(force=True, timeout=2000)
+        except Exception:
+            skipped.append(str(i))
+            continue
+        got = page.evaluate(_HOVERED, STYLE_PROPERTIES)
+        if got:
+            out[got["path"]] = got["style"]
+    return out, skipped
+
+
 def test_visual_baseline(page: Page, api: ApiClient) -> None:
     """Every screen computes the same styles it did before the refactor."""
     data = seed_harness_data(api)
@@ -122,6 +178,9 @@ def test_visual_baseline(page: Page, api: ApiClient) -> None:
         page.goto(f"{api.base_url}{path}")
         page.wait_for_load_state("networkidle")
         current[name] = _fingerprint(page)
+        hover, skipped = _hover_fingerprint(page)
+        current[name + ":hover"] = hover
+        current[name + ":hover-skipped"] = skipped
 
     # The drawers are the richest component surfaces in the app and they are
     # fragments, not pages, so they are reached by clicking. Snapshot the open
@@ -151,7 +210,11 @@ def test_visual_baseline(page: Page, api: ApiClient) -> None:
     # Report the first differences in a shape a person can act on, rather than
     # dumping two dictionaries at each other.
     problems: list[str] = []
-    for name, _ in _pages(data):
+    names = [n for n, _ in _pages(data)] + [
+        n + suffix for n, _ in _pages(data) for suffix in (":hover", ":hover-skipped")
+    ] + ["products-drawer", "products-drawer:hover", "products-drawer:hover-skipped",
+         "purchases-drawer", "purchases-drawer:hover", "purchases-drawer:hover-skipped"]
+    for name in names:
         want, got = expected.get(name, {}), current.get(name, {})
         if want == got:
             continue
