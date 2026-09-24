@@ -20,11 +20,11 @@
 
     <div class="mt-4 flex items-center gap-2">
       {% if supplier.is_active %}
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Deactivate</button>
+      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Deactivate</button>
       {% else %}
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-post="/web/suppliers/{{ supplier.id }}/activate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Activate</button>
+      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/activate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Activate</button>
       {% endif %}
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-delete="/web/suppliers/{{ supplier.id }}" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Delete</button>
+      <button type="button" class="btn-secondary" hx-delete="/web/suppliers/{{ supplier.id }}" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Delete</button>
     </div>
   </section>
 

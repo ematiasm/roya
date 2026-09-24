@@ -9,7 +9,7 @@
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Customers</h2>
   <div class="flex items-center gap-2">
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">↻ Refresh</button>
+    <button type="button" class="btn-secondary" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">↻ Refresh</button>
     <button type="button" onclick="document.getElementById('new-customer-dialog').showModal()">New customer</button>
   </div>
 </div>
@@ -24,7 +24,7 @@
 <dialog id="new-customer-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
     <h2 class="text-lg font-semibold">New customer</h2>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-customer-dialog').close()">✕</button>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-customer-dialog').close()">✕</button>
   </div>
   <form class="flex flex-col gap-2.5"
         hx-post="/web/customers"
@@ -76,8 +76,8 @@
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Customer detail</span>
     <div class="flex items-center gap-2">
-      <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/customers">All customers</a>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closeCustomerDrawer()" aria-label="Close detail">✕</button>
+      <a class="btn-secondary font-normal" href="/customers">All customers</a>
+      <button type="button" class="btn-secondary" onclick="closeCustomerDrawer()" aria-label="Close detail">✕</button>
     </div>
   </div>
   <div id="customer-drawer-body" class="flex-1 overflow-y-auto p-4">

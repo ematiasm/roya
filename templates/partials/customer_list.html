@@ -14,7 +14,7 @@
                 hx-target="#customer-drawer-body"
                 hx-swap="innerHTML">{{ r.customer.name }}</button>
         <button type="button"
-                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                class="btn-secondary shrink-0"
                 title="Edit"
                 aria-label="Edit"
                 hx-get="/web/customers/edit-form/{{ r.customer.id }}"

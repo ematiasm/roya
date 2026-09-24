@@ -145,7 +145,7 @@
             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">${{ line.subtotal }}</td>
             {% if record.purchase.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
-              <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              <button class="btn-secondary"
                       hx-delete="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
                       hx-target="#purchase-record" hx-swap="innerHTML"
                       aria-label="Remove line">✕</button>
@@ -187,7 +187,7 @@
               <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
                 <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">stale cost</span>
                 <span class="text-[13px] text-muted">line cost ${{ stale.line_cost_display() }} • stored ${{ stale.stored_cost_display() }}</span>
-                <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                <button class="btn-secondary"
                         hx-post="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}/apply-cost"
                         hx-target="#purchase-record" hx-swap="innerHTML"
                         title="Apply this line's cost to the product">Apply to product</button>
@@ -406,7 +406,7 @@
   <dialog id="confirm-purchase" class="rounded-2xl border border-border bg-card p-5 text-text">
     <div class="mb-3 flex items-center justify-between gap-6">
       <h2 class="text-lg font-semibold">Confirm purchase</h2>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+      <button type="button" class="btn-secondary"
               aria-label="Close dialog" onclick="document.getElementById('confirm-purchase').close()">✕</button>
     </div>
     <form class="flex flex-col gap-2.5" data-action="Confirm purchase"
@@ -451,7 +451,7 @@
   <dialog id="discard-purchase" class="rounded-2xl border border-border bg-card p-5 text-text">
     <div class="mb-3 flex items-center justify-between gap-6">
       <h2 class="text-lg font-semibold">Discard draft</h2>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+      <button type="button" class="btn-secondary"
               aria-label="Close dialog" onclick="document.getElementById('discard-purchase').close()">✕</button>
     </div>
     <form class="flex flex-col gap-2.5" data-action="Discard draft"
@@ -474,7 +474,7 @@
   <dialog id="record-payment" class="rounded-2xl border border-border bg-card p-5 text-text">
     <div class="mb-3 flex items-center justify-between gap-6">
       <h2 class="text-lg font-semibold">Record payment</h2>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+      <button type="button" class="btn-secondary"
               aria-label="Close dialog" onclick="document.getElementById('record-payment').close()">✕</button>
     </div>
     <form class="flex flex-col gap-2.5" data-action="Record payment"
@@ -506,7 +506,7 @@
   <dialog id="cancel-purchase" class="rounded-2xl border border-border bg-card p-5 text-text">
     <div class="mb-3 flex items-center justify-between gap-6">
       <h2 class="text-lg font-semibold">Cancel purchase</h2>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+      <button type="button" class="btn-secondary"
               aria-label="Close dialog" onclick="document.getElementById('cancel-purchase').close()">✕</button>
     </div>
     <form class="flex flex-col gap-2.5" data-action="Cancel purchase"

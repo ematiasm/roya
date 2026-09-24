@@ -19,7 +19,7 @@
         <span class="font-bold tabular-nums {% if tx.is_income() %}text-income{% else %}text-expense{% endif %}">
           {% if tx.is_expense() %}-{% endif %}${{ tx.amount }}
         </span>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+        <button class="btn-secondary"
                 hx-delete="/web/transactions/{{ tx.id }}"
                 hx-target="#tx-{{ tx.id }}"
                 hx-swap="outerHTML"

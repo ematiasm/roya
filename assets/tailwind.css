@@ -72,12 +72,25 @@
   }
 }
 
-/* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The
-   busy indicator must be genuinely absent when idle (display:none), not merely
-   transparent: an opacity-only indicator has a non-empty box, so layout, assistive
-   tooling and tests would all agree it is "there" and an in-flight search would
-   again look identical to an idle one. */
 @layer components {
+  /* The secondary button carries cursor-pointer, font-bold, hover:opacity-90 and
+     the disabled: pair even though the repeated pattern it replaces never listed
+     them: those properties came from the bare `button` rule in @layer base, and
+     every call site inherited them silently. The component is self-sufficient
+     from the start — it carries what base gave it plus its own colour and size —
+     so that when the base rule is removed in a later task nothing moves.
+     @layer components beats @layer base by layer order
+     (properties < theme < base < components < utilities), so this overrides the
+     base element style without !important. */
+  .btn-secondary {
+    @apply cursor-pointer rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs font-bold text-text hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  /* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The
+     busy indicator must be genuinely absent when idle (display:none), not merely
+     transparent: an opacity-only indicator has a non-empty box, so layout, assistive
+     tooling and tests would all agree it is "there" and an in-flight search would
+     again look identical to an idle one. */
   .htmx-indicator {
     display: none;
   }

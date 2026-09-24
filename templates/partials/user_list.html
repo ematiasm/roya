@@ -43,7 +43,7 @@
         </span>
         {% if can_manage_roles && r.user.id != acting_user_id %}
         <button type="button"
-                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                class="btn-secondary shrink-0"
                 title="Asignar roles"
                 aria-label="Asignar roles"
                 hx-get="/web/users/roles-form/{{ r.user.id }}"
@@ -53,7 +53,7 @@
         {% endif %}
         {% if can_manage %}
         <button type="button"
-                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                class="btn-secondary shrink-0"
                 title="Nueva contraseña"
                 aria-label="Nueva contraseña"
                 hx-get="/web/users/password-form/{{ r.user.id }}"
@@ -65,7 +65,7 @@
               hx-swap="innerHTML"
               class="shrink-0">
           <input type="hidden" name="user_id" value="{{ r.user.id }}" />
-          <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">
+          <button type="submit" class="btn-secondary">
             {% if r.user.is_active %}Desactivar{% else %}Activar{% endif %}
           </button>
         </form>

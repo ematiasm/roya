@@ -11,7 +11,7 @@
                 hx-target="#supplier-drawer-body"
                 hx-swap="innerHTML">{{ v.supplier.name }}</button>
         <button type="button"
-                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                class="btn-secondary shrink-0"
                 title="Edit"
                 aria-label="Edit"
                 hx-get="/web/suppliers/{{ v.supplier.id }}/edit-form"

@@ -9,7 +9,7 @@
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Suppliers</h2>
   <div class="flex items-center gap-2">
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML">↻ Refresh</button>
+    <button type="button" class="btn-secondary" hx-get="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML">↻ Refresh</button>
     <button type="button" onclick="document.getElementById('new-supplier-dialog').showModal()">New supplier</button>
   </div>
 </div>
@@ -26,7 +26,7 @@
 <dialog id="new-supplier-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
     <h2 class="text-lg font-semibold">New supplier</h2>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-supplier-dialog').close()">✕</button>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-supplier-dialog').close()">✕</button>
   </div>
   <form class="flex flex-col gap-2.5" hx-post="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
@@ -53,7 +53,7 @@
 <div id="supplier-drawer" class="fixed inset-y-0 right-0 z-40 hidden w-full max-w-md flex-col border-l border-border bg-card shadow-xl">
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Supplier detail</span>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closeSupplierDrawer()" aria-label="Close detail">✕</button>
+    <button type="button" class="btn-secondary" onclick="closeSupplierDrawer()" aria-label="Close detail">✕</button>
   </div>
   <div id="supplier-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
 </div>

@@ -66,7 +66,7 @@
       </ul>
       {% if a.method == "delete" %}
       <button type="button"
-              class="mt-2 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              class="btn-secondary mt-2"
               data-action="{{ a.data_action }}"
               hx-delete="{{ a.path }}" hx-swap="none"
               {% if let Some(c) = a.confirm %}hx-confirm="{{ c }}"{% endif %}>{{ a.label }}</button>
@@ -83,7 +83,7 @@
                type="text" name="reason" maxlength="256" placeholder="Motivo (opcional)" />
         {% endif %}
         <button type="submit"
-                class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">{{ a.label }}</button>
+                class="btn-secondary">{{ a.label }}</button>
       </form>
       {% endif %}
     </div>
@@ -106,7 +106,7 @@
       </div>
       {% endfor %}
     </div>
-    <a class="mt-3 inline-block rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="{{ p.href }}">Abrir</a>
+    <a class="btn-secondary font-normal mt-3 inline-block no-underline hover:no-underline" href="{{ p.href }}">Abrir</a>
   </section>
   {% endif %}
 
@@ -117,7 +117,7 @@
   {% if !links.is_empty() %}
   <section class="flex flex-wrap gap-2">
     {% for link in links %}
-    <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="{{ link.href }}">{{ link.label }}</a>
+    <a class="btn-secondary font-normal no-underline hover:no-underline" href="{{ link.href }}">{{ link.label }}</a>
     {% endfor %}
   </section>
   {% endif %}

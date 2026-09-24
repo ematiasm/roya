@@ -40,7 +40,7 @@
             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">${{ line.subtotal }}</td>
             {% if record.sale.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
-              <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              <button class="btn-secondary"
                       hx-delete="/web/sales/{{ record.sale.id }}/lines/{{ line.id }}"
                       hx-target="#sale-record" hx-swap="innerHTML"
                       aria-label="Remove line">✕</button>

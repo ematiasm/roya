@@ -26,7 +26,7 @@
         {# Seeding answers `HX-Redirect: /purchases/{id}`, so this is a navigation,
            not a swap: it deliberately carries no hx-target (nothing on this page
            is replaced), and hx-swap="none" says so. #}
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+        <button class="btn-secondary"
                 hx-post="/web/purchases/from-suggestion"
                 hx-vals='{"product_id": {{ s.product.id }}}'
                 hx-include="#suggestion-seed-options"

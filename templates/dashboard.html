@@ -26,7 +26,7 @@
     <div class="rounded-2xl border border-border bg-card p-5" id="accounts">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Accounts</h2>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/accounts" hx-target="#account-list" hx-swap="innerHTML">↻ Refresh</button>
+        <button class="btn-secondary" hx-get="/web/accounts" hx-target="#account-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
       <div id="account-list"
            hx-get="/web/accounts"

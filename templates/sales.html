@@ -48,7 +48,7 @@
     <div class="rounded-2xl border border-border bg-card p-5" id="debt-section">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Outstanding Debt</h2>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/sales/debt" hx-target="#sale-debt" hx-swap="innerHTML">↻ Refresh</button>
+        <button class="btn-secondary" hx-get="/web/sales/debt" hx-target="#sale-debt" hx-swap="innerHTML">↻ Refresh</button>
       </div>
       <div id="sale-debt"
            hx-get="/web/sales/debt"

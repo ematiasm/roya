@@ -53,7 +53,7 @@
   <div class="rounded-2xl border border-border bg-card p-5" id="low-stock-section">
     <div class="mb-3 flex items-center justify-between">
       <h2 class="text-lg font-semibold">Low Stock</h2>
-      <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/low-stock" hx-target="#low-stock-list" hx-swap="innerHTML">↻ Refresh</button>
+      <button class="btn-secondary" hx-get="/web/low-stock" hx-target="#low-stock-list" hx-swap="innerHTML">↻ Refresh</button>
     </div>
     <div id="low-stock-list"
          hx-get="/web/low-stock"
@@ -71,7 +71,7 @@
 <dialog id="new-category-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
     <h2 class="text-lg font-semibold">New category</h2>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-category-dialog').close()">✕</button>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-category-dialog').close()">✕</button>
   </div>
   <form class="flex flex-col gap-2.5"
         data-action="Create category"
@@ -101,7 +101,7 @@
 <dialog id="new-product-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
     <h2 class="text-lg font-semibold">New product</h2>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-product-dialog').close()">✕</button>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-product-dialog').close()">✕</button>
   </div>
   <form class="flex flex-col gap-2.5"
         data-action="Create product"
@@ -188,8 +188,8 @@
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Product detail</span>
     <div class="flex items-center gap-2">
-      <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/products">All products</a>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closeProductDrawer()" aria-label="Close detail">✕</button>
+      <a class="btn-secondary font-normal" href="/products">All products</a>
+      <button type="button" class="btn-secondary" onclick="closeProductDrawer()" aria-label="Close detail">✕</button>
     </div>
   </div>
   <div id="product-drawer-body" class="flex-1 overflow-y-auto p-4"></div>

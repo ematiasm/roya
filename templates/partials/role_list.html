@@ -38,7 +38,7 @@
           {% if r.holders.is_empty() %}sin usuarios{% else %}{{ r.holders.len() }} usuario{% if r.holders.len() > 1 %}s{% endif %}{% endif %}
         </span>
         <button type="button"
-                class="shrink-0 rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+                class="btn-secondary shrink-0"
                 title="{% if r.role.is_system %}Ver rol protegido{% else %}Editar rol y permisos{% endif %}"
                 aria-label="{% if r.role.is_system %}Ver rol protegido{% else %}Editar rol y permisos{% endif %}"
                 hx-get="/web/roles/edit-form/{{ r.role.id }}"
@@ -51,7 +51,7 @@
               hx-swap="innerHTML"
               class="shrink-0">
           <input type="hidden" name="role_id" value="{{ r.role.id }}" />
-          <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Eliminar</button>
+          <button type="submit" class="btn-secondary">Eliminar</button>
         </form>
         {% endif %}
       </div>
