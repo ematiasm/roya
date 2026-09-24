@@ -74,8 +74,24 @@ BASELINE = Path(__file__).resolve().parent.parent / "visual-baseline.json"
 VIEWPORT = {"width": 1440, "height": 900}
 
 # What a person actually sees. Layout-affecting properties are included on
-# purpose: a refactor that drops a `w-full` or a `gap` changes the screen even
+# purpose: a refactor that drops a `gap` or a `padding` changes the screen even
 # though no colour moved.
+#
+# **`width` and `height` are deliberately absent**, and the reason is the first
+# thing CI taught this net. They were in the first version, and CI failed on a
+# refactor that was visually correct: every one of the 88 reported differences
+# was a width or a height - `95.3438px -> 110.656px`, `43px -> 42px` - and not a
+# single colour, border, padding, font, display, gap, opacity or radius moved.
+# Those two properties are text metrics: they follow the rendered font, and the
+# runner's fonts are not this machine's. A net that fails for the environment is
+# a net people learn to re-run until it passes, which is worse than no net at
+# all. So it asserts what the classes control and leaves what the font controls
+# to the behavioural suite.
+#
+# The cost is stated rather than hidden: a dropped `w-full` or `w-20` would no
+# longer be caught here. `display`, `gap`, `padding`, `margin` and
+# `border-*-width` remain, so class-controlled layout is still covered; a width
+# regression that matters is a behavioural test's job.
 STYLE_PROPERTIES = [
     "color",
     "background-color",
@@ -98,8 +114,6 @@ STYLE_PROPERTIES = [
     "gap",
     "opacity",
     "cursor",
-    "width",
-    "height",
 ]
 
 # Walks the whole body and fingerprints every element. The path is built from
