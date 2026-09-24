@@ -21,6 +21,16 @@ Two deliberate choices:
 Regenerate deliberately, and only when a change to the interface is intended:
 
     ROYA_VISUAL_BASELINE=write scripts/e2e.sh -k visual_baseline
+
+The baseline holds states as well as pages. The notice dismiss buttons — the
+controls that lean on the `@layer base` `a`/`button` rules — render only in
+states the shared session never sees: the failure re-renders of the login and
+password forms, the full-page permission refusal, and the three notice boxes
+(base.html's client-side builder, the merge-scan server box and the
+create-under-filter server box). Each state has its own name below; T2c
+recorded the gap this closes: with the base rules removed, a pages-only net
+passed while those five buttons lost their background, label colour, weight
+and cursor.
 """
 
 from __future__ import annotations
@@ -30,9 +40,19 @@ import os
 from pathlib import Path
 from typing import Any
 
-from playwright.sync_api import Page
+from playwright.sync_api import Page, expect
 
+from conftest import TEST_ADMIN_USERNAME
 from helpers import ApiClient, HarnessData, seed_harness_data
+from test_identity import (
+    CHANGED_PASSWORD,
+    INITIAL_PASSWORD,
+    _assign_role_through_the_screen,
+    _change_confined_password,
+    _create_user_through_the_screen,
+    _log_in_through_the_form,
+    _response_for,
+)
 
 BASELINE = Path(__file__).resolve().parent.parent / "visual-baseline.json"
 
@@ -105,7 +125,26 @@ def _pages(data: HarnessData) -> list[tuple[str, str]]:
         ("documents", "/documents"),
         ("users", "/users"),
         ("roles", "/roles"),
+        # The password form is reachable from the sidebar for every signed-in
+        # operator; its dismiss button lives only in the failure re-render,
+        # captured separately as `password-error` below.
+        ("password", "/password"),
     ]
+
+
+# The states outside the shared session, one distinct name each. All are
+# deterministic by construction: fixed copy, seeded data, no timestamps and no
+# ids that change between runs (the server is throwaway and freshly seeded, so
+# even the DOM paths that carry line ids repeat exactly).
+_STATE_NAMES = [
+    "login",
+    "login-error",
+    "password-error",
+    "forbidden",
+    "purchase-record-notice",
+    "purchase-record-merge",
+    "products-create-under-filter",
+]
 
 
 def _fingerprint(page: Page) -> dict[str, Any]:
@@ -168,19 +207,29 @@ def _hover_fingerprint(page: Page) -> tuple[dict[str, Any], list[str]]:
     return out, skipped
 
 
-def test_visual_baseline(page: Page, api: ApiClient) -> None:
+def test_visual_baseline(
+    page: Page,
+    api: ApiClient,
+    browser,
+    browser_context_args: dict,
+    live_server,
+) -> None:
     """Every screen computes the same styles it did before the refactor."""
     data = seed_harness_data(api)
     page.set_viewport_size(VIEWPORT)
 
     current: dict[str, Any] = {}
+
+    def capture(subject: Page, name: str) -> None:
+        current[name] = _fingerprint(subject)
+        hover, skipped = _hover_fingerprint(subject)
+        current[name + ":hover"] = hover
+        current[name + ":hover-skipped"] = skipped
+
     for name, path in _pages(data):
         page.goto(f"{api.base_url}{path}")
         page.wait_for_load_state("networkidle")
-        current[name] = _fingerprint(page)
-        hover, skipped = _hover_fingerprint(page)
-        current[name + ":hover"] = hover
-        current[name + ":hover-skipped"] = skipped
+        capture(page, name)
 
     # The drawers are the richest component surfaces in the app and they are
     # fragments, not pages, so they are reached by clicking. Snapshot the open
@@ -193,6 +242,134 @@ def test_visual_baseline(page: Page, api: ApiClient) -> None:
         page.locator(row).first.click()
         page.wait_for_timeout(400)
         current[name] = _fingerprint(page)
+
+    # -- The notice states -----------------------------------------------------
+    # The purchase record is the cheapest route into two of the three notice
+    # copies: a successful data-action form raises base.html's client-side box
+    # (the JS `notice()` builder), and a repeat scan of a product already on
+    # the draft answers the server-rendered merge box. One page, two states.
+    page.goto(f"{api.base_url}/purchases/{data.purchase_id}")
+    page.wait_for_load_state("networkidle")
+    add_line = page.locator('form[data-action="Add line"]')
+    # The spare product is not on the draft yet, so this is an ordinary add:
+    # the generic client-side notice is what it leaves behind.
+    add_line.locator("#product-picker").fill("HARNESS-SPARE")
+    # The island debounces a search behind every keystroke; let it finish so a
+    # late response cannot repaint the re-rendered entry row mid-snapshot.
+    page.wait_for_load_state("networkidle")
+    with page.expect_response(
+        _response_for(f"/web/purchases/{data.purchase_id}/lines", "POST")
+    ):
+        add_line.get_by_role("button", name="Add line").click()
+    expect(page.locator("[data-notice='success']")).to_contain_text("Add line saved")
+    page.wait_for_timeout(400)
+    capture(page, "purchase-record-notice")
+
+    # The seeded line's product at the same resolved cost: the server merges
+    # instead of answering 400 and swaps the merge notice out of band.
+    add_line.locator("#product-picker").fill(data.barcode)
+    page.wait_for_load_state("networkidle")
+    with page.expect_response(
+        _response_for(f"/web/purchases/{data.purchase_id}/lines", "POST")
+    ):
+        add_line.get_by_role("button", name="Add line").click()
+    expect(page.locator("[data-notice='success']")).to_contain_text("scanned again")
+    page.wait_for_timeout(400)
+    capture(page, "purchase-record-merge")
+
+    # The third server-rendered copy: creating a product under an active
+    # catalogue filter. The create form carries the filter in its body
+    # (hx-include), so a non-empty search text is all the state it needs.
+    page.goto(f"{api.base_url}/products")
+    page.wait_for_load_state("networkidle")
+    page.locator('input[name="q"]').fill("no-product-matches-this-filter")
+    page.wait_for_load_state("networkidle")
+    dialog = page.locator("#new-product-dialog")
+    page.get_by_role("button", name="New product").click()
+    dialog.locator('input[name="sku"]').fill("BASELINE-NOTICE")
+    dialog.locator('input[name="name"]').fill("Filter Notice Product")
+    dialog.locator('input[name="sale_price"]').fill("1.00")
+    with page.expect_response(_response_for("/web/products", "POST")):
+        dialog.get_by_role("button", name="Create product").click()
+    expect(page.locator("[data-notice='success']")).to_contain_text(
+        "Filter Notice Product created"
+    )
+    page.wait_for_timeout(400)
+    capture(page, "products-create-under-filter")
+
+    # The password form's dismiss button lives only in its failure re-render.
+    # A wrong current password verifies before any write, so nothing changes.
+    page.goto(f"{api.base_url}/password")
+    page.get_by_label("Contraseña actual").fill("definitely-not-the-password")
+    page.get_by_label("Nueva contraseña", exact=True).fill(CHANGED_PASSWORD)
+    page.get_by_label("Confirmar nueva contraseña").fill(CHANGED_PASSWORD)
+    page.get_by_role("button", name="Guardar contraseña").click()
+    expect(page.locator("[data-notice='error']")).to_be_visible()
+    page.wait_for_timeout(400)
+    capture(page, "password-error")
+
+    # -- /login and /forbidden: states outside the shared session --------------
+    # The `page` fixture is authenticated, so the gate states ride their own
+    # context, the way tests/test_identity.py builds an anonymous visitor.
+    anonymous_context = browser.new_context(**browser_context_args)
+    anonymous = anonymous_context.new_page()
+    anonymous.set_viewport_size(VIEWPORT)
+    try:
+        anonymous.goto(f"{api.base_url}/login")
+        anonymous.wait_for_load_state("networkidle")
+        capture(anonymous, "login")
+        # The login page's dismiss button lives only in the failure re-render.
+        anonymous.get_by_label("Usuario").fill(TEST_ADMIN_USERNAME)
+        anonymous.get_by_label("Contraseña").fill("definitely-not-the-password")
+        anonymous.get_by_role("button", name="Iniciar sesión").click()
+        expect(anonymous.locator("[data-notice='error']")).to_be_visible()
+        anonymous.wait_for_timeout(400)
+        capture(anonymous, "login-error")
+
+        # /forbidden: a principal with no permissions at all, built through
+        # the same real-screen route test_identity.py uses — a fresh role
+        # (a new role holds no permissions, so no matrix edit is needed), a
+        # screen-created user, the role assigned, the confined first login
+        # and the password change. The landing on / is then refused for the
+        # missing dashboard.read, and the full-page refusal card is the
+        # state the net captures.
+        page.goto(f"{api.base_url}/roles")
+        page.get_by_role("button", name="Nuevo rol").click()
+        role_dialog = page.locator("#new-role-dialog")
+        role_dialog.locator('input[name="code"]').fill("sin_permisos")
+        role_dialog.locator('input[name="name"]').fill("Sin permisos")
+        role_dialog.locator('input[name="description"]').fill(
+            "Cero permisos: lo siembra la red visual para /forbidden."
+        )
+        with page.expect_response(_response_for("/web/roles", "POST")):
+            role_dialog.get_by_role("button", name="Crear rol").click()
+        expect(page.locator("#role-list")).to_contain_text("sin_permisos")
+
+        page.goto(f"{api.base_url}/users")
+        _create_user_through_the_screen(
+            page,
+            username="sinpermisos1",
+            display_name="Sin Permisos Uno",
+            password=INITIAL_PASSWORD,
+        )
+        _assign_role_through_the_screen(
+            page, username="sinpermisos1", role_name="Sin permisos"
+        )
+
+        _log_in_through_the_form(
+            anonymous, live_server, "sinpermisos1", INITIAL_PASSWORD
+        )
+        expect(anonymous).to_have_url(f"{api.base_url}/password")
+        _change_confined_password(
+            anonymous, current=INITIAL_PASSWORD, new=CHANGED_PASSWORD
+        )
+        # The post-change landing is the refused dashboard: the full-page card.
+        expect(anonymous.locator("[data-notice='error']")).to_contain_text(
+            "dashboard.read"
+        )
+        capture(anonymous, "forbidden")
+    finally:
+        anonymous_context.close()
 
     if os.environ.get("ROYA_VISUAL_BASELINE") == "write":
         BASELINE.write_text(json.dumps(current, sort_keys=True, separators=(",", ":")) + "\n")
@@ -212,6 +389,10 @@ def test_visual_baseline(page: Page, api: ApiClient) -> None:
     problems: list[str] = []
     names = [n for n, _ in _pages(data)] + [
         n + suffix for n, _ in _pages(data) for suffix in (":hover", ":hover-skipped")
+    ] + [
+        name + suffix
+        for name in _STATE_NAMES
+        for suffix in ("", ":hover", ":hover-skipped")
     ] + ["products-drawer", "products-drawer:hover", "products-drawer:hover-skipped",
          "purchases-drawer", "purchases-drawer:hover", "purchases-drawer:hover-skipped"]
     for name in names:
