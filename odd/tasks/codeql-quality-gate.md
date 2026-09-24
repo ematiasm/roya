@@ -53,11 +53,11 @@ The repository already has a GitHub Actions checks workflow, but no CodeQL confi
 ## Progress and evidence
 
 - Feature document created: `odd/tasks/codeql-quality-gate.md`.
-- Commit: not created; commit delivery requires explicit user authorization.
+- Commit: `d90b6d1` created locally; direct push to `main` was rejected by the active pull-request ruleset, and the commit is now published on `ci/codeql-quality-gate` for a pull request.
 - T1: completed; workflow added and local diff validation passed.
-- T2: pending; awaiting explicit authorization for the GitHub credential/session and destination operation.
-- T3: pending.
+- T2: blocked; the authorized GitHub API reports that Code Quality is not available for this repository, so `Require code quality results` cannot be enabled. The separate CodeQL workflow is ready for pull-request validation.
+- T3: pending; open the pull request and verify the GitHub-hosted workflow after publication.
 
 ## Next step
 
-Obtain explicit authorization for the GitHub session, commit/push the CodeQL workflow, then enable the remote code-quality merge rule.
+Open the pull request for `ci/codeql-quality-gate`, wait for the GitHub-hosted CodeQL workflow, and report that Code Quality itself remains unavailable for this repository.
