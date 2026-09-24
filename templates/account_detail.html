@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Roya — {{ account.name }}{% endblock %}
 {% block content %}
-<a href="/" class="text-[13px] text-muted">← Back to dashboard</a>
+<a href="/" class="link text-[13px] text-muted">← Back to dashboard</a>
 <div class="mt-4 rounded-2xl border border-border bg-card p-5">
   <div class="text-[13px] text-muted">Account</div>
   <div class="flex items-center justify-between gap-3">
@@ -43,7 +43,7 @@
     </div>
     {% endif %}
     <div class="text-[13px] text-muted">Saving replaces this account's method set. Methods owned by another account never appear here: unassign them there first. An account with no methods cannot record payments.</div>
-    <button type="submit" class="self-start">Save payment methods</button>
+    <button type="submit" class="btn-primary self-start">Save payment methods</button>
   </form>
 </div>
 

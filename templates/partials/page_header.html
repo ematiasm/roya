@@ -26,7 +26,7 @@
     {% if page_breadcrumb_label != "" %}
     <nav class="mb-1 text-[13px] text-muted" aria-label="Breadcrumb" data-page-breadcrumb>
       {% if page_breadcrumb_href != "" %}
-      <a href="{{ page_breadcrumb_href }}" class="text-muted">{{ page_breadcrumb_label }}</a>
+      <a href="{{ page_breadcrumb_href }}" class="link text-muted">{{ page_breadcrumb_label }}</a>
       {% else %}
       <span>{{ page_breadcrumb_label }}</span>
       {% endif %}
@@ -37,11 +37,11 @@
   {% if page_action_label != "" %}
   {% if page_action_dialog != "" %}
   <button type="button" onclick="document.getElementById('{{ page_action_dialog }}').showModal()"
-     class="rounded-[10px] bg-accent px-4 py-2 text-sm font-semibold text-bg"
+     class="btn-primary px-4 py-2 text-sm font-semibold text-bg"
      data-page-action>{{ page_action_label }}</button>
   {% else %}
   <a href="{{ page_action_href }}"
-     class="rounded-[10px] bg-accent px-4 py-2 text-sm font-semibold text-bg no-underline hover:no-underline"
+     class="btn-primary px-4 py-2 text-sm font-semibold text-bg no-underline hover:no-underline hover:opacity-100"
      data-page-action>{{ page_action_label }}</a>
   {% endif %}
   {% endif %}

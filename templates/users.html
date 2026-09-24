@@ -12,7 +12,7 @@
 {% block title %}Usuarios — Roya{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">usuarios · roles y credenciales</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
@@ -20,7 +20,7 @@
   {% if can_manage %}
   <div class="flex items-center gap-2">
     <button type="button" class="btn-secondary" hx-get="/web/users" hx-target="#user-list" hx-swap="innerHTML">↻ Actualizar</button>
-    <button type="button" onclick="document.getElementById('new-user-dialog').showModal()">Nuevo usuario</button>
+    <button type="button" onclick="document.getElementById('new-user-dialog').showModal()" class="btn-primary">Nuevo usuario</button>
   </div>
   {% endif %}
 </div>
@@ -55,7 +55,7 @@
       <label>Contraseña inicial</label>
       <input type="password" name="password" required minlength="12" autocomplete="new-password" />
     </div>
-    <button type="submit">Crear usuario</button>
+    <button type="submit" class="btn-primary">Crear usuario</button>
     <div class="text-[13px] text-muted">
       El usuario deberá cambiar esta contraseña en su primer inicio de sesión.
       Sólo letras minúsculas, números y . _ - en el nombre de usuario.

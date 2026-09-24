@@ -3935,13 +3935,16 @@ async fn purchases_dialog_offers_the_last_used_supplier_on_the_list_page() {
     // The primary action is a button that opens the dialog — never a link to
     // a creation page (AC2: none exists).
     let tag = element_tag_containing(page.as_str(), "data-page-action");
+    // `contains("bg-accent")` also matched `bg-accent2`, so the old assertion
+    // could never have caught the blue regression it names. The guard now pins
+    // the component instead: the colour is asserted by the visual net.
     assert!(
         tag.contains("<button")
             && tag.contains(
                 "onclick=\"document.getElementById('new-purchase-dialog').showModal()\""
             )
-            && tag.contains("bg-accent"),
-        "the primary action must open the creation dialog with the mint classes: {tag}"
+            && tag.contains("btn-primary"),
+        "the primary action must open the creation dialog as the primary button component: {tag}"
     );
     assert!(
         page.contains("data-page-action>New purchase</button>"),

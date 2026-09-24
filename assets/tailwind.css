@@ -86,6 +86,33 @@
     @apply cursor-pointer rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs font-bold text-text hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
   }
 
+  /* Exactly the bare `button` rule, so a bare button and a .btn-primary render
+     identically until the base rule is removed. */
+  .btn-primary {
+    @apply cursor-pointer rounded-[10px] border-0 bg-accent px-3.5 py-2.5 font-bold text-[#0a0f0d] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-danger {
+    @apply cursor-pointer rounded-[10px] border border-danger/30 bg-danger/12 px-3.5 py-2 text-sm font-bold text-danger hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  /* The row-name button: borderless, and its p-0/text-left/font-semibold are
+     part of it so the caller keeps only layout classes. Not bold: the row name
+     is a label, not a labelled action. */
+  .btn-plain {
+    @apply cursor-pointer rounded-[10px] border-0 bg-transparent p-0 text-left font-semibold hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .menu-item {
+    @apply block w-full cursor-pointer rounded-[10px] border-0 bg-transparent px-3 py-2 text-left text-sm font-bold hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  /* Exactly the bare `a` rule, so a bare anchor and a .link render identically
+     until the base rule is removed. */
+  .link {
+    @apply text-accent2 no-underline hover:underline;
+  }
+
   /* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The
      busy indicator must be genuinely absent when idle (display:none), not merely
      transparent: an opacity-only indicator has a non-empty box, so layout, assistive

@@ -152,7 +152,7 @@
         <label>Notes</label>
         <input type="text" name="notes" maxlength="1024" {% if let Some(v) = product.notes %}value="{{ v }}"{% endif %} />
       </div>
-      <button type="submit">Save product</button>
+      <button type="submit" class="btn-primary">Save product</button>
       <div class="text-[13px] text-muted">The same rules as creation apply: services cannot track stock, tracked products need min and max, and the SKU cannot collide with another product (⇒ 400/409).</div>
     </form>
     {# Markup courtesy only (product-markup T6): the edit handler is the
@@ -248,7 +248,7 @@
           <input type="date" name="date" value="{{ today }}" />
         </div>
       </div>
-      <button type="submit">Record cost</button>
+      <button type="submit" class="btn-primary">Record cost</button>
       <div class="text-[13px] text-muted">First call creates the row; a different cost shifts the current one into previous; the same cost only refreshes the date; a date older than the current one ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
     </form>
   </section>
@@ -301,7 +301,7 @@
         <label>Reference (optional)</label>
         <input type="text" name="reference" maxlength="256" />
       </div>
-      <button type="submit">Record movement</button>
+      <button type="submit" class="btn-primary">Record movement</button>
       <div class="text-[13px] text-muted">In=+qty, Out=−qty, Adjust=signed delta.</div>
     </form>
     {% else %}

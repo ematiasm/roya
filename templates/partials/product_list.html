@@ -11,7 +11,7 @@
           {# The name is the drawer trigger: the same button-as-row pattern as the
              party lists, fetching the detail fragment into the drawer body. #}
           <button type="button"
-                  class="bg-transparent p-0 text-left font-semibold {% if ps.product.is_active %}text-text{% else %}text-muted{% endif %}"
+                  class="btn-plain {% if ps.product.is_active %}text-text{% else %}text-muted{% endif %}"
                   hx-get="/web/products/detail/{{ ps.product.id }}"
                   hx-target="#product-drawer-body"
                   hx-swap="innerHTML">{{ ps.product.name }}</button>

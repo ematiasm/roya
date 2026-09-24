@@ -5100,13 +5100,16 @@ mod tests {
         );
     }
 
-    /// AC1: the shared page action speaks the mint accent with a dark label —
-    /// the rest of the system is mint (`roya ◆`, the active nav entry, the
-    /// success notice), and neither green survives white text (mint on white
-    /// is about 1.4:1), so the label rides the background token. Asserted on
-    /// the action's own opening tag: the component is shared, so a blue or
-    /// white-labelled action on ANY page is a defect this catches at the
-    /// source.
+    /// AC1: the shared page action carries the `.btn-primary` component — the
+    /// rest of the system is mint (`roya ◆`, the active nav entry, the success
+    /// notice), and neither green survives white text (mint on white is about
+    /// 1.4:1), so the label rides the background token. The colour itself is
+    /// asserted by the visual net (`e2e/tests/test_visual_baseline.py`), which
+    /// records the computed `background-color` of this very element on every
+    /// run; this guard pins the COMPONENT, so a future edit cannot quietly
+    /// swap the action to a different variant. Asserted on the action's own
+    /// opening tag: the component is shared, so a wrongly-variant action on
+    /// ANY page is a defect this catches at the source.
     #[tokio::test]
     async fn purchases_page_action_is_mint_with_a_dark_label() {
         let state = test_state().await;
@@ -5123,8 +5126,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         let action = element_tag_containing(&html, "data-page-action");
         assert!(
-            action.contains("bg-accent "),
-            "the primary action must carry the mint accent, not blue: {action}"
+            action.contains("btn-primary"),
+            "the page action must carry the primary button component (the colour itself is asserted by the visual net): {action}"
         );
         assert!(
             action.contains("text-bg"),

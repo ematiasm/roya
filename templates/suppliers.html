@@ -2,15 +2,15 @@
 {% block title %}Roya — Suppliers{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
-  <a href="/purchases" class="text-[13px] text-muted">Purchases</a>
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
+  <a href="/purchases" class="link text-[13px] text-muted">Purchases</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">suppliers • product/supplier cost satellite</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Suppliers</h2>
   <div class="flex items-center gap-2">
     <button type="button" class="btn-secondary" hx-get="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML">↻ Refresh</button>
-    <button type="button" onclick="document.getElementById('new-supplier-dialog').showModal()">New supplier</button>
+    <button type="button" onclick="document.getElementById('new-supplier-dialog').showModal()" class="btn-primary">New supplier</button>
   </div>
 </div>
 <div class="rounded-2xl border border-border bg-card p-5">
@@ -41,7 +41,7 @@
       <label>Notes (optional)</label>
       <input type="text" name="notes" placeholder="…" maxlength="512" />
     </div>
-    <button type="submit">Create Supplier</button>
+    <button type="submit" class="btn-primary">Create Supplier</button>
     <div class="text-[13px] text-muted">Duplicate name ⇒ 409. Also at <code>POST /api/suppliers</code></div>
   </form>
 </dialog>

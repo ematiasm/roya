@@ -95,7 +95,7 @@
     {% call supplier_picker::supplier_picker("/web/purchases", "#new-purchase-dialog", "new-purchase-supplier", current_supplier_name, "") %}
     <form hx-post="/web/purchases" hx-include="#new-purchase-supplier" hx-swap="none"
           data-action="Create purchase" class="flex flex-col gap-2.5">
-      <button type="submit">Create draft</button>
+      <button type="submit" class="btn-primary">Create draft</button>
       <p class="text-[13px] text-muted">Creating opens the new draft's page.</p>
     </form>
   </div>

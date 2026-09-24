@@ -21,7 +21,7 @@
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ d.total }}</span>
-        <a href="/sales/{{ d.sale.id }}" class="rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline">Open</a>
+        <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal no-underline hover:no-underline hover:opacity-100">Open</a>
       </div>
     </div>
     {% endfor %}

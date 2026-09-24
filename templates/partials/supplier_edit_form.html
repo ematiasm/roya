@@ -20,5 +20,5 @@
     <label>Notes (optional)</label>
     <input type="text" name="notes" maxlength="512" value="{% if let Some(notes) = supplier.notes %}{{ notes }}{% endif %}" />
   </div>
-  <button type="submit">Save Changes</button>
+  <button type="submit" class="btn-primary">Save Changes</button>
 </form>

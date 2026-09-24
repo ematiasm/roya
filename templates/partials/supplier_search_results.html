@@ -46,7 +46,7 @@
         <input type="hidden" name="supplier_id" value="{{ s.id }}" />
         <button type="submit"
                 data-supplier-id="{{ s.id }}"
-                class="flex w-full items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-left text-sm {% if s.is_active %}text-text{% else %}text-muted{% endif %}">
+                class="btn-secondary flex w-full items-center justify-between gap-3 bg-surface text-left text-sm {% if s.is_active %}text-text{% else %}text-muted{% endif %}">
           <span class="min-w-0 truncate font-semibold">{{ s.name }}</span>
           {% if !s.is_active %}<span class="shrink-0 text-xs text-muted">inactive</span>{% endif %}
         </button>

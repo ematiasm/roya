@@ -40,7 +40,7 @@
           <tr class="border-t border-border">
             {% for cell in row.cells %}
             {% if loop.first && row.href.is_some() %}
-            <td class="px-2 py-1.5"><a href="{{ row.href.as_ref().unwrap() }}" class="underline underline-offset-2">{{ cell }}</a></td>
+            <td class="px-2 py-1.5"><a href="{{ row.href.as_ref().unwrap() }}" class="link underline underline-offset-2">{{ cell }}</a></td>
             {% else %}
             <td class="px-2 py-1.5 tabular-nums">{{ cell }}</td>
             {% endif %}
@@ -106,7 +106,7 @@
       </div>
       {% endfor %}
     </div>
-    <a class="btn-secondary font-normal mt-3 inline-block no-underline hover:no-underline" href="{{ p.href }}">Abrir</a>
+    <a class="btn-secondary font-normal mt-3 inline-block no-underline hover:no-underline hover:opacity-100" href="{{ p.href }}">Abrir</a>
   </section>
   {% endif %}
 
@@ -117,7 +117,7 @@
   {% if !links.is_empty() %}
   <section class="flex flex-wrap gap-2">
     {% for link in links %}
-    <a class="btn-secondary font-normal no-underline hover:no-underline" href="{{ link.href }}">{{ link.label }}</a>
+    <a class="btn-secondary font-normal no-underline hover:no-underline hover:opacity-100" href="{{ link.href }}">{{ link.label }}</a>
     {% endfor %}
   </section>
   {% endif %}

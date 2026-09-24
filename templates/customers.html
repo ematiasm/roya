@@ -2,15 +2,15 @@
 {% block title %}{{ title }}{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
-  <a href="/sales" class="text-[13px] text-muted">Sales</a>
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
+  <a href="/sales" class="link text-[13px] text-muted">Sales</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">customers • derived balance and ageing</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Customers</h2>
   <div class="flex items-center gap-2">
     <button type="button" class="btn-secondary" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">↻ Refresh</button>
-    <button type="button" onclick="document.getElementById('new-customer-dialog').showModal()">New customer</button>
+    <button type="button" onclick="document.getElementById('new-customer-dialog').showModal()" class="btn-primary">New customer</button>
   </div>
 </div>
 <div id="customer-list"
@@ -63,7 +63,7 @@
       <label>Notes (optional)</label>
       <input type="text" name="notes" maxlength="512" />
     </div>
-    <button type="submit">Create Customer</button>
+    <button type="submit" class="btn-primary">Create Customer</button>
     <div class="text-[13px] text-muted">Duplicate names are allowed; the existing match is reported as a warning. Also at <code>POST /api/customers</code></div>
   </form>
 </dialog>
@@ -76,7 +76,7 @@
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Customer detail</span>
     <div class="flex items-center gap-2">
-      <a class="btn-secondary font-normal" href="/customers">All customers</a>
+      <a class="btn-secondary font-normal hover:opacity-100" href="/customers">All customers</a>
       <button type="button" class="btn-secondary" onclick="closeCustomerDrawer()" aria-label="Close detail">✕</button>
     </div>
   </div>

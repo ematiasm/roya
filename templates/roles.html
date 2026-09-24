@@ -17,14 +17,14 @@
 {% block title %}Roles — Roya{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">roles · matriz de permisos</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Roles</h2>
   <div class="flex items-center gap-2">
     <button type="button" class="btn-secondary" hx-get="/web/roles" hx-target="#role-list" hx-swap="innerHTML">↻ Actualizar</button>
-    <button type="button" onclick="document.getElementById('new-role-dialog').showModal()">Nuevo rol</button>
+    <button type="button" onclick="document.getElementById('new-role-dialog').showModal()" class="btn-primary">Nuevo rol</button>
   </div>
 </div>
 <div id="role-list"
@@ -57,7 +57,7 @@
       <label>Descripción (opcional)</label>
       <input type="text" name="description" maxlength="256" placeholder="Qué puede hacer este rol…" />
     </div>
-    <button type="submit">Crear rol</button>
+    <button type="submit" class="btn-primary">Crear rol</button>
     <div class="text-[13px] text-muted">
       El código es el nombre máquina del rol y no se puede cambiar después:
       sólo letras minúsculas, números y guión bajo, empezando con una letra.

@@ -16,7 +16,7 @@
           {# The identifier opens the drawer: the detail fragment swaps into the
              page's `#document-drawer-body` (the route is registered for GET,
              so the wiring guard can prove the target). #}
-          <button type="button" class="font-semibold underline-offset-2 hover:underline" hx-get="/web/documents/detail/{{ v.kind_token }}/{{ v.id }}" hx-target="#document-drawer-body" hx-swap="innerHTML">{{ v.reference }}</button>
+          <button type="button" class="btn-primary font-semibold underline-offset-2 hover:underline" hx-get="/web/documents/detail/{{ v.kind_token }}/{{ v.id }}" hx-target="#document-drawer-body" hx-swap="innerHTML">{{ v.reference }}</button>
           <span class="text-xs text-muted">{{ v.party }}</span>
         </div>
         <span class="text-[13px] text-muted">{{ v.date }} • {{ v.detail }}{% if let Some(name) = v.actor_name %} • {{ name }}{% endif %}</span>
@@ -28,7 +28,7 @@
         {% if let Some(quantity) = v.quantity %}
         <span class="font-bold tabular-nums">{{ quantity }}</span>
         {% endif %}
-        <a href="{{ v.href }}" class="rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline">Open</a>
+        <a href="{{ v.href }}" class="btn-secondary bg-card font-normal no-underline hover:no-underline hover:opacity-100">Open</a>
       </div>
     </div>
     {% endfor %}

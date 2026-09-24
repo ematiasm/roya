@@ -54,7 +54,7 @@
           {% endfor %}
         </select>
       </div>
-      <button type="submit">Pay supplier</button>
+      <button type="submit" class="btn-primary">Pay supplier</button>
       <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered purchase. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account.</div>
     </form>
   </section>
@@ -85,7 +85,7 @@
           <input type="date" name="date" value="{{ today }}" />
         </div>
       </div>
-      <button type="submit">Record Cost</button>
+      <button type="submit" class="btn-primary">Record Cost</button>
       <div class="text-[13px] text-muted">Unknown product ⇒ 400; a date older than the current cost date ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
     </form>
   </section>

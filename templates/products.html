@@ -6,14 +6,14 @@
    right side carries the two New buttons (the list's Refresh control lives in
    the shared filter bar below). #}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">products • inventory • {% if allow_negative_stock %}negative stock allowed{% else %}negative stock blocked{% endif %}</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Products</h2>
   <div class="flex items-center gap-2">
-    <button type="button" onclick="document.getElementById('new-category-dialog').showModal()">New category</button>
-    <button type="button" onclick="document.getElementById('new-product-dialog').showModal()">New product</button>
+    <button type="button" onclick="document.getElementById('new-category-dialog').showModal()" class="btn-primary">New category</button>
+    <button type="button" onclick="document.getElementById('new-product-dialog').showModal()" class="btn-primary">New product</button>
   </div>
 </div>
 
@@ -86,7 +86,7 @@
       <label>Parent ID (optional)</label>
       <input type="number" name="parent_id" placeholder="empty = root" min="1" />
     </div>
-    <button type="submit">Create category</button>
+    <button type="submit" class="btn-primary">Create category</button>
   </form>
 </dialog>
 
@@ -176,7 +176,7 @@
       <label>Notes (optional)</label>
       <input type="text" name="notes" maxlength="1024" />
     </div>
-    <button type="submit">Create product</button>
+    <button type="submit" class="btn-primary">Create product</button>
     <div class="text-[13px] text-muted">Services: untick stock + empty min/max.</div>
   </form>
 </dialog>
@@ -188,7 +188,7 @@
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Product detail</span>
     <div class="flex items-center gap-2">
-      <a class="btn-secondary font-normal" href="/products">All products</a>
+      <a class="btn-secondary font-normal hover:opacity-100" href="/products">All products</a>
       <button type="button" class="btn-secondary" onclick="closeProductDrawer()" aria-label="Close detail">✕</button>
     </div>
   </div>

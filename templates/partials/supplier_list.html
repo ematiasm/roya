@@ -6,7 +6,7 @@
       {% for v in suppliers %}
       <div class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 hover:border-accent2">
         <button type="button"
-                class="min-w-0 flex-1 truncate bg-transparent p-0 text-left font-semibold {% if v.supplier.is_active %}text-text{% else %}text-muted{% endif %}"
+                class="btn-plain min-w-0 flex-1 truncate {% if v.supplier.is_active %}text-text{% else %}text-muted{% endif %}"
                 hx-get="/web/suppliers/{{ v.supplier.id }}/detail"
                 hx-target="#supplier-drawer-body"
                 hx-swap="innerHTML">{{ v.supplier.name }}</button>

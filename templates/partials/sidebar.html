@@ -125,7 +125,7 @@
     {% endif %}
     <div class="truncate md:hidden lg:block">local · SQLite</div>
     <a href="/api/accounts" target="_blank" rel="noreferrer"
-       class="mt-1 inline-block text-[12px] font-normal text-muted no-underline hover:text-text hover:underline">
+       class="link mt-1 inline-block text-[12px] font-normal text-muted hover:text-text">
       <span class="md:hidden lg:inline">REST API ↗</span><span class="hidden md:inline lg:hidden">API</span>
     </a>
     {# Static logout (S1b part 2): a plain POST, no htmx — logout must work
@@ -134,7 +134,7 @@
        gate with a redirect to /login, so the button is harmless when signed
        out. The signed-in user's name renders just above (S7 part 2). #}
     <form method="post" action="/logout" class="mt-2">
-      <button type="submit" class="w-full">Cerrar sesión</button>
+      <button type="submit" class="btn-primary w-full">Cerrar sesión</button>
     </form>
   </div>
 </aside>
