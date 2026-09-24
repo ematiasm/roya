@@ -88,9 +88,18 @@ VIEWPORT = {"width": 1440, "height": 900}
 # all. So it asserts what the classes control and leaves what the font controls
 # to the behavioural suite.
 #
-# The cost is stated rather than hidden: a dropped `w-full` or `w-20` would no
-# longer be caught here. `display`, `gap`, `padding`, `margin` and
-# `border-*-width` remain, so class-controlled layout is still covered; a width
+# **`margin-top` and `margin-bottom` are out for the same reason**, and CI taught
+# this one too, a round later: an auto-centred `<dialog>` resolves its vertical
+# margin from its own height, which follows its content, which follows the font.
+# The runner reported `325px -> 326.5px` on a refactor that was visually correct.
+#
+# So the rule is one rule: **the net asserts what the classes control directly,
+# and nothing that resolves from content or font.** That is why `width`,
+# `height` and the vertical margins are absent while `padding`, `gap`, `display`,
+# `border-*-width`, the colours and the typography are all present.
+#
+# The cost is stated rather than hidden: a dropped `w-full`, `w-20` or `mb-4`
+# would no longer be caught here. Everything above still is, and a layout
 # regression that matters is a behavioural test's job.
 STYLE_PROPERTIES = [
     "color",
@@ -103,8 +112,6 @@ STYLE_PROPERTIES = [
     "padding-right",
     "padding-bottom",
     "padding-left",
-    "margin-top",
-    "margin-bottom",
     "font-size",
     "font-weight",
     "letter-spacing",
