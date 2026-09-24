@@ -12,31 +12,31 @@
 {% block sidebar %}{% endblock %}
 {% block content %}
 <div class="flex min-h-[60vh] items-center justify-center">
-  <div class="w-full max-w-sm rounded-xl border border-border bg-card p-6">
+  <div class="card w-full max-w-sm">
     <h1 class="mb-4 text-lg font-semibold">Iniciar sesión</h1>
 
     {% if let Some(message) = error %}
-    <div class="mb-4 flex items-start justify-between gap-3 rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger"
+    <div class="notice notice-error"
          data-notice="error" role="alert">
       <div class="min-w-0 flex-1 break-words">{{ message }}</div>
-      <button type="button" class="shrink-0 rounded border border-current px-2 py-0.5 text-xs"
+      <button type="button" class="notice-dismiss"
               data-notice-dismiss="true" aria-label="Cerrar">✕</button>
     </div>
     {% endif %}
 
     <form method="post" action="/login" class="flex flex-col gap-3">
-      <input type="hidden" name="next" value="{{ next }}" />
+      <input type="hidden" name="next" value="{{ next }}" class="field" />
       <div>
-        <label for="username">Usuario</label>
+        <label for="username" class="field-label">Usuario</label>
         <input id="username" name="username" type="text" required autofocus
-               autocomplete="username" autocapitalize="none" spellcheck="false" />
+               autocomplete="username" autocapitalize="none" spellcheck="false" class="field" />
       </div>
       <div>
-        <label for="password">Contraseña</label>
+        <label for="password" class="field-label">Contraseña</label>
         <input id="password" name="password" type="password" required
-               autocomplete="current-password" />
+               autocomplete="current-password" class="field" />
       </div>
-      <button type="submit">Iniciar sesión</button>
+      <button type="submit" class="btn-primary">Iniciar sesión</button>
     </form>
   </div>
 </div>

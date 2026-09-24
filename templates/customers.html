@@ -2,15 +2,15 @@
 {% block title %}{{ title }}{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
-  <a href="/sales" class="text-[13px] text-muted">Sales</a>
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
+  <a href="/sales" class="link text-[13px] text-muted">Sales</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">customers • derived balance and ageing</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Customers</h2>
   <div class="flex items-center gap-2">
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">↻ Refresh</button>
-    <button type="button" onclick="document.getElementById('new-customer-dialog').showModal()">New customer</button>
+    <button type="button" class="btn-secondary" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">↻ Refresh</button>
+    <button type="button" onclick="document.getElementById('new-customer-dialog').showModal()" class="btn-primary">New customer</button>
   </div>
 </div>
 <div id="customer-list"
@@ -24,7 +24,7 @@
 <dialog id="new-customer-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
     <h2 class="text-lg font-semibold">New customer</h2>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-customer-dialog').close()">✕</button>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-customer-dialog').close()">✕</button>
   </div>
   <form class="flex flex-col gap-2.5"
         hx-post="/web/customers"
@@ -32,38 +32,38 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label>Name</label>
-      <input type="text" name="name" required maxlength="128" placeholder="Ana Pérez…" />
+      <label class="field-label">Name</label>
+      <input type="text" name="name" required maxlength="128" placeholder="Ana Pérez…" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label>Phone (optional)</label>
-        <input type="text" name="phone" maxlength="32" placeholder="555-1234" />
+        <label class="field-label">Phone (optional)</label>
+        <input type="text" name="phone" maxlength="32" placeholder="555-1234" class="field" />
       </div>
       <div>
-        <label>Tax ID (optional)</label>
-        <input type="text" name="tax_id" maxlength="32" />
+        <label class="field-label">Tax ID (optional)</label>
+        <input type="text" name="tax_id" maxlength="32" class="field" />
       </div>
     </div>
     <div>
-      <label>Address (optional)</label>
-      <input type="text" name="address" maxlength="256" />
+      <label class="field-label">Address (optional)</label>
+      <input type="text" name="address" maxlength="256" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label>Credit limit (empty = no limit)</label>
-        <input type="number" name="credit_limit" step="0.01" min="0" placeholder="unlimited" />
+        <label class="field-label">Credit limit (empty = no limit)</label>
+        <input type="number" name="credit_limit" step="0.01" min="0" placeholder="unlimited" class="field" />
       </div>
       <div>
-        <label>Payment days (empty = no term)</label>
-        <input type="number" name="payment_days" min="0" placeholder="30" />
+        <label class="field-label">Payment days (empty = no term)</label>
+        <input type="number" name="payment_days" min="0" placeholder="30" class="field" />
       </div>
     </div>
     <div>
-      <label>Notes (optional)</label>
-      <input type="text" name="notes" maxlength="512" />
+      <label class="field-label">Notes (optional)</label>
+      <input type="text" name="notes" maxlength="512" class="field" />
     </div>
-    <button type="submit">Create Customer</button>
+    <button type="submit" class="btn-primary">Create Customer</button>
     <div class="text-[13px] text-muted">Duplicate names are allowed; the existing match is reported as a warning. Also at <code>POST /api/customers</code></div>
   </form>
 </dialog>
@@ -76,8 +76,8 @@
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Customer detail</span>
     <div class="flex items-center gap-2">
-      <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/customers">All customers</a>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closeCustomerDrawer()" aria-label="Close detail">✕</button>
+      <a class="btn-secondary font-normal hover:opacity-100" href="/customers">All customers</a>
+      <button type="button" class="btn-secondary" onclick="closeCustomerDrawer()" aria-label="Close detail">✕</button>
     </div>
   </div>
   <div id="customer-drawer-body" class="flex-1 overflow-y-auto p-4">

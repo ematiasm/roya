@@ -1,11 +1,13 @@
 <div>
   <div class="mb-2.5 text-[13px] text-muted">Total: <span class="font-bold text-text">${{ total_balance }}</span> across {{ accounts.len() }} accounts</div>
   {% if accounts.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No accounts yet — create one on the right.</div>
+    <div class="empty">No accounts yet — create one on the right.</div>
   {% else %}
     {% for acc in accounts %}
-    <a href="/accounts/{{ acc.id }}" class="block text-inherit no-underline hover:no-underline">
-      <div class="mb-2.5 flex items-center justify-between rounded-xl border border-border bg-surface px-4 py-3.5 transition-colors hover:border-accent2">
+    {# A row, not a control: the anchor is the row, carrying the flex layout
+       and its colour — the row's appearance is the layout rather than a control's. #}
+    <a href="/accounts/{{ acc.id }}" class="block text-inherit">
+      <div class="card mb-2.5 flex items-center justify-between bg-surface px-4 py-3.5 transition-colors hover:border-accent2">
         <div>
           <div class="font-semibold">{{ acc.name }}</div>
           <div class="text-[13px] text-muted">#{{ acc.id }} • {{ acc.created_at.format("%Y-%m-%d") }}</div>

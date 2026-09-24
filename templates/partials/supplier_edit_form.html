@@ -1,24 +1,24 @@
 <div class="mb-3 flex items-center justify-between gap-6">
   <h2 class="text-lg font-semibold">Edit supplier</h2>
-  <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('supplier-edit-dialog').close()">✕</button>
+  <button type="button" class="btn-secondary" onclick="document.getElementById('supplier-edit-dialog').close()">✕</button>
 </div>
 <form class="flex flex-col gap-2.5"
       hx-post="/web/suppliers/edit"
       hx-target="#supplier-list"
       hx-swap="innerHTML"
       hx-on::after-request="if(event.detail.successful) document.getElementById('supplier-edit-dialog').close()">
-  <input type="hidden" name="id" value="{{ supplier.id }}" />
+  <input type="hidden" name="id" value="{{ supplier.id }}" class="field" />
   <div>
-    <label>Name</label>
-    <input type="text" name="name" required maxlength="128" value="{{ supplier.name }}" />
+    <label class="field-label">Name</label>
+    <input type="text" name="name" required maxlength="128" value="{{ supplier.name }}" class="field" />
   </div>
   <div>
-    <label>Phone (optional)</label>
-    <input type="text" name="phone" maxlength="32" value="{% if let Some(phone) = supplier.phone %}{{ phone }}{% endif %}" />
+    <label class="field-label">Phone (optional)</label>
+    <input type="text" name="phone" maxlength="32" value="{% if let Some(phone) = supplier.phone %}{{ phone }}{% endif %}" class="field" />
   </div>
   <div>
-    <label>Notes (optional)</label>
-    <input type="text" name="notes" maxlength="512" value="{% if let Some(notes) = supplier.notes %}{{ notes }}{% endif %}" />
+    <label class="field-label">Notes (optional)</label>
+    <input type="text" name="notes" maxlength="512" value="{% if let Some(notes) = supplier.notes %}{{ notes }}{% endif %}" class="field" />
   </div>
-  <button type="submit">Save Changes</button>
+  <button type="submit" class="btn-primary">Save Changes</button>
 </form>

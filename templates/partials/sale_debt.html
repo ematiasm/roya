@@ -4,7 +4,7 @@
    panel. #}
 <div id="sale-debt-summary">
   {% if debt.count == 0 %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No outstanding debt.</div>
+    <div class="empty">No outstanding debt.</div>
   {% else %}
     <div class="mb-2 flex flex-wrap items-baseline gap-2">
       <span class="text-2xl font-bold tabular-nums text-expense">{{ debt.total }}</span>
@@ -19,7 +19,7 @@
         <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}Draft sale{% endif %}</span>
         <span class="text-[13px] text-muted">{% if d.sale.customer_name.is_empty() %}Walk-in{% else %}{{ d.sale.customer_name }}{% endif %} • {{ d.sale.sale_date }}{% if let Some(due) = d.sale.due_date %} • due {{ due }}{% endif %} • owed {{ d.due }}</span>
       </div>
-      <a href="/sales/{{ d.sale.id }}" class="rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline">Open</a>
+      <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">Open</a>
     </div>
     {% endfor %}
   {% endif %}

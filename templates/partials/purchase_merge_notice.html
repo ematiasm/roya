@@ -12,21 +12,21 @@
    row's focus contract are untouched. Rendered by `PurchaseMergeNotice` in
    `src/routes/purchases_web.rs`, which names this file in its own comment.
 
-   The box markup mirrors `notice.html` exactly — the same classes,
+   The box markup mirrors `notice.html` exactly — the same components,
    `data-notice="success"`, `role="status"` and the same dismiss button — with
    only the copy parametrized (product name, new quantity). `base.html`
-   cross-references `notice.html` as the JS-side twin of that box; this
-   template reuses only class tokens already present in `notice.html`, so it
-   needs no new Tailwind output and no `scripts/build-css.sh` run. Keep the
-   three copies in step: `notice.html`, this file, and the `notice()` JS box
-   in `base.html`.
+   cross-references `notice.html` as the JS-side twin of that box. All three
+   copies (`notice.html`, this file, and the `notice()` JS box in `base.html`)
+   carry the shared `.notice` / `.notice-success` / `.notice-dismiss`
+   components, so the old "keep the three copies in step" instruction is no
+   longer needed: the components are defined once in `assets/tailwind.css`.
 
    Askama escapes both `{{ product_name }}` and `{{ quantity }}` on output, so
    a name made of markup characters (`<`, `>`, `&`, `"`) reaches the operator
    as text, not HTML. #}
 <div hx-swap-oob="innerHTML:#notice">
-  <div class="mb-4 flex items-start justify-between gap-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3 text-sm text-accent" data-notice="success" data-notice-server="true" role="status">
+  <div class="notice notice-success" data-notice="success" data-notice-server="true" role="status">
     <div class="min-w-0 flex-1 break-words">{{ product_name }} scanned again — merged into the existing line; its quantity is now {{ quantity }}.</div>
-    <button type="button" class="shrink-0 rounded border border-current px-2 py-0.5 text-xs" data-notice-dismiss="true" aria-label="Dismiss">✕</button>
+    <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="Dismiss">✕</button>
   </div>
 </div>

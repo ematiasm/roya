@@ -3,6 +3,6 @@
    locals (`filter_module`, `filter_list`) and the opening shell are documented
    in `partials/list_filters_open.html`, which every including page pairs with
    this half around its own field block. #}
-  <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline" href="/{{ filter_list }}">Clear</a>
-  <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/{{ filter_list }}" hx-include="#{{ filter_module }}-filters" hx-target="#{{ filter_module }}-list" hx-swap="innerHTML">↻ Refresh</button>
+  <a class="btn-secondary font-normal hover:opacity-100" href="/{{ filter_list }}">Clear</a>
+  <button type="button" class="btn-secondary" hx-get="/web/{{ filter_list }}" hx-include="#{{ filter_module }}-filters" hx-target="#{{ filter_module }}-list" hx-swap="innerHTML">↻ Refresh</button>
 </form>

@@ -2,9 +2,9 @@
   {% if let Some(c) = selected %}
   <div class="flex flex-wrap items-center gap-2">
     <span class="font-semibold">{{ c.name }}</span>
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if c.is_active %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{% if c.is_active %}active{% else %}inactive{% endif %}</span>
+    <span class="chip {% if c.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if c.is_active %}active{% else %}inactive{% endif %}</span>
     {% if c.is_walkin %}
-    <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-muted">walk-in</span>
+    <span class="chip chip-muted">walk-in</span>
     {% endif %}
     <span class="text-xs text-muted">{% if let Some(limit) = c.credit_limit %}limit {{ limit }}{% else %}no limit{% endif %}{% if let Some(days) = c.payment_days %} • term {{ days }}d{% endif %}</span>
   </div>

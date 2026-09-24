@@ -1,6 +1,6 @@
 <div id="receipt-list-inner">
   {% if receipts.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No receipts yet — collect with the form.</div>
+    <div class="empty">No receipts yet — collect with the form.</div>
   {% else %}
     {% for r in receipts %}
     <div class="mb-3 rounded-[10px] border border-border bg-surface px-3.5 py-3" id="receipt-{{ r.receipt.id }}">

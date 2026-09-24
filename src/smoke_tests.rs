@@ -3935,13 +3935,16 @@ async fn purchases_dialog_offers_the_last_used_supplier_on_the_list_page() {
     // The primary action is a button that opens the dialog — never a link to
     // a creation page (AC2: none exists).
     let tag = element_tag_containing(page.as_str(), "data-page-action");
+    // `contains("bg-accent")` also matched `bg-accent2`, so the old assertion
+    // could never have caught the blue regression it names. The guard now pins
+    // the component instead: the colour is asserted by the visual net.
     assert!(
         tag.contains("<button")
             && tag.contains(
                 "onclick=\"document.getElementById('new-purchase-dialog').showModal()\""
             )
-            && tag.contains("bg-accent"),
-        "the primary action must open the creation dialog with the mint classes: {tag}"
+            && tag.contains("btn-primary"),
+        "the primary action must open the creation dialog as the primary button component: {tag}"
     );
     assert!(
         page.contains("data-page-action>New purchase</button>"),
@@ -5694,6 +5697,10 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
 /// neutral text, the badge cloud (`payable …`, `settled`, `Cash`,
 /// `Confirmed`) is gone, and the row keeps the S3 peek contract (`hx-get`
 /// into the drawer, never a full navigation).
+///
+/// As T2b, the guard pins the component, not the colour: Rust cannot compute
+/// a style, so the colours themselves are asserted by the visual-neutrality
+/// net's purchase-list-paid/due/overdue states.
 #[tokio::test]
 async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip() {
     let (app, pool) = test_app().await;
@@ -5785,11 +5792,10 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         "{draft_row}"
     );
 
-    // AC1b: the row anchor names the normal text colour itself. The stylesheet
-    // makes every anchor blue (`a { @apply text-accent2 … }`), and because the
-    // whole row is an anchor, the identifier, the supplier and the meta line
-    // inherit that blue unless the row's own class says otherwise — the same
-    // `text-text` products and suppliers name on their rows. Read on the
+    // AC1b: the row anchor names the normal text colour itself. The
+    // `@layer base` `a` rule is deleted, so an anchor can no longer inherit a
+    // colour at all; the row's computed colour is asserted by the
+    // visual-neutrality net, which covers `/purchases`. Read on the
     // row's OPENING tag, not a span inside it: the total's class once passed
     // for the row's colour.
     let draft_tag = purchase_row_opening_tag(&all, draft);
@@ -5797,10 +5803,6 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         draft_tag.contains("text-text"),
         "the row anchor must name the normal text colour so identifier, supplier \
          and meta line stop inheriting the anchor blue: {draft_tag}"
-    );
-    assert!(
-        draft_tag.contains("no-underline hover:no-underline"),
-        "the row keeps its no-underline peek contract: {draft_tag}"
     );
 
     // Exactly one chip per row, and each state gets its own colour. The owed
@@ -5819,12 +5821,12 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         .expect("purchase total")
         .to_string();
     assert!(
-        paid_row.contains(">Paid</span>") && paid_row.contains("text-income"),
+        paid_row.contains(">Paid</span>") && paid_row.contains("chip-income"),
         "a fully paid row carries the bare-word Paid chip in income colour: {paid_row}"
     );
     assert!(
         due_row_html.contains(&format!(">Due {pending_due}</span>"))
-            && due_row_html.contains("text-warning"),
+            && due_row_html.contains("chip-warning"),
         "owed and not yet past due carries the Due chip with the amount owed in warning colour: {due_row_html}"
     );
     assert!(
@@ -5834,7 +5836,7 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
     );
     assert!(
         overdue_row.contains(&format!(">Overdue {overdue_due}</span>"))
-            && overdue_row.contains("text-expense"),
+            && overdue_row.contains("chip-expense"),
         "owed past the due date carries the Overdue chip with the amount owed in expense colour: {overdue_row}"
     );
     assert!(

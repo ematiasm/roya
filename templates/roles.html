@@ -17,14 +17,14 @@
 {% block title %}Roles — Roya{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="text-[13px] text-muted">← Dashboard</a>
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">roles · matriz de permisos</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
   <h2 class="text-lg font-semibold">Roles</h2>
   <div class="flex items-center gap-2">
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/roles" hx-target="#role-list" hx-swap="innerHTML">↻ Actualizar</button>
-    <button type="button" onclick="document.getElementById('new-role-dialog').showModal()">Nuevo rol</button>
+    <button type="button" class="btn-secondary" hx-get="/web/roles" hx-target="#role-list" hx-swap="innerHTML">↻ Actualizar</button>
+    <button type="button" onclick="document.getElementById('new-role-dialog').showModal()" class="btn-primary">Nuevo rol</button>
   </div>
 </div>
 <div id="role-list"
@@ -37,7 +37,7 @@
 <dialog id="new-role-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
     <h2 class="text-lg font-semibold">Nuevo rol</h2>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="document.getElementById('new-role-dialog').close()">✕</button>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-role-dialog').close()">✕</button>
   </div>
   <form class="flex flex-col gap-2.5"
         data-action="Create role"
@@ -46,18 +46,18 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label>Código</label>
-      <input type="text" name="code" required minlength="2" maxlength="64" pattern="[a-z][a-z0-9_]*" placeholder="supervisor…" />
+      <label class="field-label">Código</label>
+      <input type="text" name="code" required minlength="2" maxlength="64" pattern="[a-z][a-z0-9_]*" placeholder="supervisor…" class="field" />
     </div>
     <div>
-      <label>Nombre</label>
-      <input type="text" name="name" required maxlength="128" placeholder="Supervisor…" />
+      <label class="field-label">Nombre</label>
+      <input type="text" name="name" required maxlength="128" placeholder="Supervisor…" class="field" />
     </div>
     <div>
-      <label>Descripción (opcional)</label>
-      <input type="text" name="description" maxlength="256" placeholder="Qué puede hacer este rol…" />
+      <label class="field-label">Descripción (opcional)</label>
+      <input type="text" name="description" maxlength="256" placeholder="Qué puede hacer este rol…" class="field" />
     </div>
-    <button type="submit">Crear rol</button>
+    <button type="submit" class="btn-primary">Crear rol</button>
     <div class="text-[13px] text-muted">
       El código es el nombre máquina del rol y no se puede cambiar después:
       sólo letras minúsculas, números y guión bajo, empezando con una letra.

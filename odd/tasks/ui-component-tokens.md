@@ -1,0 +1,468 @@
+# Feature: UI component tokens — move the styling decision out of the element default
+
+## Objective
+
+Empty `@layer base` of its element opinions and express the interface's real
+components as component classes, so that styling a control is a decision made
+where it is used rather than a fight against a default. The visible result should
+be **nothing**: this is a refactor whose success criterion is that no screen
+changes.
+
+## Problem
+
+Read from the tree on 2026-09-24, after PR #98.
+
+`assets/tailwind.css` styles the bare elements in `@layer base`:
+
+```css
+a      { @apply text-accent2 no-underline hover:underline; }
+button { @apply ... bg-accent ... font-bold text-[#0a0f0d]; }
+label  { @apply block text-[13px] font-semibold tracking-[0.04em] text-muted uppercase; }
+input,
+select,
+textarea { @apply w-full rounded-[10px] border border-border bg-bg ...; }
+```
+
+So every `<a>` in the system is blue, every `<button>` is a mint primary button,
+every `<label>` is uppercase grey, and every input is full width. Every screen
+that wants something else has to override that, and the measurements say most of
+them do:
+
+| Element | Total | Overrides the default |
+|---|---|---|
+| `<button>` | 118 | **73** (62%) |
+| `<a>` | 29 | **14** (48%) |
+| `<input>` | — | **64** with a forced width |
+
+**When 62% of buttons override the button style, that style is not a default — it
+is an exception that was promoted to one.** And because there is no component,
+every author re-types the override: `rounded-[10px] border border-border
+bg-transparent px-2.5 py-1.5 text-xs text-text` appears **61 times, verbatim**,
+in five slightly different variants across 12+ templates.
+
+The two costs:
+
+1. **Inconsistency by construction.** Changing the secondary button's radius
+   means editing 61 places. Miss one and that screen is subtly different, which
+   is what "less aesthetic" looks like from the operator's chair.
+2. **Structural collisions.** `a { text-accent2 }` leaks into anything that
+   becomes an anchor. The repository has already paid for this three times, and
+   its own commit messages say so:
+   - `ac49610` — *"the row became an anchor so it could open the peek, the
+     identifier, the supplier and the meta line all inherited that blue"*.
+   - `c6537d9` — *"the ten buttons carrying `bg-accent2 text-white` were not a
+     second palette — they were **overrides fighting the base style**"*.
+   - `f1e27e7` — *"this is not a new colour choice; it **removes an override
+     that was fighting the base style**"*.
+
+   Each time the fix was to strip the offending classes from that screen, leaving
+   the default in place waiting for the next one. This feature removes the
+   default instead.
+
+**The measured pattern inventory** (the design is derived from these, not from
+imagination):
+
+| Component | Occurrences | The string being repeated |
+|---|---|---|
+| secondary button | **61** | `rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text` |
+| chip | **37** | `rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase` + a colour |
+| empty state | **19** | `rounded-xl border border-dashed border-border ... text-[13px] text-muted` |
+| notice box | **9** | `rounded-xl border border-{accent,danger}/40 bg-{accent,danger}/10 px-4 py-3 text-sm text-{accent,danger}` |
+| danger button | **6** | `rounded-[10px] border border-danger/30 bg-danger/12 ... text-danger` |
+| panel | **3+** | `rounded-xl border border-border bg-card p-6` |
+| borderless row-name button | **3** | `bg-transparent p-0 text-left font-semibold` |
+| menu item | **2** | `block w-full rounded-[10px] bg-transparent px-3 py-2 text-left text-sm` |
+
+## Why
+
+Three reasons, in order of weight:
+
+1. **It removes a defect class rather than a defect.** The anchor-blue row cannot
+   happen again if the anchor has no colour. Two previous fixes were symptoms.
+2. **The notice boxes are duplicated in three places on purpose.** `notice.html`,
+   `purchase_merge_notice.html` and the `notice()` builder in `base.html` carry
+   the same class list, and the repository's own comment says *"Keep the three
+   copies in step"*. With a `.notice` component the three copies become one
+   class, and the instruction to keep them in step stops being needed.
+3. **It makes the next piece of work readable.** The wide-screen layout work
+   touches the same rows. Doing it first would mean every layout diff arrives
+   with 79 characters of classes attached.
+
+## Scope
+
+- `assets/tailwind.css` (the components) and the regenerated `static/tailwind.css`
+- The templates that carry the patterns above — ~20 files
+- `templates/base.html`'s `notice()` JS builder (its class list becomes the
+  component)
+- `static/picker.js`, which builds the results rows and the notice shape from JS
+
+Out of scope: any change to what a screen looks like, the layout/width work, the
+`@theme` palette (it is fine as it is), and the `label`/`input` defaults — those
+are addressed in the design decisions below, not silently dropped.
+
+## Constraints
+
+- **Visual neutrality is the acceptance criterion.** If a screen changes, the
+  refactor failed, even if it looks better.
+- **Tailwind `source(none)`**: `assets/tailwind.css` declares
+  `@source "../templates"` and `@source "../static/picker.js"`. A class that
+  exists only in a file outside those trees is purged.
+- **The compiled stylesheet is committed** and must be regenerated, not
+  hand-edited.
+- **The three notice copies must end up identical**, or the component has not
+  done its job.
+- **`@layer components` beats `@layer base` by layer order**, verified in the
+  compiled output: `properties < theme < base < components < utilities`. So a
+  component class overrides an element default **without `!important`** and
+  without specificity games. This is the mechanism the refactor relies on.
+
+## Locked design decisions
+
+1. **`@layer base` keeps only what is universal**: `body`, and `dialog` (whose
+   comment explains a real preflight collision). The `a`, `button`, `label` and
+   `input`/`select`/`textarea` rules are removed.
+2. **A control with no component class carries no styling.** That is the point:
+   an unstyled control is a visible mistake, not a silent wrong colour.
+3. **Component set**, named after what they are and tied to the existing semantic
+   tokens:
+   - `.btn-primary` — the mint button, exactly the current `button` default.
+   - `.btn-secondary` — the bordered transparent button (61 occurrences).
+   - `.btn-danger` — the destructive variant (6).
+   - `.btn-plain` — the borderless button that names a row (3). Its `p-0` and
+     `text-left` are part of it; the caller keeps only layout classes.
+   - `.chip` plus `.chip-income`, `.chip-expense`, `.chip-warning`, `.chip-muted`
+     (37). The variant names come from the palette tokens so the semantic link
+     is visible at the call site.
+   - `.notice` plus `.notice-success`, `.notice-error` (9), used by all three
+     copies.
+   - `.empty` — the dashed empty-state box (19).
+   - `.card` — the bordered panel (3+).
+   - `.menu-item` — the dropdown row (2).
+   - `.link` — the prose link, exactly the current `a` default.
+4. **`label` and `input` lose their defaults too.** `label`'s uppercase grey is
+   right for forms and wrong for anything else, and `input`'s `w-full` is wrong
+   for the many narrow numeric fields. They become `.field-label` and `.field`,
+   with the call sites naming them. **This is the largest mechanical part of the
+   change and the one most likely to be under-estimated**, so it is its own task.
+5. **No `!important`, no specificity escalation.** If a component does not win,
+   the layer order is being used wrong.
+6. **The components live in `@layer components`**, alongside the existing
+   `.htmx-indicator` pair.
+
+## Acceptance criteria
+
+All seven verified on 2026-09-24 against the tree, not against a report.
+
+- [x] `@layer base` no longer styles `a`, `button`, `label` or
+      `input`/`select`/`textarea`. It holds `body` and `dialog`, nothing else.
+- [x] Every `<button>` and `<a>` in the templates carries a component class, or
+      is deliberately unstyled **with a comment saying why**. Six were not and
+      now are; a seventh candidate was a false positive inside a JS comment.
+- [x] The three notice copies carry the same class, and the "keep the three
+      copies in step" instruction is no longer needed — the copies now cite it
+      as the old instruction rather than as a rule to follow.
+- [x] The 61-occurrence secondary-button string appears **zero** times.
+- [x] **No screen changes**, proven by a computed-style comparison rather than
+      by inspection: 3,609 fingerprinted elements across the pages, states and
+      their hover, passing after every step of every task.
+- [x] The compiled stylesheet is regenerated and committed, and it shrank.
+- [x] `cargo test` green (**885 passed, 0 failed**); `scripts/e2e.sh` green
+      (**101 passed, 4 skipped, 0 failed**); CI green on the pull request.
+
+## Applicable checks
+
+- `cargo test` (primary; `openspec/config.yaml` sets `strict_tdd: true`)
+- `scripts/e2e.sh` — the behavioural suite, which must stay at 100 passed
+- `scripts/build-css.sh` plus a purge assertion for any class that lives only in
+  `static/picker.js`
+- The computed-style comparison (below)
+- CI, once the branch is pushed
+
+## TDD
+
+`strict_tdd: true`, and this is the rare refactor where the honest red is a
+**snapshot**: capture the computed styles of a fixed set of elements across a
+fixed set of pages *before* touching the CSS, commit that as the golden file,
+and let the refactor be red until the rendering matches again.
+
+The snapshot must be taken on the pre-refactor tree. A snapshot taken afterwards
+would record whatever the refactor produced and prove nothing.
+
+## Tasks
+
+- [x] T1 — **The visual-neutrality net.** Closed in `97c04de`. A browser test
+      fingerprints every element's computed style on thirteen screens and
+      compares it to a committed baseline: 2,341 elements, 36 KB compressed,
+      deterministic across consecutive runs. Elements are keyed by **DOM path,
+      not by class** — the classes are what the refactor rewrites, so keying by
+      them would make every entry look changed and the comparison useless — and
+      the baseline was captured from the **pre-refactor tree**, with regeneration
+      behind an environment variable CI never sets.
+      **Proven by mutation, because a net that catches nothing is the vacuous
+      test problem in a new costume**: changing `--color-accent` from `#6ee7b7`
+      to `#6ee7b8`, one digit and invisible to the eye, makes it fail with a
+      readable diff, and it catches the derived `oklab` values of the `/10`
+      opacity variants too. Reverted and verified byte-identical afterwards.
+      The two drawers are reached by clicking rather than by URL: they are
+      fragments, and navigating straight to `/products/detail/{id}` snapshots
+      three elements and proves nothing.
+- [x] T2a — **The button and link components, part one: `.btn-secondary`.**
+      Closed in `755b634`. The 61-occurrence pattern across 29 templates is now
+      one class, and the string appears zero times. **Split from T2 by the
+      inventory**, which found the secondary button has **four sizes**, not one:
+      the small one is 63 of 70 occurrences and is uniform, while the other seven
+      are three variants in three files. Collapsing them would have changed the
+      rendering, and the net would have said so.
+      The component is **self-sufficient from the start** — it carries
+      `cursor-pointer`, `font-bold`, `hover:opacity-90` and the `disabled:` pair
+      that the bare `button` rule gave every button and the repeated pattern never
+      restated — so removing the base rule later moves nothing.
+- [x] T2b — **Buttons and links, part two.** Closed in `bdd87bd`. `.link`,
+      `.btn-primary`, `.btn-danger`, `.btn-plain` and `.menu-item` added and
+      applied to every control still leaning on the base: 135 of 141 now carry a
+      component. The twelve without are five notice dismiss buttons (T4's job),
+      six rows and logos unstyled by design, and one false positive from a
+      comment.
+      **The net disagreed with the plan in four places, which is the useful
+      part**: three `bg-card` anchor-as-buttons would have gone 400 → 700 weight
+      (they keep `font-normal`) and gained `hover:opacity-90` where the baseline
+      says 1 (they opt out with `hover:opacity-100`); and five medium/default
+      secondaries needed `text-base`, because the base button computes **16px**
+      and the component's `text-xs` is not what they were.
+      **The two Rust guards moved to the component.** `f1e27e7` pinned the page
+      action's colour by grepping markup for `bg-accent`, because Rust cannot
+      compute a style. It can be computed by the net now, so the guards assert
+      `btn-primary` and the colour is left to the net; a call site restating
+      `bg-accent` would have preserved the anti-pattern this refactor removes.
+      A latent weakness fell out: `contains("bg-accent")` also matches
+      `bg-accent2`, so the smoke guard could never have caught the blue
+      regression it named.
+- [ ] T2c — **Close the net's page gap.** Not a refactor task: a verification task
+      that must land before the base rules can go. The net covers nine pages plus
+      the two drawers and the two record pages, and it does **not** cover `/login`,
+      `/password`, `/forbidden`, or any state where a notice box renders. The five
+      notice dismiss buttons live only there, so the net is blind to them — and it
+      proved it: removing the `@layer base` `a` and `button` rules, the net
+      **passed**, while those five controls depend on the base for their `bg-accent`,
+      dark label, weight and cursor. Verified rather than argued: the baseline
+      contains **zero** elements with the dismiss button's signature (4px radius,
+      1px border, 8/8 padding), so nothing there is covered.
+      Add the missing pages and the notice state, capture their fingerprints from
+      the current tree (the rendering is correct today), and only then is the base
+      removal provable.
+- [x] T6 — **Remove the `@layer base` element rules.** Closed in `0c3491e`, plus
+      the guard fix and the six rationale comments in `8dd5e33`. Four of the six
+      base rules are gone; `body` and `dialog` stay. The eleven
+      `no-underline hover:no-underline` overrides went with them, in two groups
+      with the net after each and nothing going back. The stylesheet shrank from
+      28,855 to 27,571 bytes and the compiled output shed `.no-underline` and
+      `.hover\:no-underline` entirely.
+      **The guard that blocked it was pinning a fight that was already over**: it
+      asserted the literal `no-underline hover:no-underline` under a comment
+      saying the stylesheet makes every anchor blue, and the baseline says **214
+      anchors, zero of them blue** — before this refactor. The comment described
+      a mechanism with no effect. Both are gone; `text-text` stays because it
+      still pins real markup and the row's colour is now asserted by the net.
+- [ ] T3 — **The chip component.** `.chip` plus its four variants, 37
+      occurrences.
+- [ ] T4 — **The boxes.** `.notice` (all three copies), `.notice-success`,
+      `.notice-error`, `.empty`, `.card`.
+- [ ] T5 — **The form controls.** `label` → `.field-label`, `input` → `.field`,
+      across the templates. Deliberately last: it is the widest mechanical change
+      and the one most likely to hide a visual difference, so it happens with the
+      net already in place and everything else stable.
+
+## Delivery strategy
+
+Five tasks, and each is independently revertible because the net lands first.
+T2 is the highest-value slice and could ship alone; T5 is the riskiest and ships
+last.
+
+## Progress
+
+- 2026-09-24: document created. The pattern inventory was measured from the
+  templates rather than guessed, which changed the design: the chip turned out to
+  be as large as the button (37 occurrences), and the notice duplication across
+  three files turned out to be a bigger win than the class-list length alone
+  suggested.
+- 2026-09-24: T1 closed in `97c04de`. The net is in place and proven by mutation
+  before a single class was touched, which is the only order that works: a
+  baseline captured after the refactor records the refactor and proves nothing.
+
+## Lesson: a net dimension added after changes landed records those changes as correct
+
+T1 built the resting-state net and captured its baseline before anything moved,
+which is the only order that works. The hover dimension was added later — in
+`4d33edb`, after T2a had already landed — and the baseline therefore recorded
+T2a's own hover change as if it were the original: seven anchors gained
+`hover:opacity-90` from `.btn-secondary` and the net called that correct.
+
+It was caught by a worker reasoning about the ordering, then **verified against
+the pre-refactor CSS rather than by argument**: the only opacity rule that can
+touch a control at `f1610a6` is
+`@media (hover:hover){button:hover{opacity:.9}}`, which does not match an
+anchor, so the correct value is 1. The seven sites were fixed, the net was run
+and **failed with exactly the four contaminated paths moving 0.9 → 1 and
+nothing else**, and only then was the baseline regenerated.
+
+The generalisation: **extend a net in the same commit as the baseline it
+needs, or accept that the baseline is a record of the tree at capture time, not
+of the original.** And when a baseline must be regenerated, make the failing run
+prove the correction first — a baseline regenerated to make a red test green is
+not evidence, but one regenerated after confirming the failure is exactly the
+intended correction is.
+
+## Lesson: a net is only as wide as the pages it visits
+
+T2c was written as "remove the base `a` and `button` rules, now that every
+control has a component". Removing them to test that claim, the net **passed** —
+and the pass was worthless. The five notice dismiss buttons depend on the base
+for their background, label colour, weight and cursor, and they live on
+`/login`, `/password`, `/forbidden` and the two notice templates, **none of which
+the net visits**. Verified rather than argued: the baseline holds **zero**
+elements with the dismiss button's signature.
+
+Two separate failures, and both had to be named:
+
+1. **A coverage gap.** A net that does not visit a page cannot protect it, and a
+green run over an uncovered page is indistinguishable from a correct one. This
+is the same shape as the vacuous test, one level up: not "the assertion cannot
+fail", but "the assertion was never made".
+2. **A task ordered by dependency it did not have.** The base removal was placed
+as the second half of the buttons task because it is about buttons. It actually
+depends on **every** component existing, including the chip, the boxes and the
+form controls, so it belongs last.
+
+The reusable rule: **when a refactor ends by deleting the thing everything
+leaned on, the deletion is the last task and its precondition is a count, not an
+intuition** — every call site has the new thing. And before trusting the net to
+prove that count, check that the net visits every page where those call sites
+live.
+
+## Verification evidence
+
+- **T1, the net catches a real change**: `--color-accent` `#6ee7b7` → `#6ee7b8`
+  (one digit, invisible to the eye) failed with
+  `color: 'rgb(110, 231, 183)' -> 'rgb(110, 231, 184)'` and the same for
+  `border-top-color` and `background-color`, plus
+  `background-color: 'oklab(0.845178 -0.125467 0.0336939 / 0.1)' ->
+  'oklab(0.845427 -0.125022 0.0324349 / 0.1)'` — so a token change propagates
+  into the alpha-composited colours where reading would never find it. Reverted
+  and both CSS files verified byte-identical.
+- **T1, determinism checked rather than assumed**: two consecutive runs both
+  pass in the same 9.03s. A flaky net would be worse than none, because it
+  would teach people to re-run until green.
+- **T1, size**: 1,391,684 bytes uncompressed, **36 KB gzipped**, which is what
+  lands in the repository — smaller than the committed `Cargo.lock`.
+- **T1, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed** (100 plus
+  the net).
+- **T1, the message outlives the refactor**: it says that an unintended change
+  means the diff is the defect, an intended one means regenerating deliberately
+  and saying so in the commit, and that a baseline regenerated to make a red
+  test green is not evidence.
+- **T2a, the net earned its keep on its first real task.** `font-bold` on the
+  component changed **seven call sites that are anchors wearing button clothes**
+  — the drawer "All products / All customers / Todos los documentos" links, the
+  filter bar's "Clear", the notice's "Clear filter", the document "Abrir" link.
+  The bare `button` rule made buttons bold, but the bare `a` rule sets no
+  font-weight, so those anchors were 400 and the component made them 700. The net
+  reported `font-weight: '400' -> '700'` with the exact DOM paths. Fixed with
+  `font-normal` at those seven sites, **not** by regenerating the baseline.
+  This is the case the whole net was built for: a one-property change on seven
+  elements out of 2,341, invisible to any reading of the diff.
+- **T2a, a layering mistake caught before it could matter**: the first draft put
+  the component rule *outside* `@layer components`, and the compiled bytes showed
+  it landing unlayered after the utilities — which would have inverted the
+  precedence the refactor depends on. Found by inspecting the compiled output
+  rather than by a failing test.
+- **T2a, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed**; the net
+  passes. The old pattern greps empty and `btn-secondary` appears exactly 61
+  times.
+- **T2b, the net disagreed with the plan four times, and each is a rendering
+  change the plan would have shipped**: three `bg-card` anchor-as-buttons
+  400 → 700 weight; the same three gaining `hover:opacity-90` where the baseline
+  says 1; and five medium/default secondaries needing `text-base` because the
+  base button computes 16px. None of the four is visible by reading a diff.
+- **T2b, the baseline regeneration was controlled**: the net failed with
+  **exactly four entries**, all `opacity: 0.9 → 1` on anchor hover paths, no
+  resting-state entry and no other property. Verified by diffing the baseline
+  before and after, not by trusting the report.
+- **T2b, green (orchestrator-verified)**: `cargo test` → **885 passed,
+  0 failed**; `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed**; the net
+  passes; `bg-accent` greps empty in `page_header.html`; both guards assert
+  `btn-primary`.
+- **T2b, the guards' reason for existing changed**: they were built because Rust
+  cannot compute a style. The net can, so they now pin the component and the
+  colour is asserted where it is actually visible. Keeping a call site
+  restating `bg-accent` to satisfy the old grep would have preserved the exact
+  anti-pattern the repository's own commit messages call *"an override fighting
+  the base style"*.
+- **T2c is blocked, and the net proved its own blindness**: with the `@layer base`
+  `a` and `button` rules removed and the stylesheet rebuilt, the net **passed**.
+  It passed because the five notice dismiss buttons — which depend on the base for
+  `bg-accent`, the dark label, the weight and the cursor — live on `/login`,
+  `/password`, `/forbidden` and the two notice templates, and the net visits none
+  of them. Confirmed by counting: **zero** elements in the baseline carry the
+  dismiss button's signature (4px radius, 1px border, 8/8 padding). The temporary
+  removal was reverted and both CSS files verified byte-identical.
+  This is the finding of the task, and it is the reason the base removal moved to
+  last: it is a pure deletion only once **every** component exists, and the chip,
+  the boxes and the form controls do not yet.
+- **T6, the inverse mutation passed**: with the `label` and `input, select,
+  textarea` base rules removed and the stylesheet rebuilt, the net **passed** —
+  reproduced by the orchestrator independently, with the CSS reverted and the
+  base rules verified back in place. That pass is the evidence the deletion was
+  safe rather than hopeful.
+- **T6, a prediction of the brief was falsified by the same experiment**: the
+  brief said `type="hidden"` inputs could be skipped because they are not
+  painted. The net failed on exactly those, because `getComputedStyle` resolves
+  the base rule's properties for a `display:none` element and the net
+  fingerprints every element. **Not painted is not the same as not computed.**
+  All 27 now carry `.field`.
+- **T6, the guard was pinning a fight that was already over**: it asserted the
+  literal `no-underline hover:no-underline` under a comment claiming the
+  stylesheet makes every anchor blue. The baseline says **214 anchors, zero of
+  them blue** — measured before this refactor. The comment described a mechanism
+  with no effect in practice, and the assertion defended its defence.
+- **T6, green (orchestrator-verified)**: `cargo test` → **885 passed, 0 failed**;
+  `scripts/e2e.sh` → **101 passed, 4 skipped, 0 failed**; the net passes;
+  `@layer base` holds only `body` and `dialog`; the stylesheet is 27,571 bytes
+  from 28,855; and `no-underline` greps zero across `templates/`.
+
+## Outcome
+
+**Visible result: nothing.** That was the criterion and it held — 3,609
+fingerprinted elements across thirteen pages, four record states, three notice
+states, three purchase-list payment states and a picker no-match state, each with
+their hover, and none of them moved at any point.
+
+What changed is where a styling decision lives. `@layer base` used to give every
+bare element an opinion — every anchor blue and underlined on hover, every button
+a mint primary, every label uppercase grey, every field full-width and bordered —
+and every screen that wanted something else overrode it by hand: 62% of buttons
+and 48% of anchors did, and the same nine-class string was re-typed 61 times.
+That is now 19 components, and a control that wants something else says so at the
+call site instead of fighting a default.
+
+**The defect class is gone rather than fixed.** The anchor has no colour any
+more, so the row that inherited the anchor's blue cannot happen again. Three
+previous fixes had been symptoms; this one removes the mechanism.
+
+Deleted: the four base element rules, 61 copies of the secondary-button string,
+37 re-typed chips, the notice box duplicated in three places along with the
+instruction to keep them in step, six identical dismiss buttons, and eleven
+overrides whose only job was to fight the base. The compiled stylesheet went from
+28,855 to 27,571 bytes.
+
+Kept on purpose: `body` and `dialog` in the base, the six controls that are rows
+or wordmarks rather than controls (now each saying why), and the components'
+self-sufficiency — every one carries what the base gave its element, which is
+what made the deletion provable instead of hopeful.
+
+**Left for a separate decision, reported rather than fixed**: the 7 checkboxes
+and 2 radios carry `.field`, because the base styled them as text fields today —
+`w-full`, a 1px border, a 10px radius and field padding. That is the current
+rendering and this refactor preserves it exactly, but it is odd design and
+deserves its own decision.

@@ -6,17 +6,17 @@
 <div id="document-list-inner">
   <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ rows.len() }} documents</div>
   {% if rows.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">Nothing here yet.</div>
+    <div class="empty">Nothing here yet.</div>
   {% else %}
     {% for v in rows %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" data-document-kind="{{ v.kind.token() }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ v.kind_label }}</span>
+          <span class="chip border-border">{{ v.kind_label }}</span>
           {# The identifier opens the drawer: the detail fragment swaps into the
              page's `#document-drawer-body` (the route is registered for GET,
              so the wiring guard can prove the target). #}
-          <button type="button" class="font-semibold underline-offset-2 hover:underline" hx-get="/web/documents/detail/{{ v.kind_token }}/{{ v.id }}" hx-target="#document-drawer-body" hx-swap="innerHTML">{{ v.reference }}</button>
+          <button type="button" class="btn-primary font-semibold underline-offset-2 hover:underline" hx-get="/web/documents/detail/{{ v.kind_token }}/{{ v.id }}" hx-target="#document-drawer-body" hx-swap="innerHTML">{{ v.reference }}</button>
           <span class="text-xs text-muted">{{ v.party }}</span>
         </div>
         <span class="text-[13px] text-muted">{{ v.date }} • {{ v.detail }}{% if let Some(name) = v.actor_name %} • {{ name }}{% endif %}</span>
@@ -28,7 +28,7 @@
         {% if let Some(quantity) = v.quantity %}
         <span class="font-bold tabular-nums">{{ quantity }}</span>
         {% endif %}
-        <a href="{{ v.href }}" class="rounded-[10px] border border-border bg-card px-2.5 py-1.5 text-xs text-text no-underline hover:no-underline">Open</a>
+        <a href="{{ v.href }}" class="btn-secondary bg-card font-normal hover:opacity-100">Open</a>
       </div>
     </div>
     {% endfor %}

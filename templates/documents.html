@@ -23,16 +23,16 @@
   {% let filter_module = "document" %}
   {% let filter_list = "documents" %}
   {% include "partials/list_filters_open.html" %}
-    <select class="min-w-[130px] flex-1" name="group">
+    <select class="field min-w-[130px] flex-1" name="group">
       <option value="">All types</option>
       {% for g in groups %}
       <option value="{{ g.token }}" data-document-group="{{ g.token }}" {% if g.selected %}selected{% endif %}>{{ g.label }}</option>
       {% endfor %}
     </select>
-    <input class="min-w-[120px] flex-1" type="text" name="user" placeholder="User" value="{{ filter_user }}" />
-    <input class="min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
-    <input class="min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
-    <input class="min-w-[150px] flex-1" type="text" name="q" placeholder="Search number or counterpart" value="{{ filter_q }}" />
+    <input class="field min-w-[120px] flex-1" type="text" name="user" placeholder="User" value="{{ filter_user }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+    <input class="field min-w-[150px] flex-1" type="text" name="q" placeholder="Search number or counterpart" value="{{ filter_q }}" />
   {% include "partials/list_filters_close.html" %}
   {# `hx-history-elt` snapshots only the list on a history push, so Back
      restores the previous list instead of re-fetching it from a filter form
@@ -56,8 +56,8 @@
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Documento</span>
     <div class="flex items-center gap-2">
-      <a class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" href="/documents">Todos los documentos</a>
-      <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closeDocumentDrawer()" aria-label="Close detail">✕</button>
+      <a class="btn-secondary font-normal hover:opacity-100" href="/documents">Todos los documentos</a>
+      <button type="button" class="btn-secondary" onclick="closeDocumentDrawer()" aria-label="Close detail">✕</button>
     </div>
   </div>
   <div id="document-drawer-body" class="flex-1 overflow-y-auto p-4"></div>

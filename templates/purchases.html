@@ -18,16 +18,16 @@
       {% let filter_module = "purchase" %}
       {% let filter_list = "purchases" %}
       {% include "partials/list_filters_open.html" %}
-        <select class="min-w-[110px] flex-1" name="status">
+        <select class="field min-w-[110px] flex-1" name="status">
           <option value="">All statuses</option>
           <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>Draft</option>
           <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>Confirmed</option>
           <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>Cancelled</option>
         </select>
-        <input class="min-w-[120px] flex-1" type="text" name="supplier" placeholder="Supplier" value="{{ filter_supplier }}" />
-        <input class="min-w-[120px] flex-1" type="text" name="number" placeholder="Purchase number" value="{{ filter_number }}" />
-        <input class="min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
-        <input class="min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+        <input class="field min-w-[120px] flex-1" type="text" name="supplier" placeholder="Supplier" value="{{ filter_supplier }}" />
+        <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="Purchase number" value="{{ filter_number }}" />
+        <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
+        <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
       {% include "partials/list_filters_close.html" %}
       {# `hx-history-elt` snapshots only the list on a history push, so Back restores the
          previous list instead of re-fetching it from a filter form that already holds
@@ -50,7 +50,7 @@
     <div class="rounded-2xl border border-border bg-card p-5" id="suggestion-section">
       <div class="mb-3 flex items-center justify-between">
         <h2 class="text-lg font-semibold">Suggestions</h2>
-        <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" hx-get="/web/purchases/suggestions" hx-target="#suggestion-list" hx-swap="innerHTML">↻ Refresh</button>
+        <button class="btn-secondary" hx-get="/web/purchases/suggestions" hx-target="#suggestion-list" hx-swap="innerHTML">↻ Refresh</button>
       </div>
       <div id="suggestion-list"
            hx-get="/web/purchases/suggestions"
@@ -95,7 +95,7 @@
     {% call supplier_picker::supplier_picker("/web/purchases", "#new-purchase-dialog", "new-purchase-supplier", current_supplier_name, "") %}
     <form hx-post="/web/purchases" hx-include="#new-purchase-supplier" hx-swap="none"
           data-action="Create purchase" class="flex flex-col gap-2.5">
-      <button type="submit">Create draft</button>
+      <button type="submit" class="btn-primary">Create draft</button>
       <p class="text-[13px] text-muted">Creating opens the new draft's page.</p>
     </form>
   </div>
@@ -108,7 +108,7 @@
 <div id="purchase-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
     <span class="text-sm font-semibold">Purchase</span>
-    <button type="button" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text" onclick="closePurchaseDrawer()" aria-label="Close detail">✕</button>
+    <button type="button" class="btn-secondary" onclick="closePurchaseDrawer()" aria-label="Close detail">✕</button>
   </div>
   <div id="purchase-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
 </div>

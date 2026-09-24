@@ -15,7 +15,7 @@
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
   {% if record.lines.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-3 text-center text-[13px] text-muted">No lines yet{% if record.sale.status.to_string() == "Draft" %} — add one below.{% else %}.{% endif %}</div>
+    <div class="empty p-3">No lines yet{% if record.sale.status.to_string() == "Draft" %} — add one below.{% else %}.{% endif %}</div>
   {% else %}
     <div class="overflow-x-auto">
       <table class="w-full border-collapse text-sm">
@@ -40,7 +40,7 @@
             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">${{ line.subtotal }}</td>
             {% if record.sale.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
-              <button class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text"
+              <button class="btn-secondary"
                       hx-delete="/web/sales/{{ record.sale.id }}/lines/{{ line.id }}"
                       hx-target="#sale-record" hx-swap="innerHTML"
                       aria-label="Remove line">✕</button>
@@ -57,8 +57,8 @@
 
 <div id="sale-record-inner" data-sale-record>
   <div class="mb-3 flex flex-wrap items-center gap-2">
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.sale.status.to_string() == "Confirmed" %}border-income/30 bg-income/15 text-income{% else if record.sale.status.to_string() == "Cancelled" %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.sale.status }}</span>
-    <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if record.payment_status.to_string() == "Paid" %}border-income/30 bg-income/15 text-income{% else %}border-expense/30 bg-expense/12 text-expense{% endif %}">{{ record.payment_status }}</span>
+    <span class="chip {% if record.sale.status.to_string() == "Confirmed" %}chip-income{% else if record.sale.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{{ record.sale.status }}</span>
+    <span class="chip {% if record.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{{ record.payment_status }}</span>
     <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.sale.payment_type }}</span>
     <span class="text-base font-bold">
       {% if let Some(n) = record.sale.sale_number %}{{ n }}{% else %}Draft sale{% endif %}
@@ -127,15 +127,15 @@
             hx-post="/web/sales/{{ record.sale.id }}/confirm"
             hx-target="#sale-record" hx-swap="innerHTML">
         <div>
-          <label for="confirm-method">Method (Cash only; the account is derived from it)</label>
-          <select id="confirm-method" name="method_id">
+          <label for="confirm-method" class="field-label">Method (Cash only; the account is derived from it)</label>
+          <select id="confirm-method" name="method_id" class="field">
             <option value="">— none (Credit) —</option>
             {% for m in method_options %}
             <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
             {% endfor %}
           </select>
         </div>
-        <button type="submit">Confirm</button>
+        <button type="submit" class="btn-primary">Confirm</button>
       </form>
     </div>
 
@@ -146,23 +146,23 @@
             hx-target="#sale-record" hx-swap="innerHTML">
         <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
-            <label for="header-sale-date">Sale date</label>
-            <input type="date" id="header-sale-date" name="sale_date" required value="{{ record.sale.sale_date }}" />
+            <label for="header-sale-date" class="field-label">Sale date</label>
+            <input type="date" id="header-sale-date" name="sale_date" required value="{{ record.sale.sale_date }}" class="field" />
           </div>
           <div>
-            <label for="header-due-date">Due date (Credit only)</label>
-            <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.sale.due_date %}{{ due }}{% endif %}" />
+            <label for="header-due-date" class="field-label">Due date (Credit only)</label>
+            <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.sale.due_date %}{{ due }}{% endif %}" class="field" />
           </div>
         </div>
         <div>
-          <label for="header-receipt-no">Receipt no (optional)</label>
-          <input type="text" id="header-receipt-no" name="receipt_no" maxlength="64" value="{% if let Some(r) = record.sale.receipt_no %}{{ r }}{% endif %}" />
+          <label for="header-receipt-no" class="field-label">Receipt no (optional)</label>
+          <input type="text" id="header-receipt-no" name="receipt_no" maxlength="64" value="{% if let Some(r) = record.sale.receipt_no %}{{ r }}{% endif %}" class="field" />
         </div>
         <div>
-          <label for="header-notes">Notes</label>
-          <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.sale.notes }}" />
+          <label for="header-notes" class="field-label">Notes</label>
+          <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.sale.notes }}" class="field" />
         </div>
-        <button type="submit">Save header</button>
+        <button type="submit" class="btn-primary">Save header</button>
       </form>
     </div>
 
@@ -173,10 +173,10 @@
             hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
             hx-target="#sale-record" hx-swap="innerHTML">
         <div>
-          <label for="discard-reason">Reason (optional)</label>
-          <input type="text" id="discard-reason" name="reason" maxlength="256" />
+          <label for="discard-reason" class="field-label">Reason (optional)</label>
+          <input type="text" id="discard-reason" name="reason" maxlength="256" class="field" />
         </div>
-        <button type="submit" class="border border-border bg-transparent text-text">Discard draft</button>
+        <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Discard draft</button>
       </form>
     </div>
   </div>
@@ -190,8 +190,8 @@
               hx-post="/web/sales/{{ record.sale.id }}/payments"
               hx-target="#sale-record" hx-swap="innerHTML">
           <div>
-            <label for="payment-method">Method (the account is derived from it)</label>
-            <select id="payment-method" name="method_id" required>
+            <label for="payment-method" class="field-label">Method (the account is derived from it)</label>
+            <select id="payment-method" name="method_id" required class="field">
               {% for m in method_options %}
               <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
               {% endfor %}
@@ -199,15 +199,15 @@
           </div>
           <div class="flex gap-2.5 [&>*]:flex-1">
             <div>
-              <label for="payment-amount">Amount</label>
-              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+              <label for="payment-amount" class="field-label">Amount</label>
+              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
             </div>
             <div>
-              <label for="payment-date">Date</label>
-              <input type="date" id="payment-date" name="date" required value="{{ today }}" />
+              <label for="payment-date" class="field-label">Date</label>
+              <input type="date" id="payment-date" name="date" required value="{{ today }}" class="field" />
             </div>
           </div>
-          <button type="submit">Record payment</button>
+          <button type="submit" class="btn-primary">Record payment</button>
         </form>
       </div>
       {% endif %}
@@ -219,10 +219,10 @@
               hx-confirm="Cancel this sale? Stock returns and recorded payments are refunded."
               hx-target="#sale-record" hx-swap="innerHTML">
           <div>
-            <label for="cancel-reason">Reason</label>
-            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="customer return…" />
+            <label for="cancel-reason" class="field-label">Reason</label>
+            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="customer return…" class="field" />
           </div>
-          <button type="submit" class="border border-border bg-transparent text-text">Cancel sale</button>
+          <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Cancel sale</button>
         </form>
       </div>
     </div>
@@ -236,7 +236,7 @@
        and renders nothing here — the service would refuse anyway. #}
     <div class="mt-3 mb-1">
       <button type="button"
-              class="rounded-[10px] border border-danger/30 bg-danger/12 px-3.5 py-2 text-sm text-danger"
+              class="btn-danger"
               data-action="Delete sale"
               hx-delete="/web/sales/{{ record.sale.id }}"
               hx-confirm="Delete this discarded sale? This cannot be undone."

@@ -32,9 +32,9 @@
 <div aria-live="off">
 {% if matches.is_empty() %}
   {% if query.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">Type a supplier name.</div>
+    <div class="empty px-3.5 py-2.5 text-start">Type a supplier name.</div>
   {% else %}
-    <div class="rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted">No suppliers match "{{ query }}".</div>
+    <div class="empty px-3.5 py-2.5 text-start">No suppliers match "{{ query }}".</div>
   {% endif %}
 {% else %}
   <div class="flex flex-col gap-1.5">
@@ -43,10 +43,10 @@
       <form hx-post="{{ action }}"
             {% if !include.is_empty() %}hx-include="{{ include }}"{% endif %}
             hx-target="{{ target }}" hx-swap="outerHTML" hx-select="{{ target }}">
-        <input type="hidden" name="supplier_id" value="{{ s.id }}" />
+        <input type="hidden" name="supplier_id" value="{{ s.id }}" class="field" />
         <button type="submit"
                 data-supplier-id="{{ s.id }}"
-                class="flex w-full items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-left text-sm {% if s.is_active %}text-text{% else %}text-muted{% endif %}">
+                class="btn-secondary flex w-full items-center justify-between gap-3 bg-surface text-left text-sm {% if s.is_active %}text-text{% else %}text-muted{% endif %}">
           <span class="min-w-0 truncate font-semibold">{{ s.name }}</span>
           {% if !s.is_active %}<span class="shrink-0 text-xs text-muted">inactive</span>{% endif %}
         </button>

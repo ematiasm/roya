@@ -3,7 +3,7 @@
   <section class="rounded-2xl border border-border bg-card p-5">
     {% if over_limit %}
     <div class="mb-3">
-      <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">over limit</span>
+      <span class="chip chip-expense">over limit</span>
     </div>
     {% endif %}
     {% include "partials/customer_statement.html" %}
@@ -11,19 +11,19 @@
     <div class="mt-4 flex items-center gap-2">
       {% if c.is_active %}
       <form hx-post="/web/customers/deactivate" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
-        <input type="hidden" name="customer_id" value="{{ c.id }}" />
-        <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Deactivate</button>
+        <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
+        <button type="submit" class="btn-secondary">Deactivate</button>
       </form>
       {% else %}
       <form hx-post="/web/customers/activate" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
-        <input type="hidden" name="customer_id" value="{{ c.id }}" />
-        <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Activate</button>
+        <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
+        <button type="submit" class="btn-secondary">Activate</button>
       </form>
       {% endif %}
       {% if !c.is_walkin %}
       <form hx-post="/web/customers/delete" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
-        <input type="hidden" name="customer_id" value="{{ c.id }}" />
-        <button type="submit" class="rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs text-text">Delete</button>
+        <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
+        <button type="submit" class="btn-secondary">Delete</button>
       </form>
       {% endif %}
     </div>
@@ -36,30 +36,30 @@
           hx-target="#customer-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">
-      <input type="hidden" name="customer_id" value="{{ c.id }}" />
+      <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Amount</label>
-          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+          <label class="field-label">Amount</label>
+          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label>Date</label>
-          <input type="date" name="date" required value="{{ today }}" />
+          <label class="field-label">Date</label>
+          <input type="date" name="date" required value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label>Method (the account is derived from it)</label>
-        <select name="method_id" required>
+        <label class="field-label">Method (the account is derived from it)</label>
+        <select name="method_id" required class="field">
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
           {% endfor %}
         </select>
       </div>
       <div>
-        <label>Notes (optional)</label>
-        <input type="text" name="notes" placeholder="…" maxlength="256" />
+        <label class="field-label">Notes (optional)</label>
+        <input type="text" name="notes" placeholder="…" maxlength="256" class="field" />
       </div>
-      <button type="submit">Collect</button>
+      <button type="submit" class="btn-primary">Collect</button>
       <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered sale grouped under the new receipt. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account.</div>
     </form>
   </section>
@@ -74,7 +74,7 @@
       <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">{{ d.payment_status }}</span>
+            <span class="chip chip-expense">{{ d.payment_status }}</span>
             <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}sale #{{ d.sale.id }}{% endif %}</span>
           </div>
           <span class="text-[13px] text-muted">{{ d.sale.sale_date }}{% if let Some(due) = d.sale.due_date %} • due {{ due }}{% endif %} • total {{ d.total }} • paid {{ d.paid }}</span>
@@ -92,7 +92,7 @@
       <div class="mb-1.5 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3 py-2">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if e.debit.is_sign_positive() %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{{ e.description }}</span>
+            <span class="chip {% if e.debit.is_sign_positive() %}chip-expense{% else %}chip-income{% endif %}">{{ e.description }}</span>
             {% if let Some(n) = e.document_number %}
             <span class="text-xs text-muted">{{ n }}</span>
             {% endif %}

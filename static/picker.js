@@ -98,7 +98,7 @@
       // add-line form implicitly; the island triggers it deliberately.
       btn.type = 'button';
       btn.className =
-        'flex w-full select-none items-center justify-between gap-3 rounded-[10px] border border-border bg-surface px-3.5 py-2.5 text-left text-sm text-text';
+        'btn-secondary flex w-full select-none items-center justify-between gap-3 bg-surface text-left text-sm';
       btn.setAttribute('data-product-id', String(product.id));
       var name = document.createElement('span');
       name.className = 'min-w-0 truncate font-semibold';
@@ -125,8 +125,7 @@
       if (state.matches.length === 0) {
         if (state.status !== 'done') return null;
         var empty = document.createElement('div');
-        empty.className =
-          'rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted';
+        empty.className = 'empty px-3.5 py-2.5 text-start';
         empty.textContent =
           state.query === ''
             ? 'Type a name, SKU or barcode.'

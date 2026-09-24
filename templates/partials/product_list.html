@@ -1,17 +1,17 @@
 <div id="product-list-inner">
   <div class="mb-2.5 text-[13px] text-muted">{{ products.len() }} products • stock derived from movements</div>
   {% if products.is_empty() %}
-    <div class="rounded-xl border border-dashed border-border p-4 text-center text-[13px] text-muted">No products yet — use the New product button.</div>
+    <div class="empty">No products yet — use the New product button.</div>
   {% else %}
     {% for ps in products %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="product-{{ ps.product.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="rounded-full border px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase {% if ps.product.kind.to_string() == "Service" %}border-expense/30 bg-expense/12 text-expense{% else %}border-income/30 bg-income/15 text-income{% endif %}">{{ ps.product.kind }}</span>
+          <span class="chip {% if ps.product.kind.to_string() == "Service" %}chip-expense{% else %}chip-income{% endif %}">{{ ps.product.kind }}</span>
           {# The name is the drawer trigger: the same button-as-row pattern as the
              party lists, fetching the detail fragment into the drawer body. #}
           <button type="button"
-                  class="bg-transparent p-0 text-left font-semibold {% if ps.product.is_active %}text-text{% else %}text-muted{% endif %}"
+                  class="btn-plain {% if ps.product.is_active %}text-text{% else %}text-muted{% endif %}"
                   hx-get="/web/products/detail/{{ ps.product.id }}"
                   hx-target="#product-drawer-body"
                   hx-swap="innerHTML">{{ ps.product.name }}</button>
@@ -20,11 +20,11 @@
             <span class="text-xs text-muted">untracked</span>
           {% else %}
             {% if ps.stock.is_sign_negative() %}
-              <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">negative</span>
+              <span class="chip chip-expense">negative</span>
             {% endif %}
           {% endif %}
           {% if let Some(sug) = ps.suggested %}
-            <span class="rounded-full border border-expense/30 bg-expense/12 px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase text-expense">low • suggest {{ sug }}</span>
+            <span class="chip chip-expense">low • suggest {{ sug }}</span>
           {% endif %}
         </div>
         <span class="text-[13px] text-muted">stock {{ ps.stock }}{% if let Some(min) = ps.product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • max {{ max }}{% endif %}</span>

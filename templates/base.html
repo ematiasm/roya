@@ -26,11 +26,13 @@
       <!-- Mobile header: the drawer toggle lives here, below md only. -->
       <header class="sticky top-0 z-30 flex items-center gap-3 border-b border-border bg-bg px-4 py-3 md:hidden">
         <button id="drawer-toggle" type="button" data-drawer-toggle
-                class="rounded-[10px] border border-border bg-card p-2 text-text"
+                class="btn-secondary bg-card p-2 text-base"
                 aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">
           <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h16.5"/></svg>
         </button>
-        <a href="/" class="text-lg font-bold tracking-[-0.02em] text-text no-underline hover:no-underline">roya <span class="text-accent">◆</span></a>
+        {# The wordmark, not a control: it navigates home but has no button or
+           link affordance — a component would style it as something it is not. #}
+        <a href="/" class="text-lg font-bold tracking-[-0.02em] text-text">roya <span class="text-accent">◆</span></a>
       </header>
 
       <main class="mx-auto w-full max-w-[1080px] flex-1 px-4 py-6 lg:px-8">
@@ -65,26 +67,23 @@
       // create-under-filter case (issue #37): the create answer swaps it out
       // of band into this region with hx-swap-oob="innerHTML:#notice", marked
       // data-notice-server="true". That box is an Askama template,
-      // templates/partials/notice.html, built from the same classes, the same
-      // data-notice="success" and role="status", and the same dismiss button
-      // as the builder below, plus the marker and the Clear-filter link this
-      // case adds; attribute order and whitespace differ. The classes are
-      // deliberately duplicated between a JS
-      // string and an Askama template: the server box must live in `templates/`
-      // because that is the only tree Tailwind scans, while this builder stays
-      // in base.html because every page's client-side notices are built here.
-      // Change the two together, never one without the other.
+      // templates/partials/notice.html, carrying the same shared components
+      // (.notice / .notice-success / .notice-dismiss), the same
+      // data-notice="success" and role="status" as the builder below, plus the
+      // marker and the Clear-filter link this case adds; attribute order and
+      // whitespace differ. The components are defined once in
+      // assets/tailwind.css; the server box must live in `templates/` because
+      // that is the only tree Tailwind scans, while this builder stays in
+      // base.html because every page's client-side notices are built here.
       function notice(kind, text) {
         var region = document.getElementById('notice');
         if (!region) return;
         var box = document.createElement('div');
-        box.className = kind === 'error'
-          ? 'mb-4 flex items-start justify-between gap-3 rounded-xl border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger'
-          : 'mb-4 flex items-start justify-between gap-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3 text-sm text-accent';
+        box.className = kind === 'error' ? 'notice notice-error' : 'notice notice-success';
         box.setAttribute('data-notice', kind);
         box.setAttribute('role', kind === 'error' ? 'alert' : 'status');
         box.appendChild(el('div', { class: 'min-w-0 flex-1 break-words' }, text));
-        box.appendChild(el('button', { type: 'button', class: 'shrink-0 rounded border border-current px-2 py-0.5 text-xs', 'data-notice-dismiss': 'true', 'aria-label': 'Dismiss' }, '✕'));
+        box.appendChild(el('button', { type: 'button', class: 'notice-dismiss', 'data-notice-dismiss': 'true', 'aria-label': 'Dismiss' }, '✕'));
         region.replaceChildren(box);
       }
       document.addEventListener('click', function (evt) {

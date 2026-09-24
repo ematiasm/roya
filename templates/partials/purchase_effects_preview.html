@@ -8,7 +8,7 @@
    the totals. Draft-only: confirming is the moment these projections become
    facts, and a confirmed or cancelled document shows nothing to project. #}
 {% macro effects_preview(record) %}
-<div id="effects-preview" class="mt-2 rounded-xl border border-border bg-surface px-3.5 py-3 text-[13px] text-muted">
+<div id="effects-preview" class="card mt-2 bg-surface px-3.5 py-3 text-[13px] text-muted">
   <div class="mb-1 font-bold">Effects on confirm</div>
   <div>Stock · {% if !record.tracked_units.is_zero() %}+{{ record.tracked_units }} units (tracked){% else %}no stock movement{% endif %}</div>
   {# Both scenarios (purchase-payment-at-confirm T3): the stored type is a
