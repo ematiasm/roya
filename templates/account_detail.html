@@ -25,8 +25,8 @@
     <div class="text-[13px] font-bold text-muted">This account's methods (untick to unassign)</div>
     <div class="flex flex-wrap gap-x-5 gap-y-2">
       {% for m in methods %}
-      <label class="flex items-center gap-2 text-[13px]">
-        <input type="checkbox" name="method_ids" value="{{ m.id }}" checked />
+      <label class="field-label flex items-center gap-2 text-[13px]">
+        <input type="checkbox" name="method_ids" value="{{ m.id }}" checked class="field" />
         {{ m.name }}{% if !m.is_active %} <span class="text-muted">(inactive)</span>{% endif %}
       </label>
       {% endfor %}
@@ -35,8 +35,8 @@
     <div class="text-[13px] font-bold text-muted">Unassigned methods (tick to assign to this account)</div>
     <div class="flex flex-wrap gap-x-5 gap-y-2">
       {% for m in unassigned %}
-      <label class="flex items-center gap-2 text-[13px]">
-        <input type="checkbox" name="method_ids" value="{{ m.id }}" />
+      <label class="field-label flex items-center gap-2 text-[13px]">
+        <input type="checkbox" name="method_ids" value="{{ m.id }}" class="field" />
         {{ m.name }}{% if !m.is_active %} <span class="text-muted">(inactive)</span>{% endif %}
       </label>
       {% endfor %}

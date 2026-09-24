@@ -64,7 +64,7 @@
               hx-target="#user-list"
               hx-swap="innerHTML"
               class="shrink-0">
-          <input type="hidden" name="user_id" value="{{ r.user.id }}" />
+          <input type="hidden" name="user_id" value="{{ r.user.id }}" class="field" />
           <button type="submit" class="btn-secondary">
             {% if r.user.is_active %}Desactivar{% else %}Activar{% endif %}
           </button>

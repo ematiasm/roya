@@ -184,6 +184,21 @@
     @apply rounded-xl border border-border bg-card p-6;
   }
 
+  /* The form-control pair. Exactly the bare `label` and `input, select,
+     textarea` rules in @layer base, so a bare control and a component render
+     identically until the base rule is removed. `select` and `textarea` were
+     in the same base rule as `input`, so `.field` covers all three.
+     Width-forcing call sites (min-w-*, flex-1, w-auto) keep working: a
+     utility beats @layer components by layer order, the same mechanism that
+     lets .btn-secondary's call sites size themselves. */
+  .field-label {
+    @apply block text-[13px] font-semibold tracking-[0.04em] text-muted uppercase;
+  }
+
+  .field {
+    @apply w-full rounded-[10px] border border-border bg-bg px-3 py-2.5 text-sm text-text focus:border-accent2 focus:outline-none;
+  }
+
   /* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The
      busy indicator must be genuinely absent when idle (display:none), not merely
      transparent: an opacity-only indicator has a non-empty box, so layout, assistive

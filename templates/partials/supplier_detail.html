@@ -35,20 +35,20 @@
           hx-target="#supplier-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">
-      <input type="hidden" name="supplier_id" value="{{ supplier.id }}" />
+      <input type="hidden" name="supplier_id" value="{{ supplier.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Amount</label>
-          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+          <label class="field-label">Amount</label>
+          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label>Date</label>
-          <input type="date" name="date" required value="{{ today }}" />
+          <label class="field-label">Date</label>
+          <input type="date" name="date" required value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label>Method (the account is derived from it)</label>
-        <select name="method_id" required>
+        <label class="field-label">Method (the account is derived from it)</label>
+        <select name="method_id" required class="field">
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
           {% endfor %}
@@ -66,10 +66,10 @@
           hx-target="#supplier-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">
-      <input type="hidden" name="supplier_id" value="{{ supplier.id }}" />
+      <input type="hidden" name="supplier_id" value="{{ supplier.id }}" class="field" />
       <div>
-        <label>Product</label>
-        <select name="product_id" required>
+        <label class="field-label">Product</label>
+        <select name="product_id" required class="field">
           {% for p in products %}
           <option value="{{ p.id }}">{{ p.sku }} — {{ p.name }}</option>
           {% endfor %}
@@ -77,12 +77,12 @@
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Cost</label>
-          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" />
+          <label class="field-label">Cost</label>
+          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label>Date</label>
-          <input type="date" name="date" value="{{ today }}" />
+          <label class="field-label">Date</label>
+          <input type="date" name="date" value="{{ today }}" class="field" />
         </div>
       </div>
       <button type="submit" class="btn-primary">Record Cost</button>

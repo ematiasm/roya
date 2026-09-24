@@ -4,8 +4,8 @@
      defaults an omitted type to Cash server-side). #}
   <div class="mb-3 flex flex-wrap gap-2 [&>*]:flex-1" id="suggestion-seed-options">
     <div>
-      <label>Purchase date</label>
-      <input type="date" name="purchase_date" value="{{ today }}" />
+      <label class="field-label">Purchase date</label>
+      <input type="date" name="purchase_date" value="{{ today }}" class="field" />
     </div>
   </div>
   {% if !has_suggestions %}

@@ -11,18 +11,18 @@
     <div class="mt-4 flex items-center gap-2">
       {% if c.is_active %}
       <form hx-post="/web/customers/deactivate" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
-        <input type="hidden" name="customer_id" value="{{ c.id }}" />
+        <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
         <button type="submit" class="btn-secondary">Deactivate</button>
       </form>
       {% else %}
       <form hx-post="/web/customers/activate" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
-        <input type="hidden" name="customer_id" value="{{ c.id }}" />
+        <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
         <button type="submit" class="btn-secondary">Activate</button>
       </form>
       {% endif %}
       {% if !c.is_walkin %}
       <form hx-post="/web/customers/delete" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
-        <input type="hidden" name="customer_id" value="{{ c.id }}" />
+        <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
         <button type="submit" class="btn-secondary">Delete</button>
       </form>
       {% endif %}
@@ -36,28 +36,28 @@
           hx-target="#customer-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">
-      <input type="hidden" name="customer_id" value="{{ c.id }}" />
+      <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Amount</label>
-          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+          <label class="field-label">Amount</label>
+          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label>Date</label>
-          <input type="date" name="date" required value="{{ today }}" />
+          <label class="field-label">Date</label>
+          <input type="date" name="date" required value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label>Method (the account is derived from it)</label>
-        <select name="method_id" required>
+        <label class="field-label">Method (the account is derived from it)</label>
+        <select name="method_id" required class="field">
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
           {% endfor %}
         </select>
       </div>
       <div>
-        <label>Notes (optional)</label>
-        <input type="text" name="notes" placeholder="…" maxlength="256" />
+        <label class="field-label">Notes (optional)</label>
+        <input type="text" name="notes" placeholder="…" maxlength="256" class="field" />
       </div>
       <button type="submit" class="btn-primary">Collect</button>
       <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered sale grouped under the new receipt. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account.</div>

@@ -125,8 +125,7 @@
       if (state.matches.length === 0) {
         if (state.status !== 'done') return null;
         var empty = document.createElement('div');
-        empty.className =
-          'rounded-xl border border-dashed border-border px-3.5 py-2.5 text-[13px] text-muted';
+        empty.className = 'empty px-3.5 py-2.5 text-start';
         empty.textContent =
           state.query === ''
             ? 'Type a name, SKU or barcode.'

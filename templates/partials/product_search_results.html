@@ -59,23 +59,23 @@
     {# Island-owned: set from state.selectedProductId on a click, disabled
        while nothing is selected so the typed-name Enter path never competes
        with a stale id. #}
-    <input type="hidden" name="product_id" disabled />
+    <input type="hidden" name="product_id" disabled class="field" />
     <div>
-      <label for="product-picker">Product</label>
+      <label for="product-picker" class="field-label">Product</label>
       <input type="text" id="product-picker" name="product" required autocomplete="off"
              placeholder="Scan barcode or type name, SKU…"
              aria-controls="product-search-results"
              aria-describedby="product-search-status"
-             {% if oob %}autofocus{% endif %} />
+             {% if oob %}autofocus{% endif %} class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label for="line-qty">Qty</label>
-        <input type="number" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" />
+        <label for="line-qty" class="field-label">Qty</label>
+        <input type="number" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" class="field" />
       </div>
       <div>
-        <label for="{{ price_field_id }}">{{ price_label }}</label>
-        <input type="number" id="{{ price_field_id }}" name="{{ price_field_name }}" step="0.01" min="0" placeholder="{{ price_placeholder }}" />
+        <label for="{{ price_field_id }}" class="field-label">{{ price_label }}</label>
+        <input type="number" id="{{ price_field_id }}" name="{{ price_field_name }}" step="0.01" min="0" placeholder="{{ price_placeholder }}" class="field" />
       </div>
     </div>
     <button type="submit" class="btn-primary">Add line</button>

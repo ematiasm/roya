@@ -44,7 +44,7 @@
         hx-disinherit="hx-select hx-target hx-swap"
         {% if !include.is_empty() %}hx-include="{{ include }}"{% endif %}>
     <div>
-      <label for="{{ field_id }}">Supplier</label>
+      <label for="{{ field_id }}" class="field-label">Supplier</label>
       <input type="text" id="{{ field_id }}" name="supplier_name"
              value="{{ current_name }}" autocomplete="off"
              placeholder="Type a supplier name…"
@@ -56,7 +56,7 @@
              hx-target="#supplier-search-results" hx-swap="innerHTML"
              hx-vals='{"action": "{{ action }}", "target": "{{ target }}", "include": "{{ include }}"}'
              hx-on:keyup="if (event.key === 'Escape') this.value = ''"
-             hx-on:click="this.value = ''" />
+             hx-on:click="this.value = ''" class="field" />
     </div>
   </form>
   {# While the search request is in flight htmx adds `htmx-request` to this

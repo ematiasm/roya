@@ -127,8 +127,8 @@
             hx-post="/web/sales/{{ record.sale.id }}/confirm"
             hx-target="#sale-record" hx-swap="innerHTML">
         <div>
-          <label for="confirm-method">Method (Cash only; the account is derived from it)</label>
-          <select id="confirm-method" name="method_id">
+          <label for="confirm-method" class="field-label">Method (Cash only; the account is derived from it)</label>
+          <select id="confirm-method" name="method_id" class="field">
             <option value="">— none (Credit) —</option>
             {% for m in method_options %}
             <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
@@ -146,21 +146,21 @@
             hx-target="#sale-record" hx-swap="innerHTML">
         <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
-            <label for="header-sale-date">Sale date</label>
-            <input type="date" id="header-sale-date" name="sale_date" required value="{{ record.sale.sale_date }}" />
+            <label for="header-sale-date" class="field-label">Sale date</label>
+            <input type="date" id="header-sale-date" name="sale_date" required value="{{ record.sale.sale_date }}" class="field" />
           </div>
           <div>
-            <label for="header-due-date">Due date (Credit only)</label>
-            <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.sale.due_date %}{{ due }}{% endif %}" />
+            <label for="header-due-date" class="field-label">Due date (Credit only)</label>
+            <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.sale.due_date %}{{ due }}{% endif %}" class="field" />
           </div>
         </div>
         <div>
-          <label for="header-receipt-no">Receipt no (optional)</label>
-          <input type="text" id="header-receipt-no" name="receipt_no" maxlength="64" value="{% if let Some(r) = record.sale.receipt_no %}{{ r }}{% endif %}" />
+          <label for="header-receipt-no" class="field-label">Receipt no (optional)</label>
+          <input type="text" id="header-receipt-no" name="receipt_no" maxlength="64" value="{% if let Some(r) = record.sale.receipt_no %}{{ r }}{% endif %}" class="field" />
         </div>
         <div>
-          <label for="header-notes">Notes</label>
-          <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.sale.notes }}" />
+          <label for="header-notes" class="field-label">Notes</label>
+          <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.sale.notes }}" class="field" />
         </div>
         <button type="submit" class="btn-primary">Save header</button>
       </form>
@@ -173,8 +173,8 @@
             hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
             hx-target="#sale-record" hx-swap="innerHTML">
         <div>
-          <label for="discard-reason">Reason (optional)</label>
-          <input type="text" id="discard-reason" name="reason" maxlength="256" />
+          <label for="discard-reason" class="field-label">Reason (optional)</label>
+          <input type="text" id="discard-reason" name="reason" maxlength="256" class="field" />
         </div>
         <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Discard draft</button>
       </form>
@@ -190,8 +190,8 @@
               hx-post="/web/sales/{{ record.sale.id }}/payments"
               hx-target="#sale-record" hx-swap="innerHTML">
           <div>
-            <label for="payment-method">Method (the account is derived from it)</label>
-            <select id="payment-method" name="method_id" required>
+            <label for="payment-method" class="field-label">Method (the account is derived from it)</label>
+            <select id="payment-method" name="method_id" required class="field">
               {% for m in method_options %}
               <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
               {% endfor %}
@@ -199,12 +199,12 @@
           </div>
           <div class="flex gap-2.5 [&>*]:flex-1">
             <div>
-              <label for="payment-amount">Amount</label>
-              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+              <label for="payment-amount" class="field-label">Amount</label>
+              <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
             </div>
             <div>
-              <label for="payment-date">Date</label>
-              <input type="date" id="payment-date" name="date" required value="{{ today }}" />
+              <label for="payment-date" class="field-label">Date</label>
+              <input type="date" id="payment-date" name="date" required value="{{ today }}" class="field" />
             </div>
           </div>
           <button type="submit" class="btn-primary">Record payment</button>
@@ -219,8 +219,8 @@
               hx-confirm="Cancel this sale? Stock returns and recorded payments are refunded."
               hx-target="#sale-record" hx-swap="innerHTML">
           <div>
-            <label for="cancel-reason">Reason</label>
-            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="customer return…" />
+            <label for="cancel-reason" class="field-label">Reason</label>
+            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="customer return…" class="field" />
           </div>
           <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Cancel sale</button>
         </form>

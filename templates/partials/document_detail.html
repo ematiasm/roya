@@ -76,10 +76,10 @@
             hx-post="{{ a.path }}" hx-swap="none"
             {% if let Some(c) = a.confirm %}hx-confirm="{{ c }}"{% endif %}>
         {% for f in a.fields %}
-        <input type="hidden" name="{{ f.0 }}" value="{{ f.1 }}" />
+        <input type="hidden" name="{{ f.0 }}" value="{{ f.1 }}" class="field" />
         {% endfor %}
         {% if a.reason %}
-        <input class="w-full rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs"
+        <input class="field w-full rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs"
                type="text" name="reason" maxlength="256" placeholder="Motivo (opcional)" />
         {% endif %}
         <button type="submit"

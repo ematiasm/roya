@@ -29,8 +29,8 @@
     {% let filter_module = "product" %}
     {% let filter_list = "products" %}
     {% include "partials/list_filters_open.html" %}
-      <input class="min-w-[160px] flex-1" type="text" name="q" placeholder="Name, SKU or barcode" value="{{ filter_q }}" />
-      <select class="min-w-[120px] flex-1" id="filter-category" name="category_id">
+      <input class="field min-w-[160px] flex-1" type="text" name="q" placeholder="Name, SKU or barcode" value="{{ filter_q }}" />
+      <select class="field min-w-[120px] flex-1" id="filter-category" name="category_id">
         <option value="">All categories</option>
         {% for cat in categories %}
         <option value="{{ cat.id }}" {% if filter_category == cat.id.to_string() %}selected{% endif %}>{{ cat.name }}</option>
@@ -79,12 +79,12 @@
         hx-swap="none"
         hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#product-list','refresh'); htmx.ajax('GET','/web/category-options','#filter-category'); htmx.ajax('GET','/web/category-options?empty=No%20category','#new-product-category'); }">
     <div>
-      <label>Name</label>
-      <input type="text" name="name" placeholder="Beverages, Services…" required maxlength="128" />
+      <label class="field-label">Name</label>
+      <input type="text" name="name" placeholder="Beverages, Services…" required maxlength="128" class="field" />
     </div>
     <div>
-      <label>Parent ID (optional)</label>
-      <input type="number" name="parent_id" placeholder="empty = root" min="1" />
+      <label class="field-label">Parent ID (optional)</label>
+      <input type="number" name="parent_id" placeholder="empty = root" min="1" class="field" />
     </div>
     <button type="submit" class="btn-primary">Create category</button>
   </form>
@@ -111,44 +111,44 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) { document.getElementById('new-product-dialog').close(); this.reset(); }">
     <div>
-      <label>SKU</label>
-      <input type="text" name="sku" placeholder="YERBA-500" required maxlength="64" />
+      <label class="field-label">SKU</label>
+      <input type="text" name="sku" placeholder="YERBA-500" required maxlength="64" class="field" />
     </div>
     <div>
-      <label>Name</label>
-      <input type="text" name="name" placeholder="Yerba 500g" required maxlength="128" />
+      <label class="field-label">Name</label>
+      <input type="text" name="name" placeholder="Yerba 500g" required maxlength="128" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label>Kind</label>
-        <select name="kind" required>
+        <label class="field-label">Kind</label>
+        <select name="kind" required class="field">
           <option value="Product">Product</option>
           <option value="Service">Service</option>
         </select>
       </div>
       <div>
-        <label>Unit</label>
-        <input type="text" name="unit" placeholder="un, kg, lt…" required maxlength="16" value="un" />
+        <label class="field-label">Unit</label>
+        <input type="text" name="unit" placeholder="un, kg, lt…" required maxlength="16" value="un" class="field" />
       </div>
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label>Sale price</label>
-        <input id="new-product-sale-price" type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required />
+        <label class="field-label">Sale price</label>
+        <input id="new-product-sale-price" type="number" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required class="field" />
       </div>
       <div>
-        <label>Cost price</label>
-        <input type="number" name="cost_price" step="0.01" min="0" placeholder="0" value="0" />
+        <label class="field-label">Cost price</label>
+        <input type="number" name="cost_price" step="0.01" min="0" placeholder="0" value="0" class="field" />
       </div>
     </div>
     <div>
-      <label>Markup % (optional)</label>
-      <input id="new-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" />
+      <label class="field-label">Markup % (optional)</label>
+      <input id="new-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" class="field" />
       <div class="text-[13px] text-muted">With a markup the sale price is derived from the cost; leave empty to set it manually.</div>
     </div>
     <div>
-      <label>Category (optional)</label>
-      <select id="new-product-category" name="product_category_id">
+      <label class="field-label">Category (optional)</label>
+      <select id="new-product-category" name="product_category_id" class="field">
         <option value="">No category</option>
         {% for cat in categories %}
         <option value="{{ cat.id }}">{{ cat.name }}</option>
@@ -156,25 +156,25 @@
       </select>
     </div>
     <div>
-      <label class="flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" checked class="w-auto" /> Track stock</label>
+      <label class="field-label flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" checked class="field w-auto" /> Track stock</label>
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label>Min stock</label>
-        <input type="number" name="min_stock" step="0.01" min="0" placeholder="5" value="5" />
+        <label class="field-label">Min stock</label>
+        <input type="number" name="min_stock" step="0.01" min="0" placeholder="5" value="5" class="field" />
       </div>
       <div>
-        <label>Max stock</label>
-        <input type="number" name="max_stock" step="0.01" min="0" placeholder="50" value="50" />
+        <label class="field-label">Max stock</label>
+        <input type="number" name="max_stock" step="0.01" min="0" placeholder="50" value="50" class="field" />
       </div>
     </div>
     <div>
-      <label>Location (optional)</label>
-      <input type="text" name="location" maxlength="64" />
+      <label class="field-label">Location (optional)</label>
+      <input type="text" name="location" maxlength="64" class="field" />
     </div>
     <div>
-      <label>Notes (optional)</label>
-      <input type="text" name="notes" maxlength="1024" />
+      <label class="field-label">Notes (optional)</label>
+      <input type="text" name="notes" maxlength="1024" class="field" />
     </div>
     <button type="submit" class="btn-primary">Create product</button>
     <div class="text-[13px] text-muted">Services: untick stock + empty min/max.</div>

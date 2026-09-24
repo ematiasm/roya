@@ -44,17 +44,17 @@
     <div class="mt-4 flex items-center gap-2">
       {% if product.is_active %}
       <form hx-post="/web/products/deactivate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
-        <input type="hidden" name="product_id" value="{{ product.id }}" />
+        <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
         <button type="submit" class="btn-secondary">Deactivate</button>
       </form>
       {% else %}
       <form hx-post="/web/products/activate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
-        <input type="hidden" name="product_id" value="{{ product.id }}" />
+        <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
         <button type="submit" class="btn-secondary">Activate</button>
       </form>
       {% endif %}
       <form hx-post="/web/products/delete" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
-        <input type="hidden" name="product_id" value="{{ product.id }}" />
+        <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
         <button type="submit" class="btn-secondary">Delete</button>
       </form>
     </div>
@@ -70,38 +70,38 @@
           hx-post="/web/products/edit"
           hx-target="#product-drawer-body"
           hx-swap="innerHTML">
-      <input type="hidden" name="id" value="{{ product.id }}" />
+      <input type="hidden" name="id" value="{{ product.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>SKU</label>
-          <input type="text" name="sku" required maxlength="64" value="{{ product.sku }}" />
+          <label class="field-label">SKU</label>
+          <input type="text" name="sku" required maxlength="64" value="{{ product.sku }}" class="field" />
         </div>
         <div>
-          <label>Name</label>
-          <input type="text" name="name" required maxlength="128" value="{{ product.name }}" />
+          <label class="field-label">Name</label>
+          <input type="text" name="name" required maxlength="128" value="{{ product.name }}" class="field" />
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Kind</label>
-          <select name="kind">
+          <label class="field-label">Kind</label>
+          <select name="kind" class="field">
             <option value="Product" {% if product.kind.to_string() == "Product" %}selected{% endif %}>Product</option>
             <option value="Service" {% if product.kind.to_string() == "Service" %}selected{% endif %}>Service</option>
           </select>
         </div>
         <div>
-          <label>Unit</label>
-          <input type="text" name="unit" required maxlength="16" value="{{ product.unit }}" />
+          <label class="field-label">Unit</label>
+          <input type="text" name="unit" required maxlength="16" value="{{ product.unit }}" class="field" />
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Sale price</label>
+          <label class="field-label">Sale price</label>
           {# Courtesy only (product-markup T6): the edit handler is the
              enforcement — whenever a markup is present the server ignores
              this field and derives the price from the cost, so the readonly
              state here only mirrors what the server already does. #}
-          <input id="edit-product-sale-price" type="number" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ product.sale_price_display() }}" />
+          <input id="edit-product-sale-price" type="number" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ product.sale_price_display() }}" class="field" />
           {% if product.markup_pct.is_some() %}
           {# The readonly field shows the stored price from the last save; the
              derivation from the cost is server-side, so the number only moves
@@ -110,17 +110,17 @@
           {% endif %}
         </div>
         <div>
-          <label>Cost price</label>
-          <input type="number" name="cost_price" step="0.01" value="{{ product.cost_price_display() }}" />
+          <label class="field-label">Cost price</label>
+          <input type="number" name="cost_price" step="0.01" value="{{ product.cost_price_display() }}" class="field" />
         </div>
       </div>
       <div>
-        <label>Markup % (optional)</label>
-        <input id="edit-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ m }}"{% endif %} />
+        <label class="field-label">Markup % (optional)</label>
+        <input id="edit-product-markup" type="number" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ m }}"{% endif %} class="field" />
       </div>
       <div>
-        <label>Category</label>
-        <select name="category_id">
+        <label class="field-label">Category</label>
+        <select name="category_id" class="field">
           {# An empty value means "clear": the edit handler sends Some(None) so an
              untied category is a real edit, not "leave unchanged". #}
           <option value="">No category</option>
@@ -132,25 +132,25 @@
       <div>
         {# One label wraps the box and the text, and the box keeps w-auto: the global
            input width would otherwise stretch the control and push the text out. #}
-        <label class="flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" class="w-auto" {% if product.track_stock %}checked{% endif %} /> Track stock</label>
+        <label class="field-label flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" class="field w-auto" {% if product.track_stock %}checked{% endif %} /> Track stock</label>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Min stock</label>
-          <input type="number" name="min_stock" step="0.01" {% if let Some(v) = product.min_stock %}value="{{ v }}"{% endif %} />
+          <label class="field-label">Min stock</label>
+          <input type="number" name="min_stock" step="0.01" {% if let Some(v) = product.min_stock %}value="{{ v }}"{% endif %} class="field" />
         </div>
         <div>
-          <label>Max stock</label>
-          <input type="number" name="max_stock" step="0.01" {% if let Some(v) = product.max_stock %}value="{{ v }}"{% endif %} />
+          <label class="field-label">Max stock</label>
+          <input type="number" name="max_stock" step="0.01" {% if let Some(v) = product.max_stock %}value="{{ v }}"{% endif %} class="field" />
         </div>
       </div>
       <div>
-        <label>Location</label>
-        <input type="text" name="location" maxlength="64" {% if let Some(v) = product.location %}value="{{ v }}"{% endif %} />
+        <label class="field-label">Location</label>
+        <input type="text" name="location" maxlength="64" {% if let Some(v) = product.location %}value="{{ v }}"{% endif %} class="field" />
       </div>
       <div>
-        <label>Notes</label>
-        <input type="text" name="notes" maxlength="1024" {% if let Some(v) = product.notes %}value="{{ v }}"{% endif %} />
+        <label class="field-label">Notes</label>
+        <input type="text" name="notes" maxlength="1024" {% if let Some(v) = product.notes %}value="{{ v }}"{% endif %} class="field" />
       </div>
       <button type="submit" class="btn-primary">Save product</button>
       <div class="text-[13px] text-muted">The same rules as creation apply: services cannot track stock, tracked products need min and max, and the SKU cannot collide with another product (⇒ 400/409).</div>
@@ -212,8 +212,8 @@
           <span class="chip chip-income">preferred</span>
           {% else %}
           <form hx-post="/web/product-costs/preferred" hx-include="#product-filters" hx-target="#product-drawer-body" hx-swap="innerHTML">
-            <input type="hidden" name="product_id" value="{{ product.id }}" />
-            <input type="hidden" name="supplier_id" value="{{ cost.cost.supplier_id }}" />
+            <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
+            <input type="hidden" name="supplier_id" value="{{ cost.cost.supplier_id }}" class="field" />
             <button type="submit" class="btn-secondary">Set preferred</button>
           </form>
           {% endif %}
@@ -229,10 +229,10 @@
           hx-target="#product-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">
-      <input type="hidden" name="product_id" value="{{ product.id }}" />
+      <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
       <div>
-        <label>Supplier</label>
-        <select name="supplier_id" required>
+        <label class="field-label">Supplier</label>
+        <select name="supplier_id" required class="field">
           {% for s in suppliers %}
           <option value="{{ s.id }}">{{ s.name }}</option>
           {% endfor %}
@@ -240,12 +240,12 @@
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Cost</label>
-          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" />
+          <label class="field-label">Cost</label>
+          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label>Date</label>
-          <input type="date" name="date" value="{{ today }}" />
+          <label class="field-label">Date</label>
+          <input type="date" name="date" value="{{ today }}" class="field" />
         </div>
       </div>
       <button type="submit" class="btn-primary">Record cost</button>
@@ -266,25 +266,25 @@
           hx-target="#product-drawer-body"
           hx-swap="innerHTML"
           hx-on::after-request="if(event.detail.successful) this.reset()">
-      <input type="hidden" name="product_id" value="{{ product.id }}" />
+      <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Type</label>
-          <select name="type">
+          <label class="field-label">Type</label>
+          <select name="type" class="field">
             <option value="In">In</option>
             <option value="Out">Out</option>
             <option value="Adjust">Adjust</option>
           </select>
         </div>
         <div>
-          <label>Qty</label>
-          <input type="number" name="qty" step="0.01" required placeholder="10.00" />
+          <label class="field-label">Qty</label>
+          <input type="number" name="qty" step="0.01" required placeholder="10.00" class="field" />
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label>Reason</label>
-          <select name="reason">
+          <label class="field-label">Reason</label>
+          <select name="reason" class="field">
             <option value="Initial">Initial</option>
             <option value="Purchase">Purchase</option>
             <option value="Sale">Sale</option>
@@ -293,13 +293,13 @@
           </select>
         </div>
         <div>
-          <label>Date</label>
-          <input type="date" name="date" value="{{ today }}" />
+          <label class="field-label">Date</label>
+          <input type="date" name="date" value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label>Reference (optional)</label>
-        <input type="text" name="reference" maxlength="256" />
+        <label class="field-label">Reference (optional)</label>
+        <input type="text" name="reference" maxlength="256" class="field" />
       </div>
       <button type="submit" class="btn-primary">Record movement</button>
       <div class="text-[13px] text-muted">In=+qty, Out=−qty, Adjust=signed delta.</div>

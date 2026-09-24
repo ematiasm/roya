@@ -32,36 +32,36 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label>Name</label>
-      <input type="text" name="name" required maxlength="128" placeholder="Ana Pérez…" />
+      <label class="field-label">Name</label>
+      <input type="text" name="name" required maxlength="128" placeholder="Ana Pérez…" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label>Phone (optional)</label>
-        <input type="text" name="phone" maxlength="32" placeholder="555-1234" />
+        <label class="field-label">Phone (optional)</label>
+        <input type="text" name="phone" maxlength="32" placeholder="555-1234" class="field" />
       </div>
       <div>
-        <label>Tax ID (optional)</label>
-        <input type="text" name="tax_id" maxlength="32" />
+        <label class="field-label">Tax ID (optional)</label>
+        <input type="text" name="tax_id" maxlength="32" class="field" />
       </div>
     </div>
     <div>
-      <label>Address (optional)</label>
-      <input type="text" name="address" maxlength="256" />
+      <label class="field-label">Address (optional)</label>
+      <input type="text" name="address" maxlength="256" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label>Credit limit (empty = no limit)</label>
-        <input type="number" name="credit_limit" step="0.01" min="0" placeholder="unlimited" />
+        <label class="field-label">Credit limit (empty = no limit)</label>
+        <input type="number" name="credit_limit" step="0.01" min="0" placeholder="unlimited" class="field" />
       </div>
       <div>
-        <label>Payment days (empty = no term)</label>
-        <input type="number" name="payment_days" min="0" placeholder="30" />
+        <label class="field-label">Payment days (empty = no term)</label>
+        <input type="number" name="payment_days" min="0" placeholder="30" class="field" />
       </div>
     </div>
     <div>
-      <label>Notes (optional)</label>
-      <input type="text" name="notes" maxlength="512" />
+      <label class="field-label">Notes (optional)</label>
+      <input type="text" name="notes" maxlength="512" class="field" />
     </div>
     <button type="submit" class="btn-primary">Create Customer</button>
     <div class="text-[13px] text-muted">Duplicate names are allowed; the existing match is reported as a warning. Also at <code>POST /api/customers</code></div>

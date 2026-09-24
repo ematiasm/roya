@@ -138,6 +138,11 @@ def _pages(data: HarnessData) -> list[tuple[str, str]]:
         ("documents", "/documents"),
         ("users", "/users"),
         ("roles", "/roles"),
+        # The account screen is the only place the method checkboxes render
+        # (the dashboard's create form carries the same shape). T5 puts `.field`
+        # on checkboxes and radios, so the screens where they live must be in
+        # the net before that can be provable.
+        ("account-detail", f"/accounts/{data.account_id}"),
         # The password form is reachable from the sidebar for every signed-in
         # operator; its dismiss button lives only in the failure re-render,
         # captured separately as `password-error` below.
@@ -166,6 +171,13 @@ _STATE_NAMES = [
     "purchase-list-paid",
     "purchase-list-due",
     "purchase-list-overdue",
+    # T5's form controls: the confirm dialog's payment-type radios and this
+    # page's picker are not reachable through any resting page snapshot — the
+    # dialog only exists once `openRecordDialog` opens it, and the picker's
+    # no-match box only exists once a query has been answered empty. Each is
+    # captured from the current tree, which renders correctly today.
+    "purchase-record-confirm",
+    "purchase-record-picker-nomatch",
 ]
 
 
@@ -351,6 +363,28 @@ def test_visual_baseline(
     expect(page.locator("[data-notice='success']")).to_contain_text("scanned again")
     page.wait_for_timeout(400)
     capture(page, "purchase-record-merge")
+
+    # The confirm dialog is not a page: it exists only once the action bar's
+    # button calls openRecordDialog, the way the drawers are reached by
+    # clicking rather than by URL. Its payment-type radios, due-date input and
+    # method select are form controls the net would otherwise never fingerprint.
+    page.goto(f"{api.base_url}/purchases/{data.purchase_id}")
+    page.wait_for_load_state("networkidle")
+    page.locator("button[onclick*=\"openRecordDialog('confirm-purchase')\"]").click()
+    page.wait_for_timeout(400)
+    capture(page, "purchase-record-confirm")
+
+    # The picker's no-match state: type a query nothing answers, let the
+    # island's debounced search come back empty and snapshot the dashed
+    # no-match box the island renders from JS (static/picker.js).
+    page.goto(f"{api.base_url}/purchases/{data.purchase_id}")
+    page.wait_for_load_state("networkidle")
+    page.locator("#product-picker").fill("zzz-no-product-matches")
+    expect(page.locator("#product-search-results")).to_contain_text(
+        "No products match"
+    )
+    page.wait_for_timeout(400)
+    capture(page, "purchase-record-picker-nomatch")
 
     # The third server-rendered copy: creating a product under an active
     # catalogue filter. The create form carries the filter in its body

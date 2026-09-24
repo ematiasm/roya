@@ -30,16 +30,16 @@
   </div>
   <form class="flex flex-col gap-2.5" hx-post="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label>Name</label>
-      <input type="text" name="name" placeholder="Distribuidora Sur…" required maxlength="128" />
+      <label class="field-label">Name</label>
+      <input type="text" name="name" placeholder="Distribuidora Sur…" required maxlength="128" class="field" />
     </div>
     <div>
-      <label>Phone (optional)</label>
-      <input type="text" name="phone" placeholder="11 5555-5555" maxlength="32" />
+      <label class="field-label">Phone (optional)</label>
+      <input type="text" name="phone" placeholder="11 5555-5555" maxlength="32" class="field" />
     </div>
     <div>
-      <label>Notes (optional)</label>
-      <input type="text" name="notes" placeholder="…" maxlength="512" />
+      <label class="field-label">Notes (optional)</label>
+      <input type="text" name="notes" placeholder="…" maxlength="512" class="field" />
     </div>
     <button type="submit" class="btn-primary">Create Supplier</button>
     <div class="text-[13px] text-muted">Duplicate name ⇒ 409. Also at <code>POST /api/suppliers</code></div>

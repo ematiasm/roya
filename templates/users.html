@@ -44,16 +44,16 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label>Usuario</label>
-      <input type="text" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" placeholder="caja1…" />
+      <label class="field-label">Usuario</label>
+      <input type="text" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" placeholder="caja1…" class="field" />
     </div>
     <div>
-      <label>Nombre para mostrar</label>
-      <input type="text" name="display_name" required maxlength="128" placeholder="María Pérez…" />
+      <label class="field-label">Nombre para mostrar</label>
+      <input type="text" name="display_name" required maxlength="128" placeholder="María Pérez…" class="field" />
     </div>
     <div>
-      <label>Contraseña inicial</label>
-      <input type="password" name="password" required minlength="12" autocomplete="new-password" />
+      <label class="field-label">Contraseña inicial</label>
+      <input type="password" name="password" required minlength="12" autocomplete="new-password" class="field" />
     </div>
     <button type="submit" class="btn-primary">Crear usuario</button>
     <div class="text-[13px] text-muted">

@@ -25,14 +25,14 @@
       hx-target="#role-list"
       hx-swap="innerHTML"
       hx-on::after-request="if(event.detail.successful) document.getElementById('role-edit-dialog').close()">
-  <input type="hidden" name="role_id" value="{{ role.id }}" />
+  <input type="hidden" name="role_id" value="{{ role.id }}" class="field" />
   <div>
-    <label>Nombre</label>
-    <input type="text" name="name" required maxlength="128" value="{{ role.name }}" />
+    <label class="field-label">Nombre</label>
+    <input type="text" name="name" required maxlength="128" value="{{ role.name }}" class="field" />
   </div>
   <div>
-    <label>Descripción (opcional)</label>
-    <input type="text" name="description" maxlength="256" value="{{ description_value }}" />
+    <label class="field-label">Descripción (opcional)</label>
+    <input type="text" name="description" maxlength="256" value="{{ description_value }}" class="field" />
   </div>
   <button type="submit" class="btn-primary">Guardar detalles</button>
 </form>
@@ -49,7 +49,7 @@
   <div class="mb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase">{{ group.module }}</div>
   <div class="flex flex-col gap-1.5">
     {% for row in group.permissions %}
-    <label class="flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
+    <label class="field-label flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
       <span class="font-semibold text-accent">✓</span>
       <span class="font-semibold">{{ row.permission.code }}</span>
       <span class="text-[12px] text-muted">{{ row.permission.description }}</span>
@@ -65,13 +65,13 @@
       hx-target="#role-list"
       hx-swap="innerHTML"
       hx-on::after-request="if(event.detail.successful) document.getElementById('role-edit-dialog').close()">
-  <input type="hidden" name="role_id" value="{{ role.id }}" />
+  <input type="hidden" name="role_id" value="{{ role.id }}" class="field" />
   {% for group in groups %}
   <div class="mb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase">{{ group.module }}</div>
   <div class="flex flex-col gap-1.5">
     {% for row in group.permissions %}
-    <label class="flex items-start gap-2 rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
-      <input type="checkbox" name="permission_ids" value="{{ row.permission.id }}" {% if row.held %}checked{% endif %} class="mt-1" />
+    <label class="field-label flex items-start gap-2 rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
+      <input type="checkbox" name="permission_ids" value="{{ row.permission.id }}" {% if row.held %}checked{% endif %} class="field mt-1" />
       <span class="min-w-0">
         <span class="font-semibold">{{ row.permission.code }}</span>
         <span class="block text-[12px] text-muted">{{ row.permission.description }}</span>

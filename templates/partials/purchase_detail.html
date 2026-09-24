@@ -54,22 +54,22 @@
       {# Island-owned: set from state.selectedProductId on a click, disabled
          while nothing is selected so the typed-name Enter path never competes
          with a stale id. #}
-      <input type="hidden" name="product_id" disabled />
+      <input type="hidden" name="product_id" disabled class="field" />
       <div class="min-w-[150px] flex-1">
-        <label for="product-picker">Product</label>
+        <label for="product-picker" class="field-label">Product</label>
         <input type="text" id="product-picker" name="product" required autocomplete="off"
                placeholder="Scan barcode or type name, SKU…"
                aria-controls="product-search-results"
                aria-describedby="product-search-status"
-               {% if entry_row_focus %}autofocus{% endif %} />
+               {% if entry_row_focus %}autofocus{% endif %} class="field" />
       </div>
       <div class="w-20">
-        <label for="line-qty">Qty</label>
-        <input type="number" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" />
+        <label for="line-qty" class="field-label">Qty</label>
+        <input type="number" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" class="field" />
       </div>
       <div class="min-w-[110px]">
-        <label for="line-unit-cost">Unit cost (empty = supplier cost)</label>
-        <input type="number" id="line-unit-cost" name="unit_cost" step="0.01" min="0" placeholder="supplier cost" />
+        <label for="line-unit-cost" class="field-label">Unit cost (empty = supplier cost)</label>
+        <input type="number" id="line-unit-cost" name="unit_cost" step="0.01" min="0" placeholder="supplier cost" class="field" />
       </div>
       <button type="submit" class="btn-primary">Add line</button>
     </form>
@@ -120,7 +120,7 @@
                  `outerHTML` without `hx-select` duplicates every id on the
                  page. Pinned by the count test in test_purchases.py. #}
               <input type="number" id="line-qty-{{ line.id }}" name="qty"
-                     class="w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
+                     class="field w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
                      value="{{ line.qty }}" min="0.01" step="any" data-action="Edit line"
                      hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
                      hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
@@ -130,7 +130,7 @@
             </td>
             <td class="py-2.5 pr-3 text-right">
               <span class="text-muted">$</span><input type="number" id="line-cost-{{ line.id }}" name="unit_cost"
-                     class="w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
+                     class="field w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
                      value="{{ line.unit_cost }}" min="0" step="any" data-action="Edit line"
                      hx-put="/web/purchases/{{ record.purchase.id }}/lines/{{ line.id }}"
                      hx-include="#line-qty-{{ line.id }}, #line-cost-{{ line.id }}"
@@ -257,19 +257,19 @@
           hx-include="#record-supplier, #record-purchase-date, #record-invoice-no, #record-notes"
           hx-swap="none" hx-sync="this:replace">
       <div>
-        <label for="record-purchase-date">Purchase date</label>
-        <input type="date" id="record-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" />
+        <label for="record-purchase-date" class="field-label">Purchase date</label>
+        <input type="date" id="record-purchase-date" name="purchase_date" required value="{{ record.purchase.purchase_date }}" class="field" />
         <p id="record-purchase-date-error" class="mt-1 text-[13px] text-danger" hidden>
           An empty date is not saved — the stored purchase date stays.
         </p>
       </div>
       <div>
-        <label for="record-invoice-no">Supplier invoice no (optional)</label>
-        <input type="text" id="record-invoice-no" name="supplier_invoice_no" maxlength="64" value="{% if let Some(inv) = record.purchase.supplier_invoice_no %}{{ inv }}{% endif %}" />
+        <label for="record-invoice-no" class="field-label">Supplier invoice no (optional)</label>
+        <input type="text" id="record-invoice-no" name="supplier_invoice_no" maxlength="64" value="{% if let Some(inv) = record.purchase.supplier_invoice_no %}{{ inv }}{% endif %}" class="field" />
       </div>
       <div>
-        <label for="record-notes">Notes</label>
-        <input type="text" id="record-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" />
+        <label for="record-notes" class="field-label">Notes</label>
+        <input type="text" id="record-notes" name="notes" maxlength="512" value="{{ record.purchase.notes }}" class="field" />
       </div>
     </form>
     <span id="header-saved" class="text-[13px] text-muted" aria-live="polite"></span>
@@ -413,32 +413,32 @@
           hx-post="/web/purchases/{{ record.purchase.id }}/confirm"
           hx-target="#purchase-record" hx-swap="innerHTML">
       <div>
-        <label>Payment type</label>
+        <label class="field-label">Payment type</label>
         <div class="flex gap-4">
-          <label class="flex items-center gap-1.5 text-sm">
+          <label class="field-label flex items-center gap-1.5 text-sm">
             <input type="radio" id="confirm-type-cash" name="payment_type" value="Cash"
                    {% if record.purchase.payment_type.to_string() == "Cash" %}checked{% endif %}
-                   onchange="toggleConfirmPaymentType(this.form)" />
+                   onchange="toggleConfirmPaymentType(this.form)" class="field" />
             Cash
           </label>
-          <label class="flex items-center gap-1.5 text-sm">
+          <label class="field-label flex items-center gap-1.5 text-sm">
             <input type="radio" id="confirm-type-credit" name="payment_type" value="Credit"
                    {% if record.purchase.payment_type.to_string() == "Credit" %}checked{% endif %}
-                   onchange="toggleConfirmPaymentType(this.form)" />
+                   onchange="toggleConfirmPaymentType(this.form)" class="field" />
             Credit
           </label>
         </div>
       </div>
       <div id="confirm-due-block"{% if record.purchase.payment_type.to_string() == "Cash" %} hidden{% endif %}>
-        <label for="confirm-due-date">Due date</label>
+        <label for="confirm-due-date" class="field-label">Due date</label>
         <input type="date" id="confirm-due-date" name="due_date"
                value="{% if let Some(due) = record.purchase.due_date %}{{ due }}{% endif %}"
-               {% if record.purchase.payment_type.to_string() == "Credit" %}required{% endif %} />
+               {% if record.purchase.payment_type.to_string() == "Credit" %}required{% endif %} class="field" />
       </div>
       <div id="confirm-method-block"{% if record.purchase.payment_type.to_string() == "Credit" %} hidden{% endif %}>
-        <label for="confirm-method">Method (the cash account is derived from it)</label>
+        <label for="confirm-method" class="field-label">Method (the cash account is derived from it)</label>
         <select id="confirm-method" name="method_id"
-                {% if record.purchase.payment_type.to_string() == "Credit" %}disabled{% else %}required{% endif %}>
+                {% if record.purchase.payment_type.to_string() == "Credit" %}disabled{% else %}required{% endif %} class="field">
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
           {% endfor %}
@@ -459,8 +459,8 @@
           hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
           hx-target="#purchase-record" hx-swap="innerHTML">
       <div>
-        <label for="discard-reason">Reason (optional)</label>
-        <input type="text" id="discard-reason" name="reason" maxlength="256" />
+        <label for="discard-reason" class="field-label">Reason (optional)</label>
+        <input type="text" id="discard-reason" name="reason" maxlength="256" class="field" />
       </div>
       <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Discard draft</button>
     </form>
@@ -481,8 +481,8 @@
           hx-post="/web/purchases/{{ record.purchase.id }}/payments"
           hx-target="#purchase-record" hx-swap="innerHTML">
       <div>
-        <label for="payment-method">Method (the account is derived from it)</label>
-        <select id="payment-method" name="method_id" required>
+        <label for="payment-method" class="field-label">Method (the account is derived from it)</label>
+        <select id="payment-method" name="method_id" required class="field">
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
           {% endfor %}
@@ -490,12 +490,12 @@
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label for="payment-amount">Amount</label>
-          <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" />
+          <label for="payment-amount" class="field-label">Amount</label>
+          <input type="number" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label for="payment-date">Date</label>
-          <input type="date" id="payment-date" name="date" required value="{{ today }}" />
+          <label for="payment-date" class="field-label">Date</label>
+          <input type="date" id="payment-date" name="date" required value="{{ today }}" class="field" />
         </div>
       </div>
       <button type="submit" class="btn-primary">Record payment</button>
@@ -514,8 +514,8 @@
           hx-confirm="Cancel this purchase? Stock returns and recorded payments are refunded."
           hx-target="#purchase-record" hx-swap="innerHTML">
       <div>
-        <label for="cancel-reason">Reason</label>
-        <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="wrong order…" />
+        <label for="cancel-reason" class="field-label">Reason</label>
+        <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="wrong order…" class="field" />
       </div>
       <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Cancel purchase</button>
     </form>
