@@ -1,0 +1,80 @@
+# The two suites this repository already runs by hand, run by a machine instead.
+#
+# Why this exists: every check in this repo was a local command someone had to
+# remember to run. That works until the day it does not, and `main` has no CI to
+# catch what a hurried push leaves behind. Nothing here is a new check — both
+# jobs run exactly what `cargo test` and `scripts/e2e.sh` run locally, because a
+# CI that fails on something the author never sees locally is a CI people learn
+# to ignore. `fmt` and `clippy` are deliberately absent for that reason: the
+# project does not run them, so making them gate a PR would be a new rule
+# arriving through a side door.
+#
+# It also cannot catch what it does not test. The duplicate-region defect fixed
+# in PR #95 lived two days while this suite was green, because no test looked at
+# the inline edit's behaviour at all. CI runs your tests; it does not write them.
+name: checks
+
+on:
+  # Every pull request. `main` is protected by a rule that requires one, so this
+  # is the gate that actually holds.
+  pull_request:
+  # And the merge itself, so `main` carries its own green record rather than
+  # only the green of the branch that went into it.
+  push:
+    branches: [main]
+
+# A newer push to the same branch makes the running check obsolete: cancel it
+# rather than pay for two answers to a question only the newer one is asking.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Nothing here writes to the repository, so the token gets no permission to.
+permissions:
+  contents: read
+
+jobs:
+  # The primary runner, and the fast one. It is its own job so a red `cargo
+  # test` reports in a couple of minutes instead of waiting behind a browser
+  # download.
+  rust:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # The suite is ~900 tests and a cold `target/` costs minutes on every run.
+      - uses: Swatinem/rust-cache@v2
+      # `--locked` pins the dependency graph to the committed Cargo.lock, so a
+      # green run here means the graph this repo ships, not whatever resolved
+      # that morning. The tests need no environment: every variable in
+      # `env.example` has a default and `dotenvy` tolerates a missing `.env`
+      # (verified by running the suite with the file moved away).
+      - run: cargo test --locked
+
+  # The browser suite. Slower and heavier, which is why it is a separate job:
+  # it needs a Rust build, a Python environment and a Chromium download.
+  browser:
+    name: browser suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `uv` builds `e2e/.venv` from `e2e/pyproject.toml`, the same way the
+      # one-time setup in `e2e/README.md` does, so no Node toolchain is needed
+      # and the repository's no-Node posture is untouched.
+      - uses: astral-sh/setup-uv@v10
+      - name: Install Chromium
+        working-directory: e2e
+        # `--only-shell` fetches the headless shell instead of the full browser
+        # (~260 MB rather than ~660 MB) because the suite always runs headless.
+        # `--with-deps` installs the system libraries Chromium needs; the
+        # ubuntu runner provides the sudo it uses.
+        run: uv run playwright install chromium --only-shell --with-deps
+      # The suite builds the binary through its own fixtures and drives it in
+      # the browser, so this is the whole run, not just the pytest half.
+      - name: Run the suite
+        run: scripts/e2e.sh
