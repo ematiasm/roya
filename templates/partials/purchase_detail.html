@@ -415,16 +415,16 @@
       <div>
         <label class="field-label">Payment type</label>
         <div class="flex gap-4">
-          <label class="field-label flex items-center gap-1.5 text-sm">
+          <label class="choice">
             <input type="radio" id="confirm-type-cash" name="payment_type" value="Cash"
                    {% if record.purchase.payment_type.to_string() == "Cash" %}checked{% endif %}
-                   onchange="toggleConfirmPaymentType(this.form)" class="field" />
+                   onchange="toggleConfirmPaymentType(this.form)" />
             Cash
           </label>
-          <label class="field-label flex items-center gap-1.5 text-sm">
+          <label class="choice">
             <input type="radio" id="confirm-type-credit" name="payment_type" value="Credit"
                    {% if record.purchase.payment_type.to_string() == "Credit" %}checked{% endif %}
-                   onchange="toggleConfirmPaymentType(this.form)" class="field" />
+                   onchange="toggleConfirmPaymentType(this.form)" />
             Credit
           </label>
         </div>

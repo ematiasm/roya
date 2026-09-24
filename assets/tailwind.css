@@ -181,6 +181,20 @@
     @apply w-full rounded-[10px] border border-border bg-bg px-3 py-2.5 text-sm text-text focus:border-accent2 focus:outline-none;
   }
 
+  /* A checkbox or radio with its label is not a field. The text-field chrome
+     (full width, border, padding, background, 10px radius) stretched the box
+     and pushed the text out; two call sites worked around it with `w-auto` and
+     a comment, five did not. And the label belongs beside the box in normal
+     case, not above it in small caps, which is why all nine sites were undoing
+     `.field-label` at the call site. */
+  .choice {
+    @apply flex items-center gap-2 text-[13px] font-normal normal-case tracking-normal text-text;
+  }
+  .choice input[type="checkbox"],
+  .choice input[type="radio"] {
+    @apply w-4 h-4 shrink-0 accent-accent;
+  }
+
   /* htmx toggles .htmx-request at runtime; utilities cannot express that pair. The
      busy indicator must be genuinely absent when idle (display:none), not merely
      transparent: an opacity-only indicator has a non-empty box, so layout, assistive

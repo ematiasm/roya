@@ -130,9 +130,7 @@
         </select>
       </div>
       <div>
-        {# One label wraps the box and the text, and the box keeps w-auto: the global
-           input width would otherwise stretch the control and push the text out. #}
-        <label class="field-label flex items-center gap-2 normal-case tracking-normal"><input type="checkbox" name="track_stock" value="1" class="field w-auto" {% if product.track_stock %}checked{% endif %} /> Track stock</label>
+        <label class="choice"><input type="checkbox" name="track_stock" value="1" {% if product.track_stock %}checked{% endif %} /> Track stock</label>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
