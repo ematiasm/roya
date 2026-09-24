@@ -208,23 +208,35 @@ def _fingerprint(page: Page) -> dict[str, Any]:
 # Real hovers, not a synthetic event: CSS `:hover` needs a pointer position, and
 # no element in this app triggers htmx on a mouse event, so hovering has no side
 # effects (checked, not assumed).
-_HOVERED = """
-(props) => {
-  const chain = document.querySelectorAll(':hover');
-  if (!chain.length) return null;
-  const el = chain[chain.length - 1];
-  const cs = getComputedStyle(el);
-  const fp = {};
-  for (const p of props) fp[p] = cs.getPropertyValue(p);
+#
+# **Keyed by the element being hovered, and that element's own style is read.**
+# The first version keyed by whichever `:hover` chain ended deepest, which is
+# whichever element the pointer happened to land on - geometry, and therefore
+# font metrics. CI failed on it twice: the same nav item recorded `a[3]` locally
+# and `a[3]/span[1]` on the runner, because a label's width decided whether the
+# anchor's centre fell on its span. A key the environment chooses is not a key.
+# Hovering an element makes it `:hover` whether the pointer is over it or over a
+# descendant, so reading the target itself is both correct and stable.
+_PATH_OF = """
+(e) => {
   const parts = [];
-  let node = el;
+  let node = e;
   while (node && node !== document.body) {
     const parent = node.parentElement;
     parts.unshift(node.tagName.toLowerCase() + "[" +
       (parent ? Array.from(parent.children).indexOf(node) : 0) + "]");
     node = parent;
   }
-  return {path: "body/" + parts.join("/"), style: fp};
+  return "body/" + parts.join("/");
+}
+"""
+
+_STYLE_OF = """
+(e, props) => {
+  const cs = getComputedStyle(e);
+  const fp = {};
+  for (const p of props) fp[p] = cs.getPropertyValue(p);
+  return fp;
 }
 """
 
@@ -233,13 +245,14 @@ def _hover_fingerprint(page: Page) -> tuple[dict[str, Any], list[str]]:
     """Hover every anchor and button and record what the browser computes.
 
     Returns the fingerprints plus the elements whose hover could not be
-    performed, so a change in that set is visible rather than silent.
+    performed, by path, so a change in that set is visible rather than silent.
     """
     out: dict[str, Any] = {}
     skipped: list[str] = []
     targets = page.locator("a, button")
     for i in range(targets.count()):
         el = targets.nth(i)
+        path = el.evaluate(_PATH_OF)
         try:
             # `force` skips Playwright's stability wait, which costs ~340ms per
             # element because this app transitions colours and transforms. The
@@ -247,11 +260,9 @@ def _hover_fingerprint(page: Page) -> tuple[dict[str, Any], list[str]]:
             # would make the run non-deterministic, and determinism is checked.
             el.hover(force=True, timeout=2000)
         except Exception:
-            skipped.append(str(i))
+            skipped.append(path)
             continue
-        got = page.evaluate(_HOVERED, STYLE_PROPERTIES)
-        if got:
-            out[got["path"]] = got["style"]
+        out[path] = el.evaluate(_STYLE_OF, STYLE_PROPERTIES)
     return out, skipped
 
 
