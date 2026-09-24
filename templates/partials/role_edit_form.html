@@ -70,8 +70,8 @@
   <div class="mb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase">{{ group.module }}</div>
   <div class="flex flex-col gap-1.5">
     {% for row in group.permissions %}
-    <label class="field-label flex items-start gap-2 rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
-      <input type="checkbox" name="permission_ids" value="{{ row.permission.id }}" {% if row.held %}checked{% endif %} class="field mt-1" />
+    <label class="choice items-start rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
+      <input type="checkbox" name="permission_ids" value="{{ row.permission.id }}" {% if row.held %}checked{% endif %} class="mt-1" />
       <span class="min-w-0">
         <span class="font-semibold">{{ row.permission.code }}</span>
         <span class="block text-[12px] text-muted">{{ row.permission.description }}</span>

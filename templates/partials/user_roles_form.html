@@ -19,9 +19,9 @@
   <input type="hidden" name="user_id" value="{{ user.user.id }}" class="field" />
   <div class="flex flex-col gap-1.5">
     {% for role in roles %}
-    <label class="field-label flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
+    <label class="choice rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
       <input type="checkbox" name="role_ids" value="{{ role.id }}"
-             {% for held in user.roles %}{% if held.id == role.id %}checked{% endif %}{% endfor %} class="field" />
+             {% for held in user.roles %}{% if held.id == role.id %}checked{% endif %}{% endfor %} />
       <span class="font-semibold">{{ role.name }}</span>
       <span class="text-[12px] text-muted">{{ role.code }}</span>
       {% if role.is_system %}

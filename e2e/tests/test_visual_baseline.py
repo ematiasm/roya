@@ -117,6 +117,10 @@ STYLE_PROPERTIES = [
     "letter-spacing",
     "text-transform",
     "text-decoration-line",
+    # Class-determined like the rest: the .choice component tints its native
+    # checkbox/radio with accent-color, and a property the net does not record
+    # would leave that tint unasserted.
+    "accent-color",
     "display",
     "gap",
     "opacity",
