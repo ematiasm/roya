@@ -19,10 +19,10 @@
           <span class="font-semibold">{{ s.product.name }}</span>
           <span class="text-xs text-muted">{{ s.product.sku }}</span>
         </div>
-        <span class="text-[13px] text-muted">stock {{ s.stock }} • suggested {{ s.suggested_qty }} × ${{ s.unit_cost }} • {{ s.supplier_name }}</span>
+        <span class="text-[13px] text-muted">stock {{ localization.format_quantity(s.stock.clone()) }} • suggested {{ localization.format_quantity(s.suggested_qty.clone()) }} × {{ localization.format_currency(s.unit_cost.clone()) }} • {{ s.supplier_name }}</span>
       </div>
       <div class="flex items-center gap-3">
-        <span class="font-bold tabular-nums text-expense">{{ s.subtotal }}</span>
+        <span class="font-bold tabular-nums text-expense">{{ localization.format_currency(s.subtotal.clone()) }}</span>
         {# Seeding answers `HX-Redirect: /purchases/{id}`, so this is a navigation,
            not a swap: it deliberately carries no hx-target (nothing on this page
            is replaced), and hx-swap="none" says so. #}
@@ -41,7 +41,7 @@
       <div class="mb-2 flex items-center justify-between rounded-[10px] border border-dashed border-border px-3.5 py-3" id="suggestion-nosup-{{ w.product.id }}">
         <div class="flex flex-col">
           <span class="font-semibold">{{ w.product.name }}</span>
-          <span class="text-[13px] text-muted">{{ w.product.sku }} • stock {{ w.stock }} • suggested {{ w.suggested_qty }}</span>
+          <span class="text-[13px] text-muted">{{ w.product.sku }} • stock {{ localization.format_quantity(w.stock.clone()) }} • suggested {{ localization.format_quantity(w.suggested_qty.clone()) }}</span>
         </div>
         <a href="/suppliers" class="link text-xs">record cost</a>
       </div>

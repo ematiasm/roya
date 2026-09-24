@@ -432,15 +432,15 @@ mod tests {
         pool: &sqlx::SqlitePool,
         name: &str,
         limit: Option<&str>,
-        payment_days: Option<i64>,
+        due_days: Option<i64>,
     ) -> i64 {
         let row: (i64,) = sqlx::query_as(
-            "INSERT INTO customers (name, credit_limit, payment_days, created_by) \
+            "INSERT INTO customers (name, credit_limit, due_days, created_by) \
              VALUES (?, ?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(limit)
-        .bind(payment_days)
+        .bind(due_days)
         .bind(test_support::audit_actor_id(pool).await.unwrap())
         .fetch_one(pool)
         .await

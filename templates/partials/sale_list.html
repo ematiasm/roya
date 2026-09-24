@@ -17,10 +17,10 @@
             <span class="text-xs text-muted">draft #{{ d.sale.id }}</span>
           {% endif %}
         </div>
-        <span class="text-[13px] text-muted">#{{ d.sale.id }} • {{ d.sale.sale_date }} • total {{ d.total }} • paid {{ d.paid }} • due {{ d.due }}</span>
+        <span class="text-[13px] text-muted">#{{ d.sale.id }} • {{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due_date) = d.sale.due_date %} • due {{ localization.format_date(due_date.clone()) }}{% endif %} • total {{ localization.format_currency(d.total.clone()) }} • paid {{ localization.format_currency(d.paid.clone()) }} • due {{ localization.format_currency(d.due.clone()) }}</span>
       </div>
       <div class="flex items-center gap-3">
-        <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ d.total }}</span>
+        <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_currency(d.total.clone()) }}</span>
         <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">Open</a>
       </div>
     </div>

@@ -183,7 +183,7 @@ def test_confirming_a_rising_cost_purchase_warns_and_applying_updates_the_produc
     # Both numbers in the warning's own sentence, as one exact text node: a
     # line row repeating an amount cannot satisfy it, and either half dropping
     # silently breaks the match.
-    warning = page.get_by_text("line cost $12.00 • stored $10.00", exact=True)
+    warning = page.get_by_text("line cost 12.00 USD • stored 10.00 USD", exact=True)
     expect(warning).to_be_visible()
     expect(page.get_by_text("stale cost", exact=True)).to_have_count(1)
     apply_button = page.get_by_role("button", name="Apply to product")

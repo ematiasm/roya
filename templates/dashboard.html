@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% block html_lang %}{{ localization.locale_code }}{% endblock %}
 {% block title %}Roya — Dashboard{% endblock %}
 {% block content %}
 {% let page_title = "Dashboard" %}
@@ -13,7 +14,7 @@
     <!-- Total -->
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="text-[13px] text-muted">Total Balance</div>
-      <div class="text-[32px] font-bold" id="total-balance">${{ total_balance }}</div>
+      <div class="text-[32px] font-bold" id="total-balance">{{ localization.format_currency(total_balance.clone()) }}</div>
       <div class="text-[13px] text-muted">{% if allow_negative %}Negative balances allowed{% else %}Negative balances blocked{% endif %} • Derived from transactions</div>
     </div>
 
@@ -92,7 +93,7 @@
           <label class="field-label">Account</label>
           <select name="account_id" required id="tx-account-select" class="field">
             {% for acc in accounts %}
-            <option value="{{ acc.id }}">{{ acc.name }} — ${{ acc.balance }}</option>
+            <option value="{{ acc.id }}">{{ acc.name }} — {{ localization.format_currency(acc.balance.clone()) }}</option>
             {% endfor %}
           </select>
           <div class="text-[13px] text-muted">If empty, create an account first.</div>
@@ -107,7 +108,7 @@
           </div>
           <div>
             <label class="field-label">Amount</label>
-            <input type="number" name="amount" step="0.01" min="0.01" placeholder="100.00" required class="field" />
+            <input type="text" inputmode="decimal" name="amount" min="0.01" placeholder="100.00" required class="field" />
           </div>
         </div>
         <div>

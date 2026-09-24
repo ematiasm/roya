@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Configuración — Roya{% endblock %}
+{% block content %}
+<div class="mb-4 flex flex-wrap items-center gap-2">
+  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
+  <span class="chip chip-muted">configuración del negocio</span>
+</div>
+
+<div class="mb-4">
+  <h2 class="text-lg font-semibold">Configuración del negocio</h2>
+  <p class="mt-1 text-sm text-muted">Estos cambios reemplazan la configuración inicial y se aplican a las próximas páginas.</p>
+</div>
+
+{% if saved %}
+<div class="notice notice-success mb-4" data-notice="success" role="status">
+  <div class="min-w-0 flex-1 break-words">Configuración guardada</div>
+  <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="Cerrar">✕</button>
+</div>
+{% endif %}
+{% if let Some(message) = error %}
+<div class="notice notice-error mb-4" data-notice="error" role="alert">
+  <div class="min-w-0 flex-1 break-words">{{ message }}</div>
+  <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="Cerrar">✕</button>
+</div>
+{% endif %}
+
+<form method="post" action="/settings" data-action="Save settings" class="flex flex-col gap-4">
+  <section class="card p-5">
+    <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
+      <div>
+        <h3 class="font-semibold">Identidad y presentación</h3>
+        <p class="text-[13px] text-muted">Vista previa: {{ preview }}</p>
+      </div>
+      <span class="chip border-border">{{ localization.locale_code }} · {{ settings.currency_code }}</span>
+    </div>
+
+    <div class="grid gap-4 md:grid-cols-2">
+      <div>
+        <label class="field-label" for="business_name">Nombre del negocio</label>
+        <input id="business_name" class="field" type="text" name="business_name" value="{{ settings.business_name }}" required maxlength="160" autocomplete="organization" />
+      </div>
+      <div>
+        <label class="field-label" for="default_locale_code">Locale predeterminado</label>
+        <select id="default_locale_code" class="field" name="default_locale_code" required>
+          {% for locale in locales %}
+          <option value="{{ locale.code }}" {% if locale.code == settings.default_locale_code %}selected{% endif %}>{{ locale.display_name }} ({{ locale.code }})</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label class="field-label" for="currency_code">Código de moneda</label>
+        <input id="currency_code" class="field uppercase" type="text" name="currency_code" value="{{ settings.currency_code }}" required minlength="3" maxlength="3" pattern="[A-Z]{3}" inputmode="text" />
+      </div>
+      <div>
+        <label class="field-label" for="timezone">Zona horaria</label>
+        <input id="timezone" class="field" type="text" name="timezone" value="{{ settings.timezone }}" required maxlength="64" placeholder="UTC" />
+      </div>
+    </div>
+  </section>
+
+  <section class="card p-5">
+    <div class="mb-4">
+      <h3 class="font-semibold">Locales disponibles</h3>
+      <p class="text-[13px] text-muted">El locale predeterminado debe permanecer habilitado.</p>
+    </div>
+
+    <div class="flex flex-col gap-3">
+      {% for locale in locales %}
+      <div class="rounded-xl border border-border bg-surface p-3">
+        <input type="hidden" name="locale_code_{{ loop.index0 }}" value="{{ locale.code }}" />
+        <div class="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+          <div>
+            <label class="field-label" for="display_name_{{ loop.index0 }}">Nombre visible</label>
+            <input id="display_name_{{ loop.index0 }}" class="field" type="text" name="display_name_{{ loop.index0 }}" value="{{ locale.display_name }}" required maxlength="128" />
+            <div class="mt-1 text-[12px] text-muted">{{ locale.code }}</div>
+          </div>
+          <label class="field-label mb-2 flex items-center gap-2 md:mb-0">
+            <input class="field w-auto" type="checkbox" name="enabled_{{ loop.index0 }}" value="on" {% if locale.is_enabled %}checked{% endif %} />
+            Habilitado
+          </label>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <div class="flex items-center justify-end gap-2">
+    <a href="/" class="btn-secondary font-normal hover:opacity-100">Cancelar</a>
+    <button type="submit" class="btn-primary">Guardar configuración</button>
+  </div>
+</form>
+{% endblock %}

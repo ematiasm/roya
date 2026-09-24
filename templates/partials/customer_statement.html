@@ -6,7 +6,7 @@
     {% if c.is_walkin %}
     <span class="chip chip-muted">walk-in</span>
     {% endif %}
-    <span class="text-xs text-muted">{% if let Some(limit) = c.credit_limit %}limit {{ limit }}{% else %}no limit{% endif %}{% if let Some(days) = c.payment_days %} • term {{ days }}d{% endif %}</span>
+     <span class="text-xs text-muted">{% if let Some(limit) = c.credit_limit %}limit {{ localization.format_currency(limit.clone()) }}{% else %}no limit{% endif %}{% if let Some(days) = c.due_days %} • term {{ days }}d{% endif %}</span>
   </div>
   {% if let Some(phone) = c.phone %}
   <div class="text-[13px] text-muted">phone {{ phone }}</div>
@@ -30,25 +30,25 @@
   {% endif %}
 
   {% if let Some(st) = statement %}
-  <div class="my-2 text-2xl font-bold">{{ st.balance }} <span class="text-[13px] text-muted">balance as of {{ st.as_of }}</span></div>
+   <div class="my-2 text-2xl font-bold">{{ localization.format_currency(st.balance.clone()) }} <span class="text-[13px] text-muted">balance as of {{ localization.format_date(st.as_of.clone()) }}</span></div>
 
   <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">Ageing</div>
   <div class="flex flex-wrap gap-2 [&>*]:flex-1">
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">current</div>
-      <div class="font-bold tabular-nums">{{ st.ageing.current }}</div>
+       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.current.clone()) }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">1-30</div>
-      <div class="font-bold tabular-nums">{{ st.ageing.overdue_1_30 }}</div>
+       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_1_30.clone()) }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">31-60</div>
-      <div class="font-bold tabular-nums">{{ st.ageing.overdue_31_60 }}</div>
+       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_31_60.clone()) }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">61+</div>
-      <div class="font-bold tabular-nums">{{ st.ageing.overdue_61_plus }}</div>
+       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_61_plus.clone()) }}</div>
     </div>
   </div>
 

@@ -15,7 +15,7 @@
                   hx-get="/web/products/detail/{{ ps.product.id }}"
                   hx-target="#product-drawer-body"
                   hx-swap="innerHTML">{{ ps.product.name }}</button>
-          <span class="text-xs text-muted">{{ ps.product.sku }} • {{ ps.product.unit }} • ${{ ps.product.sale_price_display() }}</span>
+          <span class="text-xs text-muted">{{ ps.product.sku }} • {{ ps.product.unit }} • {{ localization.format_currency(ps.product.sale_price.clone()) }}</span>
           {% if !ps.product.track_stock %}
             <span class="text-xs text-muted">untracked</span>
           {% else %}
@@ -24,13 +24,13 @@
             {% endif %}
           {% endif %}
           {% if let Some(sug) = ps.suggested %}
-            <span class="chip chip-expense">low • suggest {{ sug }}</span>
+            <span class="chip chip-expense">low • suggest {{ localization.format_quantity(sug.clone()) }}</span>
           {% endif %}
         </div>
-        <span class="text-[13px] text-muted">stock {{ ps.stock }}{% if let Some(min) = ps.product.min_stock %} • min {{ min }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • max {{ max }}{% endif %}</span>
+        <span class="text-[13px] text-muted">stock {{ localization.format_quantity(ps.stock.clone()) }}{% if let Some(min) = ps.product.min_stock %} • min {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • max {{ localization.format_quantity(max.clone()) }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
-        <span class="font-bold tabular-nums {% if ps.stock.is_sign_negative() %}text-expense{% else %}text-income{% endif %}">{{ ps.stock }}</span>
+        <span class="font-bold tabular-nums {% if ps.stock.is_sign_negative() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_quantity(ps.stock.clone()) }}</span>
       </div>
     </div>
     {% endfor %}

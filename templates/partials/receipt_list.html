@@ -6,16 +6,16 @@
     <div class="mb-3 rounded-[10px] border border-border bg-surface px-3.5 py-3" id="receipt-{{ r.receipt.id }}">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="flex flex-col">
-          <span class="font-semibold">Receipt #{{ r.receipt.id }} • {{ r.receipt.date }}</span>
+           <span class="font-semibold">Receipt #{{ r.receipt.id }} • {{ localization.format_date(r.receipt.date.clone()) }}</span>
           <span class="text-[13px] text-muted">{{ r.account_name }} • {{ r.method_name }}{% if let Some(notes) = r.receipt.notes %} • {{ notes }}{% endif %}</span>
         </div>
-        <span class="font-bold tabular-nums text-income">{{ r.total }}</span>
+        <span class="font-bold tabular-nums text-income">{{ localization.format_currency(r.total.clone()) }}</span>
       </div>
       <div class="mt-2 mb-1 font-bold text-[13px] text-muted">Allocations ({{ r.allocations.len() }})</div>
       {% for a in r.allocations %}
       <div class="mb-1.5 flex items-center justify-between rounded-[10px] border border-border bg-card px-3 py-2">
-        <span class="text-[13px]">{% if let Some(n) = a.sale_number %}{{ n }}{% else %}sale #{{ a.sale_id }}{% endif %} • {{ a.date }}{% if let Some(tx) = a.transaction_id %} • income #{{ tx }}{% endif %}</span>
-        <span class="font-semibold tabular-nums">{{ a.amount }}</span>
+         <span class="text-[13px]">{% if let Some(n) = a.sale_number %}{{ n }}{% else %}sale #{{ a.sale_id }}{% endif %} • {{ localization.format_date(a.date.clone()) }}{% if let Some(tx) = a.transaction_id %} • income #{{ tx }}{% endif %}</span>
+         <span class="font-semibold tabular-nums">{{ localization.format_currency(a.amount.clone()) }}</span>
       </div>
       {% endfor %}
     </div>

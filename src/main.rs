@@ -1,12 +1,23 @@
 mod db;
 mod error;
+mod localization;
+#[cfg(test)]
+mod localization_tests;
 mod models;
 mod repositories;
 mod routes;
 mod security;
 mod services;
 #[cfg(test)]
+mod setup_tests;
+#[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
 mod smoke_tests;
+#[cfg(test)]
+mod t1_schema_tests;
+#[cfg(test)]
+mod tax_tests;
 
 use std::net::SocketAddr;
 
@@ -22,7 +33,10 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
 
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "roya=info,tower_http=info".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "roya=info,tower_http=info".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
@@ -44,7 +58,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Identity (S1b): the session/cookie policy, the CORS origin list and the
     // login throttle, all read here so `AppState` stays a plain construction.
-    let admin_password = std::env::var("ROYA_ADMIN_PASSWORD").ok();
     let session_ttl_hours: i64 = std::env::var("ROYA_SESSION_TTL_HOURS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -104,24 +117,12 @@ async fn main() -> anyhow::Result<()> {
         throttle,
     );
 
-    // Bootstrap (AC1): seed the administrator when none exists. With
-    // ROYA_ADMIN_PASSWORD set the operator's password is used as-is; without
-    // it a password is generated and logged here exactly once — the single
-    // place it is ever visible. An environment-supplied password is never
-    // logged.
-    let bootstrap = state
-        .identity_service
-        .bootstrap_admin(admin_password.as_deref())
-        .await?;
-    if let Some(generated) = &bootstrap.generated_password {
-        tracing::warn!(
-            "generated bootstrap administrator password (shown once, then never again): {generated}"
-        );
+    state.refresh_setup_requirement().await?;
+    if state.setup_required() {
+        tracing::info!("initial setup required: open /setup to create the first administrator");
+    } else {
+        tracing::info!("business configuration present: setup is closed");
     }
-    tracing::info!(
-        created = bootstrap.created,
-        "identity bootstrap ready: an administrator can log in"
-    );
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])

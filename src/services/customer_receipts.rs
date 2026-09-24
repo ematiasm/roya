@@ -308,8 +308,8 @@ mod tests {
         SqlitePaymentMethodRepository, SqliteProductRepository, SqliteSaleRepository,
         SqliteStockMovementRepository, SqliteTransactionRepository,
     };
-    use crate::services::{CustomerService, InventoryService, TransactionService};
     use crate::security::test_support;
+    use crate::services::{CustomerService, InventoryService, TransactionService};
 
     type ReceiptSvc = crate::services::CustomerReceiptService<
         SqliteCustomerReceiptRepository,
@@ -399,36 +399,42 @@ mod tests {
             .sales
             .inventory
             .create_product(
-                test_support::audit_actor_id(&s.sales.inventory.products.pool).await.unwrap(),
+                test_support::audit_actor_id(&s.sales.inventory.products.pool)
+                    .await
+                    .unwrap(),
                 NewProduct {
-                sku: sku.into(),
-                name: format!("prod {sku}"),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: dec(price),
-                cost_price: dec("1"),
-                track_stock: true,
-                min_stock: Some(dec("0")),
-                max_stock: Some(dec("100")),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: sku.into(),
+                    name: format!("prod {sku}"),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec(price),
+                    cost_price: dec("1"),
+                    track_stock: true,
+                    min_stock: Some(dec("0")),
+                    max_stock: Some(dec("100")),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         s.sales
             .inventory
             .record_movement(
-                test_support::audit_actor_id(&s.sales.inventory.products.pool).await.unwrap(),
+                test_support::audit_actor_id(&s.sales.inventory.products.pool)
+                    .await
+                    .unwrap(),
                 NewMovement {
-                product_id: product.id,
-                qty: dec("1000"),
-                movement_type: MovementType::In,
-                reason: MovementReason::Initial,
-                reference: "".into(),
-                date: d(2024, 1, 1),
-            })
+                    product_id: product.id,
+                    qty: dec("1000"),
+                    movement_type: MovementType::In,
+                    reason: MovementReason::Initial,
+                    reference: "".into(),
+                    date: d(2024, 1, 1),
+                },
+            )
             .await
             .unwrap();
         product.id
@@ -450,14 +456,14 @@ mod tests {
             .create_customer(
                 audit_actor(s).await,
                 NewCustomer {
-                name: name.into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
+                    name: name.into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
                     is_walkin: false,
                     credit_limit: None,
-                    payment_days: None,
+                    due_days: None,
                 },
             )
             .await
@@ -506,21 +512,27 @@ mod tests {
     ) -> SaleDetail {
         let sale = s
             .sales
-            .create_draft(audit_actor(s).await, NewSale {
-                customer_id,
-                payment_type: PaymentType::Credit,
-                sale_date,
-                due_date: Some(due),
-                receipt_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(s).await,
+                NewSale {
+                    customer_id,
+                    payment_type: PaymentType::Credit,
+                    sale_date,
+                    due_date: Some(due),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         s.sales
             .add_line(sale.id, product_id, dec(qty), None)
             .await
             .unwrap();
-        s.sales.confirm(audit_actor(&s).await, sale.id, None).await.unwrap()
+        s.sales
+            .confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap()
     }
 
     async fn receipt_count(pool: &SqlitePool) -> i64 {
@@ -575,7 +587,14 @@ mod tests {
         let debts = three_debts(&s, customer, product).await;
 
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("80"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
@@ -588,14 +607,21 @@ mod tests {
         assert_eq!(detail.receipt.account_id, account);
         assert_eq!(detail.receipt.method_id, cash);
         assert!(
-            detail.allocations.iter().all(|p| p.account_id == account && p.method_id == cash),
+            detail
+                .allocations
+                .iter()
+                .all(|p| p.account_id == account && p.method_id == cash),
             "every grouped payment carries the derived account"
         );
 
         let sale_ids: Vec<i64> = detail.allocations.iter().map(|p| p.sale_id).collect();
         assert_eq!(
             sale_ids,
-            vec![debts.first.sale.id, debts.second.sale.id, debts.third.sale.id]
+            vec![
+                debts.first.sale.id,
+                debts.second.sale.id,
+                debts.third.sale.id
+            ]
         );
         let amounts: Vec<Decimal> = detail.allocations.iter().map(|p| p.amount).collect();
         assert_eq!(amounts, vec![dec("30"), dec("20"), dec("30")]);
@@ -607,7 +633,11 @@ mod tests {
             .map(|detail| {
                 (
                     detail.sale.id,
-                    detail.sale.sale_number.clone().expect("confirmed sale has a number"),
+                    detail
+                        .sale
+                        .sale_number
+                        .clone()
+                        .expect("confirmed sale has a number"),
                 )
             })
             .collect();
@@ -665,11 +695,22 @@ mod tests {
         three_debts(&s, customer, product).await;
 
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("80"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
-        let stored = s.receipts.list_allocations(detail.receipt.id).await.unwrap();
+        let stored = s
+            .receipts
+            .list_allocations(detail.receipt.id)
+            .await
+            .unwrap();
         let sum: Decimal = stored.iter().map(|payment| payment.amount).sum();
         assert_eq!(sum, detail.total);
         // The derived read is cross-checked against raw SQL on purpose: this is
@@ -710,7 +751,14 @@ mod tests {
         credit_sale(&s, beto, product, "4", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(audit_actor(&s).await, ana, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                ana,
+                cash,
+                dec("30"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
@@ -757,18 +805,22 @@ mod tests {
         // A receipt may never apply more to a sale than the sale still owes.
         let receipt = s
             .receipts
-            .create(audit_actor(&s).await, &NewReceipt {
-                customer_id: customer,
-                account_id: account,
-                method_id: cash,
-                date: d(2024, 6, 20),
-                notes: None,
-            })
+            .create(
+                audit_actor(&s).await,
+                &NewReceipt {
+                    customer_id: customer,
+                    account_id: account,
+                    method_id: cash,
+                    date: d(2024, 6, 20),
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         let err = s
             .sales
-            .record_payment_with_receipt(audit_actor(&s).await, 
+            .record_payment_with_receipt(
+                audit_actor(&s).await,
                 sale.sale.id,
                 cash,
                 dec("40"),
@@ -798,11 +850,20 @@ mod tests {
 
         let payment = s
             .sales
-            .record_payment(audit_actor(&s).await, sale.sale.id, cash, dec("15"), d(2024, 6, 20))
+            .record_payment(
+                audit_actor(&s).await,
+                sale.sale.id,
+                cash,
+                dec("15"),
+                d(2024, 6, 20),
+            )
             .await
             .unwrap();
 
-        assert_eq!(payment.receipt_id, None, "a direct payment carries no receipt");
+        assert_eq!(
+            payment.receipt_id, None,
+            "a direct payment carries no receipt"
+        );
         assert!(payment.transaction_id.is_some());
         let after = s.sales.get_detail(sale.sale.id).await.unwrap();
         assert_eq!(after.paid, dec("15"));
@@ -824,7 +885,14 @@ mod tests {
         allow(&s, account, cash).await;
         let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("30"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
@@ -832,21 +900,31 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(err.to_string().contains("payments still reference it"));
         assert!(
-            s.receipts.find_by_id(detail.receipt.id).await.unwrap().is_some(),
+            s.receipts
+                .find_by_id(detail.receipt.id)
+                .await
+                .unwrap()
+                .is_some(),
             "the refused delete leaves the receipt and its grouping intact"
         );
-        assert_eq!(s.sales.get_detail(sale.sale.id).await.unwrap().paid, dec("30"));
+        assert_eq!(
+            s.sales.get_detail(sale.sale.id).await.unwrap().paid,
+            dec("30")
+        );
 
         // An unreferenced receipt is deletable; a second delete is a 404.
         let empty = s
             .receipts
-            .create(audit_actor(&s).await, &NewReceipt {
-                customer_id: customer,
-                account_id: account,
-                method_id: cash,
-                date: d(2024, 6, 21),
-                notes: None,
-            })
+            .create(
+                audit_actor(&s).await,
+                &NewReceipt {
+                    customer_id: customer,
+                    account_id: account,
+                    method_id: cash,
+                    date: d(2024, 6, 21),
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         s.delete_receipt(empty.id).await.unwrap();
@@ -864,7 +942,9 @@ mod tests {
     #[tokio::test]
     async fn ac18_the_collection_flow_receipt_and_its_payments_carry_the_flows_actor() {
         let (s, pool) = svc().await;
-        let collector = test_support::seed_audit_user(&pool, "coll-bob", "Bob").await.unwrap();
+        let collector = test_support::seed_audit_user(&pool, "coll-bob", "Bob")
+            .await
+            .unwrap();
 
         let product = seed_product(&s, "COLL-AUD", "10").await;
         let customer = seed_customer(&s, "coll-customer").await;
@@ -876,21 +956,33 @@ mod tests {
         // the collection is Bob's request, so the receipt and its payments name
         // HIM and stay distinguishable from the sale's creator.
         let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
-        assert_ne!(sale.sale.created_by, collector, "the two actors are distinguishable");
+        assert_ne!(
+            sale.sale.created_by, collector,
+            "the two actors are distinguishable"
+        );
 
         let detail = s
             .collect(collector, customer, cash, dec("30"), d(2024, 6, 20), None)
             .await
             .unwrap();
 
-        assert_eq!(detail.receipt.created_by, collector, "the collection request's actor");
-        assert_eq!(detail.receipt.updated_by, None, "the receipt has no edit path");
+        assert_eq!(
+            detail.receipt.created_by, collector,
+            "the collection request's actor"
+        );
+        assert_eq!(
+            detail.receipt.updated_by, None,
+            "the receipt has no edit path"
+        );
         for payment in &detail.allocations {
             assert_eq!(
                 payment.created_by, collector,
                 "every grouped payment carries the collection request's actor"
             );
-            assert_ne!(payment.created_by, sale.sale.created_by, "not the sale's creator");
+            assert_ne!(
+                payment.created_by, sale.sale.created_by,
+                "not the sale's creator"
+            );
             assert_eq!(payment.updated_by, None, "a fresh payment has no editor");
         }
     }
@@ -908,7 +1000,14 @@ mod tests {
         let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("30"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("30"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
@@ -930,13 +1029,29 @@ mod tests {
         allow(&s, account, cash).await;
         let debts = three_debts(&s, customer, product).await;
 
-        s.collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
-            .await
-            .unwrap();
+        s.collect(
+            audit_actor(&s).await,
+            customer,
+            cash,
+            dec("80"),
+            d(2024, 6, 20),
+            None,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(s.sales.get_detail(debts.first.sale.id).await.unwrap().due, Decimal::ZERO);
-        assert_eq!(s.sales.get_detail(debts.second.sale.id).await.unwrap().due, Decimal::ZERO);
-        assert_eq!(s.sales.get_detail(debts.third.sale.id).await.unwrap().due, dec("20"));
+        assert_eq!(
+            s.sales.get_detail(debts.first.sale.id).await.unwrap().due,
+            Decimal::ZERO
+        );
+        assert_eq!(
+            s.sales.get_detail(debts.second.sale.id).await.unwrap().due,
+            Decimal::ZERO
+        );
+        assert_eq!(
+            s.sales.get_detail(debts.third.sale.id).await.unwrap().due,
+            dec("20")
+        );
     }
 
     #[tokio::test]
@@ -951,7 +1066,14 @@ mod tests {
         let largest = credit_sale(&s, customer, product, "10", d(2024, 6, 15)).await; // 100
 
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("40"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("40"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
@@ -964,7 +1086,10 @@ mod tests {
             Decimal::ZERO,
             "the oldest debt is cleared first even though it is the smallest"
         );
-        assert_eq!(s.sales.get_detail(largest.sale.id).await.unwrap().due, dec("90"));
+        assert_eq!(
+            s.sales.get_detail(largest.sale.id).await.unwrap().due,
+            dec("90")
+        );
     }
 
     #[tokio::test]
@@ -982,7 +1107,14 @@ mod tests {
         let same_date = credit_sale_on(&s, customer, product, "3", d(2024, 5, 1), due).await;
 
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("90"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("90"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1006,18 +1138,34 @@ mod tests {
 
         // A direct payment reduces the debt the receipt can allocate over.
         s.sales
-            .record_payment(audit_actor(&s).await, sale.sale.id, cash, dec("10"), d(2024, 6, 10))
+            .record_payment(
+                audit_actor(&s).await,
+                sale.sale.id,
+                cash,
+                dec("10"),
+                d(2024, 6, 10),
+            )
             .await
             .unwrap();
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("20"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("20"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
         assert_eq!(detail.total, dec("20"));
         assert_eq!(detail.allocations.len(), 1);
         assert_eq!(detail.allocations[0].amount, dec("20"));
-        assert_eq!(s.sales.customer_balance(customer).await.unwrap(), Decimal::ZERO);
+        assert_eq!(
+            s.sales.customer_balance(customer).await.unwrap(),
+            Decimal::ZERO
+        );
         let after = s.sales.get_detail(sale.sale.id).await.unwrap();
         assert_eq!(after.paid, dec("30"));
         assert_eq!(after.payment_status, PaymentStatus::Paid);
@@ -1068,12 +1216,22 @@ mod tests {
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
-            .collect(audit_actor(&s).await, customer, cash, dec("31"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("31"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let msg = err.to_string();
-        assert!(msg.contains("30"), "the outstanding figure must be quoted: {msg}");
+        assert!(
+            msg.contains("30"),
+            "the outstanding figure must be quoted: {msg}"
+        );
         assert_eq!(receipt_count(&pool).await, 0);
         assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(tx_count(&pool).await, 0);
@@ -1090,7 +1248,14 @@ mod tests {
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
-            .collect(audit_actor(&s).await, customer, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("10"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1114,7 +1279,14 @@ mod tests {
 
         for amount in [dec("0"), dec("-5")] {
             let err = s
-                .collect(audit_actor(&s).await, customer, cash, amount, d(2024, 6, 20), None)
+                .collect(
+                    audit_actor(&s).await,
+                    customer,
+                    cash,
+                    amount,
+                    d(2024, 6, 20),
+                    None,
+                )
                 .await
                 .unwrap_err();
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1129,7 +1301,14 @@ mod tests {
         let cash = method_id(&s, "Cash").await;
 
         let err = s
-            .collect(audit_actor(&s).await, 999_999, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                999_999,
+                cash,
+                dec("10"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -1165,7 +1344,14 @@ mod tests {
             .unwrap()
             .is_empty());
         let err = s
-            .collect(audit_actor(&s).await, walkin, cash, dec("10"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                walkin,
+                cash,
+                dec("10"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -1186,7 +1372,8 @@ mod tests {
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await;
 
         let detail = s
-            .collect(audit_actor(&s).await, 
+            .collect(
+                audit_actor(&s).await,
                 customer,
                 cash,
                 dec("10"),
@@ -1198,7 +1385,8 @@ mod tests {
         assert_eq!(detail.receipt.notes.as_deref(), Some("half now"));
 
         let err = s
-            .collect(audit_actor(&s).await, 
+            .collect(
+                audit_actor(&s).await,
                 customer,
                 cash,
                 dec("10"),
@@ -1208,7 +1396,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert_eq!(receipt_count(&pool).await, 1, "the rejected note writes nothing");
+        assert_eq!(
+            receipt_count(&pool).await,
+            1,
+            "the rejected note writes nothing"
+        );
         assert_eq!(payment_count(&pool).await, 1);
     }
 
@@ -1222,7 +1414,14 @@ mod tests {
         allow(&s, account, cash).await;
         three_debts(&s, customer, product).await;
         let detail = s
-            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("80"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap();
 
@@ -1267,7 +1466,14 @@ mod tests {
         .unwrap();
 
         let err = s
-            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("80"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap_err();
         eprintln!("injected mid-loop failure: {err}");
@@ -1291,7 +1497,9 @@ mod tests {
         assert_eq!(payment.sale_id, debts.first.sale.id);
         assert_eq!(payment.amount, dec("30"));
         assert_eq!(payment.receipt_id, Some(receipt_id.0));
-        let tx_id = payment.transaction_id.expect("grouped payment keeps its link");
+        let tx_id = payment
+            .transaction_id
+            .expect("grouped payment keeps its link");
         let tx = s
             .sales
             .transactions
@@ -1373,7 +1581,14 @@ mod tests {
         .unwrap();
 
         let err = s
-            .collect(audit_actor(&s).await, customer, cash, dec("80"), d(2024, 6, 20), None)
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("80"),
+                d(2024, 6, 20),
+                None,
+            )
             .await
             .unwrap_err();
         eprintln!("injected first-payment failure: {err}");
@@ -1414,24 +1629,30 @@ mod tests {
         let ana_sale_two = credit_sale(&s, ana, product, "2", d(2024, 6, 10)).await;
         let beto_receipt = s
             .receipts
-            .create(audit_actor(&s).await, &NewReceipt {
-                customer_id: beto,
-                account_id: account,
-                method_id: cash,
-                date: d(2024, 6, 20),
-                notes: None,
-            })
+            .create(
+                audit_actor(&s).await,
+                &NewReceipt {
+                    customer_id: beto,
+                    account_id: account,
+                    method_id: cash,
+                    date: d(2024, 6, 20),
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         let ana_receipt = s
             .receipts
-            .create(audit_actor(&s).await, &NewReceipt {
-                customer_id: ana,
-                account_id: account,
-                method_id: cash,
-                date: d(2024, 6, 20),
-                notes: None,
-            })
+            .create(
+                audit_actor(&s).await,
+                &NewReceipt {
+                    customer_id: ana,
+                    account_id: account,
+                    method_id: cash,
+                    date: d(2024, 6, 20),
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -1479,13 +1700,12 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let free_payment: (i64,) = sqlx::query_as(
-            "SELECT id FROM sale_payments WHERE sale_id = ? AND receipt_id IS NULL",
-        )
-        .bind(ana_sale.sale.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let free_payment: (i64,) =
+            sqlx::query_as("SELECT id FROM sale_payments WHERE sale_id = ? AND receipt_id IS NULL")
+                .bind(ana_sale.sale.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         // UPDATE onto another customer's receipt is aborted...
         let err = sqlx::query("UPDATE sale_payments SET receipt_id = ? WHERE id = ?")
@@ -1521,7 +1741,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            s.receipts.list_allocations(ana_receipt.id).await.unwrap().len(),
+            s.receipts
+                .list_allocations(ana_receipt.id)
+                .await
+                .unwrap()
+                .len(),
             3,
             "one receipt grouping several payments of its own customer"
         );
@@ -1529,7 +1753,8 @@ mod tests {
         // The service path still groups its own customer's payment.
         let paid = s
             .sales
-            .record_payment_with_receipt(audit_actor(&s).await, 
+            .record_payment_with_receipt(
+                audit_actor(&s).await,
                 ana_sale.sale.id,
                 cash,
                 dec("1"),
@@ -1558,19 +1783,23 @@ mod tests {
         let ana_sale = credit_sale(&s, ana, product, "3", d(2024, 6, 1)).await; // 30
         let beto_receipt = s
             .receipts
-            .create(audit_actor(&s).await, &NewReceipt {
-                customer_id: beto,
-                account_id: account,
-                method_id: cash,
-                date: d(2024, 6, 20),
-                notes: None,
-            })
+            .create(
+                audit_actor(&s).await,
+                &NewReceipt {
+                    customer_id: beto,
+                    account_id: account,
+                    method_id: cash,
+                    date: d(2024, 6, 20),
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
 
         let err = s
             .sales
-            .record_payment_with_receipt(audit_actor(&s).await, 
+            .record_payment_with_receipt(
+                audit_actor(&s).await,
                 ana_sale.sale.id,
                 cash,
                 dec("10"),
@@ -1591,25 +1820,33 @@ mod tests {
         );
         assert_eq!(s.sales.customer_balance(ana).await.unwrap(), dec("30"));
         assert_eq!(
-            s.receipts.list_allocations(beto_receipt.id).await.unwrap().len(),
+            s.receipts
+                .list_allocations(beto_receipt.id)
+                .await
+                .unwrap()
+                .len(),
             0
         );
 
         // The same call with a receipt of the sale's own customer still works.
         let ana_receipt = s
             .receipts
-            .create(audit_actor(&s).await, &NewReceipt {
-                customer_id: ana,
-                account_id: account,
-                method_id: cash,
-                date: d(2024, 6, 20),
-                notes: None,
-            })
+            .create(
+                audit_actor(&s).await,
+                &NewReceipt {
+                    customer_id: ana,
+                    account_id: account,
+                    method_id: cash,
+                    date: d(2024, 6, 20),
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         let paid = s
             .sales
-            .record_payment_with_receipt(audit_actor(&s).await, 
+            .record_payment_with_receipt(
+                audit_actor(&s).await,
                 ana_sale.sale.id,
                 cash,
                 dec("10"),

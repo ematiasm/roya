@@ -108,7 +108,7 @@
       meta.textContent =
         product.sku +
         ' • ' +
-        (priceKind === 'cost' ? 'cost $' + product.cost_price : '$' + product.sale_price) +
+        (priceKind === 'cost' ? 'cost ' + product.cost_price : product.sale_price) +
         ' • stock ' +
         product.stock;
       btn.appendChild(name);

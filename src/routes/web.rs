@@ -1,6 +1,6 @@
 use askama::Template;
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Extension, Form, Path, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Redirect},
     routing::{delete, get, post},
@@ -11,6 +11,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{PaymentMethod, TransactionKind};
 use crate::repositories::AccountRepository;
 use crate::routes::AppState;
@@ -34,6 +35,7 @@ use crate::security::authz::{
 struct DashboardTemplate {
     accounts: Vec<crate::models::AccountWithBalance>,
     total_balance: Decimal,
+    localization: LocalizationContext,
     allow_negative: bool,
     today: String,
     methods: Vec<PaymentMethod>,
@@ -69,6 +71,7 @@ struct TransactionRow {
 struct AccountDetailTemplate {
     account: crate::models::AccountWithBalance,
     transactions: Vec<TransactionRow>,
+    localization: LocalizationContext,
     /// Display name of the account's creator ("Registrado por"). Every
     /// account has one (`created_by` is NOT NULL); it renders even when the
     /// actor is the migration's sentinel, whose display name says exactly
@@ -92,6 +95,7 @@ struct AccountListPartial {
     accounts: Vec<crate::models::AccountWithBalance>,
     total_balance: Decimal,
     accounts_without_methods: AccountsWithoutMethods,
+    localization: LocalizationContext,
 }
 
 #[derive(Template)]
@@ -99,12 +103,14 @@ struct AccountListPartial {
 struct TransactionListPartial {
     transactions: Vec<crate::models::Transaction>,
     account_id: i64,
+    localization: LocalizationContext,
 }
 
 #[derive(Template)]
 #[template(path = "partials/account_options.html")]
 struct AccountOptionsPartial {
     accounts: Vec<crate::models::AccountWithBalance>,
+    localization: LocalizationContext,
 }
 
 /// Accounts whose allowlist is empty. Exposes a template-friendly predicate so
@@ -154,15 +160,17 @@ async fn dashboard(
     State(state): State<AppState>,
     _: Require<DashboardRead>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
     let total_balance = state.account_service.total_balance().await?;
     let methods = state.payment_method_service.list().await?;
     let accounts_without_methods = missing_methods(&state).await?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = localization.today_iso();
     let tmpl = DashboardTemplate {
         accounts,
         total_balance,
+        localization,
         allow_negative: state.allow_negative,
         today,
         methods,
@@ -178,6 +186,7 @@ async fn account_detail(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, AppError> {
@@ -211,6 +220,7 @@ async fn account_detail(
         account_updated_by_name: detail.updated_by.and_then(name_for),
         account: acc_with_balance,
         transactions,
+        localization,
         allow_negative: state.allow_negative,
         methods,
         unassigned,
@@ -310,6 +320,7 @@ async fn web_create_account(
     State(state): State<AppState>,
     _: Require<FinanceMethodsManage>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CreateAccountForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -334,10 +345,14 @@ async fn web_create_account(
             accounts: accounts.clone(),
             total_balance: total,
             accounts_without_methods: missing_methods(&state).await?,
+            localization: localization.clone(),
         }
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;
-        let options_html = AccountOptionsPartial { accounts }
+        let options_html = AccountOptionsPartial {
+            accounts,
+            localization: localization.clone(),
+        }
             .render()
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -369,6 +384,7 @@ async fn web_create_transaction(
     State(state): State<AppState>,
     _: Require<FinanceWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CreateTransactionForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -376,9 +392,8 @@ async fn web_create_transaction(
         .kind
         .parse()
         .map_err(|e: String| AppError::Validation(e))?;
-    let amount: Decimal = form
-        .amount
-        .parse()
+    let amount = localization
+        .parse_decimal(&form.amount)
         .map_err(|_| AppError::Validation("invalid amount".into()))?;
     let date: NaiveDate = form
         .date
@@ -398,6 +413,7 @@ async fn web_create_transaction(
             accounts,
             total_balance: total,
             accounts_without_methods: missing_methods(&state).await?,
+            localization: localization.clone(),
         }
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -430,6 +446,7 @@ async fn web_delete_transaction(
 async fn web_account_list(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
     let total = state.account_service.total_balance().await?;
@@ -437,6 +454,7 @@ async fn web_account_list(
         accounts,
         total_balance: total,
         accounts_without_methods: missing_methods(&state).await?,
+        localization,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -454,6 +472,7 @@ pub struct TxListQuery {
 async fn web_transaction_list(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(q): Query<TxListQuery>,
 ) -> Result<Html<String>, AppError> {
     let filter = crate::models::TransactionFilter {
@@ -466,6 +485,7 @@ async fn web_transaction_list(
     let html = TransactionListPartial {
         transactions: txs,
         account_id,
+        localization,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -476,9 +496,13 @@ async fn web_transaction_list(
 async fn web_account_options(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
-    let html = AccountOptionsPartial { accounts }
+    let html = AccountOptionsPartial {
+        accounts,
+        localization,
+    }
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))

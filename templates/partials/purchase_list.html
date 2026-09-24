@@ -19,12 +19,12 @@
       <span class="font-semibold tabular-nums">{% if let Some(n) = v.detail.purchase.purchase_number %}{{ n }}{% else %}Draft #{{ v.detail.purchase.id }}{% endif %}</span>
       <span class="min-w-0">
         <span class="block truncate font-semibold">{{ v.supplier_name }}</span>
-        <span class="block truncate text-[13px] text-muted">{{ v.detail.purchase.purchase_date }} · {{ v.detail.lines.len() }} items{% if v.detail.purchase.payment_type.to_string() == "Credit" %} · Credit{% endif %}{% if v.partially_paid %} · paid {{ v.detail.paid }}{% endif %}</span>
+        <span class="block truncate text-[13px] text-muted">{{ localization.format_date(v.detail.purchase.purchase_date.clone()) }}{% if let Some(due_date) = v.detail.purchase.due_date %} · due {{ localization.format_date(due_date.clone()) }}{% endif %} · {{ v.detail.lines.len() }} items{% if v.detail.purchase.payment_type.to_string() == "Credit" %} · Credit{% endif %}{% if v.partially_paid %} · paid {{ localization.format_currency(v.detail.paid.clone()) }}{% endif %}</span>
       </span>
       <span class="flex items-center justify-between gap-2 sm:flex-col sm:items-end sm:justify-center">
-        {% if v.detail.purchase.status.to_string() == "Draft" %}<span class="chip border-border text-muted">Draft</span>{% else if v.detail.purchase.status.to_string() == "Cancelled" %}<span class="chip border-border text-muted">Cancelled</span>{% else if v.payment_state.to_string() == "Paid" %}<span class="chip chip-income">Paid</span>{% else if v.payment_state.to_string() == "Due" %}<span class="chip chip-warning">Due {{ v.detail.due }}</span>{% else if v.payment_state.to_string() == "Overdue" %}<span class="chip chip-expense">Overdue {{ v.detail.due }}</span>{% else %}<span class="chip border-border text-muted">{{ v.payment_state }}</span>{% endif %}
+        {% if v.detail.purchase.status.to_string() == "Draft" %}<span class="chip border-border text-muted">Draft</span>{% else if v.detail.purchase.status.to_string() == "Cancelled" %}<span class="chip border-border text-muted">Cancelled</span>{% else if v.payment_state.to_string() == "Paid" %}<span class="chip chip-income">Paid</span>{% else if v.payment_state.to_string() == "Due" %}<span class="chip chip-warning">Due {{ localization.format_currency(v.detail.due.clone()) }}</span>{% else if v.payment_state.to_string() == "Overdue" %}<span class="chip chip-expense">Overdue {{ localization.format_currency(v.detail.due.clone()) }}</span>{% else %}<span class="chip border-border text-muted">{{ v.payment_state }}</span>{% endif %}
         <span class="text-right">
-          <span class="block font-bold tabular-nums text-text">{{ v.detail.total }}</span>
+          <span class="block font-bold tabular-nums text-text">{{ localization.format_currency(v.detail.total.clone()) }}</span>
           <span class="block text-[11px] uppercase tracking-[0.04em] text-muted sm:hidden">Total</span>
         </span>
       </span>

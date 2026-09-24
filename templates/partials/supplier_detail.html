@@ -7,6 +7,9 @@
     {% if let Some(phone) = supplier.phone %}
     <div class="text-[13px] text-muted">phone {{ phone }}</div>
     {% endif %}
+    <div class="text-[13px] text-muted">
+      {% if let Some(days) = supplier.due_days %}default due term: {{ days }} days{% else %}default due term: none{% endif %}
+    </div>
     {% if let Some(notes) = supplier.notes %}
     <div class="text-[13px] text-muted">{{ notes }}</div>
     {% endif %}
@@ -16,7 +19,7 @@
        the purchases below — so neither can be misread as this person's work. #}
     <div class="text-[13px] text-muted" data-supplier-actor>Proveedor registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
 
-    <div class="my-2 text-2xl font-bold">{{ balance }} <span class="text-[13px] text-muted">outstanding across Confirmed purchases</span></div>
+    <div class="my-2 text-2xl font-bold">{{ localization.format_currency(balance.clone()) }} <span class="text-[13px] text-muted">outstanding across Confirmed purchases</span></div>
 
     <div class="mt-4 flex items-center gap-2">
       {% if supplier.is_active %}
@@ -39,7 +42,7 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label class="field-label">Amount</label>
-          <input type="number" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
+          <input type="text" inputmode="decimal" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
           <label class="field-label">Date</label>
@@ -78,7 +81,7 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label class="field-label">Cost</label>
-          <input type="number" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
+          <input type="text" inputmode="decimal" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
         </div>
         <div>
           <label class="field-label">Date</label>
@@ -104,9 +107,9 @@
             <span class="chip chip-muted">{{ d.purchase.status }}</span>
             <span class="font-semibold">{% if let Some(n) = d.purchase.purchase_number %}{{ n }}{% else %}purchase #{{ d.purchase.id }}{% endif %}</span>
           </div>
-          <span class="text-[13px] text-muted">{{ d.purchase.purchase_date }} • total {{ d.total }} • paid {{ d.paid }}</span>
+          <span class="text-[13px] text-muted">{{ localization.format_date(d.purchase.purchase_date.clone()) }} • total {{ localization.format_currency(d.total.clone()) }} • paid {{ localization.format_currency(d.paid.clone()) }}</span>
         </div>
-        <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ d.due }}</span>
+        <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_currency(d.due.clone()) }}</span>
       </a>
       {% endfor %}
     {% endif %}

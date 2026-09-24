@@ -228,7 +228,15 @@ async fn post_browser_form(app: &Router, uri: &str, body: &str) -> (StatusCode, 
 }
 
 async fn post_json(app: &Router, uri: &str, body: Value) -> (StatusCode, String) {
-    send(app, "POST", uri, Some("application/json"), false, body.to_string()).await
+    send(
+        app,
+        "POST",
+        uri,
+        Some("application/json"),
+        false,
+        body.to_string(),
+    )
+    .await
 }
 
 /// PUT/POST JSON as ANOTHER principal: the cookie value comes from the caller
@@ -351,14 +359,13 @@ async fn method_id(pool: &SqlitePool, name: &str) -> i64 {
 
 /// The method row one account owns (same names repeat across accounts).
 async fn account_method_id(pool: &SqlitePool, account_id: i64, name: &str) -> i64 {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT id FROM payment_methods WHERE account_id = ? AND name = ?",
-    )
-    .bind(account_id)
-    .bind(name)
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let row: (i64,) =
+        sqlx::query_as("SELECT id FROM payment_methods WHERE account_id = ? AND name = ?")
+            .bind(account_id)
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
     row.0
 }
 
@@ -429,8 +436,7 @@ async fn create_product_via_web(
 }
 
 async fn record_stock_via_web(app: &Router, product_id: i64, qty: &str) {
-    let body =
-        format!("product_id={product_id}&type=In&qty={qty}&reason=Initial&date=2024-05-01");
+    let body = format!("product_id={product_id}&type=In&qty={qty}&reason=Initial&date=2024-05-01");
     let (status, resp) = post_form(app, "/web/stock-movements", &body).await;
     assert_eq!(status, StatusCode::OK, "record stock: {resp}");
 }
@@ -453,15 +459,15 @@ async fn seed_customer(
     pool: &SqlitePool,
     name: &str,
     credit_limit: Option<&str>,
-    payment_days: Option<i64>,
+    due_days: Option<i64>,
 ) -> i64 {
     let row: (i64,) = sqlx::query_as(
-        "INSERT INTO customers (name, credit_limit, payment_days, created_by) \
+        "INSERT INTO customers (name, credit_limit, due_days, created_by) \
          VALUES (?, ?, ?, ?) RETURNING id",
     )
     .bind(name)
     .bind(credit_limit)
-    .bind(payment_days)
+    .bind(due_days)
     .bind(test_support::audit_actor_id(pool).await.unwrap())
     .fetch_one(pool)
     .await
@@ -516,11 +522,7 @@ async fn add_sale_line_via_web(app: &Router, sale_id: i64, product_id: i64, qty:
     assert_eq!(status, StatusCode::OK, "add sale line: {resp}");
 }
 
-async fn confirm_sale_via_web(
-    app: &Router,
-    sale_id: i64,
-    method_id: Option<i64>,
-) {
+async fn confirm_sale_via_web(app: &Router, sale_id: i64, method_id: Option<i64>) {
     let mut body = format!("sale_id={sale_id}");
     if let Some(method) = method_id {
         body.push_str(&format!("&method_id={method}"));
@@ -535,9 +537,7 @@ async fn pay_sale_via_web(
     method_id: i64,
     amount: &str,
 ) -> (StatusCode, String) {
-    let body = format!(
-        "sale_id={sale_id}&method_id={method_id}&amount={amount}&date=2024-05-10"
-    );
+    let body = format!("sale_id={sale_id}&method_id={method_id}&amount={amount}&date=2024-05-10");
     post_form(app, "/web/sales/payments", &body).await
 }
 
@@ -560,7 +560,11 @@ async fn sale_detail(app: &Router, sale_id: i64) -> Value {
 
 async fn purchase_detail(app: &Router, purchase_id: i64) -> Value {
     let (status, body) = get(app, &format!("/api/purchases/{purchase_id}")).await;
-    assert_eq!(status, StatusCode::OK, "purchase {purchase_id} detail: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "purchase {purchase_id} detail: {body}"
+    );
     json_body(&body)
 }
 
@@ -572,7 +576,11 @@ async fn stock_of(app: &Router, product_id: i64) -> Decimal {
 
 async fn transactions_for(app: &Router, account_id: i64) -> Vec<Value> {
     let (status, body) = get(app, &format!("/api/transactions?account_id={account_id}")).await;
-    assert_eq!(status, StatusCode::OK, "transactions for {account_id}: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "transactions for {account_id}: {body}"
+    );
     json_body(&body)["transactions"]
         .as_array()
         .cloned()
@@ -868,13 +876,23 @@ fn templated_path(template: &str) -> bool {
         let boundary = index == 0
             || matches!(
                 bytes[index - 1],
-                b' ' | b'\t' | b'\n' | b'\'' | b'"' | b'`' | b'(' | b',' | b'=' | b'{' | b'}' | b':' | b'?' | b';'
+                b' ' | b'\t'
+                    | b'\n'
+                    | b'\''
+                    | b'"'
+                    | b'`'
+                    | b'('
+                    | b','
+                    | b'='
+                    | b'{'
+                    | b'}'
+                    | b':'
+                    | b'?'
+                    | b';'
             );
         let path_char = bytes
             .get(index + 1)
-            .map(|next| {
-                next.is_ascii_alphanumeric() || matches!(next, b'_' | b'-' | b'/' | b'.')
-            })
+            .map(|next| next.is_ascii_alphanumeric() || matches!(next, b'_' | b'-' | b'/' | b'.'))
             .unwrap_or(false);
         if boundary && path_char {
             return true;
@@ -1051,7 +1069,13 @@ fn check_rendered_wiring_shape(
         )?;
     }
     for target in extract_script_targets(html).map_err(|e| format!("{page}: {e}"))? {
-        check_target_shape(page, &target.attr, &target.target, concrete_ids_are_defects, false)?;
+        check_target_shape(
+            page,
+            &target.attr,
+            &target.target,
+            concrete_ids_are_defects,
+            false,
+        )?;
     }
     for form in extract_rendered_forms(html) {
         check_native_form(page, &form, concrete_ids_are_defects)?;
@@ -1122,7 +1146,11 @@ fn check_same_page_selectors(
                 declared.selector, declared.host
             )
         })?;
-        let Some(id) = declared.selector.strip_prefix('#').filter(|id| !id.is_empty()) else {
+        let Some(id) = declared
+            .selector
+            .strip_prefix('#')
+            .filter(|id| !id.is_empty())
+        else {
             return Err(format!(
                 "{page}: external selector {:?} must be an absolute #id so its host page can be checked",
                 declared.selector
@@ -1249,9 +1277,7 @@ async fn assert_htmx_targets_are_wired(
     }
 
     let targets = extract_htmx_targets(html);
-    let forms = extract_rendered_forms(html)
-        .into_iter()
-        .collect::<Vec<_>>();
+    let forms = extract_rendered_forms(html).into_iter().collect::<Vec<_>>();
     // A page renders wiring either as htmx request attributes or as a native
     // form action (both are probed with real verbs below). A page with neither
     // renders nothing this guard can check, so it must not be guarded — but a
@@ -1281,7 +1307,13 @@ async fn assert_htmx_targets_are_wired(
     }
 
     for target in extract_script_targets(html).map_err(|e| format!("{page}: {e}"))? {
-        check_target_shape(page, &target.attr, &target.target, concrete_ids_are_defects, false)?;
+        check_target_shape(
+            page,
+            &target.attr,
+            &target.target,
+            concrete_ids_are_defects,
+            false,
+        )?;
         probe_or_fail(
             probe_app,
             page,
@@ -1378,7 +1410,7 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
     let (status, resp) = post_form(
         app,
         "/web/customers",
-        "name=GuardCustomer&phone=555-0100&credit_limit=500&payment_days=30",
+        "name=GuardCustomer&phone=555-0100&credit_limit=500&due_days=30",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "seed customer: {resp}");
@@ -1386,16 +1418,13 @@ async fn seed_wiring_fixture(app: &Router, pool: &SqlitePool) -> WiringFixture {
 
     // A confirmed credit sale collected into a receipt, so the customer statement
     // renders the receipt list and the referenced-id rule covers that path too.
-    let guard_sale =
-        create_sale_draft_for_customer(app, customer, "Credit", "2024-06-02").await;
+    let guard_sale = create_sale_draft_for_customer(app, customer, "Credit", "2024-06-02").await;
     add_sale_line_via_web(app, guard_sale, product, "1").await;
     confirm_sale_via_web(app, guard_sale, None).await;
     let (status, resp) = post_form(
         app,
         "/web/customer-receipts",
-        &format!(
-            "customer_id={customer}&method_id={cash}&amount=10&date=2024-05-10"
-        ),
+        &format!("customer_id={customer}&method_id={cash}&amount=10&date=2024-05-10"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "seed receipt: {resp}");
@@ -1660,7 +1689,11 @@ async fn web_setup_flow_persists_account_methods_product_and_supplier_cost() {
 
     let supplier = create_supplier_via_web(&app, &pool, "SetupSupplier").await;
     record_supplier_cost_via_web(&app, product, supplier, "7.50").await;
-    let (status, body) = get(&app, &format!("/api/product-supplier-costs?product_id={product}")).await;
+    let (status, body) = get(
+        &app,
+        &format!("/api/product-supplier-costs?product_id={product}"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let costs = json_body(&body);
     let cost = costs["costs"]
@@ -1669,7 +1702,10 @@ async fn web_setup_flow_persists_account_methods_product_and_supplier_cost() {
         .iter()
         .find(|c| c["supplier_id"] == json!(supplier))
         .unwrap_or_else(|| panic!("satellite cost for supplier {supplier}: {costs}"));
-    assert_eq!(dec(&cost["current_cost"]), Decimal::from_str("7.50").unwrap());
+    assert_eq!(
+        dec(&cost["current_cost"]),
+        Decimal::from_str("7.50").unwrap()
+    );
 
     // Rendered pages agree: the account is configured and the product is listed.
     let (status, page) = get(&app, &format!("/accounts/{account}")).await;
@@ -1748,10 +1784,7 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     confirm_sale_via_web(&app, sale, None).await;
 
     let detail = sale_detail(&app, sale).await;
-    let sale_number = detail["sale"]["sale_number"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let sale_number = detail["sale"]["sale_number"].as_str().unwrap().to_string();
     assert!(
         detail["payments"].as_array().unwrap().is_empty(),
         "credit confirm posts no finance row",
@@ -1837,12 +1870,8 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
     let (app, pool) = test_app().await;
 
     // AC2: a form post without a customer is a 400 and creates nothing.
-    let (status, body) = post_form(
-        &app,
-        "/web/sales",
-        "payment_type=Cash&sale_date=2024-05-02",
-    )
-    .await;
+    let (status, body) =
+        post_form(&app, "/web/sales", "payment_type=Cash&sale_date=2024-05-02").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let (status, list) = get(&app, "/api/sales").await;
     assert_eq!(status, StatusCode::OK, "{list}");
@@ -1873,9 +1902,7 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
     let (status, body) = post_form(
         &app,
         "/web/sales",
-        &format!(
-            "customer_id={no_term_id}&payment_type=Credit&sale_date=2024-05-02&due_date="
-        ),
+        &format!("customer_id={no_term_id}&payment_type=Credit&sale_date=2024-05-02&due_date="),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1885,12 +1912,8 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
     let over_id = seed_customer(&pool, "Smoke Over", Some("50"), Some(30)).await;
     let over_sale = create_sale_draft_for_customer(&app, over_id, "Credit", "").await;
     add_sale_line_via_web(&app, over_sale, product, "3").await;
-    let (status, body) = post_form(
-        &app,
-        "/web/sales/confirm",
-        &format!("sale_id={over_sale}"),
-    )
-    .await;
+    let (status, body) =
+        post_form(&app, "/web/sales/confirm", &format!("sale_id={over_sale}")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("75"), "projected debt in the message: {body}");
     assert!(body.contains("50"), "limit in the message: {body}");
@@ -1906,8 +1929,7 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let walkin_sale =
-        create_sale_draft_for_customer(&app, walkin_id, "Credit", "2024-06-02").await;
+    let walkin_sale = create_sale_draft_for_customer(&app, walkin_id, "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, walkin_sale, product, "1").await;
     let (status, body) = post_form(
         &app,
@@ -1926,144 +1948,146 @@ async fn credit_rules_and_mandatory_customer_hold_over_http() {
     );
 }
 
-    /// M4 collection flow over HTTP: create a customer, sell on credit, collect
-    /// part of it through the form, then assert the derived balance, the ageing
-    /// buckets and that the receipt total equals the sum of its allocations
-    /// while every grouped payment keeps its own finance link.
-    #[tokio::test]
-    async fn collection_flow_derives_balance_ageing_and_receipt_total() {
-        let (app, pool) = test_app().await;
-        let cash = method_id(&pool, "Cash").await;
-        let _account = create_account_via_web(&app, &pool, "CollectWallet", &[cash]).await;
-        let product = create_product_via_web(&app, &pool, "COLLECT-P", "1", "50").await;
-        record_stock_via_web(&app, product, "10").await;
+/// M4 collection flow over HTTP: create a customer, sell on credit, collect
+/// part of it through the form, then assert the derived balance, the ageing
+/// buckets and that the receipt total equals the sum of its allocations
+/// while every grouped payment keeps its own finance link.
+#[tokio::test]
+async fn collection_flow_derives_balance_ageing_and_receipt_total() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let _account = create_account_via_web(&app, &pool, "CollectWallet", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "COLLECT-P", "1", "50").await;
+    record_stock_via_web(&app, product, "10").await;
 
-        // The customer is created through the same form the page renders.
-        let (status, resp) = post_form(
-            &app,
-            "/web/customers",
-            "name=Collect+Buyer&phone=555-0200&credit_limit=500&payment_days=30",
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "create customer: {resp}");
-        let customer = customer_id_by_name(&pool, "Collect Buyer").await;
+    // The customer is created through the same form the page renders.
+    let (status, resp) = post_form(
+        &app,
+        "/web/customers",
+        "name=Collect+Buyer&phone=555-0200&credit_limit=500&due_days=30",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create customer: {resp}");
+    let customer = customer_id_by_name(&pool, "Collect Buyer").await;
 
-        // Credit sale of 3 x 25 = 75, due 2024-06-15.
-        let sale = create_sale_draft_for_customer(&app, customer, "Credit", "2024-06-15").await;
-        add_sale_line_via_web(&app, sale, product, "3").await;
-        confirm_sale_via_web(&app, sale, None).await;
-        let detail = sale_detail(&app, sale).await;
-        assert_eq!(dec(&detail["total"]), Decimal::from(75));
-        assert_eq!(dec(&detail["due"]), Decimal::from(75));
+    // Credit sale of 3 x 25 = 75, due 2024-06-15.
+    let sale = create_sale_draft_for_customer(&app, customer, "Credit", "2024-06-15").await;
+    add_sale_line_via_web(&app, sale, product, "3").await;
+    confirm_sale_via_web(&app, sale, None).await;
+    let detail = sale_detail(&app, sale).await;
+    assert_eq!(dec(&detail["total"]), Decimal::from(75));
+    assert_eq!(dec(&detail["due"]), Decimal::from(75));
 
-        // Collect 30 through the collect form (the id travels in the body).
-        let (status, resp) = post_form(
-            &app,
-            "/web/customer-receipts",
-            &format!(
-                "customer_id={customer}&method_id={cash}&amount=30&date=2024-06-20&notes=part"
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "collect: {resp}");
+    // Collect 30 through the collect form (the id travels in the body).
+    let (status, resp) = post_form(
+        &app,
+        "/web/customer-receipts",
+        &format!("customer_id={customer}&method_id={cash}&amount=30&date=2024-06-20&notes=part"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collect: {resp}");
 
-        // Derived balance and over-limit flag through the composed read.
-        let (status, body) = get(&app, &format!("/api/customers/{customer}")).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let v = json_body(&body);
-        assert_eq!(dec(&v["balance"]), Decimal::from(45));
-        assert_eq!(v["over_limit"], json!(false));
-        assert_eq!(v["customer"]["name"], json!("Collect Buyer"));
+    // Derived balance and over-limit flag through the composed read.
+    let (status, body) = get(&app, &format!("/api/customers/{customer}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json_body(&body);
+    assert_eq!(dec(&v["balance"]), Decimal::from(45));
+    assert_eq!(v["over_limit"], json!(false));
+    assert_eq!(v["customer"]["name"], json!("Collect Buyer"));
 
-        // Statement: one sale debit, one payment credit, balance 45, and the
-        // whole balance 5 days overdue falls in 1-30.
-        let (status, body) = get(
-            &app,
-            &format!("/api/customers/{customer}/statement?as_of=2024-06-20"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let v = json_body(&body);
-        let statement = &v["statement"];
-        assert_eq!(dec(&statement["balance"]), Decimal::from(45));
-        assert_eq!(dec(&statement["ageing"]["overdue_1_30"]), Decimal::from(45));
-        assert_eq!(dec(&statement["ageing"]["current"]), Decimal::ZERO);
-        let entries = statement["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2, "sale debit + payment credit: {entries:?}");
-        assert!(entries
-            .iter()
-            .any(|e| e["kind"] == json!("Sale") && dec(&e["debit"]) == Decimal::from(75)));
-        assert!(entries.iter().any(|e| e["kind"] == json!("Payment")
-            && dec(&e["credit"]) == Decimal::from(30)));
+    // Statement: one sale debit, one payment credit, balance 45, and the
+    // whole balance 5 days overdue falls in 1-30.
+    let (status, body) = get(
+        &app,
+        &format!("/api/customers/{customer}/statement?as_of=2024-06-20"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json_body(&body);
+    let statement = &v["statement"];
+    assert_eq!(dec(&statement["balance"]), Decimal::from(45));
+    assert_eq!(dec(&statement["ageing"]["overdue_1_30"]), Decimal::from(45));
+    assert_eq!(dec(&statement["ageing"]["current"]), Decimal::ZERO);
+    let entries = statement["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "sale debit + payment credit: {entries:?}");
+    assert!(entries
+        .iter()
+        .any(|e| e["kind"] == json!("Sale") && dec(&e["debit"]) == Decimal::from(75)));
+    assert!(entries
+        .iter()
+        .any(|e| e["kind"] == json!("Payment") && dec(&e["credit"]) == Decimal::from(30)));
 
-        // The receivables view ages the same balance.
-        let (status, body) = get(&app, "/api/customers/ageing?as_of=2024-06-20").await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let v = json_body(&body);
-        let row = v["ageing"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["customer_id"] == json!(customer))
-            .unwrap_or_else(|| panic!("customer {customer} missing from ageing: {v}"));
-        assert_eq!(dec(&row["balance"]), Decimal::from(45));
-        assert_eq!(dec(&row["ageing"]["overdue_1_30"]), Decimal::from(45));
-        assert_eq!(row["name"], json!("Collect Buyer"));
+    // The receivables view ages the same balance.
+    let (status, body) = get(&app, "/api/customers/ageing?as_of=2024-06-20").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json_body(&body);
+    let row = v["ageing"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["customer_id"] == json!(customer))
+        .unwrap_or_else(|| panic!("customer {customer} missing from ageing: {v}"));
+    assert_eq!(dec(&row["balance"]), Decimal::from(45));
+    assert_eq!(dec(&row["ageing"]["overdue_1_30"]), Decimal::from(45));
+    assert_eq!(row["name"], json!("Collect Buyer"));
 
-        // Receipt total is derived from its allocations, never stored.
-        let (status, body) = get(
-            &app,
-            &format!("/api/customer-receipts?customer_id={customer}"),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let v = json_body(&body);
-        let receipts = v["receipts"].as_array().unwrap();
-        assert_eq!(receipts.len(), 1, "{v}");
-        let receipt = &receipts[0];
-        let receipt_id = receipt["receipt"]["id"].as_i64().unwrap();
-        assert_eq!(dec(&receipt["total"]), Decimal::from(30));
-        let allocations = receipt["allocations"].as_array().unwrap();
-        assert_eq!(allocations.len(), 1);
-        let summed: Decimal = allocations.iter().map(|a| dec(&a["amount"])).sum();
-        assert_eq!(summed, dec(&receipt["total"]));
-        for allocation in allocations {
-            assert_eq!(allocation["receipt_id"].as_i64(), Some(receipt_id));
-            assert_eq!(allocation["sale_id"].as_i64(), Some(sale));
-            assert!(
-                allocation["transaction_id"].as_i64().is_some(),
-                "the grouped payment keeps its finance link: {allocation}"
-            );
-        }
-        let raw: Vec<(String,)> =
-            sqlx::query_as("SELECT amount FROM sale_payments WHERE receipt_id = ?")
-                .bind(receipt_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        let raw_sum: Decimal = raw
-            .iter()
-            .map(|(amount,)| Decimal::from_str(amount).unwrap())
-            .sum();
-        assert_eq!(raw_sum, dec(&receipt["total"]));
-
-        // The sale still shows the receipt-linked payment, and the money
-        // invariant holds for the whole database built by the flow.
-        let detail = sale_detail(&app, sale).await;
-        assert_eq!(detail["payments"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            detail["payments"][0]["receipt_id"].as_i64(),
-            Some(receipt_id)
+    // Receipt total is derived from its allocations, never stored.
+    let (status, body) = get(
+        &app,
+        &format!("/api/customer-receipts?customer_id={customer}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json_body(&body);
+    let receipts = v["receipts"].as_array().unwrap();
+    assert_eq!(receipts.len(), 1, "{v}");
+    let receipt = &receipts[0];
+    let receipt_id = receipt["receipt"]["id"].as_i64().unwrap();
+    assert_eq!(dec(&receipt["total"]), Decimal::from(30));
+    let allocations = receipt["allocations"].as_array().unwrap();
+    assert_eq!(allocations.len(), 1);
+    let summed: Decimal = allocations.iter().map(|a| dec(&a["amount"])).sum();
+    assert_eq!(summed, dec(&receipt["total"]));
+    for allocation in allocations {
+        assert_eq!(allocation["receipt_id"].as_i64(), Some(receipt_id));
+        assert_eq!(allocation["sale_id"].as_i64(), Some(sale));
+        assert!(
+            allocation["transaction_id"].as_i64().is_some(),
+            "the grouped payment keeps its finance link: {allocation}"
         );
-        assert_eq!(dec(&detail["due"]), Decimal::from(45));
-        assert_payment_links_are_traceable(&pool).await;
-
-        // The statement page renders the collected customer and the new balance.
-        let (status, html) = get(&app, &format!("/customers/{customer}")).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("Collect Buyer"), "{html:.400}");
-        assert!(html.contains("45"), "the page shows the derived balance: {html:.400}");
     }
+    let raw: Vec<(String,)> =
+        sqlx::query_as("SELECT amount FROM sale_payments WHERE receipt_id = ?")
+            .bind(receipt_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let raw_sum: Decimal = raw
+        .iter()
+        .map(|(amount,)| Decimal::from_str(amount).unwrap())
+        .sum();
+    assert_eq!(raw_sum, dec(&receipt["total"]));
+
+    // The sale still shows the receipt-linked payment, and the money
+    // invariant holds for the whole database built by the flow.
+    let detail = sale_detail(&app, sale).await;
+    assert_eq!(detail["payments"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        detail["payments"][0]["receipt_id"].as_i64(),
+        Some(receipt_id)
+    );
+    assert_eq!(dec(&detail["due"]), Decimal::from(45));
+    assert_payment_links_are_traceable(&pool).await;
+
+    // The statement page renders the collected customer and the new balance.
+    let (status, html) = get(&app, &format!("/customers/{customer}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Collect Buyer"), "{html:.400}");
+    assert!(
+        html.contains("45"),
+        "the page shows the derived balance: {html:.400}"
+    );
+}
 
 #[tokio::test]
 async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
@@ -2097,7 +2121,10 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
     let detail = purchase_detail(&app, purchase).await;
     assert_eq!(detail["purchase"]["status"], json!("Draft"));
     assert_eq!(dec(&detail["lines"][0]["qty"]), Decimal::from(18));
-    assert_eq!(dec(&detail["lines"][0]["unit_cost"]), Decimal::from_str("7.50").unwrap());
+    assert_eq!(
+        dec(&detail["lines"][0]["unit_cost"]),
+        Decimal::from_str("7.50").unwrap()
+    );
     assert_eq!(stock_of(&app, product).await, Decimal::from(2));
 
     // Confirm Cash: stock in plus one Expense linked from the payment.
@@ -2135,7 +2162,10 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
         .expect("expense row");
     assert_eq!(expense["kind"], json!("Expense"));
     assert_eq!(dec(&expense["amount"]), Decimal::from(135));
-    assert_eq!(expense["reference"].as_str(), Some(purchase_number.as_str()));
+    assert_eq!(
+        expense["reference"].as_str(),
+        Some(purchase_number.as_str())
+    );
 
     // Cancel the confirmed purchase: stock returns and the Expense is refunded.
     let (status, body) = post_form(
@@ -2192,7 +2222,8 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
 
     let product = create_product_via_web(&app, &pool, "GUARDFLOW-P", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
-    let sale = create_sale_draft_via_web(&app, &pool, "GuardFlowBuyer", "Credit", "2024-06-02").await;
+    let sale =
+        create_sale_draft_via_web(&app, &pool, "GuardFlowBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
     confirm_sale_via_web(&app, sale, None).await;
 
@@ -2224,8 +2255,18 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
     assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
 
     let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
-    assert_eq!(status, StatusCode::OK, "payment after configuration: {body}");
-    assert_eq!(sale_detail(&app, sale).await["payments"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "payment after configuration: {body}"
+    );
+    assert_eq!(
+        sale_detail(&app, sale).await["payments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     let txs = transactions_for(&app, account).await;
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0]["kind"], json!("Income"));
@@ -2387,14 +2428,9 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
         let payment_amount = Decimal::from_str(&amount_text).map_err(|e| {
             format!("sale payment {payment_id} has invalid amount {amount_text}: {e}")
         })?;
-        let original = check_original_transaction(
-            pool,
-            "sale",
-            payment_id,
-            transaction_id,
-            &sale_number,
-        )
-        .await?;
+        let original =
+            check_original_transaction(pool, "sale", payment_id, transaction_id, &sale_number)
+                .await?;
         claim_transaction(
             &mut owners,
             transaction_id,
@@ -2433,8 +2469,14 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
         .fetch_all(pool)
         .await
         .map_err(|e| e.to_string())?;
-    for (payment_id, transaction_id, refund_transaction_id, account_id, amount_text, purchase_number) in
-        purchase_links
+    for (
+        payment_id,
+        transaction_id,
+        refund_transaction_id,
+        account_id,
+        amount_text,
+        purchase_number,
+    ) in purchase_links
     {
         let purchase_number = purchase_number.ok_or_else(|| {
             format!("purchase payment {payment_id} belongs to a purchase without a number")
@@ -2533,13 +2575,12 @@ async fn fetch_money_transaction(
     payment_id: i64,
     transaction_id: i64,
 ) -> Result<MoneyTransaction, String> {
-    let row: Option<(Option<String>, i64, String, String)> = sqlx::query_as(
-        "SELECT reference, account_id, kind, amount FROM transactions WHERE id = ?",
-    )
-    .bind(transaction_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    let row: Option<(Option<String>, i64, String, String)> =
+        sqlx::query_as("SELECT reference, account_id, kind, amount FROM transactions WHERE id = ?")
+            .bind(transaction_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| e.to_string())?;
     let (reference, account_id, kind, amount) = row.ok_or_else(|| {
         format!("{label} payment {payment_id} points at missing transaction {transaction_id}")
     })?;
@@ -2656,10 +2697,9 @@ fn id_free_page_shape(html: &str) -> Result<(), String> {
 /// because only the literal `0` segment was rejected.
 #[test]
 fn wiring_guard_catches_hardcoded_numeric_id_on_id_free_page() {
-    let err = id_free_page_shape(
-        r#"<form hx-post="/web/sales/1/confirm"><input name="sale_id"></form>"#,
-    )
-    .unwrap_err();
+    let err =
+        id_free_page_shape(r#"<form hx-post="/web/sales/1/confirm"><input name="sale_id"></form>"#)
+            .unwrap_err();
     eprintln!("mutation-1 rejected: {err}");
     assert!(err.contains("hardcodes a concrete id segment"), "{err}");
 
@@ -2755,7 +2795,12 @@ async fn wiring_guard_rejects_a_hardcoded_id_form_added_to_the_purchases_list() 
         "the purchases list carries no legitimate concrete id and must stay under the rule"
     );
     let (status, html) = get(&app, &purchases_page.path).await;
-    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", purchases_page.path);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}: {html:.400}",
+        purchases_page.path
+    );
 
     // Exactly the verifier's mutation: one extra form with a concrete id.
     let mutant = format!(
@@ -2832,7 +2877,8 @@ async fn wiring_guard_rejects_hx_target_selectors_that_no_element_matches() {
     let (status, purchases) = get(&app, "/purchases").await;
     assert_eq!(status, StatusCode::OK, "{purchases:.400}");
     let dangling = format!("{purchases}<button hx-target=\"#purchase-detail\"></button>");
-    let err = check_same_page_selectors("purchases", &dangling, &[], &RenderedPages::new()).unwrap_err();
+    let err =
+        check_same_page_selectors("purchases", &dangling, &[], &RenderedPages::new()).unwrap_err();
     eprintln!("dangling selector rejected: {err}");
     assert!(err.contains("purchases"), "{err}");
     assert!(err.contains("#purchase-detail"), "{err}");
@@ -2841,7 +2887,10 @@ async fn wiring_guard_rejects_hx_target_selectors_that_no_element_matches() {
     let (status, sales) = get(&app, "/sales").await;
     assert_eq!(status, StatusCode::OK, "{sales:.400}");
     let removed = sales.replacen("id=\"sale-debt\"", "", 1);
-    assert_ne!(removed, sales, "the mutation must remove the targeted panel");
+    assert_ne!(
+        removed, sales,
+        "the mutation must remove the targeted panel"
+    );
     let err = check_same_page_selectors("sales", &removed, &[], &RenderedPages::new()).unwrap_err();
     eprintln!("removed panel rejected: {err}");
     assert!(err.contains("sales"), "{err}");
@@ -2877,7 +2926,13 @@ async fn fragment_external_selectors_resolve_on_their_host_record_pages() {
     // Without the declared exemption the fragment genuinely fails, so the
     // exemption is not decorative.
     let (_, fragment) = get(&app, &format!("/web/sales/{}", fixture.sale)).await;
-    let err = check_same_page_selectors("sale detail fragment", &fragment, &[], &RenderedPages::new()).unwrap_err();
+    let err = check_same_page_selectors(
+        "sale detail fragment",
+        &fragment,
+        &[],
+        &RenderedPages::new(),
+    )
+    .unwrap_err();
     assert!(err.contains("#sale-record"), "{err}");
 }
 
@@ -2952,7 +3007,8 @@ async fn wiring_guard_pins_the_non_vacuity_boundary_of_native_form_actions() {
     // The predicate directly, on all three boundaries.
     let form_with_action = extract_rendered_forms(r#"<form method="get" action="/login"></form>"#);
     assert!(!wiring_is_vacuous(&[], &form_with_action));
-    let form_with_placeholder = extract_rendered_forms(r##"<form method="post" action="#"></form>"##);
+    let form_with_placeholder =
+        extract_rendered_forms(r##"<form method="post" action="#"></form>"##);
     assert!(wiring_is_vacuous(&[], &form_with_placeholder));
     assert!(wiring_is_vacuous(&[], &[]));
 
@@ -3301,7 +3357,10 @@ fn wiring_guard_rejects_dynamic_js_urls() {
     )
     .unwrap_err();
     eprintln!("dynamic concat rejected: {err}");
-    assert!(err.contains("plain single or double quoted literal"), "{err}");
+    assert!(
+        err.contains("plain single or double quoted literal"),
+        "{err}"
+    );
 
     let err = check_rendered_wiring_shape(
         "dynamic",
@@ -3310,7 +3369,10 @@ fn wiring_guard_rejects_dynamic_js_urls() {
     )
     .unwrap_err();
     eprintln!("dynamic template rejected: {err}");
-    assert!(err.contains("plain single or double quoted literal"), "{err}");
+    assert!(
+        err.contains("plain single or double quoted literal"),
+        "{err}"
+    );
 
     // The enforced convention: a plain literal still passes.
     check_rendered_wiring_shape(
@@ -3384,7 +3446,8 @@ async fn money_invariant_catches_equal_amount_pointer_swaps() {
     let _account = create_account_via_web(&app, &pool, "EqualInv", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "EQUAL-INV", "1", "10").await;
     record_stock_via_web(&app, product, "5").await;
-    let sale = create_sale_draft_via_web(&app, &pool, "EqualInvBuyer", "Credit", "2024-06-02").await;
+    let sale =
+        create_sale_draft_via_web(&app, &pool, "EqualInvBuyer", "Credit", "2024-06-02").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
     confirm_sale_via_web(&app, sale, None).await;
     let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
@@ -3490,9 +3553,16 @@ async fn money_invariant_catches_orphan_document_movement() {
         .await
         .unwrap();
     assert_eq!(tx.0, "Income");
-    assert_eq!(Decimal::from_str(&tx.1).unwrap(), Decimal::from_str("10").unwrap());
+    assert_eq!(
+        Decimal::from_str(&tx.1).unwrap(),
+        Decimal::from_str("10").unwrap()
+    );
     let detail = sale_detail(&app, sale).await;
-    assert_eq!(dec(&detail["paid"]), Decimal::ZERO, "the orphan paid nothing");
+    assert_eq!(
+        dec(&detail["paid"]),
+        Decimal::ZERO,
+        "the orphan paid nothing"
+    );
     assert_eq!(dec(&detail["due"]), dec(&detail["total"]));
 }
 
@@ -3927,7 +3997,11 @@ async fn purchases_dialog_offers_the_last_used_supplier_on_the_list_page() {
     for (supplier, date) in [(first, "2024-05-01"), (last, "2024-05-02")] {
         let body = format!("supplier_id={supplier}&purchase_date={date}");
         let (status, location) = post_form_plain(&app, "/web/purchases", &body).await;
-        assert_eq!(status, StatusCode::SEE_OTHER, "create draft must redirect: {location}");
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "create draft must redirect: {location}"
+        );
     }
 
     let (status, page) = get(&app, "/purchases").await;
@@ -3940,9 +4014,8 @@ async fn purchases_dialog_offers_the_last_used_supplier_on_the_list_page() {
     // the component instead: the colour is asserted by the visual net.
     assert!(
         tag.contains("<button")
-            && tag.contains(
-                "onclick=\"document.getElementById('new-purchase-dialog').showModal()\""
-            )
+            && tag
+                .contains("onclick=\"document.getElementById('new-purchase-dialog').showModal()\"")
             && tag.contains("btn-primary"),
         "the primary action must open the creation dialog as the primary button component: {tag}"
     );
@@ -4087,12 +4160,11 @@ async fn web_create_purchase_resolves_a_typed_name_and_refuses_unknown_or_absent
         .unwrap()
         .to_string();
     let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
-    let (supplier_id,): (i64,) =
-        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
-            .bind(purchase_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (supplier_id,): (i64,) = sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+        .bind(purchase_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let (name,): (String,) = sqlx::query_as("SELECT name FROM suppliers WHERE id = ?")
         .bind(supplier_id)
         .fetch_one(&pool)
@@ -4119,7 +4191,11 @@ async fn web_create_purchase_resolves_a_typed_name_and_refuses_unknown_or_absent
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "an unknown name must refuse");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an unknown name must refuse"
+    );
     let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
     let body = String::from_utf8_lossy(&body).to_string();
     assert!(
@@ -4136,7 +4212,11 @@ async fn web_create_purchase_resolves_a_typed_name_and_refuses_unknown_or_absent
     );
     let resp = app
         .clone()
-        .oneshot(builder.body(Body::from("purchase_date=2024-05-02")).unwrap())
+        .oneshot(
+            builder
+                .body(Body::from("purchase_date=2024-05-02"))
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -4144,11 +4224,10 @@ async fn web_create_purchase_resolves_a_typed_name_and_refuses_unknown_or_absent
         StatusCode::BAD_REQUEST,
         "a post with neither id nor name must refuse"
     );
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM purchases")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchases")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         count, 1,
         "the refusals must have created nothing: only the resolved-name draft exists"
@@ -4189,13 +4268,15 @@ async fn web_create_purchase_an_explicit_supplier_id_wins_over_the_typed_name() 
         .unwrap()
         .to_string();
     let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
-    let (supplier_id,): (i64,) =
-        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
-            .bind(purchase_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(supplier_id, id_sup, "the explicit id must win over the typed name");
+    let (supplier_id,): (i64,) = sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+        .bind(purchase_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        supplier_id, id_sup,
+        "the explicit id must win over the typed name"
+    );
 }
 
 /// The picker's own rendered form (the Enter path, T3's hazard): the dialog
@@ -4270,14 +4351,17 @@ async fn dialog_enter_path_assigns_the_typed_supplier_not_the_pre_filled_one() {
         .collect::<Vec<_>>()
         .join("&");
     let (status, location) = post_form_plain(&app, "/web/purchases", &body).await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "Enter must create: {location}");
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "Enter must create: {location}"
+    );
     let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
-    let (supplier_id,): (i64,) =
-        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
-            .bind(purchase_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (supplier_id,): (i64,) = sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+        .bind(purchase_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         supplier_id, typed,
         "the draft must belong to the supplier the operator typed, never the pre-filled one"
@@ -4308,20 +4392,19 @@ async fn dialog_enter_path_with_the_unchanged_pre_fill_assigns_the_same_supplier
 
     // Enter submits the picker's own form carrying the pre-filled name —
     // and nothing else but what the widget rendered.
-    let (status, location) = post_form_plain(
-        &app,
-        "/web/purchases",
-        "supplier_name=UnchangedPrefillSup",
-    )
-    .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "Enter must create: {location}");
+    let (status, location) =
+        post_form_plain(&app, "/web/purchases", "supplier_name=UnchangedPrefillSup").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "Enter must create: {location}"
+    );
     let purchase_id: i64 = location["/purchases/".len()..].parse().unwrap();
-    let (supplier_id,): (i64,) =
-        sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
-            .bind(purchase_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (supplier_id,): (i64,) = sqlx::query_as("SELECT supplier_id FROM purchases WHERE id = ?")
+        .bind(purchase_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         supplier_id, prefilled,
         "the unchanged pre-fill must resolve to the same supplier"
@@ -4369,7 +4452,10 @@ async fn web_create_purchase_omitting_the_date_defaults_to_today() {
         .await
         .unwrap();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    assert_eq!(date, today, "an omitted purchase_date must default to today");
+    assert_eq!(
+        date, today,
+        "an omitted purchase_date must default to today"
+    );
 }
 
 /// `/purchases/new` is DELETED (AC2): the route answers 404 and nothing can
@@ -4466,7 +4552,9 @@ fn assert_oob_picker_is_empty_and_focused(html: &str) {
             .find("id=\"line-picker\"")
             .unwrap_or_else(|| panic!("the out-of-band picker must render: {html:.800}"));
         let pos = from + rel;
-        let start = html[..pos].rfind('<').expect("the id must sit inside a tag");
+        let start = html[..pos]
+            .rfind('<')
+            .expect("the id must sit inside a tag");
         let end_rel = html[start..].find('>').expect("unterminated tag");
         if html[start..=start + end_rel].contains("hx-swap-oob") {
             break (start, start + end_rel);
@@ -4476,7 +4564,10 @@ fn assert_oob_picker_is_empty_and_focused(html: &str) {
     let oob_tag = &html[tag_start..=tag_end];
     assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
     let oob = &html[tag_start..];
-    assert!(oob.contains("autofocus"), "the picker must come back focused: {oob:.400}");
+    assert!(
+        oob.contains("autofocus"),
+        "the picker must come back focused: {oob:.400}"
+    );
     let input_pos = oob
         .find("id=\"product-picker\"")
         .expect("the out-of-band picker renders its field");
@@ -4549,10 +4640,18 @@ async fn line_picker_loads_a_sale_without_a_click() {
     let input_pos = page
         .find("id=\"product-picker\"")
         .expect("the record page renders the picker field");
-    let input_start = page[..input_pos].rfind('<').expect("the id must sit inside a tag");
+    let input_start = page[..input_pos]
+        .rfind('<')
+        .expect("the id must sit inside a tag");
     let input_end = input_pos + page[input_pos..].find('>').expect("unterminated tag");
     let input_tag = &page[input_start..=input_end];
-    for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+    for transport in [
+        "hx-get",
+        "hx-trigger",
+        "hx-target",
+        "hx-vals",
+        "hx-on:keyup",
+    ] {
         assert!(
             !input_tag.contains(transport),
             "the field must not carry {transport}: {input_tag}"
@@ -4564,9 +4663,7 @@ async fn line_picker_loads_a_sale_without_a_click() {
     let form_pos = page[..input_pos]
         .rfind("<form")
         .expect("the field sits in the add-line form");
-    let form_end = form_pos + page[form_pos..]
-        .find("</form>")
-        .expect("unterminated form");
+    let form_end = form_pos + page[form_pos..].find("</form>").expect("unterminated form");
     let form = &page[form_pos..form_end];
     assert!(
         form.contains(&format!("hx-post=\"/web/sales/{sale}/lines\"")),
@@ -4583,7 +4680,10 @@ async fn line_picker_loads_a_sale_without_a_click() {
         !form.contains("id=\"product-search-results\""),
         "the results container must be a sibling of the picker form, never inside it: {form:.600}"
     );
-    assert!(page.contains("id=\"product-search-results\""), "{page:.600}");
+    assert!(
+        page.contains("id=\"product-search-results\""),
+        "{page:.600}"
+    );
 
     // The debounce moved with the island: the island file declares it.
     assert!(
@@ -4593,16 +4693,29 @@ async fn line_picker_loads_a_sale_without_a_click() {
 
     // Scan 1: the reader types the barcode and presses Enter. The form carries the
     // field and the quantity, never a product id.
-    let (status, added) = post_form(&app, &format!("{base}/lines"), "product=7791234567890&qty=2&unit_price=").await;
+    let (status, added) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567890&qty=2&unit_price=",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{added}");
     assert!(added.contains("product SCAN-P"), "{added:.600}");
-    assert!(added.contains("$50"), "running total after the scan: {added:.800}");
+    assert!(
+        added.contains("50 USD"),
+        "running total after the scan: {added:.800}"
+    );
     assert_oob_picker_is_empty_and_focused(&added);
 
     // Scan 2: the same series, and the picker comes back ready again.
-    let (status, added) = post_form(&app, &format!("{base}/lines"), "product=7791234567890&qty=1&unit_price=").await;
+    let (status, added) = post_form(
+        &app,
+        &format!("{base}/lines"),
+        "product=7791234567890&qty=1&unit_price=",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{added}");
-    assert!(added.contains("$75"), "running total: {added:.800}");
+    assert!(added.contains("75 USD"), "running total: {added:.800}");
     assert_oob_picker_is_empty_and_focused(&added);
 
     // A clicked result is the same form plus its own product id; the quantity
@@ -4614,7 +4727,7 @@ async fn line_picker_loads_a_sale_without_a_click() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{clicked}");
-    assert!(clicked.contains("$150"), "running total: {clicked:.800}");
+    assert!(clicked.contains("150 USD"), "running total: {clicked:.800}");
 
     // Removing a line updates the running total from the same response: 150 - 50.
     let detail = sale_detail(&app, sale).await;
@@ -4635,7 +4748,10 @@ async fn line_picker_loads_a_sale_without_a_click() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{removed}");
-    assert!(removed.contains("$100"), "running total after removal: {removed:.800}");
+    assert!(
+        removed.contains("100 USD"),
+        "running total after removal: {removed:.800}"
+    );
     assert!(
         !removed.contains(&format!("id=\"sale-line-{line_id}\"")),
         "the removed line is gone: {removed:.800}"
@@ -4682,7 +4798,9 @@ fn assert_purchase_entry_row_is_empty_and_ready(html: &str) {
     let row_pos = html
         .find("id=\"line-picker\"")
         .expect("the entry row renders on the add-line response");
-    let row_start = html[..row_pos].rfind('<').expect("the id must sit inside a tag");
+    let row_start = html[..row_pos]
+        .rfind('<')
+        .expect("the id must sit inside a tag");
     let tag_end = row_start + html[row_start..].find('>').expect("unterminated tag");
     let row_tag = &html[row_start..=tag_end];
     assert!(
@@ -4791,10 +4909,18 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     let input_pos = page
         .find("id=\"product-picker\"")
         .expect("the record page renders the picker field");
-    let input_start = page[..input_pos].rfind('<').expect("the id must sit inside a tag");
+    let input_start = page[..input_pos]
+        .rfind('<')
+        .expect("the id must sit inside a tag");
     let input_end = input_pos + page[input_pos..].find('>').expect("unterminated tag");
     let input_tag = &page[input_start..=input_end];
-    for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+    for transport in [
+        "hx-get",
+        "hx-trigger",
+        "hx-target",
+        "hx-vals",
+        "hx-on:keyup",
+    ] {
         assert!(
             !input_tag.contains(transport),
             "the field must not carry {transport}: {input_tag}"
@@ -4806,9 +4932,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     let form_pos = page[..input_pos]
         .rfind("<form")
         .expect("the field sits in the add-line form");
-    let form_end = form_pos + page[form_pos..]
-        .find("</form>")
-        .expect("unterminated form");
+    let form_end = form_pos + page[form_pos..].find("</form>").expect("unterminated form");
     let form = &page[form_pos..form_end];
     assert!(
         form.contains(&format!("hx-post=\"/web/purchases/{purchase}/lines\"")),
@@ -4825,7 +4949,10 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
         !form.contains("id=\"product-search-results\""),
         "the results container must be a sibling of the picker form, never inside it: {form:.600}"
     );
-    assert!(page.contains("id=\"product-search-results\""), "{page:.600}");
+    assert!(
+        page.contains("id=\"product-search-results\""),
+        "{page:.600}"
+    );
 
     // The debounce moved with the island: the island file declares it.
     assert!(
@@ -4833,10 +4960,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
         "the search must be debounced by static/picker.js"
     );
 
-    assert!(
-        page.contains("id=\"purchase-record-money\""),
-        "{page:.600}"
-    );
+    assert!(page.contains("id=\"purchase-record-money\""), "{page:.600}");
 
     // Scan 1: the reader types the barcode and presses Enter. The form carries the
     // field and the quantity, never a product id. The fixture's supplier has no
@@ -4851,7 +4975,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     assert_eq!(status, StatusCode::OK, "{added}");
     assert!(added.contains("product PSCAN-A"), "{added:.600}");
     assert!(
-        added.contains("$20"),
+        added.contains("20 USD"),
         "running total after the scan: {added:.800}"
     );
     assert_purchase_entry_row_is_empty_and_ready(&added);
@@ -4864,7 +4988,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{added}");
-    assert!(added.contains("$50"), "running total: {added:.800}");
+    assert!(added.contains("50 USD"), "running total: {added:.800}");
     assert_purchase_entry_row_is_empty_and_ready(&added);
 
     // Removing a line updates the running total from the same response.
@@ -4887,7 +5011,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     .await;
     assert_eq!(status, StatusCode::OK, "{removed}");
     assert!(
-        removed.contains("$30"),
+        removed.contains("30 USD"),
         "running total after removal: {removed:.800}"
     );
     assert!(
@@ -4978,7 +5102,11 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
         .iter()
         .find(|line| line["product_id"] == json!(product_b))
         .expect("product B's line");
-    assert_eq!(b_line["qty"], json!("4"), "the refusal leaves the merge intact");
+    assert_eq!(
+        b_line["qty"],
+        json!("4"),
+        "the refusal leaves the merge intact"
+    );
     assert_eq!(after["total"], json!("40"));
 
     // An unknown value is a clear 400 naming the search count, and adds nothing.
@@ -5037,7 +5165,10 @@ async fn merge_notice_escapes_html_specials_in_the_product_name() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{added}");
-    assert!(!added.contains("scanned again"), "the first add is not a merge: {added:.400}");
+    assert!(
+        !added.contains("scanned again"),
+        "the first add is not a merge: {added:.400}"
+    );
 
     // The repeat resolves to the SAME cost, so the merge notice renders —
     // with the escaped name, never the raw markup.
@@ -5053,8 +5184,7 @@ async fn merge_notice_escapes_html_specials_in_the_product_name() {
         "the merge notice must be present: {merged:.600}"
     );
     assert!(
-        merged
-            .contains("Agua &lt;500ml&gt; &amp; &quot;especial&quot; scanned again"),
+        merged.contains("Agua &lt;500ml&gt; &amp; &quot;especial&quot; scanned again"),
         "the notice must carry the escaped name: {merged:.600}"
     );
     assert!(
@@ -5076,9 +5206,10 @@ fn enclosing_tag(html: &str, pos: usize) -> &str {
     let start = html[..=pos]
         .rfind('<')
         .unwrap_or_else(|| panic!("no tag opens before byte {pos}"));
-    let end = pos + html[pos..]
-        .find('>')
-        .unwrap_or_else(|| panic!("unterminated tag at byte {pos}"));
+    let end = pos
+        + html[pos..]
+            .find('>')
+            .unwrap_or_else(|| panic!("unterminated tag at byte {pos}"));
     &html[start..=end]
 }
 
@@ -5151,7 +5282,10 @@ fn accessible_name_resolution_accepts_wrapping_and_for_labels() {
         <label>Wrapped <input type="number" name="wrapped" /></label>
         <label for="picked">Picked</label><input type="range" name="picked" id="picked" />
     "#;
-    assert_eq!(controls_without_accessible_name(named), Vec::<String>::new());
+    assert_eq!(
+        controls_without_accessible_name(named),
+        Vec::<String>::new()
+    );
 
     let offenders = controls_without_accessible_name(
         r#"<label>Qty</label><input type="number" name="qty" id="qty" />"#,
@@ -5160,9 +5294,7 @@ fn accessible_name_resolution_accepts_wrapping_and_for_labels() {
     assert!(offenders[0].contains("qty"), "{offenders:?}");
 
     // A hidden control is not announced, so it needs no name.
-    assert!(
-        controls_without_accessible_name(r#"<input type="hidden" name="id" />"#).is_empty()
-    );
+    assert!(controls_without_accessible_name(r#"<input type="hidden" name="id" />"#).is_empty());
 }
 
 /// Every control on the sale record page resolves an accessible name. The
@@ -5233,7 +5365,12 @@ async fn referenced_id_guard_rejects_a_bare_id_added_to_a_guarded_page_copy() {
         .find(|page| page.label == "products")
         .expect("the products page is guarded");
     let (status, html) = get(&app, &products_page.path).await;
-    assert_eq!(status, StatusCode::OK, "{}: {html:.400}", products_page.path);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}: {html:.400}",
+        products_page.path
+    );
     check_no_bare_referenced_ids(products_page.label, &html)
         .unwrap_or_else(|err| panic!("the guarded products page must be clean: {err}"));
 
@@ -5254,15 +5391,14 @@ async fn customer_statement_resolves_receipt_account_and_method_names() {
     let product = create_product_via_web(&app, &pool, "GAP-P", "1", "50").await;
     record_stock_via_web(&app, product, "10").await;
     let customer = seed_customer(&pool, "GapBuyer", None, None).await;
-    let sale = create_sale_draft_on_date(&app, customer, "Credit", "2024-05-02", "2024-06-01").await;
+    let sale =
+        create_sale_draft_on_date(&app, customer, "Credit", "2024-05-02", "2024-06-01").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
     confirm_sale_via_web(&app, sale, None).await;
     let (status, resp) = post_form(
         &app,
         "/web/customer-receipts",
-        &format!(
-            "customer_id={customer}&method_id={cash}&amount=10&date=2024-05-10"
-        ),
+        &format!("customer_id={customer}&method_id={cash}&amount=10&date=2024-05-10"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "collect: {resp}");
@@ -5463,7 +5599,11 @@ async fn add_purchase_line_via_web(app: &Router, purchase_id: i64, product_id: i
 async fn confirm_purchase_via_web(app: &Router, purchase_id: i64) {
     let body = format!("purchase_id={purchase_id}");
     let (status, resp) = post_form(app, "/web/purchases/confirm", &body).await;
-    assert_eq!(status, StatusCode::OK, "confirm purchase {purchase_id}: {resp}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "confirm purchase {purchase_id}: {resp}"
+    );
 }
 
 /// AC13: every sales filter works alone and combined; an empty filter is no
@@ -5542,9 +5682,7 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     // Empty values are no constraint, not an error.
     let blank = sale_list_html(&app, "?status=&customer=&number=&from=&to=").await;
     assert!(
-        blank.contains("draft #")
-            && blank.contains(&ana_number)
-            && blank.contains(&beto_number),
+        blank.contains("draft #") && blank.contains(&ana_number) && blank.contains(&beto_number),
         "{blank}"
     );
 
@@ -5587,7 +5725,10 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
         page.contains("<option value=\"Draft\" selected>Draft</option>"),
         "{page:.600}"
     );
-    assert!(page.contains("name=\"from\" value=\"2024-05-01\""), "{page:.600}");
+    assert!(
+        page.contains("name=\"from\" value=\"2024-05-01\""),
+        "{page:.600}"
+    );
 }
 
 /// AC13: the purchases list carries the same filter shape.
@@ -5612,8 +5753,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
         .as_str()
         .expect("confirmed purchase number")
         .to_string();
-    let norte_number = purchase_detail(&app, norte_confirmed).await["purchase"]
-        ["purchase_number"]
+    let norte_number = purchase_detail(&app, norte_confirmed).await["purchase"]["purchase_number"]
         .as_str()
         .expect("confirmed purchase number")
         .to_string();
@@ -5656,9 +5796,7 @@ async fn purchases_list_filters_by_status_supplier_number_and_date() {
 
     let blank = purchase_list_html(&app, "?status=&supplier=&number=&from=&to=").await;
     assert!(
-        blank.contains("Draft #")
-            && blank.contains(&sur_number)
-            && blank.contains(&norte_number),
+        blank.contains("Draft #") && blank.contains(&sur_number) && blank.contains(&norte_number),
         "{blank}"
     );
 
@@ -5720,9 +5858,18 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
     .await;
     assert_eq!(status, StatusCode::OK, "fund account: {resp}");
 
-    let draft = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
-    let due_row = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", &chrono::Local::now().date_naive().to_string()).await;
-    let overdue = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    let draft =
+        create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    let due_row = create_purchase_draft_with_due(
+        &app,
+        sur,
+        "Credit",
+        "2024-05-02",
+        &chrono::Local::now().date_naive().to_string(),
+    )
+    .await;
+    let overdue =
+        create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
     // Cash purchases carry no due date (the domain rejects one), and the Cash
     // confirm pays the total immediately, so this row settles fully paid.
     let paid = create_purchase_draft_with_due(&app, sur, "Cash", "2024-05-02", "").await;
@@ -5740,7 +5887,8 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
     assert_eq!(status, StatusCode::OK, "confirm Cash purchase: {resp}");
     // A cancelled confirmed purchase still owes money past its due date; its
     // chip must stay the muted Cancelled one — the lifecycle outranks money.
-    let cancelled = create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
+    let cancelled =
+        create_purchase_draft_with_due(&app, sur, "Credit", "2024-05-02", "2024-12-31").await;
     add_purchase_line_via_web(&app, cancelled, product, "1").await;
     confirm_purchase_via_web(&app, cancelled).await;
     let (status, resp) = post_form(
@@ -5779,7 +5927,9 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
 
     // The S3 peek contract must survive the row rewrite.
     assert!(
-        draft_row.contains(&format!("hx-get=\"/web/documents/detail/purchase/{draft}\"")),
+        draft_row.contains(&format!(
+            "hx-get=\"/web/documents/detail/purchase/{draft}\""
+        )),
         "{draft_row}"
     );
     assert!(
@@ -5806,8 +5956,8 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
     );
 
     // Exactly one chip per row, and each state gets its own colour. The owed
-    // chips print the amount still owed — a bare number, like the row's other
-    // money — and a partially paid row shows what remains, not the total.
+    // chips print the localized amount still owed, and a partially paid row
+    // shows what remains, not the total.
     let pending_due = purchase_detail(&app, due_row).await["due"]
         .as_str()
         .expect("purchase due")
@@ -5825,17 +5975,17 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         "a fully paid row carries the bare-word Paid chip in income colour: {paid_row}"
     );
     assert!(
-        due_row_html.contains(&format!(">Due {pending_due}</span>"))
+        due_row_html.contains(&format!(">Due {pending_due} USD</span>"))
             && due_row_html.contains("chip-warning"),
         "owed and not yet past due carries the Due chip with the amount owed in warning colour: {due_row_html}"
     );
     assert!(
         pending_due != pending_total
-            && !due_row_html.contains(&format!(">Due {pending_total}</span>")),
+            && !due_row_html.contains(&format!(">Due {pending_total} USD</span>")),
         "a partially paid row's Due chip names the remainder, not the total: {due_row_html}"
     );
     assert!(
-        overdue_row.contains(&format!(">Overdue {overdue_due}</span>"))
+        overdue_row.contains(&format!(">Overdue {overdue_due} USD</span>"))
             && overdue_row.contains("chip-expense"),
         "owed past the due date carries the Overdue chip with the amount owed in expense colour: {overdue_row}"
     );
@@ -5854,18 +6004,23 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
 
     // AC3: the total is neutral — it never borrows income or expense colour
     // (the old row painted it `text-expense">{total}` whenever due > 0).
-    for (id, row) in [(draft, &draft_row), (due_row, &due_row_html), (overdue, &overdue_row), (paid, &paid_row)] {
+    for (id, row) in [
+        (draft, &draft_row),
+        (due_row, &due_row_html),
+        (overdue, &overdue_row),
+        (paid, &paid_row),
+    ] {
         let total = purchase_detail(&app, id).await["total"]
             .as_str()
             .expect("purchase total")
             .to_string();
         assert!(
-            row.contains(&format!("font-bold tabular-nums text-text\">{total}")),
+            row.contains(&format!("font-bold tabular-nums text-text\">{total} USD</span>")),
             "the total must be bold, tabular and neutral: {row}"
         );
         assert!(
-            !row.contains(&format!("text-expense\">{total}"))
-                && !row.contains(&format!("text-income\">{total}")),
+            !row.contains(&format!("text-expense\">{total} USD</span>"))
+                && !row.contains(&format!("text-income\">{total} USD</span>")),
             "the total must not be painted by payment state: {row}"
         );
     }
@@ -5877,7 +6032,7 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         .unwrap()
         .to_string();
     assert_eq!(
-        paid_row.matches(&paid_total).count(),
+        paid_row.matches(&format!("{paid_total} USD")).count(),
         1,
         "the total must render once per row: {paid_row}"
     );
@@ -5980,7 +6135,8 @@ async fn products_list_searches_name_sku_and_barcode_and_combines_with_category(
     assert!(!combined.contains("Yerba Filt 500g"), "{combined}");
 
     // A barcode that matches a product in another category combines to nothing.
-    let crossed = product_list_html(&app, &format!("?q=7791234567001&category_id={other_cat}")).await;
+    let crossed =
+        product_list_html(&app, &format!("?q=7791234567001&category_id={other_cat}")).await;
     assert!(crossed.contains("No products yet"), "{crossed}");
 
     // Matching nothing is an empty list, not an error.
@@ -6241,7 +6397,9 @@ async fn products_drawer_edit_derives_the_price_from_the_markup_and_clearing_it_
     let (status, drawer) = get(&app, &format!("/web/products/detail/{product}")).await;
     assert_eq!(status, StatusCode::OK, "drawer fragment: {drawer:.400}");
     assert!(
-        drawer.contains("name=\"markup_pct\" step=\"0.01\" min=\"-99\" placeholder=\"25\" value=\"50\""),
+        drawer.contains(
+            "name=\"markup_pct\" step=\"0.01\" min=\"-99\" placeholder=\"25\" value=\"50\""
+        ),
         "the drawer must render the stored markup value: {drawer:.400}"
     );
     assert!(
@@ -6249,7 +6407,7 @@ async fn products_drawer_edit_derives_the_price_from_the_markup_and_clearing_it_
         "the drawer's price input must be readonly and show the derived price: {drawer:.400}"
     );
     assert!(
-        drawer.contains("Recalculated from the cost and the 50% markup when you save"),
+        drawer.contains("Recalculated from the cost and the 50 % markup when you save"),
         "the drawer must carry the derivation hint: {drawer:.400}"
     );
 
@@ -6260,11 +6418,17 @@ async fn products_drawer_edit_derives_the_price_from_the_markup_and_clearing_it_
         "id={product}&sku=MKP-A&name=Markup+Widget&kind=Product&unit=un&sale_price=15.00&cost_price=10&category_id=&track_stock=1&min_stock=1&max_stock=50&location=&notes=&markup_pct=100"
     );
     let (status, html) = post_drawer_form(&app, "/web/products/edit", &edit).await;
-    assert_eq!(status, StatusCode::OK, "edit with a new markup: {html:.400}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "edit with a new markup: {html:.400}"
+    );
     // The drawer branch answers with the fresh detail fragment, so the operator
     // sees the re-derived price and the new markup without a reload.
     assert!(
-        html.contains("name=\"markup_pct\" step=\"0.01\" min=\"-99\" placeholder=\"25\" value=\"100\""),
+        html.contains(
+            "name=\"markup_pct\" step=\"0.01\" min=\"-99\" placeholder=\"25\" value=\"100\""
+        ),
         "the drawer answer must render the new markup: {html:.400}"
     );
     assert!(
@@ -6438,13 +6602,12 @@ async fn product_cost_answer_honours_the_active_filter() {
         "filtered answer must not hold the other row: {html:.400}"
     );
     // The mutation itself still happened behind the filtered list answer.
-    let (rows,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM product_supplier_costs WHERE product_id = ?",
-    )
-    .bind(alpha)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (rows,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM product_supplier_costs WHERE product_id = ?")
+            .bind(alpha)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(rows, 1, "the web post must still create the satellite row");
 
     // Without a filter the answer is still the whole catalogue.
@@ -6468,9 +6631,7 @@ async fn product_preferred_cost_answer_honours_the_active_filter() {
     let supplier = create_supplier_via_web(&app, &pool, "Pref Mut Sup").await;
     record_supplier_cost_via_web(&app, alpha, supplier, "9").await;
 
-    let body = format!(
-        "product_id={alpha}&supplier_id={supplier}&category_id={alpha_cat}&q=Alpha"
-    );
+    let body = format!("product_id={alpha}&supplier_id={supplier}&category_id={alpha_cat}&q=Alpha");
     let (status, html) = post_form(&app, "/web/product-costs/preferred", &body).await;
     assert_eq!(status, StatusCode::OK, "{html:.400}");
     assert!(
@@ -6506,8 +6667,7 @@ async fn product_preferred_cost_answer_honours_the_active_filter() {
 #[tokio::test]
 async fn lists_resolve_referenced_names_and_print_no_internal_ids() {
     let (app, pool) = test_app().await;
-    let product =
-        create_product_full_via_web(&app, &pool, "NAMES-P", "Named Widget", None).await;
+    let product = create_product_full_via_web(&app, &pool, "NAMES-P", "Named Widget", None).await;
     let customer = seed_customer(&pool, "NamesBuyer", None, None).await;
     let _sale = create_sale_draft_on_date(&app, customer, "Cash", "2024-05-02", "").await;
     let supplier = create_supplier_via_web(&app, &pool, "NamesSupplier").await;
@@ -6537,7 +6697,6 @@ async fn lists_resolve_referenced_names_and_print_no_internal_ids() {
         "the products list must not print the product's internal id: {products}"
     );
 }
-
 
 /// The README must not describe the receipt-list referenced-id gap as open: the
 /// list resolves account and method names and the guard fixture now collects a
@@ -6591,12 +6750,18 @@ async fn search_matches_ignore_accents_and_case() {
     for needle in ["Pérez", "pérez", "PÉREZ", "Perez", "PEREZ"] {
         let html = sale_list_html(&app, &format!("?customer={needle}")).await;
         assert!(html.contains("Pérez"), "{needle:?} must find Pérez: {html}");
-        assert!(!html.contains("Ñandú"), "{needle:?} must not match Ñandú: {html}");
+        assert!(
+            !html.contains("Ñandú"),
+            "{needle:?} must not match Ñandú: {html}"
+        );
     }
     for needle in ["Ñandú", "ñandú", "Nandu", "ÑANDÚ"] {
         let html = sale_list_html(&app, &format!("?customer={needle}")).await;
         assert!(html.contains("Ñandú"), "{needle:?} must find Ñandú: {html}");
-        assert!(!html.contains("Pérez"), "{needle:?} must not match Pérez: {html}");
+        assert!(
+            !html.contains("Pérez"),
+            "{needle:?} must not match Pérez: {html}"
+        );
     }
 
     // Purchases: a supplier named with accents, the same both ways.
@@ -6607,20 +6772,25 @@ async fn search_matches_ignore_accents_and_case() {
     for needle in ["Nandu", "ÑANDÚ", "ñandú"] {
         let html = purchase_list_html(&app, &format!("?supplier={needle}")).await;
         assert!(html.contains("Ñandú"), "{needle:?} must find Ñandú: {html}");
-        assert!(!html.contains("Café"), "{needle:?} must not match Café: {html}");
+        assert!(
+            !html.contains("Café"),
+            "{needle:?} must not match Café: {html}"
+        );
     }
     for needle in ["CAFE", "café", "Café"] {
         let html = purchase_list_html(&app, &format!("?supplier={needle}")).await;
         assert!(html.contains("Café"), "{needle:?} must find Café: {html}");
-        assert!(!html.contains("Ñandú"), "{needle:?} must not match Ñandú: {html}");
+        assert!(
+            !html.contains("Ñandú"),
+            "{needle:?} must not match Ñandú: {html}"
+        );
     }
 
     // Catalogue: the picker reads the JSON route now, and it folds accents and
     // case on both sides, like the list.
     create_product_full_via_web(&app, &pool, "CAFE-P", "Café", None).await;
     for needle in ["CAFE", "CAFÉ"] {
-        let (status, search) =
-            get(&app, &format!("/web/product-search.json?q={needle}")).await;
+        let (status, search) = get(&app, &format!("/web/product-search.json?q={needle}")).await;
         assert_eq!(status, StatusCode::OK, "{needle}: {search}");
         let body = json_body(&search);
         let names: Vec<&str> = body["products"]
@@ -6635,9 +6805,15 @@ async fn search_matches_ignore_accents_and_case() {
         );
     }
     let list = product_list_html(&app, "?q=cafe").await;
-    assert!(list.contains("Café"), "the catalogue must find Café by cafe: {list}");
+    assert!(
+        list.contains("Café"),
+        "the catalogue must find Café by cafe: {list}"
+    );
     let list = product_list_html(&app, "?q=CAFÉ").await;
-    assert!(list.contains("Café"), "the catalogue must find Café by CAFÉ: {list}");
+    assert!(
+        list.contains("Café"),
+        "the catalogue must find Café by CAFÉ: {list}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6660,9 +6836,7 @@ async fn audit_finance_detail_view_shows_the_actor_display_name() {
     let (status, resp) = post_form(
         &app,
         "/web/transactions",
-        &format!(
-            "account_id={account}&type=Income&amount=250&description=venta&date=2024-05-01",
-        ),
+        &format!("account_id={account}&type=Income&amount=250&description=venta&date=2024-05-01",),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{resp}");
@@ -6719,7 +6893,9 @@ async fn audit_the_system_sentinel_cannot_log_in_like_any_inactive_account() {
 
     // The control: one ordinary roleless account, deactivated the way the
     // users screen does it.
-    let teller = test_support::seed_audit_user(&pool, "teller", "Teller").await.unwrap();
+    let teller = test_support::seed_audit_user(&pool, "teller", "Teller")
+        .await
+        .unwrap();
     sqlx::query("UPDATE users SET is_active = 0 WHERE id = ?")
         .bind(teller)
         .execute(&pool)
@@ -6769,7 +6945,10 @@ async fn audit_the_system_sentinel_cannot_log_in_like_any_inactive_account() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(sessions_after.0, sessions_before.0, "no session was created");
+    assert_eq!(
+        sessions_after.0, sessions_before.0,
+        "no session was created"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -6791,7 +6970,10 @@ async fn upgraded_pool_with_legacy_rows() -> (axum::Router, sqlx::SqlitePool) {
         .connect_with(opts)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run_to(20240101000029, &pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run_to(20240101000029, &pool)
+        .await
+        .unwrap();
 
     let account_id: (i64,) = sqlx::query_as(
         "INSERT INTO accounts (name, cached_balance) VALUES ('legacy', '0') RETURNING id",
@@ -6830,41 +7012,40 @@ async fn ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel() {
     .await
     .unwrap();
     assert_eq!(sentinel.1, 0, "the sentinel account is inactive");
-    let sentinel_roles: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM user_roles WHERE user_id = ?",
-    )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let sentinel_roles: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = ?")
+            .bind(sentinel.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(sentinel_roles.0, 0, "the sentinel holds no role");
 
     // Every pre-existing row points at the sentinel and nothing was lost.
-    let accounts: (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FROM accounts WHERE created_by = ?",
-    )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let accounts: (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(*) FROM accounts WHERE created_by = ?")
+            .bind(sentinel.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(accounts.0, accounts.1, "no row lost, all attributed");
     assert_eq!(accounts.0, 1, "the legacy account survived");
-    let transactions: (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FROM transactions WHERE created_by = ?",
-    )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(transactions.0, transactions.1, "no row lost, all attributed");
+    let transactions: (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(*) FROM transactions WHERE created_by = ?")
+            .bind(sentinel.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        transactions.0, transactions.1,
+        "no row lost, all attributed"
+    );
     assert_eq!(transactions.0, 1, "the legacy movement survived");
-    let methods: (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FROM payment_methods WHERE created_by = ?",
-    )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let methods: (i64, i64) =
+        sqlx::query_as("SELECT COUNT(*), COUNT(*) FROM payment_methods WHERE created_by = ?")
+            .bind(sentinel.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(methods.0, methods.1, "no row lost, all attributed");
     assert_eq!(methods.0, 6, "the five seeds plus the legacy one survived");
 
@@ -6892,9 +7073,11 @@ async fn ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(created_by.0, session_user.0, "the route's actor, not a fresh one");
+    assert_eq!(
+        created_by.0, session_user.0,
+        "the route's actor, not a fresh one"
+    );
 }
-
 
 /// The upgrade's second half: the bootstrap still creates the ONE real
 /// administrator through its ordinary creation path (never the recovery
@@ -6916,7 +7099,10 @@ async fn ac19_the_bootstrap_creates_exactly_one_active_administrator_after_the_u
         .await
         .unwrap();
     assert!(outcome.created, "the bootstrap created the administrator");
-    assert!(outcome.generated_password.is_none(), "the env password is used as-is");
+    assert!(
+        outcome.generated_password.is_none(),
+        "the env password is used as-is"
+    );
 
     let admins: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM users u \
@@ -6929,13 +7115,15 @@ async fn ac19_the_bootstrap_creates_exactly_one_active_administrator_after_the_u
     .unwrap();
     assert_eq!(admins.0, 1, "exactly one active administrator exists");
 
-    let sentinel: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM users WHERE username = 'sistema' AND is_active = 1",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(sentinel.0, 0, "the sentinel account is not an administrator");
+    let sentinel: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE username = 'sistema' AND is_active = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        sentinel.0, 0,
+        "the sentinel account is not an administrator"
+    );
 
     // A second bootstrap run is the ordinary no-op: the active protected
     // holder already exists.
@@ -6946,7 +7134,6 @@ async fn ac19_the_bootstrap_creates_exactly_one_active_administrator_after_the_u
         .unwrap();
     assert!(!again.created, "the bootstrap no-ops once an admin exists");
 }
-
 
 /// AC19: the audit foreign key holds a user row in place. Deleting the
 /// sentinel — referenced by every attributed row — is refused (the same
@@ -6964,7 +7151,9 @@ async fn ac19_deleting_the_system_actor_is_refused_by_the_audit_foreign_key() {
         .await
         .unwrap_err();
     assert!(
-        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        refused
+            .to_string()
+            .contains("FOREIGN KEY constraint failed"),
         "the audit FK refuses the deletion: {refused}"
     );
 
@@ -6996,14 +7185,16 @@ async fn upgraded_pool_with_legacy_inventory_rows() -> (Vec<i64>, sqlx::SqlitePo
         .connect_with(opts)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run_to(20240101000030, &pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run_to(20240101000030, &pool)
+        .await
+        .unwrap();
 
-    let category_id: (i64,) = sqlx::query_as(
-        "INSERT INTO categories (name) VALUES ('legacy-cat') RETURNING id",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let category_id: (i64,) =
+        sqlx::query_as("INSERT INTO categories (name) VALUES ('legacy-cat') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let product_id: (i64,) = sqlx::query_as(
         "INSERT INTO products (sku, name, kind, category_id, unit, sale_price, cost_price, track_stock) \
          VALUES ('LEGACY-P', 'Legacy', 'Product', ?, 'un', '1', '0', 1) RETURNING id",
@@ -7020,10 +7211,7 @@ async fn upgraded_pool_with_legacy_inventory_rows() -> (Vec<i64>, sqlx::SqlitePo
     .fetch_one(&pool)
     .await
     .unwrap();
-    (
-        vec![category_id.0, product_id.0, movement_id.0],
-        pool,
-    )
+    (vec![category_id.0, product_id.0, movement_id.0], pool)
 }
 
 /// The upgrade attributes every pre-existing inventory row to the sentinel it
@@ -7074,7 +7262,10 @@ async fn ac19_the_upgrade_attributes_every_inventory_row_to_the_system_sentinel(
     // `created_by` is NOT NULL on all three rebuilt tables: a write that
     // omits the actor is refused by the database.
     for (table, sql) in [
-        ("categories", "INSERT INTO categories (name) VALUES ('no-actor')"),
+        (
+            "categories",
+            "INSERT INTO categories (name) VALUES ('no-actor')",
+        ),
         (
             "products",
             "INSERT INTO products (sku, name, kind, unit, sale_price, cost_price, track_stock) \
@@ -7097,12 +7288,14 @@ async fn ac19_the_upgrade_attributes_every_inventory_row_to_the_system_sentinel(
 
     // The re-enabled foreign keys find the same graph that existed before:
     // no violation anywhere.
-    let violations: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+    let violations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        violations.0, 0,
+        "the upgrade leaves no foreign-key violation"
+    );
 
     // The RESTRICT audit foreign key holds the sentinel in place for the
     // inventory rows too: deleting it is refused and the row survives.
@@ -7112,7 +7305,9 @@ async fn ac19_the_upgrade_attributes_every_inventory_row_to_the_system_sentinel(
         .await
         .unwrap_err();
     assert!(
-        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        refused
+            .to_string()
+            .contains("FOREIGN KEY constraint failed"),
         "the audit FK refuses the deletion: {refused}"
     );
     let still_there: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
@@ -7134,10 +7329,22 @@ async fn ac19_the_inventory_migration_recreates_a_missing_sentinel() {
     let (legacy_ids, pool) = upgraded_pool_with_legacy_inventory_rows().await;
     // Make the sentinel absent: empty the finance tables that reference it
     // (RESTRICT refuses a direct delete), then delete the account.
-    sqlx::query("DELETE FROM payment_methods").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM transactions").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM accounts").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM users").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM payment_methods")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM transactions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM accounts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users")
+        .execute(&pool)
+        .await
+        .unwrap();
     let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
         .fetch_one(&pool)
         .await
@@ -7167,13 +7374,12 @@ async fn ac19_the_inventory_migration_recreates_a_missing_sentinel() {
     }
     // The defensive sentinel is the same shape migration 30's is: inactive,
     // roleless, unusable credential.
-    let sentinel_row: (i64, i64) = sqlx::query_as(
-        "SELECT is_active, must_change_password FROM users WHERE id = ?",
-    )
-    .bind(sentinel)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let sentinel_row: (i64, i64) =
+        sqlx::query_as("SELECT is_active, must_change_password FROM users WHERE id = ?")
+            .bind(sentinel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(sentinel_row.0, 0, "the recreated sentinel is inactive");
     let roles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = ?")
         .bind(sentinel)
@@ -7193,8 +7399,8 @@ async fn ac19_the_inventory_migration_recreates_a_missing_sentinel() {
 /// A pool with the migration chain stopped just after the inventory audit (the
 /// pre-32 sales/customers schema is real) plus legacy business rows planted
 /// the way pre-audit code wrote them: no created_by column exists to fill.
-async fn upgraded_pool_with_legacy_sales_and_customer_rows()
-    -> ((i64, i64, i64, i64), sqlx::SqlitePool) {
+async fn upgraded_pool_with_legacy_sales_and_customer_rows(
+) -> ((i64, i64, i64, i64), sqlx::SqlitePool) {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
         .create_if_missing(true)
@@ -7204,7 +7410,10 @@ async fn upgraded_pool_with_legacy_sales_and_customer_rows()
         .connect_with(opts)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run_to(20240101000031, &pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run_to(20240101000031, &pool)
+        .await
+        .unwrap();
 
     // The sentinel exists by now (the seeded payment methods made migration 30
     // attribute something): the finance rows the audit needs are real.
@@ -7217,7 +7426,10 @@ async fn upgraded_pool_with_legacy_sales_and_customer_rows()
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(users_before.0, 1, "no user beyond the sentinel before the upgrade");
+    assert_eq!(
+        users_before.0, 1,
+        "no user beyond the sentinel before the upgrade"
+    );
 
     let account_id: (i64,) = sqlx::query_as(
         "INSERT INTO accounts (name, created_by) VALUES ('legacy wallet', ?) RETURNING id",
@@ -7270,10 +7482,7 @@ async fn upgraded_pool_with_legacy_sales_and_customer_rows()
     .await
     .unwrap();
 
-    (
-        (customer_id.0, sale_id.0, payment_id.0, receipt_id.0),
-        pool,
-    )
+    ((customer_id.0, sale_id.0, payment_id.0, receipt_id.0), pool)
 }
 
 /// The upgrade attributes every pre-existing row of the four tables to the
@@ -7320,13 +7529,12 @@ async fn ac19_the_upgrade_attributes_every_sales_and_customer_row_to_the_system_
         assert_eq!(unattributed.0, 0, "{table}: no row lost its actor");
     }
     // The seeded walk-in predates the audit too, so it points at the sentinel.
-    let walkin_attributed: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM customers WHERE is_walkin = 1 AND created_by = ?",
-    )
-    .bind(sentinel)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let walkin_attributed: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM customers WHERE is_walkin = 1 AND created_by = ?")
+            .bind(sentinel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(walkin_attributed.0, 1, "the seeded walk-in is attributed");
 
     // Exactly one sentinel: the REUSE path never duplicated the account.
@@ -7335,12 +7543,18 @@ async fn ac19_the_upgrade_attributes_every_sales_and_customer_row_to_the_system_
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(sentinels.0, 1, "the reuse path never created a second sentinel");
+    assert_eq!(
+        sentinels.0, 1,
+        "the reuse path never created a second sentinel"
+    );
 
     // `created_by` is NOT NULL on all four rebuilt tables: a write that omits
     // the actor is refused by the database.
     for (table, sql) in [
-        ("customers", "INSERT INTO customers (name) VALUES ('no-actor')"),
+        (
+            "customers",
+            "INSERT INTO customers (name) VALUES ('no-actor')",
+        ),
         (
             "sales",
             "INSERT INTO sales (status, payment_type, customer_id, sale_date) \
@@ -7369,18 +7583,22 @@ async fn ac19_the_upgrade_attributes_every_sales_and_customer_row_to_the_system_
     // The re-enabled foreign keys find the same graph that existed before, and
     // the walk-in backstops survived the customers rebuild: the three triggers
     // still refuse the erase.
-    let violations: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+    let violations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        violations.0, 0,
+        "the upgrade leaves no foreign-key violation"
+    );
     let refused_deactivate = sqlx::query("UPDATE customers SET is_active = 0 WHERE is_walkin = 1")
         .execute(&pool)
         .await
         .unwrap_err();
     assert!(
-        refused_deactivate.to_string().contains("cannot be deactivated"),
+        refused_deactivate
+            .to_string()
+            .contains("cannot be deactivated"),
         "the walk-in deactivation trigger survived the rebuild: {refused_deactivate}"
     );
 
@@ -7392,7 +7610,9 @@ async fn ac19_the_upgrade_attributes_every_sales_and_customer_row_to_the_system_
         .await
         .unwrap_err();
     assert!(
-        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        refused
+            .to_string()
+            .contains("FOREIGN KEY constraint failed"),
         "the audit FK refuses the deletion: {refused}"
     );
     let still_there: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
@@ -7415,17 +7635,50 @@ async fn ac19_the_sales_migration_recreates_a_missing_sentinel() {
     let pool = upgraded_pool_with_legacy_sales_and_customer_rows().await.1;
     // Make the sentinel absent: empty the tables that reference it (RESTRICT
     // refuses a direct delete), children of the business rows first.
-    sqlx::query("DELETE FROM sale_payments").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM sale_lines").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM customer_receipts").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM sales").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM transactions").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM payment_methods").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM accounts").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM stock_movements").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM products").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM categories").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM users").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM sale_payments")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM sale_lines")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM customer_receipts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM sales")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM transactions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM payment_methods")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM accounts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stock_movements")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM products")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM categories")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users")
+        .execute(&pool)
+        .await
+        .unwrap();
     let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
         .fetch_one(&pool)
         .await
@@ -7471,13 +7724,12 @@ async fn ac19_the_sales_migration_recreates_a_missing_sentinel() {
     }
     // The defensive sentinel is the same shape migration 30's is: inactive,
     // roleless, unusable credential.
-    let sentinel_row: (i64, i64) = sqlx::query_as(
-        "SELECT is_active, must_change_password FROM users WHERE id = ?",
-    )
-    .bind(sentinel)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let sentinel_row: (i64, i64) =
+        sqlx::query_as("SELECT is_active, must_change_password FROM users WHERE id = ?")
+            .bind(sentinel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(sentinel_row.0, 0, "the recreated sentinel is inactive");
     let roles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = ?")
         .bind(sentinel)
@@ -7501,8 +7753,7 @@ async fn audit_the_sale_record_shows_the_actor_display_name() {
     let customer = seed_customer(&pool, "Audit Sale Client", None, Some(30)).await;
     let product = create_product_via_web(&app, &pool, "AUD-SALE-P", "0", "100").await;
     record_stock_via_web(&app, product, "10").await;
-    let sale_id =
-        create_sale_draft_for_customer(&app, customer, "Credit", "").await;
+    let sale_id = create_sale_draft_for_customer(&app, customer, "Credit", "").await;
     add_sale_line_via_web(&app, sale_id, product, "1").await;
 
     // A second principal (display name "Test Probe") holds the draft-lifecycle
@@ -7552,16 +7803,14 @@ async fn audit_the_customer_statement_shows_the_actor_display_name() {
     let customer = customer_id_by_name(&pool, "Audit Statement Client").await;
 
     // A second principal (display name "Test Probe") edits the customer.
-    let probe_token = test_support::seed_session_with_permissions(
-        &pool,
-        &["customers.read", "customers.write"],
-    )
-    .await
-    .unwrap();
+    let probe_token =
+        test_support::seed_session_with_permissions(&pool, &["customers.read", "customers.write"])
+            .await
+            .unwrap();
     let (status, body) = post_form_with_cookie(
         &app,
         "/web/customers/edit",
-        &format!("customer_id={customer}&name=Renamed+Client&phone=&address=&tax_id=&notes=&credit_limit=&payment_days="),
+        &format!("customer_id={customer}&name=Renamed+Client&phone=&address=&tax_id=&notes=&credit_limit=&due_days="),
         &test_support::cookie_for(&probe_token),
     )
     .await;
@@ -7585,8 +7834,6 @@ async fn audit_the_customer_statement_shows_the_actor_display_name() {
     );
 }
 
-
-
 // ---------------------------------------------------------------------------
 // AC19 (purchases/suppliers audit, M5 Phase B slice S12): the upgrade sequence
 // on the four rebuilt tables — a database built with the migrations up to 32,
@@ -7598,8 +7845,8 @@ async fn audit_the_customer_statement_shows_the_actor_display_name() {
 /// audit (the pre-33 purchases/suppliers schema is real) plus legacy business
 /// rows planted the way pre-audit code wrote them: no created_by column
 /// exists to fill.
-async fn upgraded_pool_with_legacy_purchases_and_supplier_rows()
-    -> ((i64, i64, i64, i64), sqlx::SqlitePool) {
+async fn upgraded_pool_with_legacy_purchases_and_supplier_rows(
+) -> ((i64, i64, i64, i64), sqlx::SqlitePool) {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
         .create_if_missing(true)
@@ -7609,7 +7856,10 @@ async fn upgraded_pool_with_legacy_purchases_and_supplier_rows()
         .connect_with(opts)
         .await
         .unwrap();
-    sqlx::migrate!("./migrations").run_to(20240101000032, &pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run_to(20240101000032, &pool)
+        .await
+        .unwrap();
 
     // The sentinel exists by now (the seeded payment methods made migration 30
     // attribute something): the finance rows the audit needs are real.
@@ -7622,7 +7872,10 @@ async fn upgraded_pool_with_legacy_purchases_and_supplier_rows()
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(users_before.0, 1, "no user beyond the sentinel before the upgrade");
+    assert_eq!(
+        users_before.0, 1,
+        "no user beyond the sentinel before the upgrade"
+    );
 
     // A product for the cost satellite (migration 31 already gave products
     // their audit columns, so the plant carries the sentinel).
@@ -7727,7 +7980,12 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
             "{table}: the legacy row survived with its id, attributed to the reused sentinel"
         );
     }
-    for table in ["suppliers", "product_supplier_costs", "purchases", "purchase_payments"] {
+    for table in [
+        "suppliers",
+        "product_supplier_costs",
+        "purchases",
+        "purchase_payments",
+    ] {
         let unattributed: (i64,) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE created_by IS NULL OR created_by != ?"
         )))
@@ -7744,12 +8002,18 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(sentinels.0, 1, "the reuse path never created a second sentinel");
+    assert_eq!(
+        sentinels.0, 1,
+        "the reuse path never created a second sentinel"
+    );
 
     // `created_by` is NOT NULL on all four rebuilt tables: a write that omits
     // the actor is refused by the database.
     for (table, sql) in [
-        ("suppliers", "INSERT INTO suppliers (name) VALUES ('no-actor')"),
+        (
+            "suppliers",
+            "INSERT INTO suppliers (name) VALUES ('no-actor')",
+        ),
         (
             "purchases",
             "INSERT INTO purchases (supplier_id, status, payment_type, purchase_date) \
@@ -7763,7 +8027,7 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
         (
             "product_supplier_costs",
             "INSERT INTO product_supplier_costs \
-             (product_id, supplier_id, current_cost, current_cost_updated_at) \
+             (product_id, supplier_id, current_cost, current_cost_date) \
              VALUES (1, 1, '1', '2024-01-01')",
         ),
     ] {
@@ -7779,17 +8043,19 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
     // The rebuilt tables keep their live constraints: a runtime probe for each
     // declaration the originals carried.
     // suppliers: the UNIQUE name and the is_active CHECK.
-    let dup_name = sqlx::query("INSERT INTO suppliers (name, created_by) VALUES ('Legacy Supplier', 1)")
-        .execute(&pool)
-        .await;
+    let dup_name =
+        sqlx::query("INSERT INTO suppliers (name, created_by) VALUES ('Legacy Supplier', 1)")
+            .execute(&pool)
+            .await;
     assert!(
         dup_name.is_err(),
         "suppliers: the UNIQUE name survived the rebuild"
     );
-    let bad_active =
-        sqlx::query("INSERT INTO suppliers (name, is_active, created_by) VALUES ('bad-active', 2, 1)")
-            .execute(&pool)
-            .await;
+    let bad_active = sqlx::query(
+        "INSERT INTO suppliers (name, is_active, created_by) VALUES ('bad-active', 2, 1)",
+    )
+    .execute(&pool)
+    .await;
     assert!(
         bad_active.is_err(),
         "suppliers: the is_active CHECK survived the rebuild"
@@ -7798,7 +8064,7 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
     // is_preferred and the partial unique one-preferred index.
     let dup_pair = sqlx::query(
         "INSERT INTO product_supplier_costs \
-         (product_id, supplier_id, current_cost, current_cost_updated_at, created_by) \
+         (product_id, supplier_id, current_cost, current_cost_date, created_by) \
          VALUES (1, 1, '9', '2024-06-01', ?)",
     )
     .bind(sentinel)
@@ -7815,12 +8081,11 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
     .fetch_one(&pool)
     .await
     .unwrap();
-    let bad_preferred = sqlx::query(
-        "UPDATE product_supplier_costs SET is_preferred = 2 WHERE id = ?",
-    )
-    .bind(cost_id)
-    .execute(&pool)
-    .await;
+    let bad_preferred =
+        sqlx::query("UPDATE product_supplier_costs SET is_preferred = 2 WHERE id = ?")
+            .bind(cost_id)
+            .execute(&pool)
+            .await;
     assert!(
         bad_preferred.is_err(),
         "product_supplier_costs: the is_preferred CHECK survived"
@@ -7834,7 +8099,7 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
     // index (the product keeps at most one preferred supplier, now rebuilt).
     sqlx::query(
         "INSERT INTO product_supplier_costs \
-         (product_id, supplier_id, current_cost, current_cost_updated_at, created_by) \
+         (product_id, supplier_id, current_cost, current_cost_date, created_by) \
          VALUES (1, ?, '9', '2024-06-01', ?)",
     )
     .bind(second_supplier.0)
@@ -7899,11 +8164,10 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
         unknown_purchase.is_err(),
         "purchase_payments: the purchase FK survived the rebuild"
     );
-    let delete_referenced_supplier =
-        sqlx::query("DELETE FROM suppliers WHERE id = ?")
-            .bind(supplier_id)
-            .execute(&pool)
-            .await;
+    let delete_referenced_supplier = sqlx::query("DELETE FROM suppliers WHERE id = ?")
+        .bind(supplier_id)
+        .execute(&pool)
+        .await;
     assert!(
         delete_referenced_supplier.is_err(),
         "suppliers: the RESTRICT from purchases/cost rows survived the rebuild"
@@ -7911,12 +8175,14 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
 
     // The re-enabled foreign keys find the same graph that existed before:
     // no violation anywhere.
-    let violations: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+    let violations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        violations.0, 0,
+        "the upgrade leaves no foreign-key violation"
+    );
 
     // The RESTRICT audit foreign key holds the sentinel in place for these
     // tables too: deleting it is refused and the row survives.
@@ -7926,7 +8192,9 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
         .await
         .unwrap_err();
     assert!(
-        refused.to_string().contains("FOREIGN KEY constraint failed"),
+        refused
+            .to_string()
+            .contains("FOREIGN KEY constraint failed"),
         "the audit FK refuses the deletion: {refused}"
     );
     let still_there: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = ?")
@@ -7945,32 +8213,94 @@ async fn ac19_the_upgrade_attributes_every_purchases_and_suppliers_row_to_the_sy
 /// and neither references a user), and runs the rest of the chain.
 #[tokio::test]
 async fn ac19_the_purchases_migration_recreates_a_missing_sentinel() {
-    let pool = upgraded_pool_with_legacy_purchases_and_supplier_rows().await.1;
+    let pool = upgraded_pool_with_legacy_purchases_and_supplier_rows()
+        .await
+        .1;
     // Make the sentinel absent: empty the tables that reference it (RESTRICT
     // refuses a direct delete), children of the business rows first.
-    sqlx::query("DELETE FROM purchase_payments").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM purchase_lines").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM product_supplier_costs").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM purchases").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM suppliers").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM sale_payments").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM sale_lines").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM customer_receipts").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM sales").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM transactions").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM payment_methods").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM accounts").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM stock_movements").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM product_barcodes").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM products").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM purchase_payments")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM purchase_lines")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM product_supplier_costs")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM purchases")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM suppliers")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM sale_payments")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM sale_lines")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM customer_receipts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM sales")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM transactions")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM payment_methods")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM accounts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM stock_movements")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM product_barcodes")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM products")
+        .execute(&pool)
+        .await
+        .unwrap();
     // The category tree is self-referencing: unparent first, then erase.
-    sqlx::query("UPDATE categories SET parent_id = NULL").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM categories").execute(&pool).await.unwrap();
+    sqlx::query("UPDATE categories SET parent_id = NULL")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM categories")
+        .execute(&pool)
+        .await
+        .unwrap();
     // Customers reference the sentinel too (migration 32), and the walk-in
     // trigger refuses its deletion, so the trigger goes first.
-    sqlx::query("DROP TRIGGER IF EXISTS trg_customers_walkin_no_delete").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM customers").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM users").execute(&pool).await.unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS trg_customers_walkin_no_delete")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM customers")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users")
+        .execute(&pool)
+        .await
+        .unwrap();
     let before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
         .fetch_one(&pool)
         .await
@@ -8020,13 +8350,12 @@ async fn ac19_the_purchases_migration_recreates_a_missing_sentinel() {
     }
     // The defensive sentinel is the same shape migration 30's is: inactive,
     // roleless, unusable credential.
-    let sentinel_row: (i64, i64) = sqlx::query_as(
-        "SELECT is_active, must_change_password FROM users WHERE id = ?",
-    )
-    .bind(sentinel)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let sentinel_row: (i64, i64) =
+        sqlx::query_as("SELECT is_active, must_change_password FROM users WHERE id = ?")
+            .bind(sentinel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(sentinel_row.0, 0, "the recreated sentinel is inactive");
     let roles: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM user_roles WHERE user_id = ?")
         .bind(sentinel)
@@ -8069,12 +8398,10 @@ async fn audit_the_purchase_record_shows_the_actor_display_name() {
 
     // A second principal (display name "Test Probe") holds the purchase
     // permission and confirms the draft.
-    let probe_token = test_support::seed_session_with_permissions(
-        &pool,
-        &["purchases.read", "purchases.create"],
-    )
-    .await
-    .unwrap();
+    let probe_token =
+        test_support::seed_session_with_permissions(&pool, &["purchases.read", "purchases.create"])
+            .await
+            .unwrap();
     let (status, body) = post_form_with_cookie(
         &app,
         &format!("/web/purchases/{purchase_id}/confirm"),
@@ -8145,13 +8472,12 @@ async fn audit_the_supplier_detail_shows_the_actor_display_name() {
 /// Helper: the newest purchase for a supplier id, resolved through the
 /// supplier-side read the drawer already uses.
 async fn purchase_id_by_supplier(pool: &sqlx::SqlitePool, supplier_id: i64) -> i64 {
-    let row: (i64,) = sqlx::query_as(
-        "SELECT id FROM purchases WHERE supplier_id = ? ORDER BY id DESC LIMIT 1",
-    )
-    .bind(supplier_id)
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let row: (i64,) =
+        sqlx::query_as("SELECT id FROM purchases WHERE supplier_id = ? ORDER BY id DESC LIMIT 1")
+            .bind(supplier_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
     row.0
 }
 
@@ -8229,11 +8555,10 @@ async fn ac18_a_user_records_two_different_actors_and_the_system_rows_stay_null(
         .await
         .unwrap(),
     );
-    let target_id: i64 =
-        sqlx::query_scalar("SELECT id FROM users WHERE username = 'teller'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let target_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'teller'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let (status, body) = post_form_with_cookie(
         &app,
         "/web/users/deactivate",
@@ -8247,7 +8572,11 @@ async fn ac18_a_user_records_two_different_actors_and_the_system_rows_stay_null(
     // final column alone cannot tell the two writes apart).
     let probe_id = probe_id_by_suffix(&pool).await;
     let (_, toggled_by) = user_audit(&pool, "teller").await;
-    assert_eq!(toggled_by, Some(probe_id), "the activation toggle records its actor");
+    assert_eq!(
+        toggled_by,
+        Some(probe_id),
+        "the activation toggle records its actor"
+    );
     // A third principal (the second probe) performs the administrator reset:
     // a DIFFERENT actor, so the reset's own stamp is observable against the
     // toggle's.
@@ -8272,17 +8601,28 @@ async fn ac18_a_user_records_two_different_actors_and_the_system_rows_stay_null(
     // the probe (both the toggle and the reset are edits of the target).
     let fixture_id = user_id_by_username_smoke(&pool, test_support::TEST_USERNAME).await;
     let (created_by, updated_by) = user_audit(&pool, "teller").await;
-    assert_eq!(created_by, Some(fixture_id), "the creation records the acting principal");
+    assert_eq!(
+        created_by,
+        Some(fixture_id),
+        "the creation records the acting principal"
+    );
     // The LAST edit is the reset, by the second probe — the column keeps the
     // latest editor, exactly what the display shows.
     let resetter_id = probe_id_by_suffix(&pool).await;
-    assert_eq!(updated_by, Some(resetter_id), "the reset records the acting administrator");
+    assert_eq!(
+        updated_by,
+        Some(resetter_id),
+        "the reset records the acting administrator"
+    );
 
     // The sentinel is the system's work: NULL, honestly, on both audit
     // columns. (The bootstrap administrator's NULLs are asserted at the
     // service level, in the AC1 bootstrap tests.)
     let (sentinel_created, sentinel_updated) = user_audit(&pool, "sistema").await;
-    assert_eq!(sentinel_created, None, "the sentinel has no creator and the schema says so");
+    assert_eq!(
+        sentinel_created, None,
+        "the sentinel has no creator and the schema says so"
+    );
     assert_eq!(sentinel_updated, None);
 
     // The RESTRICT foreign keys hold: deleting a user whose id another
@@ -8337,7 +8677,11 @@ async fn ac18_a_role_records_two_different_actors_and_the_seeds_carry_the_sentin
     let details_editor = probe_id_by_suffix(&pool).await;
     let (created_by, updated_by) = role_audit(&pool, "auditado").await;
     let fixture_id = user_id_by_username_smoke(&pool, test_support::TEST_USERNAME).await;
-    assert_eq!(created_by, Some(fixture_id), "the create records its author");
+    assert_eq!(
+        created_by,
+        Some(fixture_id),
+        "the create records its author"
+    );
     assert_eq!(
         updated_by,
         Some(details_editor),
@@ -8422,7 +8766,11 @@ async fn audit_the_users_screen_shows_the_grant_trail_and_the_actor_names() {
     // attributions are distinct.
     let probe_token = test_support::seed_session_with_permissions(
         &pool,
-        &["identity.users.read", "identity.users.manage", "identity.roles.manage"],
+        &[
+            "identity.users.read",
+            "identity.users.manage",
+            "identity.roles.manage",
+        ],
     )
     .await
     .unwrap();
@@ -8433,11 +8781,10 @@ async fn audit_the_users_screen_shows_the_grant_trail_and_the_actor_names() {
         .await
         .unwrap()
         .unwrap();
-    let target_id: i64 =
-        sqlx::query_scalar("SELECT id FROM users WHERE username = 'caja1'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let target_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'caja1'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let actor_id = user_id_by_username_smoke(&pool, test_support::TEST_USERNAME).await;
     let (status, body) = post_form_with_cookie(
         &app,
@@ -8470,7 +8817,8 @@ async fn audit_the_users_screen_shows_the_grant_trail_and_the_actor_names() {
     let (status, page) = get(&app, "/users").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert_eq!(
-        page.matches("Vendedor: otorgado por Test Probe el ").count(),
+        page.matches("Vendedor: otorgado por Test Probe el ")
+            .count(),
         1,
         "the trail names the granting actor: {page:.900}"
     );
@@ -8514,7 +8862,8 @@ async fn audit_the_roles_screen_shows_the_role_authors() {
     let (status, page) = get(&app, "/roles").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert_eq!(
-        page.matches("Creado por Sistema (anterior al registro)").count(),
+        page.matches("Creado por Sistema (anterior al registro)")
+            .count(),
         4,
         "the four seeds name the sentinel: {page:.900}"
     );
@@ -8536,7 +8885,7 @@ async fn audit_the_roles_screen_shows_the_role_authors() {
 #[tokio::test]
 async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() {
     // Build the database with migrations up to 33: identity rows exist (the
-    // four seeded roles, the 23 permissions, the sentinel) plus business rows
+    // four seeded roles, the permissions present at that migration, the sentinel) plus business rows
     // with their audit columns already attributed.
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .unwrap()
@@ -8552,12 +8901,10 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
 
     // Pre-34 identity state: a legacy role and user created by direct SQL —
     // exactly the shape the chain produces (no audit columns yet).
-    sqlx::query(
-        "INSERT INTO roles (code, name, description) VALUES ('legacy', 'Legacy', NULL)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO roles (code, name, description) VALUES ('legacy', 'Legacy', NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO users (username, display_name, password_hash) \
          VALUES ('legacy-op', 'Legacy Op', 'placeholder-not-a-real-argon2-hash')",
@@ -8565,25 +8912,21 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
     .execute(&pool)
     .await
     .unwrap();
-    let legacy_user: i64 =
-        sqlx::query_scalar("SELECT id FROM users WHERE username = 'legacy-op'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let legacy_role: i64 =
-        sqlx::query_scalar("SELECT id FROM roles WHERE code = 'legacy'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    sqlx::query(
-        "INSERT INTO user_roles (user_id, role_id, granted_by) VALUES (?, ?, ?)",
-    )
-    .bind(legacy_user)
-    .bind(legacy_role)
-    .bind(legacy_user)
-    .execute(&pool)
-    .await
-    .unwrap();
+    let legacy_user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'legacy-op'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let legacy_role: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = 'legacy'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_roles (user_id, role_id, granted_by) VALUES (?, ?, ?)")
+        .bind(legacy_user)
+        .bind(legacy_role)
+        .bind(legacy_user)
+        .execute(&pool)
+        .await
+        .unwrap();
 
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
@@ -8599,7 +8942,10 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(row.0, 0, "no pre-existing identity row lost its attribution: {sql}");
+        assert_eq!(
+            row.0, 0,
+            "no pre-existing identity row lost its attribution: {sql}"
+        );
     }
     // The legacy role and user kept their ids and now carry the sentinel.
     let attributed: (i64,) = sqlx::query_as(
@@ -8610,24 +8956,25 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(attributed.0, 1, "the legacy role survived with its id, attributed");
-    let attributed: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM permissions WHERE id > 0 AND created_by = ?",
-    )
-    .bind(sentinel)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(attributed.0, 23, "the whole catalog is attributed");
+    assert_eq!(
+        attributed.0, 1,
+        "the legacy role survived with its id, attributed"
+    );
+    let attributed: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM permissions WHERE id > 0 AND created_by = ?")
+            .bind(sentinel)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(attributed.0, 24, "the whole catalog is attributed");
 
     // users: NULL means the system — the sentinel and the legacy operator
     // predate the audit and no person created them.
-    let unattributed_users: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM users WHERE created_by IS NOT NULL",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let unattributed_users: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE created_by IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         unattributed_users.0, 0,
         "every pre-existing user is the system's work: NULL is the honest value"
@@ -8642,12 +8989,14 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
     assert_eq!(roles.0, 5, "no role was lost in the rebuild");
 
     // The upgrade leaves a consistent graph.
-    let violations: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(violations.0, 0, "the upgrade leaves no foreign-key violation");
+    let violations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        violations.0, 0,
+        "the upgrade leaves no foreign-key violation"
+    );
 
     // The recreated guard triggers bite immediately: the five refusal
     // families of the identity guarantees, after the migration, with the
@@ -8670,11 +9019,10 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
             "protected status is decided at seed time and cannot change",
         ),
     ] {
-        let admin_role: i64 =
-            sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let admin_role: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let err = sqlx::query(sqlx::AssertSqlSafe(sql.to_string()))
             .bind(admin_role)
             .execute(&pool)
@@ -8740,7 +9088,11 @@ async fn ac19_the_upgrade_attributes_the_identity_rows_to_the_system_sentinel() 
     }
 
     // The session and receipt triggers survived untouched.
-    let (status, page) = get(&crate::routes::router(crate::routes::AppState::new(pool.clone(), false, true)), "/login").await;
+    let (status, page) = get(
+        &crate::routes::router(crate::routes::AppState::new(pool.clone(), false, true)),
+        "/login",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{page:.200}");
 }
 
@@ -8799,8 +9151,14 @@ async fn documents_any_single_tier_opens_and_the_content_narrows_to_its_families
     let cookie = test_support::cookie_for(&sales);
     let (status, page) = get_with_cookie(&app, "/documents", &cookie).await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
-    assert!(page.contains(r#"data-document-group="sales""#), "{page:.600}");
-    assert!(!page.contains(r#"data-document-group="purchases""#), "{page:.600}");
+    assert!(
+        page.contains(r#"data-document-group="sales""#),
+        "{page:.600}"
+    );
+    assert!(
+        !page.contains(r#"data-document-group="purchases""#),
+        "{page:.600}"
+    );
     assert!(page.contains(&sale_number), "{page:.600}");
     assert!(!page.contains(&purchase_number), "{page:.600}");
     let (status, fragment) = get_fragment_with_cookie(&app, "/web/documents", &cookie).await;
@@ -8816,8 +9174,14 @@ async fn documents_any_single_tier_opens_and_the_content_narrows_to_its_families
     let cookie = test_support::cookie_for(&customers);
     let (status, page) = get_with_cookie(&app, "/documents", &cookie).await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
-    assert!(page.contains(r#"data-document-group="payments""#), "{page:.600}");
-    assert!(!page.contains(r#"data-document-group="sales""#), "{page:.600}");
+    assert!(
+        page.contains(r#"data-document-group="payments""#),
+        "{page:.600}"
+    );
+    assert!(
+        !page.contains(r#"data-document-group="sales""#),
+        "{page:.600}"
+    );
     assert!(!page.contains(&sale_number), "{page:.600}");
     let (status, fragment) = get_fragment_with_cookie(&app, "/web/documents", &cookie).await;
     assert_eq!(status, StatusCode::OK, "{fragment:.400}");
@@ -8928,9 +9292,18 @@ async fn documents_filters_narrow_by_group_user_text_and_date() {
 
     // Type alone: the purchases option shows the purchase and neither sale.
     let purchases_only = document_list_html(&app, "?group=purchases").await;
-    assert!(purchases_only.contains(&purchase_number), "{purchases_only:.600}");
-    assert!(!purchases_only.contains(&may_number), "{purchases_only:.600}");
-    assert!(!purchases_only.contains(&july_number), "{purchases_only:.600}");
+    assert!(
+        purchases_only.contains(&purchase_number),
+        "{purchases_only:.600}"
+    );
+    assert!(
+        !purchases_only.contains(&may_number),
+        "{purchases_only:.600}"
+    );
+    assert!(
+        !purchases_only.contains(&july_number),
+        "{purchases_only:.600}"
+    );
 
     // Number: a fragment the operator remembers finds its document; combined
     // with the type it excludes the other families' numbers too.
@@ -8951,10 +9324,19 @@ async fn documents_filters_narrow_by_group_user_text_and_date() {
     // movement row another actor legitimately owns.
     let by_user = document_list_html(&app, "?user=Test%20Admin").await;
     assert!(row_having(&by_user, "sale", &may_number), "{by_user:.600}");
-    assert!(!row_having(&by_user, "sale", &july_number), "{by_user:.600}");
+    assert!(
+        !row_having(&by_user, "sale", &july_number),
+        "{by_user:.600}"
+    );
     let by_probe_user = document_list_html(&app, "?user=Test%20Probe").await;
-    assert!(row_having(&by_probe_user, "sale", &july_number), "{by_probe_user:.600}");
-    assert!(!row_having(&by_probe_user, "sale", &may_number), "{by_probe_user:.600}");
+    assert!(
+        row_having(&by_probe_user, "sale", &july_number),
+        "{by_probe_user:.600}"
+    );
+    assert!(
+        !row_having(&by_probe_user, "sale", &may_number),
+        "{by_probe_user:.600}"
+    );
 
     // Dates bound inclusively on both ends.
     let july = document_list_html(&app, "?from=2024-07-01&to=2024-07-31").await;
@@ -8962,8 +9344,14 @@ async fn documents_filters_narrow_by_group_user_text_and_date() {
     assert!(!row_having(&july, "sale", &may_number), "{july:.600}");
     assert!(!july.contains(&purchase_number), "{july:.600}");
     let inclusive = document_list_html(&app, "?from=2024-07-15&to=2024-07-15").await;
-    assert!(row_having(&inclusive, "sale", &july_number), "{inclusive:.600}");
-    assert!(!row_having(&inclusive, "sale", &may_number), "{inclusive:.600}");
+    assert!(
+        row_having(&inclusive, "sale", &july_number),
+        "{inclusive:.600}"
+    );
+    assert!(
+        !row_having(&inclusive, "sale", &may_number),
+        "{inclusive:.600}"
+    );
 
     // A filter matching nothing is the empty state, never an error.
     let none = document_list_html(&app, "?user=NoSuchOperator").await;
@@ -9078,7 +9466,10 @@ async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
         .to_string();
     let (status, resp) = pay_sale_via_web(app, sale, cash, "10").await;
     assert_eq!(status, StatusCode::OK, "pay sale: {resp}");
-    let payments = sale_detail(app, sale).await["payments"].as_array().cloned().unwrap();
+    let payments = sale_detail(app, sale).await["payments"]
+        .as_array()
+        .cloned()
+        .unwrap();
     let sale_payment = payments[0]["id"].as_i64().expect("sale payment id");
 
     // The receipt that collects the payment (the RECEIPTS family).
@@ -9101,7 +9492,9 @@ async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
     let (status, resp) = post_form(
         app,
         "/web/stock-movements",
-        &format!("product_id={product}&type=In&qty=5&reason=Adjust&reference=drawer-fix&date=2024-05-12"),
+        &format!(
+            "product_id={product}&type=In&qty=5&reason=Adjust&reference=drawer-fix&date=2024-05-12"
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "seed movement: {resp}");
@@ -9137,11 +9530,14 @@ async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
         .as_str()
         .expect("confirmed purchase number")
         .to_string();
-    let purchase_payment = detail["payments"][0]["id"].as_i64().expect("purchase payment id");
+    let purchase_payment = detail["payments"][0]["id"]
+        .as_i64()
+        .expect("purchase payment id");
 
     // One unconfirmed sale: the drawer's delete control is only rendered for
     // drafts, so the error-handler label assertion needs one of its own.
-    let draft_sale = create_sale_draft_on_date(app, buyer, "Credit", "2024-05-13", "2024-07-13").await;
+    let draft_sale =
+        create_sale_draft_on_date(app, buyer, "Credit", "2024-05-13", "2024-07-13").await;
 
     DrawerFixture {
         sale,
@@ -9192,7 +9588,11 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     // request fails (a button has no form for `closest('form[data-action]')`
     // to find). The JS announce behaviour itself is covered by reading the
     // handler, not by a browser test.
-    let (status, body) = get(&app, &format!("/web/documents/detail/sale/{}", f.draft_sale)).await;
+    let (status, body) = get(
+        &app,
+        &format!("/web/documents/detail/sale/{}", f.draft_sale),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "draft sale drawer: {body:.400}");
     assert!(
         body.contains(r#"data-action="Eliminar borrador""#),
@@ -9210,7 +9610,11 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
 
     // Sale payment: the payment's own amount, account, method and ledger
     // transaction, plus the parent sale's summary as a sub-block.
-    let (status, body) = get(&app, &format!("/web/documents/detail/sale_payment/{}", f.sale_payment)).await;
+    let (status, body) = get(
+        &app,
+        &format!("/web/documents/detail/sale_payment/{}", f.sale_payment),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "sale payment drawer: {body:.400}");
     assert!(body.contains("10"), "{body:.800}");
     assert!(body.contains("DrawerWallet"), "{body:.800}");
@@ -9220,11 +9624,18 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     assert!(body.contains("/accounts/"), "{body:.800}");
 
     // Purchase: supplier name and the link to the owning page.
-    let (status, body) = get(&app, &format!("/web/documents/detail/purchase/{}", f.purchase)).await;
+    let (status, body) = get(
+        &app,
+        &format!("/web/documents/detail/purchase/{}", f.purchase),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "purchase drawer: {body:.400}");
     assert!(body.contains(&f.purchase_number), "{body:.800}");
     assert!(body.contains("DrawerSupplier"), "{body:.800}");
-    assert!(body.contains(&format!("/purchases/{}", f.purchase)), "{body:.800}");
+    assert!(
+        body.contains(&format!("/purchases/{}", f.purchase)),
+        "{body:.800}"
+    );
     // The purchase twin: the annul form's hidden field carries the id too.
     assert!(
         body.contains(&format!(r#"name="purchase_id" value="{}""#, f.purchase)),
@@ -9232,24 +9643,49 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     );
 
     // Purchase payment: amount and parent purchase summary.
-    let (status, body) = get(&app, &format!("/web/documents/detail/purchase_payment/{}", f.purchase_payment)).await;
-    assert_eq!(status, StatusCode::OK, "purchase payment drawer: {body:.400}");
+    let (status, body) = get(
+        &app,
+        &format!(
+            "/web/documents/detail/purchase_payment/{}",
+            f.purchase_payment
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "purchase payment drawer: {body:.400}"
+    );
     assert!(body.contains(&f.purchase_number), "{body:.800}");
     assert!(body.contains("DrawerWallet"), "{body:.800}");
-    assert!(body.contains(&format!("/purchases/{}", f.purchase)), "{body:.800}");
+    assert!(
+        body.contains(&format!("/purchases/{}", f.purchase)),
+        "{body:.800}"
+    );
 
     // Stock movement: product, reason, the product's current derived stock,
     // and the append-only sentence the action slice relies on.
-    let (status, body) = get(&app, &format!("/web/documents/detail/stock_movement/{}", f.movement)).await;
+    let (status, body) = get(
+        &app,
+        &format!("/web/documents/detail/stock_movement/{}", f.movement),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "movement drawer: {body:.400}");
     assert!(body.contains("product DRAWER-P"), "{body:.800}");
     assert!(body.contains("Stock actual"), "{body:.800}");
     assert!(body.contains("append-only"), "{body:.800}");
-    assert!(body.contains(&format!("/products#product-{}", f.product)), "{body:.800}");
+    assert!(
+        body.contains(&format!("/products#product-{}", f.product)),
+        "{body:.800}"
+    );
 
     // Receipt: customer, account, total and the allocations table with the
     // sale number it applied.
-    let (status, body) = get(&app, &format!("/web/documents/detail/receipt/{}", f.receipt)).await;
+    let (status, body) = get(
+        &app,
+        &format!("/web/documents/detail/receipt/{}", f.receipt),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "receipt drawer: {body:.400}");
     assert!(body.contains("DrawerBuyer"), "{body:.800}");
     assert!(body.contains("DrawerWallet"), "{body:.800}");
@@ -9286,12 +9722,17 @@ async fn documents_drawer_refuses_families_the_principal_cannot_read() {
         ("sale", f.sale, StatusCode::OK),
         ("sale_payment", f.sale_payment, StatusCode::OK),
         ("purchase", f.purchase, StatusCode::FORBIDDEN),
-        ("purchase_payment", f.purchase_payment, StatusCode::FORBIDDEN),
+        (
+            "purchase_payment",
+            f.purchase_payment,
+            StatusCode::FORBIDDEN,
+        ),
         ("stock_movement", f.movement, StatusCode::FORBIDDEN),
         ("receipt", f.receipt, StatusCode::FORBIDDEN),
     ] {
         let (status, body) =
-            get_fragment_with_cookie(&app, &format!("/web/documents/detail/{kind}/{id}"), &cookie).await;
+            get_fragment_with_cookie(&app, &format!("/web/documents/detail/{kind}/{id}"), &cookie)
+                .await;
         assert_eq!(status, expected, "{kind} as sales.read: {body:.400}");
         if expected == StatusCode::FORBIDDEN {
             assert!(
@@ -9309,12 +9750,17 @@ async fn documents_drawer_refuses_families_the_principal_cannot_read() {
         ("sale", f.sale, StatusCode::FORBIDDEN),
         ("sale_payment", f.sale_payment, StatusCode::FORBIDDEN),
         ("purchase", f.purchase, StatusCode::FORBIDDEN),
-        ("purchase_payment", f.purchase_payment, StatusCode::FORBIDDEN),
+        (
+            "purchase_payment",
+            f.purchase_payment,
+            StatusCode::FORBIDDEN,
+        ),
         ("stock_movement", f.movement, StatusCode::FORBIDDEN),
         ("receipt", f.receipt, StatusCode::OK),
     ] {
         let (status, body) =
-            get_fragment_with_cookie(&app, &format!("/web/documents/detail/{kind}/{id}"), &cookie).await;
+            get_fragment_with_cookie(&app, &format!("/web/documents/detail/{kind}/{id}"), &cookie)
+                .await;
         assert_eq!(status, expected, "{kind} as customers.read: {body:.400}");
     }
 }
@@ -9327,9 +9773,7 @@ async fn documents_drawer_refuses_families_the_principal_cannot_read() {
 fn row_having(html: &str, kind: &str, needle: &str) -> bool {
     html.split(r#"data-document-kind=""#)
         .skip(1)
-        .any(|chunk| {
-            chunk.split('"').next().unwrap_or("") == kind && chunk.contains(needle)
-        })
+        .any(|chunk| chunk.split('"').next().unwrap_or("") == kind && chunk.contains(needle))
 }
 
 /// Create a sale draft as the principal the cookie carries, on an explicit
@@ -9381,9 +9825,11 @@ async fn probe_id_by_suffix(pool: &SqlitePool) -> i64 {
 /// starts from (sqlx's migrator stops at the version, exactly like the S12
 /// upgrade fixture did).
 async fn run_migrations_up_to_33(pool: &SqlitePool) {
-    sqlx::migrate!("./migrations").run_to(20240101000033, pool).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run_to(20240101000033, pool)
+        .await
+        .unwrap();
 }
-
 
 // The /documents drawer actions: the two end-to-end flows the action block
 // offers. Everything runs through the real web endpoints, the way the
@@ -9396,8 +9842,7 @@ async fn documents_drawer_delete_removes_a_draft_and_the_feed_stops_listing_it()
     let (app, pool) = test_app().await;
     let product = create_product_via_web(&app, &pool, "DRAW-D", "1", "50").await;
     let buyer = seed_customer(&pool, "Drawer Delete Buyer", None, None).await;
-    let sale =
-        create_sale_draft_on_date(&app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
+    let sale = create_sale_draft_on_date(&app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
 
     // The draft is in the feed before the delete.
@@ -9462,8 +9907,7 @@ async fn documents_drawer_annul_flows_through_the_existing_cancel_endpoint() {
     // `method_ids` assigns it, exactly how the neighbouring flows seed it.
     let _wallet = create_account_via_web(&app, &pool, "DrawerAnnulWallet", &[cash]).await;
     let buyer = seed_customer(&pool, "Drawer Annul Buyer", None, None).await;
-    let sale =
-        create_sale_draft_on_date(&app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
+    let sale = create_sale_draft_on_date(&app, buyer, "Credit", "2024-05-02", "2024-06-30").await;
     add_sale_line_via_web(&app, sale, product, "2").await;
     confirm_sale_via_web(&app, sale, None).await;
     let (status, resp) = pay_sale_via_web(&app, sale, cash, "5").await;
@@ -9503,12 +9947,11 @@ async fn documents_drawer_annul_flows_through_the_existing_cancel_endpoint() {
     );
 
     // One refund Expense on the paying account.
-    let (account,): (i64,) =
-        sqlx::query_as("SELECT account_id FROM payment_methods WHERE id = ?")
-            .bind(cash)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (account,): (i64,) = sqlx::query_as("SELECT account_id FROM payment_methods WHERE id = ?")
+        .bind(cash)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let refunds: Vec<Value> = transactions_for(&app, account)
         .await
         .into_iter()
@@ -9517,8 +9960,7 @@ async fn documents_drawer_annul_flows_through_the_existing_cancel_endpoint() {
     assert!(
         refunds
             .iter()
-            .any(|t| t["amount"].as_str() == Some("5")
-                || t["amount"].as_f64() == Some(5.0)),
+            .any(|t| t["amount"].as_str() == Some("5") || t["amount"].as_f64() == Some(5.0)),
         "one Expense refund of 5 must exist: {refunds:?}"
     );
 
@@ -9532,5 +9974,332 @@ async fn documents_drawer_annul_flows_through_the_existing_cancel_endpoint() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(movements, 1, "the tracked line's return movement must exist");
+    assert_eq!(
+        movements, 1,
+        "the tracked line's return movement must exist"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4: customer/supplier due-day wiring
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn due_days_customer_web_and_api_create_edit_round_trip() {
+    let (app, pool) = test_app().await;
+
+    let (status, body) = post_form(&app, "/web/customers", "name=Term+Web&due_days=15").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create customer through web: {body}"
+    );
+    let web_customer = customer_id_by_name(&pool, "Term Web").await;
+    let (status, edit_form) = get(&app, &format!("/web/customers/edit-form/{web_customer}")).await;
+    assert_eq!(status, StatusCode::OK, "{edit_form}");
+    assert!(
+        element_tag_containing(&edit_form, "name=\"due_days\"").contains("value=\"15\""),
+        "the edit form must show the stored term: {edit_form}"
+    );
+    let (status, body) = post_form(
+        &app,
+        "/web/customers/edit",
+        &format!("customer_id={web_customer}&name=Term+Web&due_days=20"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "edit customer through web: {body}");
+
+    let api_customer = json!({
+        "name": "Term API",
+        "phone": null,
+        "address": null,
+        "tax_id": null,
+        "notes": null,
+        "is_walkin": false,
+        "credit_limit": null,
+        "due_days": 30
+    });
+    let (status, body) = post_json(&app, "/api/customers", api_customer).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create customer through API: {body}"
+    );
+    let api_customer_id = json_body(&body)["customer"]["id"].as_i64().unwrap();
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/api/customers/{api_customer_id}"),
+        Some("application/json"),
+        false,
+        json!({ "due_days": 45 }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "edit customer through API: {body}");
+
+    let (status, body) = get(&app, "/api/customers").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let customers = json_body(&body);
+    let web_due = customers["customers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|customer| customer["customer"]["id"] == json!(web_customer))
+        .unwrap()["customer"]["due_days"]
+        .as_i64();
+    let api_due = customers["customers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|customer| customer["customer"]["id"] == json!(api_customer_id))
+        .unwrap()["customer"]["due_days"]
+        .as_i64();
+    assert_eq!(web_due, Some(20));
+    assert_eq!(api_due, Some(45));
+}
+
+#[tokio::test]
+async fn due_days_supplier_web_and_api_create_edit_round_trip() {
+    let (app, pool) = test_app().await;
+
+    let (status, body) = post_form(&app, "/web/suppliers", "name=Term+Sup&due_days=15").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "create supplier through web: {body}"
+    );
+    let web_supplier = supplier_id_by_name(&pool, "Term Sup").await;
+    let (status, edit_form) = get(&app, &format!("/web/suppliers/{web_supplier}/edit-form")).await;
+    assert_eq!(status, StatusCode::OK, "{edit_form}");
+    assert!(
+        element_tag_containing(&edit_form, "name=\"due_days\"").contains("value=\"15\""),
+        "the edit form must show the stored term: {edit_form}"
+    );
+    let (status, body) = post_form(
+        &app,
+        "/web/suppliers/edit",
+        &format!("id={web_supplier}&name=Term+Sup&due_days=20"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "edit supplier through web: {body}");
+
+    let (status, body) = post_json(
+        &app,
+        "/api/suppliers",
+        json!({ "name": "Term API Sup", "due_days": 30 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create supplier through API: {body}"
+    );
+    let api_supplier = json_body(&body);
+    let api_supplier_id = api_supplier["id"].as_i64().unwrap();
+    assert_eq!(api_supplier["due_days"].as_i64(), Some(30));
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/api/suppliers/{api_supplier_id}"),
+        Some("application/json"),
+        false,
+        json!({ "due_days": 45 }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "edit supplier through API: {body}");
+    assert_eq!(json_body(&body)["due_days"].as_i64(), Some(45));
+
+    let web_due: (Option<i64>,) = sqlx::query_as("SELECT due_days FROM suppliers WHERE id = ?")
+        .bind(web_supplier)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(web_due, (Some(20),));
+}
+
+#[tokio::test]
+async fn due_days_customer_credit_sale_defaults_and_explicit_date_wins() {
+    let (app, pool) = test_app().await;
+    let (status, body) = post_form(&app, "/web/customers", "name=Net+15&due_days=15").await;
+    assert_eq!(status, StatusCode::OK, "create customer: {body}");
+    let customer = customer_id_by_name(&pool, "Net 15").await;
+
+    let defaulted = create_sale_draft_on_date(&app, customer, "Credit", "2024-05-02", "").await;
+    assert_eq!(
+        sale_detail(&app, defaulted).await["sale"]["due_date"],
+        json!("2024-05-17")
+    );
+
+    let manual =
+        create_sale_draft_on_date(&app, customer, "Credit", "2024-05-02", "2024-06-20").await;
+    assert_eq!(
+        sale_detail(&app, manual).await["sale"]["due_date"],
+        json!("2024-06-20")
+    );
+}
+
+#[tokio::test]
+async fn due_days_supplier_credit_confirm_prefills_without_storing_and_manual_wins() {
+    let (app, pool) = test_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/api/suppliers",
+        json!({ "name": "Net 30 Supplier", "due_days": 30 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let supplier = json_body(&body)["id"].as_i64().unwrap();
+    let product = create_product_via_web(&app, &pool, "DUE-P", "1", "50").await;
+    let purchase = create_purchase_draft_with_due(&app, supplier, "Cash", "2024-05-02", "").await;
+    add_purchase_line_via_web(&app, purchase, product, "1").await;
+
+    let (status, page) = get(&app, &format!("/purchases/{purchase}")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let due_input = element_tag_containing(&page, "id=\"confirm-due-date\"");
+    assert!(
+        due_input.contains("value=\"2024-06-01\""),
+        "the confirm field must visibly prefill purchase_date + supplier.due_days: {due_input}"
+    );
+    let stored_before: (Option<String>,) =
+        sqlx::query_as("SELECT due_date FROM purchases WHERE id = ?")
+            .bind(purchase)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_before,
+        (None,),
+        "prefill must not write a document fact"
+    );
+
+    let (status, body) = post_form(
+        &app,
+        &format!("/web/purchases/{purchase}/confirm"),
+        "payment_type=Credit&due_date=2024-06-15",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm Credit purchase: {body}");
+    assert_eq!(
+        purchase_detail(&app, purchase).await["purchase"]["due_date"],
+        json!("2024-06-15")
+    );
+}
+
+#[tokio::test]
+async fn due_days_supplier_cash_confirm_remains_without_a_due_date() {
+    let (app, pool) = test_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/api/suppliers",
+        json!({ "name": "Immediate Supplier", "due_days": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let supplier = json_body(&body)["id"].as_i64().unwrap();
+    let product = create_product_via_web(&app, &pool, "DUE-CASH", "1", "50").await;
+    let purchase = create_purchase_draft_with_due(&app, supplier, "Cash", "2024-05-02", "").await;
+    add_purchase_line_via_web(&app, purchase, product, "1").await;
+    let (status, page) = get(&app, &format!("/purchases/{purchase}")).await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let due_input = element_tag_containing(&page, "id=\"confirm-due-date\"");
+    assert!(due_input.contains("value=\"2024-05-02\""));
+    assert!(
+        due_input.contains("disabled"),
+        "Cash must not submit the visible Credit suggestion: {due_input}"
+    );
+
+    let cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "Due Cash Account", &[cash]).await;
+    let (status, body) = post_form(
+        &app,
+        "/web/transactions",
+        &format!(
+            "account_id={account}&type=Income&amount=1000&description=fund+due-days+cash&date=2024-05-01"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fund Cash account: {body}");
+
+    let (status, body) = post_form(
+        &app,
+        &format!("/web/purchases/{purchase}/confirm"),
+        &format!("payment_type=Cash&method_id={cash}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "confirm Cash purchase: {body}");
+    let detail = purchase_detail(&app, purchase).await;
+    assert_eq!(detail["purchase"]["payment_type"], json!("Cash"));
+    assert_eq!(detail["purchase"]["due_date"], json!(null));
+}
+
+#[tokio::test]
+async fn due_days_negative_terms_are_refused_on_create_and_edit() {
+    let (app, pool) = test_app().await;
+
+    let (status, _) = post_form(&app, "/web/customers", "name=Bad+Web&due_days=-1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let customer_body = json!({
+        "name": "Valid API Customer",
+        "phone": null,
+        "address": null,
+        "tax_id": null,
+        "notes": null,
+        "is_walkin": false,
+        "credit_limit": null,
+        "due_days": 5
+    });
+    let (status, body) = post_json(&app, "/api/customers", customer_body).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let customer_id = json_body(&body)["customer"]["id"].as_i64().unwrap();
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/api/customers/{customer_id}"),
+        Some("application/json"),
+        false,
+        json!({ "due_days": -1 }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post_form(&app, "/web/customers", "name=Valid+Web&due_days=5").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let web_customer = customer_id_by_name(&pool, "Valid Web").await;
+    let (status, body) = post_form(
+        &app,
+        "/web/customers/edit",
+        &format!("customer_id={web_customer}&name=Valid+Web&due_days=-1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = post_form(&app, "/web/suppliers", "name=Bad+Sup&due_days=-1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post_json(
+        &app,
+        "/api/suppliers",
+        json!({ "name": "Valid API Sup", "due_days": 5 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let supplier_id = json_body(&body)["id"].as_i64().unwrap();
+    let (status, body) = send(
+        &app,
+        "PUT",
+        &format!("/api/suppliers/{supplier_id}"),
+        Some("application/json"),
+        false,
+        json!({ "due_days": -1 }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = post_form(&app, "/web/suppliers", "name=Valid+Web+Sup&due_days=5").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let web_supplier = supplier_id_by_name(&pool, "Valid Web Sup").await;
+    let (status, body) = post_form(
+        &app,
+        "/web/suppliers/edit",
+        &format!("id={web_supplier}&name=Valid+Web+Sup&due_days=-1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }

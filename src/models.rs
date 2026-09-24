@@ -38,6 +38,108 @@ impl std::str::FromStr for TransactionKind {
 // ---------------------------------------------------------------------------
 // DB entities (what sqlx reads)
 // ---------------------------------------------------------------------------
+// T1 business configuration and tax domain.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessSettings {
+    pub id: i64,
+    pub business_name: String,
+    pub default_locale_code: String,
+    pub currency_code: String,
+    pub timezone: String,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewBusinessSettings {
+    pub business_name: String,
+    pub default_locale_code: String,
+    pub currency_code: String,
+    pub timezone: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBusinessSettings {
+    pub business_name: String,
+    pub default_locale_code: String,
+    pub currency_code: String,
+    pub timezone: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessLocale {
+    pub id: i64,
+    pub locale_code: String,
+    pub language_code: String,
+    pub display_name: String,
+    pub is_enabled: bool,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewBusinessLocale {
+    pub locale_code: String,
+    pub language_code: String,
+    pub display_name: String,
+    pub is_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBusinessLocale {
+    pub locale_code: String,
+    pub display_name: String,
+    pub is_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tax {
+    pub id: i64,
+    pub code: String,
+    pub name: String,
+    /// Decimal stored as canonical TEXT.
+    pub rate: Decimal,
+    pub is_active: bool,
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewTax {
+    pub code: String,
+    pub name: String,
+    pub rate: Decimal,
+    pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateTax {
+    pub code: Option<String>,
+    pub name: Option<String>,
+    pub rate: Option<Decimal>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProductTax {
+    pub id: i64,
+    pub product_id: i64,
+    pub tax_id: i64,
+    pub created_by: i64,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductTaxView {
+    #[serde(flatten)]
+    pub link: ProductTax,
+    pub tax: Tax,
+}
+
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Account {
@@ -70,6 +172,7 @@ pub struct Transaction {
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 impl Transaction {
@@ -228,10 +331,20 @@ impl std::str::FromStr for MovementType {
 pub enum MovementReason {
     Purchase,
     Sale,
-    #[serde(rename = "Sale-return", alias = "SaleReturn", alias = "sale_return", alias = "salereturn")]
+    #[serde(
+        rename = "Sale-return",
+        alias = "SaleReturn",
+        alias = "sale_return",
+        alias = "salereturn"
+    )]
     #[sqlx(rename = "Sale-return")]
     SaleReturn,
-    #[serde(rename = "Purchase-return", alias = "PurchaseReturn", alias = "purchase_return", alias = "purchasereturn")]
+    #[serde(
+        rename = "Purchase-return",
+        alias = "PurchaseReturn",
+        alias = "purchase_return",
+        alias = "purchasereturn"
+    )]
     #[sqlx(rename = "Purchase-return")]
     PurchaseReturn,
     Loss,
@@ -259,9 +372,7 @@ impl std::str::FromStr for MovementReason {
         match s.to_lowercase().as_str() {
             "purchase" => Ok(Self::Purchase),
             "sale" => Ok(Self::Sale),
-            "sale-return" | "sale_return" | "salereturn" | "sale return" => {
-                Ok(Self::SaleReturn)
-            }
+            "sale-return" | "sale_return" | "salereturn" | "sale return" => Ok(Self::SaleReturn),
             "purchase-return" | "purchase_return" | "purchasereturn" | "purchase return" => {
                 Ok(Self::PurchaseReturn)
             }
@@ -283,6 +394,7 @@ pub struct Category {
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -608,6 +720,7 @@ pub struct SalePayment {
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +741,7 @@ pub struct PaymentMethod {
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 /// One method with its owning account resolved for display, so method-only
@@ -714,7 +828,6 @@ pub fn format_sale_number(year: i32, seq: i64) -> String {
     format!("{year}-SALE-{seq:06}")
 }
 
-
 /// Fold a search string to its comparable ASCII form: Unicode lowercase plus the
 /// Spanish and Latin-1 diacritics mapped to their base letters. Both sides of every
 /// party and catalogue match go through this one function, so `Perez` finds
@@ -761,7 +874,6 @@ pub struct SaleListFilter {
     /// Inclusive upper bound on `sale_date`.
     pub to: Option<NaiveDate>,
 }
-
 
 // ---------------------------------------------------------------------------
 // Sale record page (redesign-interface N2)
@@ -840,6 +952,8 @@ pub struct Supplier {
     pub phone: Option<String>,
     pub notes: Option<String>,
     pub is_active: bool,
+    /// Default credit term in days; NULL means no default term.
+    pub due_days: Option<i64>,
     /// Audit actor (M5 Phase B, slice S12): who created the supplier and who
     /// last edited it (an edit or the activate/deactivate toggle). The
     /// interface resolves it to a display name; it never shows the id.
@@ -856,10 +970,10 @@ pub struct ProductSupplierCost {
     pub supplier_id: i64,
     /// Decimal >= 0, stored as TEXT.
     pub current_cost: Decimal,
-    pub current_cost_updated_at: NaiveDate,
+    pub current_cost_date: NaiveDate,
     /// Decimal >= 0 or NULL when there is no older recorded price.
     pub previous_cost: Option<Decimal>,
-    pub previous_cost_updated_at: Option<NaiveDate>,
+    pub previous_cost_date: Option<NaiveDate>,
     pub is_preferred: bool,
     /// The supplier's own code for this product, stored as TEXT.
     pub supplier_sku: Option<String>,
@@ -870,6 +984,7 @@ pub struct ProductSupplierCost {
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 impl ProductSupplierCost {
@@ -915,6 +1030,7 @@ pub struct NewSupplier {
     pub name: String,
     pub phone: Option<String>,
     pub notes: Option<String>,
+    pub due_days: Option<i64>,
 }
 
 /// Service-level patch for supplier edits. `Option<Option<T>>` distinguishes
@@ -924,6 +1040,7 @@ pub struct UpdateSupplier {
     pub name: Option<String>,
     pub phone: Option<Option<String>>,
     pub notes: Option<Option<String>>,
+    pub due_days: Option<Option<i64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1029,6 +1146,7 @@ pub struct PurchasePayment {
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 /// Service-level input for purchase creation (Draft).
@@ -1179,7 +1297,6 @@ pub struct PurchaseListFilter {
     pub to: Option<NaiveDate>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Documents index (cross-department read layer, slice 1 of 2): the shared types
 // the sales and purchases repositories already project and the receipts/stock
@@ -1258,7 +1375,6 @@ impl DocumentKind {
             Self::Receipt => "Recibo de cliente",
         }
     }
-
 }
 
 /// The four groups the operator filters by — the vocabulary of the request
@@ -1272,12 +1388,8 @@ pub enum DocumentGroup {
 }
 
 impl DocumentGroup {
-    pub const ALL: &'static [DocumentGroup] = &[
-        Self::Sales,
-        Self::Purchases,
-        Self::Stock,
-        Self::Payments,
-    ];
+    pub const ALL: &'static [DocumentGroup] =
+        &[Self::Sales, Self::Purchases, Self::Stock, Self::Payments];
 
     /// Tokens: "sales", "purchases", "stock", "payments".
     pub fn token(&self) -> &'static str {
@@ -1449,7 +1561,7 @@ pub struct Customer {
     /// Decimal >= 0 stored as TEXT; NULL means no limit.
     pub credit_limit: Option<Decimal>,
     /// Default credit term in days; NULL means no default term.
-    pub payment_days: Option<i64>,
+    pub due_days: Option<i64>,
     /// Audit actor (M5 Phase B, slice S11): who created the customer and who
     /// last edited it. The seeded walk-in predates the audit, so its actor is
     /// the migration's sentinel.
@@ -1473,7 +1585,7 @@ pub struct NewCustomer {
     /// None means no limit.
     pub credit_limit: Option<Decimal>,
     /// None means no default term.
-    pub payment_days: Option<i64>,
+    pub due_days: Option<i64>,
 }
 
 /// Service-level patch for customer edits. `Option<Option<T>>` distinguishes
@@ -1487,7 +1599,7 @@ pub struct UpdateCustomer {
     pub tax_id: Option<Option<String>>,
     pub notes: Option<Option<String>>,
     pub credit_limit: Option<Option<Decimal>>,
-    pub payment_days: Option<Option<i64>>,
+    pub due_days: Option<Option<i64>>,
 }
 
 /// Outcome of creating a customer: the new row plus any customers that already

@@ -756,7 +756,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(
-            matrix_rows, 44,
+            matrix_rows, 45,
             "the matrix survived the aborted REPLACE"
         );
     }

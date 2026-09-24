@@ -329,8 +329,8 @@ def test_creating_with_a_markup_derives_the_price_and_locks_the_field(
     With a markup the modal's sale price stays empty (the modal's script drops
     ``required`` the moment the markup has a value, and the server accepts an
     empty price whenever a markup is present — the readonly state is courtesy,
-    the handler is the enforcement). Asserting the DERIVED value ($15.00 from a
-    $10.00 cost and a 50% markup) rather than anything the form submitted
+    the handler is the enforcement). Asserting the DERIVED value (15.00 USD from a
+    10.00 USD cost and a 50% markup) rather than anything the form submitted
     catches a create that echoed a price back instead of deriving one, and the
     drawer's locked field and hint catch a create whose stored markup the UI
     then lost.
@@ -361,9 +361,9 @@ def test_creating_with_a_markup_derives_the_price_and_locks_the_field(
     expect(listing).to_contain_text("Markup Widget")
     row = listing.locator("> div[id^='product-']").filter(has_text="Markup Widget")
     expect(row).to_have_count(1)
-    # The stored price is the derivation: cost 10.00 + 50% markup ⇒ $15.00. No
+    # The stored price is the derivation: cost 10.00 + 50% markup ⇒ 15.00 USD. No
     # price was submitted, so anything else here is a broken derivation.
-    expect(row).to_contain_text("$15.00")
+    expect(row).to_contain_text("15.00 USD")
     product_id = int(row.get_attribute("id").removeprefix("product-"))
 
     # The drawer mirrors the stored state: the markup input carries the value,
@@ -377,7 +377,7 @@ def test_creating_with_a_markup_derives_the_price_and_locks_the_field(
     expect(price).not_to_be_editable()
     expect(price).to_have_value("15.00")
     expect(page.locator("#product-detail-inner")).to_contain_text(
-        "Recalculated from the cost and the 50% markup when you save"
+        "Recalculated from the cost and the 50 % markup when you save"
     )
 
 
@@ -445,7 +445,7 @@ def test_second_create_after_a_markup_create_is_not_poisoned_by_the_reset(
         has_text="Manual Second Widget"
     )
     expect(row).to_have_count(1)
-    expect(row).to_contain_text("$19.50")
+    expect(row).to_contain_text("19.50 USD")
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +525,7 @@ def test_editing_a_product_in_the_drawer_updates_drawer_and_list(
     # to the same product id.
     row = page.locator(f"#product-{product_id}")
     expect(row).to_contain_text("Edited Widget")
-    expect(row).to_contain_text("$29.50")
+    expect(row).to_contain_text("29.50 USD")
     expect(page.locator(f"#{_PRODUCTS_INNER}")).not_to_contain_text("Edit Me Widget")
 
 
@@ -577,7 +577,7 @@ def test_changing_the_markup_in_the_drawer_recalculates_the_price(
     stored the new markup but skipped the re-derivation would be invisible in
     the drawer (which re-renders the stored price either way after the swap) —
     the list row is the only surface that exposes it. The refreshed row must
-    show the price derived from the NEW markup (cost 10.00 + 100% ⇒ $20.00)
+    show the price derived from the NEW markup (cost 10.00 + 100% ⇒ 20.00 USD)
     and must have dropped the price the old markup produced.
     """
     product = create_product(
@@ -605,8 +605,8 @@ def test_changing_the_markup_in_the_drawer_recalculates_the_price(
     # the newly derived price.
     expect(page.locator("#product-drawer")).not_to_be_visible()
     row = page.locator(f"#product-{product_id}")
-    expect(row).to_contain_text("$20.00")
-    expect(row).not_to_contain_text("$15.00")
+    expect(row).to_contain_text("20.00 USD")
+    expect(row).not_to_contain_text("15.00 USD")
 
 
 def test_clearing_the_markup_in_the_drawer_hands_the_price_back_to_the_operator(
@@ -645,7 +645,7 @@ def test_clearing_the_markup_in_the_drawer_hands_the_price_back_to_the_operator(
     # derivation last stored, and a successful save closed the drawer.
     expect(page.locator("#product-drawer")).not_to_be_visible()
     row = page.locator(f"#product-{product_id}")
-    expect(row).to_contain_text("$15.00")
+    expect(row).to_contain_text("15.00 USD")
 
     # Reopening the drawer shows a manual price again: the input is editable
     # (no stale readonly state) and the markup field is empty.
@@ -947,7 +947,7 @@ def test_recording_a_supplier_cost_and_setting_preferred_from_the_drawer(
     # The seeded cost renders from the product side before anything is recorded.
     rows = page.locator("#product-detail-inner div.mb-2.justify-between")
     expect(rows).to_have_count(1)
-    expect(rows.filter(has_text="Cost Supplier Beta")).to_contain_text("$8.00")
+    expect(rows.filter(has_text="Cost Supplier Beta")).to_contain_text("8.00 USD")
 
     # Record a cost for the other supplier through the drawer's own form. The
     # drawer stays OPEN by design (so the recorded value is visible) — only the
@@ -963,7 +963,7 @@ def test_recording_a_supplier_cost_and_setting_preferred_from_the_drawer(
     expect(page.locator("#product-drawer")).to_be_visible()
     rows = page.locator("#product-detail-inner div.mb-2.justify-between")
     expect(rows).to_have_count(2)
-    expect(rows.filter(has_text="Cost Supplier Alpha")).to_contain_text("$9.75")
+    expect(rows.filter(has_text="Cost Supplier Alpha")).to_contain_text("9.75 USD")
 
     # Mark the freshly recorded supplier preferred; the swap re-renders the rows.
     preferred_form_a = rows.filter(
@@ -1033,7 +1033,7 @@ def test_drawer_shows_stale_cost_badge_with_both_values_when_costs_disagree(
     # Both values in the badge's own sentence, as one exact text node: a
     # supplier row repeating an amount cannot satisfy it, and the bullet joins
     # them so either half dropping silently breaks the match.
-    values = drawer.get_by_text("reference $12.50 • stored $5.00", exact=True)
+    values = drawer.get_by_text("reference 12.50 USD • stored 5.00 USD", exact=True)
     expect(values).to_be_visible()
     expect(values).to_have_count(1)
 
@@ -1067,7 +1067,7 @@ def test_drawer_hides_stale_cost_badge_when_reference_equals_stored(
     # partial), so a page-level absence is discriminating and would catch the
     # badge rendering even outside the drawer body.
     expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
-    expect(drawer.get_by_text("reference $8.00")).to_have_count(0)
+    expect(drawer.get_by_text("reference 8.00 USD")).to_have_count(0)
 
 
 def test_drawer_hides_stale_cost_badge_when_the_product_has_no_supplier_rows(
@@ -1106,7 +1106,7 @@ def test_drawer_hides_stale_cost_badge_when_the_stored_cost_is_zero(
 
     ``products.cost_price`` is ``NOT NULL DEFAULT '0'``, so zero is the column's
     empty state, not a value that can disagree with the supplier reference. A
-    badge here would read as "your $7.25 supplier cost contradicts your (non)
+    badge here would read as "your 7.25 USD supplier cost contradicts your (non)
     cost" — noise for a product that simply has not had its cost entered.
     """
     product = create_product(
@@ -1124,7 +1124,7 @@ def test_drawer_hides_stale_cost_badge_when_the_stored_cost_is_zero(
     drawer = _open_drawer_for_cost_scenario(page, api, product, "Zero Cost Widget")
 
     expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
-    expect(drawer.get_by_text("reference $7.25")).to_have_count(0)
+    expect(drawer.get_by_text("reference 7.25 USD")).to_have_count(0)
 
 
 def test_recording_a_stock_movement_from_the_drawer_updates_both_surfaces(

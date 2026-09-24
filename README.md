@@ -78,7 +78,7 @@ The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4
     from confirmed credit sales minus their payments, so cancelled sales stop
     counting.
   - For a credit sale without `due_date`, the due date defaults to
-    `sale_date + customer.payment_days`; without a term on the customer it is
+    `sale_date + customer.due_days`; without a term on the customer it is
     required (400). An explicit date always wins.
   - Payments name only the `method_id` (N per sale, mixed methods, sum ≤
     total); each posts 1 Income; overpay ⇒ 400; Paid when due = 0. The account
@@ -91,7 +91,7 @@ The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4
   - Finance/stock rows are written only via services, reference = `sale_number`;
     each payment stores the id of the Income it created.
 - **Customers (M4)** — `customers(id, name, phone, address, tax_id, notes,
-  is_walkin, is_active, credit_limit NULL = no limit, payment_days NULL = no term,
+  is_walkin, is_active, credit_limit NULL = no limit, due_days NULL = no term,
   created_at, updated_at)`, seeded with the walk-in `Consumidor final`
   (`is_walkin = 1`, never deactivatable, never deletable, never duplicated). Names
   are **not unique**: creating a duplicate is accepted and the existing matches are
@@ -471,7 +471,7 @@ curl http://localhost:3000/api/sales/debt
 # Customers (M4)
 curl -X POST http://localhost:3000/api/customers \
   -H "Content-Type: application/json" \
-  -d '{"name":"Ana Pérez","phone":"555-1234","credit_limit":"1000","payment_days":30}'
+  -d '{"name":"Ana Pérez","phone":"555-1234","credit_limit":"1000","due_days":30}'
 # -> 201 { customer, name_matches:[...] }; the name is not unique, so an existing
 #    match is a warning, never a 409
 
@@ -480,7 +480,7 @@ curl http://localhost:3000/api/customers
 curl http://localhost:3000/api/customers/1
 curl -X PUT http://localhost:3000/api/customers/1 \
   -H "Content-Type: application/json" \
-  -d '{"name":"Ana P.","credit_limit":null,"payment_days":15}'
+  -d '{"name":"Ana P.","credit_limit":null,"due_days":15}'
 # -> 200 { customer, balance, over_limit } (a null limit means no limit)
 curl -X POST http://localhost:3000/api/customers/1/deactivate
 curl -X POST http://localhost:3000/api/customers/1/activate
@@ -850,7 +850,7 @@ The entrypoint imports Tailwind, scans `templates/` and `static/picker.js` (`@so
   plus this sale) exceeds the limit returns 400 with the projected figure; a
   null limit is never checked and `ENFORCE_CREDIT_LIMIT=false` confirms the sale
   (the customer reads as over limit). Credit without `due_date` defaults to
-  `sale_date + payment_days`, and without a term the due date is required.
+  `sale_date + due_days`, and without a term the due date is required.
   `sale_number` immutable once set (`YYYY-SALE-NNNNNN`), NULL only in
   Draft/Cancelled-from-Draft. Cash forbids `due_date`. `qty > 0`,
   `unit_price >= 0`, payments name only the `method_id` (N per sale,
@@ -881,7 +881,7 @@ The entrypoint imports Tailwind, scans `templates/` and `static/picker.js` (`@so
   `ALLOW_NEGATIVE_STOCK`).
 - `Customer` rules: `name` trimmed, non-empty, ≤128 and **not unique**; `phone`/`tax_id`
   ≤32, `address` ≤256, `notes` ≤512 (empty clears to NULL); `credit_limit ≥ 0` NULL =
-  no limit, `payment_days ≥ 0` NULL = no default term. The seeded walk-in cannot be
+  no limit, `due_days ≥ 0` NULL = no default term. The seeded walk-in cannot be
   deleted or deactivated (service check plus database triggers), cannot be demoted and
   cannot be created twice; deleting any customer with sales is refused (RESTRICT) while
   deactivation keeps the history.

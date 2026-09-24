@@ -93,17 +93,24 @@ pub trait UserRepository: Send + Sync {
     /// Case-insensitive lookup through the NOCASE unique index.
     async fn find_by_username(&self, username: &str) -> AppResult<Option<User>>;
     /// Credential path: the same lookup, plus the stored PHC string.
-    async fn find_with_hash_by_username(&self, username: &str)
-        -> AppResult<Option<UserWithHash>>;
+    async fn find_with_hash_by_username(&self, username: &str) -> AppResult<Option<UserWithHash>>;
     async fn find_with_hash_by_id(&self, id: i64) -> AppResult<Option<UserWithHash>>;
     /// Replace the stored PHC string (password change / admin reset).
     /// `updated_by` is the acting user's id — the target itself on the
     /// confined change, the resetting administrator on the admin reset — or
     /// `None` when the system performs the write (the bootstrap recovery).
-    async fn update_password_hash(&self, id: i64, password_hash: &str, updated_by: Option<i64>)
-        -> AppResult<()>;
-    async fn set_must_change_password(&self, id: i64, value: bool, updated_by: Option<i64>)
-        -> AppResult<()>;
+    async fn update_password_hash(
+        &self,
+        id: i64,
+        password_hash: &str,
+        updated_by: Option<i64>,
+    ) -> AppResult<()>;
+    async fn set_must_change_password(
+        &self,
+        id: i64,
+        value: bool,
+        updated_by: Option<i64>,
+    ) -> AppResult<()>;
     /// Activation toggle. `updated_by` names the acting principal; the
     /// bootstrap's recovery reactivation passes `None` (the system did it).
     async fn set_active(&self, id: i64, active: bool, updated_by: Option<i64>) -> AppResult<()>;
@@ -178,10 +185,7 @@ impl UserRepository for SqliteUserRepository {
         Ok(row.map(|r| row_to_user(&r)))
     }
 
-    async fn find_with_hash_by_username(
-        &self,
-        username: &str,
-    ) -> AppResult<Option<UserWithHash>> {
+    async fn find_with_hash_by_username(&self, username: &str) -> AppResult<Option<UserWithHash>> {
         let row = sqlx::query(
             r#"SELECT id, username, display_name, is_active, must_change_password,
                       last_login_at, created_by, updated_by, created_at, updated_at, password_hash
@@ -205,8 +209,12 @@ impl UserRepository for SqliteUserRepository {
         Ok(row.map(row_to_user_with_hash))
     }
 
-    async fn update_password_hash(&self, id: i64, password_hash: &str, updated_by: Option<i64>)
-        -> AppResult<()> {
+    async fn update_password_hash(
+        &self,
+        id: i64,
+        password_hash: &str,
+        updated_by: Option<i64>,
+    ) -> AppResult<()> {
         sqlx::query("UPDATE users SET password_hash = ?, updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?")
             .bind(password_hash)
             .bind(updated_by)
@@ -216,8 +224,12 @@ impl UserRepository for SqliteUserRepository {
         Ok(())
     }
 
-    async fn set_must_change_password(&self, id: i64, value: bool, updated_by: Option<i64>)
-        -> AppResult<()> {
+    async fn set_must_change_password(
+        &self,
+        id: i64,
+        value: bool,
+        updated_by: Option<i64>,
+    ) -> AppResult<()> {
         sqlx::query(
             "UPDATE users SET must_change_password = ?, updated_by = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
         )
@@ -245,13 +257,11 @@ impl UserRepository for SqliteUserRepository {
     }
 
     async fn touch_last_login(&self, id: i64, when: NaiveDateTime) -> AppResult<()> {
-        sqlx::query(
-            "UPDATE users SET last_login_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-        )
-        .bind(encode_sqlite_timestamp(when))
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
+            .bind(encode_sqlite_timestamp(when))
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -318,20 +328,14 @@ mod tests {
     #[tokio::test]
     async fn f4_username_shorter_than_three_chars_maps_to_validation() {
         let repo = SqliteUserRepository::new(pool().await);
-        let err = repo
-            .create(&new_user("ab", "Ab"), None)
-            .await
-            .unwrap_err();
+        let err = repo.create(&new_user("ab", "Ab"), None).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
     #[tokio::test]
     async fn f4_username_with_illegal_characters_maps_to_validation() {
         let repo = SqliteUserRepository::new(pool().await);
-        let err = repo
-            .create(&new_user("ok!", "Ok"), None)
-            .await
-            .unwrap_err();
+        let err = repo.create(&new_user("ok!", "Ok"), None).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
     }
 
@@ -391,7 +395,10 @@ mod tests {
                     message.contains("referenced"),
                     "the refusal must name the reason: {message}"
                 );
-                assert!(!message.contains("FOREIGN KEY"), "no raw SQL text: {message}");
+                assert!(
+                    !message.contains("FOREIGN KEY"),
+                    "no raw SQL text: {message}"
+                );
             }
             other => panic!("expected Conflict, got {other:?}"),
         }

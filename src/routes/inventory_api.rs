@@ -1,21 +1,21 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json, Router,
     routing::get,
+    Json, Router,
 };
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::models::{MovementReason, MovementType, NewMovement, NewProduct, ProductKind};
+use crate::models::{
+    MovementReason, MovementType, NewMovement, NewProduct, NewTax, ProductKind, UpdateTax,
+};
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
 };
 use crate::routes::AppState;
-use crate::security::authz::{
-    InventoryRead, InventoryStockWrite, InventoryWrite, Require,
-};
+use crate::security::authz::{InventoryRead, InventoryStockWrite, InventoryWrite, Require};
 
 // S5 enforcement mapping (inventory JSON API): reads → `inventory.read`,
 // product/category/barcode mutations → `inventory.write`, stock movements →
@@ -136,6 +136,32 @@ pub struct ProductListQuery {
     pub category_id: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CreateTaxRequest {
+    pub code: String,
+    pub name: String,
+    pub rate: Decimal,
+    #[serde(default = "default_true")]
+    pub is_active: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UpdateTaxRequest {
+    pub code: Option<String>,
+    pub name: Option<String>,
+    pub rate: Option<Decimal>,
+    pub is_active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LinkProductTaxRequest {
+    pub tax_id: i64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct MovementListQuery {
     pub product_id: Option<i64>,
@@ -189,7 +215,12 @@ async fn update_category(
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let cat = state
         .inventory_service
-        .update_category(principal.user_id, id, payload.name.as_deref(), payload.parent_id)
+        .update_category(
+            principal.user_id,
+            id,
+            payload.name.as_deref(),
+            payload.parent_id,
+        )
         .await?;
     Ok(Json(serde_json::json!(cat)))
 }
@@ -213,7 +244,13 @@ async fn list_products(
     Query(q): Query<ProductListQuery>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let products = match q.category_id {
-        Some(cid) => state.inventory_service.products.list_by_category(cid).await?,
+        Some(cid) => {
+            state
+                .inventory_service
+                .products
+                .list_by_category(cid)
+                .await?
+        }
         None => state.inventory_service.products.list().await?,
     };
     Ok(Json(serde_json::json!({ "products": products })))
@@ -242,7 +279,10 @@ async fn create_product(
         // cost_price and this supplied sale_price is ignored.
         markup_pct: payload.markup_pct,
     };
-    let product = state.inventory_service.create_product(principal.user_id, input).await?;
+    let product = state
+        .inventory_service
+        .create_product(principal.user_id, input)
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(product))))
 }
 
@@ -324,8 +364,125 @@ async fn add_barcode(
     Path(id): Path<i64>,
     Json(payload): Json<AddBarcodeRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let bc = state.inventory_service.add_barcode(id, &payload.code).await?;
+    let bc = state
+        .inventory_service
+        .add_barcode(id, &payload.code)
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(bc))))
+}
+
+// ---------------------------------------------------------------------------
+// Tax catalog + product associations
+// ---------------------------------------------------------------------------
+
+async fn list_taxes(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+) -> crate::error::AppResult<Json<serde_json::Value>> {
+    let taxes = state.tax_service.list_taxes().await?;
+    Ok(Json(serde_json::json!({ "taxes": taxes })))
+}
+
+async fn get_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+    Path(id): Path<i64>,
+) -> crate::error::AppResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!(
+        state.tax_service.get_tax(id).await?
+    )))
+}
+
+async fn create_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Json(payload): Json<CreateTaxRequest>,
+) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let tax = state
+        .tax_service
+        .create_tax(
+            principal.user_id,
+            NewTax {
+                code: payload.code,
+                name: payload.name,
+                rate: payload.rate,
+                is_active: payload.is_active,
+            },
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!(tax))))
+}
+
+async fn update_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Path(id): Path<i64>,
+    Json(payload): Json<UpdateTaxRequest>,
+) -> crate::error::AppResult<Json<serde_json::Value>> {
+    let tax = state
+        .tax_service
+        .update_tax(
+            principal.user_id,
+            id,
+            UpdateTax {
+                code: payload.code,
+                name: payload.name,
+                rate: payload.rate,
+                is_active: payload.is_active,
+            },
+        )
+        .await?;
+    Ok(Json(serde_json::json!(tax)))
+}
+
+async fn deactivate_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Path(id): Path<i64>,
+) -> crate::error::AppResult<Json<serde_json::Value>> {
+    let tax = state
+        .tax_service
+        .deactivate_tax(principal.user_id, id)
+        .await?;
+    Ok(Json(serde_json::json!(tax)))
+}
+
+async fn list_product_taxes(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+    Path(product_id): Path<i64>,
+) -> crate::error::AppResult<Json<serde_json::Value>> {
+    let taxes = state.tax_service.list_product_taxes(product_id).await?;
+    Ok(Json(serde_json::json!({ "taxes": taxes })))
+}
+
+async fn link_product_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Path(product_id): Path<i64>,
+    Json(payload): Json<LinkProductTaxRequest>,
+) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let link = state
+        .tax_service
+        .link_product_tax(principal.user_id, product_id, payload.tax_id)
+        .await?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!(link))))
+}
+
+async fn unlink_product_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    Path((product_id, tax_id)): Path<(i64, i64)>,
+) -> crate::error::AppResult<StatusCode> {
+    state
+        .tax_service
+        .unlink_product_tax(product_id, tax_id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -338,12 +495,22 @@ async fn list_movements(
     Query(q): Query<MovementListQuery>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let movements = match q.product_id {
-        Some(pid) => state.inventory_service.movements.list_by_product(pid).await?,
+        Some(pid) => {
+            state
+                .inventory_service
+                .movements
+                .list_by_product(pid)
+                .await?
+        }
         None => {
             let products = state.inventory_service.products.list().await?;
             let mut all = Vec::new();
             for p in products {
-                let mut ms = state.inventory_service.movements.list_by_product(p.id).await?;
+                let mut ms = state
+                    .inventory_service
+                    .movements
+                    .list_by_product(p.id)
+                    .await?;
                 all.append(&mut ms);
             }
             all.sort_by_key(|m| (m.date, m.id));
@@ -367,7 +534,10 @@ async fn create_movement(
         reference: payload.reference.unwrap_or_default(),
         date: payload.date,
     };
-    let mov = state.inventory_service.record_movement(principal.user_id, input).await?;
+    let mov = state
+        .inventory_service
+        .record_movement(principal.user_id, input)
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(mov))))
 }
 
@@ -389,10 +559,15 @@ async fn negative_stock(
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/categories", get(list_categories).post(create_category))
+        .route(
+            "/api/categories",
+            get(list_categories).post(create_category),
+        )
         .route(
             "/api/categories/{id}",
-            get(get_category).put(update_category).delete(delete_category),
+            get(get_category)
+                .put(update_category)
+                .delete(delete_category),
         )
         .route("/api/products", get(list_products).post(create_product))
         .route(
@@ -403,6 +578,20 @@ pub fn router() -> Router<AppState> {
         .route(
             "/api/products/{id}/barcodes",
             get(list_barcodes).post(add_barcode),
+        )
+        .route("/api/taxes", get(list_taxes).post(create_tax))
+        .route("/api/taxes/{id}", get(get_tax).put(update_tax))
+        .route(
+            "/api/taxes/{id}/deactivate",
+            axum::routing::post(deactivate_tax),
+        )
+        .route(
+            "/api/products/{id}/taxes",
+            get(list_product_taxes).post(link_product_tax),
+        )
+        .route(
+            "/api/products/{id}/taxes/{tax_id}",
+            axum::routing::delete(unlink_product_tax),
         )
         .route(
             "/api/stock-movements",
@@ -455,9 +644,7 @@ mod tests {
             builder = builder.header("content-type", "application/json");
         }
         let req = builder
-            .body(Body::from(
-                body.map(|b| b.to_string()).unwrap_or_default(),
-            ))
+            .body(Body::from(body.map(|b| b.to_string()).unwrap_or_default()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         let status = resp.status();
@@ -541,7 +728,14 @@ mod tests {
         let probe_cookie = test_support::cookie_for(&probe);
         // The full-permission principal sets the stage.
         let app = crate::routes::router(state.clone());
-        let (_, v) = send_json(app.clone(), "POST", "/api/products", Some(test_support::TEST_COOKIE), Some(product_body("NOWRITE"))).await;
+        let (_, v) = send_json(
+            app.clone(),
+            "POST",
+            "/api/products",
+            Some(test_support::TEST_COOKIE),
+            Some(product_body("NOWRITE")),
+        )
+        .await;
         let pid = v["id"].as_i64().unwrap();
         let (st, _) = send_json(
             app.clone(),
@@ -553,11 +747,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::CREATED);
 
-        let movements_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM stock_movements")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let movements_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM stock_movements")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         let (st, before) = send_json(
             app.clone(),
             "GET",
@@ -578,11 +771,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
 
-        let movements_after: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM stock_movements")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let movements_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM stock_movements")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         assert_eq!(
             movements_after, movements_before,
             "a refused request must write no movement"
@@ -616,7 +808,14 @@ mod tests {
         let cookie = test_support::cookie_for(&token);
         let app = crate::routes::router(state.clone());
 
-        let (st, v) = send_json(app.clone(), "POST", "/api/products", Some(&cookie), Some(product_body("HOLDER-1"))).await;
+        let (st, v) = send_json(
+            app.clone(),
+            "POST",
+            "/api/products",
+            Some(&cookie),
+            Some(product_body("HOLDER-1")),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "{v}");
         let pid = v["id"].as_i64().unwrap();
         let (st, _) = send_json(
@@ -642,7 +841,11 @@ mod tests {
         assert_eq!(v["error"].as_str(), Some("unauthorized"), "{v}");
     }
 
-    async fn post_json(app: axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let req = Request::builder()
             .method("POST")
             .uri(uri)
@@ -715,11 +918,26 @@ mod tests {
         let (st, v) = post_json(app.clone(), "/api/products", product_body("AC8")).await;
         assert_eq!(st, StatusCode::CREATED, "create product: {v}");
         let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "20", "In", "Initial")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "20", "In", "Initial"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "8", "Out", "Sale")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "8", "Out", "Sale"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "-2", "Adjust", "Adjust")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "-2", "Adjust", "Adjust"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
         let (st, v) = get_json(app.clone(), &format!("/api/products/{pid}/stock")).await;
         assert_eq!(st, StatusCode::OK, "get stock: {v}");
@@ -733,16 +951,38 @@ mod tests {
         let (st, v) = post_json(app.clone(), "/api/products", product_body("AC9")).await;
         assert_eq!(st, StatusCode::CREATED, "create: {v}");
         let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "20", "In", "Initial")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "20", "In", "Initial"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "18", "Out", "Sale")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "18", "Out", "Sale"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
         let (st, v) = get_json(app.clone(), "/api/low-stock").await;
         assert_eq!(st, StatusCode::OK, "low-stock: {v}");
         let items = v.get("low_stock").and_then(|x| x.as_array()).unwrap();
-        let found = items.iter().find(|x| x.get("product").and_then(|p| p.get("id")).and_then(|i| i.as_i64()) == Some(pid));
+        let found = items.iter().find(|x| {
+            x.get("product")
+                .and_then(|p| p.get("id"))
+                .and_then(|i| i.as_i64())
+                == Some(pid)
+        });
         assert!(found.is_some(), "product {pid} should be in low-stock: {v}");
-        assert_eq!(found.unwrap().get("suggested").and_then(|x| x.as_str()).unwrap(), "48");
+        assert_eq!(
+            found
+                .unwrap()
+                .get("suggested")
+                .and_then(|x| x.as_str())
+                .unwrap(),
+            "48"
+        );
     }
 
     #[tokio::test]
@@ -753,12 +993,27 @@ mod tests {
         let (_, b) = post_json(app.clone(), "/api/products", product_body("BC-B")).await;
         let aid = a.get("id").and_then(|x| x.as_i64()).unwrap();
         let bid = b.get("id").and_then(|x| x.as_i64()).unwrap();
-        let (st, _) = post_json(app.clone(), &format!("/api/products/{aid}/barcodes"), serde_json::json!({"code":"7790001"})).await;
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/products/{aid}/barcodes"),
+            serde_json::json!({"code":"7790001"}),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(app.clone(), &format!("/api/products/{bid}/barcodes"), serde_json::json!({"code":"7790001"})).await;
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/products/{bid}/barcodes"),
+            serde_json::json!({"code":"7790001"}),
+        )
+        .await;
         assert_eq!(st, StatusCode::CONFLICT);
         // Delete product without movements cascades barcodes.
-        let req = Request::builder().method("DELETE").uri(format!("/api/products/{aid}")).header("cookie", test_support::TEST_COOKIE).body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/products/{aid}"))
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::empty())
+            .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
@@ -769,23 +1024,47 @@ mod tests {
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         // Finance baseline works.
-        let (st, _) = post_json(app.clone(), "/api/accounts", serde_json::json!({"name":"Cash"})).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/accounts",
+            serde_json::json!({"name":"Cash"}),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions").fetch_one(&pool).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(row.0, 0);
         // Inventory ops.
         let (_, v) = post_json(app.clone(), "/api/products", product_body("NOFIN")).await;
         let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
-        let (st, _) = post_json(app.clone(), &format!("/api/products/{pid}/barcodes"), serde_json::json!({"code":"NOFIN-BC"})).await;
+        let (st, _) = post_json(
+            app.clone(),
+            &format!("/api/products/{pid}/barcodes"),
+            serde_json::json!({"code":"NOFIN-BC"}),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "4", "In", "Purchase")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "4", "In", "Purchase"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
         // Finance untouched.
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions").fetch_one(&pool).await.unwrap();
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(row.0, 0);
         let (st, v) = get_json(app.clone(), "/api/accounts").await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(v.get("accounts").and_then(|x| x.as_array()).unwrap().len(), 1);
+        assert_eq!(
+            v.get("accounts").and_then(|x| x.as_array()).unwrap().len(),
+            1
+        );
     }
 
     // -- triangulate: error mapping + negative guard via REST --
@@ -802,10 +1081,20 @@ mod tests {
         // 400 bad qty.
         let (_, v) = post_json(app.clone(), "/api/products", product_body("BADQ")).await;
         let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "0", "In", "Purchase")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "0", "In", "Purchase"),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         // 404 unknown product movement.
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(99999, "1", "In", "Purchase")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(99999, "1", "In", "Purchase"),
+        )
+        .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
         // 404 unknown product stock.
         let (st, _) = get_json(app.clone(), "/api/products/99999/stock").await;
@@ -818,9 +1107,19 @@ mod tests {
         let app = crate::routes::router(state);
         let (_, v) = post_json(app.clone(), "/api/products", product_body("STRICT")).await;
         let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "5", "In", "Purchase")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "5", "In", "Purchase"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "10", "Out", "Sale")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "10", "Out", "Sale"),
+        )
+        .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         let (st, v) = get_json(app.clone(), &format!("/api/products/{pid}/stock")).await;
         assert_eq!(st, StatusCode::OK);
@@ -833,15 +1132,29 @@ mod tests {
         let app = crate::routes::router(state);
         let (_, v) = post_json(app.clone(), "/api/products", product_body("NEG")).await;
         let pid = v.get("id").and_then(|x| x.as_i64()).unwrap();
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "5", "In", "Purchase")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "5", "In", "Purchase"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
-        let (st, _) = post_json(app.clone(), "/api/stock-movements", movement_body(pid, "10", "Out", "Sale")).await;
+        let (st, _) = post_json(
+            app.clone(),
+            "/api/stock-movements",
+            movement_body(pid, "10", "Out", "Sale"),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED);
         let (st, v) = get_json(app.clone(), "/api/negative-stock").await;
         assert_eq!(st, StatusCode::OK, "negative-stock: {v}");
         let items = v.get("negative_stock").and_then(|x| x.as_array()).unwrap();
         assert!(
-            items.iter().any(|x| x.get("product").and_then(|p| p.get("id")).and_then(|i| i.as_i64()) == Some(pid)),
+            items.iter().any(|x| x
+                .get("product")
+                .and_then(|p| p.get("id"))
+                .and_then(|i| i.as_i64())
+                == Some(pid)),
             "product {pid} should be in negative-stock: {v}"
         );
     }
@@ -863,12 +1176,21 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "update: {v}");
-        assert_eq!(v.get("name").and_then(|x| x.as_str()).unwrap(), "Renamed via PUT");
+        assert_eq!(
+            v.get("name").and_then(|x| x.as_str()).unwrap(),
+            "Renamed via PUT"
+        );
         // Every other field survives.
-        assert_eq!(v.get("sku").and_then(|x| x.as_str()).unwrap(), "PUT-PARTIAL");
+        assert_eq!(
+            v.get("sku").and_then(|x| x.as_str()).unwrap(),
+            "PUT-PARTIAL"
+        );
         assert_eq!(v.get("sale_price").and_then(|x| x.as_str()).unwrap(), "10");
         assert_eq!(v.get("cost_price").and_then(|x| x.as_str()).unwrap(), "5");
-        assert_eq!(v.get("track_stock").and_then(|x| x.as_bool()).unwrap(), true);
+        assert_eq!(
+            v.get("track_stock").and_then(|x| x.as_bool()).unwrap(),
+            true
+        );
         assert_eq!(v.get("min_stock").and_then(|x| x.as_str()).unwrap(), "5");
         assert_eq!(v.get("max_stock").and_then(|x| x.as_str()).unwrap(), "50");
     }
@@ -913,11 +1235,15 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "null put: {v}");
         assert!(
-            v.get("location").map(serde_json::Value::is_null).unwrap_or(false),
+            v.get("location")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(false),
             "explicit null must clear location: {v}"
         );
         assert!(
-            v.get("notes").map(serde_json::Value::is_null).unwrap_or(false),
+            v.get("notes")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(false),
             "explicit null must clear notes: {v}"
         );
         assert_eq!(v.get("sku").and_then(|x| x.as_str()).unwrap(), "PUT-NULL");
@@ -926,7 +1252,10 @@ mod tests {
             "Renamed, nothing cleared"
         );
         assert_eq!(v.get("sale_price").and_then(|x| x.as_str()).unwrap(), "10");
-        assert_eq!(v.get("track_stock").and_then(|x| x.as_bool()).unwrap(), true);
+        assert_eq!(
+            v.get("track_stock").and_then(|x| x.as_bool()).unwrap(),
+            true
+        );
         assert_eq!(v.get("min_stock").and_then(|x| x.as_str()).unwrap(), "5");
         assert_eq!(v.get("max_stock").and_then(|x| x.as_str()).unwrap(), "50");
     }

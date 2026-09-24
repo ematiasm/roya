@@ -24,7 +24,7 @@ fn row_to_customer(row: sqlx::sqlite::SqliteRow) -> Customer {
         is_walkin: walkin == 1,
         is_active: active == 1,
         credit_limit: credit.as_deref().map(parse_decimal),
-        payment_days: row.get("payment_days"),
+        due_days: row.get("due_days"),
         created_by: row.get("created_by"),
         updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
@@ -81,10 +81,10 @@ impl CustomerRepository for SqliteCustomerRepository {
     async fn create(&self, actor: i64, input: &NewCustomer) -> AppResult<Customer> {
         let row = sqlx::query(
             r#"INSERT INTO customers
-                   (name, phone, address, tax_id, notes, is_walkin, credit_limit, payment_days, created_by)
+                   (name, phone, address, tax_id, notes, is_walkin, credit_limit, due_days, created_by)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                RETURNING id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                         credit_limit, payment_days, created_by, updated_by, created_at, updated_at"#,
+                         credit_limit, due_days, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(&input.name)
         .bind(input.phone.clone())
@@ -93,7 +93,7 @@ impl CustomerRepository for SqliteCustomerRepository {
         .bind(input.notes.clone())
         .bind(if input.is_walkin { 1i64 } else { 0i64 })
         .bind(input.credit_limit.map(|d| d.to_string()))
-        .bind(input.payment_days)
+        .bind(input.due_days)
         .bind(actor)
         .fetch_one(&self.pool)
         .await
@@ -104,7 +104,7 @@ impl CustomerRepository for SqliteCustomerRepository {
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Customer>> {
         let row = sqlx::query(
             r#"SELECT id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                      credit_limit, payment_days, created_by, updated_by, created_at, updated_at
+                      credit_limit, due_days, created_by, updated_by, created_at, updated_at
                FROM customers WHERE id = ?"#,
         )
         .bind(id)
@@ -116,7 +116,7 @@ impl CustomerRepository for SqliteCustomerRepository {
     async fn find_by_name(&self, name: &str) -> AppResult<Vec<Customer>> {
         let rows = sqlx::query(
             r#"SELECT id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                      credit_limit, payment_days, created_by, updated_by, created_at, updated_at
+                      credit_limit, due_days, created_by, updated_by, created_at, updated_at
                FROM customers WHERE name = ? ORDER BY id"#,
         )
         .bind(name)
@@ -128,7 +128,7 @@ impl CustomerRepository for SqliteCustomerRepository {
     async fn find_walkin(&self) -> AppResult<Option<Customer>> {
         let row = sqlx::query(
             r#"SELECT id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                      credit_limit, payment_days, created_by, updated_by, created_at, updated_at
+                      credit_limit, due_days, created_by, updated_by, created_at, updated_at
                FROM customers WHERE is_walkin = 1 ORDER BY id LIMIT 1"#,
         )
         .fetch_optional(&self.pool)
@@ -140,7 +140,7 @@ impl CustomerRepository for SqliteCustomerRepository {
         let rows = if only_active {
             sqlx::query(
                 r#"SELECT id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                          credit_limit, payment_days, created_by, updated_by, created_at, updated_at
+                          credit_limit, due_days, created_by, updated_by, created_at, updated_at
                    FROM customers WHERE is_active = 1 ORDER BY id"#,
             )
             .fetch_all(&self.pool)
@@ -148,7 +148,7 @@ impl CustomerRepository for SqliteCustomerRepository {
         } else {
             sqlx::query(
                 r#"SELECT id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                          credit_limit, payment_days, created_by, updated_by, created_at, updated_at
+                          credit_limit, due_days, created_by, updated_by, created_at, updated_at
                    FROM customers ORDER BY id"#,
             )
             .fetch_all(&self.pool)
@@ -184,20 +184,20 @@ impl CustomerRepository for SqliteCustomerRepository {
             Some(inner) => inner.map(|d| d.to_string()),
             None => existing.credit_limit.map(|d| d.to_string()),
         };
-        let payment_days = match patch.payment_days {
+        let due_days = match patch.due_days {
             Some(inner) => inner,
-            None => existing.payment_days,
+            None => existing.due_days,
         };
 
         let row = sqlx::query(
             r#"UPDATE customers
                SET name = ?, phone = ?, address = ?, tax_id = ?, notes = ?,
-                   credit_limit = ?, payment_days = ?,
+                   credit_limit = ?, due_days = ?,
                    updated_by = ?,
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
                RETURNING id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                         credit_limit, payment_days, created_by, updated_by, created_at, updated_at"#,
+                         credit_limit, due_days, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(name)
         .bind(phone)
@@ -205,7 +205,7 @@ impl CustomerRepository for SqliteCustomerRepository {
         .bind(tax_id)
         .bind(notes)
         .bind(credit_limit)
-        .bind(payment_days)
+        .bind(due_days)
         .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
@@ -222,7 +222,7 @@ impl CustomerRepository for SqliteCustomerRepository {
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
                RETURNING id, name, phone, address, tax_id, notes, is_walkin, is_active,
-                         credit_limit, payment_days, created_by, updated_by, created_at, updated_at"#,
+                         credit_limit, due_days, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(if active { 1i64 } else { 0i64 })
         .bind(actor)

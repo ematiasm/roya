@@ -5,7 +5,7 @@
 // form body) stay registered for existing callers.
 use askama::Template;
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Extension, Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -14,16 +14,14 @@ use axum::{
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{
     DebtSummary, PaymentType, SaleDetail, SaleListFilter, SaleRecord, SaleStatus, UpdateSaleDraft,
 };
 use crate::routes::AppState;
-use crate::security::authz::{
-    CustomersCollect, Nav, Require, SalesCancel, SalesCreate, SalesRead,
-};
+use crate::security::authz::{CustomersCollect, Nav, Require, SalesCancel, SalesCreate, SalesRead};
 use crate::services::sales::DEBT_BANNER_LIMIT;
 
 // S6 enforcement (AC10): reads are `sales.read`; the draft lifecycle (create,
@@ -40,6 +38,7 @@ use crate::services::sales::DEBT_BANNER_LIMIT;
 #[template(path = "sales.html")]
 struct SalesTemplate {
     title: String,
+    localization: LocalizationContext,
     sales: Vec<SaleDetail>,
     debt: DebtSummary,
     customers: Vec<crate::models::Customer>,
@@ -61,6 +60,7 @@ struct SalesTemplate {
 #[derive(Template)]
 #[template(path = "sale.html")]
 struct SalePageTemplate {
+    localization: LocalizationContext,
     /// Sale number, or "Draft sale" before confirmation.
     page_title: String,
     page_breadcrumb_label: String,
@@ -85,6 +85,7 @@ struct SalePageTemplate {
 #[template(path = "partials/sale_list.html")]
 struct SaleListPartial {
     title: String,
+    localization: LocalizationContext,
     sales: Vec<SaleDetail>,
 }
 
@@ -93,6 +94,7 @@ struct SaleListPartial {
 #[derive(Template)]
 #[template(path = "partials/sale_debt.html")]
 struct SaleDebtPartial {
+    localization: LocalizationContext,
     debt: DebtSummary,
 }
 
@@ -102,6 +104,7 @@ struct SaleDebtPartial {
 #[template(path = "partials/sale_detail.html")]
 struct SaleDetailPartial {
     record: SaleRecord,
+    localization: LocalizationContext,
     oob_picker: bool,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
@@ -121,17 +124,27 @@ fn is_htmx(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_required_decimal(s: &str, field: &str) -> AppResult<Decimal> {
-    Decimal::from_str(s.trim())
+fn parse_required_decimal(
+    s: &str,
+    field: &str,
+    localization: &LocalizationContext,
+) -> AppResult<Decimal> {
+    localization
+        .parse_decimal(s.trim())
         .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
-fn parse_opt_decimal(s: &str, field: &str) -> AppResult<Option<Decimal>> {
+fn parse_opt_decimal(
+    s: &str,
+    field: &str,
+    localization: &LocalizationContext,
+) -> AppResult<Option<Decimal>> {
     let t = s.trim();
     if t.is_empty() {
         return Ok(None);
     }
-    Decimal::from_str(t)
+    localization
+        .parse_decimal(t)
         .map(Some)
         .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
@@ -158,18 +171,26 @@ fn parse_opt_date_field(s: &str, field: &str) -> AppResult<Option<NaiveDate>> {
         .map_err(|_| AppError::Validation(format!("invalid {field} (YYYY-MM-DD)")))
 }
 
-fn parse_date_or_today(s: &str) -> AppResult<NaiveDate> {
+fn parse_date_or_today(s: &str, localization: &LocalizationContext) -> AppResult<NaiveDate> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(chrono::Local::now().date_naive());
+        return localization
+            .today_iso()
+            .parse()
+            .map_err(|_| AppError::Internal("invalid localized date".into()));
     }
     t.parse()
         .map_err(|_| AppError::Validation("invalid date (YYYY-MM-DD)".into()))
 }
 
-fn render_list(sales: Vec<SaleDetail>, title: &str) -> AppResult<Html<String>> {
+fn render_list(
+    sales: Vec<SaleDetail>,
+    title: &str,
+    localization: LocalizationContext,
+) -> AppResult<Html<String>> {
     let html = SaleListPartial {
         title: title.to_string(),
+        localization,
         sales,
     }
     .render()
@@ -177,10 +198,16 @@ fn render_list(sales: Vec<SaleDetail>, title: &str) -> AppResult<Html<String>> {
     Ok(Html(html))
 }
 
-fn render_debt(debt: DebtSummary) -> AppResult<Html<String>> {
-    let html = SaleDebtPartial { debt }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+fn render_debt(
+    debt: DebtSummary,
+    localization: LocalizationContext,
+) -> AppResult<Html<String>> {
+    let html = SaleDebtPartial {
+        localization,
+        debt,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -189,6 +216,7 @@ fn render_debt(debt: DebtSummary) -> AppResult<Html<String>> {
 /// searches `/web/product-search.json` instead of carrying the whole catalogue.
 struct SaleRecordContext {
     record: SaleRecord,
+    localization: LocalizationContext,
     method_options: Vec<crate::models::PaymentMethodWithAccount>,
     today: String,
     /// Audit display names: the sale's creator and its last editor, resolved
@@ -197,10 +225,14 @@ struct SaleRecordContext {
     updated_by_name: Option<String>,
 }
 
-async fn record_context(state: &AppState, sale_id: i64) -> AppResult<SaleRecordContext> {
+async fn record_context(
+    state: &AppState,
+    sale_id: i64,
+    localization: LocalizationContext,
+) -> AppResult<SaleRecordContext> {
     let record = state.sales_service.get_record(sale_id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = localization.today_iso();
     let mut actor_ids = vec![record.sale.created_by];
     actor_ids.extend(record.sale.updated_by);
     let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
@@ -209,6 +241,7 @@ async fn record_context(state: &AppState, sale_id: i64) -> AppResult<SaleRecordC
     let updated_by_name = record.sale.updated_by.and_then(name_for);
     Ok(SaleRecordContext {
         record,
+        localization,
         method_options,
         today,
         created_by_name,
@@ -219,6 +252,7 @@ async fn record_context(state: &AppState, sale_id: i64) -> AppResult<SaleRecordC
 fn render_record(context: SaleRecordContext, oob_picker: bool) -> AppResult<Html<String>> {
     let html = SaleDetailPartial {
         record: context.record,
+        localization: context.localization,
         oob_picker,
         method_options: context.method_options,
         today: context.today,
@@ -232,8 +266,12 @@ fn render_record(context: SaleRecordContext, oob_picker: bool) -> AppResult<Html
 
 /// Record-body response that keeps the cross-region `sale-changed` refresh
 /// event, so subscribed list and debt regions update after an action.
-async fn changed(state: &AppState, sale_id: i64) -> AppResult<Response> {
-    changed_with_picker(state, sale_id, false).await
+async fn changed(
+    state: &AppState,
+    sale_id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<Response> {
+    changed_with_picker(state, sale_id, localization, false).await
 }
 
 /// Line-add response: the same body plus the out-of-band picker, empty and
@@ -241,9 +279,14 @@ async fn changed(state: &AppState, sale_id: i64) -> AppResult<Response> {
 async fn changed_with_picker(
     state: &AppState,
     sale_id: i64,
+    localization: &LocalizationContext,
     oob_picker: bool,
 ) -> AppResult<Response> {
-    let html = render_record(record_context(state, sale_id).await?, oob_picker)?.0;
+    let html = render_record(
+        record_context(state, sale_id, localization.clone()).await?,
+        oob_picker,
+    )?
+    .0;
     let mut resp = Html(html).into_response();
     resp.headers_mut()
         .insert("HX-Trigger", "sale-changed".parse().unwrap());
@@ -257,6 +300,7 @@ async fn changed_with_picker(
 async fn sales_page(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Query(query): Query<SaleListQuery>,
 ) -> Result<Html<String>, AppError> {
@@ -266,9 +310,10 @@ async fn sales_page(
         .await?;
     let debt = state.sales_service.debt_summary(DEBT_BANNER_LIMIT).await?;
     let customers = state.customer_service.list_customers(true).await?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = localization.today_iso();
     let tmpl = SalesTemplate {
         title: "All sales".to_string(),
+        localization,
         sales,
         debt,
         customers,
@@ -282,7 +327,8 @@ async fn sales_page(
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
@@ -345,21 +391,23 @@ fn parse_optional_date(raw: &str) -> Option<NaiveDate> {
 async fn web_sale_list(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<SaleListQuery>,
 ) -> Result<Html<String>, AppError> {
     let sales = state
         .sales_service
         .list_details_filtered(&query.to_filter())
         .await?;
-    render_list(sales, "All sales")
+    render_list(sales, "All sales", localization)
 }
 
 async fn web_sale_debt(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
     let debt = state.sales_service.debt_summary(DEBT_BANNER_LIMIT).await?;
-    render_debt(debt)
+    render_debt(debt, localization)
 }
 
 /// `/sales/{id}`: a real page inside the shell. The label is the sale number or
@@ -367,10 +415,11 @@ async fn web_sale_debt(
 async fn sale_record_page(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
-    let context = record_context(&state, id).await?;
+    let context = record_context(&state, id, localization.clone()).await?;
     let label = match &context.record.sale.sale_number {
         Some(number) => number.clone(),
         None => "Draft sale".to_string(),
@@ -385,6 +434,7 @@ async fn sale_record_page(
         (String::new(), String::new())
     };
     let tmpl = SalePageTemplate {
+        localization: context.localization.clone(),
         page_title: label,
         page_breadcrumb_label: "Sales".to_string(),
         page_breadcrumb_href: "/sales".to_string(),
@@ -400,16 +450,18 @@ async fn sale_record_page(
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
 async fn web_sale_detail(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
-    render_record(record_context(&state, id).await?, false)
+    render_record(record_context(&state, id, localization).await?, false)
 }
 
 /// `DELETE /web/sales/{id}`: the documents drawer's draft delete — the
@@ -518,6 +570,7 @@ async fn web_create_sale(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CreateSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -534,9 +587,12 @@ async fn web_create_sale(
     let due_date = if form.due_date.trim().is_empty() {
         None
     } else {
-        Some(form.due_date.trim().parse().map_err(|_| {
-            AppError::Validation("invalid due_date (YYYY-MM-DD)".into())
-        })?)
+        Some(
+            form.due_date
+                .trim()
+                .parse()
+                .map_err(|_| AppError::Validation("invalid due_date (YYYY-MM-DD)".into()))?,
+        )
     };
     let customer_id = form
         .customer_id
@@ -548,7 +604,7 @@ async fn web_create_sale(
             crate::models::NewSale {
                 customer_id,
                 payment_type,
-                sale_date: parse_date_or_today(&form.sale_date)?,
+                sale_date: parse_date_or_today(&form.sale_date, &localization)?,
                 due_date,
                 receipt_no,
                 notes: Some(form.notes),
@@ -575,36 +631,40 @@ async fn web_add_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
 ) -> Result<axum::response::Response, AppError> {
-    add_line_impl(state, headers, id, form).await
+    add_line_impl(state, headers, localization, id, form).await
 }
 
 async fn add_line_impl(
     state: AppState,
     headers: HeaderMap,
+    localization: LocalizationContext,
     id: i64,
     form: AddLineForm,
 ) -> Result<axum::response::Response, AppError> {
-    let qty = parse_required_decimal(&form.qty, "qty")?;
-    let unit_price = parse_opt_decimal(&form.unit_price, "unit_price")?;
+    let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
+    let unit_price = parse_opt_decimal(&form.unit_price, "unit_price", &localization)?;
     // An explicit product id (a clicked result) wins over the typed text; a scan
     // or an Enter carries only the value and resolves through inventory.
     let product_id = match form.product_id.filter(|id| *id > 0) {
         Some(id) => id,
-        None => state
-            .inventory_service
-            .resolve_product_ref(&form.product)
-            .await?
-            .id,
+        None => {
+            state
+                .inventory_service
+                .resolve_product_ref(&form.product)
+                .await?
+                .id
+        }
     };
     state
         .sales_service
         .add_line(id, product_id, qty, unit_price)
         .await?;
     if is_htmx(&headers) {
-        return changed_with_picker(&state, id, true).await;
+        return changed_with_picker(&state, id, &localization, true).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -613,17 +673,18 @@ async fn web_update_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path((sale_id, line_id)): Path<(i64, i64)>,
     Form(form): Form<UpdateLineForm>,
 ) -> Result<axum::response::Response, AppError> {
-    let qty = parse_required_decimal(&form.qty, "qty")?;
-    let unit_price = parse_required_decimal(&form.unit_price, "unit_price")?;
+    let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
+    let unit_price = parse_required_decimal(&form.unit_price, "unit_price", &localization)?;
     state
         .sales_service
         .update_line(line_id, qty, unit_price)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, sale_id).await;
+        return changed(&state, sale_id, &localization).await;
     }
     Ok(Redirect::to(&format!("/sales/{sale_id}")).into_response())
 }
@@ -631,10 +692,11 @@ async fn web_update_line(
 async fn web_remove_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    Extension(localization): Extension<LocalizationContext>,
     Path((sale_id, line_id)): Path<(i64, i64)>,
 ) -> Result<axum::response::Response, AppError> {
     state.sales_service.remove_line(line_id).await?;
-    changed(&state, sale_id).await
+    changed(&state, sale_id, &localization).await
 }
 
 async fn web_confirm_sale(
@@ -642,23 +704,25 @@ async fn web_confirm_sale(
     _: Require<SalesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    confirm_sale_impl(state, principal.user_id, headers, id, form).await
+    confirm_sale_impl(state, principal.user_id, headers, localization, id, form).await
 }
 
 async fn confirm_sale_impl(
     state: AppState,
     actor: i64,
     headers: HeaderMap,
+    localization: LocalizationContext,
     id: i64,
     form: ConfirmSaleForm,
 ) -> Result<axum::response::Response, AppError> {
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
     state.sales_service.confirm(actor, id, method_id).await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -671,27 +735,29 @@ async fn web_record_payment(
     _: Require<CustomersCollect>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
 ) -> Result<axum::response::Response, AppError> {
-    record_payment_impl(state, principal.user_id, headers, id, form).await
+    record_payment_impl(state, principal.user_id, headers, localization, id, form).await
 }
 
 async fn record_payment_impl(
     state: AppState,
     actor: i64,
     headers: HeaderMap,
+    localization: LocalizationContext,
     id: i64,
     form: RecordPaymentForm,
 ) -> Result<axum::response::Response, AppError> {
-    let amount = parse_required_decimal(&form.amount, "amount")?;
-    let date = parse_date_or_today(&form.date)?;
+    let amount = parse_required_decimal(&form.amount, "amount", &localization)?;
+    let date = parse_date_or_today(&form.date, &localization)?;
     state
         .sales_service
         .record_payment(actor, id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -701,16 +767,18 @@ async fn web_cancel_sale(
     _: Require<SalesCancel>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<CancelSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    cancel_sale_impl(state, principal.user_id, headers, id, form).await
+    cancel_sale_impl(state, principal.user_id, headers, localization, id, form).await
 }
 
 async fn cancel_sale_impl(
     state: AppState,
     actor: i64,
     headers: HeaderMap,
+    localization: LocalizationContext,
     id: i64,
     form: CancelSaleForm,
 ) -> Result<axum::response::Response, AppError> {
@@ -721,7 +789,7 @@ async fn cancel_sale_impl(
     };
     state.sales_service.cancel(actor, id, reason).await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -733,6 +801,7 @@ async fn web_update_sale_header(
     _: Require<SalesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<UpdateSaleHeaderForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -757,7 +826,7 @@ async fn web_update_sale_header(
         )
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id).await;
+        return changed(&state, id, &localization).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -779,9 +848,10 @@ async fn web_add_line_collection(
     state: State<AppState>,
     _: Require<SalesCreate>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<AddLineForm>,
 ) -> Result<axum::response::Response, AppError> {
-    add_line_impl(state.0, headers, form.sale_id, form).await
+    add_line_impl(state.0, headers, localization, form.sale_id, form).await
 }
 
 async fn web_confirm_sale_collection(
@@ -789,9 +859,18 @@ async fn web_confirm_sale_collection(
     _: Require<SalesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    confirm_sale_impl(state.0, principal.user_id, headers, form.sale_id, form).await
+    confirm_sale_impl(
+        state.0,
+        principal.user_id,
+        headers,
+        localization,
+        form.sale_id,
+        form,
+    )
+    .await
 }
 
 async fn web_record_payment_collection(
@@ -799,9 +878,18 @@ async fn web_record_payment_collection(
     _: Require<CustomersCollect>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<RecordPaymentForm>,
 ) -> Result<axum::response::Response, AppError> {
-    record_payment_impl(state.0, principal.user_id, headers, form.sale_id, form).await
+    record_payment_impl(
+        state.0,
+        principal.user_id,
+        headers,
+        localization,
+        form.sale_id,
+        form,
+    )
+    .await
 }
 
 async fn web_cancel_sale_collection(
@@ -809,9 +897,18 @@ async fn web_cancel_sale_collection(
     _: Require<SalesCancel>,
     principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
+    Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<CancelSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    cancel_sale_impl(state.0, principal.user_id, headers, form.sale_id, form).await
+    cancel_sale_impl(
+        state.0,
+        principal.user_id,
+        headers,
+        localization,
+        form.sale_id,
+        form,
+    )
+    .await
 }
 
 pub fn router() -> Router<AppState> {
@@ -824,7 +921,10 @@ pub fn router() -> Router<AppState> {
         .route("/web/sales/confirm", post(web_confirm_sale_collection))
         .route("/web/sales/payments", post(web_record_payment_collection))
         .route("/web/sales/cancel", post(web_cancel_sale_collection))
-        .route("/web/sales/{id}", get(web_sale_detail).delete(web_delete_draft))
+        .route(
+            "/web/sales/{id}",
+            get(web_sale_detail).delete(web_delete_draft),
+        )
         .route("/web/sales/{id}/lines", post(web_add_line))
         .route(
             "/web/sales/{sale_id}/lines/{line_id}",
@@ -889,7 +989,7 @@ mod tests {
                     notes: None,
                     is_walkin: false,
                     credit_limit: None,
-                    payment_days: None,
+                    due_days: None,
                 },
             )
             .await
@@ -1011,38 +1111,40 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku,
-                name: "Record product".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(10),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku,
+                    name: "Record product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         let customer = seed_customer(state, "Record Buyer").await;
         let sale = state
             .sales_service
-            .create_draft(audit_actor(&state).await, NewSale {
-                customer_id: customer.id,
-                payment_type,
-                sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                due_date: match payment_type {
-                    PaymentType::Credit => {
-                        Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap())
-                    }
-                    PaymentType::Cash => None,
+            .create_draft(
+                audit_actor(&state).await,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type,
+                    sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: match payment_type {
+                        PaymentType::Credit => Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                        PaymentType::Cash => None,
+                    },
+                    receipt_no: None,
+                    notes: None,
                 },
-                receipt_no: None,
-                notes: None,
-            })
+            )
             .await
             .unwrap();
         let line = state
@@ -1187,8 +1289,8 @@ mod tests {
             .unwrap();
         state
             .sales_service
-
-            .record_payment(audit_actor(&state).await, 
+            .record_payment(
+                audit_actor(&state).await,
                 fixture.sale_id,
                 fixture.method_id,
                 Decimal::from(10),
@@ -1207,7 +1309,10 @@ mod tests {
 
         let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
-        assert!(html.contains("data-page-header"), "record uses the page header");
+        assert!(
+            html.contains("data-page-header"),
+            "record uses the page header"
+        );
         assert!(
             html.contains("data-nav=\"sales\"") && html.contains("aria-current=\"page\""),
             "record page keeps the sales nav key"
@@ -1282,7 +1387,11 @@ mod tests {
 
         state
             .sales_service
-            .cancel(audit_actor(&state).await, fixture.sale_id, Some("customer return".to_string()))
+            .cancel(
+                audit_actor(&state).await,
+                fixture.sale_id,
+                Some("customer return".to_string()),
+            )
             .await
             .unwrap();
         let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
@@ -1313,8 +1422,8 @@ mod tests {
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         state
             .sales_service
-
-            .confirm(audit_actor(&state).await, 
+            .confirm(
+                audit_actor(&state).await,
                 fixture.sale_id,
                 Some(fixture.method_id),
             )
@@ -1394,14 +1503,20 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
-            resp.headers().get("HX-Trigger").map(|v| v.to_str().unwrap()),
+            resp.headers()
+                .get("HX-Trigger")
+                .map(|v| v.to_str().unwrap()),
             Some("sale-changed")
         );
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let html = String::from_utf8_lossy(&bytes).to_string();
         assert!(html.contains("sale-record-inner"), "{html:.400}");
         assert!(html.contains("edited note"), "{html:.400}");
-        let detail = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        let detail = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap();
         assert_eq!(detail.sale.notes, "edited note");
         assert_eq!(detail.sale.sale_date.to_string(), "2024-05-03");
     }
@@ -1424,20 +1539,21 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "WEB-PAY".into(),
-                name: "prod WEB-PAY".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(10),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::ZERO),
-                max_stock: Some(Decimal::from(100)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "WEB-PAY".into(),
+                    name: "prod WEB-PAY".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(10),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::ZERO),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         state
@@ -1445,16 +1561,21 @@ mod tests {
             .record_movement(
                 audit_actor(&state).await,
                 NewMovement {
-                product_id: product.id,
-                qty: Decimal::from(10),
-                movement_type: MovementType::In,
-                reason: MovementReason::Initial,
-                reference: String::new(),
-                date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
-            })
+                    product_id: product.id,
+                    qty: Decimal::from(10),
+                    movement_type: MovementType::In,
+                    reason: MovementReason::Initial,
+                    reference: String::new(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                },
+            )
             .await
             .unwrap();
-        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
+        let account = state
+            .account_service
+            .create(audit_actor(&state).await, "Caja")
+            .await
+            .unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
@@ -1475,14 +1596,17 @@ mod tests {
         for _ in 0..2 {
             let sale = state
                 .sales_service
-                .create_draft(audit_actor(&state).await, NewSale {
-                    customer_id: payer.id,
-                    payment_type: PaymentType::Credit,
-                    sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                    due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
-                    receipt_no: None,
-                    notes: None,
-                })
+                .create_draft(
+                    audit_actor(&state).await,
+                    NewSale {
+                        customer_id: payer.id,
+                        payment_type: PaymentType::Credit,
+                        sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                        due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                        receipt_no: None,
+                        notes: None,
+                    },
+                )
                 .await
                 .unwrap();
             state
@@ -1543,20 +1667,21 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "WEB-SVC".into(),
-                name: "svc WEB-SVC".into(),
-                kind: ProductKind::Service,
-                category_id: None,
-                unit: "hr".into(),
-                sale_price: Decimal::from(30),
-                cost_price: Decimal::ZERO,
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "WEB-SVC".into(),
+                    name: "svc WEB-SVC".into(),
+                    kind: ProductKind::Service,
+                    category_id: None,
+                    unit: "hr".into(),
+                    sale_price: Decimal::from(30),
+                    cost_price: Decimal::ZERO,
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -1566,14 +1691,17 @@ mod tests {
         for _ in 0..2 {
             let sale = state
                 .sales_service
-                .create_draft(audit_actor(&state).await, NewSale {
-                    customer_id: typist.id,
-                    payment_type: PaymentType::Credit,
-                    sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                    due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
-                    receipt_no: None,
-                    notes: None,
-                })
+                .create_draft(
+                    audit_actor(&state).await,
+                    NewSale {
+                        customer_id: typist.id,
+                        payment_type: PaymentType::Credit,
+                        sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                        due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                        receipt_no: None,
+                        notes: None,
+                    },
+                )
                 .await
                 .unwrap();
             sale_ids.push(sale.id);
@@ -1618,11 +1746,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            state.sales_service.get_detail(target).await.unwrap().sale.status,
+            state
+                .sales_service
+                .get_detail(target)
+                .await
+                .unwrap()
+                .sale
+                .status,
             SaleStatus::Confirmed
         );
         assert_eq!(
-            state.sales_service.get_detail(other).await.unwrap().sale.status,
+            state
+                .sales_service
+                .get_detail(other)
+                .await
+                .unwrap()
+                .sale
+                .status,
             SaleStatus::Draft
         );
 
@@ -1635,11 +1775,23 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            state.sales_service.get_detail(target).await.unwrap().sale.status,
+            state
+                .sales_service
+                .get_detail(target)
+                .await
+                .unwrap()
+                .sale
+                .status,
             SaleStatus::Cancelled
         );
         assert_eq!(
-            state.sales_service.get_detail(other).await.unwrap().sale.status,
+            state
+                .sales_service
+                .get_detail(other)
+                .await
+                .unwrap()
+                .sale
+                .status,
             SaleStatus::Draft
         );
 
@@ -1724,12 +1876,8 @@ mod tests {
     #[tokio::test]
     async fn k2_sale_form_without_customer_is_rejected() {
         let app = crate::routes::router(test_state().await);
-        let (status, body) = post_form(
-            app,
-            "/web/sales",
-            "payment_type=Cash&sale_date=2024-05-02",
-        )
-        .await;
+        let (status, body) =
+            post_form(app, "/web/sales", "payment_type=Cash&sale_date=2024-05-02").await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.to_lowercase().contains("customer"), "{body}");
     }
@@ -1742,7 +1890,9 @@ mod tests {
         let pos = html
             .find(needle)
             .unwrap_or_else(|| panic!("{needle} not rendered: {html:.600}"));
-        let start = html[..pos].rfind("<form").expect("needle must sit in a form");
+        let start = html[..pos]
+            .rfind("<form")
+            .expect("needle must sit in a form");
         let end = html[pos..].find("</form>").expect("form must close");
         &html[start..pos + end + "</form>".len()]
     }
@@ -1786,10 +1936,18 @@ mod tests {
         let input_pos = html
             .find("id=\"product-picker\"")
             .expect("the record page renders the picker field");
-        let input_start = html[..input_pos].rfind('<').expect("the id must sit inside a tag");
+        let input_start = html[..input_pos]
+            .rfind('<')
+            .expect("the id must sit inside a tag");
         let input_end = input_pos + html[input_pos..].find('>').expect("unterminated tag");
         let input_tag = &html[input_start..=input_end];
-        for transport in ["hx-get", "hx-trigger", "hx-target", "hx-vals", "hx-on:keyup"] {
+        for transport in [
+            "hx-get",
+            "hx-trigger",
+            "hx-target",
+            "hx-vals",
+            "hx-on:keyup",
+        ] {
             assert!(
                 !input_tag.contains(transport),
                 "the field must not carry {transport}: {input_tag}"
@@ -1860,7 +2018,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{added}");
 
-        let detail = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        let detail = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap();
         assert_eq!(detail.lines.len(), 2, "the scan adds its own line");
         let scanned = detail
             .lines
@@ -1873,7 +2035,7 @@ mod tests {
         // lines and total can never drift.
         assert!(added.contains(&fixture.product_name), "{added:.600}");
         assert!(
-            added.contains("$50"),
+            added.contains("50 USD"),
             "the running total travels with the lines: {added:.800}"
         );
         let oob_pos = added
@@ -1919,7 +2081,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let detail = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        let detail = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap();
         let clicked = detail
             .lines
             .iter()
@@ -1936,7 +2102,11 @@ mod tests {
         let state = test_state().await;
         let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
         let app = crate::routes::router(state.clone());
-        let before = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        let before = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap();
 
         let (status, body) = post_form(
             app,
@@ -1951,7 +2121,11 @@ mod tests {
             "the message must name the search count: {body}"
         );
 
-        let after = state.sales_service.get_detail(fixture.sale_id).await.unwrap();
+        let after = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap();
         assert_eq!(
             after.lines.len(),
             before.lines.len(),
@@ -2182,7 +2356,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(sales_after, sales_before, "a refused create must write nothing");
+        assert_eq!(
+            sales_after, sales_before,
+            "a refused create must write nothing"
+        );
 
         let (status, body) = post_form_as(
             app.clone(),
@@ -2226,7 +2403,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(payments_after, payments_before, "a refused payment must write nothing");
+        assert_eq!(
+            payments_after, payments_before,
+            "a refused payment must write nothing"
+        );
     }
 
     /// A principal holding the permissions gets the normal answers: the
@@ -2254,12 +2434,19 @@ mod tests {
         let (status, _body) = post_form_as(
             app.clone(),
             "/web/sales",
-            &format!("customer_id={}&payment_type=Cash&sale_date=2024-05-02", fixture.sale_id),
+            &format!(
+                "customer_id={}&payment_type=Cash&sale_date=2024-05-02",
+                fixture.sale_id
+            ),
             &[],
             Some(&cookie),
         )
         .await;
-        assert_eq!(status, StatusCode::SEE_OTHER, "the creation redirects to the record");
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "the creation redirects to the record"
+        );
 
         let (status, body) = post_form_as(
             app.clone(),
@@ -2312,7 +2499,10 @@ mod tests {
         let cases = [
             (
                 "/web/sales/lines",
-                format!("sale_id={}&product_id={}&qty=1", fixture.sale_id, fixture.product_id),
+                format!(
+                    "sale_id={}&product_id={}&qty=1",
+                    fixture.sale_id, fixture.product_id
+                ),
                 "sales.create",
             ),
             (
@@ -2322,7 +2512,10 @@ mod tests {
             ),
             (
                 "/web/sales/payments",
-                format!("sale_id={}&method_id={}&amount=5&date=2024-05-03", fixture.sale_id, fixture.method_id),
+                format!(
+                    "sale_id={}&method_id={}&amount=5&date=2024-05-03",
+                    fixture.sale_id, fixture.method_id
+                ),
                 "customers.collect",
             ),
             (
@@ -2384,7 +2577,11 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER);
         // get_html always carries the shared cookie, so the anonymous GET is
         // built by hand here.
-        let req = Request::builder().method("GET").uri("/sales").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/sales")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     }
@@ -2464,7 +2661,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(state.sales_service.get_detail(fixture.sale_id).await.is_ok());
+        assert!(state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .is_ok());
     }
 
     /// A discarded sale (cancelled before confirm, number still NULL)
@@ -2538,7 +2739,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(state.sales_service.get_detail(fixture.sale_id).await.is_ok());
+        assert!(state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .is_ok());
     }
 
     /// An unknown id is 404 through the same route — the service's NotFound
@@ -2548,12 +2753,8 @@ mod tests {
         let state = test_state().await;
         let app = crate::routes::router(state);
 
-        let (status, body, _) = send_delete(
-            app,
-            "/web/sales/999999",
-            Some(test_support::TEST_COOKIE),
-        )
-        .await;
+        let (status, body, _) =
+            send_delete(app, "/web/sales/999999", Some(test_support::TEST_COOKIE)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
 
@@ -2593,8 +2794,7 @@ mod tests {
 
         let app = crate::routes::router(state);
 
-        let (status, html) = get_html(app.clone(), &format!("/sales/{}", discarded.sale_id))
-            .await;
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", discarded.sale_id)).await;
         assert_eq!(status, StatusCode::OK);
         let needle = format!("hx-delete=\"/web/sales/{}\"", discarded.sale_id);
         assert!(
@@ -2630,6 +2830,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(state.sales_service.get_detail(fixture.sale_id).await.is_ok());
+        assert!(state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .is_ok());
     }
 }

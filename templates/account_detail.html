@@ -6,9 +6,9 @@
   <div class="text-[13px] text-muted">Account</div>
   <div class="flex items-center justify-between gap-3">
     <h2 class="m-0 text-2xl font-semibold">{{ account.name }}</h2>
-    <span class="text-[22px] font-bold tabular-nums {% if account.is_negative() %}text-danger{% else %}text-income{% endif %}">${{ account.balance }}</span>
+    <span class="text-[22px] font-bold tabular-nums {% if account.is_negative() %}text-danger{% else %}text-income{% endif %}">{{ localization.format_currency(account.balance.clone()) }}</span>
   </div>
-  <div class="text-[13px] text-muted">Derived balance • ID {{ account.id }} • Created {{ account.created_at }}</div>
+  <div class="text-[13px] text-muted">Derived balance • ID {{ account.id }} • Created {{ localization.format_timestamp(account.created_at.clone()) }}</div>
   <div class="mt-1 text-[13px] text-muted">
     Registrado por {{ account_created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = account_updated_by_name %} • Actualizado por {{ name }}{% endif %}
   </div>
@@ -62,11 +62,11 @@
           <span class="chip {% if tx.tx.is_income() %}chip-income{% else %}chip-expense{% endif %}">{{ tx.tx.kind }}</span>
           <span class="font-semibold">{{ tx.tx.description }}</span>
         </div>
-        <span class="text-[13px] text-muted">{{ tx.tx.date }} • #{{ tx.tx.id }} • Registrado por {{ tx.created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = tx.updated_by_name %} • Actualizado por {{ editor }}{% endif %}</span>
+        <span class="text-[13px] text-muted">{{ localization.format_date(tx.tx.date.clone()) }} • #{{ tx.tx.id }} • Registrado por {{ tx.created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = tx.updated_by_name %} • Actualizado por {{ editor }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums {% if tx.tx.is_income() %}text-income{% else %}text-expense{% endif %}">
-          {% if tx.tx.is_expense() %}-{% endif %}${{ tx.tx.amount }}
+          {% if tx.tx.is_expense() %}-{% endif %}{{ localization.format_currency(tx.tx.amount.clone()) }}
         </span>
         <button class="btn-secondary"
                 hx-delete="/web/transactions/{{ tx.tx.id }}"

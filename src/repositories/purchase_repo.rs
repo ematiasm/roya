@@ -77,6 +77,8 @@ fn row_to_line(row: sqlx::sqlite::SqliteRow) -> PurchaseLine {
 
 fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> PurchasePayment {
     let amt_str: String = row.get("amount");
+    let created_at = row.get("created_at");
+    let updated_at = row.try_get("updated_at").unwrap_or(created_at);
     PurchasePayment {
         id: row.get("id"),
         purchase_id: row.get("purchase_id"),
@@ -88,7 +90,8 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> PurchasePayment {
         refund_transaction_id: row.get("refund_transaction_id"),
         created_by: row.get("created_by"),
         updated_by: row.get("updated_by"),
-        created_at: row.get("created_at"),
+        created_at,
+        updated_at,
     }
 }
 
@@ -130,13 +133,24 @@ pub trait PurchaseRepository: Send + Sync {
     ) -> AppResult<Vec<Purchase>>;
     /// Update Draft header fields (service guarantees Draft status); the edit
     /// stamps `updated_by` with the acting user.
-    async fn update_draft(&self, id: i64, actor: i64, patch: &UpdatePurchaseDraft) -> AppResult<Purchase>;
+    async fn update_draft(
+        &self,
+        id: i64,
+        actor: i64,
+        patch: &UpdatePurchaseDraft,
+    ) -> AppResult<Purchase>;
     /// Transition Draft -> Confirmed with assigned number; the confirming
     /// request is an edit of the document and stamps `updated_by`.
-    async fn set_confirmed(&self, id: i64, actor: i64, purchase_number: &str) -> AppResult<Purchase>;
+    async fn set_confirmed(
+        &self,
+        id: i64,
+        actor: i64,
+        purchase_number: &str,
+    ) -> AppResult<Purchase>;
     /// Transition Draft/Confirmed -> Cancelled; the cancelling request stamps
     /// `updated_by`.
-    async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Purchase>;
+    async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>)
+        -> AppResult<Purchase>;
     /// Stamp a purchase's `updated_by`/`updated_at` after a line change: the
     /// line inherits the purchase's actor (no columns of its own), but the
     /// document was just edited and the edit is attributed to the request.
@@ -155,8 +169,12 @@ pub trait PurchaseRepository: Send + Sync {
     ) -> AppResult<PurchaseLine>;
     async fn find_line(&self, id: i64) -> AppResult<Option<PurchaseLine>>;
     async fn list_lines(&self, purchase_id: i64) -> AppResult<Vec<PurchaseLine>>;
-    async fn update_line(&self, id: i64, qty: Decimal, unit_cost: Decimal)
-        -> AppResult<PurchaseLine>;
+    async fn update_line(
+        &self,
+        id: i64,
+        qty: Decimal,
+        unit_cost: Decimal,
+    ) -> AppResult<PurchaseLine>;
     async fn delete_line(&self, id: i64) -> AppResult<bool>;
 
     /// Delete a DRAFT purchase — or a DISCARDED one (Cancelled while never
@@ -209,8 +227,10 @@ pub trait PurchaseRepository: Send + Sync {
     /// The PURCHASE-PAYMENTS family of the documents index: the payment joined
     /// to its purchase so the row names the document the way the operator does
     /// (number, or `Draft #id`) and shows the supplier's name.
-    async fn list_payment_document_rows(&self, query: &DocumentQuery)
-        -> AppResult<Vec<DocumentRow>>;
+    async fn list_payment_document_rows(
+        &self,
+        query: &DocumentQuery,
+    ) -> AppResult<Vec<DocumentRow>>;
 }
 
 #[derive(Clone)]
@@ -234,8 +254,7 @@ impl SqlitePurchaseRepository {
     /// Count one repository read (test builds only).
     #[cfg(test)]
     fn tick(&self) {
-        self.reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Reset and read the test-only read counter.
@@ -372,7 +391,12 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         Ok(rows.into_iter().map(row_to_purchase).collect())
     }
 
-    async fn update_draft(&self, id: i64, actor: i64, patch: &UpdatePurchaseDraft) -> AppResult<Purchase> {
+    async fn update_draft(
+        &self,
+        id: i64,
+        actor: i64,
+        patch: &UpdatePurchaseDraft,
+    ) -> AppResult<Purchase> {
         let existing = self
             .find_purchase(id)
             .await?
@@ -420,7 +444,12 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         Ok(row_to_purchase(row))
     }
 
-    async fn set_confirmed(&self, id: i64, actor: i64, purchase_number: &str) -> AppResult<Purchase> {
+    async fn set_confirmed(
+        &self,
+        id: i64,
+        actor: i64,
+        purchase_number: &str,
+    ) -> AppResult<Purchase> {
         let row = sqlx::query(
             r#"UPDATE purchases
                SET purchase_number = ?, status = 'Confirmed',
@@ -438,7 +467,12 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         Ok(row_to_purchase(row))
     }
 
-    async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Purchase> {
+    async fn set_cancelled(
+        &self,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<Purchase> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -586,7 +620,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         let row = sqlx::query(
             r#"INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, transaction_id, created_by)
                VALUES (?, ?, ?, ?, ?, ?, ?)
-               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at"#,
+               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(purchase_id)
         .bind(account_id)
@@ -609,9 +643,10 @@ impl PurchaseRepository for SqlitePurchaseRepository {
     ) -> AppResult<PurchasePayment> {
         let row = sqlx::query(
             r#"UPDATE purchase_payments
-               SET refund_transaction_id = ?, updated_by = ?
+               SET refund_transaction_id = ?, updated_by = ?,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
                WHERE id = ?
-               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at"#,
+               RETURNING id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at, updated_at"#,
         )
         .bind(refund_transaction_id)
         .bind(actor)
@@ -626,7 +661,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         #[cfg(test)]
         self.tick();
         let rows = sqlx::query(
-            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at FROM purchase_payments WHERE purchase_id = ? ORDER BY id"#,
+            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at, updated_at FROM purchase_payments WHERE purchase_id = ? ORDER BY id"#,
         )
         .bind(purchase_id)
         .fetch_all(&self.pool)
@@ -638,7 +673,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         #[cfg(test)]
         self.tick();
         let row = sqlx::query(
-            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at FROM purchase_payments WHERE id = ?"#,
+            r#"SELECT id, purchase_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at, updated_at FROM purchase_payments WHERE id = ?"#,
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -728,7 +763,9 @@ impl PurchaseRepository for SqlitePurchaseRepository {
             std::collections::BTreeMap::new();
         for row in line_rows {
             let line = row_to_line(row);
-            *totals.entry(line.purchase_id).or_insert_with(|| Decimal::ZERO) += line.subtotal();
+            *totals
+                .entry(line.purchase_id)
+                .or_insert_with(|| Decimal::ZERO) += line.subtotal();
         }
 
         Ok(purchases
@@ -821,7 +858,6 @@ impl PurchaseRepository for SqlitePurchaseRepository {
             })
             .collect())
     }
-
 }
 
 #[cfg(test)]
@@ -866,17 +902,15 @@ mod tests {
             .unwrap()
         {
             Some(id) => id,
-            None => {
-                sqlx::query_scalar(
-                    r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+            None => sqlx::query_scalar(
+                r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
                        VALUES ('DOC-P', 'doc prod', 'Product', 'un', '10', 1, ?)
                        RETURNING id"#,
-                )
-                .bind(actor)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-            }
+            )
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
         }
     }
 
@@ -891,16 +925,14 @@ mod tests {
             .unwrap()
         {
             Some(id) => id,
-            None => {
-                sqlx::query_scalar(
-                    "INSERT INTO suppliers (name, is_active, created_by) VALUES (?, 1, ?) RETURNING id",
-                )
-                .bind(name)
-                .bind(actor)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-            }
+            None => sqlx::query_scalar(
+                "INSERT INTO suppliers (name, is_active, created_by) VALUES (?, 1, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
         }
     }
 
@@ -950,22 +982,21 @@ mod tests {
     async fn account_and_method(pool: &SqlitePool, actor: i64) -> (i64, i64) {
         // One wallet per test database: the name is UNIQUE, so reuse it when a
         // second payment in the same test needs the pair.
-        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
-            .fetch_optional(pool)
-            .await
-            .unwrap()
-        {
-            Some(id) => id,
-            None => {
-                sqlx::query_scalar(
+        let account: i64 =
+            match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
+                .fetch_optional(pool)
+                .await
+                .unwrap()
+            {
+                Some(id) => id,
+                None => sqlx::query_scalar(
                     "INSERT INTO accounts (name, created_by) VALUES ('doc wallet', ?) RETURNING id",
                 )
                 .bind(actor)
                 .fetch_one(pool)
                 .await
-                .unwrap()
-            }
-        };
+                .unwrap(),
+            };
         let (method,): (i64,) =
             sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
                 .fetch_one(pool)
@@ -1006,9 +1037,14 @@ mod tests {
         let repo = SqlitePurchaseRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
 
-        let confirmed =
-            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
-                .await;
+        let confirmed = seed_purchase(
+            &pool,
+            Some("2024-PURCH-000001"),
+            "Distribuidora Sur",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         seed_line(&pool, confirmed, "2", "10").await;
         seed_line(&pool, confirmed, "3", "2.5").await; // Σ = 20 + 7.5 = 27.5
         let draft = seed_purchase(&pool, None, "Importadora Norte", d(2024, 5, 3), actor).await;
@@ -1057,9 +1093,22 @@ mod tests {
             .unwrap();
         assert_ne!(sistema, other);
 
-        let mine = seed_purchase(&pool, Some("2024-PURCH-000001"), "Sur", d(2024, 5, 2), sistema).await;
-        let theirs =
-            seed_purchase(&pool, Some("2024-PURCH-000002"), "Norte", d(2024, 5, 3), other).await;
+        let mine = seed_purchase(
+            &pool,
+            Some("2024-PURCH-000001"),
+            "Sur",
+            d(2024, 5, 2),
+            sistema,
+        )
+        .await;
+        let theirs = seed_purchase(
+            &pool,
+            Some("2024-PURCH-000002"),
+            "Norte",
+            d(2024, 5, 3),
+            other,
+        )
+        .await;
 
         let only_sistema = repo
             .list_document_rows(&DocumentQuery {
@@ -1110,8 +1159,10 @@ mod tests {
         let pool = memory_pool().await;
         let repo = SqlitePurchaseRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let early = seed_purchase(&pool, Some("2024-PURCH-000001"), "A", d(2024, 5, 1), actor).await;
-        let first = seed_purchase(&pool, Some("2024-PURCH-000002"), "B", d(2024, 5, 2), actor).await;
+        let early =
+            seed_purchase(&pool, Some("2024-PURCH-000001"), "A", d(2024, 5, 1), actor).await;
+        let first =
+            seed_purchase(&pool, Some("2024-PURCH-000002"), "B", d(2024, 5, 2), actor).await;
         let last = seed_purchase(&pool, Some("2024-PURCH-000003"), "C", d(2024, 5, 4), actor).await;
         let late = seed_purchase(&pool, Some("2024-PURCH-000004"), "D", d(2024, 5, 5), actor).await;
 
@@ -1138,16 +1189,27 @@ mod tests {
         let pool = memory_pool().await;
         let repo = SqlitePurchaseRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let with_invoice =
-            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
-                .await;
+        let with_invoice = seed_purchase(
+            &pool,
+            Some("2024-PURCH-000001"),
+            "Distribuidora Sur",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         sqlx::query("UPDATE purchases SET supplier_invoice_no = 'FACT-77' WHERE id = ?")
             .bind(with_invoice)
             .execute(&pool)
             .await
             .unwrap();
-        seed_purchase(&pool, Some("2024-PURCH-000002"), "Importadora Norte", d(2024, 5, 3), actor)
-            .await;
+        seed_purchase(
+            &pool,
+            Some("2024-PURCH-000002"),
+            "Importadora Norte",
+            d(2024, 5, 3),
+            actor,
+        )
+        .await;
 
         // Partial, case-insensitive number match.
         let rows = repo
@@ -1288,9 +1350,14 @@ mod tests {
         let repo = SqlitePurchaseRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
 
-        let confirmed =
-            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
-                .await;
+        let confirmed = seed_purchase(
+            &pool,
+            Some("2024-PURCH-000001"),
+            "Distribuidora Sur",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         let draft = seed_purchase(&pool, None, "Importadora Norte", d(2024, 5, 3), actor).await;
         seed_payment(&pool, confirmed, "10", d(2024, 5, 10), actor).await;
         seed_payment(&pool, draft, "5", d(2024, 5, 11), actor).await;
@@ -1338,13 +1405,22 @@ mod tests {
         let pool = memory_pool().await;
         let repo = SqlitePurchaseRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let purchase =
-            seed_purchase(&pool, Some("2024-PURCH-000001"), "Distribuidora Sur", d(2024, 5, 2), actor)
-                .await;
+        let purchase = seed_purchase(
+            &pool,
+            Some("2024-PURCH-000001"),
+            "Distribuidora Sur",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
         let payment_id = seed_payment(&pool, purchase, "10", d(2024, 5, 10), actor).await;
 
         repo.reset_reads();
-        let found = repo.find_payment(payment_id).await.unwrap().expect("payment exists");
+        let found = repo
+            .find_payment(payment_id)
+            .await
+            .unwrap()
+            .expect("payment exists");
         assert_eq!(found.id, payment_id);
         assert_eq!(found.purchase_id, purchase);
         assert_eq!(found.amount, dec("10"));
@@ -1404,14 +1480,9 @@ mod tests {
         let repo = SqlitePurchaseRepository::new(pool.clone());
         let product = product_id(&pool, actor).await;
 
-        let draft = seed_purchase_with_status(
-            &pool,
-            "Draft",
-            "Delete Supplier",
-            d(2024, 5, 2),
-            actor,
-        )
-        .await;
+        let draft =
+            seed_purchase_with_status(&pool, "Draft", "Delete Supplier", d(2024, 5, 2), actor)
+                .await;
         for _ in 0..2 {
             sqlx::query(
                 "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) VALUES (?, ?, '1', '5')",
@@ -1422,14 +1493,8 @@ mod tests {
             .await
             .unwrap();
         }
-        let other = seed_purchase_with_status(
-            &pool,
-            "Draft",
-            "Keep Supplier",
-            d(2024, 5, 3),
-            actor,
-        )
-        .await;
+        let other =
+            seed_purchase_with_status(&pool, "Draft", "Keep Supplier", d(2024, 5, 3), actor).await;
         sqlx::query(
             "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost) VALUES (?, ?, '3', '5')",
         )
@@ -1477,7 +1542,8 @@ mod tests {
     /// `WHERE status = 'Draft'` in the statement is what makes deleting a
     /// confirmed document impossible even if the service check were relaxed.
     #[tokio::test]
-    async fn delete_draft_called_directly_on_a_confirmed_purchase_returns_false_and_the_row_survives() {
+    async fn delete_draft_called_directly_on_a_confirmed_purchase_returns_false_and_the_row_survives(
+    ) {
         let pool = memory_pool().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let repo = SqlitePurchaseRepository::new(pool.clone());
@@ -1502,7 +1568,12 @@ mod tests {
 
         assert!(!repo.delete_draft(confirmed).await.unwrap());
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", confirmed).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchases WHERE id = ?",
+                confirmed
+            )
+            .await,
             1,
             "a confirmed purchase must survive a direct repository delete attempt"
         );
@@ -1546,7 +1617,12 @@ mod tests {
 
         assert!(!repo.delete_draft(cancelled).await.unwrap());
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", cancelled).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchases WHERE id = ?",
+                cancelled
+            )
+            .await,
             1,
             "a confirmed-then-cancelled purchase must survive a direct repository delete"
         );
@@ -1578,21 +1654,21 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let other = seed_purchase_with_status(
-            &pool,
-            "Cancelled",
-            "Keep Supplier",
-            d(2024, 5, 3),
-            actor,
-        )
-        .await;
+        let other =
+            seed_purchase_with_status(&pool, "Cancelled", "Keep Supplier", d(2024, 5, 3), actor)
+                .await;
 
         assert!(
             repo.delete_draft(discarded).await.unwrap(),
             "a never-confirmed cancelled purchase is deletable"
         );
         assert_eq!(
-            count(&pool, "SELECT COUNT(*) FROM purchases WHERE id = ?", discarded).await,
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchases WHERE id = ?",
+                discarded
+            )
+            .await,
             0,
             "the discarded row must be gone"
         );

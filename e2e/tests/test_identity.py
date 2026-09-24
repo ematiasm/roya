@@ -47,7 +47,7 @@ from conftest import (
     _free_port,
     _wait_until_ready,
 )
-from helpers import expire_session_in_database
+from helpers import ApiClient, expire_session_in_database, setup_fresh_server
 
 
 @pytest.fixture
@@ -154,7 +154,6 @@ def test_roya_cookie_secure_1_puts_secure_on_the_real_wire(
             "DATABASE_URL": f"sqlite://{db_path}",
             "PORT": str(port),
             "RUST_LOG": "info",
-            "ROYA_ADMIN_PASSWORD": TEST_ADMIN_PASSWORD,
             "ROYA_COOKIE_SECURE": "1",
         }
     )
@@ -175,6 +174,7 @@ def test_roya_cookie_secure_1_puts_secure_on_the_real_wire(
         )
         try:
             _wait_until_ready(server)
+            setup_fresh_server(ApiClient(server.url))
             cookie = _session_set_cookie(
                 server.url, TEST_ADMIN_USERNAME, TEST_ADMIN_PASSWORD
             )

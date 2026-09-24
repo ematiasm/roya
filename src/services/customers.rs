@@ -45,7 +45,11 @@ where
 
     /// Optional free text: trimmed, whitespace-only becomes NULL, bounded by the
     /// spec limits (phone/tax_id <= 32, address <= 256, notes <= 512).
-    fn clean_optional(label: &str, value: &Option<String>, max: usize) -> AppResult<Option<String>> {
+    fn clean_optional(
+        label: &str,
+        value: &Option<String>,
+        max: usize,
+    ) -> AppResult<Option<String>> {
         match value {
             None => Ok(None),
             Some(s) => {
@@ -66,19 +70,17 @@ where
     /// NULL means no limit; a set limit must be >= 0.
     fn clean_credit_limit(limit: Option<Decimal>) -> AppResult<Option<Decimal>> {
         match limit {
-            Some(v) if v < Decimal::ZERO => Err(AppError::Validation(
-                "credit limit must be >= 0".into(),
-            )),
+            Some(v) if v < Decimal::ZERO => {
+                Err(AppError::Validation("credit limit must be >= 0".into()))
+            }
             other => Ok(other),
         }
     }
 
     /// NULL means no default term; a set term must be >= 0 days.
-    fn clean_payment_days(days: Option<i64>) -> AppResult<Option<i64>> {
+    fn clean_due_days(days: Option<i64>) -> AppResult<Option<i64>> {
         match days {
-            Some(d) if d < 0 => Err(AppError::Validation(
-                "payment days must be >= 0".into(),
-            )),
+            Some(d) if d < 0 => Err(AppError::Validation("payment days must be >= 0".into())),
             other => Ok(other),
         }
     }
@@ -92,7 +94,7 @@ where
             notes: Self::clean_optional("notes", &input.notes, 512)?,
             is_walkin: input.is_walkin,
             credit_limit: Self::clean_credit_limit(input.credit_limit)?,
-            payment_days: Self::clean_payment_days(input.payment_days)?,
+            due_days: Self::clean_due_days(input.due_days)?,
         })
     }
 
@@ -104,7 +106,11 @@ where
     /// created a second time. `actor` is the acting user's id from the request
     /// (`Principal.user_id`): it is the row's `created_by`, and nothing the
     /// request itself can supply names it.
-    pub async fn create_customer(&self, actor: i64, input: NewCustomer) -> AppResult<CustomerCreateResult> {
+    pub async fn create_customer(
+        &self,
+        actor: i64,
+        input: NewCustomer,
+    ) -> AppResult<CustomerCreateResult> {
         let clean = Self::clean_input(&input)?;
         if clean.is_walkin {
             if let Some(existing) = self.customers.find_walkin().await? {
@@ -123,7 +129,12 @@ where
         })
     }
 
-    pub async fn update_customer(&self, id: i64, actor: i64, patch: UpdateCustomer) -> AppResult<Customer> {
+    pub async fn update_customer(
+        &self,
+        id: i64,
+        actor: i64,
+        patch: UpdateCustomer,
+    ) -> AppResult<Customer> {
         self.get_customer(id).await?;
 
         let mut clean = UpdateCustomer::default();
@@ -145,8 +156,8 @@ where
         if let Some(limit) = patch.credit_limit {
             clean.credit_limit = Some(Self::clean_credit_limit(limit)?);
         }
-        if let Some(days) = patch.payment_days {
-            clean.payment_days = Some(Self::clean_payment_days(days)?);
+        if let Some(days) = patch.due_days {
+            clean.due_days = Some(Self::clean_due_days(days)?);
         }
         self.customers.update(id, actor, &clean).await
     }
@@ -242,7 +253,9 @@ mod tests {
     /// The audit-attribution tests below seed their own users instead, because
     /// there the point is telling two actors apart.
     async fn audit_actor(s: &Svc) -> i64 {
-        test_support::audit_actor_id(&s.customers.pool).await.unwrap()
+        test_support::audit_actor_id(&s.customers.pool)
+            .await
+            .unwrap()
     }
 
     fn dec(s: &str) -> Decimal {
@@ -250,16 +263,19 @@ mod tests {
     }
 
     async fn new_customer(s: &Svc, name: &str) -> Customer {
-        s.create_customer(audit_actor(&s).await, NewCustomer {
-            name: name.into(),
-            phone: None,
-            address: None,
-            tax_id: None,
-            notes: None,
-            is_walkin: false,
-            credit_limit: None,
-            payment_days: None,
-        })
+        s.create_customer(
+            audit_actor(&s).await,
+            NewCustomer {
+                name: name.into(),
+                phone: None,
+                address: None,
+                tax_id: None,
+                notes: None,
+                is_walkin: false,
+                credit_limit: None,
+                due_days: None,
+            },
+        )
         .await
         .unwrap()
         .customer
@@ -287,21 +303,24 @@ mod tests {
         assert_eq!(w.name, "Consumidor final");
         assert!(w.is_active);
         assert_eq!(w.credit_limit, None, "the walk-in has no limit");
-        assert_eq!(w.payment_days, None, "the walk-in has no default term");
+        assert_eq!(w.due_days, None, "the walk-in has no default term");
         assert!(s.is_walkin(w.id).await.unwrap());
 
         // A second walk-in cannot be created.
         let err = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Otro mostrador".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: true,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Otro mostrador".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: true,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
@@ -316,7 +335,10 @@ mod tests {
         );
 
         // The walk-in cannot be deactivated...
-        let err = s.deactivate_customer(audit_actor(&s).await, w.id).await.unwrap_err();
+        let err = s
+            .deactivate_customer(audit_actor(&s).await, w.id)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(s.get_customer(w.id).await.unwrap().is_active);
 
@@ -362,7 +384,10 @@ mod tests {
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(s.get_customer(c.id).await.is_ok(), "the row survives");
 
-        let off = s.deactivate_customer(audit_actor(&s).await, c.id).await.unwrap();
+        let off = s
+            .deactivate_customer(audit_actor(&s).await, c.id)
+            .await
+            .unwrap();
         assert!(!off.is_active);
         assert_eq!(s.get_customer(c.id).await.unwrap().name, "Con historial");
         assert!(s
@@ -379,7 +404,12 @@ mod tests {
             .any(|x| x.id == c.id));
 
         // Reactivation keeps the customer usable.
-        assert!(s.activate_customer(audit_actor(&s).await, c.id).await.unwrap().is_active);
+        assert!(
+            s.activate_customer(audit_actor(&s).await, c.id)
+                .await
+                .unwrap()
+                .is_active
+        );
         assert!(s
             .list_customers(true)
             .await
@@ -407,32 +437,38 @@ mod tests {
         let (s, _pool) = svc().await;
 
         let first = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "  Juan Pérez  ".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "  Juan Pérez  ".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         assert!(first.name_matches.is_empty(), "nothing exists yet");
         assert_eq!(first.customer.name, "Juan Pérez", "the name is trimmed");
 
         let second = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Juan Pérez".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Juan Pérez".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(second.name_matches.len(), 1);
@@ -457,16 +493,19 @@ mod tests {
 
         // The seeded walk-in is reported as a match too, without blocking.
         let third = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Consumidor final".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Consumidor final".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(third.name_matches.len(), 1);
@@ -480,46 +519,55 @@ mod tests {
         let (s, _pool) = svc().await;
         for bad in ["", "   ", "\t\n"] {
             let err = s
-                .create_customer(audit_actor(&s).await, NewCustomer {
-                    name: bad.into(),
+                .create_customer(
+                    audit_actor(&s).await,
+                    NewCustomer {
+                        name: bad.into(),
+                        phone: None,
+                        address: None,
+                        tax_id: None,
+                        notes: None,
+                        is_walkin: false,
+                        credit_limit: None,
+                        due_days: None,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        }
+        let err = s
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "n".repeat(129),
                     phone: None,
                     address: None,
                     tax_id: None,
                     notes: None,
                     is_walkin: false,
                     credit_limit: None,
-                    payment_days: None,
-                })
-                .await
-                .unwrap_err();
-            assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        }
-        let err = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "n".repeat(129),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+                    due_days: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         let created = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "  Límite exacto  ".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "  Límite exacto  ".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap()
             .customer;
@@ -532,16 +580,19 @@ mod tests {
     async fn tri_optional_fields_are_trimmed_bounded_and_clearable() {
         let (s, _pool) = svc().await;
         let created = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Campos".into(),
-                phone: Some("  555-1234  ".into()),
-                address: Some("  Calle 1  ".into()),
-                tax_id: Some("  30-123  ".into()),
-                notes: Some("  fiado  ".into()),
-                is_walkin: false,
-                credit_limit: Some(dec("1500.50")),
-                payment_days: Some(30),
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Campos".into(),
+                    phone: Some("  555-1234  ".into()),
+                    address: Some("  Calle 1  ".into()),
+                    tax_id: Some("  30-123  ".into()),
+                    notes: Some("  fiado  ".into()),
+                    is_walkin: false,
+                    credit_limit: Some(dec("1500.50")),
+                    due_days: Some(30),
+                },
+            )
             .await
             .unwrap()
             .customer;
@@ -550,20 +601,23 @@ mod tests {
         assert_eq!(created.tax_id.as_deref(), Some("30-123"));
         assert_eq!(created.notes.as_deref(), Some("fiado"));
         assert_eq!(created.credit_limit, Some(dec("1500.50")));
-        assert_eq!(created.payment_days, Some(30));
+        assert_eq!(created.due_days, Some(30));
 
         // Whitespace-only optional values are stored as NULL.
         let blank = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Blancos".into(),
-                phone: Some("   ".into()),
-                address: Some("".into()),
-                tax_id: Some(" \t ".into()),
-                notes: Some("".into()),
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Blancos".into(),
+                    phone: Some("   ".into()),
+                    address: Some("".into()),
+                    tax_id: Some(" \t ".into()),
+                    notes: Some("".into()),
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap()
             .customer;
@@ -580,16 +634,19 @@ mod tests {
             (None, None, None, Some("x".repeat(513))),
         ] {
             let err = s
-                .create_customer(audit_actor(&s).await, NewCustomer {
-                    name: "Largos".into(),
-                    phone,
-                    address,
-                    tax_id,
-                    notes,
-                    is_walkin: false,
-                    credit_limit: None,
-                    payment_days: None,
-                })
+                .create_customer(
+                    audit_actor(&s).await,
+                    NewCustomer {
+                        name: "Largos".into(),
+                        phone,
+                        address,
+                        tax_id,
+                        notes,
+                        is_walkin: false,
+                        credit_limit: None,
+                        due_days: None,
+                    },
+                )
                 .await
                 .unwrap_err();
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -612,7 +669,7 @@ mod tests {
         assert_eq!(patched.phone, None);
         assert_eq!(patched.address.as_deref(), Some("Calle 1"));
         assert_eq!(patched.credit_limit, Some(dec("1500.50")));
-        assert_eq!(patched.payment_days, Some(30));
+        assert_eq!(patched.due_days, Some(30));
 
         // A patch can also change the limit and the term.
         let patched = s
@@ -621,44 +678,50 @@ mod tests {
                 audit_actor(&s).await,
                 UpdateCustomer {
                     credit_limit: Some(Some(dec("2000"))),
-                    payment_days: Some(Some(15)),
+                    due_days: Some(Some(15)),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         assert_eq!(patched.credit_limit, Some(dec("2000")));
-        assert_eq!(patched.payment_days, Some(15));
+        assert_eq!(patched.due_days, Some(15));
     }
 
     #[tokio::test]
     async fn tri_negative_limit_and_term_are_rejected() {
         let (s, _pool) = svc().await;
         let err = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Negativo".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: Some(dec("-0.01")),
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Negativo".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: Some(dec("-0.01")),
+                    due_days: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Negativo".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: Some(-1),
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Negativo".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: Some(-1),
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
@@ -670,14 +733,14 @@ mod tests {
                 audit_actor(&s).await,
                 UpdateCustomer {
                     credit_limit: Some(Some(Decimal::ZERO)),
-                    payment_days: Some(Some(0)),
+                    due_days: Some(Some(0)),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
         assert_eq!(patched.credit_limit, Some(Decimal::ZERO));
-        assert_eq!(patched.payment_days, Some(0));
+        assert_eq!(patched.due_days, Some(0));
 
         let err = s
             .update_customer(
@@ -702,16 +765,19 @@ mod tests {
     async fn tri_name_lookup_is_exact_and_case_sensitive() {
         let (s, _pool) = svc().await;
         let stored = s
-            .create_customer(audit_actor(&s).await, NewCustomer {
-                name: "Pedro Gómez".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                audit_actor(&s).await,
+                NewCustomer {
+                    name: "Pedro Gómez".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         assert!(stored.name_matches.is_empty());
@@ -719,22 +785,22 @@ mod tests {
         // Different case and partial names are not duplicate warnings.
         for name in ["pedro gómez", "Pedro"] {
             let r = s
-                .create_customer(audit_actor(&s).await, NewCustomer {
-                    name: name.into(),
-                    phone: None,
-                    address: None,
-                    tax_id: None,
-                    notes: None,
-                    is_walkin: false,
-                    credit_limit: None,
-                    payment_days: None,
-                })
+                .create_customer(
+                    audit_actor(&s).await,
+                    NewCustomer {
+                        name: name.into(),
+                        phone: None,
+                        address: None,
+                        tax_id: None,
+                        notes: None,
+                        is_walkin: false,
+                        credit_limit: None,
+                        due_days: None,
+                    },
+                )
                 .await
                 .unwrap();
-            assert!(
-                r.name_matches.is_empty(),
-                "{name} must not match exactly"
-            );
+            assert!(r.name_matches.is_empty(), "{name} must not match exactly");
         }
 
         // The repository lookup itself returns every exact-name row.
@@ -748,7 +814,9 @@ mod tests {
         let (s, _pool) = svc().await;
         let on = new_customer(&s, "Activo").await;
         let off = new_customer(&s, "Inactivo").await;
-        s.deactivate_customer(audit_actor(&s).await, off.id).await.unwrap();
+        s.deactivate_customer(audit_actor(&s).await, off.id)
+            .await
+            .unwrap();
 
         let active = s.list_customers(true).await.unwrap();
         assert!(active.iter().any(|c| c.id == on.id));
@@ -772,11 +840,15 @@ mod tests {
             AppError::NotFound(_)
         ));
         assert!(matches!(
-            s.deactivate_customer(audit_actor(&s).await, 999_999).await.unwrap_err(),
+            s.deactivate_customer(audit_actor(&s).await, 999_999)
+                .await
+                .unwrap_err(),
             AppError::NotFound(_)
         ));
         assert!(matches!(
-            s.activate_customer(audit_actor(&s).await, 999_999).await.unwrap_err(),
+            s.activate_customer(audit_actor(&s).await, 999_999)
+                .await
+                .unwrap_err(),
             AppError::NotFound(_)
         ));
         assert!(matches!(
@@ -797,7 +869,7 @@ mod tests {
         // Re-run the seed statement exactly as the migration wrote it: the guard
         // must leave the single existing walk-in untouched.
         sqlx::query(
-            r#"INSERT INTO customers (name, is_walkin, credit_limit, payment_days, created_by)
+            r#"INSERT INTO customers (name, is_walkin, credit_limit, due_days, created_by)
                SELECT 'Consumidor final', 1, NULL, NULL, ?
                WHERE NOT EXISTS (SELECT 1 FROM customers WHERE is_walkin = 1)"#,
         )
@@ -902,7 +974,8 @@ mod tests {
             .unwrap_err();
         eprintln!("walk-in delete error: {err}");
         assert!(
-            err.to_string().contains("walk-in customer cannot be deleted"),
+            err.to_string()
+                .contains("walk-in customer cannot be deleted"),
             "got {err}"
         );
         assert!(
@@ -918,7 +991,10 @@ mod tests {
         let (s, _pool) = svc().await;
         let walkin = seeded_walkin(&s).await;
 
-        let err = s.deactivate_customer(audit_actor(&s).await, walkin.id).await.unwrap_err();
+        let err = s
+            .deactivate_customer(audit_actor(&s).await, walkin.id)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert_eq!(
             err.to_string(),
@@ -941,7 +1017,10 @@ mod tests {
         let (s, _pool) = svc().await;
 
         let deactivated = new_customer(&s, "Se desactiva").await;
-        let off = s.deactivate_customer(audit_actor(&s).await, deactivated.id).await.unwrap();
+        let off = s
+            .deactivate_customer(audit_actor(&s).await, deactivated.id)
+            .await
+            .unwrap();
         assert!(!off.is_active);
         assert!(!s.get_customer(deactivated.id).await.unwrap().is_active);
 
@@ -987,7 +1066,7 @@ mod tests {
                 UpdateCustomer {
                     name: Some("Consumidor final".into()),
                     credit_limit: Some(Some(dec("2000"))),
-                    payment_days: Some(Some(30)),
+                    due_days: Some(Some(30)),
                     ..Default::default()
                 },
             )
@@ -995,7 +1074,7 @@ mod tests {
             .unwrap();
         assert_eq!(updated.name, "Consumidor final");
         assert_eq!(updated.credit_limit, Some(dec("2000")));
-        assert_eq!(updated.payment_days, Some(30));
+        assert_eq!(updated.due_days, Some(30));
         assert!(updated.is_active && updated.is_walkin);
     }
 
@@ -1013,7 +1092,8 @@ mod tests {
             .unwrap_err();
         eprintln!("walk-in demote error: {err}");
         assert!(
-            err.to_string().contains("walk-in customer cannot be demoted"),
+            err.to_string()
+                .contains("walk-in customer cannot be demoted"),
             "got {err}"
         );
 
@@ -1040,7 +1120,10 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("cannot be deactivated"), "got {err}");
+        assert!(
+            err.to_string().contains("cannot be deactivated"),
+            "got {err}"
+        );
 
         let err = sqlx::query("DELETE FROM customers WHERE id = ?")
             .bind(walkin.id)
@@ -1076,7 +1159,7 @@ mod tests {
                     tax_id: Some(Some("20-12345678-9".into())),
                     notes: Some(Some("nota".into())),
                     credit_limit: Some(Some(dec("500"))),
-                    payment_days: Some(Some(15)),
+                    due_days: Some(Some(15)),
                 },
             )
             .await
@@ -1087,30 +1170,37 @@ mod tests {
         assert_eq!(updated.tax_id.as_deref(), Some("20-12345678-9"));
         assert_eq!(updated.notes.as_deref(), Some("nota"));
         assert_eq!(updated.credit_limit, Some(dec("500")));
-        assert_eq!(updated.payment_days, Some(15));
+        assert_eq!(updated.due_days, Some(15));
         assert!(!updated.is_walkin && updated.is_active);
     }
 
-        /// AC18 (customers audit, M5 Phase B slice S11): a customer records TWO
+    /// AC18 (customers audit, M5 Phase B slice S11): a customer records TWO
     /// different actors — its creator and, after a rename, its last editor —
     /// and the walk-in protection is untouched by the new columns.
     #[tokio::test]
     async fn ac18_a_customer_records_two_different_actors() {
         let (s, pool) = svc().await;
-        let creator = test_support::seed_audit_user(&pool, "cust-alice", "Alice").await.unwrap();
-        let editor = test_support::seed_audit_user(&pool, "cust-bob", "Bob").await.unwrap();
+        let creator = test_support::seed_audit_user(&pool, "cust-alice", "Alice")
+            .await
+            .unwrap();
+        let editor = test_support::seed_audit_user(&pool, "cust-bob", "Bob")
+            .await
+            .unwrap();
 
         let customer = s
-            .create_customer(creator, NewCustomer {
-                name: "Audited".into(),
-                phone: None,
-                address: None,
-                tax_id: None,
-                notes: None,
-                is_walkin: false,
-                credit_limit: None,
-                payment_days: None,
-            })
+            .create_customer(
+                creator,
+                NewCustomer {
+                    name: "Audited".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap()
             .customer;
@@ -1118,13 +1208,20 @@ mod tests {
         assert_eq!(customer.updated_by, None, "a fresh row has no editor");
 
         let updated = s
-            .update_customer(customer.id, editor, UpdateCustomer {
-                name: Some("Audited II".into()),
-                ..Default::default()
-            })
+            .update_customer(
+                customer.id,
+                editor,
+                UpdateCustomer {
+                    name: Some("Audited II".into()),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
-        assert_eq!(updated.created_by, creator, "the creator is untouched by an edit");
+        assert_eq!(
+            updated.created_by, creator,
+            "the creator is untouched by an edit"
+        );
         assert_eq!(updated.updated_by, Some(editor), "the editor");
 
         // The activation toggle is an edit too, so it carries the same rule.
@@ -1133,7 +1230,11 @@ mod tests {
         assert_eq!(off.updated_by, Some(editor));
         let on = s.activate_customer(creator, customer.id).await.unwrap();
         assert_eq!(on.created_by, creator);
-        assert_eq!(on.updated_by, Some(creator), "the toggle names its own actor");
+        assert_eq!(
+            on.updated_by,
+            Some(creator),
+            "the toggle names its own actor"
+        );
     }
 
     /// REPLACE conflict resolution cannot remove or replace the walk-in: with
@@ -1214,7 +1315,8 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            err.to_string().contains("walk-in customer cannot be demoted"),
+            err.to_string()
+                .contains("walk-in customer cannot be demoted"),
             "got {err}"
         );
 
@@ -1247,7 +1349,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(renamed.name, "Válido renombrado");
-        let off = s.deactivate_customer(audit_actor(&s).await, regular.id).await.unwrap();
+        let off = s
+            .deactivate_customer(audit_actor(&s).await, regular.id)
+            .await
+            .unwrap();
         assert!(!off.is_active);
         s.delete_customer(regular.id).await.unwrap();
         assert!(matches!(
@@ -1265,7 +1370,7 @@ mod tests {
                     phone: Some(Some("555-0100".into())),
                     address: Some(Some("Mostrador".into())),
                     credit_limit: Some(Some(Decimal::ZERO)),
-                    payment_days: Some(Some(0)),
+                    due_days: Some(Some(0)),
                     ..Default::default()
                 },
             )
@@ -1275,7 +1380,7 @@ mod tests {
         assert_eq!(edited.phone.as_deref(), Some("555-0100"));
         assert_eq!(edited.address.as_deref(), Some("Mostrador"));
         assert_eq!(edited.credit_limit, Some(Decimal::ZERO));
-        assert_eq!(edited.payment_days, Some(0));
+        assert_eq!(edited.due_days, Some(0));
         assert!(edited.is_walkin && edited.is_active);
     }
 }

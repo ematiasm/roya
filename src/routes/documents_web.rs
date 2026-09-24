@@ -9,7 +9,7 @@
 // a page its reader cannot open.
 use askama::Template;
 use axum::{
-    extract::{Query, State},
+    extract::{Extension, Query, State},
     response::Html,
     routing::get,
     Router,
@@ -18,6 +18,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{
     DocumentFilter, DocumentGroup, DocumentKind, DocumentRow, PurchaseRecord, PurchaseStatus,
     SaleRecord, SaleStatus,
@@ -49,6 +50,7 @@ pub fn router() -> Router<AppState> {
 #[template(path = "documents.html")]
 struct DocumentsTemplate {
     title: String,
+    localization: LocalizationContext,
     rows: Vec<DocumentView>,
     truncated: bool,
     limit: usize,
@@ -68,6 +70,7 @@ struct DocumentsTemplate {
 #[template(path = "partials/document_list.html")]
 struct DocumentListPartial {
     title: String,
+    localization: LocalizationContext,
     rows: Vec<DocumentView>,
     truncated: bool,
     limit: usize,
@@ -123,7 +126,10 @@ fn permitted_kinds(principal: &Principal) -> Vec<DocumentKind> {
 /// means every group) expanded to kinds, intersected with what the principal
 /// may read, deduped, in `DocumentKind::ALL` order. An empty intersection
 /// renders an empty list — a narrower request never becomes a 403.
-fn selected_kinds(permitted: &[DocumentKind], requested: Option<DocumentGroup>) -> Vec<DocumentKind> {
+fn selected_kinds(
+    permitted: &[DocumentKind],
+    requested: Option<DocumentGroup>,
+) -> Vec<DocumentKind> {
     let requested_kinds: &[DocumentKind] = match requested {
         Some(group) => group.kinds(),
         None => DocumentKind::ALL,
@@ -287,12 +293,14 @@ async fn documents_model(
 async fn documents_page(
     State(state): State<AppState>,
     _: RequireAny<(SalesRead, PurchasesRead, InventoryRead, CustomersRead)>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<Principal>,
     Query(query): Query<DocumentListQuery>,
 ) -> Result<Html<String>, AppError> {
     let model = documents_model(&state, &principal, &query).await?;
     let tmpl = DocumentsTemplate {
         title: "All documents".to_string(),
+        localization,
         rows: model.rows,
         truncated: model.truncated,
         limit: model.limit,
@@ -305,7 +313,8 @@ async fn documents_page(
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
@@ -314,12 +323,14 @@ async fn documents_page(
 async fn web_document_list(
     State(state): State<AppState>,
     _: RequireAny<(SalesRead, PurchasesRead, InventoryRead, CustomersRead)>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<Principal>,
     Query(query): Query<DocumentListQuery>,
 ) -> Result<Html<String>, AppError> {
     let model = documents_model(&state, &principal, &query).await?;
     let html = DocumentListPartial {
         title: "All documents".to_string(),
+        localization,
         rows: model.rows,
         truncated: model.truncated,
         limit: model.limit,
@@ -501,7 +512,9 @@ async fn document_detail(
 /// The identifier a document answers by, the way every list already shows it:
 /// the assigned number, or `Draft #id` while a draft has none.
 fn document_title(number: Option<&str>, id: i64) -> String {
-    number.map(str::to_string).unwrap_or_else(|| format!("Draft #{id}"))
+    number
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Draft #{id}"))
 }
 
 /// The edit affordance the user asked for as a real BUTTON-styled link: the
@@ -654,10 +667,7 @@ async fn sale_actions(
 /// will be refused, never hiding the operator's only path. With
 /// `allow_negative = false` the refusal caveat the endpoint enforces renders
 /// too.
-async fn sale_annul_action(
-    state: &AppState,
-    record: &SaleRecord,
-) -> AppResult<DrawerAction> {
+async fn sale_annul_action(state: &AppState, record: &SaleRecord) -> AppResult<DrawerAction> {
     let sale = &record.sale;
     let mut impact = Vec::new();
     for line in &record.lines {
@@ -683,9 +693,7 @@ async fn sale_annul_action(
             payment.amount, payment.account_name
         ));
     }
-    impact.push(
-        "El documento pasa a Anulado y deja de contar como deuda del cliente.".to_string(),
-    );
+    impact.push("El documento pasa a Anulado y deja de contar como deuda del cliente.".to_string());
     if !state.allow_negative {
         impact.push(
             "Si algún reembolso dejaría una cuenta en negativo, la anulación se rechaza y verás el motivo."
@@ -1180,7 +1188,10 @@ async fn purchase_payment_drawer(
     id: i64,
 ) -> AppResult<DocumentDetailPartial> {
     let payment = state.purchases_service.find_payment(id).await?;
-    let record = state.purchases_service.get_record(payment.purchase_id).await?;
+    let record = state
+        .purchases_service
+        .get_record(payment.purchase_id)
+        .await?;
     let purchase = &record.purchase;
     let view = record
         .payments
@@ -1343,12 +1354,8 @@ async fn receipt_drawer(
         .customer_service
         .get_customer(detail.receipt.customer_id)
         .await?;
-    let (created_by, updated_by) = actor_facts(
-        state,
-        detail.receipt.created_by,
-        detail.receipt.updated_by,
-    )
-    .await?;
+    let (created_by, updated_by) =
+        actor_facts(state, detail.receipt.created_by, detail.receipt.updated_by).await?;
 
     let mut facts = vec![
         DrawerFact::new("Cliente", &customer.name),
@@ -1512,11 +1519,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let account = state
-            .account_service
-            .create(actor, "Caja")
-            .await
-            .unwrap();
+        let account = state.account_service.create(actor, "Caja").await.unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(actor, account.id, "Caja")
@@ -1537,7 +1540,14 @@ mod tests {
     }
 
     async fn seed_sale(state: &AppState, product_id: i64, confirm: bool) -> i64 {
-        seed_sale_typed(state, product_id, confirm, crate::models::PaymentType::Cash, None).await
+        seed_sale_typed(
+            state,
+            product_id,
+            confirm,
+            crate::models::PaymentType::Cash,
+            None,
+        )
+        .await
     }
 
     /// The same fixture with an explicit payment type: the receipt family test
@@ -1566,7 +1576,7 @@ mod tests {
                     notes: None,
                     is_walkin: false,
                     credit_limit: None,
-                    payment_days: None,
+                    due_days: None,
                 },
             )
             .await
@@ -1643,7 +1653,10 @@ mod tests {
             html.contains(&format!("hx-delete=\"/web/sales/{sale}\"")),
             "{html:.800}"
         );
-        assert!(html.contains("hx-post=\"/web/sales/cancel\""), "{html:.800}");
+        assert!(
+            html.contains("hx-post=\"/web/sales/cancel\""),
+            "{html:.800}"
+        );
         assert!(
             html.contains("Nunca se confirmó"),
             "the delete impact must say what a draft never did: {html:.800}"
@@ -1671,8 +1684,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (status, html) =
-            get_drawer(app, &uri, &test_support::cookie_for(&canceller)).await;
+        let (status, html) = get_drawer(app, &uri, &test_support::cookie_for(&canceller)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(html.contains("Descartar"), "{html:.800}");
         assert!(!html.contains("Eliminar borrador"), "{html:.800}");
@@ -1690,9 +1702,14 @@ mod tests {
         let (product, account, method) = seed_sale_kit(&state).await;
         // A CASH confirm pays in full with the method it carries: the drawer
         // then previews exactly one refund Expense for that payment.
-        let sale =
-            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
-                .await;
+        let sale = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Cash,
+            Some(method),
+        )
+        .await;
         let app = crate::routes::router(state);
 
         let (status, html) = get_drawer(
@@ -1741,9 +1758,14 @@ mod tests {
     async fn document_drawer_confirmed_sale_warns_about_an_inactive_product_before_the_refusal() {
         let state = test_state().await;
         let (product, _, method) = seed_sale_kit(&state).await;
-        let sale =
-            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
-                .await;
+        let sale = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Cash,
+            Some(method),
+        )
+        .await;
         state
             .inventory_service
             .set_product_active(audit_actor(&state).await, product, false)
@@ -1762,10 +1784,7 @@ mod tests {
             html.contains("No se puede anular"),
             "the blocker must be visible before the click: {html:.800}"
         );
-        assert!(
-            html.contains("está inactivo"),
-            "{html:.800}"
-        );
+        assert!(html.contains("está inactivo"), "{html:.800}");
         assert!(
             html.contains("Anular"),
             "the action is NOT hidden: the refusal path is still the operator's path"
@@ -1780,9 +1799,14 @@ mod tests {
     async fn document_drawer_confirmed_then_cancelled_sale_offers_no_action() {
         let state = test_state().await;
         let (product, _, method) = seed_sale_kit(&state).await;
-        let sale =
-            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
-                .await;
+        let sale = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Cash,
+            Some(method),
+        )
+        .await;
         state
             .sales_service
             .cancel(
@@ -1843,9 +1867,14 @@ mod tests {
         );
 
         // Confirmed then cancelled: the number proves it → NO delete renders.
-        let annulled_id =
-            seed_sale_typed(&state, product, true, crate::models::PaymentType::Cash, Some(method))
-                .await;
+        let annulled_id = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Cash,
+            Some(method),
+        )
+        .await;
         state
             .sales_service
             .cancel(
@@ -2003,7 +2032,14 @@ mod tests {
         // A credit sale carries debt, so a collection can apply to it; the
         // receipt then creates the payment it groups (with `receipt_id` set),
         // exactly how production links a payment to its receipt.
-        let sale = seed_sale_typed(&state, product, true, crate::models::PaymentType::Credit, None).await;
+        let sale = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Credit,
+            None,
+        )
+        .await;
         let customer_id = state
             .sales_service
             .get_detail(sale)
@@ -2057,7 +2093,10 @@ mod tests {
             html.contains("Asiento"),
             "the ledger entry stays readable as a fact: {html:.800}"
         );
-        assert!(html.contains("Income"), "the entry's kind stays visible: {html:.800}");
+        assert!(
+            html.contains("Income"),
+            "the entry's kind stays visible: {html:.800}"
+        );
         assert!(
             html.contains("Recibo #"),
             "the receipt number stays readable as a fact: {html:.800}"
@@ -2076,10 +2115,20 @@ mod tests {
     async fn document_drawer_receipt_allocation_links_render_only_for_sales_read() {
         let state = test_state().await;
         let (product, _, method) = seed_sale_kit(&state).await;
-        let sale = seed_sale_typed(&state, product, true, crate::models::PaymentType::Credit, None).await;
+        let sale = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Credit,
+            None,
+        )
+        .await;
         let detail = state.sales_service.get_detail(sale).await.unwrap();
         let customer_id = detail.sale.customer_id;
-        let sale_number = detail.sale.sale_number.expect("a confirmed sale has a number");
+        let sale_number = detail
+            .sale
+            .sale_number
+            .expect("a confirmed sale has a number");
         let app = crate::routes::router(state.clone());
         let body = format!("customer_id={customer_id}&method_id={method}&amount=1&date=2024-05-05");
         let req = Request::builder()
@@ -2124,7 +2173,10 @@ mod tests {
             html.contains(&sale_number),
             "the allocation keeps its sale number as text: {html:.800}"
         );
-        assert!(html.contains("Asignaciones"), "the table still renders: {html:.800}");
+        assert!(
+            html.contains("Asignaciones"),
+            "the table still renders: {html:.800}"
+        );
     }
 
     /// T3: the drawer — home of the existing draft delete — offers the delete
@@ -2168,6 +2220,7 @@ mod tests {
                     name: "Drawer Discard Supplier".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -2290,6 +2343,7 @@ mod tests {
                     name: "Drawer Supplier".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -2350,10 +2404,9 @@ mod tests {
         );
 
         // Reader only: no actions.
-        let reader =
-            test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
-                .await
-                .unwrap();
+        let reader = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
         let (status, html) = get_drawer(
             app.clone(),
             &format!("/web/documents/detail/purchase/{}", purchase.id),
@@ -2378,10 +2431,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(html.contains("Anular"), "{html:.800}");
-        assert!(
-            !html.contains("Eliminar borrador"),
-            "{html:.800}"
-        );
+        assert!(!html.contains("Eliminar borrador"), "{html:.800}");
         assert!(
             html.contains("Out · Purchase-return"),
             "the purchase wording differs from the sale's: {html:.800}"
@@ -2425,7 +2475,9 @@ mod tests {
             .unwrap_or_else(|| panic!("table {title:?} is rendered"));
         let rest = &html[start..];
         let rest = &rest[rest.find("<tbody>").expect("the table renders a tbody")..];
-        let rest = &rest[rest.find("<tr class=\"border-t").expect("a data row renders")..];
+        let rest = &rest[rest
+            .find("<tr class=\"border-t")
+            .expect("a data row renders")..];
         let row_end = rest.find("</tr>").expect("the data row closes");
         rest[..row_end].matches("<td").count()
     }
@@ -2501,6 +2553,7 @@ mod tests {
                     name: "Drawer line supplier".into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await

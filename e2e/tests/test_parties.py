@@ -138,7 +138,7 @@ def test_customers_list_shows_names_only(page: Page, api: ApiClient) -> None:
         "List Buyer One",
         phone="555-0199",
         credit_limit="500.00",
-        payment_days=30,
+        due_days=30,
     )
 
     _open_names_list(
@@ -179,7 +179,7 @@ def test_clicking_a_customer_name_opens_the_drawer_with_statement(
         "Drawer Buyer",
         phone="555-0142",
         credit_limit="500.00",
-        payment_days=30,
+        due_days=30,
     )
     sale_id = create_confirmed_credit_sale(
         api, customer_id, product_id, qty="1", unit_price="10.00"
@@ -258,7 +258,7 @@ def test_customer_edit_modal_is_prefilled_and_saves(page: Page, api: ApiClient) 
         "Prefill Buyer",
         phone="555-0120",
         credit_limit="250.00",
-        payment_days=15,
+        due_days=15,
     )
     _open_names_list(
         page,
@@ -537,7 +537,7 @@ def test_design_screenshots_probe(page: Page, api: ApiClient) -> None:
         "Ana Screenshot",
         phone="555-0101",
         credit_limit="500.00",
-        payment_days=30,
+        due_days=30,
     )
     create_confirmed_credit_sale(
         api, customer_id, product_id, qty="1", unit_price="10.00"

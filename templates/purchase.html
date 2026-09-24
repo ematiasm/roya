@@ -47,6 +47,7 @@
     if (dueBlock) dueBlock.hidden = cash;
     if (due) {
       due.required = !cash;
+      due.disabled = cash;
       if (cash) due.value = '';
     }
   }

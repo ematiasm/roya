@@ -1,6 +1,6 @@
 use askama::Template;
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Extension, Form, Path, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Json, Redirect},
     routing::{get, post},
@@ -8,12 +8,12 @@ use axum::{
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{
-    MovementReason, MovementType, NewMovement, NewProduct, Product, ProductKind,
-    ProductStock, ProductSupplierCost, UpdateProduct,
+    MovementReason, MovementType, NewMovement, NewProduct, NewTax, Product, ProductKind,
+    ProductStock, ProductSupplierCost, ProductTaxView, Tax, UpdateProduct, UpdateTax,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, ProductSupplierCostRepository,
@@ -45,6 +45,8 @@ use crate::security::authz::{
 struct ProductsTemplate {
     products: Vec<ProductStock>,
     categories: Vec<crate::models::Category>,
+    taxes: Vec<Tax>,
+    localization: LocalizationContext,
     allow_negative_stock: bool,
     nav_key: &'static str,
     /// Current filter values, so the form reflects a bookmarkable `/products?q=…`.
@@ -58,6 +60,14 @@ struct ProductsTemplate {
 #[template(path = "partials/product_list.html")]
 struct ProductListPartial {
     products: Vec<ProductStock>,
+    localization: LocalizationContext,
+}
+
+#[derive(Template)]
+#[template(path = "partials/tax_list.html")]
+struct TaxListPartial {
+    taxes: Vec<Tax>,
+    localization: LocalizationContext,
 }
 
 /// The server-rendered create-under-filter notice (issue #37). The box lives
@@ -81,6 +91,7 @@ struct StockListPartial {
     /// One row per stock-tracked product with its audit actor resolved to a
     /// display name (see `StockRow` below).
     items: Vec<StockRow>,
+    localization: LocalizationContext,
 }
 
 /// One row of the low/negative stock fragment with its audit actors resolved
@@ -99,12 +110,12 @@ struct StockRow {
 /// name, a SKU, one price and a stock figure, so the wire carries exactly that
 /// instead of the whole `ProductStock` with its nested product.
 ///
-/// The money fields are already in display form. The island renders them
-/// verbatim, so the server keeps the single formatting rule (`money_display`
-/// normalises a stored value up to exactly two decimals) instead of the island
-/// reimplementing it in JS and drifting. `stock` is deliberately NOT normalised:
-/// the fragment renders the raw decimal (`stock {{ ps.stock }}`), so the wire
-/// carries the same raw form and the island shows the same digits.
+/// The money fields are localized display strings produced by the request
+/// context. The island renders them verbatim, so the server keeps the single
+/// formatting rule instead of the island reimplementing it in JS and drifting.
+/// `stock` is formatted with the same request context as the prices, so every
+/// quantity shown by the island follows the business locale without JavaScript
+/// reimplementing number formatting.
 ///
 /// Both prices travel and the island picks by its own context, which is what
 /// keeps the `price` parameter off the request entirely.
@@ -134,19 +145,6 @@ pub struct StaleCostView {
     pub stored: Decimal,
 }
 
-impl StaleCostView {
-    /// Display form of the reference cost, same rule as `Product`'s display
-    /// methods so the two numbers of the gap render consistently.
-    pub fn reference_display(&self) -> String {
-        crate::models::money_display(self.reference)
-    }
-
-    /// Display form of the stored cost, same rule as above.
-    pub fn stored_display(&self) -> String {
-        crate::models::money_display(self.stored)
-    }
-}
-
 /// The product slide-over drawer body: the header with derived stock and the
 /// inline edit form, the per-supplier cost satellite (record/switch preferred)
 /// and the stock movement form. Field names are the template task's contract.
@@ -156,6 +154,7 @@ impl StaleCostView {
 #[derive(Template)]
 #[template(path = "partials/product_detail.html")]
 struct ProductDetailPartial {
+    localization: LocalizationContext,
     product: Product,
     stock: Decimal,
     suggested: Option<Decimal>,
@@ -167,6 +166,8 @@ struct ProductDetailPartial {
     /// when the product has been edited at all.
     updated_by_name: Option<String>,
     categories: Vec<crate::models::Category>,
+    product_taxes: Vec<ProductTaxView>,
+    available_taxes: Vec<Tax>,
     supplier_costs: Vec<ProductCostView>,
     suppliers: Vec<crate::models::Supplier>,
     stale_cost: Option<StaleCostView>,
@@ -208,17 +209,35 @@ async fn filtered_products(
         .await
 }
 
-async fn filtered_list_html(state: &AppState, q: &str, category_id: &str) -> AppResult<String> {
+async fn filtered_list_html(
+    state: &AppState,
+    q: &str,
+    category_id: &str,
+    localization: &LocalizationContext,
+) -> AppResult<String> {
     let products = filtered_products(state, q, category_id).await?;
-    render_product_list(&products)
+    render_product_list(&products, localization)
 }
 
-fn render_product_list(products: &[ProductStock]) -> AppResult<String> {
+fn render_product_list(
+    products: &[ProductStock],
+    localization: &LocalizationContext,
+) -> AppResult<String> {
     ProductListPartial {
         products: products.to_vec(),
+        localization: localization.clone(),
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+async fn tax_list_html(state: &AppState, localization: &LocalizationContext) -> AppResult<String> {
+    TaxListPartial {
+        taxes: state.tax_service.list_taxes().await?,
+        localization: localization.clone(),
+    }
+    .render()
+    .map_err(|error| AppError::Internal(error.to_string()))
 }
 
 /// Whether the body-borne catalogue filter actually constrains the list: a
@@ -277,6 +296,7 @@ async fn products_page(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(q): Query<WebProductFilter>,
 ) -> Result<Html<String>, AppError> {
     let (query, category_id) = q.parsed();
@@ -285,9 +305,12 @@ async fn products_page(
         .filter_products(&query, category_id)
         .await?;
     let categories = state.inventory_service.categories.list().await?;
+    let taxes = state.tax_service.list_taxes().await?;
     let tmpl = ProductsTemplate {
         products,
         categories,
+        taxes,
+        localization,
         allow_negative_stock: state.allow_negative_stock,
         nav_key: "products",
         filter_q: query,
@@ -295,7 +318,8 @@ async fn products_page(
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
@@ -327,6 +351,7 @@ impl WebProductFilter {
 async fn web_product_list(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(q): Query<WebProductFilter>,
 ) -> Result<Html<String>, AppError> {
     let (query, category_id) = q.parsed();
@@ -334,35 +359,55 @@ async fn web_product_list(
         .inventory_service
         .filter_products(&query, category_id)
         .await?;
-    let html = ProductListPartial { products }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let html = ProductListPartial {
+        products,
+        localization: localization.clone(),
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
+}
+
+async fn web_tax_list(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
+) -> AppResult<Html<String>> {
+    Ok(Html(tax_list_html(&state, &localization).await?))
 }
 
 async fn web_low_stock(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
     let items = state.inventory_service.low_stock().await?;
-    let html = stock_list_html(&state, items).await?;
+    let html = stock_list_html(&state, items, localization).await?;
     Ok(Html(html))
 }
 
 async fn web_negative_stock(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
     let items = state.inventory_service.negative_stock().await?;
-    let html = stock_list_html(&state, items).await?;
+    let html = stock_list_html(&state, items, localization).await?;
     Ok(Html(html))
 }
 
 /// Resolve the stock rows' audit actors in the wiring layer and render the
 /// fragment: one statement covers every row, the same way the finance detail
 /// resolves its names.
-async fn stock_list_html(state: &AppState, items: Vec<ProductStock>) -> AppResult<String> {
-    let mut actor_ids = items.iter().map(|ps| ps.product.created_by).collect::<Vec<i64>>();
+async fn stock_list_html(
+    state: &AppState,
+    items: Vec<ProductStock>,
+    localization: LocalizationContext,
+) -> AppResult<String> {
+    let mut actor_ids = items
+        .iter()
+        .map(|ps| ps.product.created_by)
+        .collect::<Vec<i64>>();
     actor_ids.extend(items.iter().filter_map(|ps| ps.product.updated_by));
     let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
     let name_for = |id: i64| names.get(&id).cloned();
@@ -374,9 +419,12 @@ async fn stock_list_html(state: &AppState, items: Vec<ProductStock>) -> AppResul
             ps,
         })
         .collect();
-    StockListPartial { items: rows }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))
+    StockListPartial {
+        items: rows,
+        localization,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))
 }
 
 /// The empty option's label is caller-owned: the catalogue filter says "All
@@ -460,6 +508,7 @@ fn resolve_search_query(params: &ProductSearchQuery) -> String {
 async fn web_product_search_json(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(params): Query<ProductSearchQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let raw = resolve_search_query(&params);
@@ -467,18 +516,18 @@ async fn web_product_search_json(
     let products: Vec<ProductSearchRow> = matches
         .into_iter()
         .map(|ps| {
-            // The same helpers the fragment calls, so the island's verbatim
-            // render cannot differ from today's markup. Computed before the
-            // fields are moved out of `ps.product`, which the borrow needs.
-            let sale_price = ps.product.sale_price_display();
-            let cost_price = ps.product.cost_price_display();
+            // This is the static island's presentation boundary, not the JSON
+            // API. Keep its existing string fields, but format them from the
+            // same request context as HTML and HTMX.
+            let sale_price = localization.format_currency(ps.product.sale_price);
+            let cost_price = localization.format_currency(ps.product.cost_price);
             ProductSearchRow {
                 id: ps.product.id,
                 name: ps.product.name,
                 sku: ps.product.sku,
                 sale_price,
                 cost_price,
-                stock: ps.stock.to_string(),
+                stock: localization.format_quantity(ps.stock),
             }
         })
         .collect();
@@ -494,9 +543,10 @@ async fn web_product_detail(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     _: Require<PurchasesCostsRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
-    product_detail_html(&state, id).await
+    product_detail_html(&state, id, &localization).await
 }
 
 /// The drawer body with fresh derived data. The detail read and every mutating
@@ -505,9 +555,15 @@ async fn web_product_detail(
 /// HERE, in the wiring layer, because a department may not read identity
 /// tables (AC20) and the view must show a name, never an id — the same way
 /// the finance detail does it.
-async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
+async fn product_detail_html(
+    state: &AppState,
+    id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<Html<String>> {
     let ps = state.inventory_service.product_stock(id).await?;
     let categories = state.inventory_service.categories.list().await?;
+    let product_taxes = state.tax_service.list_product_taxes(id).await?;
+    let available_taxes = state.tax_service.list_active_taxes_excluding(id).await?;
     let suppliers = state.supplier_service.list_suppliers().await?;
     let costs = state.supplier_service.costs.list_by_product(id).await?;
     let supplier_costs = costs
@@ -518,7 +574,10 @@ async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String
                 .find(|s| s.id == cost.supplier_id)
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| format!("supplier #{}", cost.supplier_id));
-            ProductCostView { cost, supplier_name }
+            ProductCostView {
+                cost,
+                supplier_name,
+            }
         })
         .collect();
     let mut actor_ids = vec![ps.product.created_by];
@@ -527,13 +586,16 @@ async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String
     let name_for = |id: i64| names.get(&id).cloned();
     let created_by_name = name_for(ps.product.created_by);
     let updated_by_name = ps.product.updated_by.and_then(name_for);
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = localization.today_iso();
     // Derived, never stored (cost-freshness S1): the supplier reference cost
     // disagrees with the stored cost only when there IS a supplier truth to
     // compare against (no rows ⇒ the product column IS the truth), the stored
     // cost was ever recorded (0 is the NOT NULL DEFAULT, "no cost yet", not a
     // cost), and the two genuinely differ (equal ⇒ fresh).
-    let stale_cost = match (state.supplier_service.reference_cost(id).await?, ps.product.cost_price != Decimal::ZERO) {
+    let stale_cost = match (
+        state.supplier_service.reference_cost(id).await?,
+        ps.product.cost_price != Decimal::ZERO,
+    ) {
         (Some(r), true) if r != ps.product.cost_price => Some(StaleCostView {
             reference: r,
             stored: ps.product.cost_price,
@@ -541,12 +603,15 @@ async fn product_detail_html(state: &AppState, id: i64) -> AppResult<Html<String
         _ => None,
     };
     let html = ProductDetailPartial {
+        localization: localization.clone(),
         product: ps.product,
         stock: ps.stock,
         suggested: ps.suggested,
         created_by_name,
         updated_by_name,
         categories,
+        product_taxes,
+        available_taxes,
         supplier_costs,
         suppliers,
         stale_cost,
@@ -703,6 +768,26 @@ pub struct ProductIdForm {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TaxForm {
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub code: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub rate: String,
+    #[serde(default)]
+    pub is_active: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProductTaxForm {
+    pub product_id: i64,
+    pub tax_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct CreateMovementForm {
     pub product_id: i64,
     #[serde(rename = "type")]
@@ -723,14 +808,21 @@ pub struct CreateMovementForm {
     pub category_id: String,
 }
 
-fn parse_opt_decimal(s: &str) -> AppResult<Option<Decimal>> {
+fn parse_opt_decimal(s: &str, localization: &LocalizationContext) -> AppResult<Option<Decimal>> {
     let t = s.trim();
     if t.is_empty() {
         return Ok(None);
     }
-    Decimal::from_str(t)
+    localization
+        .parse_decimal(t)
         .map(Some)
         .map_err(|_| AppError::Validation(format!("invalid decimal: {s}")))
+}
+
+fn checkbox_is_checked(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true")
+    })
 }
 
 fn parse_opt_i64(s: &str) -> AppResult<Option<i64>> {
@@ -768,22 +860,22 @@ async fn web_create_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CreateProductForm>,
 ) -> Result<axum::response::Response, AppError> {
     let kind: ProductKind = if form.kind.trim().is_empty() {
         ProductKind::Product
     } else {
-        form.kind
-            .parse()
-            .map_err(AppError::Validation)?
+        form.kind.parse().map_err(AppError::Validation)?
     };
     // The markup is parsed BEFORE the price gate: the gate now depends on it.
     let markup_pct = if form.markup_pct.trim().is_empty() {
         None
     } else {
         Some(
-            Decimal::from_str(form.markup_pct.trim())
+            localization
+                .parse_decimal(form.markup_pct.trim())
                 .map_err(|_| AppError::Validation("invalid markup_pct".into()))?,
         )
     };
@@ -797,13 +889,15 @@ async fn web_create_product(
         }
         Decimal::ZERO
     } else {
-        Decimal::from_str(form.sale_price.trim())
+        localization
+            .parse_decimal(form.sale_price.trim())
             .map_err(|_| AppError::Validation("invalid sale_price".into()))?
     };
     let cost_price = if form.cost_price.trim().is_empty() {
         Decimal::ZERO
     } else {
-        Decimal::from_str(form.cost_price.trim())
+        localization
+            .parse_decimal(form.cost_price.trim())
             .map_err(|_| AppError::Validation("invalid cost_price".into()))?
     };
     // Checkbox: present means checked (value "1"/"on"/"true"); absent means false.
@@ -825,8 +919,8 @@ async fn web_create_product(
         sale_price,
         cost_price,
         track_stock,
-        min_stock: parse_opt_decimal(&form.min_stock)?,
-        max_stock: parse_opt_decimal(&form.max_stock)?,
+        min_stock: parse_opt_decimal(&form.min_stock, &localization)?,
+        max_stock: parse_opt_decimal(&form.max_stock, &localization)?,
         location: if form.location.trim().is_empty() {
             None
         } else {
@@ -841,7 +935,10 @@ async fn web_create_product(
         // in the service; `None` (empty field) keeps the price manual.
         markup_pct: markup_pct,
     };
-    let created = state.inventory_service.create_product(principal.user_id, input).await?;
+    let created = state
+        .inventory_service
+        .create_product(principal.user_id, input)
+        .await?;
     if is_htmx(&headers) {
         // The answer is the list the caller is looking at: the filter rides the
         // body via `hx-include="#product-filters"` (issue #37), so an active
@@ -858,7 +955,7 @@ async fn web_create_product(
         // against the form values, and only when the filter actually filters.
         let hidden = body_filter_is_active(&form.q, &form.category_id)
             && !products.iter().any(|p| p.product.id == created.id);
-        let mut html = render_product_list(&products)?;
+        let mut html = render_product_list(&products, &localization)?;
         if hidden {
             // Prepended so the out-of-band notice opens the answer body; htmx
             // removes the wrapper from the main swap either way. The
@@ -874,15 +971,147 @@ async fn web_create_product(
     Ok(Redirect::to("/products").into_response())
 }
 
+async fn web_create_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
+    headers: HeaderMap,
+    Form(form): Form<TaxForm>,
+) -> AppResult<axum::response::Response> {
+    let rate = localization
+        .parse_decimal(&form.rate)
+        .map_err(|_| AppError::Validation("invalid tax rate".into()))?;
+    state
+        .tax_service
+        .create_tax(
+            principal.user_id,
+            NewTax {
+                code: form.code,
+                name: form.name,
+                rate,
+                is_active: true,
+            },
+        )
+        .await?;
+    tax_mutation_response(&state, &headers, &localization).await
+}
+
+async fn web_edit_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
+    headers: HeaderMap,
+    Form(form): Form<TaxForm>,
+) -> AppResult<axum::response::Response> {
+    let id = form
+        .id
+        .ok_or_else(|| AppError::Validation("tax id is required".into()))?;
+    let rate = localization
+        .parse_decimal(&form.rate)
+        .map_err(|_| AppError::Validation("invalid tax rate".into()))?;
+    state
+        .tax_service
+        .update_tax(
+            principal.user_id,
+            id,
+            UpdateTax {
+                code: Some(form.code),
+                name: Some(form.name),
+                rate: Some(rate),
+                is_active: Some(checkbox_is_checked(form.is_active.as_deref())),
+            },
+        )
+        .await?;
+    tax_mutation_response(&state, &headers, &localization).await
+}
+
+async fn web_deactivate_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
+    headers: HeaderMap,
+    Form(form): Form<TaxForm>,
+) -> AppResult<axum::response::Response> {
+    let id = form
+        .id
+        .ok_or_else(|| AppError::Validation("tax id is required".into()))?;
+    state
+        .tax_service
+        .deactivate_tax(principal.user_id, id)
+        .await?;
+    tax_mutation_response(&state, &headers, &localization).await
+}
+
+async fn tax_mutation_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    localization: &LocalizationContext,
+) -> AppResult<axum::response::Response> {
+    if is_htmx(headers) {
+        return Ok(triggered(
+            tax_list_html(state, localization).await?,
+            "taxes-changed",
+        ));
+    }
+    Ok(Redirect::to("/products").into_response())
+}
+
+async fn web_link_product_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
+    headers: HeaderMap,
+    Form(form): Form<ProductTaxForm>,
+) -> AppResult<axum::response::Response> {
+    state
+        .tax_service
+        .link_product_tax(principal.user_id, form.product_id, form.tax_id)
+        .await?;
+    product_tax_mutation_response(&state, &headers, form.product_id, &localization).await
+}
+
+async fn web_unlink_product_tax(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    Extension(localization): Extension<LocalizationContext>,
+    headers: HeaderMap,
+    Form(form): Form<ProductTaxForm>,
+) -> AppResult<axum::response::Response> {
+    state
+        .tax_service
+        .unlink_product_tax(form.product_id, form.tax_id)
+        .await?;
+    product_tax_mutation_response(&state, &headers, form.product_id, &localization).await
+}
+
+async fn product_tax_mutation_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    product_id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<axum::response::Response> {
+    if is_htmx(headers) {
+        let html = product_detail_html(state, product_id, localization).await?;
+        return Ok(triggered(html.0, "product-taxes-changed"));
+    }
+    Ok(Redirect::to("/products").into_response())
+}
+
 async fn web_create_movement(
     State(state): State<AppState>,
     _: Require<InventoryStockWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CreateMovementForm>,
 ) -> Result<axum::response::Response, AppError> {
     let movement_type: MovementType = form.kind.parse().map_err(AppError::Validation)?;
-    let qty = Decimal::from_str(form.qty.trim())
+    let qty = localization
+        .parse_decimal(form.qty.trim())
         .map_err(|_| AppError::Validation("invalid qty".into()))?;
     let reason: MovementReason = if form.reason.trim().is_empty() {
         MovementReason::Initial
@@ -890,7 +1119,10 @@ async fn web_create_movement(
         form.reason.parse().map_err(AppError::Validation)?
     };
     let date = if form.date.trim().is_empty() {
-        chrono::Local::now().date_naive()
+        localization
+            .today_iso()
+            .parse()
+            .map_err(|_| AppError::Internal("invalid localized date".into()))?
     } else {
         form.date
             .trim()
@@ -905,7 +1137,10 @@ async fn web_create_movement(
         reference: form.reference.trim().to_string(),
         date,
     };
-    state.inventory_service.record_movement(principal.user_id, input).await?;
+    state
+        .inventory_service
+        .record_movement(principal.user_id, input)
+        .await?;
     if is_htmx(&headers) {
         // Drawer submissions target `#product-drawer-body`: answer the fresh
         // detail fragment (stock and header reloaded) and keep the existing
@@ -917,13 +1152,14 @@ async fn web_create_movement(
             .map(|v| v.contains("product-drawer-body"))
             .unwrap_or(false);
         if from_drawer {
-            let html = product_detail_html(&state, form.product_id).await?;
+            let html = product_detail_html(&state, form.product_id, &localization).await?;
             return Ok(triggered(html.0, "movement-created"));
         }
         // Non-drawer callers get the list they are looking at (issue #37): the
         // filter rides the body via `hx-include="#product-filters"`.
         let mut resp =
-            Html(filtered_list_html(&state, &form.q, &form.category_id).await?).into_response();
+            Html(filtered_list_html(&state, &form.q, &form.category_id, &localization).await?)
+                .into_response();
         resp.headers_mut()
             .insert("HX-Trigger", "movement-created".parse().unwrap());
         return Ok(resp);
@@ -939,6 +1175,7 @@ async fn web_edit_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Query(filter): Query<WebProductFilter>,
     Form(form): Form<EditProductForm>,
@@ -953,7 +1190,8 @@ async fn web_edit_product(
         None
     } else {
         Some(
-            Decimal::from_str(form.markup_pct.trim())
+            localization
+                .parse_decimal(form.markup_pct.trim())
                 .map_err(|_| AppError::Validation("invalid markup_pct".into()))?,
         )
     };
@@ -967,13 +1205,15 @@ async fn web_edit_product(
         }
         Decimal::ZERO
     } else {
-        Decimal::from_str(form.sale_price.trim())
+        localization
+            .parse_decimal(form.sale_price.trim())
             .map_err(|_| AppError::Validation("invalid sale_price".into()))?
     };
     let cost_price = if form.cost_price.trim().is_empty() {
         Decimal::ZERO
     } else {
-        Decimal::from_str(form.cost_price.trim())
+        localization
+            .parse_decimal(form.cost_price.trim())
             .map_err(|_| AppError::Validation("invalid cost_price".into()))?
     };
     // Checkbox: present means checked; absent means false, like creation.
@@ -995,22 +1235,18 @@ async fn web_edit_product(
         sale_price: Some(sale_price),
         cost_price: Some(cost_price),
         track_stock: Some(track_stock),
-        min_stock: Some(parse_opt_decimal(&form.min_stock)?),
-        max_stock: Some(parse_opt_decimal(&form.max_stock)?),
-        location: Some(
-            if form.location.trim().is_empty() {
-                None
-            } else {
-                Some(form.location)
-            },
-        ),
-        notes: Some(
-            if form.notes.trim().is_empty() {
-                None
-            } else {
-                Some(form.notes)
-            },
-        ),
+        min_stock: Some(parse_opt_decimal(&form.min_stock, &localization)?),
+        max_stock: Some(parse_opt_decimal(&form.max_stock, &localization)?),
+        location: Some(if form.location.trim().is_empty() {
+            None
+        } else {
+            Some(form.location)
+        }),
+        notes: Some(if form.notes.trim().is_empty() {
+            None
+        } else {
+            Some(form.notes)
+        }),
         // The drawer always sends the field: an empty markup is an explicit
         // clear back to a manual price (`Some(None)`); a value re-derives the
         // price from the cost.
@@ -1027,7 +1263,7 @@ async fn web_edit_product(
             .map(|v| v.contains("product-drawer-body"))
             .unwrap_or(false);
         if from_drawer {
-            let html = product_detail_html(&state, form.id).await?;
+            let html = product_detail_html(&state, form.id, &localization).await?;
             // Two events with distinct jobs: `product-changed` (pre-swap)
             // refreshes the lists, `product-saved` closes the drawer. The close
             // must fire after the swap so the `htmx:afterSwap` open cannot
@@ -1047,9 +1283,12 @@ async fn web_edit_product(
             .inventory_service
             .filter_products(&query, category_id)
             .await?;
-        let html = ProductListPartial { products }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let html = ProductListPartial {
+            products,
+            localization: localization.clone(),
+        }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
         return Ok(triggered(html, "product-changed"));
     }
     Ok(Redirect::to("/products").into_response())
@@ -1062,13 +1301,18 @@ async fn web_record_product_cost(
     State(state): State<AppState>,
     _: Require<PurchasesCostsWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<RecordProductCostForm>,
 ) -> Result<axum::response::Response, AppError> {
-    let cost = Decimal::from_str(form.cost.trim())
+    let cost = localization
+        .parse_decimal(form.cost.trim())
         .map_err(|_| AppError::Validation("invalid cost".into()))?;
     let date = if form.date.trim().is_empty() {
-        chrono::Local::now().date_naive()
+        localization
+            .today_iso()
+            .parse()
+            .map_err(|_| AppError::Internal("invalid localized date".into()))?
     } else {
         form.date
             .trim()
@@ -1077,7 +1321,13 @@ async fn web_record_product_cost(
     };
     state
         .supplier_service
-        .record_cost(principal.user_id, form.product_id, form.supplier_id, cost, date)
+        .record_cost(
+            principal.user_id,
+            form.product_id,
+            form.supplier_id,
+            cost,
+            date,
+        )
         .await?;
     if is_htmx(&headers) {
         let from_drawer = headers
@@ -1086,12 +1336,12 @@ async fn web_record_product_cost(
             .map(|v| v.contains("product-drawer-body"))
             .unwrap_or(false);
         if from_drawer {
-            let html = product_detail_html(&state, form.product_id).await?;
+            let html = product_detail_html(&state, form.product_id, &localization).await?;
             return Ok(triggered(html.0, "product-cost-recorded"));
         }
         // Non-drawer callers get the list they are looking at (issue #37): the
         // filter rides the body via `hx-include="#product-filters"`.
-        let html = filtered_list_html(&state, &form.q, &form.category_id).await?;
+        let html = filtered_list_html(&state, &form.q, &form.category_id, &localization).await?;
         return Ok(triggered(html, "product-cost-recorded"));
     }
     Ok(Redirect::to("/products").into_response())
@@ -1103,6 +1353,7 @@ async fn web_set_preferred_cost(
     State(state): State<AppState>,
     _: Require<PurchasesCostsWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<PreferredCostForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -1117,12 +1368,12 @@ async fn web_set_preferred_cost(
             .map(|v| v.contains("product-drawer-body"))
             .unwrap_or(false);
         if from_drawer {
-            let html = product_detail_html(&state, form.product_id).await?;
+            let html = product_detail_html(&state, form.product_id, &localization).await?;
             return Ok(triggered(html.0, "product-cost-recorded"));
         }
         // Non-drawer callers get the list they are looking at (issue #37): the
         // filter rides the body via `hx-include="#product-filters"`.
-        let html = filtered_list_html(&state, &form.q, &form.category_id).await?;
+        let html = filtered_list_html(&state, &form.q, &form.category_id, &localization).await?;
         return Ok(triggered(html, "product-cost-recorded"));
     }
     Ok(Redirect::to("/products").into_response())
@@ -1135,6 +1386,7 @@ async fn web_activate_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -1142,13 +1394,14 @@ async fn web_activate_product(
         .inventory_service
         .set_product_active(principal.user_id, form.product_id, true)
         .await?;
-    product_lifecycle_response(&state, &headers, &form).await
+    product_lifecycle_response(&state, &headers, &form, &localization).await
 }
 
 async fn web_deactivate_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
@@ -1156,17 +1409,21 @@ async fn web_deactivate_product(
         .inventory_service
         .set_product_active(principal.user_id, form.product_id, false)
         .await?;
-    product_lifecycle_response(&state, &headers, &form).await
+    product_lifecycle_response(&state, &headers, &form, &localization).await
 }
 
 async fn web_delete_product(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<ProductIdForm>,
 ) -> Result<axum::response::Response, AppError> {
-    state.inventory_service.delete_product(form.product_id).await?;
-    product_lifecycle_response(&state, &headers, &form).await
+    state
+        .inventory_service
+        .delete_product(form.product_id)
+        .await?;
+    product_lifecycle_response(&state, &headers, &form, &localization).await
 }
 
 /// The shared answer for the lifecycle actions: list fragment + trigger for
@@ -1178,6 +1435,7 @@ async fn product_lifecycle_response(
     state: &AppState,
     headers: &HeaderMap,
     form: &ProductIdForm,
+    localization: &LocalizationContext,
 ) -> Result<axum::response::Response, AppError> {
     if is_htmx(headers) {
         // The same lenient parsing as the page: empty strings mean "no
@@ -1191,9 +1449,12 @@ async fn product_lifecycle_response(
             .inventory_service
             .filter_products(&query, category_id)
             .await?;
-        let html = ProductListPartial { products }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        let html = ProductListPartial {
+            products,
+            localization: localization.clone(),
+        }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
         return Ok(triggered(html, "product-changed"));
     }
     Ok(Redirect::to("/products").into_response())
@@ -1207,6 +1468,11 @@ pub fn router() -> Router<AppState> {
             get(web_product_list).post(web_create_product),
         )
         .route("/web/categories", post(web_create_category))
+        .route("/web/taxes", get(web_tax_list).post(web_create_tax))
+        .route("/web/taxes/edit", post(web_edit_tax))
+        .route("/web/taxes/deactivate", post(web_deactivate_tax))
+        .route("/web/product-taxes", post(web_link_product_tax))
+        .route("/web/product-taxes/unlink", post(web_unlink_product_tax))
         .route("/web/category-options", get(web_category_options))
         .route("/web/product-options", get(web_product_options))
         .route("/web/product-search.json", get(web_product_search_json))
@@ -1401,20 +1667,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "DRAWER-GATE".into(),
-                name: "drawer gate prod".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(10),
-                cost_price: Decimal::from(5),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "DRAWER-GATE".into(),
+                    name: "drawer gate prod".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(10),
+                    cost_price: Decimal::from(5),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state.clone());
@@ -1513,10 +1780,9 @@ mod tests {
     //    the happy paths; the probe is a second session built for this set.
 
     async fn inventory_read_only_probe(state: &AppState) -> String {
-        let token =
-            test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
-                .await
-                .unwrap();
+        let token = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+            .await
+            .unwrap();
         test_support::cookie_for(&token)
     }
 
@@ -1553,7 +1819,11 @@ mod tests {
         );
 
         // The refusal writes nothing: the product keeps its stored name.
-        let after = state.inventory_service.get_product(product.id).await.unwrap();
+        let after = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
         assert_eq!(after.name, "prod EDIT-GATE");
         assert_eq!(after.sku, "EDIT-GATE");
     }
@@ -1611,8 +1881,15 @@ mod tests {
                 .contains("inventory.write"),
             "the HTMX refusal must name inventory.write: {json}"
         );
-        let after = state.inventory_service.get_product(product.id).await.unwrap();
-        assert!(after.is_active, "a refused deactivate must not flip the flag");
+        let after = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
+        assert!(
+            after.is_active,
+            "a refused deactivate must not flip the flag"
+        );
     }
 
     /// Delete as a plain browser post: the full-page refusal card, and the
@@ -1726,7 +2003,10 @@ mod tests {
             html.contains("Products") || html.contains("products"),
             "page should mention products"
         );
-        assert!(html.contains("Low Stock"), "page should have low-stock section");
+        assert!(
+            html.contains("Low Stock"),
+            "page should have low-stock section"
+        );
     }
 
     #[tokio::test]
@@ -1762,7 +2042,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let (status, html) = get_html(app, "/web/products").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("WEB-1"), "fragment should contain new sku: {html:.300}");
+        assert!(
+            html.contains("WEB-1"),
+            "fragment should contain new sku: {html:.300}"
+        );
     }
 
     // -- N4: the picker search fragment ---------------------------------------
@@ -1776,20 +2059,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "PICK-1".into(),
-                name: "Yerba Picker".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(10),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "PICK-1".into(),
+                    name: "Yerba Picker".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         state
@@ -1824,11 +2108,10 @@ mod tests {
             assert_eq!(row["sku"], "PICK-1", "{needle}: {json}");
 
             // The island renders these strings verbatim, so they must be the
-            // display form and not a raw decimal: `money_display` normalises a
-            // stored value up to exactly two decimals, so a raw "25" would
-            // render "$25" where the fragment shows "$25.00".
-            assert_eq!(row["sale_price"], "25.00", "{needle}: {json}");
-            assert_eq!(row["cost_price"], "10.00", "{needle}: {json}");
+            // request's display form rather than canonical API decimals. The
+            // pre-setup fallback is USD and the stored scale is preserved.
+            assert_eq!(row["sale_price"], "25 USD", "{needle}: {json}");
+            assert_eq!(row["cost_price"], "10 USD", "{needle}: {json}");
 
             let stock = row["stock"].as_str().expect("stock as string");
             assert_eq!(stock.parse::<f64>().unwrap(), 0.0, "{needle}: {json}");
@@ -1836,9 +2119,9 @@ mod tests {
     }
 
     // Deleted with the HTML route (T4c): `n5_product_search_json_money_is_the_fragments_display_form`
-    // pinned the wire money against that fragment. The display form is now pinned
-    // literally by `n5_product_search_json_matches_name_sku_and_barcode` and exactly
-    // by e2e `test_picker.py`'s full-row assertion ("HARNESS-WIDGET • $25.00 • stock 5").
+    // pinned the wire money against that fragment. The request-localized display
+    // form is now pinned literally by
+    // `n5_product_search_json_matches_name_sku_and_barcode`.
 
     /// N5 negative: an empty query returns no products, not the catalogue. The
     /// island renders the empty state from this, so a catalogue dump here would
@@ -1966,11 +2249,7 @@ mod tests {
         let status = resp.status();
         let headers = resp.headers().clone();
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        (
-            status,
-            headers,
-            String::from_utf8_lossy(&bytes).to_string(),
-        )
+        (status, headers, String::from_utf8_lossy(&bytes).to_string())
     }
 
     async fn seed_tracked_product(state: &AppState, sku: &str) -> crate::models::Product {
@@ -1979,20 +2258,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: sku.into(),
-                name: format!("prod {sku}"),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::from(2)),
-                max_stock: Some(Decimal::from(50)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: sku.into(),
+                    name: format!("prod {sku}"),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::from(2)),
+                    max_stock: Some(Decimal::from(50)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap()
     }
@@ -2021,27 +2301,33 @@ mod tests {
             .record_movement(
                 audit_actor_id(&state).await,
                 crate::models::NewMovement {
-                product_id: product.id,
-                qty: Decimal::from(5),
-                movement_type: crate::models::MovementType::In,
-                reason: crate::models::MovementReason::Initial,
-                reference: String::new(),
-                date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
-            })
+                    product_id: product.id,
+                    qty: Decimal::from(5),
+                    movement_type: crate::models::MovementType::In,
+                    reason: crate::models::MovementReason::Initial,
+                    reference: String::new(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                },
+            )
             .await
             .unwrap();
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor_id(&state).await, NewSupplier {
-                name: "Detail Sup".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor_id(&state).await,
+                NewSupplier {
+                    name: "Detail Sup".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         state
             .supplier_service
-            .record_cost(audit_actor_id(&state).await, 
+            .record_cost(
+                audit_actor_id(&state).await,
                 product.id,
                 supplier.id,
                 Decimal::from_str("12.50").unwrap(),
@@ -2056,8 +2342,7 @@ mod tests {
             .unwrap();
 
         let app = crate::routes::router(state);
-        let (status, html) =
-            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         for expected in [
             "product-detail-inner",
@@ -2067,7 +2352,10 @@ mod tests {
             "12.50",
             "preferred",
         ] {
-            assert!(html.contains(expected), "drawer must show {expected}: {html:.900}");
+            assert!(
+                html.contains(expected),
+                "drawer must show {expected}: {html:.900}"
+            );
         }
 
         // The global notice region labels its success/error messages with the
@@ -2075,7 +2363,12 @@ mod tests {
         // silent UX regression: every HTTP-status test still sees 200 and only
         // the toast text degrades. Pin the exact three labels and forbid any
         // other `data-action` in the fragment.
-        for label in ["Save product", "Record product cost", "Record movement"] {
+        for label in [
+            "Save product",
+            "Link product tax",
+            "Record product cost",
+            "Record movement",
+        ] {
             let attr = format!("data-action=\"{label}\"");
             assert_eq!(
                 html.matches(&attr).count(),
@@ -2085,7 +2378,7 @@ mod tests {
         }
         assert_eq!(
             html.matches("data-action=").count(),
-            3,
+            4,
             "no other data-action labels may appear in the drawer fragment: {html:.900}"
         );
 
@@ -2147,6 +2440,7 @@ mod tests {
                     name: supplier_name.into(),
                     phone: None,
                     notes: None,
+                    due_days: None,
                 },
             )
             .await
@@ -2178,14 +2472,19 @@ mod tests {
     async fn web_product_detail_shows_stale_cost_badge_when_reference_differs_stored() {
         let state = test_state().await;
         let product = seed_product_with_cost(&state, "STALE-1", Decimal::from(5)).await;
-        seed_supplier_cost(&state, product.id, "Stale Sup", Decimal::from_str("12.50").unwrap(), true)
-            .await;
+        seed_supplier_cost(
+            &state,
+            product.id,
+            "Stale Sup",
+            Decimal::from_str("12.50").unwrap(),
+            true,
+        )
+        .await;
 
         let app = crate::routes::router(state);
-        let (status, html) =
-            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
-        for expected in ["stale cost", "reference $12.50", "stored $5.00"] {
+        for expected in ["stale cost", "reference 12.50 USD", "stored 5 USD"] {
             assert!(
                 html.contains(expected),
                 "stale badge must show {expected}: {html:.900}"
@@ -2201,8 +2500,7 @@ mod tests {
         seed_supplier_cost(&state, product.id, "Fresh Sup", Decimal::from(5), true).await;
 
         let app = crate::routes::router(state);
-        let (status, html) =
-            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
             !html.contains("stale cost"),
@@ -2218,8 +2516,7 @@ mod tests {
         let product = seed_product_with_cost(&state, "STALE-3", Decimal::from(5)).await;
 
         let app = crate::routes::router(state);
-        let (status, html) =
-            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
             !html.contains("stale cost"),
@@ -2234,12 +2531,17 @@ mod tests {
     async fn web_product_detail_hides_stale_cost_badge_when_stored_cost_is_zero() {
         let state = test_state().await;
         let product = seed_product_with_cost(&state, "STALE-4", Decimal::ZERO).await;
-        seed_supplier_cost(&state, product.id, "Zero-Cost Sup", Decimal::from_str("12.50").unwrap(), true)
-            .await;
+        seed_supplier_cost(
+            &state,
+            product.id,
+            "Zero-Cost Sup",
+            Decimal::from_str("12.50").unwrap(),
+            true,
+        )
+        .await;
 
         let app = crate::routes::router(state);
-        let (status, html) =
-            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
             !html.contains("stale cost"),
@@ -2257,15 +2559,14 @@ mod tests {
         seed_supplier_cost(&state, product.id, "Preferred Sup", Decimal::from(20), true).await;
 
         let app = crate::routes::router(state);
-        let (status, html) =
-            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
-            html.contains("reference $20.00"),
+            html.contains("reference 20 USD"),
             "badge must show the preferred supplier's cost: {html:.900}"
         );
         assert!(
-            !html.contains("reference $8.00"),
+            !html.contains("reference 8 USD"),
             "badge must not fall back to the cheapest row: {html:.900}"
         );
     }
@@ -2339,16 +2640,12 @@ mod tests {
         // carries the product's own `category_id`, so the keys would collide.
         let cat_a = state
             .inventory_service
-            .create_category(
-                audit_actor_id(&state).await,
-                "Edit Cat A", None)
+            .create_category(audit_actor_id(&state).await, "Edit Cat A", None)
             .await
             .unwrap();
         let cat_b = state
             .inventory_service
-            .create_category(
-                audit_actor_id(&state).await,
-                "Edit Cat B", None)
+            .create_category(audit_actor_id(&state).await, "Edit Cat B", None)
             .await
             .unwrap();
         let _other = state
@@ -2356,20 +2653,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "EDIT-OTHER".into(),
-                name: "other EDIT-OTHER".into(),
-                kind: ProductKind::Product,
-                category_id: Some(cat_b.id),
-                unit: "un".into(),
-                sale_price: Decimal::from(10),
-                cost_price: Decimal::from(2),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "EDIT-OTHER".into(),
+                    name: "other EDIT-OTHER".into(),
+                    kind: ProductKind::Product,
+                    category_id: Some(cat_b.id),
+                    unit: "un".into(),
+                    sale_price: Decimal::from(10),
+                    cost_price: Decimal::from(2),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         // The body keeps the product in cat_a so the query filter can select it.
@@ -2439,9 +2737,7 @@ mod tests {
         let state = test_state().await;
         let category = state
             .inventory_service
-            .create_category(
-                audit_actor_id(&state).await,
-                "Clear Cat", None)
+            .create_category(audit_actor_id(&state).await, "Clear Cat", None)
             .await
             .unwrap();
         let product = state
@@ -2449,20 +2745,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "CLEAR-1".into(),
-                name: "clearable prod".into(),
-                kind: ProductKind::Product,
-                category_id: Some(category.id),
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::from(2)),
-                max_stock: Some(Decimal::from(50)),
-                location: Some("shelf 3".into()),
-                notes: Some("fragile".into()),
-                markup_pct: None,
-            })
+                    sku: "CLEAR-1".into(),
+                    name: "clearable prod".into(),
+                    kind: ProductKind::Product,
+                    category_id: Some(category.id),
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::from(2)),
+                    max_stock: Some(Decimal::from(50)),
+                    location: Some("shelf 3".into()),
+                    notes: Some("fragile".into()),
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -2590,7 +2887,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.600}");
 
-        let stored = state.inventory_service.get_product(product.id).await.unwrap();
+        let stored = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
         assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
         assert_eq!(stored.markup_pct, Some(Decimal::from(100)));
     }
@@ -2608,22 +2909,23 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "EDIT-MKCLR".into(),
-                name: "markup to clear".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                // Deliberately absurd: with a markup the request price must be
-                // ignored, so a stored 10 proves the derivation happened.
-                sale_price: Decimal::from(999),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::from(2)),
-                max_stock: Some(Decimal::from(50)),
-                location: None,
-                notes: None,
-                markup_pct: Some(Decimal::from(100)),
-            })
+                    sku: "EDIT-MKCLR".into(),
+                    name: "markup to clear".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    // Deliberately absurd: with a markup the request price must be
+                    // ignored, so a stored 10 proves the derivation happened.
+                    sale_price: Decimal::from(999),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::from(2)),
+                    max_stock: Some(Decimal::from(50)),
+                    location: None,
+                    notes: None,
+                    markup_pct: Some(Decimal::from(100)),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(product.sale_price, Decimal::from_str("10").unwrap());
@@ -2644,9 +2946,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.600}");
 
-        let stored = state.inventory_service.get_product(product.id).await.unwrap();
-        assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap(), "the last price survives the clear");
-        assert_eq!(stored.markup_pct, None, "an empty markup field clears back to manual");
+        let stored = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.sale_price,
+            Decimal::from_str("10").unwrap(),
+            "the last price survives the clear"
+        );
+        assert_eq!(
+            stored.markup_pct, None,
+            "an empty markup field clears back to manual"
+        );
         assert!(
             !html.contains("readonly"),
             "the manual price must not render readonly again: {html:.600}"
@@ -2680,7 +2993,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.600}");
-        let stored = state.inventory_service.get_product(product.id).await.unwrap();
+        let stored = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
         assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
         assert_eq!(stored.markup_pct, Some(Decimal::from(100)));
 
@@ -2695,7 +3012,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{html:.600}");
         assert!(html.contains("sale_price is required"), "{html:.400}");
-        let stored = state.inventory_service.get_product(product.id).await.unwrap();
+        let stored = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
         assert_eq!(stored.sale_price, Decimal::from_str("10").unwrap());
         assert_eq!(stored.markup_pct, Some(Decimal::from(100)));
     }
@@ -2712,25 +3033,25 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "DRAW-MK".into(),
-                name: "drawer markup".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(999),
-                cost_price: Decimal::from(8),
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: Some(Decimal::from(25)),
-            })
+                    sku: "DRAW-MK".into(),
+                    name: "drawer markup".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(999),
+                    cost_price: Decimal::from(8),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: Some(Decimal::from(25)),
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state);
-        let (status, html) =
-            get_html(app, &format!("/web/products/detail/{}", product.id)).await;
+        let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html:.600}");
         assert!(
             html.contains("name=\"markup_pct\"") && html.contains("value=\"25\""),
@@ -2751,11 +3072,15 @@ mod tests {
         let product = seed_tracked_product(&state, "COST-WEB").await;
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor_id(&state).await, NewSupplier {
-                name: "Cost Sup".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor_id(&state).await,
+                NewSupplier {
+                    name: "Cost Sup".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state.clone());
@@ -2813,26 +3138,35 @@ mod tests {
         let product = seed_tracked_product(&state, "PREF-WEB").await;
         let a = state
             .supplier_service
-            .create_supplier(audit_actor_id(&state).await, NewSupplier {
-                name: "Pref A".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor_id(&state).await,
+                NewSupplier {
+                    name: "Pref A".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let b = state
             .supplier_service
-            .create_supplier(audit_actor_id(&state).await, NewSupplier {
-                name: "Pref B".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor_id(&state).await,
+                NewSupplier {
+                    name: "Pref B".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         for (sid, cost) in [(a.id, "9"), (b.id, "8")] {
             state
                 .supplier_service
-                .record_cost(audit_actor_id(&state).await, 
+                .record_cost(
+                    audit_actor_id(&state).await,
                     product.id,
                     sid,
                     Decimal::from_str(cost).unwrap(),
@@ -2880,20 +3214,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "SRV-WEB".into(),
-                name: "service SRV-WEB".into(),
-                kind: ProductKind::Service,
-                category_id: None,
-                unit: "hr".into(),
-                sale_price: Decimal::from(30),
-                cost_price: Decimal::ZERO,
-                track_stock: false,
-                min_stock: None,
-                max_stock: None,
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "SRV-WEB".into(),
+                    name: "service SRV-WEB".into(),
+                    kind: ProductKind::Service,
+                    category_id: None,
+                    unit: "hr".into(),
+                    sale_price: Decimal::from(30),
+                    cost_price: Decimal::ZERO,
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state);
@@ -2942,16 +3277,12 @@ mod tests {
         let state = test_state().await;
         let cat_a = state
             .inventory_service
-            .create_category(
-                audit_actor_id(&state).await,
-                "Life Cat A", None)
+            .create_category(audit_actor_id(&state).await, "Life Cat A", None)
             .await
             .unwrap();
         let cat_b = state
             .inventory_service
-            .create_category(
-                audit_actor_id(&state).await,
-                "Life Cat B", None)
+            .create_category(audit_actor_id(&state).await, "Life Cat B", None)
             .await
             .unwrap();
         let product = state
@@ -2959,20 +3290,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "LIFE-WEB".into(),
-                name: "prod LIFE-WEB".into(),
-                kind: ProductKind::Product,
-                category_id: Some(cat_a.id),
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::from(2)),
-                max_stock: Some(Decimal::from(50)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "LIFE-WEB".into(),
+                    name: "prod LIFE-WEB".into(),
+                    kind: ProductKind::Product,
+                    category_id: Some(cat_a.id),
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::from(2)),
+                    max_stock: Some(Decimal::from(50)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         let other = state
@@ -2980,20 +3312,21 @@ mod tests {
             .create_product(
                 audit_actor_id(&state).await,
                 NewProduct {
-                sku: "LIFE-OTHER".into(),
-                name: "prod LIFE-OTHER".into(),
-                kind: ProductKind::Product,
-                category_id: Some(cat_b.id),
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::from(2)),
-                max_stock: Some(Decimal::from(50)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "LIFE-OTHER".into(),
+                    name: "prod LIFE-OTHER".into(),
+                    kind: ProductKind::Product,
+                    category_id: Some(cat_b.id),
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::from(2)),
+                    max_stock: Some(Decimal::from(50)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state.clone());
@@ -3026,7 +3359,11 @@ mod tests {
             "must fire product-changed, got {:?}",
             hx_trigger(&headers)
         );
-        let after = state.inventory_service.get_product(product.id).await.unwrap();
+        let after = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
         assert!(!after.is_active, "deactivate must flip is_active");
 
         // Activate without a filter: the answer is still the whole catalogue.
@@ -3042,7 +3379,11 @@ mod tests {
             html.contains("LIFE-WEB") && html.contains("LIFE-OTHER"),
             "unfiltered answer must cover the whole catalogue: {html:.400}"
         );
-        let after = state.inventory_service.get_product(product.id).await.unwrap();
+        let after = state
+            .inventory_service
+            .get_product(product.id)
+            .await
+            .unwrap();
         assert!(after.is_active, "activate must flip is_active back");
 
         // Delete without movements: gone.
@@ -3055,7 +3396,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = get_html(app.clone(), &format!("/web/products/detail/{}", plain_id)).await;
+        let (status, _) =
+            get_html(app.clone(), &format!("/web/products/detail/{}", plain_id)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         // Delete with movements: 400, row survives.
@@ -3064,13 +3406,14 @@ mod tests {
             .record_movement(
                 audit_actor_id(&state).await,
                 crate::models::NewMovement {
-                product_id: product.id,
-                qty: Decimal::from(3),
-                movement_type: crate::models::MovementType::In,
-                reason: crate::models::MovementReason::Initial,
-                reference: String::new(),
-                date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
-            })
+                    product_id: product.id,
+                    qty: Decimal::from(3),
+                    movement_type: crate::models::MovementType::In,
+                    reason: crate::models::MovementReason::Initial,
+                    reference: String::new(),
+                    date: chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                },
+            )
             .await
             .unwrap();
         let (status, _, _) = post_form_full(
@@ -3082,7 +3425,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
-        assert_eq!(status, StatusCode::OK, "a product with movements survives delete");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a product with movements survives delete"
+        );
     }
 
     // -- audit attribution (M5 Phase B, slice S10, AC18): what the view shows --
@@ -3166,11 +3513,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{resp}");
-        let product_id: i64 =
-            sqlx::query_scalar("SELECT id FROM products WHERE sku = 'LOW-VIEW'")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let product_id: i64 = sqlx::query_scalar("SELECT id FROM products WHERE sku = 'LOW-VIEW'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         state
             .inventory_service
             .record_movement(

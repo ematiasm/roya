@@ -23,7 +23,7 @@
 
 use askama::Template;
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Extension, Form, Path, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -33,9 +33,9 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{
     Ageing, Customer, CustomerStatement, NewCustomer, PaymentMethodWithAccount, ReceiptDetail,
     SaleDetail, UpdateCustomer,
@@ -64,6 +64,7 @@ pub struct CustomerRow {
 #[template(path = "customers.html")]
 struct CustomersTemplate {
     title: String,
+    localization: LocalizationContext,
     customers: Vec<CustomerRow>,
     statement: Option<CustomerStatement>,
     selected: Option<Customer>,
@@ -97,6 +98,7 @@ struct CustomerListPartial {
 #[derive(Template)]
 #[template(path = "partials/customer_detail.html")]
 struct CustomerDetailPartial {
+    localization: LocalizationContext,
     statement: Option<CustomerStatement>,
     selected: Option<Customer>,
     debt_sales: Vec<SaleDetail>,
@@ -112,6 +114,7 @@ struct CustomerDetailPartial {
 #[derive(Template)]
 #[template(path = "partials/receipt_list.html")]
 struct ReceiptListPartial {
+    localization: LocalizationContext,
     receipts: Vec<ReceiptDetail>,
 }
 
@@ -122,6 +125,7 @@ struct ReceiptListPartial {
 #[template(path = "partials/customer_edit_form.html")]
 struct CustomerEditFormPartial {
     customer: Customer,
+    localization: LocalizationContext,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,20 +139,34 @@ fn is_htmx(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn today() -> NaiveDate {
-    chrono::Local::now().date_naive()
+fn today(localization: &LocalizationContext) -> AppResult<NaiveDate> {
+    localization
+        .today_iso()
+        .parse()
+        .map_err(|_| AppError::Internal("invalid localized date".into()))
 }
 
-fn parse_required_decimal(s: &str, field: &str) -> AppResult<Decimal> {
-    Decimal::from_str(s.trim()).map_err(|_| AppError::Validation(format!("invalid {field}")))
+fn parse_required_decimal(
+    s: &str,
+    field: &str,
+    localization: &LocalizationContext,
+) -> AppResult<Decimal> {
+    localization
+        .parse_decimal(s.trim())
+        .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
-fn parse_opt_decimal(s: &str, field: &str) -> AppResult<Option<Decimal>> {
+fn parse_opt_decimal(
+    s: &str,
+    field: &str,
+    localization: &LocalizationContext,
+) -> AppResult<Option<Decimal>> {
     let t = s.trim();
     if t.is_empty() {
         return Ok(None);
     }
-    Decimal::from_str(t)
+    localization
+        .parse_decimal(t)
         .map(Some)
         .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
@@ -163,10 +181,10 @@ fn parse_opt_i64(s: &str, field: &str) -> AppResult<Option<i64>> {
         .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
-fn parse_date_or_today(s: &str) -> AppResult<NaiveDate> {
+fn parse_date_or_today(s: &str, localization: &LocalizationContext) -> AppResult<NaiveDate> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(today());
+        return today(localization);
     }
     t.parse()
         .map_err(|_| AppError::Validation("invalid date (YYYY-MM-DD)".into()))
@@ -207,8 +225,11 @@ async fn customer_actor_names(
 /// Every active/inactive customer with the derived receivable folded in.
 /// `ageing_all` only returns customers with a non-zero balance, so absent
 /// entries are a zero balance with an empty ageing.
-async fn customer_rows(state: &AppState) -> AppResult<Vec<CustomerRow>> {
-    let as_of = today();
+async fn customer_rows(
+    state: &AppState,
+    localization: &LocalizationContext,
+) -> AppResult<Vec<CustomerRow>> {
+    let as_of = today(localization)?;
     let ageings: HashMap<i64, (Decimal, Ageing)> = state
         .sales_service
         .ageing_all(as_of)
@@ -235,21 +256,19 @@ async fn customer_rows(state: &AppState) -> AppResult<Vec<CustomerRow>> {
         .collect())
 }
 
-fn render_list(
-    customers: Vec<CustomerRow>,
-    warning: Option<String>,
-) -> AppResult<Html<String>> {
-    let html = CustomerListPartial {
-        customers,
-        warning,
-    }
-    .render()
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+fn render_list(customers: Vec<CustomerRow>, warning: Option<String>) -> AppResult<Html<String>> {
+    let html = CustomerListPartial { customers, warning }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
-async fn list_response(state: &AppState, warning: Option<String>) -> AppResult<Response> {
-    let rows = customer_rows(state).await?;
+async fn list_response(
+    state: &AppState,
+    warning: Option<String>,
+    localization: &LocalizationContext,
+) -> AppResult<Response> {
+    let rows = customer_rows(state, localization).await?;
     Ok(render_list(rows, warning)?.into_response())
 }
 
@@ -260,11 +279,13 @@ async fn list_response(state: &AppState, warning: Option<String>) -> AppResult<R
 async fn customers_page(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<crate::security::authz::Principal>,
 ) -> Result<Html<String>, AppError> {
-    let customers = customer_rows(&state).await?;
+    let customers = customer_rows(&state, &localization).await?;
     let tmpl = CustomersTemplate {
         title: "Roya — Customers".to_string(),
+        localization,
         customers,
         statement: None,
         selected: None,
@@ -281,7 +302,8 @@ async fn customers_page(
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
@@ -291,11 +313,13 @@ async fn customers_page(
 async fn customer_statement_page(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
     let customer = state.customer_service.get_customer(id).await?;
-    let statement = state.sales_service.customer_statement(id, today()).await?;
+    let as_of = today(&localization)?;
+    let statement = state.sales_service.customer_statement(id, as_of).await?;
     let over_limit = over_limit(&customer, statement.balance);
     let debt_sales = state.sales_service.customer_debt_sales(id).await?;
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
@@ -303,13 +327,14 @@ async fn customer_statement_page(
     let (created_by_name, updated_by_name) = customer_actor_names(&state, &customer).await?;
     let tmpl = CustomersTemplate {
         title: format!("Roya — Statement: {}", customer.name),
-        customers: customer_rows(&state).await?,
+        localization: localization.clone(),
+        customers: customer_rows(&state, &localization).await?,
         statement: Some(statement),
         selected: Some(customer),
         receipts,
         debt_sales,
         method_options,
-        today: today().to_string(),
+        today: as_of.to_string(),
         warning: None,
         over_limit,
         drawer_open: true,
@@ -319,34 +344,41 @@ async fn customer_statement_page(
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
 async fn web_customer_list(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> AppResult<Response> {
-    list_response(&state, None).await
+    list_response(&state, None, &localization).await
 }
 
 async fn web_customer_detail(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
-    detail_html(&state, id).await
+    detail_html(&state, id, localization).await
 }
 
 async fn web_customer_edit_form(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     let customer = state.customer_service.get_customer(id).await?;
-    let html = CustomerEditFormPartial { customer }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let html = CustomerEditFormPartial {
+        customer,
+        localization,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -354,21 +386,27 @@ async fn web_customer_edit_form(
 /// and the collect context. Both the detail fragment and the collect action
 /// answer it, so collecting refreshes the balance in place without the client
 /// rebuilding a URL.
-async fn detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
+async fn detail_html(
+    state: &AppState,
+    id: i64,
+    localization: LocalizationContext,
+) -> AppResult<Html<String>> {
     let customer = state.customer_service.get_customer(id).await?;
-    let statement = state.sales_service.customer_statement(id, today()).await?;
+    let as_of = today(&localization)?;
+    let statement = state.sales_service.customer_statement(id, as_of).await?;
     let over_limit = over_limit(&customer, statement.balance);
     let debt_sales = state.sales_service.customer_debt_sales(id).await?;
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let (created_by_name, updated_by_name) = customer_actor_names(&state, &customer).await?;
     let html = CustomerDetailPartial {
+        localization,
         statement: Some(statement),
         selected: Some(customer),
         debt_sales,
         receipts,
         method_options,
-        today: today().to_string(),
+        today: as_of.to_string(),
         over_limit,
         created_by_name,
         updated_by_name,
@@ -381,10 +419,14 @@ async fn detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
 async fn web_customer_receipts(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
-    let html = ReceiptListPartial { receipts }
+    let html = ReceiptListPartial {
+        localization,
+        receipts,
+    }
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
@@ -409,7 +451,7 @@ pub struct CreateCustomerForm {
     #[serde(default)]
     pub credit_limit: String,
     #[serde(default)]
-    pub payment_days: String,
+    pub due_days: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -429,7 +471,7 @@ pub struct EditCustomerForm {
     #[serde(default)]
     pub credit_limit: String,
     #[serde(default)]
-    pub payment_days: String,
+    pub due_days: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -456,6 +498,7 @@ async fn web_create_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CreateCustomerForm>,
 ) -> AppResult<Response> {
@@ -470,8 +513,8 @@ async fn web_create_customer(
                 tax_id: clean_opt(&form.tax_id),
                 notes: clean_opt(&form.notes),
                 is_walkin: false,
-                credit_limit: parse_opt_decimal(&form.credit_limit, "credit_limit")?,
-                payment_days: parse_opt_i64(&form.payment_days, "payment_days")?,
+                credit_limit: parse_opt_decimal(&form.credit_limit, "credit_limit", &localization)?,
+                due_days: parse_opt_i64(&form.due_days, "due_days")?,
             },
         )
         .await?;
@@ -492,7 +535,7 @@ async fn web_create_customer(
         ))
     };
     if is_htmx(&headers) {
-        let mut resp = list_response(&state, warning).await?;
+        let mut resp = list_response(&state, warning, &localization).await?;
         resp.headers_mut()
             .insert("HX-Trigger", "customer-created".parse().unwrap());
         return Ok(resp);
@@ -504,6 +547,7 @@ async fn web_update_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<EditCustomerForm>,
 ) -> AppResult<Response> {
@@ -520,13 +564,17 @@ async fn web_update_customer(
                 address: Some(clean_opt(&form.address)),
                 tax_id: Some(clean_opt(&form.tax_id)),
                 notes: Some(clean_opt(&form.notes)),
-                credit_limit: Some(parse_opt_decimal(&form.credit_limit, "credit_limit")?),
-                payment_days: Some(parse_opt_i64(&form.payment_days, "payment_days")?),
+                credit_limit: Some(parse_opt_decimal(
+                    &form.credit_limit,
+                    "credit_limit",
+                    &localization,
+                )?),
+                due_days: Some(parse_opt_i64(&form.due_days, "due_days")?),
             },
         )
         .await?;
     if is_htmx(&headers) {
-        let mut resp = list_response(&state, None).await?;
+        let mut resp = list_response(&state, None, &localization).await?;
         resp.headers_mut()
             .insert("HX-Trigger", "customer-changed".parse().unwrap());
         return Ok(resp);
@@ -538,6 +586,7 @@ async fn web_activate_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
@@ -546,7 +595,7 @@ async fn web_activate_customer(
         .activate_customer(principal.user_id, form.customer_id)
         .await?;
     if is_htmx(&headers) {
-        let mut resp = list_response(&state, None).await?;
+        let mut resp = list_response(&state, None, &localization).await?;
         resp.headers_mut()
             .insert("HX-Trigger", "customer-changed".parse().unwrap());
         return Ok(resp);
@@ -558,6 +607,7 @@ async fn web_deactivate_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
@@ -566,7 +616,7 @@ async fn web_deactivate_customer(
         .deactivate_customer(principal.user_id, form.customer_id)
         .await?;
     if is_htmx(&headers) {
-        let mut resp = list_response(&state, None).await?;
+        let mut resp = list_response(&state, None, &localization).await?;
         resp.headers_mut()
             .insert("HX-Trigger", "customer-changed".parse().unwrap());
         return Ok(resp);
@@ -577,6 +627,7 @@ async fn web_deactivate_customer(
 async fn web_delete_customer(
     State(state): State<AppState>,
     _: Require<CustomersWrite>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CustomerIdForm>,
 ) -> AppResult<Response> {
@@ -585,7 +636,7 @@ async fn web_delete_customer(
         .delete_customer(form.customer_id)
         .await?;
     if is_htmx(&headers) {
-        let mut resp = list_response(&state, None).await?;
+        let mut resp = list_response(&state, None, &localization).await?;
         resp.headers_mut()
             .insert("HX-Trigger", "customer-changed".parse().unwrap());
         return Ok(resp);
@@ -600,14 +651,14 @@ async fn web_collect_receipt(
     State(state): State<AppState>,
     _: Require<CustomersCollect>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<CollectForm>,
 ) -> AppResult<Response> {
-    let amount = parse_required_decimal(&form.amount, "amount")?;
-    let date = parse_date_or_today(&form.date)?;
+    let amount = parse_required_decimal(&form.amount, "amount", &localization)?;
+    let date = parse_date_or_today(&form.date, &localization)?;
     state
         .customer_receipt_service
-
         .collect(
             principal.user_id,
             form.customer_id,
@@ -618,7 +669,7 @@ async fn web_collect_receipt(
         )
         .await?;
     if is_htmx(&headers) {
-        return Ok(detail_html(&state, form.customer_id).await?.into_response());
+        return Ok(detail_html(&state, form.customer_id, localization).await?.into_response());
     }
     Ok(Redirect::to(&format!("/customers/{}", form.customer_id)).into_response())
 }
@@ -746,7 +797,11 @@ mod tests {
     /// One customer with a 75 credit debt (3 × 25) and the account/method pair
     /// the collect form uses.
     async fn seed_fixture(state: &AppState) -> WebFixture {
-        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
+        let account = state
+            .account_service
+            .create(audit_actor(&state).await, "Caja")
+            .await
+            .unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
@@ -766,20 +821,21 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "WEB-CUST-P".into(),
-                name: "prod WEB-CUST-P".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::ZERO),
-                max_stock: Some(Decimal::from(100)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "WEB-CUST-P".into(),
+                    name: "prod WEB-CUST-P".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::ZERO),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         state
@@ -787,13 +843,14 @@ mod tests {
             .record_movement(
                 audit_actor(&state).await,
                 NewMovement {
-                product_id: product.id,
-                qty: Decimal::from(100),
-                movement_type: MovementType::In,
-                reason: MovementReason::Initial,
-                reference: String::new(),
-                date: NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
-            })
+                    product_id: product.id,
+                    qty: Decimal::from(100),
+                    movement_type: MovementType::In,
+                    reason: MovementReason::Initial,
+                    reference: String::new(),
+                    date: NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                },
+            )
             .await
             .unwrap();
         let customer = state
@@ -808,7 +865,7 @@ mod tests {
                     notes: None,
                     is_walkin: false,
                     credit_limit: Some(Decimal::from(40)),
-                    payment_days: Some(30),
+                    due_days: Some(30),
                 },
             )
             .await
@@ -867,7 +924,10 @@ mod tests {
             "customer-drawer",
             "customer-drawer-body",
         ] {
-            assert!(html.contains(expected), "page must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "page must show {expected}: {html:.600}"
+            );
         }
         for absent in ["Edit Customer", "over limit", "1-30", "31-60", "61+"] {
             assert!(
@@ -894,7 +954,8 @@ mod tests {
 
         // The statement page keeps the customer context and renders the drawer
         // open with its fragments.
-        let (status, html) = get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         for expected in [
             "Ana Web",
@@ -905,7 +966,10 @@ mod tests {
             "Collect",
             "Payment history",
         ] {
-            assert!(html.contains(expected), "statement must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "statement must show {expected}: {html:.600}"
+            );
         }
         assert!(
             html.contains(&format!("/web/customers/detail/{}", fixture.customer)),
@@ -929,7 +993,10 @@ mod tests {
             "Collect",
             "Payment history",
         ] {
-            assert!(html.contains(expected), "detail must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "detail must show {expected}: {html:.600}"
+            );
         }
 
         let (status, html) = get_html(
@@ -949,7 +1016,7 @@ mod tests {
         let (status, html) = post_form(
             app.clone(),
             "/web/customers",
-            "name=Juan+P%C3%A9rez&phone=555-1234&credit_limit=100&payment_days=30",
+            "name=Juan+P%C3%A9rez&phone=555-1234&credit_limit=100&due_days=30",
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
@@ -982,7 +1049,7 @@ mod tests {
         let (status, html) = post_form(
             app.clone(),
             "/web/customers/edit",
-            &format!("customer_id={row}&name=Juan+P.&phone=&credit_limit=&payment_days=7"),
+            &format!("customer_id={row}&name=Juan+P.&phone=&credit_limit=&due_days=7"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
@@ -991,13 +1058,13 @@ mod tests {
         assert_eq!(stored.name, "Juan P.");
         assert_eq!(stored.phone, None);
         assert_eq!(stored.credit_limit, None);
-        assert_eq!(stored.payment_days, Some(7));
+        assert_eq!(stored.due_days, Some(7));
 
         // An empty name is rejected and changes nothing.
         let (status, body) = post_form(
             app.clone(),
             "/web/customers/edit",
-            &format!("customer_id={row}&name=&payment_days="),
+            &format!("customer_id={row}&name=&due_days="),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -1014,7 +1081,14 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
-        assert!(!state.customer_service.get_customer(row).await.unwrap().is_active);
+        assert!(
+            !state
+                .customer_service
+                .get_customer(row)
+                .await
+                .unwrap()
+                .is_active
+        );
         let (status, _) = post_form(
             app.clone(),
             "/web/customers/activate",
@@ -1022,7 +1096,14 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(state.customer_service.get_customer(row).await.unwrap().is_active);
+        assert!(
+            state
+                .customer_service
+                .get_customer(row)
+                .await
+                .unwrap()
+                .is_active
+        );
 
         // Delete without history.
         let (status, _) = post_form(
@@ -1057,7 +1138,8 @@ mod tests {
         // The rendered collect form carries the customer, amount and method
         // (the account is derived from the method), and posts to the
         // collection endpoint with the id in the body.
-        let (status, html) = get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         let form_start = html
             .find("hx-post=\"/web/customer-receipts\"")
@@ -1068,7 +1150,10 @@ mod tests {
             "name=\"amount\"",
             "name=\"method_id\"",
         ] {
-            assert!(form.contains(field), "collect form must carry {field}: {form:.600}");
+            assert!(
+                form.contains(field),
+                "collect form must carry {field}: {form:.600}"
+            );
         }
         assert!(
             !form.contains("name=\"account_id\""),
@@ -1086,7 +1171,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
-        assert!(html.contains("30"), "the refreshed receipts must show it: {html:.600}");
+        assert!(
+            html.contains("30"),
+            "the refreshed receipts must show it: {html:.600}"
+        );
 
         // The statement fragment now mixes the sale debit with the payment credit.
         let (status, html) = get_html(
@@ -1098,9 +1186,13 @@ mod tests {
         assert!(html.contains("Payment"), "{html:.600}");
 
         // The page reads the derived 45 balance.
-        let (status, html) = get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/customers/{}", fixture.customer)).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("45"), "derived balance after collecting: {html:.600}");
+        assert!(
+            html.contains("45"),
+            "derived balance after collecting: {html:.600}"
+        );
 
         // Over-collecting is refused and the refreshed list is untouched.
         let (status, body) = post_form(
@@ -1171,11 +1263,8 @@ mod tests {
         );
 
         // The detail fragment collects through the collection endpoint.
-        let (status, html) = get_html(
-            app,
-            &format!("/web/customers/detail/{}", fixture.customer),
-        )
-        .await;
+        let (status, html) =
+            get_html(app, &format!("/web/customers/detail/{}", fixture.customer)).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             html.contains("hx-post=\"/web/customer-receipts\""),
@@ -1219,9 +1308,12 @@ mod tests {
             &format!("name=\"customer_id\" value=\"{}\"", fixture.customer),
             "value=\"Ana Web\"",
             "name=\"credit_limit\"",
-            "name=\"payment_days\"",
+            "name=\"due_days\"",
         ] {
-            assert!(html.contains(expected), "edit form must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "edit form must show {expected}: {html:.600}"
+            );
         }
 
         let (status, _) = get_html(app, "/web/customers/edit-form/999999").await;
@@ -1343,12 +1435,9 @@ mod tests {
     async fn ac10_the_customers_web_refusal_writes_nothing() {
         let state = test_state().await;
         let fixture = seed_fixture(&state).await;
-        let probe = test_support::seed_session_with_permissions(
-            &state.pool,
-            &["customers.read"],
-        )
-        .await
-        .unwrap();
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
         let cookie = test_support::cookie_for(&probe);
         let app = crate::routes::router(state.clone());
 
@@ -1377,7 +1466,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(customers_after, customers_before, "a refused delete must write nothing");
+        assert_eq!(
+            customers_after, customers_before,
+            "a refused delete must write nothing"
+        );
 
         let receipts_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customer_receipts")
             .fetch_one(&state.pool)
@@ -1399,7 +1491,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(receipts_after, receipts_before, "a refused collect must write nothing");
+        assert_eq!(
+            receipts_after, receipts_before,
+            "a refused collect must write nothing"
+        );
     }
 
     /// A principal holding the permissions gets the normal answers: the
@@ -1426,7 +1521,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body:.300}");
-        assert!(body.contains("Beto Holder"), "the list must include the new customer");
+        assert!(
+            body.contains("Beto Holder"),
+            "the list must include the new customer"
+        );
 
         let (status, body) = post_form_as(
             app,

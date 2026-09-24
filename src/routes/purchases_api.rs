@@ -34,6 +34,8 @@ pub struct CreateSupplierRequest {
     pub phone: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(default)]
+    pub due_days: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -44,6 +46,8 @@ pub struct UpdateSupplierRequest {
     pub phone: Option<Option<String>>,
     #[serde(default)]
     pub notes: Option<Option<String>>,
+    #[serde(default)]
+    pub due_days: Option<Option<i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +162,7 @@ async fn create_supplier(
                 name: payload.name,
                 phone: payload.phone,
                 notes: payload.notes,
+                due_days: payload.due_days,
             },
         )
         .await?;
@@ -189,6 +194,7 @@ async fn update_supplier(
                 name: payload.name,
                 phone: payload.phone,
                 notes: payload.notes,
+                due_days: payload.due_days,
             },
         )
         .await?;

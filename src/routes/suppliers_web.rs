@@ -7,7 +7,7 @@
 // list fragment lives in partials/supplier_list.html.
 use askama::Template;
 use axum::{
-    extract::{Form, Path, Query, State},
+    extract::{Extension, Form, Path, Query, State},
     http::HeaderMap,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
@@ -16,9 +16,9 @@ use axum::{
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
+use crate::localization::LocalizationContext;
 use crate::models::{
     NewSupplier, PaymentMethodWithAccount, Product, ProductSupplierCost, PurchaseDetail,
     PurchaseListFilter, PurchaseStatus, Supplier, UpdateSupplier,
@@ -58,6 +58,7 @@ pub struct SupplierView {
 #[derive(Template)]
 #[template(path = "suppliers.html")]
 struct SuppliersTemplate {
+    localization: LocalizationContext,
     suppliers: Vec<SupplierView>,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
@@ -77,6 +78,7 @@ struct SupplierListPartial {
 #[derive(Template)]
 #[template(path = "partials/supplier_detail.html")]
 struct SupplierDetailPartial {
+    localization: LocalizationContext,
     supplier: Supplier,
     balance: Decimal,
     purchases: Vec<PurchaseDetail>,
@@ -112,17 +114,37 @@ fn is_htmx(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_required_decimal(s: &str, field: &str) -> AppResult<Decimal> {
-    Decimal::from_str(s.trim()).map_err(|_| AppError::Validation(format!("invalid {field}")))
+fn parse_required_decimal(
+    s: &str,
+    field: &str,
+    localization: &LocalizationContext,
+) -> AppResult<Decimal> {
+    localization
+        .parse_decimal(s.trim())
+        .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
-fn parse_date_or_today(s: &str) -> AppResult<NaiveDate> {
+fn parse_date_or_today(s: &str, localization: &LocalizationContext) -> AppResult<NaiveDate> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(chrono::Local::now().date_naive());
+        return localization
+            .today_iso()
+            .parse()
+            .map_err(|_| AppError::Internal("invalid localized date".into()));
     }
     t.parse()
         .map_err(|_| AppError::Validation("invalid date (YYYY-MM-DD)".into()))
+}
+
+fn parse_opt_i64(value: &str, field: &str) -> AppResult<Option<i64>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<i64>()
+        .map(Some)
+        .map_err(|_| AppError::Validation(format!("invalid {field}")))
 }
 
 fn clean_opt(s: &str) -> Option<String> {
@@ -150,7 +172,13 @@ async fn supplier_views(state: &AppState) -> AppResult<Vec<SupplierView>> {
                 .iter()
                 .find(|p| p.id == cost.product_id)
                 .map(|p| (p.name.clone(), p.sku.clone(), p.unit.clone()))
-                .unwrap_or_else(|| (format!("product #{}", cost.product_id), String::new(), String::new()));
+                .unwrap_or_else(|| {
+                    (
+                        format!("product #{}", cost.product_id),
+                        String::new(),
+                        String::new(),
+                    )
+                });
             cost_views.push(SupplierCostView {
                 cost,
                 product_name,
@@ -197,16 +225,19 @@ async fn list_response(state: &AppState, event: &str) -> AppResult<Response> {
 async fn suppliers_page(
     State(state): State<AppState>,
     _: Require<SuppliersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     principal: axum::Extension<crate::security::authz::Principal>,
 ) -> Result<Html<String>, AppError> {
     let suppliers = supplier_views(&state).await?;
     let tmpl = SuppliersTemplate {
+        localization,
         suppliers,
         nav_key: "suppliers",
         nav: Nav::for_principal(&principal),
     };
     Ok(Html(
-        tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?,
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
     ))
 }
 
@@ -263,10 +294,7 @@ async fn web_supplier_search(
     } else {
         params.q
     };
-    let matches = state
-        .supplier_service
-        .search_suppliers(raw.trim())
-        .await?;
+    let matches = state.supplier_service.search_suppliers(raw.trim()).await?;
     let html = SupplierSearchResultsPartial {
         query: raw.trim().to_string(),
         matches,
@@ -306,15 +334,20 @@ async fn web_supplier_detail(
     State(state): State<AppState>,
     _: Require<SuppliersRead>,
     _: Require<PurchasesCostsRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
-    supplier_detail_html(&state, id).await
+    supplier_detail_html(&state, id, &localization).await
 }
 
 /// The drawer body with fresh derived data. Both the detail fragment and the
 /// pay/record-cost actions answer it, so paying or recording refreshes the
 /// drawer in place without the client rebuilding a URL.
-async fn supplier_detail_html(state: &AppState, id: i64) -> AppResult<Html<String>> {
+async fn supplier_detail_html(
+    state: &AppState,
+    id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<Html<String>> {
     let supplier = state.supplier_service.get_supplier(id).await?;
     let filter = PurchaseListFilter {
         supplier_ids: Some(vec![id]),
@@ -331,7 +364,7 @@ async fn supplier_detail_html(state: &AppState, id: i64) -> AppResult<Html<Strin
         .sum();
     let products = state.inventory_service.products.list().await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = localization.today_iso();
     let mut actor_ids = vec![supplier.created_by];
     actor_ids.extend(supplier.updated_by);
     let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
@@ -339,6 +372,7 @@ async fn supplier_detail_html(state: &AppState, id: i64) -> AppResult<Html<Strin
     let created_by_name = name_for(supplier.created_by);
     let updated_by_name = supplier.updated_by.and_then(name_for);
     let html = SupplierDetailPartial {
+        localization: localization.clone(),
         supplier,
         balance,
         purchases,
@@ -377,6 +411,8 @@ pub struct SupplierForm {
     pub phone: String,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub due_days: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +424,8 @@ pub struct EditSupplierForm {
     pub phone: String,
     #[serde(default)]
     pub notes: String,
+    #[serde(default)]
+    pub due_days: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -421,11 +459,15 @@ async fn web_create_supplier(
 ) -> AppResult<Response> {
     state
         .supplier_service
-        .create_supplier(principal.user_id, NewSupplier {
-            name: form.name,
-            phone: clean_opt(&form.phone),
-            notes: clean_opt(&form.notes),
-        })
+        .create_supplier(
+            principal.user_id,
+            NewSupplier {
+                name: form.name,
+                phone: clean_opt(&form.phone),
+                notes: clean_opt(&form.notes),
+                due_days: parse_opt_i64(&form.due_days, "due_days")?,
+            },
+        )
         .await?;
     if is_htmx(&headers) {
         return list_response(&state, "supplier-created").await;
@@ -449,6 +491,7 @@ async fn web_update_supplier(
                 name: Some(form.name),
                 phone: Some(clean_opt(&form.phone)),
                 notes: Some(clean_opt(&form.notes)),
+                due_days: Some(parse_opt_i64(&form.due_days, "due_days")?),
             },
         )
         .await?;
@@ -464,7 +507,10 @@ async fn web_activate_supplier(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    state.supplier_service.set_active(principal.user_id, id, true).await?;
+    state
+        .supplier_service
+        .set_active(principal.user_id, id, true)
+        .await?;
     list_response(&state, "supplier-changed").await
 }
 
@@ -474,7 +520,10 @@ async fn web_deactivate_supplier(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    state.supplier_service.set_active(principal.user_id, id, false).await?;
+    state
+        .supplier_service
+        .set_active(principal.user_id, id, false)
+        .await?;
     list_response(&state, "supplier-changed").await
 }
 
@@ -491,14 +540,21 @@ async fn web_record_cost(
     State(state): State<AppState>,
     _: Require<PurchasesCostsWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<RecordCostForm>,
 ) -> AppResult<Response> {
-    let cost = parse_required_decimal(&form.cost, "cost")?;
-    let date = parse_date_or_today(&form.date)?;
+    let cost = parse_required_decimal(&form.cost, "cost", &localization)?;
+    let date = parse_date_or_today(&form.date, &localization)?;
     state
         .supplier_service
-        .record_cost(principal.user_id, form.product_id, form.supplier_id, cost, date)
+        .record_cost(
+            principal.user_id,
+            form.product_id,
+            form.supplier_id,
+            cost,
+            date,
+        )
         .await?;
     if is_htmx(&headers) {
         // Drawer submissions target `#supplier-drawer-body`: answer the fresh
@@ -512,7 +568,7 @@ async fn web_record_cost(
             .map(|v| v.contains("supplier-drawer-body"))
             .unwrap_or(false);
         if from_drawer {
-            let html = supplier_detail_html(&state, form.supplier_id).await?;
+            let html = supplier_detail_html(&state, form.supplier_id, &localization).await?;
             return Ok(triggered(html.0, "supplier-cost-recorded"));
         }
         return list_response(&state, "supplier-cost-recorded").await;
@@ -533,14 +589,21 @@ async fn web_pay_supplier(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
     principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
     headers: HeaderMap,
     Form(form): Form<PaySupplierForm>,
 ) -> AppResult<Response> {
-    let amount = parse_required_decimal(&form.amount, "amount")?;
-    let date = parse_date_or_today(&form.date)?;
+    let amount = parse_required_decimal(&form.amount, "amount", &localization)?;
+    let date = parse_date_or_today(&form.date, &localization)?;
     state
         .purchases_service
-        .pay_supplier(principal.user_id, form.supplier_id, form.method_id, amount, date)
+        .pay_supplier(
+            principal.user_id,
+            form.supplier_id,
+            form.method_id,
+            amount,
+            date,
+        )
         .await?;
     if is_htmx(&headers) {
         // Drawer submissions target `#supplier-drawer-body`: answer the fresh
@@ -553,7 +616,7 @@ async fn web_pay_supplier(
             .map(|v| v.contains("supplier-drawer-body"))
             .unwrap_or(false);
         if from_drawer {
-            let html = supplier_detail_html(&state, form.supplier_id).await?;
+            let html = supplier_detail_html(&state, form.supplier_id, &localization).await?;
             return Ok(triggered(html.0, "supplier-paid"));
         }
         return list_response(&state, "supplier-paid").await;
@@ -664,11 +727,7 @@ mod tests {
         let status = resp.status();
         let headers = resp.headers().clone();
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        (
-            status,
-            headers,
-            String::from_utf8_lossy(&bytes).to_string(),
-        )
+        (status, headers, String::from_utf8_lossy(&bytes).to_string())
     }
 
     #[tokio::test]
@@ -684,7 +743,10 @@ mod tests {
             "supplier-drawer",
             "supplier-drawer-body",
         ] {
-            assert!(html.contains(expected), "page must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "page must show {expected}: {html:.600}"
+            );
         }
         // The cost form lives in the drawer now (card B), not on the page.
         assert!(
@@ -735,27 +797,33 @@ mod tests {
         use chrono::NaiveDate;
         use rust_decimal::Decimal;
 
-        use crate::models::{
-            NewProduct, NewPurchase, NewSupplier, PaymentType, ProductKind,
-        };
+        use crate::models::{NewProduct, NewPurchase, NewSupplier, PaymentType, ProductKind};
 
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Web Detail Supplier".into(),
-                phone: Some("555-0100".into()),
-                notes: Some("drawer notes".into()),
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Web Detail Supplier".into(),
+                    phone: Some("555-0100".into()),
+                    notes: Some("drawer notes".into()),
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let other = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Unrelated Supplier".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Unrelated Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let product = state
@@ -763,39 +831,49 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "WEB-SUP-P".into(),
-                name: "prod WEB-SUP-P".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::ZERO),
-                max_stock: Some(Decimal::from(100)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "WEB-SUP-P".into(),
+                    name: "prod WEB-SUP-P".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::ZERO),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         // One Confirmed credit purchase (2 × 10 = 20 due) plus one Draft that
         // must not move the balance.
         let confirmed = state
             .purchases_service
-            .create_draft(audit_actor(&state).await, NewPurchase {
-                supplier_id: supplier.id,
-                payment_type: PaymentType::Credit,
-                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&state).await,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type: PaymentType::Credit,
+                    purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         state
             .purchases_service
-            .add_line(audit_actor(&state).await, confirmed.id, product.id, Decimal::from(2), Some(Decimal::from(10)))
+            .add_line(
+                audit_actor(&state).await,
+                confirmed.id,
+                product.id,
+                Decimal::from(2),
+                Some(Decimal::from(10)),
+            )
             .await
             .unwrap();
         state
@@ -805,37 +883,55 @@ mod tests {
             .unwrap();
         let draft = state
             .purchases_service
-            .create_draft(audit_actor(&state).await, NewPurchase {
-                supplier_id: supplier.id,
-                payment_type: PaymentType::Credit,
-                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 3).unwrap(),
-                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 16).unwrap()),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&state).await,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type: PaymentType::Credit,
+                    purchase_date: NaiveDate::from_ymd_opt(2024, 5, 3).unwrap(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 16).unwrap()),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         state
             .purchases_service
-            .add_line(audit_actor(&state).await, draft.id, product.id, Decimal::from(5), Some(Decimal::from(10)))
+            .add_line(
+                audit_actor(&state).await,
+                draft.id,
+                product.id,
+                Decimal::from(5),
+                Some(Decimal::from(10)),
+            )
             .await
             .unwrap();
         // Another supplier's purchase must not leak into this detail.
         let foreign = state
             .purchases_service
-            .create_draft(audit_actor(&state).await, NewPurchase {
-                supplier_id: other.id,
-                payment_type: PaymentType::Credit,
-                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 4).unwrap(),
-                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 17).unwrap()),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&state).await,
+                NewPurchase {
+                    supplier_id: other.id,
+                    payment_type: PaymentType::Credit,
+                    purchase_date: NaiveDate::from_ymd_opt(2024, 5, 4).unwrap(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 17).unwrap()),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         state
             .purchases_service
-            .add_line(audit_actor(&state).await, foreign.id, product.id, Decimal::from(1), Some(Decimal::from(7)))
+            .add_line(
+                audit_actor(&state).await,
+                foreign.id,
+                product.id,
+                Decimal::from(1),
+                Some(Decimal::from(7)),
+            )
             .await
             .unwrap();
         state
@@ -850,7 +946,7 @@ mod tests {
         // The balance counts only the Confirmed purchase (2 × 10 = 20); the
         // 5 × 10 Draft stays out of it.
         assert!(
-            html.contains(">20 <"),
+            html.contains(">20 USD <"),
             "balance must be exactly the Confirmed due: {html:.600}"
         );
         for expected in [
@@ -862,7 +958,10 @@ mod tests {
             &format!("/purchases/{}", confirmed.id),
             &format!("/purchases/{}", draft.id),
         ] {
-            assert!(html.contains(expected), "detail must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "detail must show {expected}: {html:.600}"
+            );
         }
         assert!(
             !html.contains(&format!("/purchases/{}", foreign.id)),
@@ -882,11 +981,15 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Web Edit Supplier".into(),
-                phone: Some("555-0100".into()),
-                notes: Some("edit notes".into()),
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Web Edit Supplier".into(),
+                    phone: Some("555-0100".into()),
+                    notes: Some("edit notes".into()),
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let app = crate::routes::router(state);
@@ -923,7 +1026,10 @@ mod tests {
             "value=\"555-0100\"",
             "value=\"edit notes\"",
         ] {
-            assert!(html.contains(expected), "edit form must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "edit form must show {expected}: {html:.600}"
+            );
         }
 
         let (status, _) = get_html(app, "/web/suppliers/999/edit-form").await;
@@ -937,11 +1043,15 @@ mod tests {
         let state = test_state().await;
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Web Cost Supplier".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Web Cost Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let product = state
@@ -949,20 +1059,21 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "WEB-SUP-C".into(),
-                name: "prod WEB-SUP-C".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::ZERO),
-                max_stock: Some(Decimal::from(100)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "WEB-SUP-C".into(),
+                    name: "prod WEB-SUP-C".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::ZERO),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         (state, supplier.id, product.id)
@@ -984,7 +1095,10 @@ mod tests {
             &format!("value=\"{product_id}\""),
             "WEB-SUP-C",
         ] {
-            assert!(html.contains(expected), "drawer must show {expected}: {html:.800}");
+            assert!(
+                html.contains(expected),
+                "drawer must show {expected}: {html:.800}"
+            );
         }
         assert!(
             !html.contains("name=\"supplier_id\" required")
@@ -992,14 +1106,18 @@ mod tests {
             "drawer must not offer a supplier dropdown: {html:.800}"
         );
         // The purchases card is untouched.
-        assert!(html.contains("Purchases ("), "drawer must keep the purchases card: {html:.400}");
+        assert!(
+            html.contains("Purchases ("),
+            "drawer must keep the purchases card: {html:.400}"
+        );
     }
 
     #[tokio::test]
     async fn web_record_cost_from_drawer_returns_fresh_detail_and_list_trigger() {
         let (state, supplier_id, product_id) = cost_fixture_state().await;
         let app = crate::routes::router(state);
-        let body = format!("product_id={product_id}&supplier_id={supplier_id}&cost=12.50&date=2024-05-01");
+        let body =
+            format!("product_id={product_id}&supplier_id={supplier_id}&cost=12.50&date=2024-05-01");
         let (status, headers, html) = post_form_full(
             app.clone(),
             "/web/supplier-costs",
@@ -1015,7 +1133,10 @@ mod tests {
             "Web Cost Supplier",
             "hx-post=\"/web/supplier-costs\"",
         ] {
-            assert!(html.contains(expected), "drawer answer must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "drawer answer must show {expected}: {html:.600}"
+            );
         }
         assert!(
             !html.contains("supplier-list-inner"),
@@ -1033,9 +1154,9 @@ mod tests {
 
         // Non-drawer HTMX callers keep the historical list-fragment answer.
         // A later date keeps the satellite's newer-date rule satisfied.
-        let body2 = format!("product_id={product_id}&supplier_id={supplier_id}&cost=13.50&date=2024-05-02");
-        let (status, headers, html) =
-            post_form_full(app, "/web/supplier-costs", &body2, &[]).await;
+        let body2 =
+            format!("product_id={product_id}&supplier_id={supplier_id}&cost=13.50&date=2024-05-02");
+        let (status, headers, html) = post_form_full(app, "/web/supplier-costs", &body2, &[]).await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
             html.contains("supplier-list-inner"),
@@ -1063,7 +1184,11 @@ mod tests {
         // A funded account with an owning Cash method: paying posts an Expense,
         // so with overdraft blocked the account needs money before the handover.
         // The name "Caja" makes `ensure_defaults_for_account` assign Cash.
-        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
+        let account = state
+            .account_service
+            .create(audit_actor(&state).await, "Caja")
+            .await
+            .unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
@@ -1080,7 +1205,6 @@ mod tests {
             .id;
         state
             .transaction_service
-
             .create(
                 audit_actor(&state).await,
                 account.id,
@@ -1094,11 +1218,15 @@ mod tests {
 
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Web Pay Supplier".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Web Pay Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let product = state
@@ -1106,38 +1234,43 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "WEB-PAY-C".into(),
-                name: "prod WEB-PAY-C".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::ZERO),
-                max_stock: Some(Decimal::from(100)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "WEB-PAY-C".into(),
+                    name: "prod WEB-PAY-C".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::ZERO),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         // One Confirmed Credit purchase: 3 × 25 = 75 due.
         let purchase = state
             .purchases_service
-            .create_draft(audit_actor(&state).await, NewPurchase {
-                supplier_id: supplier.id,
-                payment_type: PaymentType::Credit,
-                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&state).await,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type: PaymentType::Credit,
+                    purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         state
             .purchases_service
-            .add_line(audit_actor(&state).await, 
+            .add_line(
+                audit_actor(&state).await,
                 purchase.id,
                 product.id,
                 Decimal::from(3),
@@ -1154,8 +1287,11 @@ mod tests {
         let app = crate::routes::router(state);
         // The drawer fragment carries the pay card wired to the collection
         // endpoint: method select, no notes field.
-        let (status, html) =
-            get_html(app.clone(), &format!("/web/suppliers/{}/detail", supplier.id)).await;
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/web/suppliers/{}/detail", supplier.id),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         for expected in [
             "Pay supplier",
@@ -1166,7 +1302,10 @@ mod tests {
             "name=\"amount\"",
             "name=\"date\"",
         ] {
-            assert!(html.contains(expected), "drawer must show {expected}: {html:.800}");
+            assert!(
+                html.contains(expected),
+                "drawer must show {expected}: {html:.800}"
+            );
         }
         assert!(
             !html.contains("name=\"notes\""),
@@ -1187,8 +1326,11 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
-        for expected in ["supplier-detail-inner", "Web Pay Supplier", ">45 <"] {
-            assert!(html.contains(expected), "drawer answer must show {expected}: {html:.600}");
+        for expected in ["supplier-detail-inner", "Web Pay Supplier", ">45 USD <"] {
+            assert!(
+                html.contains(expected),
+                "drawer answer must show {expected}: {html:.600}"
+            );
         }
         assert!(
             !html.contains("supplier-list-inner"),
@@ -1320,7 +1462,8 @@ mod tests {
             test_support::seed_session_with_permissions(&state.pool, &["purchases.costs.read"])
                 .await
                 .unwrap();
-        let (status, html) = get_html_as(app.clone(), &uri, Some(&test_support::cookie_for(&probe))).await;
+        let (status, html) =
+            get_html_as(app.clone(), &uri, Some(&test_support::cookie_for(&probe))).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{html:.200}");
         assert!(
             html.contains("Acción no permitida") && html.contains("suppliers.read"),
@@ -1405,7 +1548,10 @@ mod tests {
         // Edit, activate, deactivate and delete: the entity gate, each in the
         // shape its caller reads.
         for (uri, body) in [
-            ("/web/suppliers/edit".to_string(), format!("id={supplier_id}&name=hacked")),
+            (
+                "/web/suppliers/edit".to_string(),
+                format!("id={supplier_id}&name=hacked"),
+            ),
             (
                 format!("/web/suppliers/{supplier_id}/activate"),
                 String::new(),
@@ -1444,12 +1590,16 @@ mod tests {
         );
 
         // The per-supplier cost record: the costs write tier, from the drawer.
-        let body = format!("product_id={product_id}&supplier_id={supplier_id}&cost=10&date=2024-05-01");
+        let body =
+            format!("product_id={product_id}&supplier_id={supplier_id}&cost=10&date=2024-05-01");
         let (status, body) = post_form_as(
             app.clone(),
             "/web/supplier-costs",
             &body,
-            &[("HX-Request", "true"), ("HX-Target", "supplier-drawer-body")],
+            &[
+                ("HX-Request", "true"),
+                ("HX-Target", "supplier-drawer-body"),
+            ],
             Some(&cookie),
         )
         .await;
@@ -1466,7 +1616,10 @@ mod tests {
             app,
             "/web/supplier-payments",
             &body,
-            &[("HX-Request", "true"), ("HX-Target", "supplier-drawer-body")],
+            &[
+                ("HX-Request", "true"),
+                ("HX-Target", "supplier-drawer-body"),
+            ],
             Some(&cookie),
         )
         .await;
@@ -1509,13 +1662,17 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(suppliers_after, suppliers_before, "a refused create must write nothing");
+        assert_eq!(
+            suppliers_after, suppliers_before,
+            "a refused create must write nothing"
+        );
 
         let costs_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM product_supplier_costs")
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        let body = format!("product_id={product_id}&supplier_id={supplier_id}&cost=10&date=2024-05-01");
+        let body =
+            format!("product_id={product_id}&supplier_id={supplier_id}&cost=10&date=2024-05-01");
         let (status, body) = post_form_as(
             app.clone(),
             "/web/supplier-costs",
@@ -1529,7 +1686,10 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        assert_eq!(costs_after, costs_before, "a refused cost must write nothing");
+        assert_eq!(
+            costs_after, costs_before,
+            "a refused cost must write nothing"
+        );
 
         // A refused delete keeps the supplier row.
         let req = Request::builder()
@@ -1559,7 +1719,11 @@ mod tests {
 
         let state = test_state().await;
         // The funded account with its owning Cash method, so a payment can run.
-        let account = state.account_service.create(audit_actor(&state).await, "Caja").await.unwrap();
+        let account = state
+            .account_service
+            .create(audit_actor(&state).await, "Caja")
+            .await
+            .unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(audit_actor(&state).await, account.id, "Caja")
@@ -1576,7 +1740,6 @@ mod tests {
             .id;
         state
             .transaction_service
-
             .create(
                 audit_actor(&state).await,
                 account.id,
@@ -1589,11 +1752,15 @@ mod tests {
             .unwrap();
         let supplier = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Holder Supplier".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Holder Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let product = state
@@ -1601,41 +1768,55 @@ mod tests {
             .create_product(
                 audit_actor(&state).await,
                 NewProduct {
-                sku: "HOLDER-SUP-P".into(),
-                name: "prod HOLDER-SUP-P".into(),
-                kind: ProductKind::Product,
-                category_id: None,
-                unit: "un".into(),
-                sale_price: Decimal::from(25),
-                cost_price: Decimal::from(5),
-                track_stock: true,
-                min_stock: Some(Decimal::ZERO),
-                max_stock: Some(Decimal::from(100)),
-                location: None,
-                notes: None,
-                markup_pct: None,
-            })
+                    sku: "HOLDER-SUP-P".into(),
+                    name: "prod HOLDER-SUP-P".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(5),
+                    track_stock: true,
+                    min_stock: Some(Decimal::ZERO),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
             .await
             .unwrap();
         // One Confirmed credit purchase: 3 × 25 = 75 due.
         let purchase = state
             .purchases_service
-            .create_draft(audit_actor(&state).await, NewPurchase {
-                supplier_id: supplier.id,
-                payment_type: crate::models::PaymentType::Credit,
-                purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
-                due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
-                supplier_invoice_no: None,
-                notes: None,
-            })
+            .create_draft(
+                audit_actor(&state).await,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type: crate::models::PaymentType::Credit,
+                    purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 15).unwrap()),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
             .await
             .unwrap();
         state
             .purchases_service
-            .add_line(audit_actor(&state).await, purchase.id, product.id, Decimal::from(3), Some(Decimal::from(25)))
+            .add_line(
+                audit_actor(&state).await,
+                purchase.id,
+                product.id,
+                Decimal::from(3),
+                Some(Decimal::from(25)),
+            )
             .await
             .unwrap();
-        state.purchases_service.confirm(audit_actor(&state).await, purchase.id, None).await.unwrap();
+        state
+            .purchases_service
+            .confirm(audit_actor(&state).await, purchase.id, None)
+            .await
+            .unwrap();
 
         let holder = test_support::seed_session_with_permissions(
             &state.pool,
@@ -1728,16 +1909,23 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
         let body = String::from_utf8_lossy(&bytes).to_string();
         assert_eq!(status, StatusCode::OK, "{body:.200}");
-        assert!(body.contains(">45 <"), "the balance must drop to 45: {body:.400}");
+        assert!(
+            body.contains(">45 USD <"),
+            "the balance must drop to 45: {body:.400}"
+        );
 
         // Delete a supplier with no rows: its normal list answer.
         let empty = state
             .supplier_service
-            .create_supplier(audit_actor(&state).await, NewSupplier {
-                name: "Empty Supplier".into(),
-                phone: None,
-                notes: None,
-            })
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Empty Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
             .await
             .unwrap();
         let req = Request::builder()
@@ -1760,14 +1948,7 @@ mod tests {
         assert_eq!(status, StatusCode::SEE_OTHER);
         // An HTMX anonymous request is the 401 + HX-Redirect shape, so the
         // plain browser post is the one that answers the login redirect.
-        let (status, _) = post_form_as(
-            app,
-            "/web/suppliers",
-            "name=Anonymous",
-            &[],
-            None,
-        )
-        .await;
+        let (status, _) = post_form_as(app, "/web/suppliers", "name=Anonymous", &[], None).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
     }
 
@@ -1782,11 +1963,15 @@ mod tests {
             out.push(
                 state
                     .supplier_service
-                    .create_supplier(audit_actor(state).await, NewSupplier {
-                        name: format!("Picker Supplier {i:02}"),
-                        phone: None,
-                        notes: None,
-                    })
+                    .create_supplier(
+                        audit_actor(state).await,
+                        NewSupplier {
+                            name: format!("Picker Supplier {i:02}"),
+                            phone: None,
+                            notes: None,
+                            due_days: None,
+                        },
+                    )
                     .await
                     .unwrap(),
             );
@@ -1806,7 +1991,11 @@ mod tests {
     #[tokio::test]
     async fn supplier_search_returns_bounded_case_insensitive_name_matches_as_forms() {
         let state = test_state().await;
-        seeded_suppliers(&state, crate::routes::SupplierSvc::SUPPLIER_SEARCH_LIMIT + 2).await;
+        seeded_suppliers(
+            &state,
+            crate::routes::SupplierSvc::SUPPLIER_SEARCH_LIMIT + 2,
+        )
+        .await;
         let (status, html) = search_html(&state, "picker%20supplier").await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
 
@@ -1920,35 +2109,43 @@ mod tests {
         let state = test_state().await;
         seeded_suppliers(&state, 1).await;
         let app = crate::routes::router(state.clone());
-        let uri = "/web/supplier-search?q=picker&action=%2Fweb%2Fpurchases&target=%23purchase-header";
+        let uri =
+            "/web/supplier-search?q=picker&action=%2Fweb%2Fpurchases&target=%23purchase-header";
 
         // purchases.create alone: admitted — its reason to exist.
-        let purchases = test_support::seed_session_with_permissions(
-            &state.pool,
-            &["purchases.create"],
+        let purchases =
+            test_support::seed_session_with_permissions(&state.pool, &["purchases.create"])
+                .await
+                .unwrap();
+        let (status, html) = get_html_as(
+            app.clone(),
+            uri,
+            Some(&test_support::cookie_for(&purchases)),
         )
-        .await
-        .unwrap();
-        let (status, html) = get_html_as(app.clone(), uri, Some(&test_support::cookie_for(&purchases))).await;
-        assert_eq!(status, StatusCode::OK, "purchases.create must reach the search: {html:.400}");
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "purchases.create must reach the search: {html:.400}"
+        );
 
         // suppliers.read alone: admitted too (the read half of the any-of).
-        let suppliers = test_support::seed_session_with_permissions(
-            &state.pool,
-            &["suppliers.read"],
+        let suppliers =
+            test_support::seed_session_with_permissions(&state.pool, &["suppliers.read"])
+                .await
+                .unwrap();
+        let (status, _) = get_html_as(
+            app.clone(),
+            uri,
+            Some(&test_support::cookie_for(&suppliers)),
         )
-        .await
-        .unwrap();
-        let (status, _) = get_html_as(app.clone(), uri, Some(&test_support::cookie_for(&suppliers))).await;
+        .await;
         assert_eq!(status, StatusCode::OK);
 
         // An unrelated permission is refused, naming the codes the gate takes.
-        let neither = test_support::seed_session_with_permissions(
-            &state.pool,
-            &["customers.read"],
-        )
-        .await
-        .unwrap();
+        let neither = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
         let (status, body) = get_html_as(app, uri, Some(&test_support::cookie_for(&neither))).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
         assert!(
@@ -1975,7 +2172,8 @@ mod tests {
         // current name (plus the caller's extra fields to include) — and no
         // current-id parameter: the field's text is the whole contract.
         assert!(
-            picker.contains("macro supplier_picker(action, target, field_id, current_name, include)"),
+            picker
+                .contains("macro supplier_picker(action, target, field_id, current_name, include)"),
             "the macro takes the caller's context: {picker:.400}"
         );
         assert!(
@@ -1984,9 +2182,15 @@ mod tests {
         );
 
         // The field is a text input that searches as you type.
-        assert!(picker.contains("type=\"text\""), "the field is a text input: {picker:.400}");
+        assert!(
+            picker.contains("type=\"text\""),
+            "the field is a text input: {picker:.400}"
+        );
         assert!(picker.contains("name=\"supplier_name\""), "{picker:.400}");
-        assert!(picker.contains("hx-get=\"/web/supplier-search\""), "{picker:.400}");
+        assert!(
+            picker.contains("hx-get=\"/web/supplier-search\""),
+            "{picker:.400}"
+        );
         assert!(
             picker.contains("hx-trigger=\"input changed delay:250ms\""),
             "the search debounces on input: {picker:.400}"
@@ -2007,7 +2211,10 @@ mod tests {
 
         // The caller's post target and swap target drive the widget's form.
         assert!(picker.contains("hx-post=\"{{ action }}\""), "{picker:.400}");
-        assert!(picker.contains("hx-select=\"{{ target }}\""), "{picker:.400}");
+        assert!(
+            picker.contains("hx-select=\"{{ target }}\""),
+            "{picker:.400}"
+        );
 
         // The inheritance audit (the product picker's documented trap): the
         // form's hx-select would filter the search GET to an element the
