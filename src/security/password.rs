@@ -6,8 +6,10 @@
 // the production parameters so a light-only regression cannot hide. A malformed
 // stored hash is a verification failure, not a panic: a corrupt row must never
 // crash a login. Nothing in this module logs or returns a password.
-use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher as _, PasswordVerifier, Version};
 use argon2::password_hash::SaltString;
+use argon2::{
+    Algorithm, Argon2, Params, PasswordHash, PasswordHasher as _, PasswordVerifier, Version,
+};
 
 use crate::error::{AppError, AppResult};
 

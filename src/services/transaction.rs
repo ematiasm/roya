@@ -84,7 +84,9 @@ where
         self.validate_date(date)?;
 
         if !self.accounts.exists(account_id).await? {
-            return Err(AppError::NotFound(format!("account {account_id} not found")));
+            return Err(AppError::NotFound(format!(
+                "account {account_id} not found"
+            )));
         }
 
         // If Expense and negative not allowed, check resulting balance
@@ -106,7 +108,15 @@ where
         }
 
         self.transactions
-            .create(actor, account_id, kind, amount, &desc, reference.as_deref(), date)
+            .create(
+                actor,
+                account_id,
+                kind,
+                amount,
+                &desc,
+                reference.as_deref(),
+                date,
+            )
             .await
     }
 
@@ -332,11 +342,12 @@ mod tests {
         // Historical payments stay unlinked: there is no deterministic way to know
         // which transaction a pre-existing payment created, but the transaction is
         // still traceable through its `reference`.
-        let legacy_payment: (Option<i64>, Option<i64>) =
-            sqlx::query_as("SELECT transaction_id, refund_transaction_id FROM sale_payments LIMIT 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let legacy_payment: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT transaction_id, refund_transaction_id FROM sale_payments LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(legacy_payment, (None, None));
     }
 
@@ -400,7 +411,11 @@ mod tests {
         .bind(sale_id.0)
         .bind(account_id)
         .bind(tx_id)
-        .bind(crate::security::test_support::audit_actor_id(pool).await.unwrap())
+        .bind(
+            crate::security::test_support::audit_actor_id(pool)
+                .await
+                .unwrap(),
+        )
         .execute(pool)
         .await
         .unwrap();
@@ -411,7 +426,11 @@ mod tests {
         let supplier_id: (i64,) = sqlx::query_as(
             "INSERT INTO suppliers (name, created_by) VALUES ('fixture supplier', ?) RETURNING id",
         )
-        .bind(crate::security::test_support::audit_actor_id(pool).await.unwrap())
+        .bind(
+            crate::security::test_support::audit_actor_id(pool)
+                .await
+                .unwrap(),
+        )
         .fetch_one(pool)
         .await
         .unwrap();
@@ -420,7 +439,11 @@ mod tests {
              VALUES (?, 'Confirmed', 'Credit', '2024-05-01', ?) RETURNING id",
         )
         .bind(supplier_id.0)
-        .bind(crate::security::test_support::audit_actor_id(pool).await.unwrap())
+        .bind(
+            crate::security::test_support::audit_actor_id(pool)
+                .await
+                .unwrap(),
+        )
         .fetch_one(pool)
         .await
         .unwrap();
@@ -432,7 +455,11 @@ mod tests {
         .bind(purchase_id.0)
         .bind(account_id)
         .bind(tx_id)
-        .bind(crate::security::test_support::audit_actor_id(pool).await.unwrap())
+        .bind(
+            crate::security::test_support::audit_actor_id(pool)
+                .await
+                .unwrap(),
+        )
         .execute(pool)
         .await
         .unwrap();
@@ -531,8 +558,12 @@ mod tests {
     #[tokio::test]
     async fn ac18_create_and_update_store_two_different_actors() {
         let (s, pool) = svc().await;
-        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice").await.unwrap();
-        let bob = test_support::seed_audit_user(&pool, "audit-bob", "Bob").await.unwrap();
+        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice")
+            .await
+            .unwrap();
+        let bob = test_support::seed_audit_user(&pool, "audit-bob", "Bob")
+            .await
+            .unwrap();
 
         let acc = s.accounts.create(alice, "Caja").await.unwrap();
         assert_eq!(acc.created_by, alice, "the account records its creator");
@@ -559,8 +590,15 @@ mod tests {
             .update(alice, tx.id, None, Some(dec("12")), None, None)
             .await
             .unwrap();
-        assert_eq!(updated.created_by, bob, "the creator attribution survives the edit");
-        assert_eq!(updated.updated_by, Some(alice), "the edit records the editor");
+        assert_eq!(
+            updated.created_by, bob,
+            "the creator attribution survives the edit"
+        );
+        assert_eq!(
+            updated.updated_by,
+            Some(alice),
+            "the edit records the editor"
+        );
     }
 
     /// AC18: a movement produced INSIDE another document flow carries the
@@ -570,8 +608,12 @@ mod tests {
     #[tokio::test]
     async fn ac18_a_flow_created_row_carries_the_flows_actor() {
         let (s, pool) = svc().await;
-        let creator = test_support::seed_audit_user(&pool, "flow-account", "Account Op").await.unwrap();
-        let operator = test_support::seed_audit_user(&pool, "flow-payment", "Paying Op").await.unwrap();
+        let creator = test_support::seed_audit_user(&pool, "flow-account", "Account Op")
+            .await
+            .unwrap();
+        let operator = test_support::seed_audit_user(&pool, "flow-payment", "Paying Op")
+            .await
+            .unwrap();
 
         let acc = s.accounts.create(creator, "Caja").await.unwrap();
         // A manual Expense (the flow's own write path) carries the flow's
@@ -589,7 +631,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tx.created_by, operator, "the flow's actor, not a fresh one");
-        assert_ne!(tx.created_by, acc.created_by, "the two actors are distinguishable");
+        assert_ne!(
+            tx.created_by, acc.created_by,
+            "the two actors are distinguishable"
+        );
         let stored = s.transactions.find_by_id(tx.id).await.unwrap().unwrap();
         assert_eq!(stored.created_by, operator);
         assert_eq!(stored.updated_by, None);

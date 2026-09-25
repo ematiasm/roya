@@ -130,8 +130,12 @@ pub trait RoleRepository: Send + Sync {
     /// form posts the complete new set). Returns the roles the user ends
     /// with; refuses (via the trigger) when the change would strip the last
     /// active protected-role holder.
-    async fn replace_user_roles(&self, user_id: i64, role_ids: &[i64], granted_by: i64)
-        -> AppResult<Vec<Role>>;
+    async fn replace_user_roles(
+        &self,
+        user_id: i64,
+        role_ids: &[i64],
+        granted_by: i64,
+    ) -> AppResult<Vec<Role>>;
     /// Create a role row (the S4 create form). `created_by` is the acting
     /// principal — the database refuses a row without one (NOT NULL) — so a
     /// role created through the screen always names its author. The schema
@@ -143,9 +147,13 @@ pub trait RoleRepository: Send + Sync {
     /// for a protected role and are not offered by the interface for any
     /// role (a machine name is not a relabel). Touches `updated_at` and
     /// stamps `updated_by` with the editing actor (slice S13).
-    async fn update_details(&self, id: i64, name: &str, description: Option<&str>,
-        updated_by: i64)
-        -> AppResult<()>;
+    async fn update_details(
+        &self,
+        id: i64,
+        name: &str,
+        description: Option<&str>,
+        updated_by: i64,
+    ) -> AppResult<()>;
     /// Usernames of EVERY user holding the role (AC15): the names a blocked
     /// deletion reports. `user_roles.role_id` is ON DELETE RESTRICT for
     /// holders of any state, active or not, so the refusal names all of them.
@@ -381,9 +389,13 @@ impl RoleRepository for SqliteRoleRepository {
         Ok(row_to_role(&row))
     }
 
-    async fn update_details(&self, id: i64, name: &str, description: Option<&str>,
-        updated_by: i64)
-        -> AppResult<()> {
+    async fn update_details(
+        &self,
+        id: i64,
+        name: &str,
+        description: Option<&str>,
+        updated_by: i64,
+    ) -> AppResult<()> {
         sqlx::query(
             r#"UPDATE roles
                SET name = ?, description = ?, updated_by = ?,
@@ -579,7 +591,14 @@ mod tests {
         }
         // The attempted flip changed nothing: the role and its matrix survive.
         let roles = SqliteRoleRepository::new(p.clone());
-        assert!(roles.find_by_code("admin").await.unwrap().unwrap().is_system);
+        assert!(
+            roles
+                .find_by_code("admin")
+                .await
+                .unwrap()
+                .unwrap()
+                .is_system
+        );
         assert_eq!(
             roles.count_active_protected_holders().await.unwrap(),
             1,
@@ -658,11 +677,10 @@ mod tests {
     async fn ac14_the_last_active_admin_cannot_be_deactivated_and_a_second_admin_unblocks() {
         let p = pool().await;
         seed_admin_holders(&p, &["first-admin"]).await;
-        let first: i64 =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let first: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
         let err = sqlx::query("UPDATE users SET is_active = 0 WHERE id = ?")
             .bind(first)
             .execute(&p)
@@ -688,15 +706,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ac14_the_last_grant_of_a_protected_role_cannot_be_deleted_and_a_second_admin_unblocks() {
+    async fn ac14_the_last_grant_of_a_protected_role_cannot_be_deleted_and_a_second_admin_unblocks()
+    {
         let p = pool().await;
         seed_admin_holders(&p, &["first-admin"]).await;
         let role_id = admin_role_id(&p).await;
-        let first: i64 =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let first: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
         let err = sqlx::query("DELETE FROM user_roles WHERE user_id = ? AND role_id = ?")
             .bind(first)
             .bind(role_id)
@@ -710,13 +728,12 @@ mod tests {
 
         // A second administrator makes the same deletion succeed.
         seed_admin_holders(&p, &["second-admin"]).await;
-        let updated =
-            sqlx::query("DELETE FROM user_roles WHERE user_id = ? AND role_id = ?")
-                .bind(first)
-                .bind(role_id)
-                .execute(&p)
-                .await
-                .unwrap();
+        let updated = sqlx::query("DELETE FROM user_roles WHERE user_id = ? AND role_id = ?")
+            .bind(first)
+            .bind(role_id)
+            .execute(&p)
+            .await
+            .unwrap();
         assert_eq!(updated.rows_affected(), 1, "the second admin unblocks it");
         let roles = SqliteRoleRepository::new(p.clone());
         assert_eq!(roles.count_active_protected_holders().await.unwrap(), 1);
@@ -750,15 +767,11 @@ mod tests {
         let roles = SqliteRoleRepository::new(p.clone());
         let admin = roles.find_by_code("admin").await.unwrap().unwrap();
         assert!(admin.is_system);
-        let (matrix_rows,): (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM role_permissions")
-                .fetch_one(&p)
-                .await
-                .unwrap();
-        assert_eq!(
-            matrix_rows, 45,
-            "the matrix survived the aborted REPLACE"
-        );
+        let (matrix_rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM role_permissions")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(matrix_rows, 45, "the matrix survived the aborted REPLACE");
     }
 
     #[tokio::test]
@@ -800,11 +813,10 @@ mod tests {
         seed_admin_holders(&p, &["first-admin"]).await;
         let roles = SqliteRoleRepository::new(p.clone());
         let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
-        let user: i64 =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
         roles
             .grant(&NewUserRole {
                 user_id: user,
@@ -841,7 +853,10 @@ mod tests {
             other => panic!("expected Conflict, got {other:?}"),
         };
         assert!(msg.contains("rol protegido"), "{msg}");
-        assert!(!msg.contains("protected role"), "no raw trigger text: {msg}");
+        assert!(
+            !msg.contains("protected role"),
+            "no raw trigger text: {msg}"
+        );
         assert!(roles.find_by_code("admin").await.unwrap().is_some());
     }
 
@@ -854,11 +869,10 @@ mod tests {
         seed_admin_holders(&p, &["first-admin"]).await;
         let roles = SqliteRoleRepository::new(p.clone());
         let vendedor = roles.find_by_code("vendedor").await.unwrap().unwrap();
-        let user: i64 =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
         roles
             .grant(&NewUserRole {
                 user_id: user,
@@ -906,13 +920,18 @@ mod tests {
             .fetch_one(&p)
             .await
             .unwrap();
-        let second: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'second-admin'")
-            .fetch_one(&p)
-            .await
-            .unwrap();
+        let second: i64 =
+            sqlx::query_scalar("SELECT id FROM users WHERE username = 'second-admin'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
         for user_id in [first, second] {
             roles
-                .grant(&NewUserRole { user_id, role_id: vendedor.id, granted_by: user_id })
+                .grant(&NewUserRole {
+                    user_id,
+                    role_id: vendedor.id,
+                    granted_by: user_id,
+                })
                 .await
                 .unwrap();
         }
@@ -920,7 +939,10 @@ mod tests {
 
         // The read is the TOTAL set: the deactivated holder is named too.
         let named = roles.holder_names(vendedor.id).await.unwrap();
-        assert_eq!(named, vec!["first-admin".to_string(), "second-admin".to_string()]);
+        assert_eq!(
+            named,
+            vec!["first-admin".to_string(), "second-admin".to_string()]
+        );
 
         // And the deletion is still refused with the holders' reason.
         let err = roles.delete(vendedor.id).await.unwrap_err();
@@ -966,11 +988,10 @@ mod tests {
     async fn a_grant_naming_a_missing_role_is_a_validation_naming_the_submitted_set() {
         let p = pool().await;
         seed_admin_holders(&p, &["first-admin"]).await;
-        let user: i64 =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'first-admin'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
         let err = SqliteRoleRepository::new(p.clone())
             .grant(&NewUserRole {
                 user_id: user,
@@ -1068,9 +1089,16 @@ mod tests {
         );
         for grant in &trail {
             assert_eq!(grant.granted_by, granter.id, "the granter is recorded");
-            assert!(!grant.granted_at.to_string().is_empty(), "the instant is recorded");
+            assert!(
+                !grant.granted_at.to_string().is_empty(),
+                "the instant is recorded"
+            );
         }
         // A user holding nothing answers the empty trail, never an error.
-        assert!(roles.list_grants_for_user(granter.id).await.unwrap().is_empty());
+        assert!(roles
+            .list_grants_for_user(granter.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }

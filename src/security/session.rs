@@ -72,9 +72,8 @@ impl SessionPolicy {
     /// absolute TTL, Secure when the policy says so.
     pub fn serialize_cookie(&self, token: &str) -> String {
         let max_age = self.ttl_hours * 3600;
-        let mut cookie = format!(
-            "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}"
-        );
+        let mut cookie =
+            format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}");
         if self.secure {
             cookie.push_str("; Secure");
         }
@@ -134,7 +133,10 @@ mod tests {
         let token = mint_token().unwrap();
         let hash = hash_token(&token);
         assert_ne!(hash, token, "stored digest must not be the raw token");
-        assert!(!hash.contains(&token), "raw token must not appear in the digest");
+        assert!(
+            !hash.contains(&token),
+            "raw token must not appear in the digest"
+        );
         // Deterministic: same token, same digest (this is what resolve compares).
         assert_eq!(hash, hash_token(&token));
         let decoded = URL_SAFE_NO_PAD.decode(&hash).unwrap();
@@ -146,7 +148,10 @@ mod tests {
         let policy = SessionPolicy::new(12, false);
         let token = mint_token().unwrap();
         let header = format!("other=1; {}; another=2", policy.serialize_cookie(&token));
-        assert_eq!(policy.parse_cookie(&header).as_deref(), Some(token.as_str()));
+        assert_eq!(
+            policy.parse_cookie(&header).as_deref(),
+            Some(token.as_str())
+        );
     }
 
     #[test]
@@ -154,7 +159,11 @@ mod tests {
         let policy = SessionPolicy::new(12, false);
         assert_eq!(policy.parse_cookie(""), None);
         assert_eq!(policy.parse_cookie("other=1; more=2"), None);
-        assert_eq!(policy.parse_cookie("roya_session"), None, "no '=' means no value");
+        assert_eq!(
+            policy.parse_cookie("roya_session"),
+            None,
+            "no '=' means no value"
+        );
     }
 
     #[test]
@@ -164,7 +173,10 @@ mod tests {
         assert!(plain.contains("HttpOnly"));
         assert!(plain.contains("SameSite=Lax"));
         assert!(plain.contains("Path=/"));
-        assert!(plain.contains("Max-Age=43200"), "Max-Age is the absolute TTL: {plain}");
+        assert!(
+            plain.contains("Max-Age=43200"),
+            "Max-Age is the absolute TTL: {plain}"
+        );
         assert!(!plain.contains("Secure"));
 
         let secure = SessionPolicy::new(12, true).serialize_cookie("tok");

@@ -271,7 +271,12 @@ mod tests {
         row.0
     }
 
-    async fn insert_session(repo: &SqliteSessionRepository, token_hash: &str, user_id: i64, now: NaiveDateTime) -> Session {
+    async fn insert_session(
+        repo: &SqliteSessionRepository,
+        token_hash: &str,
+        user_id: i64,
+        now: NaiveDateTime,
+    ) -> Session {
         repo.insert(&NewSession {
             token_hash: token_hash.into(),
             user_id,
@@ -360,7 +365,10 @@ mod tests {
             .revoke_all_for_user_except(user_id, "hash-kept")
             .await
             .unwrap();
-        assert_eq!(revoked, 2, "exactly the two other live sessions of the user");
+        assert_eq!(
+            revoked, 2,
+            "exactly the two other live sessions of the user"
+        );
 
         // The named row survives with its identity untouched: same id, same
         // expiry, still unrevoked — resolvable like nothing happened.
@@ -370,7 +378,10 @@ mod tests {
             .unwrap()
             .expect("the kept session must still resolve");
         assert_eq!(kept_after.0.id, kept.id, "the session row keeps its id");
-        assert_eq!(kept_after.0.expires_at, kept.expires_at, "the expiry is untouched");
+        assert_eq!(
+            kept_after.0.expires_at, kept.expires_at,
+            "the expiry is untouched"
+        );
         assert!(kept_after.0.revoked_at.is_none());
         let live_count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM sessions WHERE user_id = ? AND revoked_at IS NULL",

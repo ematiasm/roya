@@ -216,7 +216,13 @@ async fn record_payment(
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let payment = state
         .sales_service
-        .record_payment(principal.user_id, id, payload.method_id, payload.amount, payload.date)
+        .record_payment(
+            principal.user_id,
+            id,
+            payload.method_id,
+            payload.amount,
+            payload.date,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(payment))))
 }
@@ -233,7 +239,10 @@ async fn confirm_sale(
     Path(id): Path<i64>,
     Json(payload): Json<ConfirmSaleRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let detail = state.sales_service.confirm(principal.user_id, id, payload.method_id).await?;
+    let detail = state
+        .sales_service
+        .confirm(principal.user_id, id, payload.method_id)
+        .await?;
     Ok(Json(serde_json::json!(detail)))
 }
 
@@ -405,13 +414,15 @@ mod tests {
         let mid = cash_method_id(pool).await;
         // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
         // the name when it is already owned elsewhere in this pool.
-        let assigned = sqlx::query("UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL")
-            .bind(account_id)
-            .bind(mid)
-            .execute(pool)
-            .await
-            .unwrap()
-            .rows_affected();
+        let assigned = sqlx::query(
+            "UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL",
+        )
+        .bind(account_id)
+        .bind(mid)
+        .execute(pool)
+        .await
+        .unwrap()
+        .rows_affected();
         if assigned == 1 {
             return mid;
         }
@@ -510,9 +521,14 @@ mod tests {
         let pid = seed_product(app, sku, "Product").await;
         seed_stock(app, pid, "100").await;
         let body = draft_body(pool, "Ana Draft", "Credit").await;
-        let (st, v) =
-            send_json_as(app.clone(), "POST", "/api/sales", Some(test_support::TEST_COOKIE), Some(body))
-                .await;
+        let (st, v) = send_json_as(
+            app.clone(),
+            "POST",
+            "/api/sales",
+            Some(test_support::TEST_COOKIE),
+            Some(body),
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "seed draft sale: {v}");
         let sale_id = v["sale"]["id"].as_i64().unwrap();
         let (st, v) = send_json_as(
@@ -544,9 +560,17 @@ mod tests {
         let probe_cookie = test_support::cookie_for(&probe);
 
         // The reads the probe is allowed.
-        let (st, _) = send_json_as(app.clone(), "GET", "/api/sales", Some(&probe_cookie), None).await;
+        let (st, _) =
+            send_json_as(app.clone(), "GET", "/api/sales", Some(&probe_cookie), None).await;
         assert_eq!(st, StatusCode::OK, "sales.read must open the list");
-        let (st, _) = send_json_as(app.clone(), "GET", "/api/sales/debt", Some(&probe_cookie), None).await;
+        let (st, _) = send_json_as(
+            app.clone(),
+            "GET",
+            "/api/sales/debt",
+            Some(&probe_cookie),
+            None,
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "sales.read must open the debt report");
         let (st, _) = send_json_as(
             app.clone(),
@@ -569,7 +593,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sales.create"),
             "the refusal must name sales.create: {v}"
         );
         let (st, v) = send_json_as(
@@ -582,7 +609,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sales.create"),
             "the refusal must name sales.create: {v}"
         );
 
@@ -597,7 +627,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sales.create"),
             "the refusal must name sales.create: {v}"
         );
         let (st, v) = send_json_as(
@@ -610,7 +643,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sales.create"),
             "the refusal must name sales.create: {v}"
         );
         let (st, v) = send_json_as(
@@ -635,7 +671,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("sales.create"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sales.create"),
             "the refusal must name sales.create: {v}"
         );
 
@@ -650,7 +689,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("sales.cancel"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("sales.cancel"),
             "the refusal must name sales.cancel: {v}"
         );
 
@@ -665,7 +707,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("customers.collect"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("customers.collect"),
             "the refusal must name customers.collect: {v}"
         );
     }
@@ -679,16 +724,16 @@ mod tests {
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let (sale, _line) = draft_sale_with_line(&app, &pool, "S6-NOWRITE").await;
-        let probe = test_support::seed_session_with_permissions(
-            &pool,
-            &["sales.read", "customers.read"],
-        )
-        .await
-        .unwrap();
+        let probe =
+            test_support::seed_session_with_permissions(&pool, &["sales.read", "customers.read"])
+                .await
+                .unwrap();
         let probe_cookie = test_support::cookie_for(&probe);
 
-        let sales_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sales").fetch_one(&pool).await.unwrap();
+        let sales_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sales")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (st, v) = send_json_as(
             app.clone(),
             "POST",
@@ -698,9 +743,14 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-        let sales_after: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sales").fetch_one(&pool).await.unwrap();
-        assert_eq!(sales_after, sales_before, "a refused create must write nothing");
+        let sales_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sales")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sales_after, sales_before,
+            "a refused create must write nothing"
+        );
 
         // Confirm the sale as the shared principal, then refuse a payment.
         let (st, v) = send_json_as(
@@ -729,7 +779,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(payments_after, payments_before, "a refused payment must write nothing");
+        assert_eq!(
+            payments_after, payments_before,
+            "a refused payment must write nothing"
+        );
 
         // A refused cancel leaves the sale Confirmed.
         let (st, v) = send_json_as(
@@ -750,7 +803,10 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(v["sale"]["status"], "Confirmed", "a refused cancel must not flip the status");
+        assert_eq!(
+            v["sale"]["status"], "Confirmed",
+            "a refused cancel must not flip the status"
+        );
     }
 
     /// A principal holding the permissions gets the normal answers: the
@@ -837,11 +893,18 @@ mod tests {
             .unwrap();
         let cookie = test_support::cookie_for(&probe);
 
-        for uri in ["/api/sales", "/api/sales/debt", &format!("/api/sales/{sale}")] {
+        for uri in [
+            "/api/sales",
+            "/api/sales/debt",
+            &format!("/api/sales/{sale}"),
+        ] {
             let (st, v) = send_json_as(app.clone(), "GET", uri, Some(&cookie), None).await;
             assert_eq!(st, StatusCode::FORBIDDEN, "{uri}: {v}");
             assert!(
-                v["error"].as_str().unwrap_or_default().contains("sales.read"),
+                v["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("sales.read"),
                 "{uri} must name sales.read: {v}"
             );
         }
@@ -859,7 +922,12 @@ mod tests {
         let cash = allow_cash(&pool, acc).await;
 
         // Draft has NULL sale_number.
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ana", "Cash").await).await;
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            draft_body(&pool, "Ana", "Cash").await,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let aid = v
             .get("sale")
@@ -896,7 +964,12 @@ mod tests {
         assert!(number_a.starts_with("2024-SALE-"), "got {number_a}");
 
         // Second confirm -> UNIQUE second number.
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Beto", "Cash").await).await;
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            draft_body(&pool, "Beto", "Cash").await,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "create draft b: {v}");
         let bid = v
             .get("sale")
@@ -946,7 +1019,12 @@ mod tests {
         assert_eq!(still, number_a);
 
         // Draft -> Cancelled keeps NULL number (no-op).
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ceci", "Cash").await).await;
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            draft_body(&pool, "Ceci", "Cash").await,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "create draft c: {v}");
         let cid = v
             .get("sale")
@@ -982,7 +1060,12 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Serv", "Cash").await).await;
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            draft_body(&pool, "Serv", "Cash").await,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -1027,7 +1110,12 @@ mod tests {
         let acc = seed_account(&app, "caja10").await;
         let cash = allow_cash(&pool, acc).await;
 
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ref", "Cash").await).await;
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            draft_body(&pool, "Ref", "Cash").await,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -1123,7 +1211,12 @@ mod tests {
         let (st, v) = get_json(app.clone(), "/api/sales/debt").await;
         assert_eq!(st, StatusCode::OK, "empty debt: {v}");
 
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Deudor", "Credit").await).await;
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            draft_body(&pool, "Deudor", "Credit").await,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -1212,7 +1305,12 @@ mod tests {
         let cash = cash_method_id(&pool).await;
         // Cash belongs to no account: confirming with it must be 400 with no
         // side effects.
-        let (st, v) = post_json(app.clone(), "/api/sales", draft_body(&pool, "Ana", "Cash").await).await;
+        let (st, v) = post_json(
+            app.clone(),
+            "/api/sales",
+            draft_body(&pool, "Ana", "Cash").await,
+        )
+        .await;
         assert_eq!(st, StatusCode::CREATED, "create draft: {v}");
         let id = v
             .get("sale")
@@ -1281,11 +1379,10 @@ mod tests {
         assert_eq!(st, StatusCode::NOT_FOUND, "unknown customer: {v}");
 
         // Known walk-in customer => 201 with the snapshot.
-        let (walkin_id,): (i64,) =
-            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (walkin_id,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (st, v) = post_json(
             app.clone(),
             "/api/sales",
@@ -1338,7 +1435,10 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "over limit: {v}");
         let msg = v["error"].as_str().unwrap_or_default();
-        assert!(msg.contains("60"), "projected figure must be visible: {msg}");
+        assert!(
+            msg.contains("60"),
+            "projected figure must be visible: {msg}"
+        );
         assert!(msg.contains("50"), "limit must be visible: {msg}");
     }
 
@@ -1351,11 +1451,10 @@ mod tests {
         let app = crate::routes::router(state);
         let pid = seed_product(&app, "K2-WALKIN", "Product").await;
         seed_stock(&app, pid, "10").await;
-        let (walkin_id,): (i64,) =
-            sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let (walkin_id,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
         let (st, v) = post_json(
             app.clone(),

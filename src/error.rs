@@ -60,7 +60,10 @@ impl IntoResponse for AppError {
                 if s.contains("UNIQUE constraint failed") {
                     (StatusCode::CONFLICT, "resource already exists".to_string())
                 } else {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "database error".to_string())
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "database error".to_string(),
+                    )
                 }
             }
             Self::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.clone()),

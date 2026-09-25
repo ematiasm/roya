@@ -197,16 +197,14 @@ mod tests {
             .unwrap()
         {
             Some(id) => id,
-            None => {
-                sqlx::query_scalar(
-                    "INSERT INTO suppliers (name, is_active, created_by) VALUES (?, 1, ?) RETURNING id",
-                )
-                .bind(name)
-                .bind(actor)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-            }
+            None => sqlx::query_scalar(
+                "INSERT INTO suppliers (name, is_active, created_by) VALUES (?, 1, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
         }
     }
 
@@ -219,17 +217,15 @@ mod tests {
             .unwrap()
         {
             Some(id) => id,
-            None => {
-                sqlx::query_scalar(
-                    r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+            None => sqlx::query_scalar(
+                r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
                        VALUES ('DOC-P', 'doc prod', 'Product', 'un', '10', 1, ?)
                        RETURNING id"#,
-                )
-                .bind(actor)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-            }
+            )
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
         }
     }
 
@@ -243,15 +239,13 @@ mod tests {
                 .unwrap()
             {
                 Some(id) => id,
-                None => {
-                    sqlx::query_scalar(
-                        "INSERT INTO accounts (name, created_by) VALUES ('doc wallet', ?) RETURNING id",
-                    )
-                    .bind(actor)
-                    .fetch_one(pool)
-                    .await
-                    .unwrap()
-                }
+                None => sqlx::query_scalar(
+                    "INSERT INTO accounts (name, created_by) VALUES ('doc wallet', ?) RETURNING id",
+                )
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap(),
             };
         let (method,): (i64,) =
             sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
@@ -263,12 +257,7 @@ mod tests {
 
     /// One confirmed sale with one line, through raw SQL: the composure tests
     /// seed shapes the repository API cannot build (arbitrary dates, actors).
-    async fn seed_sale(
-        pool: &SqlitePool,
-        customer: &str,
-        date: NaiveDate,
-        actor: i64,
-    ) -> i64 {
+    async fn seed_sale(pool: &SqlitePool, customer: &str, date: NaiveDate, actor: i64) -> i64 {
         let walkin: i64 = sqlx::query_scalar("SELECT id FROM customers WHERE is_walkin = 1")
             .fetch_one(pool)
             .await
@@ -317,12 +306,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn seed_purchase(
-        pool: &SqlitePool,
-        supplier: &str,
-        date: NaiveDate,
-        actor: i64,
-    ) -> i64 {
+    async fn seed_purchase(pool: &SqlitePool, supplier: &str, date: NaiveDate, actor: i64) -> i64 {
         let supplier_id = seed_supplier(pool, supplier, actor).await;
         let purchase_id: i64 = sqlx::query_scalar(
             r#"INSERT INTO purchases (purchase_number, supplier_id, status, payment_type, purchase_date, created_by)
@@ -369,12 +353,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn seed_movement(
-        pool: &SqlitePool,
-        product_id: i64,
-        date: NaiveDate,
-        actor: i64,
-    ) -> i64 {
+    async fn seed_movement(pool: &SqlitePool, product_id: i64, date: NaiveDate, actor: i64) -> i64 {
         sqlx::query_scalar(
             r#"INSERT INTO stock_movements (product_id, qty, type, reason, reference, date, created_by)
                VALUES (?, '1', 'In', 'Purchase', 'MOV-REF', ?, ?)
@@ -461,10 +440,7 @@ mod tests {
         let s = svc(&pool).await;
 
         let narrowed = s
-            .list(&filt(vec![
-                DocumentKind::Sale,
-                DocumentKind::StockMovement,
-            ]))
+            .list(&filt(vec![DocumentKind::Sale, DocumentKind::StockMovement]))
             .await
             .unwrap();
         let kinds: Vec<DocumentKind> = narrowed.rows.iter().map(|r| r.kind).collect();
@@ -560,7 +536,10 @@ mod tests {
         tx.commit().await.unwrap();
 
         let feed = s.list(&filt(vec![DocumentKind::Sale])).await.unwrap();
-        assert!(feed.truncated, "the cap cut the history and the feed says so");
+        assert!(
+            feed.truncated,
+            "the cap cut the history and the feed says so"
+        );
         assert_eq!(feed.rows.len(), DOCUMENTS_PAGE_LIMIT);
         assert_eq!(feed.limit, DOCUMENTS_PAGE_LIMIT);
         // Same date falls back to id descending: the last inserted row is the
@@ -632,7 +611,10 @@ mod tests {
         // The other actor's documents were dropped, not re-added.
         assert!(!feed.rows.iter().any(|r| r.created_by == other));
         assert_eq!(
-            feed.rows.iter().map(|r| r.kind).collect::<std::collections::BTreeSet<_>>(),
+            feed.rows
+                .iter()
+                .map(|r| r.kind)
+                .collect::<std::collections::BTreeSet<_>>(),
             DocumentKind::ALL.iter().copied().collect(),
             "every family kept its in-range document"
         );
