@@ -123,6 +123,30 @@ pub struct UpdateTax {
     pub is_active: Option<bool>,
 }
 
+/// What currently references one tax, split by the two families that mean
+/// DIFFERENT things to the operator and are therefore never summed into a
+/// single "in use" number.
+///
+/// The split is the whole point of the hard-delete safeguard: a product link is
+/// current catalogue state the operator can undo, while a document snapshot is
+/// frozen history the application will never rewrite. Each count answers a
+/// different question and leads to a different remedy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaxReferenceCounts {
+    /// Rows in `product_taxes`: the tax is still linked to products.
+    pub product_links: i64,
+    /// Rows in `sale_line_taxes` plus `purchase_line_taxes`: a document line
+    /// already froze this tax's code, name, rate and contribution.
+    pub document_snapshots: i64,
+}
+
+impl TaxReferenceCounts {
+    /// Nothing references the tax, so it may be hard-deleted.
+    pub fn is_deletable(&self) -> bool {
+        self.product_links == 0 && self.document_snapshots == 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductTax {
     pub id: i64,

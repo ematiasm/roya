@@ -1,0 +1,99 @@
+{# The Taxes catalogue of the Settings Taxes tab.
+
+   Rows are the same shape the Products screen's catalogue uses — code, name,
+   rate and the active toggle, all inside one form so an edit is a single
+   submit — with the settings surface's own action URLs.
+
+   The rate is a canonical Decimal in Rust and is formatted only here, at the
+   presentation boundary; the same request context parses it back, so a rate
+   typed as `21,5` in Spanish is stored as `21.5` and read back as `21,5 %`.
+   A localized value is never persisted.
+
+   The hard delete is a two-step: the row's button asks the server for a
+   confirmation panel (see partials/settings_tax_delete_confirm.html) and only
+   that panel's form can actually delete. Nothing here deletes on one click. #}
+<div class="flex flex-col gap-2">
+  {# Where the delete confirmation lands. It is EMPTY in the resting list: the
+     panel exists only between "Delete" and the operator's answer, and any
+     catalogue mutation re-renders this list, so a stale panel cannot survive a
+     change it no longer describes. #}
+  <div id="settings-tax-delete"></div>
+  {% if rows.is_empty() %}
+  <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductNoTaxesConfigured) }}</div>
+  {% else %}
+  {% for row in rows %}
+  <div class="rounded-[10px] border border-border bg-surface p-3">
+    <form class="grid grid-cols-1 gap-2 sm:grid-cols-[100px_1fr_120px_auto]"
+          data-action="{{ localization.tr(crate::localization::MessageKey::ProductSaveTax) }}"
+          hx-post="/web/settings/taxes/edit"
+          hx-target="#settings-tax-list"
+          hx-swap="innerHTML">
+      <input type="hidden" name="id" value="{{ row.tax.id }}" />
+      <div>
+        <label class="field-label" for="settings-tax-code-{{ row.tax.id }}">{{ localization.tr(crate::localization::MessageKey::ProductCode) }}</label>
+        <input id="settings-tax-code-{{ row.tax.id }}" class="field" type="text" name="code" value="{{ row.tax.code }}" required maxlength="32" />
+      </div>
+      <div>
+        <label class="field-label" for="settings-tax-name-{{ row.tax.id }}">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+        <input id="settings-tax-name-{{ row.tax.id }}" class="field" type="text" name="name" value="{{ row.tax.name }}" required maxlength="128" />
+      </div>
+      <div>
+        <label class="field-label" for="settings-tax-rate-{{ row.tax.id }}">{{ localization.tr(crate::localization::MessageKey::ProductRate) }}</label>
+        <input id="settings-tax-rate-{{ row.tax.id }}" class="field" type="text" inputmode="decimal" name="rate" value="{{ localization.format_decimal(row.tax.rate.clone()) }}" required />
+      </div>
+      <div class="flex items-end gap-2">
+        <label class="choice whitespace-nowrap"><input type="checkbox" name="is_active" value="1" {% if row.tax.is_active %}checked{% endif %} /> {{ localization.tr(crate::localization::MessageKey::CommonActive) }}</label>
+        <button class="btn-primary" type="submit">{{ localization.tr(crate::localization::MessageKey::CommonSave) }}</button>
+      </div>
+    </form>
+    <div class="mt-2 flex flex-wrap items-center justify-between gap-2 text-[13px] text-muted">
+      <span>{{ localization.format_percentage(row.tax.rate.clone()) }}{% if !row.tax.is_active %} • {{ localization.tr(crate::localization::MessageKey::CommonInactive) }}{% endif %}</span>
+      <span class="flex flex-wrap items-center gap-2">
+        {% if row.tax.is_active %}
+        <form hx-post="/web/settings/taxes/deactivate" hx-target="#settings-tax-list" hx-swap="innerHTML" data-action="{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}">
+          <input type="hidden" name="id" value="{{ row.tax.id }}" />
+          <button class="btn-secondary" type="submit">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
+        </form>
+        {% else %}
+        <form hx-post="/web/settings/taxes/activate" hx-target="#settings-tax-list" hx-swap="innerHTML" data-action="{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}">
+          <input type="hidden" name="id" value="{{ row.tax.id }}" />
+          <button class="btn-secondary" type="submit">{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}</button>
+        </form>
+        {% endif %}
+        {# Step one of the delete: it asks for the confirmation panel and
+           changes nothing. `delete_label` names the tax, so a screen reader
+           meeting one of these rows out of context knows which tax it acts on. #}
+        <button class="btn-danger" type="button"
+                data-action="{{ localization.tr(crate::localization::MessageKey::TaxDelete) }}"
+                aria-label="{{ row.delete_label }}"
+                hx-get="/web/settings/taxes/delete-confirm/{{ row.tax.id }}"
+                hx-target="#settings-tax-delete"
+                hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
+      </span>
+    </div>
+  </div>
+  {% endfor %}
+  {% endif %}
+</div>
+<div class="mt-4">
+  <form class="grid grid-cols-1 gap-2 sm:grid-cols-[100px_1fr_120px_auto]"
+        data-action="{{ localization.tr(crate::localization::MessageKey::ProductCreateTax) }}"
+        hx-post="/web/settings/taxes"
+        hx-target="#settings-tax-list"
+        hx-swap="innerHTML"
+        hx-on::after-request="if(event.detail.successful) this.reset()">
+    <div>
+      <label class="field-label" for="settings-new-tax-code">{{ localization.tr(crate::localization::MessageKey::ProductCode) }}</label>
+      <input id="settings-new-tax-code" class="field" type="text" name="code" required maxlength="32" />
+    </div>
+    <div>
+      <label class="field-label" for="settings-new-tax-name">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+      <input id="settings-new-tax-name" class="field" type="text" name="name" required maxlength="128" />
+    </div>
+    <div>
+      <label class="field-label" for="settings-new-tax-rate">{{ localization.tr(crate::localization::MessageKey::ProductRate) }}</label>
+      <input id="settings-new-tax-rate" class="field" type="text" inputmode="decimal" name="rate" required />
+    </div>
+    <button class="btn-primary self-end" type="submit">{{ localization.tr(crate::localization::MessageKey::ProductCreateTax) }}</button>
+  </form>
+</div>

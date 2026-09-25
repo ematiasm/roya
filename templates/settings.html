@@ -3,9 +3,39 @@
 {% block content %}
 <div class="mb-4 flex flex-wrap items-center gap-2">
   <a href="/" class="link text-[13px] text-muted">← {{ localization.tr(crate::localization::MessageKey::NavigationDashboard) }}</a>
-  <span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::SettingsBusinessChip) }}</span>
+  <span class="chip chip-muted">{% if self.is_taxes_tab() %}{{ localization.tr(crate::localization::MessageKey::SettingsTaxesChip) }}{% else %}{{ localization.tr(crate::localization::MessageKey::SettingsBusinessChip) }}{% endif %}</span>
 </div>
 
+{# The tab strip. ONE mechanism for the whole page: a link per section, the
+   selected one marked with `aria-current` so the tab an operator is on is
+   announced, not only coloured. Both tabs are the same page under
+   `/settings` and `/settings?tab=taxes`, so the business form keeps its own
+   URL and its own submission, and switching section is a navigation a
+   bookmark can hold. #}
+<nav class="mb-4 flex flex-wrap items-center gap-2" aria-label="{{ localization.tr(crate::localization::MessageKey::SettingsTabsLabel) }}">
+  <a data-settings-tab="business" href="/settings"{% if !self.is_taxes_tab() %} aria-current="page"{% endif %}
+     class="{% if !self.is_taxes_tab() %}btn-primary{% else %}btn-secondary{% endif %}">{{ localization.tr(crate::localization::MessageKey::SettingsTabBusiness) }}</a>
+  <a data-settings-tab="taxes" href="/settings?tab=taxes"{% if self.is_taxes_tab() %} aria-current="page"{% endif %}
+     class="{% if self.is_taxes_tab() %}btn-primary{% else %}btn-secondary{% endif %}">{{ localization.tr(crate::localization::MessageKey::SettingsTabTaxes) }}</a>
+</nav>
+
+{% if self.is_taxes_tab() %}
+<div class="mb-4">
+  <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::SettingsTaxesHeading) }}</h2>
+  <p class="mt-1 text-sm text-muted">{{ localization.tr(crate::localization::MessageKey::SettingsTaxesIntro) }}</p>
+</div>
+
+{% if let Some(message) = error %}
+<div class="notice notice-error mb-4" data-notice="error" role="alert">
+  <div class="min-w-0 flex-1 break-words">{{ message }}</div>
+  <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}">✕</button>
+</div>
+{% endif %}
+
+<div id="settings-tax-list">
+  {% include "partials/settings_taxes.html" %}
+</div>
+{% else %}
 <div class="mb-4">
   <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::SettingsHeading) }}</h2>
   <p class="mt-1 text-sm text-muted">{{ localization.tr(crate::localization::MessageKey::SettingsIntro) }}</p>
@@ -93,4 +123,5 @@
     <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SettingsSubmit) }}</button>
   </div>
 </form>
+{% endif %}
 {% endblock %}

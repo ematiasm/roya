@@ -1,0 +1,37 @@
+{# The explicit confirmation step a hard delete requires.
+
+   This panel is what the row's Delete button fetches, and it is the ONLY thing
+   that can delete a tax: the form below carries the `confirm` field, and the
+   delete route refuses a request without it. The operator therefore reads
+   which tax is about to disappear, what will not come back, and how many
+   references still hold it, before answering.
+
+   The two counts are the decision, spelled out: a product link is removable
+   (unlink the product, then delete), while a recorded document line is not
+   (the tax is kept for history — deactivate it instead). The route refuses
+   both with those remedies spelled out, so the numbers here tell the operator
+   what to expect before they answer. #}
+<div class="rounded-[10px] border border-danger/30 bg-danger/12 p-3" role="alertdialog"
+     aria-labelledby="settings-tax-delete-title">
+  <div class="font-semibold text-danger" id="settings-tax-delete-title">{{ localization.tr(crate::localization::MessageKey::TaxDeleteConfirmTitle) }}</div>
+  <div class="mt-1 text-[13px]">
+    <span class="font-semibold">{{ tax.code }}</span> — {{ tax.name }}
+  </div>
+  <p class="mt-1 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::TaxDeleteConfirmHelp) }}</p>
+  <p class="mt-1 text-[13px] text-muted">
+    {{ products_summary }} • {{ snapshots_summary }}
+  </p>
+  <form class="mt-3 flex flex-wrap items-center gap-2"
+        hx-post="/web/settings/taxes/delete"
+        hx-target="#settings-tax-list"
+        hx-swap="innerHTML"
+        data-action="{{ localization.tr(crate::localization::MessageKey::TaxDelete) }}">
+    <input type="hidden" name="id" value="{{ tax.id }}" />
+    <input type="hidden" name="confirm" value="on" />
+    <button class="btn-danger" type="submit">{{ localization.tr(crate::localization::MessageKey::TaxDeleteConfirmSubmit) }}</button>
+    <button class="btn-secondary" type="button"
+            hx-get="/web/settings/taxes"
+            hx-target="#settings-tax-list"
+            hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::ActionCancel) }}</button>
+  </form>
+</div>

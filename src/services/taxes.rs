@@ -2,10 +2,32 @@ use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewTax, ProductTax, ProductTaxBreakdownRow, ProductTaxPreview, ProductTaxView, Tax, UpdateTax,
+    NewTax, ProductTax, ProductTaxBreakdownRow, ProductTaxPreview, ProductTaxView, Tax,
+    TaxReferenceCounts, UpdateTax,
 };
 use crate::repositories::{ProductRepository, ProductTaxRepository, TaxRepository};
 use crate::services::line_taxes::calculate_line_taxes;
+
+/// Canonical reason a hard delete was refused because a `product_taxes` row
+/// still links the tax to a product. The remedy is in the message's meaning:
+/// unlink the product, then delete.
+///
+/// A presentation layer maps this marker to a localized message; it is domain
+/// vocabulary, never operator copy, and it carries no database text.
+pub const TAX_DELETE_BLOCKED_BY_PRODUCTS: &str = "tax is still linked to products";
+
+/// Canonical reason a hard delete was refused because a sale-line or
+/// purchase-line snapshot still references the tax. There is no remedy at all:
+/// the snapshot is frozen history, so the tax must be KEPT. Deactivating it
+/// stops new documents from charging it without touching the past.
+pub const TAX_DELETE_BLOCKED_BY_HISTORY: &str = "tax is referenced by document history";
+
+/// Canonical reason for a hard delete refused by the database's own
+/// `ON DELETE RESTRICT` backstop when the application could not attribute the
+/// reference to a family — a race that resolved itself between the count and
+/// the delete, or a reference this build does not know how to name. It is
+/// still an actionable conflict, never a raw database fault.
+pub const TAX_DELETE_BLOCKED: &str = "tax is still referenced";
 
 #[derive(Clone)]
 pub struct TaxService<P, T, L>
@@ -98,6 +120,67 @@ where
     pub async fn deactivate_tax(&self, actor: i64, id: i64) -> AppResult<Tax> {
         self.get_tax(id).await?;
         self.taxes.deactivate(actor, id).await
+    }
+
+    /// Reactivate a tax the catalogue no longer charges.
+    ///
+    /// A first-class action, not a side effect of an edit: an operator who
+    /// stopped charging a tax and later needs it back must not have to re-submit
+    /// its code, name and rate to bring it back, and the row keeps the same
+    /// audit shape as every other lifecycle change here.
+    pub async fn activate_tax(&self, actor: i64, id: i64) -> AppResult<Tax> {
+        let current = self.get_tax(id).await?;
+        self.taxes
+            .update(actor, id, &current.code, &current.name, current.rate, true)
+            .await
+    }
+
+    /// What currently references one tax, split into the two families the
+    /// delete safeguard distinguishes. A read: it counts and writes nothing, and
+    /// the counts are what a presentation layer shows before asking for a
+    /// destructive confirmation.
+    pub async fn tax_references(&self, id: i64) -> AppResult<TaxReferenceCounts> {
+        self.taxes.reference_counts(id).await
+    }
+
+    /// The hard delete: remove a tax definition outright, but only when nothing
+    /// references it.
+    ///
+    /// Two reference families, and they are never treated as one number,
+    /// because they demand different things from the operator (see
+    /// [`TaxReferenceCounts`]). The refusal order is fixed and explained there:
+    /// frozen history outranks a product link, since no amount of unlinking can
+    /// free a tax a document already froze.
+    ///
+    /// The count and the delete cannot be one atomic statement here — the
+    /// catalogue tables are the tax repository's and the reference check must
+    /// be answerable on its own — so a reference can appear between them. The
+    /// `ON DELETE RESTRICT` backstop is what closes that window, and its
+    /// refusal is translated HERE into the same actionable conflict the
+    /// application-level check produces, by re-reading the counts. The caller
+    /// therefore cannot tell a raced refusal from an anticipated one, and no
+    /// database text ever escapes.
+    ///
+    /// NO ACTOR PARAMETER: the `taxes` table records no delete audit, so there
+    /// is nowhere to store who removed it (see `TaxRepository::hard_delete`).
+    pub async fn delete_tax(&self, id: i64) -> AppResult<()> {
+        self.get_tax(id).await?;
+        let references = self.tax_references(id).await?;
+        if let Some(refusal) = delete_refusal(&references) {
+            return Err(refusal);
+        }
+        match self.taxes.hard_delete(id).await {
+            Ok(true) => return Ok(()),
+            // The row was already gone: a concurrent delete won, and the tax
+            // this call asked to remove no longer exists either way.
+            Ok(false) => return Err(AppError::NotFound(format!("tax {id} not found"))),
+            // The database backstop fired. Re-read the counts and answer with the
+            // real reason instead of forwarding the internal marker.
+            Err(AppError::Conflict(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let raced = self.tax_references(id).await?;
+        Err(delete_refusal(&raced).unwrap_or_else(|| AppError::Conflict(TAX_DELETE_BLOCKED.into())))
     }
 
     pub async fn list_product_taxes(&self, product_id: i64) -> AppResult<Vec<ProductTaxView>> {
@@ -217,6 +300,26 @@ fn validate_rate(rate: Decimal) -> AppResult<()> {
         return Err(AppError::Validation("tax rate cannot be negative".into()));
     }
     Ok(())
+}
+
+/// The one place a hard-delete refusal is decided, so the application-level
+/// check and the raced re-check can never disagree about which reason applies.
+///
+/// FROZEN HISTORY FIRST, and the reason is not precedence for its own sake: a
+/// `product_taxes` link is something the operator can undo right now, while a
+/// document snapshot never releases its reference. Reporting "unlink the
+/// products" for a tax a sale already froze would send the operator through
+/// work that cannot possibly end in the deletion they asked for.
+fn delete_refusal(references: &TaxReferenceCounts) -> Option<AppError> {
+    if references.is_deletable() {
+        return None;
+    }
+    if references.document_snapshots > 0 {
+        return Some(AppError::Conflict(TAX_DELETE_BLOCKED_BY_HISTORY.into()));
+    }
+    // The counts are not deletable, no snapshot holds it, and a link does: the
+    // one remaining reason there can be.
+    Some(AppError::Conflict(TAX_DELETE_BLOCKED_BY_PRODUCTS.into()))
 }
 
 #[cfg(test)]

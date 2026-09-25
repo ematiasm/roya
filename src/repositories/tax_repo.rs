@@ -3,12 +3,23 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewTax, ProductTax, Tax};
+use crate::models::{NewTax, ProductTax, Tax, TaxReferenceCounts};
 use rust_decimal::Decimal;
 
 fn parse_decimal(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap_or(Decimal::ZERO)
 }
+
+/// What the `ON DELETE RESTRICT` backstop maps to when a `DELETE FROM taxes`
+/// hits a reference.
+///
+/// It is an INTERNAL signal, not operator copy: `TaxService::delete_tax`
+/// re-reads the reference counts after this refusal and replaces it with the
+/// specific reason (a product link, or frozen document history) before any
+/// response is built, so no database text and no bare marker ever reaches an
+/// operator. Mapping it to `AppError::Conflict` rather than
+/// `AppError::Database` is what keeps a lost race a 409 instead of a raw 500.
+const DELETE_REFUSED_BY_FOREIGN_KEY: &str = "tax delete refused by a foreign key";
 
 fn map_tax_error(error: sqlx::Error) -> AppError {
     if error.to_string().contains("UNIQUE constraint failed") {
@@ -71,6 +82,27 @@ pub trait TaxRepository: Send + Sync {
         is_active: bool,
     ) -> AppResult<Tax>;
     async fn deactivate(&self, actor: i64, id: i64) -> AppResult<Tax>;
+    /// Every row that currently references one tax, split into the two
+    /// families the delete safeguard distinguishes.
+    ///
+    /// THREE counts in ONE pass on purpose. A separate count per table would
+    /// read the three tables at three different moments, so a link created
+    /// between two of them could be counted as absent by the check and still
+    /// stop the delete; the `ON DELETE RESTRICT` backstop remains the authority
+    /// for that case, but the application-level answer should be internally
+    /// consistent on its own.
+    async fn reference_counts(&self, id: i64) -> AppResult<TaxReferenceCounts>;
+    /// Remove the tax row outright, and report whether a row was removed.
+    ///
+    /// NO ACTOR PARAMETER, deliberately: the `taxes` table has no delete audit
+    /// (`created_by`/`updated_by` die with the row and this project has no
+    /// generic audit log), so an actor here could be recorded nowhere. Carrying
+    /// one anyway would advertise an audit trail that does not exist.
+    ///
+    /// It never cascades and never rewrites a snapshot: the only thing this
+    /// statement does is remove the tax definition, and the database refuses it
+    /// outright while any reference remains.
+    async fn hard_delete(&self, id: i64) -> AppResult<bool>;
 }
 
 #[async_trait]
@@ -198,6 +230,43 @@ impl TaxRepository for SqliteTaxRepository {
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_tax(row))
+    }
+
+    async fn reference_counts(&self, id: i64) -> AppResult<TaxReferenceCounts> {
+        // One statement, three scalar subqueries: the link table and both
+        // snapshot tables are read at the same instant, so the counts describe
+        // one consistent state of the catalogue and the history.
+        let row = sqlx::query(
+            r#"SELECT
+                 (SELECT COUNT(*) FROM product_taxes WHERE tax_id = ?) AS product_links,
+                 (SELECT COUNT(*) FROM sale_line_taxes WHERE tax_id = ?)
+                   + (SELECT COUNT(*) FROM purchase_line_taxes WHERE tax_id = ?)
+                   AS document_snapshots"#,
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(TaxReferenceCounts {
+            product_links: row.get("product_links"),
+            document_snapshots: row.get("document_snapshots"),
+        })
+    }
+
+    async fn hard_delete(&self, id: i64) -> AppResult<bool> {
+        let result = sqlx::query("DELETE FROM taxes WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("FOREIGN KEY constraint failed") {
+                    AppError::Conflict(DELETE_REFUSED_BY_FOREIGN_KEY.into())
+                } else {
+                    AppError::Database(error)
+                }
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 }
 

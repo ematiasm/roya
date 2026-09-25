@@ -87,12 +87,57 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
   - Product presentation shows the stored net price, linked tax breakdown, and derived tax-inclusive price without mutating the net price.
   - Evidence: strict TDD RED proved document totals ignored stored tax; final `cargo test tax_snapshot` → 41 passed, `cargo test sales` → 122 passed, `cargo test purchases` → 161 passed, `cargo test documents` → 30 passed, `cargo test localization_tests` → 39 passed, `cargo test tax_` → 85 passed, `cargo test` → 1043 passed, `cargo check --all-targets` → 0 errors, 81 warnings, `cargo fmt --check` and `git diff --check` clean, and `bash scripts/e2e.sh tests/test_visual_baseline.py` → 1 passed. Independent financial verification audited every money path, found a vacuous locale guard, an intentional-but-stale visual baseline, and a duplicate product no-tax notice; all were closed and final independent verdict was PASS. Parent spot check repeated `cargo test tax_preview` → 8 passed. CSS build is N/A because every new template utility class already exists in committed `static/tailwind.css`. Commit identity is recorded in this document after the work-unit commit.
 
-- [ ] T3 — Add the Settings Taxes tab and hard-delete safeguard.
-  - Add localized tab navigation and reusable tax administration UI.
-  - Support create, edit, activate/deactivate, and hard delete under `SettingsManage`.
-  - Reject deletion for product associations and document snapshots with actionable conflicts.
-  - Preserve existing business settings behavior and inventory product-tax management.
-  - Evidence: RED/GREEN settings/tax tests and focused browser coverage, exact commands and commit identity.
+- [x] T3 — Add the Settings Taxes tab and hard-delete safeguard.
+  - Added a localized `?tab=taxes` Settings tab with a dedicated `/web/settings/taxes…` surface under `SettingsManage`, while preserving the existing business settings form and the inventory product-drawer association surface.
+  - Supports create, edit, activate/deactivate, and server-enforced confirmed hard delete.
+  - Deletion is refused separately for product associations and document snapshots, with document history taking priority, and a raced foreign-key refusal is re-resolved into the same localized conflict.
+  - Database and internal faults are logged and answered as 500; only genuine refusals keep 409/404/400 with actionable localized copy.
+  - Evidence: strict TDD RED covered the missing tab, routes, service methods, and fault status; final `cargo test settings_` → 23 passed, `cargo test tax_` → 98 passed, `cargo test tax_snapshot` → 41 passed, `cargo test` → 1063 passed, `cargo check --all-targets` → 0 errors, 81 warnings, `cargo fmt --check` and `git diff --check` clean, `bash scripts/e2e.sh tests/test_settings.py` → 6 passed, and `bash scripts/e2e.sh tests/test_visual_baseline.py` → 1 passed without regeneration because `/settings` is not baselined. Independent verification found unlogged database faults, uncovered localized history-refusal copy, and an overstated authorization note; all were closed and final independent verdict was PASS. Parent spot check repeated `cargo test settings_` → 23 passed. CSS build is N/A because the new templates introduce no class missing from the committed stylesheet. Commit identity is recorded in this document after the work-unit commit.
+
+### T3 design decisions
+
+- **Canonical tax-administration URL surface.** Settings owns tax administration, so
+  every tax mutation the Taxes tab issues is addressed under `/web/settings/taxes…`
+  (`POST` create/edit/activate/deactivate/delete, `GET` list and delete-confirmation) and is
+  gated by `settings.manage`, on the page at `/settings?tab=taxes`. The pre-existing
+  `/web/taxes`, `/web/taxes/edit` and `/web/taxes/deactivate` routes are a DIFFERENT surface:
+  they belong to the Products screen's tax catalogue, are gated by `inventory.write`, and the
+  product drawer renders their fragments. They were left untouched on purpose.
+- **The real authorization invariant (stated exactly).** This feature makes tax administration
+  *irreversible* only under `settings.manage`: a hard delete — the one operation that destroys a
+  definition instead of editing it — exists on no other route, and `inventory.write` cannot reach
+  it. It does NOT make the catalogue `settings.manage`-only. A principal holding
+  `inventory.write` can still create, rename, re-rate and deactivate/activate taxes from the
+  Products screen's catalogue, exactly as before this feature, and that remains true. Both
+  surfaces are therefore real, both keep their own permission, and they share no handler; merging
+  them would either hand deletion to `inventory.write` or break the product page, its catalogue
+  and their tests. Whether the catalogue's write access should eventually narrow to
+  `settings.manage` is a separate authorization decision, not a side effect of T3.
+- **Tab mechanism.** One `?tab=` query parameter on the existing `/settings` route, business tab
+  as the default. The business form keeps its own URL, its own submission and its own markup; the
+  taxes catalogue is read only when the taxes tab is selected.
+- **Deletion conflict semantics.** Two reference families, never summed: a `product_taxes` link is
+  removable current state (unlink the product), while a `sale_line_taxes` / `purchase_line_taxes`
+  snapshot is frozen history with no remedy (keep the tax, deactivate it instead). When BOTH
+  block the tax, the HISTORY conflict is the one reported: no amount of unlinking can free a tax a
+  document already froze, so reporting the product link first would send the operator through work
+  that cannot end in the deletion they asked for. Each reason has its own localized message.
+- **Two-step delete.** The row's delete button only fetches a server-rendered confirmation panel
+  naming the tax and both reference counts; the panel's form carries the `confirm` field and the
+  delete route refuses a request without it, so the confirmation is enforced by the server and not
+  only by the button.
+- **No delete audit actor.** `taxes` has no delete audit trail (`created_by`/`updated_by` die with
+  the row and the project has no generic audit log), so `TaxService::delete_tax` and
+  `TaxRepository::hard_delete` deliberately take no actor parameter rather than advertising an
+  audit that does not exist.
+- **CSS build is N/A for this unit.** The three utility classes the new templates use that are
+  absent from the committed `static/tailwind.css` (`self-end`,
+  `sm:grid-cols-[100px_1fr_120px_auto]`, `whitespace-nowrap`) are the SAME classes the committed
+  Products tax catalogue already uses, so T3 introduces no new styling requirement and the Taxes
+  tab is guaranteed to render like the existing catalogue. The committed stylesheet is stale for
+  14 classes across 11 other templates; regenerating it is a separate work unit with its own
+  visual-baseline audit.
+
 
 - [ ] T4 — Run final verification and record delivery evidence.
   - Run focused suites, the full Rust suite, formatting/diff checks, and applicable E2E checks.
@@ -135,4 +180,6 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
 - T1 delivery: work-unit commit `88176a9` (`feat(tax): persist line tax snapshots atomically`).
 - T2 verification: every sale/purchase money path reconciles through the per-line rounded tax-inclusive rule. Independent verification confirmed no `qty * price` bypass, no double counting in refunds or receipt-driven sales, confirmed-document immutability, and correct canonical/localized separation. The required visual baseline was regenerated with 14 intentionally changed captures and no lost appearance; the locale leak guard and duplicate product no-tax notice were fixed. Final verdict: PASS.
 - T2 delivery: work-unit commit `a8fa64c` (`feat(tax): make document totals tax-inclusive`).
-- Next step: T3 Settings Taxes tab plus product-association and document-snapshot hard-delete safeguards.
+- T3 verification: the Settings tax catalogue is correctly gated, the business tab is unchanged, hard deletion is server-confirmed and refused for both reference families with history taking priority, and product-association management from the inventory drawer is untouched. Independent verification confirmed the true authorization invariant: this feature makes irreversible administration exclusive to `settings.manage`, while pre-existing `inventory.write` catalogue access to create, rename, re-rate, and activate/deactivate taxes is deliberately unchanged. Final verdict: PASS.
+- T3 delivery: no commit recorded yet.
+- Next step: T4 final branch-wide verification, honest skip accounting, and delivery evidence.
