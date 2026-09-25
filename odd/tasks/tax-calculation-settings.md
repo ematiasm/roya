@@ -132,5 +132,5 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
 - Feature document: `odd/tasks/tax-calculation-settings.md`.
 - Engram mirror topic: `odd/tax-calculation-settings/tasks`.
 - T1 verification: 38 focused tax-snapshot tests and 1005 full Rust tests pass. Independent verification forced and closed three real blockers: non-atomic snapshot/aggregate writes, a legacy public line-write bypass, and unguarded confirmed-line deletion. Final independent verdict: PASS. `cargo check --all-targets` reports 0 errors and 82 warnings; transitional dead-code suppressions are documented for removal in T2.
-- T1 delivery: single work unit, no commit recorded yet.
+- T1 delivery: work-unit commit `88176a9` (`feat(tax): persist line tax snapshots atomically`).
 - Next step: T2 tax-inclusive document totals, payment limits, debt math, and read-side presentation.
