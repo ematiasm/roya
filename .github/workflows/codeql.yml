@@ -1,0 +1,38 @@
+# Keep CodeQL separate from the behavioral checks in checks.yml.
+# Rust supports CodeQL's no-build mode, which avoids coupling analysis to the
+# application's build command while still producing results for pull requests.
+name: codeql
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+
+# CodeQL needs to upload security events; it does not need repository write
+# access or permission to change Actions state.
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (Rust)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:rust"
