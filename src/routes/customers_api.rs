@@ -167,7 +167,8 @@ async fn list_customers(
     Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<ListCustomersQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let customers = customer_views(&state, query.only_active.unwrap_or(false), &localization).await?;
+    let customers =
+        customer_views(&state, query.only_active.unwrap_or(false), &localization).await?;
     Ok(Json(serde_json::json!({ "customers": customers })))
 }
 

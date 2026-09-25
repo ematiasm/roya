@@ -1,17 +1,17 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    Json, Router,
     routing::{get, put},
+    Json, Router,
 };
 use serde::Deserialize;
 
 use crate::error::AppResult;
-use crate::models::{CreateAccountRequest, CreateTransactionRequest, TransactionFilter, UpdateTransactionRequest};
-use crate::routes::AppState;
-use crate::security::authz::{
-    FinanceMethodsManage, FinanceRead, FinanceWrite, Require,
+use crate::models::{
+    CreateAccountRequest, CreateTransactionRequest, TransactionFilter, UpdateTransactionRequest,
 };
+use crate::routes::AppState;
+use crate::security::authz::{FinanceMethodsManage, FinanceRead, FinanceWrite, Require};
 
 // S5 enforcement mapping (finance JSON API): reads → `finance.read`,
 // transaction mutations → `finance.write`, and the account/method allowlist
@@ -25,7 +25,9 @@ async fn list_accounts(
 ) -> AppResult<Json<serde_json::Value>> {
     let accounts = state.account_service.list_with_balances().await?;
     let total = state.account_service.total_balance().await?;
-    Ok(Json(serde_json::json!({ "accounts": accounts, "total_balance": total })))
+    Ok(Json(
+        serde_json::json!({ "accounts": accounts, "total_balance": total }),
+    ))
 }
 
 async fn create_account(
@@ -34,7 +36,10 @@ async fn create_account(
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateAccountRequest>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let acc = state.account_service.create(principal.user_id, &payload.name).await?;
+    let acc = state
+        .account_service
+        .create(principal.user_id, &payload.name)
+        .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(acc))))
 }
 
@@ -95,10 +100,7 @@ async fn put_account_payment_methods(
 }
 
 /// Shape shared by GET and PUT: the account plus its owned methods.
-fn methods_json(
-    account_id: i64,
-    methods: Vec<crate::models::PaymentMethod>,
-) -> serde_json::Value {
+fn methods_json(account_id: i64, methods: Vec<crate::models::PaymentMethod>) -> serde_json::Value {
     let method_ids: Vec<i64> = methods.iter().map(|m| m.id).collect();
     serde_json::json!({
         "account_id": account_id,
@@ -146,7 +148,14 @@ async fn update_transaction(
 ) -> AppResult<Json<serde_json::Value>> {
     let tx = state
         .transaction_service
-        .update(principal.user_id, id, payload.kind, payload.amount, payload.description, payload.date)
+        .update(
+            principal.user_id,
+            id,
+            payload.kind,
+            payload.amount,
+            payload.description,
+            payload.date,
+        )
         .await?;
     Ok(Json(serde_json::json!(tx)))
 }
@@ -169,7 +178,10 @@ pub fn router() -> Router<AppState> {
             "/api/accounts/{id}/payment-methods",
             get(get_account_payment_methods).put(put_account_payment_methods),
         )
-        .route("/api/transactions", get(list_transactions).post(create_transaction))
+        .route(
+            "/api/transactions",
+            get(list_transactions).post(create_transaction),
+        )
         .route(
             "/api/transactions/{id}",
             put(update_transaction).delete(delete_transaction),
@@ -539,7 +551,15 @@ mod tests {
     #[tokio::test]
     async fn an_anonymous_request_still_gets_the_login_gate_not_the_permission_refusal() {
         let app = crate::routes::router(test_state().await);
-        let (st, v) = send_as(app.clone(), "GET", "/api/accounts", None, None, String::new()).await;
+        let (st, v) = send_as(
+            app.clone(),
+            "GET",
+            "/api/accounts",
+            None,
+            None,
+            String::new(),
+        )
+        .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
         assert_eq!(v["error"].as_str(), Some("unauthorized"), "{v}");
     }
@@ -619,7 +639,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let (status, v) = put_methods(&app, acc, &[transfer, 999_999]).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "unknown method must 404: {v}");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "unknown method must 404: {v}"
+        );
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK);
@@ -643,9 +667,16 @@ mod tests {
 
         // Stealing is a 400 and changes nothing on either side.
         let (status, v) = put_methods(&app, b, &[cash]).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "foreign method must 400: {v}");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "foreign method must 400: {v}"
+        );
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("belongs to account"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("belongs to account"),
             "actionable message: {v}"
         );
         let (status, v) = get_methods(&app, a).await;
@@ -668,7 +699,10 @@ mod tests {
 
         let (status, v) = put_methods(&app, acc, &[]).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert!(owned_names(&v).is_empty(), "empty unassigns everything: {v}");
+        assert!(
+            owned_names(&v).is_empty(),
+            "empty unassigns everything: {v}"
+        );
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK);
@@ -700,8 +734,14 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{v}");
-        assert!(v.get("reference").is_some(), "reference must be exposed: {v}");
-        assert!(v["reference"].is_null(), "manual transaction has no reference: {v}");
+        assert!(
+            v.get("reference").is_some(),
+            "reference must be exposed: {v}"
+        );
+        assert!(
+            v["reference"].is_null(),
+            "manual transaction has no reference: {v}"
+        );
 
         let stored: (Option<String>,) =
             sqlx::query_as("SELECT reference FROM transactions WHERE id = ?")

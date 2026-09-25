@@ -9,9 +9,9 @@ mod routes;
 mod security;
 mod services;
 #[cfg(test)]
-mod setup_tests;
-#[cfg(test)]
 mod settings_tests;
+#[cfg(test)]
+mod setup_tests;
 #[cfg(test)]
 mod smoke_tests;
 #[cfg(test)]

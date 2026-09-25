@@ -74,14 +74,14 @@ where
             {
                 continue;
             }
-            if let Some(unassigned) =
-                self.methods.find_unassigned_by_name(method_name).await?
-            {
+            if let Some(unassigned) = self.methods.find_unassigned_by_name(method_name).await? {
                 self.methods
                     .set_method_account(actor, unassigned.id, Some(account_id))
                     .await?;
             } else {
-                self.methods.create_in_account(actor, method_name, account_id).await?;
+                self.methods
+                    .create_in_account(actor, method_name, account_id)
+                    .await?;
             }
         }
         Ok(())
@@ -89,10 +89,7 @@ where
 
     /// The account's own methods (ownership implies usability; there is no
     /// separate allowlist anymore).
-    pub async fn catalog_for_account(
-        &self,
-        account_id: i64,
-    ) -> AppResult<Vec<PaymentMethod>> {
+    pub async fn catalog_for_account(&self, account_id: i64) -> AppResult<Vec<PaymentMethod>> {
         self.methods.list_by_account(account_id).await
     }
 
@@ -154,11 +151,15 @@ where
         let current = self.methods.list_by_account(account_id).await?;
         for owned in &current {
             if !seen.contains(&owned.id) {
-                self.methods.set_method_account(actor, owned.id, None).await?;
+                self.methods
+                    .set_method_account(actor, owned.id, None)
+                    .await?;
             }
         }
         for id in to_assign {
-            self.methods.set_method_account(actor, id, Some(account_id)).await?;
+            self.methods
+                .set_method_account(actor, id, Some(account_id))
+                .await?;
         }
         self.catalog_for_account(account_id).await
     }
@@ -189,7 +190,9 @@ where
                 {
                     Ok(existing)
                 } else {
-                    self.methods.create_in_account(actor, &method.name, account_id).await
+                    self.methods
+                        .create_in_account(actor, &method.name, account_id)
+                        .await
                 }
             }
             None => {
@@ -198,10 +201,14 @@ where
                     .find_method_in_account(account_id, &method.name)
                     .await?
                 {
-                    self.methods.set_method_account(actor, method.id, None).await?;
+                    self.methods
+                        .set_method_account(actor, method.id, None)
+                        .await?;
                     Ok(existing)
                 } else {
-                    self.methods.set_method_account(actor, method.id, Some(account_id)).await?;
+                    self.methods
+                        .set_method_account(actor, method.id, Some(account_id))
+                        .await?;
                     self.methods
                         .find_method(method.id)
                         .await?
@@ -263,12 +270,13 @@ mod tests {
         // sentinel account, resolved through the shared test support (the AC20
         // boundary scan forbids naming identity tables here).
         let actor = test_support::audit_actor_id(pool).await.unwrap();
-        let row: (i64,) = sqlx::query_as("INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id")
-            .bind(name)
-            .bind(actor)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        let row: (i64,) =
+            sqlx::query_as("INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id")
+                .bind(name)
+                .bind(actor)
+                .fetch_one(pool)
+                .await
+                .unwrap();
         row.0
     }
 
@@ -297,10 +305,11 @@ mod tests {
         let svc = PaymentMethodService::new(repo);
         let methods = svc.list().await.unwrap();
         let names: Vec<String> = methods.iter().map(|m| m.name.clone()).collect();
-        let seeded: Vec<String> = PaymentMethodService::<SqlitePaymentMethodRepository>::seeded_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect();
+        let seeded: Vec<String> =
+            PaymentMethodService::<SqlitePaymentMethodRepository>::seeded_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
         assert_eq!(names, seeded, "seed order is the canonical order");
         assert!(!names.iter().any(|n| n == "Other"));
         assert!(methods.iter().all(|m| m.account_id.is_none()));
@@ -313,7 +322,13 @@ mod tests {
         let svc = PaymentMethodService::new(repo);
         for name in ["Caja", "Banco", "MP"] {
             let id = seed_account(&pool, name).await;
-            svc.ensure_defaults_for_account(test_support::audit_actor_id(&pool).await.unwrap(), id, name).await.unwrap();
+            svc.ensure_defaults_for_account(
+                test_support::audit_actor_id(&pool).await.unwrap(),
+                id,
+                name,
+            )
+            .await
+            .unwrap();
         }
         async fn names(pool: &sqlx::SqlitePool, acc: i64) -> Vec<String> {
             let rows = SqlitePaymentMethodRepository::new(pool.clone())
@@ -335,7 +350,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names(&pool, caja_id.0).await, vec!["Cash"]);
-        assert_eq!(names(&pool, banco_id.0).await, vec!["CreditCard", "Debit", "Transfer"]);
+        assert_eq!(
+            names(&pool, banco_id.0).await,
+            vec!["CreditCard", "Debit", "Transfer"]
+        );
         assert_eq!(names(&pool, mp_id.0).await, vec!["QR", "Transfer"]);
     }
 
@@ -345,8 +363,20 @@ mod tests {
         let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
         let banco = seed_account(&pool, "Banco").await;
         let mp = seed_account(&pool, "MP").await;
-        svc.ensure_defaults_for_account(test_support::audit_actor_id(&pool).await.unwrap(), banco, "Banco").await.unwrap();
-        svc.ensure_defaults_for_account(test_support::audit_actor_id(&pool).await.unwrap(), mp, "MP").await.unwrap();
+        svc.ensure_defaults_for_account(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            banco,
+            "Banco",
+        )
+        .await
+        .unwrap();
+        svc.ensure_defaults_for_account(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            mp,
+            "MP",
+        )
+        .await
+        .unwrap();
 
         let transfers: Vec<(i64, Option<i64>)> = sqlx::query_as(
             "SELECT id, account_id FROM payment_methods WHERE name = 'Transfer' ORDER BY id",
@@ -354,13 +384,23 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(transfers.len(), 2, "Transfer duplicates across accounts: {transfers:?}");
+        assert_eq!(
+            transfers.len(),
+            2,
+            "Transfer duplicates across accounts: {transfers:?}"
+        );
         assert_eq!(transfers[0].1, Some(banco));
         assert_eq!(transfers[1].1, Some(mp));
         assert_ne!(transfers[0].0, transfers[1].0);
 
         // Idempotent: a second run assigns nothing new.
-        svc.ensure_defaults_for_account(test_support::audit_actor_id(&pool).await.unwrap(), banco, "Banco").await.unwrap();
+        svc.ensure_defaults_for_account(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            banco,
+            "Banco",
+        )
+        .await
+        .unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM payment_methods")
             .fetch_one(&pool)
             .await
@@ -373,7 +413,13 @@ mod tests {
         let pool = test_pool().await;
         let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
         let acc = seed_account(&pool, "Caja").await;
-        svc.ensure_defaults_for_account(test_support::audit_actor_id(&pool).await.unwrap(), acc, "Caja").await.unwrap();
+        svc.ensure_defaults_for_account(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            acc,
+            "Caja",
+        )
+        .await
+        .unwrap();
         let cash = method_id(&svc, "Cash").await;
         assert_eq!(svc.resolve_account(cash).await.unwrap(), acc);
     }
@@ -389,12 +435,19 @@ mod tests {
         let cash = method_id(&svc, "Cash").await;
         let err = svc.resolve_account(cash).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert!(err.to_string().contains("not assigned to any account"), "got {err}");
+        assert!(
+            err.to_string().contains("not assigned to any account"),
+            "got {err}"
+        );
 
         // Inactive is a 400 too.
         let acc = seed_account(&pool, "Caja").await;
         svc.methods
-            .set_method_account(test_support::audit_actor_id(&pool).await.unwrap(), cash, Some(acc))
+            .set_method_account(
+                test_support::audit_actor_id(&pool).await.unwrap(),
+                cash,
+                Some(acc),
+            )
             .await
             .unwrap();
         sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
@@ -415,13 +468,36 @@ mod tests {
         let cash = method_id(&svc, "Cash").await;
         let transfer = method_id(&svc, "Transfer").await;
 
-        let catalog = svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), acc, &[cash]).await.unwrap();
+        let catalog = svc
+            .replace_account_methods(
+                test_support::audit_actor_id(&pool).await.unwrap(),
+                acc,
+                &[cash],
+            )
+            .await
+            .unwrap();
         assert_eq!(catalog_names(&catalog), vec!["Cash"]);
 
-        let catalog = svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), acc, &[transfer]).await.unwrap();
-        assert_eq!(catalog_names(&catalog), vec!["Transfer"], "replace removes Cash");
+        let catalog = svc
+            .replace_account_methods(
+                test_support::audit_actor_id(&pool).await.unwrap(),
+                acc,
+                &[transfer],
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            svc.methods.find_method(cash).await.unwrap().unwrap().account_id,
+            catalog_names(&catalog),
+            vec!["Transfer"],
+            "replace removes Cash"
+        );
+        assert_eq!(
+            svc.methods
+                .find_method(cash)
+                .await
+                .unwrap()
+                .unwrap()
+                .account_id,
             None,
             "removed methods are unassigned, not deleted"
         );
@@ -433,9 +509,22 @@ mod tests {
         let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
         let acc = seed_account(&pool, "A").await;
         let cash = method_id(&svc, "Cash").await;
-        svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), acc, &[cash]).await.unwrap();
+        svc.replace_account_methods(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            acc,
+            &[cash],
+        )
+        .await
+        .unwrap();
 
-        let err = svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), acc, &[cash, 999_999]).await.unwrap_err();
+        let err = svc
+            .replace_account_methods(
+                test_support::audit_actor_id(&pool).await.unwrap(),
+                acc,
+                &[cash, 999_999],
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
         assert_eq!(
             catalog_names(&svc.catalog_for_account(acc).await.unwrap()),
@@ -451,12 +540,29 @@ mod tests {
         let a = seed_account(&pool, "A").await;
         let b = seed_account(&pool, "B").await;
         let cash = method_id(&svc, "Cash").await;
-        svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), a, &[cash]).await.unwrap();
+        svc.replace_account_methods(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            a,
+            &[cash],
+        )
+        .await
+        .unwrap();
 
-        let err = svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), b, &[cash]).await.unwrap_err();
+        let err = svc
+            .replace_account_methods(
+                test_support::audit_actor_id(&pool).await.unwrap(),
+                b,
+                &[cash],
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(err.to_string().contains("belongs to account"), "got {err}");
-        assert_eq!(svc.resolve_account(cash).await.unwrap(), a, "ownership unchanged");
+        assert_eq!(
+            svc.resolve_account(cash).await.unwrap(),
+            a,
+            "ownership unchanged"
+        );
     }
 
     #[tokio::test]
@@ -465,9 +571,18 @@ mod tests {
         let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
         let acc = seed_account(&pool, "A").await;
         let cash = method_id(&svc, "Cash").await;
-        svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), acc, &[cash]).await.unwrap();
+        svc.replace_account_methods(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            acc,
+            &[cash],
+        )
+        .await
+        .unwrap();
 
-        let catalog = svc.replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), acc, &[]).await.unwrap();
+        let catalog = svc
+            .replace_account_methods(test_support::audit_actor_id(&pool).await.unwrap(), acc, &[])
+            .await
+            .unwrap();
         assert!(catalog.is_empty());
         assert_eq!(svc.accounts_without_methods().await.unwrap(), vec![acc]);
     }
@@ -481,11 +596,17 @@ mod tests {
         let cash = method_id(&svc, "Cash").await;
 
         // Free method is assigned.
-        let owned = svc.assign_or_duplicate(test_support::audit_actor_id(&pool).await.unwrap(), a, cash).await.unwrap();
+        let owned = svc
+            .assign_or_duplicate(test_support::audit_actor_id(&pool).await.unwrap(), a, cash)
+            .await
+            .unwrap();
         assert_eq!(owned.account_id, Some(a));
 
         // Owned elsewhere: B gets a duplicate, A keeps its row.
-        let dup = svc.assign_or_duplicate(test_support::audit_actor_id(&pool).await.unwrap(), b, cash).await.unwrap();
+        let dup = svc
+            .assign_or_duplicate(test_support::audit_actor_id(&pool).await.unwrap(), b, cash)
+            .await
+            .unwrap();
         assert_eq!(dup.account_id, Some(b));
         assert_ne!(dup.id, cash);
         assert_eq!(dup.name, "Cash");
@@ -497,7 +618,13 @@ mod tests {
         let pool = test_pool().await;
         let svc = PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone()));
         let acc = seed_account(&pool, "Caja").await;
-        svc.ensure_defaults_for_account(test_support::audit_actor_id(&pool).await.unwrap(), acc, "Caja").await.unwrap();
+        svc.ensure_defaults_for_account(
+            test_support::audit_actor_id(&pool).await.unwrap(),
+            acc,
+            "Caja",
+        )
+        .await
+        .unwrap();
 
         let options = svc.methods_with_accounts().await.unwrap();
         assert_eq!(options.len(), 5);
@@ -517,13 +644,21 @@ mod tests {
         let pool = test_pool().await;
         let repo = SqlitePaymentMethodRepository::new(pool.clone());
         let svc = PaymentMethodService::new(repo.clone());
-        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice").await.unwrap();
-        let bob = test_support::seed_audit_user(&pool, "audit-bob", "Bob").await.unwrap();
+        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice")
+            .await
+            .unwrap();
+        let bob = test_support::seed_audit_user(&pool, "audit-bob", "Bob")
+            .await
+            .unwrap();
         let acc = seed_account(&pool, "Caja").await;
 
         // Alice creates a method owned by the account (through the repo write
         // path the finance routes drive).
-        let created = svc.methods.create_in_account(alice, "Solo", acc).await.unwrap();
+        let created = svc
+            .methods
+            .create_in_account(alice, "Solo", acc)
+            .await
+            .unwrap();
         assert_eq!(created.created_by, alice);
         assert_eq!(created.updated_by, None);
         let stored = svc.methods.find_method(created.id).await.unwrap().unwrap();
@@ -536,6 +671,10 @@ mod tests {
             .unwrap();
         let edited = svc.methods.find_method(created.id).await.unwrap().unwrap();
         assert_eq!(edited.created_by, alice, "the creator attribution survives");
-        assert_eq!(edited.updated_by, Some(bob), "the reassignment records the editor");
+        assert_eq!(
+            edited.updated_by,
+            Some(bob),
+            "the reassignment records the editor"
+        );
     }
 }

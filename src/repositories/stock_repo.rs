@@ -67,9 +67,7 @@ fn row_to_movement(row: sqlx::sqlite::SqliteRow) -> StockMovement {
         product_id: row.get("product_id"),
         qty: parse_decimal(&qty_str),
         movement_type: type_from_str(&type_str),
-        reason: reason_str
-            .parse()
-            .unwrap_or(MovementReason::Purchase),
+        reason: reason_str.parse().unwrap_or(MovementReason::Purchase),
         reference: row.get("reference"),
         date: row.get("date"),
         created_by: row.get("created_by"),
@@ -107,8 +105,7 @@ impl SqliteStockMovementRepository {
     /// Count one repository read (test builds only).
     #[cfg(test)]
     fn tick(&self) {
-        self.reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Reset and read the test-only read counter.
@@ -175,12 +172,10 @@ impl StockMovementRepository for SqliteStockMovementRepository {
     }
 
     async fn stock_for_product(&self, product_id: i64) -> AppResult<Decimal> {
-        let rows = sqlx::query(
-            r#"SELECT qty, type FROM stock_movements WHERE product_id = ?"#,
-        )
-        .bind(product_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(r#"SELECT qty, type FROM stock_movements WHERE product_id = ?"#)
+            .bind(product_id)
+            .fetch_all(&self.pool)
+            .await?;
         let mut total = Decimal::ZERO;
         for row in rows {
             let qty_str: String = row.get("qty");
@@ -251,9 +246,7 @@ impl StockMovementRepository for SqliteStockMovementRepository {
                 let type_str: String = row.get("type");
                 let reason_str: String = row.get("reason");
                 let movement_type = type_from_str(&type_str);
-                let reason = reason_str
-                    .parse()
-                    .unwrap_or(MovementReason::Purchase);
+                let reason = reason_str.parse().unwrap_or(MovementReason::Purchase);
                 // The stored reference is the operator's identifier when one
                 // was written (a sale or purchase number); an unnamed
                 // adjustment still needs a label.
@@ -325,17 +318,15 @@ mod tests {
             .unwrap()
         {
             Some(id) => id,
-            None => {
-                sqlx::query_scalar(
-                    r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+            None => sqlx::query_scalar(
+                r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
                        VALUES ('DOC-P', 'doc prod', 'Product', 'un', '10', 1, ?)
                        RETURNING id"#,
-                )
-                .bind(actor)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-            }
+            )
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
         }
     }
 
@@ -379,13 +370,18 @@ mod tests {
         let product = seed_product(&pool, actor).await;
 
         let referenced = seed_movement(
-            &pool, product, "5", "In", "Purchase", "2024-SALE-000001", d(2024, 5, 2), actor,
+            &pool,
+            product,
+            "5",
+            "In",
+            "Purchase",
+            "2024-SALE-000001",
+            d(2024, 5, 2),
+            actor,
         )
         .await;
-        let unnamed = seed_movement(
-            &pool, product, "2", "Out", "Sale", "", d(2024, 5, 3), actor,
-        )
-        .await;
+        let unnamed =
+            seed_movement(&pool, product, "2", "Out", "Sale", "", d(2024, 5, 3), actor).await;
 
         let rows = repo
             .list_document_rows(&DocumentQuery {
@@ -408,7 +404,10 @@ mod tests {
         assert_eq!(referenced_row.party, "doc prod");
         assert_eq!(referenced_row.date, d(2024, 5, 2));
         assert_eq!(referenced_row.detail, "In · Purchase");
-        assert_eq!(referenced_row.owner_id, product, "the drill-down target is the product");
+        assert_eq!(
+            referenced_row.owner_id, product,
+            "the drill-down target is the product"
+        );
         assert_eq!(referenced_row.amount, None, "stock has no money");
         assert_eq!(referenced_row.quantity, Some(dec("5")));
         assert_eq!(referenced_row.created_by, actor);
@@ -433,11 +432,25 @@ mod tests {
 
         let product = seed_product(&pool, sistema).await;
         let mine = seed_movement(
-            &pool, product, "5", "In", "Purchase", "ref-mine", d(2024, 5, 2), sistema,
+            &pool,
+            product,
+            "5",
+            "In",
+            "Purchase",
+            "ref-mine",
+            d(2024, 5, 2),
+            sistema,
         )
         .await;
         let theirs = seed_movement(
-            &pool, product, "1", "Out", "Loss", "ref-theirs", d(2024, 5, 3), other,
+            &pool,
+            product,
+            "1",
+            "Out",
+            "Loss",
+            "ref-theirs",
+            d(2024, 5, 3),
+            other,
         )
         .await;
 
@@ -491,10 +504,32 @@ mod tests {
         let repo = SqliteStockMovementRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let product = seed_product(&pool, actor).await;
-        let early = seed_movement(&pool, product, "1", "In", "Purchase", "", d(2024, 5, 1), actor).await;
-        let first = seed_movement(&pool, product, "1", "In", "Purchase", "", d(2024, 5, 2), actor).await;
-        let last = seed_movement(&pool, product, "1", "Out", "Sale", "", d(2024, 5, 4), actor).await;
-        let late = seed_movement(&pool, product, "1", "Out", "Sale", "", d(2024, 5, 5), actor).await;
+        let early = seed_movement(
+            &pool,
+            product,
+            "1",
+            "In",
+            "Purchase",
+            "",
+            d(2024, 5, 1),
+            actor,
+        )
+        .await;
+        let first = seed_movement(
+            &pool,
+            product,
+            "1",
+            "In",
+            "Purchase",
+            "",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        let last =
+            seed_movement(&pool, product, "1", "Out", "Sale", "", d(2024, 5, 4), actor).await;
+        let late =
+            seed_movement(&pool, product, "1", "Out", "Sale", "", d(2024, 5, 5), actor).await;
 
         let rows = repo
             .list_document_rows(&DocumentQuery {
@@ -520,9 +555,28 @@ mod tests {
         let repo = SqliteStockMovementRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let product = seed_product(&pool, actor).await;
-        seed_movement(&pool, product, "5", "In", "Purchase", "", d(2024, 5, 2), actor).await;
-        let with_reference =
-            seed_movement(&pool, product, "1", "Out", "Sale", "FACT-77", d(2024, 5, 3), actor).await;
+        seed_movement(
+            &pool,
+            product,
+            "5",
+            "In",
+            "Purchase",
+            "",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        let with_reference = seed_movement(
+            &pool,
+            product,
+            "1",
+            "Out",
+            "Sale",
+            "FACT-77",
+            d(2024, 5, 3),
+            actor,
+        )
+        .await;
 
         // Partial, case-insensitive product name match.
         let rows = repo
@@ -586,9 +640,39 @@ mod tests {
         let repo = SqliteStockMovementRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let product = seed_product(&pool, actor).await;
-        let a = seed_movement(&pool, product, "1", "In", "Purchase", "", d(2024, 5, 1), actor).await;
-        let b = seed_movement(&pool, product, "1", "In", "Purchase", "", d(2024, 5, 2), actor).await;
-        let c = seed_movement(&pool, product, "1", "In", "Purchase", "", d(2024, 5, 2), actor).await;
+        let a = seed_movement(
+            &pool,
+            product,
+            "1",
+            "In",
+            "Purchase",
+            "",
+            d(2024, 5, 1),
+            actor,
+        )
+        .await;
+        let b = seed_movement(
+            &pool,
+            product,
+            "1",
+            "In",
+            "Purchase",
+            "",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
+        let c = seed_movement(
+            &pool,
+            product,
+            "1",
+            "In",
+            "Purchase",
+            "",
+            d(2024, 5, 2),
+            actor,
+        )
+        .await;
 
         let rows = repo
             .list_document_rows(&DocumentQuery {

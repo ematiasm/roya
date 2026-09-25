@@ -3,8 +3,8 @@ use sqlx::{Row, SqlitePool};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    BusinessLocale, BusinessSettings, NewBusinessLocale, NewBusinessSettings,
-    UpdateBusinessLocale, UpdateBusinessSettings,
+    BusinessLocale, BusinessSettings, NewBusinessLocale, NewBusinessSettings, UpdateBusinessLocale,
+    UpdateBusinessSettings,
 };
 
 fn map_db_err(error: sqlx::Error) -> AppError {
@@ -199,9 +199,10 @@ impl BusinessConfigurationRepository for SqliteBusinessConfigurationRepository {
         .map(row_to_locale)
         .collect::<Vec<_>>();
         if existing.len() != locales.len()
-            || existing.iter().zip(locales).any(|(current, update)| {
-                current.locale_code != update.locale_code
-            })
+            || existing
+                .iter()
+                .zip(locales)
+                .any(|(current, update)| current.locale_code != update.locale_code)
         {
             return Err(AppError::Validation(
                 "The submitted locale profiles do not match the configured locales.".into(),
@@ -259,7 +260,9 @@ impl BusinessConfigurationRepository for SqliteBusinessConfigurationRepository {
     }
 }
 
-async fn load_configuration(pool: &SqlitePool) -> AppResult<(BusinessSettings, Vec<BusinessLocale>)> {
+async fn load_configuration(
+    pool: &SqlitePool,
+) -> AppResult<(BusinessSettings, Vec<BusinessLocale>)> {
     let settings = sqlx::query(
         "SELECT id, business_name, default_locale_code, currency_code, timezone, \
                 created_at, updated_at FROM business_settings WHERE id = 1",

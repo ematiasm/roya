@@ -104,8 +104,7 @@ impl SqliteCustomerReceiptRepository {
     /// Count one repository read (test builds only).
     #[cfg(test)]
     fn tick(&self) {
-        self.reads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Reset and read the test-only read counter.
@@ -389,22 +388,21 @@ mod tests {
     async fn account_and_method(pool: &SqlitePool, actor: i64) -> (i64, i64) {
         // One wallet per test database: the name is UNIQUE, so reuse it when a
         // second payment in the same test needs the pair.
-        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
-            .fetch_optional(pool)
-            .await
-            .unwrap()
-        {
-            Some(id) => id,
-            None => {
-                sqlx::query_scalar(
+        let account: i64 =
+            match sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'doc wallet'")
+                .fetch_optional(pool)
+                .await
+                .unwrap()
+            {
+                Some(id) => id,
+                None => sqlx::query_scalar(
                     "INSERT INTO accounts (name, created_by) VALUES ('doc wallet', ?) RETURNING id",
                 )
                 .bind(actor)
                 .fetch_one(pool)
                 .await
-                .unwrap()
-            }
-        };
+                .unwrap(),
+            };
         let (method,): (i64,) =
             sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
                 .fetch_one(pool)
@@ -522,13 +520,19 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
 
-        let plain_row = rows.iter().find(|r| r.id == plain).expect("plain receipt row");
+        let plain_row = rows
+            .iter()
+            .find(|r| r.id == plain)
+            .expect("plain receipt row");
         assert_eq!(plain_row.kind, DocumentKind::Receipt);
         assert_eq!(plain_row.reference, format!("Recibo #{plain}"));
         assert_eq!(plain_row.party, "Díaz");
         assert_eq!(plain_row.date, d(2024, 6, 3));
         assert_eq!(plain_row.detail, "Cobro");
-        assert_eq!(plain_row.owner_id, diaz, "the drill-down target is the customer");
+        assert_eq!(
+            plain_row.owner_id, diaz,
+            "the drill-down target is the customer"
+        );
         assert_eq!(plain_row.amount, Some(dec("7")));
         assert_eq!(plain_row.quantity, None);
         assert_eq!(plain_row.created_by, actor);
@@ -538,7 +542,11 @@ mod tests {
             .find(|r| r.id == with_notes)
             .expect("receipt with notes row");
         assert_eq!(noted_row.party, "Pérez");
-        assert_eq!(noted_row.amount, Some(dec("12.5")), "the total is the summed allocations");
+        assert_eq!(
+            noted_row.amount,
+            Some(dec("12.5")),
+            "the total is the summed allocations"
+        );
     }
 
     /// The audit-actor filter narrows the family read to the given ids, and
@@ -739,7 +747,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 20);
-        assert_eq!(repo.read_count(), 2, "rows query + one batched allocation read");
+        assert_eq!(
+            repo.read_count(),
+            2,
+            "rows query + one batched allocation read"
+        );
         assert_eq!(
             repo.sales.read_count(),
             1,
@@ -761,7 +773,11 @@ mod tests {
             .await
             .unwrap();
         assert!(rows.is_empty());
-        assert_eq!(repo.read_count(), 1, "no allocation batch for an empty result");
+        assert_eq!(
+            repo.read_count(),
+            1,
+            "no allocation batch for an empty result"
+        );
         assert_eq!(repo.sales.read_count(), 0);
     }
 }

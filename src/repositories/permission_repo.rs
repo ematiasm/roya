@@ -57,8 +57,12 @@ pub trait PermissionRepository: Send + Sync {
     /// same transaction stamps the role's `updated_by` (slice S13) — the
     /// join rows themselves carry no actor of their own, they inherit the
     /// role's.
-    async fn set_role_permissions(&self, role_id: i64, permission_ids: &[i64], updated_by: i64)
-        -> AppResult<()>;
+    async fn set_role_permissions(
+        &self,
+        role_id: i64,
+        permission_ids: &[i64],
+        updated_by: i64,
+    ) -> AppResult<()>;
     /// The catalog rows whose ids exist, resolved in ONE statement — the
     /// matrix form's whole submitted set, the same contract
     /// `RoleRepository::find_by_ids` carries for the assignment form: one

@@ -207,7 +207,10 @@ async fn activate_supplier(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let supplier = state.supplier_service.set_active(principal.user_id, id, true).await?;
+    let supplier = state
+        .supplier_service
+        .set_active(principal.user_id, id, true)
+        .await?;
     Ok(Json(serde_json::json!(supplier)))
 }
 
@@ -217,7 +220,10 @@ async fn deactivate_supplier(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let supplier = state.supplier_service.set_active(principal.user_id, id, false).await?;
+    let supplier = state
+        .supplier_service
+        .set_active(principal.user_id, id, false)
+        .await?;
     Ok(Json(serde_json::json!(supplier)))
 }
 
@@ -314,14 +320,17 @@ async fn create_purchase(
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let purchase = state
         .purchases_service
-        .create_draft(principal.user_id, NewPurchase {
-            supplier_id: payload.supplier_id,
-            payment_type: payload.payment_type,
-            purchase_date: payload.purchase_date,
-            due_date: payload.due_date,
-            supplier_invoice_no: payload.supplier_invoice_no,
-            notes: payload.notes,
-        })
+        .create_draft(
+            principal.user_id,
+            NewPurchase {
+                supplier_id: payload.supplier_id,
+                payment_type: payload.payment_type,
+                purchase_date: payload.purchase_date,
+                due_date: payload.due_date,
+                supplier_invoice_no: payload.supplier_invoice_no,
+                notes: payload.notes,
+            },
+        )
         .await?;
     let detail = state.purchases_service.get_detail(purchase.id).await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(detail))))
@@ -402,7 +411,10 @@ async fn remove_line(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(line_id): Path<i64>,
 ) -> crate::error::AppResult<StatusCode> {
-    state.purchases_service.remove_line(principal.user_id, line_id).await?;
+    state
+        .purchases_service
+        .remove_line(principal.user_id, line_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -461,7 +473,10 @@ async fn confirm_purchase(
     Path(id): Path<i64>,
     Json(payload): Json<ConfirmPurchaseRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let detail = state.purchases_service.confirm(principal.user_id, id, payload.method_id).await?;
+    let detail = state
+        .purchases_service
+        .confirm(principal.user_id, id, payload.method_id)
+        .await?;
     Ok(Json(serde_json::json!(detail)))
 }
 
@@ -472,7 +487,10 @@ async fn cancel_purchase(
     Path(id): Path<i64>,
     Json(payload): Json<CancelPurchaseRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
-    let detail = state.purchases_service.cancel(principal.user_id, id, payload.reason).await?;
+    let detail = state
+        .purchases_service
+        .cancel(principal.user_id, id, payload.reason)
+        .await?;
     Ok(Json(serde_json::json!(detail)))
 }
 
@@ -481,14 +499,22 @@ pub fn router() -> Router<AppState> {
         .route("/api/suppliers", get(list_suppliers).post(create_supplier))
         .route(
             "/api/suppliers/{id}",
-            get(get_supplier).put(update_supplier).delete(delete_supplier),
+            get(get_supplier)
+                .put(update_supplier)
+                .delete(delete_supplier),
         )
         .route("/api/suppliers/{id}/activate", post(activate_supplier))
         .route("/api/suppliers/{id}/deactivate", post(deactivate_supplier))
-        .route("/api/product-supplier-costs", get(list_costs).post(record_cost))
+        .route(
+            "/api/product-supplier-costs",
+            get(list_costs).post(record_cost),
+        )
         .route("/api/purchases", get(list_purchases).post(create_purchase))
         .route("/api/purchases/suggestions", get(purchase_suggestions))
-        .route("/api/purchases/{id}", get(get_purchase).put(update_purchase))
+        .route(
+            "/api/purchases/{id}",
+            get(get_purchase).put(update_purchase),
+        )
         .route("/api/purchases/{id}/lines", post(add_line))
         .route(
             "/api/purchases/lines/{line_id}",
@@ -676,13 +702,15 @@ mod tests {
         let mid = cash_method_id(pool).await;
         // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
         // the name when it is already owned elsewhere in this pool.
-        let assigned = sqlx::query("UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL")
-            .bind(account_id)
-            .bind(mid)
-            .execute(pool)
-            .await
-            .unwrap()
-            .rows_affected();
+        let assigned = sqlx::query(
+            "UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL",
+        )
+        .bind(account_id)
+        .bind(mid)
+        .execute(pool)
+        .await
+        .unwrap()
+        .rows_affected();
         if assigned == 1 {
             return mid;
         }
@@ -713,11 +741,7 @@ mod tests {
         }
     }
 
-    async fn create_draft(
-        app: &axum::Router,
-        supplier_id: i64,
-        payment_type: &str,
-    ) -> i64 {
+    async fn create_draft(app: &axum::Router, supplier_id: i64, payment_type: &str) -> i64 {
         let (st, v) = post_json(
             app.clone(),
             "/api/purchases",
@@ -794,10 +818,7 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST);
         let (st, v) = get_json(app.clone(), &format!("/api/purchases/{aid}")).await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(
-            v["purchase"]["purchase_number"].as_str().unwrap(),
-            number_a
-        );
+        assert_eq!(v["purchase"]["purchase_number"].as_str().unwrap(), number_a);
 
         // Draft -> Cancelled keeps NULL number (no-op).
         let cid = create_draft(&app, sup, "Cash").await;
@@ -1011,7 +1032,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned payment must be 400");
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "unassigned payment must be 400"
+        );
         let tx: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
             .fetch_one(&pool)
             .await
@@ -1181,7 +1206,11 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_REQUEST, "overpay must be 400");
         let (st, v) = get_json(app.clone(), &format!("/api/purchases/{id}")).await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(v["due"].as_str().unwrap(), "6", "overpay left no side effect");
+        assert_eq!(
+            v["due"].as_str().unwrap(),
+            "6",
+            "overpay left no side effect"
+        );
 
         // Unknown supplier ⇒ 404, like the service.
         let (st, _) = post_json(
@@ -1276,10 +1305,7 @@ mod tests {
             let (st, v) = send_json_as(app.clone(), "GET", &uri, Some(&cookie), None).await;
             assert_eq!(st, StatusCode::FORBIDDEN, "{uri}: {v}");
             assert!(
-                v["error"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .contains(code),
+                v["error"].as_str().unwrap_or_default().contains(code),
                 "{uri} must name {code}: {v}"
             );
         }
@@ -1356,7 +1382,9 @@ mod tests {
             (
                 "POST",
                 "/api/supplier-payments".to_string(),
-                Some(serde_json::json!({ "supplier_id": sup, "method_id": 1, "amount": "5", "date": "2024-05-03" })),
+                Some(
+                    serde_json::json!({ "supplier_id": sup, "method_id": 1, "amount": "5", "date": "2024-05-03" }),
+                ),
             ),
         ] {
             let (st, v) = send_json_as(app.clone(), method, &uri, Some(&cookie), body).await;
@@ -1478,8 +1506,10 @@ mod tests {
         let cookie = test_support::cookie_for(&probe);
 
         // Refused draft creation.
-        let purchases_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM purchases").fetch_one(&pool).await.unwrap();
+        let purchases_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (st, v) = send_json_as(
             app.clone(),
             "POST",
@@ -1491,13 +1521,20 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
-        let purchases_after: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM purchases").fetch_one(&pool).await.unwrap();
-        assert_eq!(purchases_after, purchases_before, "a refused create must write nothing");
+        let purchases_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            purchases_after, purchases_before,
+            "a refused create must write nothing"
+        );
 
         // Refused supplier create and refused cost record.
-        let suppliers_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM suppliers").fetch_one(&pool).await.unwrap();
+        let suppliers_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM suppliers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (st, _) = send_json_as(
             app.clone(),
             "POST",
@@ -1507,9 +1544,14 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::FORBIDDEN);
-        let suppliers_after: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM suppliers").fetch_one(&pool).await.unwrap();
-        assert_eq!(suppliers_after, suppliers_before, "a refused supplier create must write nothing");
+        let suppliers_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM suppliers")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            suppliers_after, suppliers_before,
+            "a refused supplier create must write nothing"
+        );
 
         let costs_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM product_supplier_costs")
             .fetch_one(&pool)
@@ -1530,7 +1572,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(costs_after, costs_before, "a refused cost must write nothing");
+        assert_eq!(
+            costs_after, costs_before,
+            "a refused cost must write nothing"
+        );
 
         // Confirm as the shared principal, then refuse both payment paths.
         let (st, _) = post_json(
@@ -1540,8 +1585,10 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "shared confirm must run");
-        let payments_before: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM purchase_payments").fetch_one(&pool).await.unwrap();
+        let payments_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchase_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         for uri in [
             format!("/api/purchases/{purchase}/payments"),
             "/api/supplier-payments".to_string(),
@@ -1558,9 +1605,14 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::FORBIDDEN, "{uri}: {v}");
         }
-        let payments_after: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM purchase_payments").fetch_one(&pool).await.unwrap();
-        assert_eq!(payments_after, payments_before, "a refused payment must write nothing");
+        let payments_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM purchase_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            payments_after, payments_before,
+            "a refused payment must write nothing"
+        );
 
         // A refused cancel leaves the purchase Confirmed.
         let (st, _) = send_json_as(

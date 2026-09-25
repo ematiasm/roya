@@ -37,10 +37,9 @@ use crate::localization::load_context;
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteBusinessConfigurationRepository,
     SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
-    SqliteDocSequenceRepository,
-    SqlitePaymentMethodRepository, SqliteProductRepository, SqliteProductSupplierCostRepository,
-    SqliteProductTaxRepository, SqlitePurchaseRepository, SqliteRoleRepository,
-    SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
+    SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
+    SqliteProductSupplierCostRepository, SqliteProductTaxRepository, SqlitePurchaseRepository,
+    SqliteRoleRepository, SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
     SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxRepository,
     SqliteTransactionRepository, SqliteUserRepository,
 };
@@ -297,9 +296,8 @@ impl AppState {
             SqliteSetupRepository::new(pool.clone()),
             crate::security::PasswordHasher::production(),
         );
-        let settings_service = SettingsService::new(
-            SqliteBusinessConfigurationRepository::new(pool.clone()),
-        );
+        let settings_service =
+            SettingsService::new(SqliteBusinessConfigurationRepository::new(pool.clone()));
         Self {
             pool,
             account_service,

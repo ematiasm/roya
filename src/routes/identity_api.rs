@@ -68,7 +68,10 @@ async fn create_session(
             if let Err(e) = state.identity_service.prune_sessions().await {
                 tracing::warn!(error = %e, "session prune failed");
             }
-            let cookie = state.identity_service.policy.serialize_cookie(&outcome.token);
+            let cookie = state
+                .identity_service
+                .policy
+                .serialize_cookie(&outcome.token);
             Ok((
                 [(header::SET_COOKIE, cookie.as_str())],
                 StatusCode::NO_CONTENT,
@@ -96,12 +99,15 @@ async fn delete_session(State(state): State<AppState>, headers: HeaderMap) -> Ap
         state.identity_service.logout(&token).await?;
     }
     let clear = state.identity_service.policy.clear_cookie();
-    Ok(([(header::SET_COOKIE, clear.as_str())], StatusCode::NO_CONTENT).into_response())
+    Ok((
+        [(header::SET_COOKIE, clear.as_str())],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response())
 }
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/api/sessions", post(create_session).delete(delete_session))
+    Router::new().route("/api/sessions", post(create_session).delete(delete_session))
 }
 
 #[cfg(test)]
@@ -177,12 +183,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        set_cookie
-            .split(';')
-            .next()
-            .unwrap()
-            .trim()
-            .to_string()
+        set_cookie.split(';').next().unwrap().trim().to_string()
     }
 
     // -- POST /api/sessions: the happy path ------------------------------------
@@ -205,7 +206,10 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        assert!(set_cookie.starts_with(&format!("{SESSION_COOKIE}=")), "{set_cookie}");
+        assert!(
+            set_cookie.starts_with(&format!("{SESSION_COOKIE}=")),
+            "{set_cookie}"
+        );
         assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
         assert!(set_cookie.contains("SameSite=Lax"), "{set_cookie}");
         assert!(set_cookie.contains("Path=/"), "{set_cookie}");
@@ -216,7 +220,6 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), 16).await.unwrap();
         assert!(bytes.is_empty(), "a 204 login must carry no body");
 
-        
         let resp = send(&app, "GET", "/", &[("cookie", pair.as_str())], "").await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -235,7 +238,14 @@ mod tests {
     async fn a_malformed_body_is_rejected_before_the_service_and_mints_no_session() {
         let (app, _state) = test_app().await;
 
-        let truncated = send(&app, "POST", "/api/sessions", &json_headers(), r#"{"username":"#).await;
+        let truncated = send(
+            &app,
+            "POST",
+            "/api/sessions",
+            &json_headers(),
+            r#"{"username":"#,
+        )
+        .await;
         assert_eq!(truncated.status(), StatusCode::BAD_REQUEST);
         assert!(
             truncated.headers().get(header::SET_COOKIE).is_none(),
@@ -250,9 +260,15 @@ mod tests {
             r#"{"username":"admin","password":"bootstrap password 1"}"#,
         )
         .await;
-        assert_eq!(wrong_content_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            wrong_content_type.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
         assert!(
-            wrong_content_type.headers().get(header::SET_COOKIE).is_none(),
+            wrong_content_type
+                .headers()
+                .get(header::SET_COOKIE)
+                .is_none(),
             "valid credentials sent as text/plain must still mint nothing"
         );
     }
@@ -305,7 +321,14 @@ mod tests {
         .await;
         let pair = cookie_pair(&login);
 
-        let delete = send(&app, "DELETE", "/api/sessions", &[("cookie", pair.as_str())], "").await;
+        let delete = send(
+            &app,
+            "DELETE",
+            "/api/sessions",
+            &[("cookie", pair.as_str())],
+            "",
+        )
+        .await;
         assert_eq!(delete.status(), StatusCode::NO_CONTENT);
         let cleared = delete
             .headers()
@@ -320,15 +343,16 @@ mod tests {
 
         // The session row is actually revoked in the store, not just expired.
         let token = pair.split('=').nth(1).unwrap();
-        let row = sqlx::query(
-            "SELECT revoked_at FROM sessions WHERE token_hash = ?",
-        )
-        .bind(crate::security::session::hash_token(token))
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+        let row = sqlx::query("SELECT revoked_at FROM sessions WHERE token_hash = ?")
+            .bind(crate::security::session::hash_token(token))
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         let revoked_at: Option<String> = row.get(0);
-        assert!(revoked_at.is_some(), "the session row must carry revoked_at");
+        assert!(
+            revoked_at.is_some(),
+            "the session row must carry revoked_at"
+        );
 
         // And the same cookie afterwards is refused: the gate sees a dead
         // session.

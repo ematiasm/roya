@@ -282,9 +282,9 @@ async fn user_id(pool: &SqlitePool) -> AppResult<i64> {
     let user = users
         .find_by_username(TEST_USERNAME)
         .await?
-        .ok_or_else(|| crate::error::AppError::Internal(
-            "the shared test user is missing".to_string(),
-        ))?;
+        .ok_or_else(|| {
+            crate::error::AppError::Internal("the shared test user is missing".to_string())
+        })?;
     Ok(user.id)
 }
 
@@ -412,7 +412,10 @@ mod tests {
         // is satisfied for the shared fixture. Membership is read through the
         // real effective-permission resolution the middleware uses.
         let effective = service
-            .effective_permissions(&SqlitePermissionRepository::new(pool.clone()), resolved.user.id)
+            .effective_permissions(
+                &SqlitePermissionRepository::new(pool.clone()),
+                resolved.user.id,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -430,8 +433,14 @@ mod tests {
         // S3's session list and revocation screens render (and the ones the
         // middleware's expiry check reads) survive the round-trip.
         assert_eq!(resolved.session.user_id, resolved.user.id);
-        assert!(!resolved.session.token_hash.is_empty(), "the digest is stored, never the token");
-        assert!(resolved.session.created_at > chrono::Utc::now().naive_utc() - chrono::Duration::minutes(1));
+        assert!(
+            !resolved.session.token_hash.is_empty(),
+            "the digest is stored, never the token"
+        );
+        assert!(
+            resolved.session.created_at
+                > chrono::Utc::now().naive_utc() - chrono::Duration::minutes(1)
+        );
         assert!(resolved.session.user_agent.is_none());
         assert_eq!(resolved.session.id, session_id);
         assert!(resolved.session.revoked_at.is_none());

@@ -113,7 +113,9 @@ mod tests {
             SqliteAccountRepository::new(pool.clone()),
             SqliteTransactionRepository::new(pool.clone()),
         );
-        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice").await.unwrap();
+        let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice")
+            .await
+            .unwrap();
 
         let acc = s.create(alice, "Caja").await.unwrap();
         assert_eq!(acc.created_by, alice, "the account records its creator");

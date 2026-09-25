@@ -35,7 +35,8 @@ pub trait ProductRepository: Send + Sync {
 }
 
 fn parse_decimal_opt(v: Option<String>) -> Option<Decimal> {
-    v.as_deref().map(|s| Decimal::from_str(s).unwrap_or(Decimal::ZERO))
+    v.as_deref()
+        .map(|s| Decimal::from_str(s).unwrap_or(Decimal::ZERO))
 }
 
 /// Strict sibling of `parse_decimal_opt` for `markup_pct`. `parse_decimal_opt`
@@ -213,11 +214,10 @@ impl ProductRepository for SqliteProductRepository {
     }
 
     async fn count_by_category(&self, category_id: i64) -> AppResult<i64> {
-        let row: (i64,) =
-            sqlx::query_as(r#"SELECT COUNT(*) FROM products WHERE category_id = ?"#)
-                .bind(category_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let row: (i64,) = sqlx::query_as(r#"SELECT COUNT(*) FROM products WHERE category_id = ?"#)
+            .bind(category_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.0)
     }
 
@@ -276,9 +276,7 @@ impl ProductRepository for SqliteProductRepository {
             .map_err(|e| {
                 let s = e.to_string();
                 if s.contains("FOREIGN KEY constraint failed") {
-                    AppError::Validation(
-                        "cannot delete product with stock movements".into(),
-                    )
+                    AppError::Validation("cannot delete product with stock movements".into())
                 } else {
                     AppError::Database(e)
                 }
@@ -353,7 +351,10 @@ mod tests {
     #[tokio::test]
     async fn update_persists_the_full_row_and_returns_it() {
         let r = repo().await;
-        let created = r.create(actor(&r).await, &product_input("REPO-U1")).await.unwrap();
+        let created = r
+            .create(actor(&r).await, &product_input("REPO-U1"))
+            .await
+            .unwrap();
         let input = NewProduct {
             sku: "REPO-U2".to_string(),
             name: "renamed".to_string(),
@@ -391,7 +392,10 @@ mod tests {
     #[tokio::test]
     async fn update_unknown_id_is_not_found() {
         let r = repo().await;
-        let err = r.update(actor(&r).await, 99999, &product_input("REPO-GHOST")).await.unwrap_err();
+        let err = r
+            .update(actor(&r).await, 99999, &product_input("REPO-GHOST"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 
@@ -404,7 +408,10 @@ mod tests {
         let created = r.create(actor(&r).await, &input).await.unwrap();
         assert_eq!(created.markup_pct, Some(Decimal::from_str("21.5").unwrap()));
         let reloaded = r.find_by_id(created.id).await.unwrap().unwrap();
-        assert_eq!(reloaded.markup_pct, Some(Decimal::from_str("21.5").unwrap()));
+        assert_eq!(
+            reloaded.markup_pct,
+            Some(Decimal::from_str("21.5").unwrap())
+        );
     }
 
     /// Pricing T1: no markup means NULL, and NULL reads back as None — the
@@ -412,7 +419,10 @@ mod tests {
     #[tokio::test]
     async fn markup_pct_none_round_trips_as_none() {
         let r = repo().await;
-        let created = r.create(actor(&r).await, &product_input("REPO-MK2")).await.unwrap();
+        let created = r
+            .create(actor(&r).await, &product_input("REPO-MK2"))
+            .await
+            .unwrap();
         assert_eq!(created.markup_pct, None);
         let reloaded = r.find_by_id(created.id).await.unwrap().unwrap();
         assert_eq!(reloaded.markup_pct, None);
@@ -425,7 +435,10 @@ mod tests {
     #[tokio::test]
     async fn malformed_stored_markup_pct_reads_back_as_none_not_zero() {
         let r = repo().await;
-        let created = r.create(actor(&r).await, &product_input("REPO-MK3")).await.unwrap();
+        let created = r
+            .create(actor(&r).await, &product_input("REPO-MK3"))
+            .await
+            .unwrap();
         sqlx::query("UPDATE products SET markup_pct = 'abc' WHERE id = ?")
             .bind(created.id)
             .execute(&r.pool)
@@ -443,7 +456,10 @@ mod tests {
     #[tokio::test]
     async fn update_sets_markup_pct_on_existing_row() {
         let r = repo().await;
-        let created = r.create(actor(&r).await, &product_input("REPO-MK4")).await.unwrap();
+        let created = r
+            .create(actor(&r).await, &product_input("REPO-MK4"))
+            .await
+            .unwrap();
         assert_eq!(created.markup_pct, None);
         let mut input = product_input("REPO-MK4");
         input.markup_pct = Some(Decimal::from_str("30").unwrap());
