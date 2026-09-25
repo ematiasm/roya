@@ -88,7 +88,7 @@ One bounded delegated-direct ODD work unit, because it touches several non-trivi
 - Feature document: `odd/tasks/api-tax-permissions.md`.
 - Engram mirror topic: `odd/api-tax-permissions/tasks`.
 - Verification: PASS. The only behavioral change is three permission gates, proven independently non-vacuous against each gate individually, with reads and association provably unmoved and no assertion, template or route touched.
-- Delivery: no commit recorded yet.
+- Delivery: work-unit commit `796a6c1` (`fix(auth): make tax definition administration settings-only on every surface`).
 - Next step: delivery is the user's decision. No push, PR creation, or merge has been performed.
 
 ### Staging note
