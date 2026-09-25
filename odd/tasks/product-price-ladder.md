@@ -72,12 +72,12 @@ Substantial delegated-direct ODD work. Two work units, each delegated to one bou
   - Regenerate and audit the affected `products` visual capture.
   - Evidence: RED/GREEN focused tests, exact commands, commit identity.
 
-- [ ] U2 — Add the server-computed product price ladder.
-  - Add the ordered ladder fragment and its refresh endpoint.
-  - Cover cost, markup, net, per-tax amounts, total taxes, and tax-inclusive price.
-  - Cover manual-price products, taxes added/removed, and locale formatting.
-  - Prove the browser never computes money: no markup formula or rounding is duplicated in static JavaScript.
-  - Evidence: RED/GREEN focused tests, exact commands, commit identity.
+- [x] U2 — Add the server-computed product price ladder.
+  - Extracted `derive_net_sale_price` and `validate_effective_prices` from `validate_product` so the save path and the preview share ONE net-price rule and ONE price/cost refusal set. Save-path behavior and messages are unchanged.
+  - Added `TaxService::product_price_ladder` and a GET-only, read-only `GET /web/product-price-ladder` endpoint behind `Require<InventoryRead>`, plus the new `templates/partials/product_price_ladder.html` fragment refreshed by `change` on cost, markup, sale price, and product kind.
+  - The ladder publishes no money in any state a save refuses, and each figure states whether it comes from the stored row or the unsaved form via `data-product-ladder-source`.
+  - Consolidated the drawer's scattered money into the ladder: the header net line, the tax-inclusive preview line and the breakdown table were removed; the association card keeps link/unlink and tax identity without duplicating amounts.
+  - Evidence: strict TDD observed RED twice — first `0 passed, 17 failed` on the missing endpoint, then `0 passed, 21 failed` with every failure `left: 400, right: 200`, which reproduced the browser's real 400 because the endpoint demanded `product_id` while the form sends `id`. Final `cargo test product_price_ladder` → 27 passed, `cargo test price_ladder` → 36 passed, `cargo test product` → 111 passed, `cargo test tax_` → 99 passed, `cargo test` → 1095 passed, `cargo check --all-targets` → 0 errors, 81 warnings (exact baseline), `cargo fmt --check` and `git diff --check` clean, `bash scripts/e2e.sh tests/test_products.py` → 24 passed / 1 pre-existing opt-in skip, `bash scripts/e2e.sh tests/test_visual_baseline.py` → 1 passed with the change confined to `products-drawer`. Independent verification found two blocking defects — the browser 400 and a fabricated `0.00` for a save-refused derived price — plus an overstated "Stored" chip and a missing authorization test; all were closed, a kind-binding residue was closed in a follow-up round, and the final independent verdict was PASS. Parent spot check repeated `cargo test product_price_ladder` → 27 passed. CSS build is N/A because the ladder introduces no class missing from the committed stylesheet. Commit identity is recorded in this document after the work-unit commit.
 
 - [ ] U3 — Run final verification and record delivery evidence.
   - Run focused suites, the full Rust suite, compile, formatting, diff, and the applicable browser checks.
@@ -120,7 +120,8 @@ Substantial delegated-direct ODD work. Two work units, each delegated to one bou
 - Feature document: `odd/tasks/product-price-ladder.md`.
 - Engram mirror topic: `odd/product-price-ladder/tasks`.
 - U1 delivery: work-unit commit `121293d` (`refactor(tax): make Settings the only web surface for tax definitions`).
-- Next step: U2 server-computed product price ladder.
+- U2 delivery: no commit recorded yet.
+- Next step: U3 final branch-wide verification and honest skip accounting.
 
 ### U1 — tax catalogue de-duplication
 
@@ -160,3 +161,22 @@ Independent verification found a real prose defect in U1, and it is worth statin
 - **Non-vacuity of the renamed test was proven by mutation, not asserted.** `POST /web/taxes` was temporarily re-registered as a stub returning 200; the test failed with `left: 200, right: 404`, and the stub was reverted immediately. `grep '"/web/taxes' src/routes/*.rs` returns nothing afterwards, so the route table is clean.
 - **Verification:** this round changed comments, docstrings, one test name and prose only — **no markup, no route, no template, no stylesheet**. The visual baseline was therefore NOT regenerated, and no e2e run was needed. `cargo test tax_`, `cargo test product`, `cargo test settings_`, `cargo test`, `cargo check --all-targets`, `cargo fmt --check` and `git diff --check` all re-run clean.
 - **Independent final verdict: PASS.** Parent spot check repeated `cargo test tax_` → 99 passed.
+
+### U2 — server-computed price ladder
+
+- **Single source of truth, by extraction rather than by copying.** `validate_product`'s markup branch moved verbatim into `pub fn derive_net_sale_price`, and its price/cost block moved verbatim into `pub fn validate_effective_prices(kind, sale_price, cost_price)`. The save path calls both, in the same order, with unchanged messages; the ladder calls the same two. A repo-wide search finds exactly one markup formula, one derived-price rounding site, and one per-tax/inclusive rounding site. Templates contain no arithmetic at all.
+- **RED that mattered.** After the first implementation the endpoint demanded `product_id` while the drawer's form carries `id`, so every real browser refresh returned **400** while 1084 Rust tests passed, because the test helper hand-built a query shape the browser never sends. Fixing the helper to build the form's real body reproduced it honestly: **0 passed, 21 failed, every one `left: 400, right: 200`**. The fix reads the form's own `id` and ignores every other field, so the form's shape can never be taught twice.
+- **Money is never published for a state a save refuses.** The ladder mirrors every rule that can change a figure it shows, and publishes no net, no per-tax amount, no tax total and no tax-inclusive price in a refused state — asserted by the *absence* of the tax labels, not by a zero. A derived price that pins to `0.00` and a negative cost are both refused. The mirror is kind-aware: a Service priced at exactly `0` is published, because the save accepts it.
+- **Kind comes from the form.** `LadderInput::Form` carries the form's `kind`, parsed with the same parser `web_edit_product` uses, empty or unreadable falling back to the stored kind. This closed a residue the final review found: a zero-priced Service switched to Product in the form made the ladder publish `0.00` that the save refuses. The kind select now triggers the same server refresh as the price fields.
+- **Provenance is a fact, not a chip.** `ProductPriceLadder.from_form` is the single discriminator; every stored column renders `data-product-ladder-source="stored|unsaved"` with the matching label, so an unsaved value cannot be presented as stored. The stored-only fallback is labeled stored, which is true, with a separate note explaining it is not a preview.
+- **Read-only is structural.** The route is `get(...)` only, so POST/PUT/DELETE are rejected at routing time (405) before any extractor. A test snapshots all 19 `products` columns and all 5 `product_taxes` columns — machine-checked against `pragma_table_info`, so a future migration adding a column fails the test — and asserts byte-identity after the preview. A Playwright test types a cost, reads the ladder from the DOM, and reads the product back through the API to prove `sale_price` and `cost_price` did not move.
+- **No money in JavaScript.** A structural test enumerates `static/*.js` and every inline `<script>` in `templates/` at run time (15 sources, with a floor so a broken walk fails) and rejects `Math.round`, `toFixed`, `parseFloat`, `/ 100`, `* (1 +` and the rest. The vendored `htmx.min.js` is excluded by name and its existence asserted.
+- **Visual baseline.** Only `products-drawer` changed. The correction rounds regenerated it and got a byte-identical result, because hx attributes and data attributes affect no computed style and the capture's first render is the stored state. The 121/166 element deltas against `HEAD` are `<section>` index shifts from inserting the ladder, not regressions.
+- **One deliberate divergence, documented rather than hidden.** The save reads an empty `kind` as `Product`; the ladder reads an absent or unreadable one as the **stored** kind. The drawer's select always carries a value, so a browser cannot reach the difference, but it is written into the doc comment on `product_price_ladder` because it is the one place the two surfaces could answer differently.
+
+### U2 follow-ups, recorded not hidden
+
+1. **Refusal messages are English.** The ladder shows the save path's own refusal string under a localized lead, because mirroring the message is what guarantees the preview cannot disagree with the save. A Spanish operator therefore reads an English refusal. This is a localization decision for the user, not a U2 change.
+2. `products-drawer:hover` and `:hover-skipped` are absent from the visual baseline because the drawer loop calls `_fingerprint` instead of `capture()`. Pre-existing, found in U1, not fixed.
+3. `sqlx 0.9` accepts only `&'static str` query strings, so the column snapshot uses literal statements plus the PRAGMA check rather than `format!`-built SQL.
+4. Money assertions in this area must expect the exact stored scale: a derived price always carries cents while a manual or stored price keeps its stored scale, and `round_dp(2)` does not pad.

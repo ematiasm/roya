@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{
-    MovementReason, MovementType, NewMovement, NewProduct, Product, ProductKind, ProductStock,
-    ProductSupplierCost, ProductTaxView, Tax, UpdateProduct,
+    LadderInput, MovementReason, MovementType, NewMovement, NewProduct, PriceField, PriceFields,
+    Product, ProductKind, ProductPriceLadder, ProductStock, ProductSupplierCost, ProductTaxView,
+    Tax, UpdateProduct,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, ProductSupplierCostRepository,
@@ -146,6 +147,29 @@ pub struct StaleCostView {
     pub stored: Decimal,
 }
 
+/// The product price ladder, the ONE place the drawer shows money. A
+/// server-rendered fragment with two shapes — the drawer embeds it through
+/// `product_detail.html`, and the preview endpoint answers it on its own.
+#[derive(Template)]
+#[template(path = "partials/product_price_ladder.html")]
+struct ProductPriceLadderPartial {
+    localization: LocalizationContext,
+    ladder: ProductPriceLadder,
+}
+
+fn product_price_ladder_html(
+    localization: &LocalizationContext,
+    ladder: ProductPriceLadder,
+) -> AppResult<Html<String>> {
+    ProductPriceLadderPartial {
+        localization: localization.clone(),
+        ladder,
+    }
+    .render()
+    .map(Html)
+    .map_err(|e| AppError::Internal(e.to_string()))
+}
+
 /// The product slide-over drawer body: the header with derived stock and the
 /// inline edit form, the per-supplier cost satellite (record/switch preferred)
 /// and the stock movement form. Field names are the template task's contract.
@@ -169,10 +193,11 @@ struct ProductDetailPartial {
     categories: Vec<crate::models::Category>,
     product_taxes: Vec<ProductTaxView>,
     available_taxes: Vec<Tax>,
-    /// Derived, never stored: the stored net sale price, the ACTIVE linked-tax
-    /// breakdown and the tax-inclusive unit price. The stored `sale_price` is
-    /// not touched by it, so the edit form and the preview cannot disagree.
-    tax_preview: crate::models::ProductTaxPreview,
+    /// The price ladder, computed from the product's STORED state: the drawer
+    /// has no form values yet when it first renders, and every one of its
+    /// money figures lives here (U2). The stored net price is what a save
+    /// persists, untouched by the taxes.
+    ladder: ProductPriceLadder,
     supplier_costs: Vec<ProductCostView>,
     suppliers: Vec<crate::models::Supplier>,
     stale_cost: Option<StaleCostView>,
@@ -551,6 +576,112 @@ async fn web_product_detail(
     product_detail_html(&state, id, &localization).await
 }
 
+/// The drawer's price fields as the `change` listener sends them.
+///
+/// `id` is the drawer's OWN key: the edit form posts to `/web/products/edit`
+/// under that name, and the three ladder inputs carry `hx-include="closest
+/// form"`, so the browser sends the whole form — the product under `id` and
+/// never under a second name. Naming the field differently here is what made
+/// this endpoint answer 400 to every real browser request while a suite that
+/// hand-built `?product_id=…` stayed green: the endpoint has to speak the
+/// form's language, not a private one.
+///
+/// The three price fields are `Option` on purpose: an ABSENT key means "this
+/// request carries no form at all" (a direct read), which is different from a
+/// key the operator emptied — the first reports the stored state, the second
+/// reports what a save would do with an empty field. Every other field the form
+/// sends is ignored, so the ladder never has to be taught the form's shape
+/// twice.
+#[derive(Debug, Deserialize)]
+struct PriceLadderQuery {
+    id: i64,
+    /// The kind select rides the same form, and the price rule branches on it,
+    /// so a `None` here means "no readable kind in the form" and the ladder
+    /// falls back to the product's stored kind.
+    kind: Option<String>,
+    sale_price: Option<String>,
+    cost_price: Option<String>,
+    markup_pct: Option<String>,
+}
+
+/// `GET /web/product-price-ladder`: the read-only price ladder, for the CURRENT
+/// form values, before anything is saved.
+///
+/// THE ARCHITECTURAL RULE lives here: the ladder is computed on the server and
+/// returned already formatted in the active locale. The browser never applies
+/// the markup formula and never rounds money, so a drawer and a document cannot
+/// end up a cent apart.
+///
+/// It is a GET behind `inventory.read`, which is what makes "it persists
+/// nothing" structural rather than promised: there is no write verb on this
+/// path, and a POST is answered 405. The id travels in the query, like every
+/// other body-borne filter on this screen, so the wiring guard's "no concrete
+/// id in a path" rule stays satisfied.
+///
+/// A field that is not a number is not a refusal here: the operator is still
+/// typing. The ladder reports the last state the save path accepted and says
+/// so, which is more useful than an error box over a half-typed number.
+async fn web_product_price_ladder(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
+    Query(query): Query<PriceLadderQuery>,
+) -> AppResult<Html<String>> {
+    let carries_a_form = query.sale_price.is_some()
+        || query.cost_price.is_some()
+        || query.markup_pct.is_some()
+        || query.kind.is_some();
+    // The kind is parsed with the SAME `ProductKind` parser the save handler
+    // uses, and an unreadable one is not guessed: the ladder falls back to the
+    // stored kind rather than picking a threshold out of thin air.
+    let kind = query
+        .kind
+        .as_deref()
+        .and_then(|raw| raw.trim().parse::<ProductKind>().ok());
+    let fields = form_price_fields(
+        query.sale_price.as_deref().unwrap_or_default(),
+        query.cost_price.as_deref().unwrap_or_default(),
+        query.markup_pct.as_deref().unwrap_or_default(),
+        &localization,
+    );
+    let input = if !carries_a_form {
+        // No form: the stored row is the ladder, and the drawer already has the
+        // stored values in its own fields.
+        None
+    } else if [fields.sale_price, fields.cost_price, fields.markup_pct]
+        .contains(&PriceField::Unreadable)
+    {
+        // THE LADDER'S OWN PRECEDENCE, and it is documented on
+        // `LadderInput::Unreadable`: an unreadable field stops the preview
+        // before any form-shape gate is considered. The save path checks the
+        // sale price before the cost, so the same request would answer
+        // "sale_price is required" and never mention the field the operator is
+        // actually typing into. The ladder answers what the operator needs
+        // instead — WHICH field cannot be read — because a preview has nothing
+        // to say once a field is not a number.
+        Some(LadderInput::Unreadable)
+    } else {
+        match resolve_price_fields(fields) {
+            Ok(prices) => Some(ladder_input_from(prices, kind)),
+            // A refusal the SAVE would also answer (an empty manual price) is a
+            // state the ladder reports, not an error of its own. The cost the
+            // form does hold still belongs on the ladder.
+            Err(PriceFieldError::Refusal(message)) => Some(LadderInput::Refused {
+                message,
+                cost_price: fields.cost_price.as_value().unwrap_or(Decimal::ZERO),
+            }),
+            // Unreachable by the check above; kept total so a future field
+            // cannot silently fall through into a fabricated preview.
+            Err(PriceFieldError::Unreadable(_)) => Some(LadderInput::Unreadable),
+        }
+    };
+    let ladder = state
+        .tax_service
+        .product_price_ladder(query.id, input)
+        .await?;
+    product_price_ladder_html(&localization, ladder)
+}
+
 /// The drawer body with fresh derived data. The detail read and every mutating
 /// drawer action answer it, so saving/costs/movements refresh the drawer in
 /// place without the client rebuilding a URL. The audit actors are resolved
@@ -620,7 +751,10 @@ async fn product_detail_html(
         categories,
         product_taxes,
         available_taxes,
-        tax_preview: state.tax_service.product_price_preview(id).await?,
+        // The drawer has no form values on its first render, so the ladder
+        // reports the stored state — the very figures the form is prefilled
+        // with, so the two cannot disagree on arrival.
+        ladder: state.tax_service.product_price_ladder(id, None).await?,
         supplier_costs,
         suppliers,
         stale_cost,
@@ -824,6 +958,118 @@ fn parse_opt_i64(s: &str) -> AppResult<Option<i64>> {
         .map_err(|_| AppError::Validation(format!("invalid id: {s}")))
 }
 
+// ---------------------------------------------------------------------------
+// The product price ladder's inputs (U2)
+//
+// ONE reading of the three price fields, shared by the save path
+// (`/web/products`, `/web/products/edit`) and the read-only ladder preview
+// (`/web/product-price-ladder`). The rule each one follows:
+//
+// * EMPTY is a value, not an absence. An empty markup means "no markup", the
+//   manual-price mode; an empty cost is the column's "no cost recorded" zero.
+//   A save accepts both, so the ladder reports both.
+// * UNREADABLE is a typo. A save answers 400; the ladder refuses to guess and
+//   reports the last state the save path accepted, because a preview that
+//   invented a number from a typo is worse than no preview.
+// ---------------------------------------------------------------------------
+
+/// How one form value reads, in the request's own locale.
+fn read_price_field(raw: &str, localization: &LocalizationContext) -> PriceField {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return PriceField::Empty;
+    }
+    match localization.parse_decimal(trimmed) {
+        Ok(value) => PriceField::Value(value),
+        Err(_) => PriceField::Unreadable,
+    }
+}
+
+/// Why a form's price fields could not become a product's prices.
+#[derive(Debug)]
+enum PriceFieldError {
+    /// A field was not a number in this locale. The payload is the save path's
+    /// own refusal for that exact field, so answering 400 changes nothing an
+    /// existing caller can observe.
+    Unreadable(&'static str),
+    /// The save path's own form-shape refusal, verbatim.
+    Refusal(String),
+}
+
+impl PriceFieldError {
+    fn into_app_error(self) -> AppError {
+        match self {
+            Self::Unreadable(message) => AppError::Validation(message.into()),
+            Self::Refusal(message) => AppError::Validation(message),
+        }
+    }
+}
+
+/// The three prices a product form submits, read exactly once for every caller.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPrices {
+    sale_price: Decimal,
+    cost_price: Decimal,
+    markup_pct: Option<Decimal>,
+}
+
+/// The reading, in the order the handlers used to apply it — and the order is
+/// load-bearing for the messages: the markup decides whether an empty sale
+/// price is a refusal or a placeholder, so it is read first.
+fn resolve_price_fields(fields: PriceFields) -> Result<ResolvedPrices, PriceFieldError> {
+    let markup_pct = match fields.markup_pct {
+        PriceField::Value(value) => Some(value),
+        PriceField::Empty => None,
+        PriceField::Unreadable => return Err(PriceFieldError::Unreadable("invalid markup_pct")),
+    };
+    // An empty sale_price is only an error when the price is manual. With a
+    // markup the service DERIVES and validates the price and ignores the
+    // incoming one, so Decimal::ZERO is a safe placeholder that can never
+    // reach the database.
+    let sale_price = match fields.sale_price {
+        PriceField::Value(value) => value,
+        PriceField::Empty if markup_pct.is_some() => Decimal::ZERO,
+        PriceField::Empty => return Err(PriceFieldError::Refusal("sale_price is required".into())),
+        PriceField::Unreadable => return Err(PriceFieldError::Unreadable("invalid sale_price")),
+    };
+    let cost_price = match fields.cost_price {
+        PriceField::Value(value) => value,
+        PriceField::Empty => Decimal::ZERO,
+        PriceField::Unreadable => return Err(PriceFieldError::Unreadable("invalid cost_price")),
+    };
+    Ok(ResolvedPrices {
+        sale_price,
+        cost_price,
+        markup_pct,
+    })
+}
+
+/// The ladder's input from an already-resolved form: the very values a save
+/// would submit, so the preview cannot disagree with the save. `kind` is
+/// `None` when the form named none that could be read.
+fn ladder_input_from(prices: ResolvedPrices, kind: Option<ProductKind>) -> LadderInput {
+    LadderInput::Form {
+        kind,
+        sale_price: prices.sale_price,
+        cost_price: prices.cost_price,
+        markup_pct: prices.markup_pct,
+    }
+}
+
+/// The three raw form values, read the one way every caller reads them.
+fn form_price_fields(
+    sale_price: &str,
+    cost_price: &str,
+    markup_pct: &str,
+    localization: &LocalizationContext,
+) -> PriceFields {
+    PriceFields {
+        sale_price: read_price_field(sale_price, localization),
+        cost_price: read_price_field(cost_price, localization),
+        markup_pct: read_price_field(markup_pct, localization),
+    }
+}
+
 async fn web_create_category(
     State(state): State<AppState>,
     _: Require<InventoryWrite>,
@@ -858,37 +1104,13 @@ async fn web_create_product(
     } else {
         form.kind.parse().map_err(AppError::Validation)?
     };
-    // The markup is parsed BEFORE the price gate: the gate now depends on it.
-    let markup_pct = if form.markup_pct.trim().is_empty() {
-        None
-    } else {
-        Some(
-            localization
-                .parse_decimal(form.markup_pct.trim())
-                .map_err(|_| AppError::Validation("invalid markup_pct".into()))?,
-        )
-    };
-    // An empty sale_price is only an error when the price is manual. With a
-    // markup the service DERIVES and validates the price and ignores the
-    // incoming one, so Decimal::ZERO is a safe placeholder that can never
-    // reach the database.
-    let sale_price = if form.sale_price.trim().is_empty() {
-        if markup_pct.is_none() {
-            return Err(AppError::Validation("sale_price is required".into()));
-        }
-        Decimal::ZERO
-    } else {
-        localization
-            .parse_decimal(form.sale_price.trim())
-            .map_err(|_| AppError::Validation("invalid sale_price".into()))?
-    };
-    let cost_price = if form.cost_price.trim().is_empty() {
-        Decimal::ZERO
-    } else {
-        localization
-            .parse_decimal(form.cost_price.trim())
-            .map_err(|_| AppError::Validation("invalid cost_price".into()))?
-    };
+    let prices = resolve_price_fields(form_price_fields(
+        &form.sale_price,
+        &form.cost_price,
+        &form.markup_pct,
+        &localization,
+    ))
+    .map_err(PriceFieldError::into_app_error)?;
     // Checkbox: present means checked (value "1"/"on"/"true"); absent means false.
     // A hidden default of checked in the template sends Some("1").
     let track_stock = match form.track_stock.as_deref() {
@@ -905,8 +1127,10 @@ async fn web_create_product(
         } else {
             form.unit
         },
-        sale_price,
-        cost_price,
+        // Read above by the one shared reader: `Some` derives and validates the
+        // price in the service; `None` (empty field) keeps the price manual.
+        sale_price: prices.sale_price,
+        cost_price: prices.cost_price,
         track_stock,
         min_stock: parse_opt_decimal(&form.min_stock, &localization)?,
         max_stock: parse_opt_decimal(&form.max_stock, &localization)?,
@@ -920,9 +1144,7 @@ async fn web_create_product(
         } else {
             Some(form.notes)
         },
-        // Parsed from the form above: `Some` derives and validates the price
-        // in the service; `None` (empty field) keeps the price manual.
-        markup_pct: markup_pct,
+        markup_pct: prices.markup_pct,
     };
     let created = state
         .inventory_service
@@ -1097,37 +1319,13 @@ async fn web_edit_product(
     } else {
         form.kind.parse().map_err(AppError::Validation)?
     };
-    // The markup is parsed BEFORE the price gate: the gate now depends on it.
-    let markup_pct = if form.markup_pct.trim().is_empty() {
-        None
-    } else {
-        Some(
-            localization
-                .parse_decimal(form.markup_pct.trim())
-                .map_err(|_| AppError::Validation("invalid markup_pct".into()))?,
-        )
-    };
-    // An empty sale_price is only an error when the price is manual. With a
-    // markup the service DERIVES and validates the price and ignores the
-    // incoming one, so Decimal::ZERO is a safe placeholder that can never
-    // reach the database.
-    let sale_price = if form.sale_price.trim().is_empty() {
-        if markup_pct.is_none() {
-            return Err(AppError::Validation("sale_price is required".into()));
-        }
-        Decimal::ZERO
-    } else {
-        localization
-            .parse_decimal(form.sale_price.trim())
-            .map_err(|_| AppError::Validation("invalid sale_price".into()))?
-    };
-    let cost_price = if form.cost_price.trim().is_empty() {
-        Decimal::ZERO
-    } else {
-        localization
-            .parse_decimal(form.cost_price.trim())
-            .map_err(|_| AppError::Validation("invalid cost_price".into()))?
-    };
+    let prices = resolve_price_fields(form_price_fields(
+        &form.sale_price,
+        &form.cost_price,
+        &form.markup_pct,
+        &localization,
+    ))
+    .map_err(PriceFieldError::into_app_error)?;
     // Checkbox: present means checked; absent means false, like creation.
     let track_stock = match form.track_stock.as_deref() {
         None => false,
@@ -1144,8 +1342,8 @@ async fn web_edit_product(
         } else {
             form.unit
         }),
-        sale_price: Some(sale_price),
-        cost_price: Some(cost_price),
+        sale_price: Some(prices.sale_price),
+        cost_price: Some(prices.cost_price),
         track_stock: Some(track_stock),
         min_stock: Some(parse_opt_decimal(&form.min_stock, &localization)?),
         max_stock: Some(parse_opt_decimal(&form.max_stock, &localization)?),
@@ -1162,7 +1360,7 @@ async fn web_edit_product(
         // The drawer always sends the field: an empty markup is an explicit
         // clear back to a manual price (`Some(None)`); a value re-derives the
         // price from the cost.
-        markup_pct: Some(markup_pct),
+        markup_pct: Some(prices.markup_pct),
     };
     state
         .inventory_service
@@ -1386,6 +1584,7 @@ pub fn router() -> Router<AppState> {
         .route("/web/product-options", get(web_product_options))
         .route("/web/product-search.json", get(web_product_search_json))
         .route("/web/products/detail/{id}", get(web_product_detail))
+        .route("/web/product-price-ladder", get(web_product_price_ladder))
         .route("/web/products/edit", post(web_edit_product))
         .route("/web/products/activate", post(web_activate_product))
         .route("/web/products/deactivate", post(web_deactivate_product))
@@ -3730,5 +3929,1513 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(linked, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // U2 (product price ladder): ONE ordered, server-computed ladder — cost,
+    // markup, net sale price, each tax with its amount, total taxes and the
+    // tax-inclusive price — previewed from the drawer's own form values and
+    // never written anywhere.
+    // -----------------------------------------------------------------------
+
+    const LADDER_PATH: &str = "/web/product-price-ladder";
+
+    /// Money as the ACTIVE locale formats it, so a test asserts the value, not
+    /// a convention.
+    fn money(localization: &crate::localization::LocalizationContext, value: &str) -> String {
+        localization.format_currency(Decimal::from_str(value).unwrap())
+    }
+
+    /// A product in either derivation mode: `markup: None` keeps a manual net
+    /// price, `Some` derives it from the cost exactly as the save path does.
+    async fn product_with_markup(
+        state: &AppState,
+        sku: &str,
+        price: &str,
+        cost: &str,
+        markup: Option<&str>,
+    ) -> i64 {
+        state
+            .inventory_service
+            .create_product(
+                audit_actor_id(state).await,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: format!("Product {sku}"),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    // A markup makes the server ignore this field, so the
+                    // absurd value proves the derivation rather than a
+                    // coincidence.
+                    sale_price: Decimal::from_str(price).unwrap(),
+                    cost_price: Decimal::from_str(cost).unwrap(),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: markup.map(|m| Decimal::from_str(m).unwrap()),
+                },
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn link_tax(state: &AppState, code: &str, name: &str, rate: &str) -> i64 {
+        state
+            .tax_service
+            .create_tax(
+                audit_actor_id(state).await,
+                crate::models::NewTax {
+                    code: code.into(),
+                    name: name.into(),
+                    rate: Decimal::from_str(rate).unwrap(),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// The read-only preview, sent EXACTLY as the drawer sends it: the whole
+    /// `hx-include="closest form"` body, field for field, under the keys the
+    /// drawer's own inputs carry — the product id included, which is `id`.
+    ///
+    /// Nothing here is invented for the test. A hand-built `?product_id=…` that
+    /// the browser never sends is precisely how a dead endpoint can sit behind a
+    /// green suite, so every test in this block goes through this one builder.
+    /// `prices` is the tail of the price fields the test is about, e.g.
+    /// `cost_price=0&markup_pct=50`; `kind` is passed here by the tests that
+    /// exercise it, so a query can never carry the same key twice. An empty
+    /// `prices` is a bare read with no price fields at all, which is the one
+    /// shape the browser never sends and which the stored-state tests need.
+    async fn preview(app: axum::Router, product_id: i64, prices: &str) -> (StatusCode, String) {
+        // One literal on one line: `cargo fmt` rewraps a `\` continuation and
+        // the indentation it leaves behind is not a valid URI character.
+        let body = format!("id={product_id}&sku=LADDER-BODY&name=Ladder+body&category_id=&unit=un&track_stock=&min_stock=&max_stock=&location=&notes=&{prices}");
+        get_html(app, &format!("{LADDER_PATH}?{body}")).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Independent verification round: the ladder must work in a REAL browser
+    // and must refuse everything the save path refuses.
+    // -----------------------------------------------------------------------
+
+    /// BLOCKER 1, proven at the HTTP boundary: the request the BROWSER sends
+    /// must answer 200. The drawer's three price fields carry
+    /// `hx-include="closest form"`, so the body is the whole edit form and the
+    /// product id arrives under the form's own key, `id`. Every other test in
+    /// this block already goes through `preview`, which sends that exact body;
+    /// this one states the contract in one place so the field-name contract
+    /// cannot drift again.
+    #[tokio::test]
+    async fn product_price_ladder_answers_the_drawers_own_request_shape() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-BODY", "42").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // Field for field, exactly as `templates/partials/product_detail.html`
+        // renders the edit form, with the three price fields left out so the
+        // request is the bare form a direct read makes. One literal on one
+        // line: a `\` continuation is rewrapped by `cargo fmt`, and the spaces
+        // it leaves behind are not valid in a URI.
+        let body = format!("id={product_id}&sku=LADDER-BODY&name=Ladder+body&kind=Product&category_id=&unit=un&sale_price=42&cost_price=5&markup_pct=&track_stock=&min_stock=&max_stock=&location=&notes=");
+        let (status, html) = get_html(app, &format!("{LADDER_PATH}?{body}")).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("id=\"product-price-ladder\""),
+            "the browser's request must be answered with the ladder: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "42")),
+            "and with the figures it asked about: {html}"
+        );
+    }
+
+    /// BLOCKER 2: a markup whose derived price rounds to zero is a state the
+    /// save path refuses ("sale_price must be > 0 for products"). The ladder
+    /// must carry that refusal and publish no money at all — a net of 0.00 with
+    /// a tax total beside it is exactly the fabricated figure this ladder
+    /// exists not to show.
+    #[tokio::test]
+    async fn product_price_ladder_refuses_a_derived_price_that_rounds_to_zero() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-ZERO", "42").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // 0.05 * (1 - 99/100) = 0.0005, which pins to 0.00 at cents.
+        let (status, html) = preview(
+            app,
+            product_id,
+            "cost_price=0.05&markup_pct=-99&sale_price=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("sale_price must be &gt; 0 for products"),
+            "the ladder must carry the save path's own refusal: {html}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("42"),
+            "and a refusal writes nothing"
+        );
+    }
+
+    /// BLOCKER 2: a negative cost is refused by the save path too, and the
+    /// ladder must not publish a price built on one. It has no markup here, so
+    /// the derivation rule stays silent and the COST rule is what refuses —
+    /// which is exactly the state a hand-written mirror would miss.
+    #[tokio::test]
+    async fn product_price_ladder_refuses_a_negative_cost() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-NEGCOST", "42").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) =
+            preview(app, product_id, "cost_price=-5&markup_pct=&sale_price=42").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("cost_price cannot be negative"),
+            "the ladder must carry the save path's own refusal: {html}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+    }
+
+    /// LOW: the emptied-manual-price branch, at the HTTP boundary. A manual
+    /// product whose sale price the operator clears is a save refusal, and the
+    /// ladder reports the same one instead of inventing a price.
+    #[tokio::test]
+    async fn product_price_ladder_reports_the_save_paths_refusal_for_an_emptied_manual_price() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-EMPTIED", "42").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = preview(app, product_id, "cost_price=5&markup_pct=&sale_price=").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("sale_price is required"),
+            "the ladder must carry the save path's own refusal: {html}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(stored_net(&state, product_id).await, dec("42"));
+    }
+
+    /// MEDIUM: provenance must be honest. A figure the operator has typed but
+    /// not saved is NOT stored, and labelling it "Stored" is a lie the footer
+    /// then contradicts. Each of the three stored columns is marked per row.
+    #[tokio::test]
+    async fn product_price_ladder_never_presents_an_unsaved_value_as_stored() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_markup(&state, "LADDER-PROV", "999", "10", Some("100")).await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let stored = localization.tr(crate::localization::MessageKey::ProductLadderStored);
+        let unsaved = "Unsaved";
+
+        // The drawer's own first render: the stored row, honestly labelled.
+        let (status, html) = preview(app.clone(), product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(
+            html.matches("data-product-ladder-source=\"stored\"")
+                .count(),
+            3,
+            "the stored state labels all three of its own columns as stored: {html}"
+        );
+        assert_eq!(
+            html.matches(&format!(">{unsaved}<")).count(),
+            0,
+            "nothing is unsaved in the stored state: {html}"
+        );
+        assert!(html.contains(&format!(">{stored}<")), "{html}");
+
+        // The form's own values, unsaved: none of the three may claim to be
+        // stored, and the net row must not contradict its own footer.
+        let (status, html) = preview(
+            app,
+            product_id,
+            "cost_price=25&markup_pct=100&sale_price=15",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(
+            html.matches("data-product-ladder-source=\"unsaved\"")
+                .count(),
+            3,
+            "every figure taken from the form is unsaved: {html}"
+        );
+        assert_eq!(
+            html.matches("data-product-ladder-source=\"stored\"")
+                .count(),
+            0,
+            "an unsaved value must never be presented as stored: {html}"
+        );
+        assert_eq!(
+            html.matches(&format!(">{unsaved}<")).count(),
+            3,
+            "and each one says so in words: {html}"
+        );
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("20"),
+            "labelling a value unsaved is not a write"
+        );
+    }
+
+    /// MEDIUM: the new endpoint is a real surface, so it carries the real gates.
+    /// A principal without `inventory.read` is refused in the shape every other
+    /// refusal on this screen uses, and an unknown product is a 404 — never a
+    /// ladder built from a product that does not exist.
+    #[tokio::test]
+    async fn product_price_ladder_enforces_its_gate_and_its_product() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-GATE", "42").await;
+        let body = format!("id={product_id}&cost_price=5&markup_pct=&sale_price=42");
+
+        // No inventory access at all: FORBIDDEN, naming the gate.
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["dashboard.read"])
+            .await
+            .unwrap();
+        let (status, refused) = get_html_with_cookie(
+            app.clone(),
+            &format!("{LADDER_PATH}?{body}"),
+            &test_support::cookie_for(&probe),
+        )
+        .await;
+        // This module's convention: a plain browser navigation gets the
+        // full-page refusal, not a JSON body.
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        assert!(
+            refused.contains("inventory.read"),
+            "the refusal must name the gate: {refused:.400}"
+        );
+        assert!(
+            refused.contains("data-nav=\"products\"") || refused.contains("data-nav=\"dashboard\""),
+            "and must keep the navigation shell: {refused:.400}"
+        );
+
+        // A product that does not exist: 404, not a zero ladder.
+        let (status, missing) = get_html(
+            app,
+            &format!("{LADDER_PATH}?id=999999&cost_price=5&markup_pct=&sale_price=42"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The ladder's kind is the FORM's kind, not the stored one.
+    // -----------------------------------------------------------------------
+
+    /// A Service priced at exactly 0.00 is legal (the Service rule refuses only
+    /// BELOW zero), so switching it to Product in the form must move the ladder
+    /// onto the Product threshold — which refuses 0.00 — and publish no money.
+    /// Binding the stored kind would have kept publishing 0.00 as a price a
+    /// save would reject.
+    #[tokio::test]
+    async fn product_price_ladder_uses_the_kinds_in_the_form_not_the_stored_one() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let service_id =
+            product_of_kind(&state, "LADDER-KIND-SVC", ProductKind::Service, "0").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, service_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // As stored: a Service may cost nothing, so the ladder publishes 0.00.
+        let (status, html) = preview(app.clone(), service_id, "kind=Service&sale_price=0").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains("data-product-ladder-net-refused"),
+            "a zero-priced service is a price the save path accepts: {html}"
+        );
+
+        // Switched to Product in the form: the Product rule refuses 0.00, and
+        // the ladder must say so instead of publishing a price a save rejects.
+        let (status, html) = preview(app, service_id, "kind=Product&sale_price=0").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("sale_price must be &gt; 0 for products"),
+            "the ladder must apply the kind IN THE FORM: {html}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(
+            stored_kind(&state, service_id).await,
+            ProductKind::Service,
+            "a preview must never write the kind either"
+        );
+    }
+
+    /// The reverse direction: a stored Product priced at 0.00 is not a legal
+    /// state to begin with, so this pins the half that matters — a Service the
+    /// form keeps as a Service must still publish, whatever the row is.
+    #[tokio::test]
+    async fn product_price_ladder_publishes_a_zero_priced_service_the_form_keeps() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let service_id = product_of_kind(&state, "LADDER-KIND-OK", ProductKind::Service, "0").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) =
+            preview(app, service_id, "kind=Service&sale_price=0&cost_price=5").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains("data-product-ladder-net-refused"),
+            "the service rule refuses only below zero: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "0")),
+            "and the ladder publishes the figure rather than refusing: {html}"
+        );
+    }
+
+    /// An absent or unreadable kind is not a licence to guess: the ladder falls
+    /// back to the kind the product is stored as, and says nothing about it.
+    #[tokio::test]
+    async fn product_price_ladder_falls_back_to_the_stored_kind_when_the_form_sends_none() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let service_id =
+            product_of_kind(&state, "LADDER-KIND-FALLBACK", ProductKind::Service, "0").await;
+
+        for prices in [
+            "sale_price=0",
+            "kind=&sale_price=0",
+            "kind=Widget&sale_price=0",
+        ] {
+            let (status, html) = preview(app.clone(), service_id, prices).await;
+            assert_eq!(status, StatusCode::OK, "{prices} -> {html}");
+            assert!(
+                !html.contains("data-product-ladder-net-refused"),
+                "{prices}: with no readable kind the stored one applies, and a \
+                 zero-priced service is legal: {html}"
+            );
+        }
+    }
+
+    /// The kind select is a ladder input like the three price fields: switching
+    /// a free service to a product has to move the figures before any save.
+    #[tokio::test]
+    async fn product_price_ladder_refreshes_on_a_kind_change_too() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-KIND-WIRE", "42").await;
+
+        let (status, html) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        let select = html
+            .split("name=\"kind\"")
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .unwrap_or_default();
+        assert!(
+            select.contains(&format!("hx-get=\"{LADDER_PATH}\"")),
+            "the kind select must ask the server for the ladder: {select}"
+        );
+        assert!(
+            select.contains("hx-trigger=\"change\""),
+            "the kind select must ask on change: {select}"
+        );
+        assert!(
+            select.contains("hx-target=\"#product-price-ladder\""),
+            "the kind select must replace the ladder island: {select}"
+        );
+    }
+
+    /// A Service in either derivation mode, for the kind-bound rules above.
+    async fn product_of_kind(state: &AppState, sku: &str, kind: ProductKind, price: &str) -> i64 {
+        state
+            .inventory_service
+            .create_product(
+                audit_actor_id(state).await,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: format!("Product {sku}"),
+                    kind,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec(price),
+                    cost_price: dec("5"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    async fn stored_kind(state: &AppState, product_id: i64) -> ProductKind {
+        let raw: String = sqlx::query_scalar("SELECT kind FROM products WHERE id = ?")
+            .bind(product_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        raw.parse().unwrap()
+    }
+
+    /// A GET with an explicit cookie, for the authorization probes: the seeded
+    /// test session is not the principal under test.
+    async fn get_html_with_cookie(
+        app: axum::Router,
+        uri: &str,
+        cookie: &str,
+    ) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The refusal the ladder shows instead of a price, proven to be the only
+    /// thing it published: no tax total and no tax-inclusive price at all.
+    fn assert_publishes_no_tax_money(
+        localization: &crate::localization::LocalizationContext,
+        html: &str,
+    ) {
+        assert!(
+            html.contains("data-product-ladder-net-refused"),
+            "the ladder must state a refusal, not a figure: {html}"
+        );
+        for key in [
+            crate::localization::MessageKey::TaxTotal,
+            crate::localization::MessageKey::TaxInclusivePrice,
+        ] {
+            assert!(
+                !html.contains(localization.tr(key)),
+                "{key:?} is tax money derived from a price that does not exist, \
+                 so it must not be published: {html}"
+            );
+        }
+    }
+
+    /// The drawer's stored net price, read straight from the row so a test can
+    /// prove a derived figure never became a stored one. Compared as a
+    /// `Decimal`, because the stored TEXT scale is the repository's business and
+    /// not what these tests are about.
+    async fn stored_net(state: &AppState, product_id: i64) -> Decimal {
+        let raw: String = sqlx::query_scalar("SELECT sale_price FROM products WHERE id = ?")
+            .bind(product_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        Decimal::from_str(&raw).unwrap()
+    }
+
+    fn dec(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
+    /// An untaxed product: the ladder states the net price once and the
+    /// tax-inclusive price once, they are equal, and it says why.
+    #[tokio::test]
+    async fn product_price_ladder_shows_an_untaxed_product_with_equal_prices() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-0", "42").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, drawer) =
+            get_html(app.clone(), &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{drawer}");
+        assert!(
+            drawer.contains("id=\"product-price-ladder\""),
+            "the drawer must carry the ladder: {drawer}"
+        );
+
+        let (status, html) = preview(app, product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(
+            html.matches(&format!(">{}<", money(&localization, "42")))
+                .count(),
+            2,
+            "an untaxed ladder states the net and the tax-inclusive price once each: {html}"
+        );
+        assert_eq!(
+            html.matches(localization.tr(crate::localization::MessageKey::TaxNoBreakdown))
+                .count(),
+            1,
+            "an untaxed ladder says why the two figures are equal: {html}"
+        );
+    }
+
+    /// One tax: the ladder names it, shows its localized rate and the amount
+    /// that rate adds, then totals and the tax-inclusive price.
+    #[tokio::test]
+    async fn product_price_ladder_shows_one_tax_with_its_rate_and_amount() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-1", "100").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = preview(app, product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("IVA21") && html.contains("IVA 21%"),
+            "the tax identity: {html}"
+        );
+        assert!(
+            html.contains(&localization.format_percentage(Decimal::from_str("21").unwrap())),
+            "the localized rate: {html}"
+        );
+        for value in ["100", "21", "121"] {
+            assert!(
+                html.contains(&money(&localization, value)),
+                "the ladder must state {value}: {html}"
+            );
+        }
+        for key in [
+            crate::localization::MessageKey::TaxTotal,
+            crate::localization::MessageKey::TaxInclusivePrice,
+        ] {
+            assert!(
+                html.contains(localization.tr(key)),
+                "{key:?} must label the ladder: {html}"
+            );
+        }
+    }
+
+    /// Several taxes are additive, never compounded, and the per-row amounts
+    /// reconcile with the total the ladder states.
+    #[tokio::test]
+    async fn product_price_ladder_sums_several_linked_taxes_additively() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-2", "100").await;
+        let actor = audit_actor_id(&state).await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        let iibb = link_tax(&state, "IIBB10", "IIBB 10%", "10").await;
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, iva)
+            .await
+            .unwrap();
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, iibb)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = preview(app, product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        for value in ["10", "21", "31", "131"] {
+            assert!(
+                html.contains(&money(&localization, value)),
+                "additive, not compounded: the ladder must state {value}: {html}"
+            );
+        }
+    }
+
+    /// The per-tax amount is pinned to cents half-up, exactly like a document
+    /// line of the same product: 10.005 at 21% is 2.10, never 2.11 or 2.09.
+    #[tokio::test]
+    async fn product_price_ladder_rounds_each_tax_amount_half_up_to_cents() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-3", "10.005").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = preview(app, product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains(&money(&localization, "2.10")),
+            "21% of 10.005 is 2.10 half-up: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "12.11")),
+            "and the tax-inclusive price is the same one a line would carry: {html}"
+        );
+    }
+
+    /// A manual-price product keeps its own net price and still gets the tax
+    /// rows, the total and the tax-inclusive price.
+    #[tokio::test]
+    async fn product_price_ladder_keeps_a_manual_price_product_manual() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-4", "80").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // The form changes the cost only: with no markup the net price stays the
+        // manual one, so the ladder must not derive from the new cost.
+        let (status, html) =
+            preview(app, product_id, "cost_price=5&markup_pct=&sale_price=80").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains(&money(&localization, "80")),
+            "the manual net price is the truth: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "16.80")),
+            "21% of 80 is 16.80: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "96.80")),
+            "and the tax-inclusive price follows it: {html}"
+        );
+    }
+
+    /// A markup product: the ladder's net price IS the cost times the markup,
+    /// stated with the very figure the save path would store.
+    #[tokio::test]
+    async fn product_price_ladder_derives_a_markup_product_net_from_its_cost() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_markup(&state, "LADDER-5", "999", "10", Some("100")).await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("20"),
+            "10 * (1 + 100/100) is what the save path stored"
+        );
+
+        let (status, html) = preview(app, product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains(&money(&localization, "20.00")),
+            "the ladder derives the net price from the cost and the markup: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "4.20"))
+                && html.contains(&money(&localization, "24.20")),
+            "the taxes apply to the derived net price: {html}"
+        );
+    }
+
+    /// Changing the cost in the form moves the ladder, before anything is
+    /// saved, and the stored row is untouched.
+    #[tokio::test]
+    async fn product_price_ladder_follows_a_cost_change_in_the_form() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_markup(&state, "LADDER-6", "999", "10", Some("100")).await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // A DERIVED price always carries cents: the markup factor is a
+        // two-decimal scale shift, so 25 * (1 + 100/100) is 50.00 and not 50.
+        let (status, html) = preview(
+            app,
+            product_id,
+            "cost_price=25&markup_pct=100&sale_price=15",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains(&money(&localization, "50.00")),
+            "25 * (1 + 100/100) = 50.00: {html}"
+        );
+        assert!(
+            !html.contains(&money(&localization, "20.00")),
+            "the previous derived price must not linger: {html}"
+        );
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("20"),
+            "a preview must never write the product"
+        );
+    }
+
+    /// Changing the markup in the form moves the ladder too, on the same
+    /// derivation the save enforces.
+    #[tokio::test]
+    async fn product_price_ladder_follows_a_markup_change_in_the_form() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_markup(&state, "LADDER-7", "999", "10", Some("100")).await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) =
+            preview(app, product_id, "cost_price=10&markup_pct=50&sale_price=15").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains(&money(&localization, "15.00")),
+            "10 * (1 + 50/100) = 15.00: {html}"
+        );
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("20"),
+            "the preview persists nothing"
+        );
+    }
+
+    /// The preview derives through the SAME rule the save path enforces: the
+    /// numbers the form shows before a save are the numbers the save stores.
+    #[tokio::test]
+    async fn product_price_ladder_preview_matches_what_saving_the_same_values_stores() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-8", "42").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        // The drawer always re-submits its readonly price field, so the save
+        // below sends the stale 42.00 exactly as the browser would.
+        let edit = format!(
+            "id={product_id}&sku=LADDER-8&name=Product+LADDER-8&kind=Product&unit=un\
+             &sale_price=42&cost_price=10&category_id=&track_stock=&min_stock=&max_stock=\
+             &location=&notes=&markup_pct=100"
+        );
+        let (status, saved) = post_form_with_cookie(
+            app.clone(),
+            "/web/products/edit",
+            &edit,
+            &[
+                ("HX-Request", "true"),
+                ("HX-Target", "#product-drawer-body"),
+            ],
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+
+        let (status, html) = preview(
+            app,
+            product_id,
+            "cost_price=10&markup_pct=100&sale_price=42",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("20"),
+            "the save re-derives the stored net price"
+        );
+        assert!(
+            html.contains(&money(&localization, "20.00")),
+            "the preview of the same form values must be the stored figure: {html}"
+        );
+    }
+
+    /// Linking a tax moves the tax-inclusive price; unlinking it moves the price
+    /// back. Neither rewrites the stored net price.
+    #[tokio::test]
+    async fn product_price_ladder_follows_linking_and_unlinking_a_tax() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-9", "100").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = preview(app.clone(), product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains(&money(&localization, "121")),
+            "no tax is linked yet: {html}"
+        );
+
+        let (status, linked) = post_form_with_cookie(
+            app.clone(),
+            "/web/product-taxes",
+            &format!("product_id={product_id}&tax_id={iva}"),
+            &[("HX-Request", "true")],
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{linked}");
+
+        let (status, html) = preview(app.clone(), product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains(&money(&localization, "121")),
+            "linking the tax moves the tax-inclusive price: {html}"
+        );
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("100"),
+            "a tax change never rewrites the stored net price"
+        );
+
+        let (status, unlinked) = post_form_with_cookie(
+            app.clone(),
+            "/web/product-taxes/unlink",
+            &format!("product_id={product_id}&tax_id={iva}"),
+            &[("HX-Request", "true")],
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{unlinked}");
+
+        let (status, html) = preview(app, product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains(&money(&localization, "121")),
+            "unlinking the tax moves it back: {html}"
+        );
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("100"),
+            "the stored net price is still untouched"
+        );
+    }
+
+    /// A markup with no cost cannot produce a price — the save path rejects it
+    /// — so the ladder states that refusal instead of a zero or a stale
+    /// figure, and publishes no tax money derived from nothing.
+    #[tokio::test]
+    async fn product_price_ladder_shows_the_save_paths_refusal_for_a_markup_without_a_cost() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-10", "42").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) =
+            preview(app, product_id, "cost_price=0&markup_pct=50&sale_price=").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        // The save path's own refusal, verbatim. `&gt;` is the wire form of
+        // `>`: the ladder escapes it like any other rendered text and the
+        // browser decodes it back, so the operator reads the server's message.
+        assert!(
+            html.contains("cost_price must be &gt; 0 when markup_pct is set"),
+            "the ladder states the save path's own refusal: {html}"
+        );
+        assert!(
+            html.contains("data-product-ladder-net-refused"),
+            "and says which figures it therefore cannot state: {html}"
+        );
+        assert!(
+            !html.contains(&money(&localization, "46.20"))
+                && !html.contains(&money(&localization, "4.20")),
+            "no tax money may be derived from a price that does not exist: {html}"
+        );
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("42"),
+            "and the refusal writes nothing"
+        );
+    }
+
+    /// A field that is not a number is not a zero: the ladder falls back to the
+    /// last state the save path accepted, and says that is what it is showing.
+    #[tokio::test]
+    async fn product_price_ladder_shows_the_last_saved_state_for_an_unreadable_field() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-11", "42").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        for query in [
+            "cost_price=abc&markup_pct=&sale_price=",
+            "cost_price=&markup_pct=twenty&sale_price=",
+            "cost_price=&markup_pct=&sale_price=4o0",
+        ] {
+            let (status, html) = preview(app.clone(), product_id, query).await;
+            assert_eq!(status, StatusCode::OK, "{query} -> {html}");
+            assert!(
+                html.contains("data-product-ladder-unreadable"),
+                "{query}: the ladder must say it fell back to the saved values: {html}"
+            );
+            assert!(
+                html.contains("not a number"),
+                "{query}: in the operator's own words: {html}"
+            );
+            assert!(
+                html.contains(&money(&localization, "42")),
+                "{query}: the last coherent state is the stored net price: {html}"
+            );
+            assert!(
+                html.contains(&money(&localization, "5")),
+                "{query}: and the stored cost, not a misread one: {html}"
+            );
+        }
+    }
+
+    /// An empty cost is NOT an unreadable field: the save path stores it as the
+    /// "no cost recorded" zero, so the ladder states that, and a manual net
+    /// price still stands.
+    #[tokio::test]
+    async fn product_price_ladder_treats_an_empty_cost_as_no_cost_recorded() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-12", "42").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) =
+            preview(app, product_id, "cost_price=&markup_pct=&sale_price=42").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            !html.contains("data-product-ladder-unreadable"),
+            "an empty cost is a value the save path accepts: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "42")),
+            "the manual net price stands: {html}"
+        );
+    }
+
+    /// The ladder is readable in every enabled locale, through the existing
+    /// currency and percentage helpers.
+    #[tokio::test]
+    async fn product_price_ladder_renders_in_both_enabled_locales() {
+        for (locale_code, decimal_sep, ladder, net, gross) in [
+            ("en-US", '.', "Price ladder", "Net price", "Price with tax"),
+            (
+                "es-AR",
+                ',',
+                "Escalera de precios",
+                "Precio neto",
+                "Precio con impuestos",
+            ),
+        ] {
+            let state = test_state().await;
+            sqlx::query(
+                "INSERT INTO business_settings \
+                 (id, business_name, default_locale_code, currency_code, timezone) \
+                 VALUES (1, 'Acme', ?, 'ARS', 'UTC')",
+            )
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            for (code, language) in [("en-US", "en"), ("es-AR", "es")] {
+                sqlx::query(
+                    "INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) \
+                     VALUES (?, ?, ?, 1)",
+                )
+                .bind(code)
+                .bind(language)
+                .bind(code)
+                .execute(&state.pool)
+                .await
+                .unwrap();
+            }
+            let app = crate::routes::router(state.clone());
+            let product_id = product_with_taxes(&state, "LADDER-13", "100").await;
+            // A rate with a fraction, so the locale's decimal separator is
+            // actually load-bearing: a whole number would render identically in
+            // both locales and the test would pass vacuously.
+            let iva = link_tax(&state, "IVA21", "IVA 21.5%", "21.5").await;
+            state
+                .tax_service
+                .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+                .await
+                .unwrap();
+            let localization = crate::localization::load_context(&state.pool)
+                .await
+                .unwrap();
+            assert_eq!(localization.locale_code, locale_code);
+
+            let (status, html) = preview(app, product_id, "").await;
+            assert_eq!(status, StatusCode::OK, "{locale_code}: {html}");
+            assert!(
+                html.contains(&format!("21{decimal_sep}5 ARS")),
+                "{locale_code}: the tax amount must follow the locale's own conventions: {html}"
+            );
+            assert!(
+                html.contains(&format!("121{decimal_sep}5 ARS")),
+                "{locale_code}: and so must the tax-inclusive price: {html}"
+            );
+            assert!(
+                html.contains(&localization.format_currency(Decimal::from_str("100").unwrap())),
+                "{locale_code}: the net price must be localized too: {html}"
+            );
+            assert!(
+                html.contains(&format!("21{decimal_sep}5 %")),
+                "{locale_code}: the rate must be localized: {html}"
+            );
+            for label in [ladder, net, gross] {
+                assert!(
+                    html.contains(label),
+                    "{locale_code}: the ladder label {label:?} must be translated: {html}"
+                );
+            }
+        }
+    }
+
+    /// The preview is a read: it answers a GET, refuses any other verb, and
+    /// leaves every product, association and audit column byte-for-byte as it
+    /// found them.
+    #[tokio::test]
+    async fn product_price_ladder_endpoint_persists_nothing() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-14", "42").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        let actor = audit_actor_id(&state).await;
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, iva)
+            .await
+            .unwrap();
+
+        /// EVERY column of `products` and `product_taxes`, not a chosen subset:
+        /// "the preview writes nothing" is a claim about the whole row, and a
+        /// snapshot that left a column out could not falsify it.
+        ///
+        /// The statements are literal, and the completeness of the column list
+        /// is MACHINE-CHECKED against `pragma_table_info`: a migration that adds
+        /// a column fails this test until the snapshot names it, so the claim
+        /// cannot rot into "every column I remembered".
+        async fn snapshot(pool: &sqlx::SqlitePool) -> Vec<String> {
+            /// One table's rows, with its column list checked against the
+            /// table's own `pragma_table_info` before the rows are read.
+            async fn rows_of(
+                pool: &sqlx::SqlitePool,
+                // sqlx 0.9 only accepts a query string that is 'static or
+                // explicitly audited, so these are literals by construction.
+                pragma: &'static str,
+                table: &str,
+                projection: &'static str,
+                expected: &[&str],
+            ) -> Vec<String> {
+                let actual: Vec<String> = sqlx::query_scalar::<_, String>(pragma)
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
+                let expected: Vec<String> = expected.iter().map(|c| (*c).to_string()).collect();
+                assert_eq!(
+                    actual, expected,
+                    "the {table} snapshot must name EVERY column the table has; \
+                     a migration that adds one must add it here too"
+                );
+                sqlx::query_scalar::<_, String>(projection)
+                    .fetch_all(pool)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| format!("{table}|{row}"))
+                    .collect()
+            }
+
+            let mut out = rows_of(
+                pool,
+                "SELECT name FROM pragma_table_info('products') ORDER BY cid",
+                "products",
+                "SELECT id || '|' || sku || '|' || name || '|' || kind || '|' || unit || '|' \
+                 || sale_price || '|' || cost_price || '|' || COALESCE(markup_pct, '-') || '|' \
+                 || is_active || '|' || COALESCE(category_id, '-') || '|' || track_stock || '|' \
+                 || COALESCE(min_stock, '-') || '|' || COALESCE(max_stock, '-') || '|' \
+                 || COALESCE(location, '-') || '|' || COALESCE(notes, '-') || '|' \
+                 || created_by || '|' || COALESCE(updated_by, '-') || '|' || created_at || '|' \
+                 || COALESCE(updated_at, '-') FROM products ORDER BY id",
+                // In the table's own column order, which the equality above
+                // pins: the projection below may concatenate in any order it
+                // likes, but this list may not drift from the schema.
+                &[
+                    "id",
+                    "sku",
+                    "name",
+                    "kind",
+                    "category_id",
+                    "unit",
+                    "sale_price",
+                    "cost_price",
+                    "track_stock",
+                    "min_stock",
+                    "max_stock",
+                    "location",
+                    "notes",
+                    "is_active",
+                    "created_by",
+                    "updated_by",
+                    "created_at",
+                    "updated_at",
+                    "markup_pct",
+                ],
+            )
+            .await;
+            out.extend(
+                rows_of(
+                    pool,
+                    "SELECT name FROM pragma_table_info('product_taxes') ORDER BY cid",
+                    "product_taxes",
+                    "SELECT id || '|' || product_id || '|' || tax_id || '|' || created_by || '|' \
+                     || created_at FROM product_taxes ORDER BY id",
+                    &["id", "product_id", "tax_id", "created_by", "created_at"],
+                )
+                .await,
+            );
+            assert!(
+                out.iter().any(|row| row.starts_with("products|")),
+                "the snapshot must actually contain the product it is protecting"
+            );
+            out
+        }
+
+        let before = snapshot(&state.pool).await;
+        let (status, html) = preview(
+            app.clone(),
+            product_id,
+            "cost_price=999&markup_pct=500&sale_price=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(
+            snapshot(&state.pool).await,
+            before,
+            "the ladder preview must persist nothing at all"
+        );
+
+        // Only a read verb is served: a POST cannot be the same endpoint.
+        let (status, refused) = post_form_with_cookie(
+            app,
+            LADDER_PATH,
+            "product_id=1&cost_price=1",
+            &[("HX-Request", "true")],
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "the preview must be a GET-only read: {refused}"
+        );
+        assert_eq!(
+            snapshot(&state.pool).await,
+            before,
+            "the refused verb must persist nothing either"
+        );
+    }
+
+    /// Consolidation: the ladder is the ONE place the drawer shows money. The
+    /// scattered header lines are gone, and the association card keeps the
+    /// controls and the tax identity without repeating an amount.
+    #[tokio::test]
+    async fn product_price_ladder_is_the_only_money_the_drawer_shows() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-15", "100").await;
+        // Two taxes, so the ladder's total (31) is a figure no single row
+        // repeats: with one tax the total and the row would be the same number
+        // twice, which is the ladder's own arithmetic and not a duplication.
+        let actor = audit_actor_id(&state).await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        let iibb = link_tax(&state, "IIBB10", "IIBB 10%", "10").await;
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, iva)
+            .await
+            .unwrap();
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, iibb)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_eq!(
+            html.matches("data-product-price-ladder").count(),
+            1,
+            "the ladder appears exactly once: {html}"
+        );
+        assert!(
+            !html.contains("data-product-tax-preview"),
+            "the scattered tax-inclusive preview line is gone: {html}"
+        );
+        // Each money figure is counted as the whole cell it renders in, so a
+        // value that happens to be a substring of another ("10" inside "100")
+        // cannot pass or fail by accident.
+        for value in ["100", "21", "10", "31", "131"] {
+            let cell = format!(">{}<", money(&localization, value));
+            assert_eq!(
+                html.matches(&cell).count(),
+                1,
+                "{value} is displayed in exactly one place, the ladder: {html}"
+            );
+        }
+        // The association card keeps the identity and the controls, and no
+        // amount: the ladder owns every figure.
+        let associations = html
+            .split("data-product-tax-associations")
+            .nth(1)
+            .expect("the association list must be marked");
+        let associations = associations
+            .split("</section>")
+            .next()
+            .unwrap_or(associations);
+        for value in ["100", "21", "10", "31", "131"] {
+            assert!(
+                !associations.contains(&money(&localization, value)),
+                "the association card must not repeat {value}: {associations}"
+            );
+        }
+        assert!(
+            associations.contains("IVA21")
+                && associations.contains("/web/product-taxes/unlink")
+                && associations.contains("/web/product-taxes"),
+            "but it must keep the identity and both association controls: {associations}"
+        );
+    }
+
+    /// The ladder refreshes because the price fields ask the server, and the
+    /// browser is never asked to compute money: no markup formula and no
+    /// rounding anywhere in the project's own JavaScript.
+    #[tokio::test]
+    async fn product_price_ladder_refreshes_from_the_server_without_computing_money_in_javascript()
+    {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-16", "42").await;
+
+        let (status, html) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        for field in ["sale_price", "cost_price", "markup_pct"] {
+            let input = html
+                .split(&format!("name=\"{field}\""))
+                .nth(1)
+                .and_then(|rest| rest.split('>').next())
+                .unwrap_or_default();
+            assert!(
+                input.contains(&format!("hx-get=\"{LADDER_PATH}\"")),
+                "the {field} field must ask the server for the ladder: {input}"
+            );
+            assert!(
+                input.contains("hx-trigger=\"change\""),
+                "the {field} field must ask on change: {input}"
+            );
+            assert!(
+                input.contains("hx-target=\"#product-price-ladder\""),
+                "the {field} field must replace the ladder island: {input}"
+            );
+        }
+
+        // The architectural rule, as a structural check over every piece of
+        // JavaScript this project ships. The set is ENUMERATED at run time —
+        // every `static/*.js` and every `<script>` in every template — so a
+        // future island is covered by construction instead of by remembering to
+        // add it here. The vendored htmx bundle is excluded BY NAME, and only
+        // because it is a third-party library this project does not author.
+        const VENDORED: [&str; 1] = ["htmx.min.js"];
+        // `cargo test` runs with the package root as the working directory, so
+        // these are the real directories, not a guess about the layout.
+        let mut sources: Vec<(String, String)> = Vec::new();
+
+        let mut static_files: Vec<_> = std::fs::read_dir("static")
+            .expect("the static directory must exist")
+            .map(|entry| entry.expect("a readable directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "js"))
+            .collect();
+        static_files.sort();
+        assert!(
+            static_files
+                .iter()
+                .any(|path| { path.file_name().is_some_and(|name| name == "picker.js") }),
+            "the static JavaScript set must really contain the picker island: \
+             {static_files:?}"
+        );
+        for path in static_files {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if VENDORED.contains(&name.as_str()) {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{path:?} must be readable: {error}"));
+            assert!(
+                !body.is_empty(),
+                "{path:?} is empty: an empty scan target proves nothing"
+            );
+            sources.push((format!("static/{name}"), body));
+        }
+
+        fn collect_templates(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap_or_else(|error| panic!("{dir:?} must be readable: {error}"))
+                .map(|entry| entry.expect("a readable directory entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    collect_templates(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "html") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut templates = Vec::new();
+        collect_templates(std::path::Path::new("templates"), &mut templates);
+        assert!(
+            !templates.is_empty(),
+            "the template tree must not be empty, or this scan is vacuous"
+        );
+        for path in templates {
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{path:?} must be readable: {error}"));
+            let mut rest = body.as_str();
+            while let Some(start) = rest.find("<script") {
+                let after = &rest[start..];
+                let Some(end) = after.find("</script>") else {
+                    break;
+                };
+                let index = body[..body.len() - rest.len() + start]
+                    .matches("<script")
+                    .count();
+                sources.push((
+                    format!("{} inline script #{index}", path.display()),
+                    after[..end].to_string(),
+                ));
+                rest = &after[end..];
+            }
+        }
+        // The reach is ASSERTED, not assumed: a scan that silently found one
+        // file would pass the FORBIDDEN loop below for the wrong reason.
+        assert!(
+            sources.len() >= 3,
+            "the scan must reach the static islands and the inline scripts: {sources:#?}"
+        );
+        println!(
+            "JS-SCAN-REACH: {} sources: {:?}",
+            sources.len(),
+            sources
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // Money primitives. A single match is a defect: the ladder is computed
+        // on the server or not at all.
+        const FORBIDDEN: [&str; 8] = [
+            "Math.round",
+            "toFixed",
+            "parseFloat",
+            "/ 100",
+            "* (1 +",
+            "currency",
+            "sale_price *",
+            "markup_pct *",
+        ];
+        let violations: Vec<String> = sources
+            .iter()
+            .flat_map(|(name, body)| {
+                FORBIDDEN
+                    .iter()
+                    .filter(|needle| body.contains(**needle))
+                    .map(move |needle| format!("{name}: {needle}"))
+            })
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "money must not be computed in the browser: {violations:#?}"
+        );
+        // The exclusion must be a decision about a file that really exists,
+        // not a filter that matches nothing. Asserting "no scanned source is
+        // named htmx.min.js" would be true even if the vendored file were
+        // deleted, which is the tautology this assertion exists to avoid.
+        for name in VENDORED {
+            let vendored = std::path::Path::new("static").join(name);
+            assert!(
+                vendored.exists(),
+                "{name} is declared vendored, so it must exist to be excluded"
+            );
+            assert!(
+                !sources.iter().any(|(scanned, _)| scanned.ends_with(name)),
+                "{name} is vendored and must stay out of the authored scan"
+            );
+        }
     }
 }

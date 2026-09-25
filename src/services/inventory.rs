@@ -27,6 +27,118 @@ where
     pub allow_negative_stock: bool,
 }
 
+/// The ONE net-sale-price rule, shared by the save path and the read-only
+/// product price ladder.
+///
+/// `markup_pct: None` is a MANUAL price: `manual_sale_price` is the price, kept
+/// exactly as the caller sent it, never rounded. `Some(markup)` DERIVES it from
+/// the cost — `cost * (1 + markup/100)`, pinned to cents half-up — and ignores
+/// `manual_sale_price` entirely, so a caller that supplies a markup must not
+/// also be forced to send a meaningful price.
+///
+/// The refusals are the save path's own, verbatim, because the ladder shows
+/// them instead of a fabricated figure: a markup needs a positive cost, the
+/// markup itself must be above -100, and an unbounded pair must not overflow
+/// `Decimal` into a panic. Extracted from `validate_product` so the preview
+/// cannot drift from the enforcement: there is now one definition, and the
+/// product drawer's ladder and the save both go through it.
+pub fn derive_net_sale_price(
+    cost_price: Decimal,
+    markup_pct: Option<Decimal>,
+    manual_sale_price: Decimal,
+) -> AppResult<Decimal> {
+    let Some(markup) = markup_pct else {
+        return Ok(manual_sale_price);
+    };
+    if markup <= Decimal::from(-100) {
+        return Err(AppError::Validation("markup_pct must be > -100".into()));
+    }
+    // `cost_price` is NOT NULL DEFAULT '0': "no cost" manifests as 0, not
+    // NULL. A zero (or negative) cost must be rejected instead of silently
+    // deriving a free price.
+    if cost_price <= Decimal::ZERO {
+        return Err(AppError::Validation(
+            "cost_price must be > 0 when markup_pct is set".into(),
+        ));
+    }
+    // sale_price = cost_price * (1 + markup_pct/100). The percentage's scale
+    // shift is a multiplication by 0.01, because this project never divides a
+    // `Decimal`.
+    //
+    // Every operand here is user-supplied and unbounded, and rust_decimal's
+    // `Mul`/`Add` PANIC on overflow, so the bare operators would let an
+    // authenticated caller 500 the handler. The checked forms turn the same
+    // inputs into a validation error instead. There is deliberately no upper
+    // bound on `markup_pct`: whether a markup is plausible is a product
+    // decision, not an arithmetic one.
+    let factor = markup
+        .checked_mul(Decimal::new(1, 2))
+        .and_then(|shift| Decimal::ONE.checked_add(shift))
+        .and_then(|f| cost_price.checked_mul(f));
+    match factor {
+        Some(f) => Ok(round_derived_price_to_cents(f)),
+        None => Err(AppError::Validation(
+            "markup_pct or cost_price is too large to derive a sale_price".into(),
+        )),
+    }
+}
+
+/// The price and cost rules a save applies to the EFFECTIVE price — the derived
+/// one when a markup is set, the incoming one otherwise — and to the cost.
+///
+/// ONE definition, shared by the save path and the read-only product price
+/// ladder, in the same order and with the same messages the save has always
+/// answered. A caller that supplies a markup must not also be forced to send a
+/// meaningful price, so the price rule reads the EFFECTIVE value, never the
+/// incoming one.
+///
+/// The kind matters and is not a detail: a product must sell for something, a
+/// service may legitimately cost nothing, and a negative price is refused for
+/// both. A preview that refused a zero-priced service, or published a negative
+/// product, would disagree with the save it previews — which is why this is
+/// extracted rather than mirrored.
+pub fn validate_effective_prices(
+    kind: ProductKind,
+    sale_price: Decimal,
+    cost_price: Decimal,
+) -> AppResult<()> {
+    match kind {
+        ProductKind::Product => {
+            if sale_price <= Decimal::ZERO {
+                return Err(AppError::Validation(
+                    "sale_price must be > 0 for products".into(),
+                ));
+            }
+        }
+        ProductKind::Service => {
+            if sale_price < Decimal::ZERO {
+                return Err(AppError::Validation("sale_price cannot be negative".into()));
+            }
+        }
+    }
+    if cost_price < Decimal::ZERO {
+        return Err(AppError::Validation("cost_price cannot be negative".into()));
+    }
+    Ok(())
+}
+
+/// Pins a markup-derived price to cents with half-up rounding
+/// (`RoundingStrategy::MidpointAwayFromZero` — half-up away from zero,
+/// retail convention; rust_decimal names it RoundingStrategy, not
+/// RoundingMode).
+///
+/// This is deliberately the project's FIRST rounding helper. Until now
+/// every money operation was exact: multiplying an exact quantity by an
+/// exact price never produced a third decimal, so no `round_dp` existed
+/// anywhere. Deriving a price from a percentage is the first operation
+/// that can (80.00 * 1.3333 = 106.6640), so the derived value is pinned to
+/// cents here and only here. Manual prices keep the exact value the caller
+/// sent — never round those.
+fn round_derived_price_to_cents(price: Decimal) -> Decimal {
+    use rust_decimal::RoundingStrategy;
+    price.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
+}
+
 impl<C, P, B, S> InventoryService<C, P, B, S>
 where
     C: CategoryRepository,
@@ -186,23 +298,6 @@ where
 
     // -- products -----------------------------------------------------------
 
-    /// Pins a markup-derived price to cents with half-up rounding
-    /// (`RoundingStrategy::MidpointAwayFromZero` — half-up away from zero,
-    /// retail convention; rust_decimal names it RoundingStrategy, not
-    /// RoundingMode).
-    ///
-    /// This is deliberately the project's FIRST rounding helper. Until now
-    /// every money operation was exact: multiplying an exact quantity by an
-    /// exact price never produced a third decimal, so no `round_dp` existed
-    /// anywhere. Deriving a price from a percentage is the first operation
-    /// that can (80.00 * 1.3333 = 106.6640), so the derived value is pinned to
-    /// cents here and only here. Manual prices keep the exact value the caller
-    /// sent — never round those.
-    fn round_derived_price_to_cents(price: Decimal) -> Decimal {
-        use rust_decimal::RoundingStrategy;
-        price.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
-    }
-
     async fn validate_product(&self, input: NewProduct) -> AppResult<NewProduct> {
         let sku = input.sku.trim();
         if sku.is_empty() {
@@ -231,66 +326,25 @@ where
         // (`Some(None)`) reaches this function as `None` after the update
         // merge, so the price keeps its last stored value and becomes manual
         // again — nothing reverts to any earlier price.
+        //
+        // The derivation and its refusals live in `derive_net_sale_price`, the
+        // one rule the product price ladder previews with: a preview that
+        // re-implemented the formula here would be a second definition of the
+        // price, which is exactly what this feature exists to prevent.
         let (sale_price, markup_pct) = match input.markup_pct {
             None => (input.sale_price, None),
-            Some(m) => {
-                if m <= Decimal::from(-100) {
-                    return Err(AppError::Validation("markup_pct must be > -100".into()));
-                }
-                // `cost_price` is NOT NULL DEFAULT '0': "no cost" manifests
-                // as 0, not NULL. A zero (or negative) cost must be rejected
-                // instead of silently deriving a free price.
-                if input.cost_price <= Decimal::ZERO {
-                    return Err(AppError::Validation(
-                        "cost_price must be > 0 when markup_pct is set".into(),
-                    ));
-                }
-                // sale_price = cost_price * (1 + markup_pct/100). The
-                // percentage's scale shift is a multiplication by 0.01,
-                // because this project never divides a `Decimal`.
-                //
-                // Every operand here is user-supplied and unbounded, and
-                // rust_decimal's `Mul`/`Add` PANIC on overflow, so the bare
-                // operators would let an authenticated caller 500 the
-                // handler. The checked forms turn the same inputs into a
-                // validation error instead. There is deliberately no upper
-                // bound on `markup_pct`: whether a markup is plausible is a
-                // product decision, not an arithmetic one.
-                let factor = m
-                    .checked_mul(Decimal::new(1, 2))
-                    .and_then(|shift| Decimal::ONE.checked_add(shift))
-                    .and_then(|f| input.cost_price.checked_mul(f));
-                let derived = match factor {
-                    Some(f) => Self::round_derived_price_to_cents(f),
-                    None => {
-                        return Err(AppError::Validation(
-                            "markup_pct or cost_price is too large to derive a sale_price".into(),
-                        ));
-                    }
-                };
-                (derived, Some(m))
-            }
+            Some(m) => (
+                derive_net_sale_price(input.cost_price, Some(m), input.sale_price)?,
+                Some(m),
+            ),
         };
-        // The price rule applies to the EFFECTIVE price: the derived one when
-        // markup is set, the incoming one otherwise. A caller that supplies a
-        // markup must not also be forced to send a meaningful sale_price.
-        match input.kind {
-            ProductKind::Product => {
-                if sale_price <= Decimal::ZERO {
-                    return Err(AppError::Validation(
-                        "sale_price must be > 0 for products".into(),
-                    ));
-                }
-            }
-            ProductKind::Service => {
-                if sale_price < Decimal::ZERO {
-                    return Err(AppError::Validation("sale_price cannot be negative".into()));
-                }
-            }
-        }
-        if input.cost_price < Decimal::ZERO {
-            return Err(AppError::Validation("cost_price cannot be negative".into()));
-        }
+        // The price and cost rules, in the save path's own order and with the
+        // save path's own messages. They live in
+        // `validate_effective_prices` so the product price ladder previews with
+        // the same definition: a ladder that re-derived these two checks would
+        // be a second set of price rules, which is what this feature exists to
+        // prevent.
+        validate_effective_prices(input.kind, sale_price, input.cost_price)?;
         if let Some(cid) = input.category_id {
             if !self.categories.exists(cid).await? {
                 return Err(AppError::NotFound(format!("category {cid} not found")));
