@@ -15,7 +15,7 @@ use crate::localization::{LocalizationContext, MessageKey};
 use crate::models::{
     BusinessLocale, BusinessSettings, UpdateBusinessLocale, UpdateBusinessSettings,
 };
-use crate::routes::AppState;
+use crate::routes::{currency_options, AppState};
 use crate::security::authz::{Nav, Principal, Require, SettingsManage};
 use crate::services::settings::UpdateBusinessConfiguration;
 
@@ -30,6 +30,7 @@ struct SettingsLocaleRow {
 struct SettingsPage {
     settings: BusinessSettings,
     locales: Vec<SettingsLocaleRow>,
+    currency_options: Vec<crate::routes::CurrencyOption>,
     localization: LocalizationContext,
     nav_key: &'static str,
     nav: Nav,
@@ -54,10 +55,13 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     fn to_update(&self, current_locales: &[BusinessLocale]) -> UpdateBusinessConfiguration {
-        let locales = current_locales
+        let persistence_order: BTreeMap<&str, usize> = current_locales
             .iter()
             .enumerate()
-            .map(|(index, _)| UpdateBusinessLocale {
+            .map(|(index, locale)| (locale.locale_code.as_str(), index))
+            .collect();
+        let mut locales: Vec<_> = (0..current_locales.len())
+            .map(|index| UpdateBusinessLocale {
                 locale_code: self
                     .locale_fields
                     .get(&format!("locale_code_{index}"))
@@ -71,6 +75,12 @@ impl SettingsForm {
                 is_enabled: self.locale_fields.contains_key(&format!("enabled_{index}")),
             })
             .collect();
+        locales.sort_by_key(|locale| {
+            persistence_order
+                .get(locale.locale_code.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
         UpdateBusinessConfiguration {
             settings: UpdateBusinessSettings {
                 business_name: self.business_name.clone(),
@@ -163,6 +173,15 @@ fn page_response(
     localization: LocalizationContext,
     principal: &Principal,
 ) -> AppResult<SettingsPage> {
+    let mut current_locales = current_locales;
+    if let Some(default_index) = current_locales
+        .iter()
+        .position(|locale| locale.locale_code == settings.default_locale_code)
+    {
+        let default_locale = current_locales.remove(default_index);
+        current_locales.insert(0, default_locale);
+    }
+
     let locales = current_locales
         .into_iter()
         .enumerate()
@@ -186,6 +205,11 @@ fn page_response(
         MessageKey::SettingsPreview,
         &[("preview", preview.as_str())],
     );
+    let effective_currency_code = submitted.as_ref().map_or_else(
+        || settings.currency_code.clone(),
+        |form| form.currency_code.clone(),
+    );
+    let currency_options = currency_options(&effective_currency_code);
     let page = SettingsPage {
         settings: BusinessSettings {
             id: settings.id,
@@ -197,10 +221,7 @@ fn page_response(
                 || settings.default_locale_code.clone(),
                 |form| form.default_locale_code.clone(),
             ),
-            currency_code: submitted.as_ref().map_or_else(
-                || settings.currency_code.clone(),
-                |form| form.currency_code.clone(),
-            ),
+            currency_code: effective_currency_code,
             timezone: submitted
                 .as_ref()
                 .map_or_else(|| settings.timezone.clone(), |form| form.timezone.clone()),
@@ -208,6 +229,7 @@ fn page_response(
             updated_at: settings.updated_at,
         },
         locales,
+        currency_options,
         localization,
         nav_key: "settings",
         nav: Nav::for_principal(principal),

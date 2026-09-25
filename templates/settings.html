@@ -49,7 +49,11 @@
       </div>
       <div>
         <label class="field-label" for="currency_code">{{ localization.tr(crate::localization::MessageKey::FieldCurrencyCode) }}</label>
-        <input id="currency_code" class="field uppercase" type="text" name="currency_code" value="{{ settings.currency_code }}" required minlength="3" maxlength="3" pattern="[A-Z]{3}" inputmode="text" />
+        <select id="currency_code" class="field" name="currency_code" required>
+          {% for currency in currency_options %}
+          <option value="{{ currency.code }}"{% if currency.code == settings.currency_code %} selected{% endif %}>{{ currency.display_name }}</option>
+          {% endfor %}
+        </select>
       </div>
       <div>
         <label class="field-label" for="timezone">{{ localization.tr(crate::localization::MessageKey::FieldTimezone) }}</label>
