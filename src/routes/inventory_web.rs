@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{
-    MovementReason, MovementType, NewMovement, NewProduct, NewTax, Product, ProductKind,
-    ProductStock, ProductSupplierCost, ProductTaxView, Tax, UpdateProduct, UpdateTax,
+    MovementReason, MovementType, NewMovement, NewProduct, Product, ProductKind, ProductStock,
+    ProductSupplierCost, ProductTaxView, Tax, UpdateProduct,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, ProductSupplierCostRepository,
@@ -35,6 +35,13 @@ use crate::security::authz::{
 // `purchases.costs.read` on top of `inventory.read` (the seeded `deposito`
 // role holds both; a principal with only `inventory.read` gets the refusal
 // instead of cost rows it is not allowed to see).
+//
+// The screen owns no tax DEFINITION. This module used to expose a second,
+// `inventory.write`-gated address space for tax administration
+// (`/web/taxes`, `/web/taxes/edit`, `/web/taxes/deactivate`) and render its
+// catalogue on the page. Both are gone; see the note above
+// `web_link_product_tax` and `settings_web.rs`'s URL decision. The product-tax
+// ASSOCIATION is the only tax surface here, and it stays on this gate.
 
 // ---------------------------------------------------------------------------
 // Askama templates
@@ -45,7 +52,6 @@ use crate::security::authz::{
 struct ProductsTemplate {
     products: Vec<ProductStock>,
     categories: Vec<crate::models::Category>,
-    taxes: Vec<Tax>,
     localization: LocalizationContext,
     allow_negative_stock: bool,
     nav_key: &'static str,
@@ -60,13 +66,6 @@ struct ProductsTemplate {
 #[template(path = "partials/product_list.html")]
 struct ProductListPartial {
     products: Vec<ProductStock>,
-    localization: LocalizationContext,
-}
-
-#[derive(Template)]
-#[template(path = "partials/tax_list.html")]
-struct TaxListPartial {
-    taxes: Vec<Tax>,
     localization: LocalizationContext,
 }
 
@@ -237,15 +236,6 @@ fn render_product_list(
     .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-async fn tax_list_html(state: &AppState, localization: &LocalizationContext) -> AppResult<String> {
-    TaxListPartial {
-        taxes: state.tax_service.list_taxes().await?,
-        localization: localization.clone(),
-    }
-    .render()
-    .map_err(|error| AppError::Internal(error.to_string()))
-}
-
 /// Whether the body-borne catalogue filter actually constrains the list: a
 /// non-empty search text or a category that parses. Unparseable values stay
 /// inert — the lenient rule `WebProductFilter::parsed()` applies — so a stray
@@ -323,11 +313,9 @@ async fn products_page(
         .filter_products(&query, category_id)
         .await?;
     let categories = state.inventory_service.categories.list().await?;
-    let taxes = state.tax_service.list_taxes().await?;
     let tmpl = ProductsTemplate {
         products,
         categories,
-        taxes,
         localization,
         allow_negative_stock: state.allow_negative_stock,
         nav_key: "products",
@@ -384,14 +372,6 @@ async fn web_product_list(
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
-}
-
-async fn web_tax_list(
-    State(state): State<AppState>,
-    _: Require<InventoryRead>,
-    Extension(localization): Extension<LocalizationContext>,
-) -> AppResult<Html<String>> {
-    Ok(Html(tax_list_html(&state, &localization).await?))
 }
 
 async fn web_low_stock(
@@ -797,20 +777,6 @@ pub struct ProductIdForm {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TaxForm {
-    #[serde(default)]
-    pub id: Option<i64>,
-    #[serde(default)]
-    pub code: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub rate: String,
-    #[serde(default)]
-    pub is_active: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct ProductTaxForm {
     pub product_id: i64,
     pub tax_id: i64,
@@ -846,12 +812,6 @@ fn parse_opt_decimal(s: &str, localization: &LocalizationContext) -> AppResult<O
         .parse_decimal(t)
         .map(Some)
         .map_err(|_| AppError::Validation(format!("invalid decimal: {s}")))
-}
-
-fn checkbox_is_checked(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        value == "1" || value.eq_ignore_ascii_case("on") || value.eq_ignore_ascii_case("true")
-    })
 }
 
 fn parse_opt_i64(s: &str) -> AppResult<Option<i64>> {
@@ -1000,93 +960,16 @@ async fn web_create_product(
     Ok(Redirect::to("/products").into_response())
 }
 
-async fn web_create_tax(
-    State(state): State<AppState>,
-    _: Require<InventoryWrite>,
-    principal: axum::Extension<crate::security::authz::Principal>,
-    Extension(localization): Extension<LocalizationContext>,
-    headers: HeaderMap,
-    Form(form): Form<TaxForm>,
-) -> AppResult<axum::response::Response> {
-    let rate = localization
-        .parse_decimal(&form.rate)
-        .map_err(|_| AppError::Validation("invalid tax rate".into()))?;
-    state
-        .tax_service
-        .create_tax(
-            principal.user_id,
-            NewTax {
-                code: form.code,
-                name: form.name,
-                rate,
-                is_active: true,
-            },
-        )
-        .await?;
-    tax_mutation_response(&state, &headers, &localization).await
-}
-
-async fn web_edit_tax(
-    State(state): State<AppState>,
-    _: Require<InventoryWrite>,
-    principal: axum::Extension<crate::security::authz::Principal>,
-    Extension(localization): Extension<LocalizationContext>,
-    headers: HeaderMap,
-    Form(form): Form<TaxForm>,
-) -> AppResult<axum::response::Response> {
-    let id = form
-        .id
-        .ok_or_else(|| AppError::Validation("tax id is required".into()))?;
-    let rate = localization
-        .parse_decimal(&form.rate)
-        .map_err(|_| AppError::Validation("invalid tax rate".into()))?;
-    state
-        .tax_service
-        .update_tax(
-            principal.user_id,
-            id,
-            UpdateTax {
-                code: Some(form.code),
-                name: Some(form.name),
-                rate: Some(rate),
-                is_active: Some(checkbox_is_checked(form.is_active.as_deref())),
-            },
-        )
-        .await?;
-    tax_mutation_response(&state, &headers, &localization).await
-}
-
-async fn web_deactivate_tax(
-    State(state): State<AppState>,
-    _: Require<InventoryWrite>,
-    principal: axum::Extension<crate::security::authz::Principal>,
-    Extension(localization): Extension<LocalizationContext>,
-    headers: HeaderMap,
-    Form(form): Form<TaxForm>,
-) -> AppResult<axum::response::Response> {
-    let id = form
-        .id
-        .ok_or_else(|| AppError::Validation("tax id is required".into()))?;
-    state
-        .tax_service
-        .deactivate_tax(principal.user_id, id)
-        .await?;
-    tax_mutation_response(&state, &headers, &localization).await
-}
-
-async fn tax_mutation_response(
-    state: &AppState,
-    headers: &HeaderMap,
-    localization: &LocalizationContext,
-) -> AppResult<axum::response::Response> {
-    if is_htmx(headers) {
-        return Ok(triggered(
-            tax_list_html(state, localization).await?,
-            "taxes-changed",
-        ));
-    }
-    Ok(Redirect::to("/products").into_response())
-}
+// The product-tax ASSOCIATION is the only tax surface left on this screen: the
+// drawer links and unlinks an existing definition. A tax DEFINITION (code,
+// name, rate, active) is owned by Settings on the WEB surface, addressed under
+// `/web/settings/taxes…` behind `settings.manage`, so no `inventory.write` WEB
+// route in this module can create, rename, re-rate or activate/deactivate one.
+//
+// Scoped to "on the web" on purpose: the JSON API in `inventory_api.rs` still
+// administers definitions behind `inventory.write`, and U1 deliberately left it
+// that way. See the URL decision in `settings_web.rs` and the open decision in
+// `odd/tasks/product-price-ladder.md`.
 
 async fn web_link_product_tax(
     State(state): State<AppState>,
@@ -1497,9 +1380,6 @@ pub fn router() -> Router<AppState> {
             get(web_product_list).post(web_create_product),
         )
         .route("/web/categories", post(web_create_category))
-        .route("/web/taxes", get(web_tax_list).post(web_create_tax))
-        .route("/web/taxes/edit", post(web_edit_tax))
-        .route("/web/taxes/deactivate", post(web_deactivate_tax))
         .route("/web/product-taxes", post(web_link_product_tax))
         .route("/web/product-taxes/unlink", post(web_unlink_product_tax))
         .route("/web/category-options", get(web_category_options))

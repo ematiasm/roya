@@ -825,28 +825,40 @@ async fn existing_single_profile_database_is_backfilled_and_can_switch_to_englis
 // T3 — the permission-gated Taxes tab and the hard-delete safeguard
 // ---------------------------------------------------------------------------
 //
-// THE CANONICAL TAX-ADMINISTRATION SURFACE (T3).
+// THE CANONICAL TAX-DEFINITION SURFACE ON THE WEB (T3, narrowed by U1).
 //
-// Settings owns tax administration, so every tax mutation the Settings Taxes
-// tab issues is addressed under `/web/settings/taxes…` and every one of those
-// routes is gated by `settings.manage`. The pre-existing `/web/taxes…` routes
-// are a DIFFERENT surface with a different owner and a different permission:
-// they belong to the Products screen's tax catalogue and stay gated by
-// `inventory.write`. They are not an alias of the settings surface and this
-// unit does not move them — the product drawer keeps its association
-// management, and moving the catalogue out from under it would break both the
-// product page and its tests for no gain. The two surfaces never share a
-// handler: a principal may hold one permission and not the other, and the tab
-// must not be reachable through the inventory gate.
+// SCOPE FIRST: everything in this block is about the WEB surface. The JSON API
+// is a different surface with different permissions and is deliberately not
+// covered by the claim below — the residual is named at the bottom.
 //
-// WHAT THIS MEANS, precisely, so the boundary is not over-claimed in either
-// direction: `settings.manage` is required for IRREVERSIBLE tax administration
-// — the hard delete exists on no other route — while a principal holding
-// `inventory.write` can still create, rename, re-rate and activate/deactivate
-// taxes from the Products catalogue, exactly as before this feature. The tests
-// below prove the first half. `tax_web_uses_locale_input_and_display_and_
-// refreshes_product_drawer` in `tax_tests.rs` proves the second half still
-// works, and it is why the inventory routes were left alone.
+// Settings owns tax definitions on the web, so every mutation a definition
+// needs is addressed under `/web/settings/taxes…` and every one of those routes
+// is gated by `settings.manage`.
+//
+// There USED to be a second WEB surface: `/web/taxes…`, gated by
+// `inventory.write`, rendered by the Products screen's tax catalogue. It is
+// gone. The product-price-ladder unit (U1) removed the catalogue from
+// `templates/products.html` and unregistered those routes, so the same form is
+// no longer reachable from two screens under two different permissions, and no
+// `inventory.write` WEB route can create, rename, re-rate or
+// activate/deactivate a tax. `tax_web_definition_administration_is_exclusive_
+// to_settings_manage` in `tax_tests.rs` is the test that proves it; it replaces
+// `tax_inventory_catalogue_keeps_its_own_write_access_for_an_inventory_writer`,
+// which pinned the opposite claim on purpose before U1 inverted it.
+//
+// What is deliberately NOT settings-gated is the product-tax ASSOCIATION:
+// linking and unlinking a tax to a product is inventory state, so it stays on
+// `POST /web/product-taxes` and `POST /web/product-taxes/unlink` behind
+// `inventory.write`. The two surfaces never share a handler — a principal may
+// hold one permission and not the other.
+//
+// THE RESIDUAL: the JSON API still administers tax definitions behind
+// `inventory.write` (`POST /api/taxes`, `PUT /api/taxes/{id}` and
+// `POST /api/taxes/{id}/deactivate`, all `Require<InventoryWrite>` in
+// `src/routes/inventory_api.rs`). Pre-existing, not a U1 regression, and left
+// alone on purpose: narrowing it is an open product decision, not a side effect
+// of de-duplicating the web catalogue. So the claim above is "the WEB catalogue
+// is settings-only" — never "tax administration is settings-only".
 
 /// One tax created through the real repository, for the fixtures that only need
 /// one to exist before the surface under test is exercised.
@@ -989,8 +1001,11 @@ async fn settings_taxes_tab_is_refused_without_the_settings_manage_permission() 
 }
 
 /// Every mutation is gated by `settings.manage` and not by `inventory.write`:
-/// a principal that holds the inventory gate the PRODUCTS catalogue uses still
-/// cannot touch the settings surface, and nothing is written.
+/// a principal that holds the inventory gate cannot touch the definition
+/// surface, and nothing is written. (Since U1 it cannot reach a definition from
+/// any WEB address — `tax_web_definition_administration_is_exclusive_to_settings_
+/// manage` in `tax_tests.rs` proves the inventory side is now 404, not 403.
+/// The JSON API is out of scope for that test and still admits `inventory.write`.)
 #[tokio::test]
 async fn settings_tax_administration_is_refused_without_the_settings_manage_permission() {
     let state = configured_state().await;
