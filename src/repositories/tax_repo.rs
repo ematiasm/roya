@@ -85,11 +85,6 @@ pub trait ProductTaxRepository: Send + Sync {
     /// pure calculation contract applies exactly the definitions it receives,
     /// so a deactivated tax must never survive this read. It is a pure read —
     /// it creates no link and changes no row.
-    // T2 is the first caller outside tests (the product tax-inclusive preview
-    // and, through the shared statement below, the document line writes), so
-    // the `allow` is dropped then. It is here, not on the module, because this
-    // trait carries plenty of other methods that are used today.
-    #[allow(dead_code)]
     async fn list_active_for_product(&self, product_id: i64) -> AppResult<Vec<Tax>>;
     async fn unlink(&self, product_id: i64, tax_id: i64) -> AppResult<bool>;
 }

@@ -170,6 +170,10 @@ struct ProductDetailPartial {
     categories: Vec<crate::models::Category>,
     product_taxes: Vec<ProductTaxView>,
     available_taxes: Vec<Tax>,
+    /// Derived, never stored: the stored net sale price, the ACTIVE linked-tax
+    /// breakdown and the tax-inclusive unit price. The stored `sale_price` is
+    /// not touched by it, so the edit form and the preview cannot disagree.
+    tax_preview: crate::models::ProductTaxPreview,
     supplier_costs: Vec<ProductCostView>,
     suppliers: Vec<crate::models::Supplier>,
     stale_cost: Option<StaleCostView>,
@@ -636,6 +640,7 @@ async fn product_detail_html(
         categories,
         product_taxes,
         available_taxes,
+        tax_preview: state.tax_service.product_price_preview(id).await?,
         supplier_costs,
         suppliers,
         stale_cost,
@@ -3637,5 +3642,213 @@ mod tests {
             !html.contains(&registered_by.replace("Test Admin", "1")),
             "the fragment never renders a raw user id: {html}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T2: the product drawer shows the net price, the linked-tax breakdown and
+    // the derived tax-inclusive price, without ever writing the stored price.
+    // -----------------------------------------------------------------------
+
+    async fn product_with_taxes(state: &AppState, sku: &str, price: &str) -> i64 {
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor_id(state).await,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: format!("Product {sku}"),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from_str(price).unwrap(),
+                    cost_price: Decimal::from_str("5").unwrap(),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        product.id
+    }
+
+    /// The drawer must show all three figures an operator needs to price with,
+    /// localized, and the stored net sale price must be exactly what it was.
+    #[tokio::test]
+    async fn tax_preview_shows_net_breakdown_and_tax_inclusive_price_in_the_drawer() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "TAX-DRAWER", "100").await;
+        let actor = audit_actor_id(&state).await;
+        let iva = state
+            .tax_service
+            .create_tax(
+                actor,
+                crate::models::NewTax {
+                    code: "IVA21".into(),
+                    name: "IVA 21%".into(),
+                    rate: Decimal::from_str("21").unwrap(),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        let iibb = state
+            .tax_service
+            .create_tax(
+                actor,
+                crate::models::NewTax {
+                    code: "IIBB10".into(),
+                    name: "IIBB 10%".into(),
+                    rate: Decimal::from_str("10").unwrap(),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, iva.id)
+            .await
+            .unwrap();
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, iibb.id)
+            .await
+            .unwrap();
+
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+
+        // Every figure is rendered through the localized helpers, so the same
+        // stored value can be asserted without hard-coding a convention.
+        let net = localization.format_currency(Decimal::from_str("100").unwrap());
+        let tax = localization.format_currency(Decimal::from_str("31").unwrap());
+        let gross = localization.format_currency(Decimal::from_str("131").unwrap());
+        assert!(html.contains(&net), "the net price must be shown: {html}");
+        assert!(html.contains(&tax), "the tax total must be shown: {html}");
+        assert!(
+            html.contains(&gross),
+            "the tax-inclusive price must be shown: {html}"
+        );
+        assert!(
+            html.contains("IVA21") && html.contains("IIBB10"),
+            "the linked taxes must be named: {html}"
+        );
+        for key in [
+            crate::localization::MessageKey::TaxNetPrice,
+            crate::localization::MessageKey::TaxInclusivePrice,
+            crate::localization::MessageKey::TaxRate,
+        ] {
+            assert!(
+                html.contains(localization.tr(key)),
+                "{key:?} must label the preview: {html}"
+            );
+        }
+
+        // The stored net price is untouched by the preview.
+        let stored: String = sqlx::query_scalar("SELECT sale_price FROM products WHERE id = ?")
+            .bind(product_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, "100", "the preview must never write the net price");
+    }
+
+    /// A product with no linked tax still shows the two prices — equal — and
+    /// says plainly that nothing is linked, instead of rendering an empty table.
+    #[tokio::test]
+    async fn tax_preview_of_an_untaxed_product_says_so_and_keeps_both_prices() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "TAX-DRAWER-0", "42").await;
+
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let (status, html) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        let price = Decimal::from_str("42").unwrap();
+        assert_eq!(
+            html.matches(&localization.format_currency(price)).count() >= 2,
+            true,
+            "both the net and the tax-inclusive price render the same value: {html}"
+        );
+        let notice = localization.tr(crate::localization::MessageKey::TaxNoBreakdown);
+        assert!(
+            html.contains(notice),
+            "an untaxed product must say so: {html}"
+        );
+        // Exactly ONCE. The header explains why the two prices are equal and the
+        // tax card below already says nothing is linked; saying it a second time
+        // is duplicate copy in one card, and the visual baseline caught it.
+        assert_eq!(
+            html.matches(notice).count(),
+            1,
+            "the no-tax notice must not be repeated: {html}"
+        );
+    }
+
+    /// The drawer already edits associations, and that must keep working: the
+    /// link answer re-renders the drawer with the new breakdown included.
+    #[tokio::test]
+    async fn tax_preview_survives_linking_a_tax_from_the_drawer() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "TAX-LINK", "200").await;
+        let actor = audit_actor_id(&state).await;
+        let iva = state
+            .tax_service
+            .create_tax(
+                actor,
+                crate::models::NewTax {
+                    code: "IVA21".into(),
+                    name: "IVA 21%".into(),
+                    rate: Decimal::from_str("21").unwrap(),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let (status, html) = post_form_with_cookie(
+            app.clone(),
+            "/web/product-taxes",
+            &format!("product_id={product_id}&tax_id={}", iva.id),
+            &[("HX-Request", "true")],
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert!(
+            html.contains("IVA21"),
+            "the linked tax is now shown: {html}"
+        );
+        assert!(
+            html.contains(&localization.format_currency(Decimal::from_str("42").unwrap())),
+            "21% of 200 is a 42 tax total: {html}"
+        );
+        assert!(
+            html.contains(&localization.format_currency(Decimal::from_str("242").unwrap())),
+            "the tax-inclusive price follows the link: {html}"
+        );
+
+        // The association really was written, not only rendered.
+        let linked: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM product_taxes WHERE product_id = ?")
+                .bind(product_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, 1);
     }
 }

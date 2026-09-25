@@ -11,7 +11,7 @@ use crate::models::{
 };
 use crate::repositories::tax_repo::active_taxes_for_product;
 use crate::repositories::tax_snapshot_repo::replace_purchase_line_taxes;
-use crate::services::line_taxes::calculate_line_taxes;
+use crate::services::line_taxes::{calculate_line_taxes, tax_inclusive_total};
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
@@ -890,7 +890,8 @@ impl PurchaseRepository for SqlitePurchaseRepository {
 
         // ONE batched lines read for the whole page: the query count stays
         // constant no matter how many documents matched. The total is folded
-        // in Rust over `PurchaseLine::subtotal`, never with SQL SUM over TEXT.
+        // in Rust with the shared tax-inclusive rule, never with SQL SUM over
+        // TEXT: the stored `tax_total` is part of what a document costs.
         let ids: Vec<i64> = purchases.iter().map(|(p, _)| p.id).collect();
         let mut lines_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT id, purchase_id, product_id, qty, unit_cost, tax_total, created_at FROM purchase_lines WHERE purchase_id IN (",
@@ -912,7 +913,8 @@ impl PurchaseRepository for SqlitePurchaseRepository {
             let line = row_to_line(row);
             *totals
                 .entry(line.purchase_id)
-                .or_insert_with(|| Decimal::ZERO) += line.subtotal();
+                .or_insert_with(|| Decimal::ZERO) +=
+                tax_inclusive_total(line.subtotal(), line.tax_total);
         }
 
         Ok(purchases

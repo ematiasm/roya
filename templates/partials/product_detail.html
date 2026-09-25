@@ -28,7 +28,17 @@
       <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductNegative) }}</span>
       {% endif %}
     </div>
-    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • {{ localization.format_currency(product.sale_price.clone()) }}</div>
+    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • {{ localization.tr(crate::localization::MessageKey::TaxNetPrice) }} {{ localization.format_currency(tax_preview.net_price.clone()) }}</div>
+    {# Tax-inclusive price preview (tax calculation T2): derived from the CURRENT
+       active linked taxes and never written back. The stored `sale_price` above
+       stays net, which is what a document line snapshots. #}
+    <div class="text-[13px] text-muted" data-product-tax-preview>
+      {% if tax_preview.breakdown.is_empty() %}
+      {{ localization.tr(crate::localization::MessageKey::TaxInclusivePrice) }} {{ localization.format_currency(tax_preview.total.clone()) }} — {{ localization.tr(crate::localization::MessageKey::TaxNoBreakdown) }}
+      {% else %}
+      {{ localization.tr(crate::localization::MessageKey::TaxInclusivePrice) }} <span class="font-bold tabular-nums">{{ localization.format_currency(tax_preview.total.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxTotal) }} {{ localization.format_currency(tax_preview.tax_total.clone()) }}
+      {% endif %}
+    </div>
     <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(stock.clone()) }}{% if let Some(min) = product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
     {# Audit attribution (M5 Phase B): who registered the product and who last
        changed it, shown as a display name resolved in the wiring layer — the
@@ -176,6 +186,41 @@
 
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductTaxes) }} ({{ product_taxes.len() }})</div>
+    {# The derived price breakdown, so the tax-inclusive figure in the header is
+       auditable: every active tax, its rate, and what it adds to the net price.
+       Rendered only when there IS a breakdown — an untaxed product already says
+       so in the header (which explains why its two prices are equal) and again
+       on the association list below, and a third copy here would be noise. The
+       card still lists the ASSOCIATIONS, including inactive ones, because
+       unlinking is an association edit, not a calculation. #}
+    {% if !tax_preview.breakdown.is_empty() %}
+    <div class="mb-3 overflow-x-auto">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+            <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductTaxes) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxRate) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxAmount) }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in tax_preview.breakdown %}
+          <tr class="border-b border-border/60">
+            <td class="py-2 pr-3"><span class="font-semibold">{{ row.code }}</span> <span class="text-[13px] text-muted">— {{ row.name }}</span></td>
+            <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_percentage(row.rate.clone()) }}</td>
+            <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(row.amount.clone()) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+        <tfoot>
+          <tr class="border-t border-border font-bold">
+            <td class="py-2 pr-3" colspan="2">{{ localization.tr(crate::localization::MessageKey::TaxTotal) }}</td>
+            <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(tax_preview.tax_total.clone()) }}</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+    {% endif %}
     {% if product_taxes.is_empty() %}
     <div class="mb-3 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductNoLinkedTaxes) }}</div>
     {% else %}

@@ -1,8 +1,11 @@
 use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{NewTax, ProductTax, ProductTaxView, Tax, UpdateTax};
+use crate::models::{
+    NewTax, ProductTax, ProductTaxBreakdownRow, ProductTaxPreview, ProductTaxView, Tax, UpdateTax,
+};
 use crate::repositories::{ProductRepository, ProductTaxRepository, TaxRepository};
+use crate::services::line_taxes::calculate_line_taxes;
 
 #[derive(Clone)]
 pub struct TaxService<P, T, L>
@@ -144,11 +147,45 @@ where
         Ok(())
     }
 
-    async fn require_product(&self, product_id: i64) -> AppResult<()> {
+    /// The product's tax-inclusive unit price preview: the stored net sale price
+    /// plus every ACTIVE linked tax, run through the same calculation contract a
+    /// document line write runs, so the two can never disagree by a cent.
+    ///
+    /// Purely derived. Nothing here writes: the stored `sale_price` stays net,
+    /// which is what a document line snapshots and what the API reports.
+    pub async fn product_price_preview(&self, product_id: i64) -> AppResult<ProductTaxPreview> {
+        let product = self.require_product(product_id).await?;
+        // The same resolution boundary the line write uses: linked AND active,
+        // ordered by code then id so the breakdown is deterministic.
+        let taxes = self
+            .product_taxes
+            .list_active_for_product(product_id)
+            .await?;
+        let calc = calculate_line_taxes(product.sale_price, &taxes);
+        Ok(ProductTaxPreview {
+            // The net the taxes were actually applied to, read from the
+            // calculation itself instead of re-read from the product: one
+            // source of truth for the figure the breakdown adds up to.
+            net_price: calc.net_subtotal,
+            breakdown: calc
+                .taxes
+                .iter()
+                .map(|row| ProductTaxBreakdownRow {
+                    code: row.code.clone(),
+                    name: row.name.clone(),
+                    rate: row.rate,
+                    amount: row.amount,
+                })
+                .collect(),
+            tax_total: calc.tax_total,
+            total: calc.total,
+        })
+    }
+
+    async fn require_product(&self, product_id: i64) -> AppResult<crate::models::Product> {
         self.products
             .find_by_id(product_id)
             .await?
-            .map(|_| ())
             .ok_or_else(|| AppError::NotFound(format!("product {product_id} not found")))
     }
 }
@@ -180,4 +217,191 @@ fn validate_rate(rate: Decimal) -> AppResult<()> {
         return Err(AppError::Validation("tax rate cannot be negative".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{NewProduct, ProductKind};
+    use crate::repositories::{
+        SqliteBarcodeRepository, SqliteCategoryRepository, SqliteProductRepository,
+        SqliteProductTaxRepository, SqliteStockMovementRepository, SqliteTaxRepository,
+    };
+    use crate::security::test_support;
+    use crate::services::InventoryService;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    type Svc = TaxService<SqliteProductRepository, SqliteTaxRepository, SqliteProductTaxRepository>;
+
+    fn dec(value: &str) -> Decimal {
+        Decimal::from_str(value).unwrap()
+    }
+
+    async fn test_pool() -> sqlx::SqlitePool {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .pragma("recursive_triggers", "1");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    /// A product at `sale_price`, tracked, with the service wired the way the
+    /// application wires it (the inventory service holds the shared product
+    /// repository, the tax service holds the same one).
+    async fn svc_with_product(price: &str) -> (Svc, sqlx::SqlitePool, i64) {
+        let pool = test_pool().await;
+        let products = SqliteProductRepository::new(pool.clone());
+        let inventory = InventoryService::new(
+            SqliteCategoryRepository::new(pool.clone()),
+            products.clone(),
+            SqliteBarcodeRepository::new(pool.clone()),
+            SqliteStockMovementRepository::new(pool.clone()),
+            true,
+        );
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let product = inventory
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "TAX-PREVIEW".into(),
+                    name: "taxed product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec(price),
+                    cost_price: dec("5"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let s = TaxService::new(
+            products,
+            SqliteTaxRepository::new(pool.clone()),
+            SqliteProductTaxRepository::new(pool.clone()),
+        );
+        (s, pool, product.id)
+    }
+
+    async fn link(s: &Svc, code: &str, rate: &str) -> i64 {
+        s.create_tax(
+            1,
+            NewTax {
+                code: code.into(),
+                name: format!("tax {code}"),
+                rate: dec(rate),
+                is_active: true,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// The preview is a read of the CURRENT catalogue: a product with no linked
+    /// tax previews as its net price, and a linked tax changes nothing about the
+    /// stored price.
+    #[tokio::test]
+    async fn tax_preview_without_taxes_is_the_stored_net_price() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+
+        let preview = s.product_price_preview(product_id).await.unwrap();
+        assert_eq!(preview.net_price, dec("100"));
+        assert!(preview.breakdown.is_empty());
+        assert_eq!(preview.tax_total, dec("0"));
+        assert_eq!(preview.total, dec("100"));
+
+        let product = s.products.find_by_id(product_id).await.unwrap().unwrap();
+        assert_eq!(
+            product.sale_price,
+            dec("100"),
+            "the preview must never write the stored net price"
+        );
+    }
+
+    /// Several linked taxes are additive, and the breakdown the operator reads
+    /// reconciles with the total they are shown.
+    #[tokio::test]
+    async fn tax_preview_sums_every_linked_tax_additively() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        let iibb = link(&s, "IIBB10", "10").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+        s.link_product_tax(1, product_id, iibb).await.unwrap();
+
+        let preview = s.product_price_preview(product_id).await.unwrap();
+        assert_eq!(preview.net_price, dec("100"));
+        assert_eq!(preview.breakdown.len(), 2);
+        assert_eq!(
+            preview.breakdown[0].code, "IIBB10",
+            "ordered by code, then id"
+        );
+        assert_eq!(preview.breakdown[0].rate, dec("10"));
+        assert_eq!(preview.breakdown[0].amount, dec("10"));
+        assert_eq!(preview.breakdown[1].code, "IVA21");
+        assert_eq!(preview.breakdown[1].amount, dec("21"));
+        assert_eq!(preview.tax_total, dec("31"), "additive, not compounded");
+        assert_eq!(preview.total, dec("131"));
+        let sum: Decimal = preview.breakdown.iter().map(|row| row.amount).sum();
+        assert_eq!(sum, preview.tax_total, "the breakdown must reconcile");
+    }
+
+    /// A DEACTIVATED tax is not a tax the product will be charged, so it leaves
+    /// the preview — the same exclusion the document line write performs.
+    #[tokio::test]
+    async fn tax_preview_excludes_a_deactivated_tax() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        let iibb = link(&s, "IIBB10", "10").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+        s.link_product_tax(1, product_id, iibb).await.unwrap();
+        s.deactivate_tax(1, iibb).await.unwrap();
+
+        let preview = s.product_price_preview(product_id).await.unwrap();
+        assert_eq!(preview.breakdown.len(), 1);
+        assert_eq!(preview.breakdown[0].code, "IVA21");
+        assert_eq!(preview.tax_total, dec("21"));
+        assert_eq!(preview.total, dec("121"));
+    }
+
+    /// The preview shares the one half-up money rule, so a net price with a
+    /// third decimal previews as the value a line would charge.
+    #[tokio::test]
+    async fn tax_preview_rounds_the_tax_inclusive_price_half_up() {
+        let (s, _pool, product_id) = svc_with_product("10.005").await;
+        let iva = link(&s, "IVA21", "21").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+
+        let preview = s.product_price_preview(product_id).await.unwrap();
+        assert_eq!(preview.net_price, dec("10.005"), "shown net, unrounded");
+        assert_eq!(preview.breakdown[0].amount, dec("2.10"));
+        assert_eq!(preview.tax_total, dec("2.10"));
+        assert_eq!(
+            preview.total,
+            dec("12.11"),
+            "half-up, the same total a line of this product would carry"
+        );
+    }
+
+    /// An unknown product is a 404, not a silent zero preview: the drawer already
+    /// resolved the product, so this only guards the contract.
+    #[tokio::test]
+    async fn tax_preview_of_an_unknown_product_is_not_found() {
+        let (s, _pool, _product_id) = svc_with_product("100").await;
+        let err = s.product_price_preview(999_999).await.unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+    }
 }

@@ -29,7 +29,10 @@
 //!
 //! The document repositories' line writes call this on a real request path, so
 //! there is NO way in this application to compute a document line's taxes that
-//! does not come through here.
+//! does not come through here. The read side has the same single route:
+//! [`tax_inclusive_total`] is the one place a stored line's net amount and its
+//! stored tax amount are added together, so no total, payment ceiling or debt
+//! balance derives its own arithmetic.
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::models::{NewLineTax, Tax};
@@ -60,10 +63,7 @@ pub fn round_to_cents(amount: Decimal) -> Decimal {
 pub struct LineTaxCalculation {
     /// The net amount the taxes were applied to, exactly as received.
     ///
-    /// Read by the document totals and the product tax-inclusive preview (T2);
-    /// the line persistence needs only the contributions and the aggregate, so
-    /// the allow is dropped when those consumers land.
-    #[allow(dead_code)]
+    /// Read by the document totals and the product tax-inclusive preview.
     pub net_subtotal: Decimal,
     /// One entry per resolved tax, in the order it was resolved. Each entry is
     /// a snapshot fact: it never re-reads the tax.
@@ -71,9 +71,25 @@ pub struct LineTaxCalculation {
     /// The sum of the contributions, already at `MONEY_SCALE`.
     pub tax_total: Decimal,
     /// The tax-inclusive line total at `MONEY_SCALE`, the single rounding rule
-    /// applied once. Read by the same T2 consumers as `net_subtotal`.
-    #[allow(dead_code)]
+    /// applied once. Read by the same consumers as `net_subtotal`.
     pub total: Decimal,
+}
+
+/// The tax-inclusive money of ONE stored document line: the net subtotal plus the
+/// tax total that line already froze, pinned to cents.
+///
+/// This is the read-side twin of [`calculate_line_taxes`]. A line's net
+/// subtotal is `qty * price` and can carry more than two decimals (a fractional
+/// quantity), so the sum is rounded here, exactly as the write path rounds it.
+/// Every derived document figure routes through this one function, so a
+/// document total, a payment ceiling and a debt balance can never disagree by a
+/// cent about the same line.
+///
+/// Rounding belongs to the LINE, not to the document: a document total is the
+/// sum of its lines' pinned totals, which is what the operator sees on the
+/// record page and can therefore audit.
+pub fn tax_inclusive_total(net_subtotal: Decimal, tax_total: Decimal) -> Decimal {
+    round_to_cents(net_subtotal + tax_total)
 }
 
 /// One tax's contribution to a line, together with the values that produced

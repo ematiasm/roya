@@ -41,7 +41,7 @@ use crate::repositories::{
     SqliteProductSupplierCostRepository, SqliteProductTaxRepository, SqlitePurchaseRepository,
     SqliteRoleRepository, SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
     SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxRepository,
-    SqliteTransactionRepository, SqliteUserRepository,
+    SqliteTaxSnapshotRepository, SqliteTransactionRepository, SqliteUserRepository,
 };
 use crate::routes::setup_web::setup_gate;
 use crate::security::auth_middleware;
@@ -70,6 +70,7 @@ pub type SalesSvc = SalesService<
     SqliteTransactionRepository,
     SqlitePaymentMethodRepository,
     SqliteCustomerRepository,
+    SqliteTaxSnapshotRepository,
 >;
 
 pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
@@ -98,6 +99,7 @@ pub type ReceiptSvc = CustomerReceiptService<
     SqliteTransactionRepository,
     SqlitePaymentMethodRepository,
     SqliteCustomerRepository,
+    SqliteTaxSnapshotRepository,
 >;
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
@@ -120,6 +122,7 @@ pub type PurchasesSvc = PurchasesService<
     SqliteAccountRepository,
     SqliteTransactionRepository,
     SqlitePaymentMethodRepository,
+    SqliteTaxSnapshotRepository,
 >;
 
 /// The identity service the deny-by-default gate and the login/logout routes
@@ -298,6 +301,7 @@ impl AppState {
             transaction_service.clone(),
             method_repo.clone(),
             customer_service.clone(),
+            SqliteTaxSnapshotRepository::new(pool.clone()),
             enforce_credit_limit,
         );
         // M4: collections group the payments one handover of money produced; the
@@ -322,6 +326,7 @@ impl AppState {
             inventory_service.clone(),
             transaction_service.clone(),
             PaymentMethodService::new(method_repo),
+            SqliteTaxSnapshotRepository::new(pool.clone()),
         );
         // The documents index composes the four families' read paths; it holds
         // only reads, so wiring it never moves write ownership.

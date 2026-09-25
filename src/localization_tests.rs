@@ -41,6 +41,84 @@ fn locale(code: &str, language: &str, enabled: bool) -> BusinessLocale {
     }
 }
 
+/// The tax money vocabulary must exist in BOTH enabled locales and must not
+/// collapse to an English fallback in Spanish: a document detail that shows a
+/// raw key, or a Spanish operator reading an English label, is a real defect.
+#[test]
+fn tax_money_labels_are_translated_in_every_enabled_locale() {
+    let en = resolve_context(
+        Some(&settings("en-US")),
+        &[locale("en-US", "en", true), locale("es-AR", "es", true)],
+    );
+    let es = resolve_context(
+        Some(&settings("es-AR")),
+        &[locale("en-US", "en", true), locale("es-AR", "es", true)],
+    );
+
+    let keys = [
+        MessageKey::TaxNetSubtotal,
+        MessageKey::TaxTotal,
+        MessageKey::TaxBreakdown,
+        MessageKey::TaxInclusiveTotal,
+        MessageKey::TaxRate,
+        MessageKey::TaxAmount,
+        MessageKey::TaxNoBreakdown,
+        MessageKey::TaxNetPrice,
+        MessageKey::TaxInclusivePrice,
+    ];
+    for key in keys {
+        let english = en.tr(key);
+        let spanish = es.tr(key);
+        assert_ne!(english, "Translation unavailable", "{key:?} is missing");
+        assert_ne!(spanish, "Translation unavailable", "{key:?} is missing");
+        assert_ne!(
+            spanish, english,
+            "{key:?} falls back to English in the Spanish catalog"
+        );
+    }
+}
+
+/// Tax VALUES go through the same localized currency and percentage helpers as
+/// every other money in the app: the stored canonical decimals are never
+/// rendered, and the Spanish conventions are the ones the locale defines.
+#[test]
+fn tax_values_render_through_the_localized_currency_and_percentage_helpers() {
+    let en = resolve_context(
+        Some(&settings("en-US")),
+        &[locale("en-US", "en", true), locale("es-AR", "es", true)],
+    );
+    let es = resolve_context(
+        Some(&settings("es-AR")),
+        &[locale("en-US", "en", true), locale("es-AR", "es", true)],
+    );
+
+    let rate = Decimal::from_str("21.5").unwrap();
+    let amount = Decimal::from_str("21.00").unwrap();
+    let net = Decimal::from_str("100.00").unwrap();
+    let gross = Decimal::from_str("121.00").unwrap();
+
+    // `en-US` separates the fraction with a dot, `es-AR` with a comma, so the
+    // SAME stored value renders differently per locale — the helpers are what
+    // localize money, never the stored decimal.
+    assert_eq!(en.format_percentage(rate), "21.5 %");
+    assert_eq!(es.format_percentage(rate), "21,5 %");
+    assert_eq!(en.format_currency(gross), "121.00 ARS");
+    assert_eq!(es.format_currency(gross), "121,00 ARS");
+    assert_eq!(en.format_currency(net), "100.00 ARS");
+    assert_eq!(es.format_currency(amount), "21,00 ARS");
+    assert_ne!(
+        en.format_currency(gross),
+        es.format_currency(gross),
+        "the currency conventions must follow the locale, not the stored value"
+    );
+
+    // The canonical values are untouched: formatting is presentation only.
+    assert_eq!(gross.to_string(), "121.00");
+    assert_eq!(amount.to_string(), "21.00");
+    assert_eq!(net.to_string(), "100.00");
+    assert_eq!(rate.to_string(), "21.5");
+}
+
 #[test]
 fn locale_resolution_prefers_the_configured_locale_then_language_then_enabled_fallback() {
     let exact = resolve_context(
@@ -595,7 +673,7 @@ async fn locale_presentation_customer_statement_and_detail_localize_derived_fact
         )),
         "statement date: {page}"
     );
-    assert!(page.contains("26,250 ARS"), "ageing/balance: {page}");
+    assert!(page.contains("26,25 ARS"), "ageing/balance: {page}");
 
     let (status, detail) = request(
         &app,
@@ -616,12 +694,25 @@ async fn locale_presentation_customer_statement_and_detail_localize_derived_fact
         detail.contains(&context.format_date(due_date)),
         "due date: {detail}"
     );
-    assert!(detail.contains("Total 26,250 ARS"), "sale total: {detail}");
+    // The tax-inclusive total, pinned to two decimals half-up.
+    assert!(detail.contains("Total 26,25 ARS"), "sale total: {detail}");
     assert!(detail.contains("Pagado 0 ARS"), "sale paid: {detail}");
-    assert!(detail.contains("26,250 ARS"), "sale due: {detail}");
+    assert!(detail.contains("26,25 ARS"), "sale due: {detail}");
+    // The leak guard names the CANONICAL forms, because that is what a raw
+    // `Decimal` renders: `26.250` for the stored net and `26.25` for the
+    // tax-inclusive total, both with a DOT. The localized `26,25` uses a comma,
+    // so a guard written against the localized spelling can never fire.
+    assert!(
+        !detail.contains("26.250"),
+        "raw customer Decimal leaked (stored net scale): {detail}"
+    );
     assert!(
         !detail.contains("26.25"),
-        "raw customer Decimal leaked: {detail}"
+        "raw customer Decimal leaked (canonical dot form): {detail}"
+    );
+    assert!(
+        !detail.contains("26,250"),
+        "the localized total must be the pinned one, never the net's scale: {detail}"
     );
 
     let (status, canonical) = request(
@@ -635,7 +726,11 @@ async fn locale_presentation_customer_statement_and_detail_localize_derived_fact
     .await;
     assert_eq!(status, StatusCode::OK, "{canonical}");
     let canonical: Value = serde_json::from_str(&canonical).unwrap();
-    assert_eq!(canonical["total"], "26.250");
+    // The tax-inclusive total, pinned to two decimals half-up; the net keeps
+    // its stored scale so the API consumer can audit the two against each other.
+    assert_eq!(canonical["net_subtotal"], "26.250");
+    assert_eq!(canonical["tax_total"], "0");
+    assert_eq!(canonical["total"], "26.25");
     assert_eq!(canonical["sale"]["sale_date"], sale_date.to_string());
     assert_eq!(canonical["sale"]["due_date"], due_date.to_string());
 }
@@ -975,7 +1070,12 @@ async fn locale_presentation_sale_detail_localizes_money_quantity_and_dates() {
     .await;
     assert_eq!(status, StatusCode::OK, "{canonical}");
     let canonical: Value = serde_json::from_str(&canonical).unwrap();
-    assert_eq!(canonical["total"], "26.250");
+    // The API reports the tax-inclusive total, pinned to two decimals
+    // half-up (tax calculation T2). The net keeps its stored scale so the two
+    // are auditable against each other; the tax total is exactly zero.
+    assert_eq!(canonical["net_subtotal"], "26.250");
+    assert_eq!(canonical["tax_total"], "0");
+    assert_eq!(canonical["total"], "26.25");
     assert_eq!(canonical["lines"][0]["qty"], "2.5");
     assert_eq!(canonical["lines"][0]["unit_price"], "10.50");
 }
@@ -1079,7 +1179,11 @@ async fn locale_presentation_purchase_detail_localizes_money_quantity_and_dates(
     .await;
     assert_eq!(status, StatusCode::OK, "{canonical}");
     let canonical: Value = serde_json::from_str(&canonical).unwrap();
-    assert_eq!(canonical["total"], "2.5000");
+    // The purchase API mirrors the sale API: net keeps its stored scale, the
+    // total is the tax-inclusive figure pinned to two decimals.
+    assert_eq!(canonical["net_subtotal"], "2.5000");
+    assert_eq!(canonical["tax_total"], "0");
+    assert_eq!(canonical["total"], "2.50");
     assert_eq!(canonical["lines"][0]["qty"], "1.25");
     assert_eq!(
         canonical["purchase"]["purchase_date"],
@@ -1140,7 +1244,7 @@ async fn locale_presentation_supplier_detail_localizes_purchase_date_and_decimal
     assert_eq!(status, StatusCode::OK, "{detail}");
     assert!(detail.contains("31/12/2026"), "purchase date: {detail}");
     assert!(
-        detail.contains("2,5000 ARS"),
+        detail.contains("2,50 ARS"),
         "purchase total/paid/due: {detail}"
     );
     assert!(!detail.contains("2026-12-31"), "raw ISO date: {detail}");
@@ -1307,16 +1411,16 @@ async fn locale_presentation_sales_list_and_debt_fragments_localize_dates_and_mo
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
         assert!(body.contains("31/12/2026"), "{uri} sale date: {body}");
         assert!(body.contains("15/01/2027"), "{uri} due date: {body}");
-        assert!(body.contains("26,250 ARS"), "{uri} total/owed: {body}");
+        assert!(body.contains("26,25 ARS"), "{uri} total/owed: {body}");
         if uri == "/web/sales" {
             assert!(body.contains("pagado 0 ARS"), "{uri} paid: {body}");
             assert!(
-                body.contains("saldo pendiente 26,250 ARS"),
+                body.contains("saldo pendiente 26,25 ARS"),
                 "{uri} due: {body}"
             );
         } else {
             assert!(
-                body.contains("documentos pendientes 26,250 ARS"),
+                body.contains("documentos pendientes 26,25 ARS"),
                 "{uri} owed: {body}"
             );
         }
@@ -1379,7 +1483,7 @@ async fn locale_presentation_purchase_list_fragment_localizes_dates_and_money() 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("31/12/2026"), "purchase date: {body}");
     assert!(body.contains("15/01/2027"), "due date: {body}");
-    assert!(body.contains("2,5000 ARS"), "total/due: {body}");
+    assert!(body.contains("2,50 ARS"), "total/due: {body}");
     assert!(!body.contains("2026-12-31"), "raw ISO date: {body}");
     assert!(!body.contains("2.5000"), "raw Decimal: {body}");
 }

@@ -1693,6 +1693,192 @@ async fn tax_snapshot_migration_backfills_zero_tax_total_on_existing_lines() {
 }
 
 // ---------------------------------------------------------------------------
+// T2: the frozen snapshot and the derived total, together
+// ---------------------------------------------------------------------------
+
+/// CONFIRMED immutability, from the persistence side: a confirmed document's
+/// line keeps its frozen breakdown AND its frozen tax total after the tax is
+/// re-rated, renamed and deactivated, and the tax-inclusive total derived from
+/// those two stored values is therefore unchanged too.
+#[tokio::test]
+async fn tax_snapshot_confirmed_line_total_survives_a_tax_rerate_rename_and_deactivate() {
+    let pool = pool().await;
+    let actor = sentinel(&pool).await;
+    let product = create_product(&pool, "T2-FROZEN").await;
+    let created = taxes_linked_to(&pool, product, &[("IVA", "21")])
+        .await
+        .remove(0);
+    let sales = SqliteSaleRepository::new(pool.clone());
+    let sale = create_sale(&pool).await;
+    let line = sales
+        .create_line(sale, product, dec("2"), dec("100"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sales SET status = 'Confirmed' WHERE id = ?")
+        .bind(sale)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let frozen_total = round_to_cents(line.subtotal() + line.tax_total);
+    assert_eq!(frozen_total, dec("242"), "200 net plus 21% IVA");
+
+    let taxes = SqliteTaxRepository::new(pool.clone());
+    taxes
+        .update(
+            actor,
+            created.id,
+            "IVA-NUEVO",
+            "Renamed tax",
+            dec("27.5"),
+            true,
+        )
+        .await
+        .unwrap();
+    taxes.deactivate(actor, created.id).await.unwrap();
+
+    let read_back = SqliteTaxSnapshotRepository::new(pool.clone())
+        .list_sale_line_taxes(line.id)
+        .await
+        .unwrap();
+    assert_eq!(read_back.len(), 1);
+    assert_eq!(read_back[0].code, "IVA");
+    assert_eq!(read_back[0].name, "Tax IVA");
+    assert_eq!(read_back[0].rate, dec("21"));
+    assert_eq!(read_back[0].amount, dec("42"));
+
+    let stored = sales.find_line(line.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.tax_total,
+        dec("42"),
+        "the stored aggregate is frozen"
+    );
+    assert_eq!(
+        round_to_cents(stored.subtotal() + stored.tax_total),
+        frozen_total,
+        "the derived tax-inclusive total is frozen with it"
+    );
+    assert_eq!(
+        stored.unit_price,
+        dec("100"),
+        "the stored net price never moves"
+    );
+}
+
+/// DRAFT recomputation, from the persistence side: the same line write contract
+/// re-resolves the catalogue, so a re-rated tax replaces the breakdown and the
+/// aggregate in one unit — a draft is not history.
+#[tokio::test]
+async fn tax_snapshot_draft_line_recomputes_after_a_tax_change() {
+    let pool = pool().await;
+    let actor = sentinel(&pool).await;
+    let product = create_product(&pool, "T2-REDRAFT").await;
+    let created = taxes_linked_to(&pool, product, &[("IVA", "21")])
+        .await
+        .remove(0);
+    let sales = SqliteSaleRepository::new(pool.clone());
+    let sale = create_sale(&pool).await;
+    let line = sales
+        .create_line(sale, product, dec("1"), dec("100"))
+        .await
+        .unwrap();
+    assert_eq!(line.tax_total, dec("21"));
+
+    SqliteTaxRepository::new(pool.clone())
+        .update(actor, created.id, "IVA", "Tax IVA", dec("10"), true)
+        .await
+        .unwrap();
+
+    let recomputed = sales
+        .update_line(line.id, dec("1"), dec("100"))
+        .await
+        .unwrap();
+    assert_eq!(
+        recomputed.tax_total,
+        dec("10"),
+        "the draft re-resolved the rate"
+    );
+    assert_eq!(
+        round_to_cents(recomputed.subtotal() + recomputed.tax_total),
+        dec("110")
+    );
+
+    let read_back = SqliteTaxSnapshotRepository::new(pool.clone())
+        .list_sale_line_taxes(line.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        read_back.len(),
+        1,
+        "the breakdown is replaced, not appended"
+    );
+    assert_eq!(read_back[0].rate, dec("10"));
+    assert_eq!(read_back[0].amount, dec("10"));
+}
+
+/// The purchase side of the same two claims, so a snapshot contract that only
+/// held for sales could not pass.
+#[tokio::test]
+async fn tax_snapshot_purchase_confirmed_freezes_and_draft_recomputes() {
+    let pool = pool().await;
+    let actor = sentinel(&pool).await;
+    let product = create_product(&pool, "T2-PURCH").await;
+    let created = taxes_linked_to(&pool, product, &[("IVA", "21")])
+        .await
+        .remove(0);
+    let purchases = SqlitePurchaseRepository::new(pool.clone());
+    let purchase = create_purchase(&pool).await;
+    let line = purchases
+        .create_line(purchase, product, dec("1"), dec("200"))
+        .await
+        .unwrap();
+    assert_eq!(line.tax_total, dec("42"));
+
+    let taxes = SqliteTaxRepository::new(pool.clone());
+    taxes
+        .update(actor, created.id, "IVA", "Tax IVA", dec("10"), true)
+        .await
+        .unwrap();
+    let recomputed = purchases
+        .update_line(line.id, dec("1"), dec("200"))
+        .await
+        .unwrap();
+    assert_eq!(recomputed.tax_total, dec("20"));
+    assert_eq!(
+        round_to_cents(recomputed.subtotal() + recomputed.tax_total),
+        dec("220")
+    );
+
+    sqlx::query("UPDATE purchases SET status = 'Confirmed' WHERE id = ?")
+        .bind(purchase)
+        .execute(&pool)
+        .await
+        .unwrap();
+    taxes
+        .update(actor, created.id, "IVA", "Tax IVA", dec("27.5"), true)
+        .await
+        .unwrap();
+    taxes.deactivate(actor, created.id).await.unwrap();
+
+    let stored = purchases.find_line(line.id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.tax_total,
+        dec("20"),
+        "the confirmed aggregate is frozen"
+    );
+    assert_eq!(
+        round_to_cents(stored.subtotal() + stored.tax_total),
+        dec("220")
+    );
+    let read_back = SqliteTaxSnapshotRepository::new(pool.clone())
+        .list_purchase_line_taxes(line.id)
+        .await
+        .unwrap();
+    assert_eq!(read_back.len(), 1);
+    assert_eq!(read_back[0].rate, dec("10"));
+    assert_eq!(read_back[0].amount, dec("20"));
+}
+
+// ---------------------------------------------------------------------------
 // Local helpers
 // ---------------------------------------------------------------------------
 

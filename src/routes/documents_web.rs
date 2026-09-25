@@ -1224,6 +1224,21 @@ async fn sale_drawer(
         ),
         sale.cancel_reason.clone(),
     ));
+    // Net, tax and tax-inclusive total (tax calculation T2). The document's
+    // money is three figures, not one: showing only the total would make it
+    // unauditable, and the tax figure comes from the lines' frozen snapshots so
+    // it cannot drift when a tax is edited later.
+    facts.push(DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::TaxNetSubtotal,
+        ),
+        localization.format_currency(record.net_subtotal),
+    ));
+    facts.push(DrawerFact::new(
+        copy(localization, crate::localization::MessageKey::TaxTotal),
+        localization.format_currency(record.tax_total),
+    ));
     facts.push(DrawerFact::new(
         copy(localization, crate::localization::MessageKey::CustomerTotal),
         localization.format_currency(record.total),
@@ -1270,7 +1285,12 @@ async fn sale_drawer(
                 ),
                 copy(
                     localization,
-                    crate::localization::MessageKey::DocumentsSubtotal,
+                    crate::localization::MessageKey::TaxNetSubtotal,
+                ),
+                copy(localization, crate::localization::MessageKey::TaxTotal),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::TaxInclusiveTotal,
                 ),
             ],
             rows: record
@@ -1282,6 +1302,8 @@ async fn sale_drawer(
                         localization.format_quantity(line.qty),
                         localization.format_currency(line.unit_price),
                         localization.format_currency(line.subtotal),
+                        localization.format_currency(line.tax_total),
+                        localization.format_currency(line.total),
                     ],
                     href: None,
                 })
@@ -1629,6 +1651,21 @@ async fn purchase_drawer(
         ),
         purchase.cancel_reason.clone(),
     ));
+    // Net, tax and tax-inclusive total (tax calculation T2). The document's
+    // money is three figures, not one: showing only the total would make it
+    // unauditable, and the tax figure comes from the lines' frozen snapshots so
+    // it cannot drift when a tax is edited later.
+    facts.push(DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::TaxNetSubtotal,
+        ),
+        localization.format_currency(record.net_subtotal),
+    ));
+    facts.push(DrawerFact::new(
+        copy(localization, crate::localization::MessageKey::TaxTotal),
+        localization.format_currency(record.tax_total),
+    ));
     facts.push(DrawerFact::new(
         copy(localization, crate::localization::MessageKey::CustomerTotal),
         localization.format_currency(record.total),
@@ -1675,7 +1712,12 @@ async fn purchase_drawer(
                 ),
                 copy(
                     localization,
-                    crate::localization::MessageKey::DocumentsSubtotal,
+                    crate::localization::MessageKey::TaxNetSubtotal,
+                ),
+                copy(localization, crate::localization::MessageKey::TaxTotal),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::TaxInclusiveTotal,
                 ),
             ],
             rows: record
@@ -1687,6 +1729,8 @@ async fn purchase_drawer(
                         localization.format_quantity(line.qty),
                         localization.format_currency(line.unit_cost),
                         localization.format_currency(line.subtotal),
+                        localization.format_currency(line.tax_total),
+                        localization.format_currency(line.total),
                     ],
                     href: None,
                 })
@@ -3267,9 +3311,11 @@ mod tests {
         rest[..row_end].matches("<td").count()
     }
 
-    /// The sale drawer's line table names four columns, not five: SKU is not
+    /// The sale drawer's line table names six columns, not seven: SKU is not
     /// worth a column at the drawer's width, and the data row must align with
-    /// its headers.
+    /// its headers. The three money columns are the net subtotal, the tax and
+    /// the tax-inclusive total (tax calculation T2), so the drawer's amount is
+    /// auditable instead of opaque.
     #[tokio::test]
     async fn s3_the_sale_drawer_lines_table_drops_the_sku_column() {
         let state = test_state().await;
@@ -3287,7 +3333,14 @@ mod tests {
         let headers = table_headers(&html, "Líneas");
         assert_eq!(
             headers,
-            vec!["Producto", "Cant.", "Precio unitario", "Subtotal"],
+            vec![
+                "Producto",
+                "Cant.",
+                "Precio unitario",
+                "Subtotal neto",
+                "Total de impuestos",
+                "Total con impuestos",
+            ],
             "{html:.800}"
         );
         assert_eq!(
@@ -3297,7 +3350,7 @@ mod tests {
         );
     }
 
-    /// The purchase drawer's line table mirrors the sale's: four columns, no
+    /// The purchase drawer's line table mirrors the sale's: six columns, no
     /// SKU, and a data row that aligns with its headers.
     #[tokio::test]
     async fn s3_the_purchase_drawer_lines_table_drops_the_sku_column() {
@@ -3375,7 +3428,14 @@ mod tests {
         let headers = table_headers(&html, "Líneas");
         assert_eq!(
             headers,
-            vec!["Producto", "Cant.", "Costo unitario", "Subtotal"],
+            vec![
+                "Producto",
+                "Cant.",
+                "Costo unitario",
+                "Subtotal neto",
+                "Total de impuestos",
+                "Total con impuestos",
+            ],
             "{html:.800}"
         );
         assert_eq!(

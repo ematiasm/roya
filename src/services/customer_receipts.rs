@@ -17,7 +17,7 @@ use crate::models::{CustomerReceipt, NewReceipt, ReceiptDetail, SaleDetail};
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, CustomerReceiptRepository,
     CustomerRepository, DocSequenceRepository, PaymentMethodRepository, ProductRepository,
-    SaleRepository, StockMovementRepository, TransactionRepository,
+    SaleRepository, StockMovementRepository, TaxSnapshotRepository, TransactionRepository,
 };
 use crate::services::{PaymentMethodService, SalesService};
 
@@ -29,7 +29,7 @@ struct PlannedAllocation {
 }
 
 #[derive(Clone)]
-pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR>
+pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -42,17 +42,18 @@ where
     T: TransactionRepository,
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
+    TS: TaxSnapshotRepository,
 {
     pub receipts: RR,
     /// The receivable is read and every grouped payment is written through the
     /// sales service; receipts never touch the sales tables themselves.
-    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR>,
+    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>,
     /// Finance-owned allowlist for the `(account, method)` pair.
     pub payment_methods: PaymentMethodService<PM>,
 }
 
-impl<RR, SR, DR, C, P, B, S, A, T, PM, CR>
-    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR>
+impl<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
+    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -65,10 +66,11 @@ where
     T: TransactionRepository,
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
+    TS: TaxSnapshotRepository,
 {
     pub fn new(
         receipts: RR,
-        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR>,
+        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>,
         payment_methods: PaymentMethodService<PM>,
     ) -> Self {
         Self {
@@ -306,7 +308,7 @@ mod tests {
         SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
         SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
         SqlitePaymentMethodRepository, SqliteProductRepository, SqliteSaleRepository,
-        SqliteStockMovementRepository, SqliteTransactionRepository,
+        SqliteStockMovementRepository, SqliteTaxSnapshotRepository, SqliteTransactionRepository,
     };
     use crate::security::test_support;
     use crate::services::{CustomerService, InventoryService, TransactionService};
@@ -323,6 +325,7 @@ mod tests {
         SqliteTransactionRepository,
         SqlitePaymentMethodRepository,
         SqliteCustomerRepository,
+        SqliteTaxSnapshotRepository,
     >;
 
     async fn test_pool() -> SqlitePool {
@@ -376,6 +379,7 @@ mod tests {
             transactions,
             method_repo.clone(),
             customers,
+            SqliteTaxSnapshotRepository::new(pool.clone()),
             true,
         );
         let receipts = SqliteCustomerReceiptRepository::new(pool.clone());

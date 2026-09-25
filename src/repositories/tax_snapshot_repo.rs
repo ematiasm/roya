@@ -18,11 +18,8 @@
 //! long after the write, and no write can go through it.
 //!
 //! The write helpers are `pub(crate)` and their only callers are the document
-//! repositories' transactions, which T2 moves the flows onto. Until then a
-//! non-test build reaches none of it, and the transitive dead-code warning would
-//! name every helper and row mapper instead of the pending seam; the allow
-//! below is removed in T2.
-#![allow(dead_code)]
+//! repositories' transactions, which run them inside the same transaction that
+//! already proved the line belongs to a DRAFT document.
 use async_trait::async_trait;
 use sqlx::{Row, SqliteConnection, SqlitePool};
 use std::str::FromStr;

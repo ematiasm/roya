@@ -619,4 +619,95 @@ mod tests {
             "every family kept its in-range document"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // T2: the index amount is the tax-inclusive document total.
+    //
+    // The index folds each family's lines in the repository, not in this
+    // service, so this is the test that a document listed at `10` really is a
+    // `12.10` document.
+    // -----------------------------------------------------------------------
+
+    /// A sale line carrying a stored `tax_total` must be indexed at
+    /// `net + tax`, rounded half-up — the same figure the record page shows.
+    #[tokio::test]
+    async fn tax_totals_index_a_sale_by_its_tax_inclusive_amount() {
+        let pool = memory_pool().await;
+        let sistema = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, "Taxed buyer", d(2024, 5, 2), sistema).await;
+        // The seeded line is 1 x 10 net with no tax; give it the tax a real
+        // line write would have resolved.
+        sqlx::query("UPDATE sale_lines SET tax_total = '2.10' WHERE sale_id = ?")
+            .bind(sale)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let feed = svc(&pool)
+            .await
+            .list(&filt(vec![DocumentKind::Sale]))
+            .await
+            .unwrap();
+        assert_eq!(feed.rows.len(), 1);
+        assert_eq!(
+            feed.rows[0].amount,
+            Some(rust_decimal::Decimal::from_str("12.10").unwrap()),
+            "the index must show the tax-inclusive document total"
+        );
+    }
+
+    /// The purchase half of the index, so the two families cannot drift.
+    #[tokio::test]
+    async fn tax_totals_index_a_purchase_by_its_tax_inclusive_amount() {
+        let pool = memory_pool().await;
+        let sistema = test_support::audit_actor_id(&pool).await.unwrap();
+        let purchase = seed_purchase(&pool, "Taxed supplier", d(2024, 5, 2), sistema).await;
+        // The seeded line is 1 x 4 net; 21% on it is 0.84.
+        sqlx::query("UPDATE purchase_lines SET tax_total = '0.84' WHERE purchase_id = ?")
+            .bind(purchase)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let feed = svc(&pool)
+            .await
+            .list(&filt(vec![DocumentKind::Purchase]))
+            .await
+            .unwrap();
+        assert_eq!(feed.rows.len(), 1);
+        assert_eq!(
+            feed.rows[0].amount,
+            Some(rust_decimal::Decimal::from_str("4.84").unwrap()),
+            "the index must show the tax-inclusive document total"
+        );
+    }
+
+    /// A line whose net part carries a third decimal is pinned half-up in the
+    /// index too, so the listed amount is the sum of the listed line totals.
+    #[tokio::test]
+    async fn tax_totals_round_an_indexed_amount_half_up() {
+        let pool = memory_pool().await;
+        let sistema = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, "Rounding buyer", d(2024, 5, 2), sistema).await;
+        // 1 x 10.005 net plus a 2.10 contribution: the pinned line total is
+        // 12.11, where rounding the summed parts once would say 12.10.
+        sqlx::query(
+            "UPDATE sale_lines SET unit_price = '10.005', tax_total = '2.10' WHERE sale_id = ?",
+        )
+        .bind(sale)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let feed = svc(&pool)
+            .await
+            .list(&filt(vec![DocumentKind::Sale]))
+            .await
+            .unwrap();
+        assert_eq!(
+            feed.rows[0].amount,
+            Some(rust_decimal::Decimal::from_str("12.11").unwrap()),
+            "the listed amount must be the pinned line total, half-up"
+        );
+    }
 }
