@@ -79,10 +79,11 @@ Substantial delegated-direct ODD work. Two work units, each delegated to one bou
   - Consolidated the drawer's scattered money into the ladder: the header net line, the tax-inclusive preview line and the breakdown table were removed; the association card keeps link/unlink and tax identity without duplicating amounts.
   - Evidence: strict TDD observed RED twice — first `0 passed, 17 failed` on the missing endpoint, then `0 passed, 21 failed` with every failure `left: 400, right: 200`, which reproduced the browser's real 400 because the endpoint demanded `product_id` while the form sends `id`. Final `cargo test product_price_ladder` → 27 passed, `cargo test price_ladder` → 36 passed, `cargo test product` → 111 passed, `cargo test tax_` → 99 passed, `cargo test` → 1095 passed, `cargo check --all-targets` → 0 errors, 81 warnings (exact baseline), `cargo fmt --check` and `git diff --check` clean, `bash scripts/e2e.sh tests/test_products.py` → 24 passed / 1 pre-existing opt-in skip, `bash scripts/e2e.sh tests/test_visual_baseline.py` → 1 passed with the change confined to `products-drawer`. Independent verification found two blocking defects — the browser 400 and a fabricated `0.00` for a save-refused derived price — plus an overstated "Stored" chip and a missing authorization test; all were closed, a kind-binding residue was closed in a follow-up round, and the final independent verdict was PASS. Parent spot check repeated `cargo test product_price_ladder` → 27 passed. CSS build is N/A because the ladder introduces no class missing from the committed stylesheet. Commit identity is recorded in this document after the work-unit commit.
 
-- [ ] U3 — Run final verification and record delivery evidence.
-  - Run focused suites, the full Rust suite, compile, formatting, diff, and the applicable browser checks.
-  - Record failures, skips, and environment limitations honestly.
-  - Evidence: exact command results and final branch state.
+- [x] U3 — Run final verification and record delivery evidence.
+  - Ran the full Rust suite, every focused suite, compile, formatting, diff, the products, settings and visual-baseline browser checks, and the complete browser suite.
+  - Ran a fresh-database migration smoke check on a throwaway `/tmp` path and verified the development database was byte-identical afterward.
+  - Re-confirmed the web-surface tax-definition exclusivity and re-confirmed the JSON API residual as a known open decision, plus a clean money-in-JS scan over 15 authored sources.
+  - Evidence: `cargo test` → 1095 passed; `cargo check --all-targets` → 0 errors, 81 warnings (identical baseline); `cargo fmt --check` and `git diff --check` clean; working tree clean before and after; `cargo test product` → 111, `tax_` → 99, `price_ladder` → 36, `product_price_ladder` → 27, `settings_` → 24, `localization_tests` → 39; `bash scripts/e2e.sh tests/test_products.py` → 24 passed / 1 opt-in skip, `tests/test_settings.py` → 6 passed, `tests/test_visual_baseline.py` → 1 passed, and the full `bash scripts/e2e.sh` → 110 passed, 4 opt-in skips, 0 failed; migrations all applied on an empty database with the highest being `20240101000039` and zero failures; `roya.db`, `-shm` and `-wal` unchanged in size, mtime and sha256; the independent JS scan found one `Number(` hit, which is a DOM id coercion in `static/picker.js:222`, and zero money formulas. Verdict: PASS. No commit required beyond the U3 evidence commit.
 
 ## Acceptance criteria
 
@@ -121,7 +122,9 @@ Substantial delegated-direct ODD work. Two work units, each delegated to one bou
 - Engram mirror topic: `odd/product-price-ladder/tasks`.
 - U1 delivery: work-unit commit `121293d` (`refactor(tax): make Settings the only web surface for tax definitions`).
 - U2 delivery: work-unit commit `fd9b4e0` (`feat(products): add the server-computed product price ladder`).
-- Next step: U3 final branch-wide verification and honest skip accounting.
+- U3 verification: PASS. No failed check, no environment blocker. The four browser skips are intentional opt-in diagnostic probes, none introduced or widened by this branch. The development database was byte-identical after all thirteen checks.
+- Delivery accounting: the product-price-ladder slice is 4,157 authored changed lines. U1 is 923 (2.3× the 400 advisory), U2 is 3,249 (8.1×). The full branch versus `main` is 11,534 authored lines. The dominant contributor is `src/routes/inventory_web.rs`. Per the work-unit skill this is reported rather than repaired: the correct response is a `size:exception` or a chained-PR slice at a natural seam, never deleting comments, tests or documentation to reach 400. No push, PR creation, or merge has been performed.
+- Next step: delivery is the user's decision. The feature is implemented, independently verified and committed on a local feature branch.
 
 ### U1 — tax catalogue de-duplication
 
