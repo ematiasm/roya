@@ -87,7 +87,7 @@ One bounded delegated-direct ODD work unit: it touches the shared price helpers,
 - Verified: `web_create_product`, `web_edit_product` and the ladder route all already receive `Extension<LocalizationContext>`, so no new plumbing is needed to localize.
 - Feature document: `odd/tasks/localized-price-refusals.md`.
 - Engram mirror topic: `odd/localized-price-refusals/tasks`.
-- Delivery: no commit recorded yet.
+- Delivery: work-unit commit `7153f28` (`feat(i18n): localize product price refusals with a typed rule`).
 - Next step: delivery is the user's decision. No push, PR creation, or merge has been performed.
 
 ### Known gaps, recorded rather than hidden
