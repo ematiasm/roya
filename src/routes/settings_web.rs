@@ -15,7 +15,7 @@ use crate::localization::{LocalizationContext, MessageKey};
 use crate::models::{
     BusinessLocale, BusinessSettings, UpdateBusinessLocale, UpdateBusinessSettings,
 };
-use crate::routes::AppState;
+use crate::routes::{currency_options, AppState};
 use crate::security::authz::{Nav, Principal, Require, SettingsManage};
 use crate::services::settings::UpdateBusinessConfiguration;
 
@@ -30,6 +30,7 @@ struct SettingsLocaleRow {
 struct SettingsPage {
     settings: BusinessSettings,
     locales: Vec<SettingsLocaleRow>,
+    currency_options: Vec<crate::routes::CurrencyOption>,
     localization: LocalizationContext,
     nav_key: &'static str,
     nav: Nav,
@@ -204,6 +205,11 @@ fn page_response(
         MessageKey::SettingsPreview,
         &[("preview", preview.as_str())],
     );
+    let effective_currency_code = submitted.as_ref().map_or_else(
+        || settings.currency_code.clone(),
+        |form| form.currency_code.clone(),
+    );
+    let currency_options = currency_options(&effective_currency_code);
     let page = SettingsPage {
         settings: BusinessSettings {
             id: settings.id,
@@ -215,10 +221,7 @@ fn page_response(
                 || settings.default_locale_code.clone(),
                 |form| form.default_locale_code.clone(),
             ),
-            currency_code: submitted.as_ref().map_or_else(
-                || settings.currency_code.clone(),
-                |form| form.currency_code.clone(),
-            ),
+            currency_code: effective_currency_code,
             timezone: submitted
                 .as_ref()
                 .map_or_else(|| settings.timezone.clone(), |form| form.timezone.clone()),
@@ -226,6 +229,7 @@ fn page_response(
             updated_at: settings.updated_at,
         },
         locales,
+        currency_options,
         localization,
         nav_key: "settings",
         nav: Nav::for_principal(principal),

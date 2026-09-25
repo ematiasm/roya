@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
 use crate::localization::{LocalizationContext, MessageKey};
-use crate::routes::AppState;
+use crate::routes::{currency_options, AppState};
 use crate::services::setup::{SetupInput, LOCALE_CATALOG};
 
 #[derive(Debug, Deserialize, Default)]
@@ -40,6 +40,7 @@ struct SetupLocale {
 #[template(path = "setup.html")]
 struct SetupPage {
     locales: Vec<SetupLocale>,
+    currency_options: Vec<crate::routes::CurrencyOption>,
     localization: LocalizationContext,
 }
 
@@ -68,6 +69,7 @@ pub async fn setup_page(State(state): State<AppState>) -> AppResult<Response> {
         .collect();
     let html = SetupPage {
         locales,
+        currency_options: currency_options("ARS"),
         localization,
     }
     .render()

@@ -29,7 +29,11 @@
         </div>
         <div>
           <label for="currency-code" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldCurrencyCode) }}</label>
-          <input id="currency-code" name="currency_code" value="ARS" required maxlength="3" pattern="[A-Z]{3}" autocomplete="off" class="field" />
+          <select id="currency-code" name="currency_code" required class="field">
+            {% for currency in currency_options %}
+            <option value="{{ currency.code }}"{% if currency.code == "ARS" %} selected{% endif %}>{{ currency.display_name }}</option>
+            {% endfor %}
+          </select>
         </div>
       </div>
 

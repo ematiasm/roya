@@ -103,6 +103,25 @@ async fn fresh_installation_exposes_setup_blocks_normal_routes_and_keeps_static_
 }
 
 #[tokio::test]
+async fn setup_currency_selector_renders_catalog_options_and_selects_ars() {
+    let app = router(fresh_state().await);
+
+    let response = get(&app, "/setup").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(body
+        .contains("<select id=\"currency-code\" name=\"currency_code\" required class=\"field\">"));
+    assert!(body.contains("<option value=\"ARS\" selected>Argentine Peso</option>"));
+    assert!(body.contains("<option value=\"EUR\">Euro</option>"));
+    assert!(body.contains("<option value=\"USD\">United States Dollar</option>"));
+    assert!(!body.contains("<input id=\"currency-code\" name=\"currency_code\""));
+}
+
+#[tokio::test]
 async fn successful_setup_creates_configuration_hashed_admin_and_protected_role_grant() {
     let state = fresh_state().await;
     let app = router(state.clone());

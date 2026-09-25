@@ -33,7 +33,7 @@ def test_admin_can_open_and_update_business_settings(
     )
 
     page.locator("#business_name").fill("Roya Settings E2E")
-    page.locator("#currency_code").fill("EUR")
+    page.locator("#currency_code").select_option("EUR")
     page.locator("#timezone").fill("Europe/Madrid")
     page.locator("#display_name_0").fill("E2E locale")
     page.get_by_role("button", name=e2e_copy("save_settings")).click()

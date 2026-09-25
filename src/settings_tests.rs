@@ -183,6 +183,79 @@ async fn body(response: axum::response::Response) -> String {
 }
 
 #[tokio::test]
+async fn settings_currency_selector_renders_catalog_and_selects_persisted_code() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state);
+    let cookie = test_support::cookie_for(&token);
+
+    let response = get(&app, "/settings", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body(response).await;
+
+    assert!(page
+        .contains("<select id=\"currency_code\" class=\"field\" name=\"currency_code\" required>"));
+    assert!(page.contains("<option value=\"ARS\" selected>Argentine Peso</option>"));
+    assert!(page.contains("<option value=\"EUR\">Euro</option>"));
+    assert!(page.contains("<option value=\"USD\">United States Dollar</option>"));
+    assert!(!page.contains("name=\"currency_code\" required minlength=\"3\""));
+}
+
+#[tokio::test]
+async fn settings_currency_selector_preserves_legacy_code_as_selected_fallback() {
+    let state = configured_state().await;
+    let mut update = valid_update();
+    update.settings.currency_code = "XBT".into();
+    let (settings, _) = state.settings_service.update(update).await.unwrap();
+    assert_eq!(settings.currency_code, "XBT");
+
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state);
+    let cookie = test_support::cookie_for(&token);
+
+    let response = get(&app, "/settings", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = body(response).await;
+
+    assert!(page.contains("<option value=\"XBT\" selected>XBT</option>"));
+    assert_eq!(page.matches("value=\"XBT\"").count(), 1);
+}
+
+#[tokio::test]
+async fn settings_currency_selector_preserves_submitted_currency_on_validation_redisplay() {
+    let state = configured_state().await;
+    let mut update = valid_update();
+    update.settings.currency_code = "USD".into();
+    let (settings, _) = state.settings_service.update(update).await.unwrap();
+    assert_eq!(settings.currency_code, "USD");
+
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state);
+    let cookie = test_support::cookie_for(&token);
+
+    let response = post_form(
+        &app,
+        &cookie,
+        "business_name=Acme+Store&default_locale_code=en-US&currency_code=EUR&timezone=+++\
+         &locale_code_0=en-US&locale_code_1=es-AR\
+         &display_name_0=English+(United+States)&display_name_1=Espa%C3%B1ol+(Argentina)\
+         &enabled_0=on",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let page = body(response).await;
+
+    assert!(page.contains("<option value=\"EUR\" selected>Euro</option>"));
+    assert!(!page.contains("<option value=\"ARS\" selected>"));
+}
+
+#[tokio::test]
 async fn settings_persistence_updates_settings_and_every_locale_profile_with_audit_timestamps() {
     let state = configured_state().await;
     sqlx::query(

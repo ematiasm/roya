@@ -137,6 +137,45 @@ pub type SetupSvc = SetupService<SqliteSetupRepository, crate::security::Passwor
 pub type SettingsSvc = SettingsService<SqliteBusinessConfigurationRepository>;
 
 #[derive(Clone)]
+pub(crate) struct CurrencyOption {
+    pub(crate) code: String,
+    pub(crate) display_name: String,
+}
+
+pub(crate) const CURRENCY_CATALOG: [(&str, &str); 10] = [
+    ("ARS", "Argentine Peso"),
+    ("AUD", "Australian Dollar"),
+    ("BRL", "Brazilian Real"),
+    ("CAD", "Canadian Dollar"),
+    ("EUR", "Euro"),
+    ("GBP", "British Pound"),
+    ("JPY", "Japanese Yen"),
+    ("MXN", "Mexican Peso"),
+    ("USD", "United States Dollar"),
+    ("UYU", "Uruguayan Peso"),
+];
+
+pub(crate) fn currency_options(current_code: &str) -> Vec<CurrencyOption> {
+    let mut options = CURRENCY_CATALOG
+        .iter()
+        .map(|(code, display_name)| CurrencyOption {
+            code: (*code).to_owned(),
+            display_name: (*display_name).to_owned(),
+        })
+        .collect::<Vec<_>>();
+    if !CURRENCY_CATALOG
+        .iter()
+        .any(|(code, _)| *code == current_code)
+    {
+        options.push(CurrencyOption {
+            code: current_code.to_owned(),
+            display_name: current_code.to_owned(),
+        });
+    }
+    options
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
     pub account_service: AccountService<SqliteAccountRepository, SqliteTransactionRepository>,
