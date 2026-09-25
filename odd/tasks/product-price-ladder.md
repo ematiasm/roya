@@ -120,7 +120,7 @@ Substantial delegated-direct ODD work. Two work units, each delegated to one bou
 - Feature document: `odd/tasks/product-price-ladder.md`.
 - Engram mirror topic: `odd/product-price-ladder/tasks`.
 - U1 delivery: work-unit commit `121293d` (`refactor(tax): make Settings the only web surface for tax definitions`).
-- U2 delivery: no commit recorded yet.
+- U2 delivery: work-unit commit `fd9b4e0` (`feat(products): add the server-computed product price ladder`).
 - Next step: U3 final branch-wide verification and honest skip accounting.
 
 ### U1 — tax catalogue de-duplication
