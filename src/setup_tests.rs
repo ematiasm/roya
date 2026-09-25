@@ -128,20 +128,37 @@ async fn successful_setup_creates_configuration_hashed_admin_and_protected_role_
         )
     );
 
-    let locale: (String, String, String, bool) = sqlx::query_as(
-        "SELECT locale_code, language_code, display_name, is_enabled FROM business_locales",
+    // Every supported profile is seeded so `/settings` can offer and enable a
+    // locale the first-run form did not select; only the chosen one is enabled.
+    let locales: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT locale_code, language_code, display_name, is_enabled \
+         FROM business_locales ORDER BY id",
     )
-    .fetch_one(&state.pool)
+    .fetch_all(&state.pool)
     .await
     .unwrap();
     assert_eq!(
-        locale,
-        (
-            "es-AR".into(),
-            "es".into(),
-            "Español (Argentina)".into(),
-            true
-        )
+        locales,
+        vec![
+            (
+                "es-AR".into(),
+                "es".into(),
+                "Español (Argentina)".into(),
+                true
+            ),
+            (
+                "es-ES".into(),
+                "es".into(),
+                "Español (España)".into(),
+                false
+            ),
+            (
+                "en-US".into(),
+                "en".into(),
+                "English (United States)".into(),
+                false
+            ),
+        ]
     );
 
     let (password_hash, active, must_change, created_by): (String, bool, bool, Option<i64>) =

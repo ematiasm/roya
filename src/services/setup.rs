@@ -114,12 +114,20 @@ where
                     currency_code: currency_code.into(),
                     timezone: timezone.into(),
                 },
-                locales: vec![NewBusinessLocale {
-                    locale_code: locale.code.into(),
-                    language_code: locale.language_code.into(),
-                    display_name: locale.display_name.into(),
-                    is_enabled: true,
-                }],
+                // Seed every supported profile, not only the selected one: the
+                // settings form can only offer locales that already exist, so a
+                // fresh `es-AR` installation would otherwise be unable to switch
+                // to `es-ES` or `en-US`. Only the selected locale starts enabled.
+                // Language codes stay derived from the canonical locale code.
+                locales: LOCALE_CATALOG
+                    .iter()
+                    .map(|definition| NewBusinessLocale {
+                        locale_code: definition.code.into(),
+                        language_code: definition.language_code.into(),
+                        display_name: definition.display_name.into(),
+                        is_enabled: definition.code == locale.code,
+                    })
+                    .collect(),
                 username: username.into(),
                 display_name: display_name.into(),
                 password_hash,

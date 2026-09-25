@@ -59,6 +59,69 @@ async fn configured_state() -> AppState {
     state
 }
 
+/// A brand-new installation that has already completed first-run setup: the
+/// state `/settings` really starts from on a fresh deployment. Distinct from
+/// [`configured_pool`], which hand-seeds an arbitrary two-profile fixture.
+async fn fresh_setup_state() -> AppState {
+    fresh_setup_state_with_default("es-AR").await
+}
+
+async fn fresh_setup_state_with_default(default_locale_code: &str) -> AppState {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(crate::db::base_connect_options("sqlite::memory:").unwrap())
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = test_support::app_state(pool);
+    state
+        .setup_service
+        .create(&crate::services::setup::SetupInput {
+            business_name: "Acme Store".into(),
+            default_locale_code: default_locale_code.into(),
+            currency_code: "ARS".into(),
+            timezone: "America/Argentina/Buenos_Aires".into(),
+            username: "setup.admin".into(),
+            display_name: "Setup Admin".into(),
+            password: "correct horse battery staple".into(),
+        })
+        .await
+        .unwrap();
+    state.refresh_setup_requirement().await.unwrap();
+    assert!(!state.setup_required());
+    state
+}
+
+async fn existing_single_locale_state() -> AppState {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(crate::db::base_connect_options("sqlite::memory:").unwrap())
+        .await
+        .unwrap();
+    let migrator = sqlx::migrate!("./migrations");
+    migrator.run_to(20240101000037, &pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO business_settings \
+         (id, business_name, default_locale_code, currency_code, timezone) \
+         VALUES (1, 'Acme Store', 'es-AR', 'ARS', 'America/Argentina/Buenos_Aires')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) \
+         VALUES ('es-AR', 'es', 'Español (Argentina)', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    migrator.run(&pool).await.unwrap();
+    let state = test_support::app_state(pool);
+    state.refresh_setup_requirement().await.unwrap();
+    assert!(!state.setup_required());
+    state
+}
+
 fn valid_update() -> UpdateBusinessConfiguration {
     UpdateBusinessConfiguration {
         settings: UpdateBusinessSettings {
@@ -423,6 +486,239 @@ async fn settings_form_persists_the_complete_profile_and_renders_the_new_configu
             "UTC".into()
         )
     );
+    let enabled_codes: Vec<String> = sqlx::query_scalar(
+        "SELECT locale_code FROM business_locales WHERE is_enabled = 1 ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(enabled_codes, vec!["en-US".to_string()]);
+}
+
+#[tokio::test]
+async fn settings_page_renders_default_locale_first_and_round_trips_all_profiles() {
+    let state = fresh_setup_state_with_default("en-US").await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+
+    let page = get(&app, "/settings", &cookie).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = body(page).await;
+    for (index, (code, display_name)) in [
+        ("en-US", "English (United States)"),
+        ("es-AR", "Español (Argentina)"),
+        ("es-ES", "Español (España)"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            page.contains(&format!("name=\"locale_code_{index}\" value=\"{code}\"")),
+            "the configured default must lead the stable locale order: {page}"
+        );
+        assert!(
+            page.contains(&format!(
+                "name=\"display_name_{index}\" value=\"{display_name}\""
+            )),
+            "positional display names must follow their locale rows: {page}"
+        );
+    }
+
+    let response = post_form(
+        &app,
+        &cookie,
+        "business_name=Acme+Store&default_locale_code=en-US&currency_code=ARS\
+         &timezone=America%2FArgentina%2FBuenos_Aires\
+         &locale_code_0=en-US&locale_code_1=es-AR&locale_code_2=es-ES\
+         &display_name_0=English+(United+States)&display_name_1=Espa%C3%B1ol+(Argentina)\
+         &display_name_2=Espa%C3%B1ol+(Espa%C3%B1a)&enabled_0=on",
+    )
+    .await;
+    let status = response.status();
+    let response = body(response).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{response}");
+
+    let profiles: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT locale_code, display_name, is_enabled FROM business_locales ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        profiles,
+        vec![
+            ("es-AR".into(), "Español (Argentina)".into(), false),
+            ("es-ES".into(), "Español (España)".into(), false),
+            ("en-US".into(), "English (United States)".into(), true),
+        ]
+    );
+}
+
+/// The reported bug: a fresh `es-AR` installation could not change its
+/// presentation language because setup persisted a single locale profile.
+/// Setup must seed every supported profile so `/settings` can offer it, and
+/// switching the default to `en-US` must re-render the next request in English.
+#[tokio::test]
+async fn fresh_installation_can_switch_its_presentation_language_from_settings() {
+    let state = fresh_setup_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+
+    // Every supported profile is offered, and the seeded default is presented
+    // in Spanish.
+    let page = get(&app, "/settings", &cookie).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = body(page).await;
+    for (code, display_name) in [
+        ("es-AR", "Español (Argentina)"),
+        ("es-ES", "Español (España)"),
+        ("en-US", "English (United States)"),
+    ] {
+        assert!(
+            page.contains(&format!("value=\"{code}\"")),
+            "/settings must offer {code} on a fresh installation: {page}"
+        );
+        assert!(
+            page.contains(display_name),
+            "/settings must offer the {code} display name: {page}"
+        );
+    }
+    assert!(
+        page.contains(">Configuración del negocio</h2>"),
+        "the seeded es-AR locale presents Spanish before the switch: {page}"
+    );
+
+    // The operator makes English the default and the only enabled locale.
+    let switch = post_form(
+        &app,
+        &cookie,
+        "business_name=Acme+Store&default_locale_code=en-US&currency_code=ARS\
+         &timezone=America%2FArgentina%2FBuenos_Aires\
+         &locale_code_0=es-AR&locale_code_1=es-ES&locale_code_2=en-US\
+         &display_name_0=Espa%C3%B1ol+(Argentina)&display_name_1=Espa%C3%B1ol+(Espa%C3%B1a)\
+         &display_name_2=English+(United+States)&enabled_2=on",
+    )
+    .await;
+    assert_eq!(switch.status(), StatusCode::SEE_OTHER, "{switch:?}");
+    assert_eq!(switch.headers()[header::LOCATION], "/settings?saved=true");
+
+    // The next request renders English presentation.
+    let page = get(&app, "/settings?saved=true", &cookie).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = body(page).await;
+    assert!(
+        page.contains(">Business settings</h2>"),
+        "the switched default must present English: {page}"
+    );
+    assert!(page.contains("Settings saved"));
+    assert!(page.contains("value=\"en-US\" selected"));
+
+    let persisted: (String, String) = sqlx::query_as(
+        "SELECT s.default_locale_code, l.language_code \
+         FROM business_settings s JOIN business_locales l \
+         ON l.locale_code = s.default_locale_code WHERE s.id = 1",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, ("en-US".into(), "en".into()));
+    let enabled_codes: Vec<String> = sqlx::query_scalar(
+        "SELECT locale_code FROM business_locales WHERE is_enabled = 1 ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(enabled_codes, vec!["en-US".to_string()]);
+}
+
+#[tokio::test]
+async fn existing_single_profile_database_is_backfilled_and_can_switch_to_english() {
+    let state = existing_single_locale_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+
+    let locales: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT locale_code, language_code, display_name, is_enabled \
+         FROM business_locales ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        locales,
+        vec![
+            (
+                "es-AR".into(),
+                "es".into(),
+                "Español (Argentina)".into(),
+                true
+            ),
+            (
+                "es-ES".into(),
+                "es".into(),
+                "Español (España)".into(),
+                false
+            ),
+            (
+                "en-US".into(),
+                "en".into(),
+                "English (United States)".into(),
+                false
+            ),
+        ]
+    );
+
+    let page = get(&app, "/settings", &cookie).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = body(page).await;
+    for (code, display_name) in [
+        ("es-AR", "Español (Argentina)"),
+        ("es-ES", "Español (España)"),
+        ("en-US", "English (United States)"),
+    ] {
+        assert!(page.contains(&format!("value=\"{code}\"")));
+        assert!(page.contains(display_name));
+    }
+    assert!(page.contains(">Configuración del negocio</h2>"));
+
+    let switch = post_form(
+        &app,
+        &cookie,
+        "business_name=Acme+Store&default_locale_code=en-US&currency_code=ARS\
+         &timezone=America%2FArgentina%2FBuenos_Aires\
+         &locale_code_0=es-AR&locale_code_1=es-ES&locale_code_2=en-US\
+         &display_name_0=Espa%C3%B1ol+(Argentina)&display_name_1=Espa%C3%B1ol+(Espa%C3%B1a)\
+         &display_name_2=English+(United+States)&enabled_2=on",
+    )
+    .await;
+    assert_eq!(switch.status(), StatusCode::SEE_OTHER, "{switch:?}");
+    assert_eq!(switch.headers()[header::LOCATION], "/settings?saved=true");
+
+    let page = get(&app, "/settings?saved=true", &cookie).await;
+    assert_eq!(page.status(), StatusCode::OK);
+    let page = body(page).await;
+    assert!(page.contains(">Business settings</h2>"));
+    assert!(page.contains("Settings saved"));
+    assert!(page.contains("value=\"en-US\" selected"));
+
+    let persisted: (String, String) = sqlx::query_as(
+        "SELECT s.default_locale_code, l.language_code \
+         FROM business_settings s JOIN business_locales l \
+         ON l.locale_code = s.default_locale_code WHERE s.id = 1",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, ("en-US".into(), "en".into()));
     let enabled_codes: Vec<String> = sqlx::query_scalar(
         "SELECT locale_code FROM business_locales WHERE is_enabled = 1 ORDER BY id",
     )
