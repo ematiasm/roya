@@ -1,6 +1,6 @@
 use std::{borrow::Cow, str::FromStr};
 
-use chrono::{NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -2494,8 +2494,12 @@ impl LocalizationContext {
     /// The business-local date in the canonical ISO form required by HTML
     /// date inputs and API filters.
     pub fn today_iso(&self) -> String {
+        self.today_iso_at(Utc::now())
+    }
+
+    pub(crate) fn today_iso_at(&self, instant: DateTime<Utc>) -> String {
         let timezone = self.timezone.parse::<Tz>().unwrap_or(chrono_tz::UTC);
-        Utc::now()
+        instant
             .with_timezone(&timezone)
             .date_naive()
             .format("%Y-%m-%d")
