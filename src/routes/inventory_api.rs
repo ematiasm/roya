@@ -15,13 +15,31 @@ use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
 };
 use crate::routes::AppState;
-use crate::security::authz::{InventoryRead, InventoryStockWrite, InventoryWrite, Require};
+use crate::security::authz::{
+    InventoryRead, InventoryStockWrite, InventoryWrite, Require, SettingsManage,
+};
 
 // S5 enforcement mapping (inventory JSON API): reads → `inventory.read`,
 // product/category/barcode mutations → `inventory.write`, stock movements →
 // `inventory.stock.write`. Every handler declares its own extractor: the
 // module mixes read/write/stock-write on the same paths, so a router-level
 // guard would over-gate the reads.
+//
+// TAX DEFINITION ADMINISTRATION IS THE ONE EXCEPTION, and it is not an
+// exception to the read side: the three handlers that create, rename, re-rate
+// and activate/deactivate a tax DEFINITION are `Require<SettingsManage>`, so a
+// tax definition has exactly the same owner on this surface as it has on the
+// web (`/web/settings/taxes…`, also `settings.manage`). A tax DEFINITION is
+// business configuration; a product-tax LINK is inventory state. So the two
+// never share a gate: reading a rate stays `inventory.read` (an inventory
+// surface renders pickers and previews from the catalogue) and associating a
+// rate with a product stays `inventory.write` (linking is inventory work), while
+// defining one is `settings.manage` everywhere.
+//
+// The hard delete is still unreachable from JSON: there is no `DELETE` on
+// `/api/taxes/{id}`, so the router refuses the method itself rather than a
+// permission refusing a handler. That delete stays exclusive to the Settings
+// web tab, which is the only surface that offers a confirmation step.
 
 // ---------------------------------------------------------------------------
 // Request DTOs (JSON, English names)
@@ -395,7 +413,7 @@ async fn get_tax(
 
 async fn create_tax(
     State(state): State<AppState>,
-    _: Require<InventoryWrite>,
+    _: Require<SettingsManage>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateTaxRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
@@ -416,7 +434,7 @@ async fn create_tax(
 
 async fn update_tax(
     State(state): State<AppState>,
-    _: Require<InventoryWrite>,
+    _: Require<SettingsManage>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTaxRequest>,
@@ -439,7 +457,7 @@ async fn update_tax(
 
 async fn deactivate_tax(
     State(state): State<AppState>,
-    _: Require<InventoryWrite>,
+    _: Require<SettingsManage>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {

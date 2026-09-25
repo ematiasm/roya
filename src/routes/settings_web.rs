@@ -412,9 +412,9 @@ fn render<T: Template>(template: T) -> AppResult<String> {
 // THE URL DECISION, stated once so the next reader does not have to infer it.
 //
 // SCOPE FIRST, because it is the thing most easily over-claimed: everything
-// below is about the WEB surface (`/web/…`, the operator's browser). The JSON
-// API is a DIFFERENT surface with different permissions, and this comment says
-// nothing about it. See the residual named at the bottom.
+// below is about the WEB surface (`/web/…`, the operator's browser) and is
+// argued from the web's own address space. What the JSON API gates is a
+// separate statement, and it is made at the bottom.
 //
 // On the web, tax administration has exactly ONE canonical address space, and
 // it is this one: `/web/settings/taxes…`, gated by `settings.manage`, on the
@@ -446,16 +446,21 @@ fn render<T: Template>(template: T) -> AppResult<String> {
 //     concern, and the two never share a handler: a principal may hold one
 //     permission and not the other.
 //
-// THE RESIDUAL, stated rather than left for the next reader to discover: the
-// JSON API still administers tax DEFINITIONS behind `inventory.write` —
-// `POST /api/taxes` (create), `PUT /api/taxes/{id}` (rename, re-rate, and
-// `is_active`) and `POST /api/taxes/{id}/deactivate`, all
-// `Require<InventoryWrite>` in `src/routes/inventory_api.rs`. This is
-// PRE-EXISTING, it is NOT a U1 regression, and U1 deliberately left it alone:
-// narrowing the API's permissions is a separate product decision nobody has
-// made yet. So the honest one-line summary is "the WEB catalogue is
-// settings-only", never "tax administration is settings-only". Read
-// `odd/tasks/product-price-ladder.md` for that open decision.
+// THE JSON API KEEPS THE SAME RULE, so the block above is never read as "the
+// browser is careful, the script is not". Tax DEFINITION administration is
+// `settings.manage` on BOTH surfaces: `POST /api/taxes` (create),
+// `PUT /api/taxes/{id}` (rename, re-rate, and `is_active`) and
+// `POST /api/taxes/{id}/deactivate` in `src/routes/inventory_api.rs` are
+// `Require<SettingsManage>`, the same code these web routes declare. So
+// "tax definition administration is settings-only" is now a statement about the
+// whole application rather than about the browser alone.
+//
+// The API still differs from the web in three ways, and all three are
+// deliberate rather than leftovers: reading a definition there is
+// `inventory.read` (an inventory client has to render pickers and previews
+// from the catalogue), the product-tax ASSOCIATION is `inventory.write` on both
+// surfaces, and the hard delete has no JSON route at all, so the router refuses
+// the method rather than a permission refusing a handler.
 
 /// The tax form the catalogue rows and the create row submit.
 #[derive(Debug, Deserialize)]

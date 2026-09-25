@@ -42,7 +42,8 @@ use crate::security::authz::{
 // (`/web/taxes`, `/web/taxes/edit`, `/web/taxes/deactivate`) and render its
 // catalogue on the page. Both are gone; see the note above
 // `web_link_product_tax` and `settings_web.rs`'s URL decision. The product-tax
-// ASSOCIATION is the only tax surface here, and it stays on this gate.
+// ASSOCIATION is the only tax surface here, and it stays on this gate. The JSON
+// API agrees: its three definition routes are `settings.manage` too.
 
 // ---------------------------------------------------------------------------
 // Askama templates
@@ -1183,15 +1184,15 @@ async fn web_create_product(
 }
 
 // The product-tax ASSOCIATION is the only tax surface left on this screen: the
-// drawer links and unlinks an existing definition. A tax DEFINITION (code,
-// name, rate, active) is owned by Settings on the WEB surface, addressed under
-// `/web/settings/taxes…` behind `settings.manage`, so no `inventory.write` WEB
-// route in this module can create, rename, re-rate or activate/deactivate one.
+// drawer links and unlinks an existing definition. A tax DEFINITION (code, name,
+// rate, active) is owned by Settings, addressed under `/web/settings/taxes…`
+// behind `settings.manage`, so no `inventory.write` WEB route in this module can
+// create, rename, re-rate or activate/deactivate one.
 //
-// Scoped to "on the web" on purpose: the JSON API in `inventory_api.rs` still
-// administers definitions behind `inventory.write`, and U1 deliberately left it
-// that way. See the URL decision in `settings_web.rs` and the open decision in
-// `odd/tasks/product-price-ladder.md`.
+// That is not a web-only rule either: the JSON API's three definition routes
+// (`POST /api/taxes`, `PUT /api/taxes/{id}`, `POST /api/taxes/{id}/deactivate`)
+// are `Require<SettingsManage>` as well, while the association below is
+// `inventory.write` on both surfaces. See the URL decision in `settings_web.rs`.
 
 async fn web_link_product_tax(
     State(state): State<AppState>,

@@ -827,9 +827,9 @@ async fn existing_single_profile_database_is_backfilled_and_can_switch_to_englis
 //
 // THE CANONICAL TAX-DEFINITION SURFACE ON THE WEB (T3, narrowed by U1).
 //
-// SCOPE FIRST: everything in this block is about the WEB surface. The JSON API
-// is a different surface with different permissions and is deliberately not
-// covered by the claim below — the residual is named at the bottom.
+// SCOPE FIRST: everything in this block is about the WEB surface, argued from
+// the web's own address space. The JSON API is a separate surface, and it keeps
+// the same rule for the same reason; that is stated at the bottom.
 //
 // Settings owns tax definitions on the web, so every mutation a definition
 // needs is addressed under `/web/settings/taxes…` and every one of those routes
@@ -852,13 +852,15 @@ async fn existing_single_profile_database_is_backfilled_and_can_switch_to_englis
 // `inventory.write`. The two surfaces never share a handler — a principal may
 // hold one permission and not the other.
 //
-// THE RESIDUAL: the JSON API still administers tax definitions behind
-// `inventory.write` (`POST /api/taxes`, `PUT /api/taxes/{id}` and
-// `POST /api/taxes/{id}/deactivate`, all `Require<InventoryWrite>` in
-// `src/routes/inventory_api.rs`). Pre-existing, not a U1 regression, and left
-// alone on purpose: narrowing it is an open product decision, not a side effect
-// of de-duplicating the web catalogue. So the claim above is "the WEB catalogue
-// is settings-only" — never "tax administration is settings-only".
+// THE JSON API KEEPS THE SAME RULE, and for the same reason: `POST /api/taxes`,
+// `PUT /api/taxes/{id}` and `POST /api/taxes/{id}/deactivate` in
+// `src/routes/inventory_api.rs` are `Require<SettingsManage>`, so a tax
+// DEFINITION has one owner on every surface. What the API does NOT share with
+// the web is the read side and the association: reading a definition there is
+// `inventory.read`, linking a tax to a product is `inventory.write`, and the
+// hard delete has no JSON route at all.
+// `tax_api_definition_administration_is_exclusive_to_settings_manage` in
+// `tax_tests.rs` proves the API half.
 
 /// One tax created through the real repository, for the fixtures that only need
 /// one to exist before the surface under test is exercised.
@@ -1004,8 +1006,9 @@ async fn settings_taxes_tab_is_refused_without_the_settings_manage_permission() 
 /// a principal that holds the inventory gate cannot touch the definition
 /// surface, and nothing is written. (Since U1 it cannot reach a definition from
 /// any WEB address — `tax_web_definition_administration_is_exclusive_to_settings_
-/// manage` in `tax_tests.rs` proves the inventory side is now 404, not 403.
-/// The JSON API is out of scope for that test and still admits `inventory.write`.)
+/// manage` in `tax_tests.rs` proves the inventory side is now 404, not 403 —
+/// and the JSON API keeps the same rule, so an `inventory.write` client is
+/// refused there too with a 403.)
 #[tokio::test]
 async fn settings_tax_administration_is_refused_without_the_settings_manage_permission() {
     let state = configured_state().await;
