@@ -5,6 +5,7 @@ pub mod documents;
 pub mod finance_methods;
 pub mod identity;
 pub mod inventory;
+pub mod line_taxes;
 pub mod purchases;
 pub mod sales;
 pub mod settings;

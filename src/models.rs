@@ -140,6 +140,60 @@ pub struct ProductTaxView {
 }
 
 // ---------------------------------------------------------------------------
+// Line tax snapshots (tax calculation and settings)
+// ---------------------------------------------------------------------------
+
+/// One tax's immutable facts as a document line recorded them, together with
+/// the contribution that tax made to the line's net subtotal.
+///
+/// This is the WRITE shape of a snapshot: it carries no id of its own and no
+/// parent, so the same value is inserted into the sale-line or the
+/// purchase-line snapshot table and the calculation contract can produce it
+/// without knowing which family will consume it. `rate` and `amount` are
+/// canonical decimals stored as TEXT; `tax_code`/`tax_name` are frozen copies,
+/// never a live join to `taxes`. The columns are named `tax_code`/`tax_name`
+/// because inside a line-tax table the qualifier is what makes the row
+/// readable; the Rust fields keep the shorter shape `Tax` already uses.
+#[derive(Debug, Clone)]
+pub struct NewLineTax {
+    pub tax_id: i64,
+    pub code: String,
+    pub name: String,
+    /// The rate the calculation used, as a percentage.
+    pub rate: Decimal,
+    /// The rounded contribution of this tax to the line's net subtotal.
+    pub amount: Decimal,
+}
+
+/// A stored sale-line tax snapshot: [`NewLineTax`] plus the row's identity and
+/// the line it belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleLineTax {
+    pub id: i64,
+    pub sale_line_id: i64,
+    pub tax_id: i64,
+    pub code: String,
+    pub name: String,
+    pub rate: Decimal,
+    pub amount: Decimal,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// A stored purchase-line tax snapshot: [`NewLineTax`] plus the row's identity
+/// and the line it belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurchaseLineTax {
+    pub id: i64,
+    pub purchase_line_id: i64,
+    pub tax_id: i64,
+    pub code: String,
+    pub name: String,
+    pub rate: Decimal,
+    pub amount: Decimal,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Account {
@@ -685,6 +739,12 @@ pub struct SaleLine {
     pub qty: Decimal,
     /// Decimal unit_price >= 0, frozen at confirm, stored as TEXT.
     pub unit_price: Decimal,
+    /// Decimal tax total stored as TEXT: the sum of this line's snapshotted
+    /// tax contributions, written when the line's taxes are computed. The net
+    /// subtotal and the tax-inclusive total are NOT stored — they are derived
+    /// from `qty`, `unit_price` and this value, so no line can hold a total
+    /// that disagrees with its own quantity and price.
+    pub tax_total: Decimal,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -1116,6 +1176,9 @@ pub struct PurchaseLine {
     pub qty: Decimal,
     /// Decimal unit_cost >= 0, frozen at confirm, stored as TEXT.
     pub unit_cost: Decimal,
+    /// Decimal tax total stored as TEXT; the purchase-line mirror of
+    /// `SaleLine::tax_total`, with the same derived-total rule.
+    pub tax_total: Decimal,
     pub created_at: chrono::NaiveDateTime,
 }
 

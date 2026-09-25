@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
@@ -77,6 +77,20 @@ pub trait TaxRepository: Send + Sync {
 pub trait ProductTaxRepository: Send + Sync {
     async fn link(&self, actor: i64, product_id: i64, tax_id: i64) -> AppResult<ProductTax>;
     async fn list_by_product(&self, product_id: i64) -> AppResult<Vec<ProductTax>>;
+    /// The tax definitions a document line will charge: every tax currently
+    /// LINKED to this product and still ACTIVE, ordered by code then id so the
+    /// calculation and the stored breakdown are deterministic.
+    ///
+    /// This is the resolution boundary where INACTIVE taxes are excluded: the
+    /// pure calculation contract applies exactly the definitions it receives,
+    /// so a deactivated tax must never survive this read. It is a pure read —
+    /// it creates no link and changes no row.
+    // T2 is the first caller outside tests (the product tax-inclusive preview
+    // and, through the shared statement below, the document line writes), so
+    // the `allow` is dropped then. It is here, not on the module, because this
+    // trait carries plenty of other methods that are used today.
+    #[allow(dead_code)]
+    async fn list_active_for_product(&self, product_id: i64) -> AppResult<Vec<Tax>>;
     async fn unlink(&self, product_id: i64, tax_id: i64) -> AppResult<bool>;
 }
 
@@ -239,4 +253,40 @@ impl ProductTaxRepository for SqliteProductTaxRepository {
             .await?;
         Ok(result.rows_affected() == 1)
     }
+
+    async fn list_active_for_product(&self, product_id: i64) -> AppResult<Vec<Tax>> {
+        let mut conn = self.pool.acquire().await?;
+        active_taxes_for_product(&mut conn, product_id).await
+    }
+}
+
+/// The active-tax resolution statement, shared by the public read above and by
+/// the document repositories' line transactions.
+///
+/// It takes a CONNECTION, not a pool, so a caller that is already inside a
+/// transaction resolves the taxes through that same transaction: the snapshot
+/// a line writes and the catalog state it was resolved from are then one
+/// consistent view, and a tax deactivated or re-rated while the line was being
+/// written cannot slip between the two.
+pub(crate) async fn active_taxes_for_product(
+    conn: &mut SqliteConnection,
+    product_id: i64,
+) -> AppResult<Vec<Tax>> {
+    // ONE joined read: the link table decides membership, `taxes.is_active`
+    // decides whether the tax still applies. The existing `list_by_product` +
+    // per-tax `find_by_id` shape would need N+1 reads and would apply the
+    // active filter in Rust, where a missing row would be indistinguishable
+    // from an inactive one.
+    let rows = sqlx::query(
+        r#"SELECT t.id, t.code, t.name, t.rate, t.is_active, t.created_by, t.updated_by,
+                  t.created_at, t.updated_at
+           FROM product_taxes pt
+           JOIN taxes t ON t.id = pt.tax_id
+           WHERE pt.product_id = ? AND t.is_active = 1
+           ORDER BY t.code, t.id"#,
+    )
+    .bind(product_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows.into_iter().map(row_to_tax).collect())
 }

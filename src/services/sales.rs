@@ -371,10 +371,11 @@ where
             .await?
             .ok_or_else(|| AppError::NotFound(format!("sale {} not found", line.sale_id)))?;
         Self::ensure_draft(&sale)?;
-        let deleted = self.sales.delete_line(line_id).await?;
-        if !deleted {
-            return Err(AppError::NotFound(format!("sale line {line_id} not found")));
-        }
+        // The repository refuses a line whose sale is not a Draft and reports a
+        // missing one as `NotFound`, so this call carries the same answers the
+        // guards above do — the `ensure_draft` check stays as the early,
+        // cheap refusal and the statement is the backstop.
+        self.sales.delete_line(line_id).await?;
         Ok(())
     }
 

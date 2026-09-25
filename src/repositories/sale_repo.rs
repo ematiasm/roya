@@ -1,14 +1,17 @@
 use async_trait::async_trait;
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    DocumentKind, DocumentQuery, DocumentRow, NewSale, PaymentType, Sale, SaleLine, SaleListFilter,
-    SalePayment, SaleStatus, UpdateSaleDraft,
+    DocumentKind, DocumentQuery, DocumentRow, NewLineTax, NewSale, PaymentType, Sale, SaleLine,
+    SaleListFilter, SalePayment, SaleStatus, UpdateSaleDraft,
 };
+use crate::repositories::tax_repo::active_taxes_for_product;
+use crate::repositories::tax_snapshot_repo::replace_sale_line_taxes;
+use crate::services::line_taxes::calculate_line_taxes;
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
@@ -66,12 +69,14 @@ fn row_to_sale(row: sqlx::sqlite::SqliteRow) -> Sale {
 fn row_to_line(row: sqlx::sqlite::SqliteRow) -> SaleLine {
     let qty_str: String = row.get("qty");
     let price_str: String = row.get("unit_price");
+    let tax_str: String = row.get("tax_total");
     SaleLine {
         id: row.get("id"),
         sale_id: row.get("sale_id"),
         product_id: row.get("product_id"),
         qty: parse_decimal(&qty_str),
         unit_price: parse_decimal(&price_str),
+        tax_total: parse_decimal(&tax_str),
         created_at: row.get("created_at"),
     }
 }
@@ -162,6 +167,21 @@ pub trait SaleRepository: Send + Sync {
     /// Transition Draft/Confirmed -> Cancelled.
     async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale>;
 
+    /// Create a line on a DRAFT sale together with everything the feature says
+    /// a line must carry: the frozen tax breakdown and the tax total that
+    /// summarizes it. ONE transaction, ONE public contract — this method IS the
+    /// tax-aware write, so there is no second, tax-free way to add a line.
+    ///
+    /// The taxes are resolved from the product's ACTIVE links INSIDE that
+    /// transaction, so a tax deactivated or re-rated while the line was being
+    /// written cannot slip between resolution and persistence. The calculation
+    /// is the shared contract (`services::line_taxes`), so the sale, purchase
+    /// and product-preview paths cannot disagree by a cent.
+    ///
+    /// The DRAFT requirement is in the INSERT's own `WHERE` clause, not only in
+    /// the service: even a caller that skipped the service's state guard cannot
+    /// attach a line to a Confirmed or Cancelled sale. `NotFound` for a sale
+    /// that does not exist, `Conflict` for one that is not a Draft.
     async fn create_line(
         &self,
         sale_id: i64,
@@ -171,8 +191,30 @@ pub trait SaleRepository: Send + Sync {
     ) -> AppResult<SaleLine>;
     async fn find_line(&self, id: i64) -> AppResult<Option<SaleLine>>;
     async fn list_lines(&self, sale_id: i64) -> AppResult<Vec<SaleLine>>;
+    /// Edit a DRAFT line: new quantity, new price, the breakdown REPLACED by the
+    /// taxes that are active right now, and the tax total recomputed from all
+    /// three — atomically, in the same single transaction as the create.
+    ///
+    /// Replacing (never appending) is what keeps a line's breakdown equal to the
+    /// catalog state it was last edited against: a tax that stopped applying
+    /// disappears from the line instead of surviving as stale money.
+    ///
+    /// The DRAFT predicate is part of the UPDATE's `WHERE`, and the breakdown is
+    /// only touched after that UPDATE has matched, so a Confirmed line's
+    /// quantity, price, aggregate and snapshots are all provably untouched by a
+    /// refused call. `NotFound` for an unknown line, `Conflict` for one whose
+    /// sale is no longer a Draft.
     async fn update_line(&self, id: i64, qty: Decimal, unit_price: Decimal) -> AppResult<SaleLine>;
-    async fn delete_line(&self, id: i64) -> AppResult<bool>;
+    /// Remove a DRAFT line, and with it the tax breakdown the line CASCADEs —
+    /// the ordinary "the operator changed their mind" case.
+    ///
+    /// The DRAFT predicate is in the DELETE's own `WHERE` clause, the same
+    /// backstop `create_line` and `update_line` carry: a Confirmed or Cancelled
+    /// sale's line cannot be removed even by a caller that skipped the service's
+    /// state guard, and deleting it would CASCADE away the immutable record of
+    /// what the document actually charged. `NotFound` for a line that does not
+    /// exist, `Conflict` for one whose sale is no longer a Draft.
+    async fn delete_line(&self, id: i64) -> AppResult<()>;
 
     /// Delete a DRAFT sale — or a DISCARDED one (Cancelled while never
     /// confirmed: `sale_number IS NULL`) — and let its lines die by
@@ -277,6 +319,131 @@ impl SqliteSaleRepository {
     #[cfg(test)]
     pub(crate) fn read_count(&self) -> usize {
         self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The ONE implementation behind `SaleRepository::create_line`: insert the
+    /// line, snapshot its resolved taxes and store the aggregate that
+    /// summarizes them, in a single transaction. Private on purpose — the
+    /// public trait method is the contract, so a caller cannot reach a
+    /// tax-aware path that behaves differently from the ordinary one.
+    async fn write_line_with_taxes(
+        &self,
+        sale_id: i64,
+        product_id: i64,
+        qty: Decimal,
+        unit_price: Decimal,
+    ) -> AppResult<SaleLine> {
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve, calculate, write — all inside this one transaction, so the
+        // breakdown and the aggregate that summarizes it can never be committed
+        // apart. The resolver takes this transaction's connection, so the taxes
+        // a line is snapshotted with are the ones its own transaction saw.
+        let taxes = active_taxes_for_product(&mut tx, product_id).await?;
+        let calc = calculate_line_taxes(qty * unit_price, &taxes);
+
+        // The DRAFT predicate is the statement's own: a Confirmed sale matches
+        // no row and the insert is a no-op, not a line on closed history.
+        let row = sqlx::query(
+            r#"INSERT INTO sale_lines (sale_id, product_id, qty, unit_price, tax_total)
+               SELECT ?, ?, ?, ?, ?
+               WHERE EXISTS (SELECT 1 FROM sales WHERE id = ? AND status = 'Draft')
+               RETURNING id, sale_id, product_id, qty, unit_price, tax_total, created_at"#,
+        )
+        .bind(sale_id)
+        .bind(product_id)
+        .bind(qty.to_string())
+        .bind(unit_price.to_string())
+        .bind(calc.tax_total.to_string())
+        .bind(sale_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let row = match row {
+            Some(row) => row,
+            None => return Err(Self::refuse_line(&mut tx, sale_id).await),
+        };
+
+        let taxes: Vec<NewLineTax> = calc.taxes.iter().map(NewLineTax::from).collect();
+        replace_sale_line_taxes(&mut tx, row.get("id"), &taxes).await?;
+        tx.commit().await?;
+        Ok(row_to_line(row))
+    }
+
+    /// The ONE implementation behind `SaleRepository::update_line`: guarded
+    /// draft edit, breakdown replaced, aggregate recomputed, one transaction.
+    async fn rewrite_draft_line_taxes(
+        &self,
+        id: i64,
+        qty: Decimal,
+        unit_price: Decimal,
+    ) -> AppResult<SaleLine> {
+        let mut tx = self.pool.begin().await?;
+
+        // The line's product and its owning document, read inside the
+        // transaction that will write it.
+        let current: Option<(i64, i64)> =
+            sqlx::query_as("SELECT product_id, sale_id FROM sale_lines WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_db_err)?;
+        let (product_id, sale_id) = match current {
+            Some(current) => current,
+            None => return Err(AppError::NotFound(format!("sale line {id} not found"))),
+        };
+
+        // Resolved through this transaction, like the creation path.
+        let taxes = active_taxes_for_product(&mut tx, product_id).await?;
+        let calc = calculate_line_taxes(qty * unit_price, &taxes);
+
+        // The DRAFT predicate is in the UPDATE's own WHERE. If it matches
+        // nothing, the line belongs to a closed document and NOTHING below
+        // runs: no snapshot is deleted, none is inserted, and the stored
+        // aggregate is left alone.
+        let row = sqlx::query(
+            r#"UPDATE sale_lines SET qty = ?, unit_price = ?, tax_total = ?
+               WHERE id = ?
+                 AND EXISTS (SELECT 1 FROM sales s WHERE s.id = sale_lines.sale_id AND s.status = 'Draft')
+               RETURNING id, sale_id, product_id, qty, unit_price, tax_total, created_at"#,
+        )
+        .bind(qty.to_string())
+        .bind(unit_price.to_string())
+        .bind(calc.tax_total.to_string())
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        let row = match row {
+            Some(row) => row,
+            None => return Err(Self::refuse_line(&mut tx, sale_id).await),
+        };
+
+        // Reached only for a DRAFT line: swap the whole breakdown, so no
+        // snapshot of a tax that stopped applying can survive the edit.
+        let taxes: Vec<NewLineTax> = calc.taxes.iter().map(NewLineTax::from).collect();
+        replace_sale_line_taxes(&mut tx, id, &taxes).await?;
+        tx.commit().await?;
+        Ok(row_to_line(row))
+    }
+
+    /// Why a tax-aware line write matched no row: either the sale does not
+    /// exist, or it exists and is no longer a Draft. Read through the CALLER'S
+    /// transaction, so the refusal describes the same state the write saw, and
+    /// the two cases stay distinguishable — a missing document is a 404, a
+    /// frozen one is a conflict the caller can explain.
+    async fn refuse_line(conn: &mut SqliteConnection, sale_id: i64) -> AppError {
+        let status = sqlx::query_scalar::<_, String>("SELECT status FROM sales WHERE id = ?")
+            .bind(sale_id)
+            .fetch_optional(&mut *conn)
+            .await;
+        match status {
+            Ok(None) => AppError::NotFound(format!("sale {sale_id} not found")),
+            Ok(Some(status)) => AppError::Conflict(format!(
+                "sale {sale_id} is {status}: its lines and their taxes are frozen"
+            )),
+            Err(error) => AppError::Database(error),
+        }
     }
 }
 
@@ -443,7 +610,7 @@ impl SaleRepository for SqliteSaleRepository {
         let ids: Vec<i64> = sales.iter().map(|sale| sale.id).collect();
 
         let mut lines_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, sale_id, product_id, qty, unit_price, created_at FROM sale_lines WHERE sale_id IN (",
+            "SELECT id, sale_id, product_id, qty, unit_price, tax_total, created_at FROM sale_lines WHERE sale_id IN (",
         );
         {
             let mut separated = lines_qb.separated(", ");
@@ -590,24 +757,14 @@ impl SaleRepository for SqliteSaleRepository {
         qty: Decimal,
         unit_price: Decimal,
     ) -> AppResult<SaleLine> {
-        let row = sqlx::query(
-            r#"INSERT INTO sale_lines (sale_id, product_id, qty, unit_price)
-               VALUES (?, ?, ?, ?)
-               RETURNING id, sale_id, product_id, qty, unit_price, created_at"#,
-        )
-        .bind(sale_id)
-        .bind(product_id)
-        .bind(qty.to_string())
-        .bind(unit_price.to_string())
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_db_err)?;
-        Ok(row_to_line(row))
+        // The public contract and the tax-aware write are the same operation.
+        self.write_line_with_taxes(sale_id, product_id, qty, unit_price)
+            .await
     }
 
     async fn find_line(&self, id: i64) -> AppResult<Option<SaleLine>> {
         let row = sqlx::query(
-            r#"SELECT id, sale_id, product_id, qty, unit_price, created_at
+            r#"SELECT id, sale_id, product_id, qty, unit_price, tax_total, created_at
                FROM sale_lines WHERE id = ?"#,
         )
         .bind(id)
@@ -620,7 +777,7 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
         let rows = sqlx::query(
-            r#"SELECT id, sale_id, product_id, qty, unit_price, created_at
+            r#"SELECT id, sale_id, product_id, qty, unit_price, tax_total, created_at
                FROM sale_lines WHERE sale_id = ? ORDER BY id"#,
         )
         .bind(sale_id)
@@ -630,25 +787,45 @@ impl SaleRepository for SqliteSaleRepository {
     }
 
     async fn update_line(&self, id: i64, qty: Decimal, unit_price: Decimal) -> AppResult<SaleLine> {
-        let row = sqlx::query(
-            r#"UPDATE sale_lines SET qty = ?, unit_price = ? WHERE id = ?
-               RETURNING id, sale_id, product_id, qty, unit_price, created_at"#,
-        )
-        .bind(qty.to_string())
-        .bind(unit_price.to_string())
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_db_err)?;
-        Ok(row_to_line(row))
+        // Same single contract on the edit path: the breakdown is replaced and
+        // the aggregate recomputed, never left behind a stale total.
+        self.rewrite_draft_line_taxes(id, qty, unit_price).await
     }
 
-    async fn delete_line(&self, id: i64) -> AppResult<bool> {
-        let res = sqlx::query(r#"DELETE FROM sale_lines WHERE id = ?"#)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(res.rows_affected() > 0)
+    async fn delete_line(&self, id: i64) -> AppResult<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // The owning document, read inside the transaction that will delete.
+        let sale_id: Option<i64> =
+            sqlx::query_scalar("SELECT sale_id FROM sale_lines WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_db_err)?;
+        let sale_id = match sale_id {
+            Some(sale_id) => sale_id,
+            None => return Err(AppError::NotFound(format!("sale line {id} not found"))),
+        };
+
+        // The DRAFT predicate is this statement's own WHERE. Zero rows means the
+        // line belongs to a closed document, and the refusal is read through the
+        // same transaction so it describes the state the delete saw.
+        let res = sqlx::query(
+            r#"DELETE FROM sale_lines
+               WHERE id = ?
+                 AND EXISTS (SELECT 1 FROM sales s WHERE s.id = sale_lines.sale_id AND s.status = 'Draft')"#,
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_db_err)?;
+        if res.rows_affected() == 0 {
+            return Err(Self::refuse_line(&mut tx, sale_id).await);
+        }
+        // The line's breakdown went with it by CASCADE, inside this same
+        // transaction: a refusal can never leave a half-deleted line.
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn delete_draft(&self, id: i64) -> AppResult<bool> {
@@ -820,7 +997,7 @@ impl SaleRepository for SqliteSaleRepository {
         // in Rust over `SaleLine::subtotal`, never with SQL SUM over TEXT.
         let ids: Vec<i64> = sales.iter().map(|sale| sale.id).collect();
         let mut lines_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, sale_id, product_id, qty, unit_price, created_at FROM sale_lines WHERE sale_id IN (",
+            "SELECT id, sale_id, product_id, qty, unit_price, tax_total, created_at FROM sale_lines WHERE sale_id IN (",
         );
         {
             let mut separated = lines_qb.separated(", ");

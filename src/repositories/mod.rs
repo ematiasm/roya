@@ -21,6 +21,7 @@ pub mod setup_repo;
 pub mod stock_repo;
 pub mod supplier_repo;
 pub mod tax_repo;
+pub mod tax_snapshot_repo;
 pub mod transaction_repo;
 pub mod user_repo;
 
@@ -51,6 +52,7 @@ pub use supplier_repo::{SqliteSupplierRepository, SupplierRepository};
 pub use tax_repo::{
     ProductTaxRepository, SqliteProductTaxRepository, SqliteTaxRepository, TaxRepository,
 };
+pub use tax_snapshot_repo::{SqliteTaxSnapshotRepository, TaxSnapshotRepository};
 pub use transaction_repo::{SqliteTransactionRepository, TransactionRepository};
 pub use user_repo::{SqliteUserRepository, UserRepository};
 

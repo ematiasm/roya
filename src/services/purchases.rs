@@ -515,12 +515,9 @@ where
                 AppError::NotFound(format!("purchase {} not found", line.purchase_id))
             })?;
         Self::ensure_draft(&purchase)?;
-        let deleted = self.purchases.delete_line(line_id).await?;
-        if !deleted {
-            return Err(AppError::NotFound(format!(
-                "purchase line {line_id} not found"
-            )));
-        }
+        // Same answers as the guards above, now enforced by the statement too:
+        // `NotFound` for a missing line, `Conflict` for a closed purchase.
+        self.purchases.delete_line(line_id).await?;
         self.purchases.touch_draft(line.purchase_id, actor).await?;
         Ok(())
     }
