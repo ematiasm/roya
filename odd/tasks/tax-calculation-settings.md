@@ -139,10 +139,10 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
   visual-baseline audit.
 
 
-- [ ] T4 — Run final verification and record delivery evidence.
-  - Run focused suites, the full Rust suite, formatting/diff checks, and applicable E2E checks.
-  - Record failures, skips, and environment limitations honestly.
-  - Evidence: exact command results and final branch state.
+- [x] T4 — Run final verification and record delivery evidence.
+  - Ran the full Rust suite, focused tax/settings/sales/purchases/documents/localization suites, compile, formatting, diff, settings browser, visual baseline, and the complete browser suite.
+  - Ran a fresh-database migration smoke check through the application's own embedded migrator on a throwaway `/tmp` database and verified the development database was byte-identical afterward.
+  - Evidence: `cargo test` → 1063 passed; `cargo check --all-targets` → 0 errors, 81 warnings; `cargo fmt --check` and `git diff --check` clean; working tree clean; `cargo test tax_` → 98, `settings_` → 23, `sales` → 122, `purchases` → 161, `documents` → 30, `localization_tests` → 39; `bash scripts/e2e.sh tests/test_settings.py` → 6 passed; `bash scripts/e2e.sh tests/test_visual_baseline.py` → 1 passed; `bash scripts/e2e.sh` → 107 passed, 4 intentionally skipped opt-in probes; migrations 36-39 applied cleanly on an empty database with `sale_line_taxes` and `purchase_line_taxes` present and zero failures; `roya.db`, `-shm`, and `-wal` unchanged in size, mtime, and md5. Verdict: PASS. No commit required beyond the T4 evidence commit.
 
 ## Acceptance criteria
 
@@ -182,4 +182,7 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
 - T2 delivery: work-unit commit `a8fa64c` (`feat(tax): make document totals tax-inclusive`).
 - T3 verification: the Settings tax catalogue is correctly gated, the business tab is unchanged, hard deletion is server-confirmed and refused for both reference families with history taking priority, and product-association management from the inventory drawer is untouched. Independent verification confirmed the true authorization invariant: this feature makes irreversible administration exclusive to `settings.manage`, while pre-existing `inventory.write` catalogue access to create, rename, re-rate, and activate/deactivate taxes is deliberately unchanged. Final verdict: PASS.
 - T3 delivery: work-unit commit `3b9a927` (`feat(tax): add settings taxes tab with hard-delete safeguard`).
-- Next step: T4 final branch-wide verification, honest skip accounting, and delivery evidence.
+- T4 verification: PASS. No failed check and no environment blocker. The four browser skips are intentional opt-in artifact/screenshot probes, not regressions. The development database was verified byte-identical (size, mtime, md5) after every check.
+- Delivery accounting: branch `feat/tax-calculation-settings` is 34 files, approximately 7,856 authored changed lines versus `main` (excluding the generated visual baseline). T1 = 2,885, T2 = 2,295, T3 = 2,744. Each cohesive work unit individually exceeds the 400-line advisory budget; the recorded `ask-on-risk` → `stacked-to-main` decision covers the delivery route, and a single-PR route would require maintainer-approved `size:exception`. No push, PR creation, or merge has been performed.
+- Follow-ups outside this feature: add `/settings` and `/settings?tab=taxes` to the visual baseline; refine the delete-confirmation panel placement and dialog semantics; decide whether the Products catalogue's `inventory.write` tax access should eventually narrow to `settings.manage`; rebuild `static/tailwind.css`, which is stale for 14 pre-existing classes across 11 templates.
+- Next step: delivery is the user's decision. The feature is implemented, verified, and committed on a local feature branch.
