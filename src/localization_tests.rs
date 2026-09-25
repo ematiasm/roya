@@ -3,7 +3,7 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePoolOptions;
@@ -1147,6 +1147,18 @@ async fn locale_presentation_supplier_detail_localizes_purchase_date_and_decimal
     assert!(!detail.contains("2.5000"), "raw Decimal: {detail}");
 }
 
+#[test]
+fn business_timezone_date_conversion_is_deterministic_at_a_date_boundary() {
+    let mut business_settings = settings("es-AR");
+    business_settings.timezone = "Pacific/Kiritimati".into();
+    let context = resolve_context(Some(&business_settings), &[locale("es-AR", "es", true)]);
+    let instant = "2026-09-25T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+    let utc_date = instant.format("%Y-%m-%d").to_string();
+
+    assert_eq!(utc_date, "2026-09-25");
+    assert_eq!(context.today_iso_at(instant), "2026-09-26");
+}
+
 #[tokio::test]
 async fn locale_presentation_business_timezone_controls_affected_web_and_api_date_defaults() {
     let (app, pool) = localized_app_with_timezone("Pacific/Kiritimati").await;
@@ -1154,11 +1166,6 @@ async fn locale_presentation_business_timezone_controls_affected_web_and_api_dat
     business_settings.timezone = "Pacific/Kiritimati".into();
     let context = resolve_context(Some(&business_settings), &[locale("es-AR", "es", true)]);
     let expected_today = context.today_iso();
-    let host_today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    assert_ne!(
-        expected_today, host_today,
-        "this regression test must exercise a date boundary"
-    );
 
     let customer_id = seed_localized_customer(&app).await;
     let product_id = seed_localized_product(&app, "LOC-TIMEZONE-DEFAULT").await;
