@@ -30,6 +30,7 @@ from helpers import (
     create_product,
     create_sale_draft,
     create_supplier,
+    e2e_copy,
 )
 
 _DOCUMENTS_PAGE = "/documents"
@@ -117,22 +118,22 @@ def _create_role_with_one_permission(
 ) -> None:
     """A role whose permission matrix holds exactly one code, via the editor."""
     page.goto(f"{base_url}/roles")
-    page.get_by_role("button", name="Nuevo rol").click()
+    page.get_by_role("button", name=e2e_copy("new_role")).click()
     dialog = page.locator("#new-role-dialog")
     dialog.locator('input[name="code"]').fill(role_name)
     dialog.locator('input[name="name"]').fill(role_name)
     dialog.locator('input[name="description"]').fill(f"Ve sólo {code}.")
     with page.expect_response(_response_for("/web/roles", "POST")):
-        dialog.get_by_role("button", name="Crear rol").click()
+        dialog.get_by_role("button", name=e2e_copy("create_role")).click()
 
     row = page.locator("#role-list-inner > div > div", has_text=role_name)
-    row.locator('button[aria-label="Editar rol y permisos"]').click()
+    row.locator(f'button[aria-label="{e2e_copy("edit_role")}"]').click()
     edit_dialog = page.locator("#role-edit-dialog")
     edit_dialog.locator("label", has_text=code).locator(
         'input[name="permission_ids"]'
     ).check()
     with page.expect_response(_response_for("/web/roles/matrix", "POST")):
-        edit_dialog.get_by_role("button", name="Guardar permisos").click()
+        edit_dialog.get_by_role("button", name=e2e_copy("save_permissions")).click()
 
 
 def _create_user_with_role(
@@ -140,43 +141,43 @@ def _create_user_with_role(
 ) -> None:
     """A user holding exactly one role, created through the real screens."""
     page.goto(f"{base_url}/users")
-    page.get_by_role("button", name="Nuevo usuario").click()
+    page.get_by_role("button", name=e2e_copy("new_user")).click()
     dialog = page.locator("#new-user-dialog")
     dialog.locator('input[name="username"]').fill(username)
     dialog.locator('input[name="display_name"]').fill(username)
     dialog.locator('input[name="password"]').fill(password)
     with page.expect_response(_response_for("/web/users", "POST")):
-        dialog.get_by_role("button", name="Crear usuario").click()
+        dialog.get_by_role("button", name=e2e_copy("create_user")).click()
     expect(page.locator("#user-list")).to_contain_text(username)
 
     # Scoped to the CREATED user's row: the `sistema` sentinel row also has a
     # roles button, so the click must name whose row it means.
     page.locator("#user-list-inner > div > div", has_text=username).locator(
-        'button[aria-label="Asignar roles"]'
+        f'button[aria-label="{e2e_copy("assign_roles")}"]'
     ).click()
     roles_dialog = page.locator("#user-edit-dialog")
-    expect(roles_dialog).to_contain_text(f"Roles de {username}")
+    expect(roles_dialog).to_contain_text(f"Roles — {username}")
     roles_dialog.locator("label", has_text=role_name).locator(
         'input[name="role_ids"]'
     ).check()
     with page.expect_response(_response_for("/web/users/roles", "POST")):
-        roles_dialog.get_by_role("button", name="Guardar roles").click()
+        roles_dialog.get_by_role("button", name=e2e_copy("save_roles")).click()
 
 
 def _log_in_through_the_form(page: Page, base_url: str, username: str, password: str):
     """Drive the real login form and return the page the browser lands on."""
     page.goto(f"{base_url}/login")
-    page.get_by_label("Usuario").fill(username)
-    page.get_by_label("Contraseña").fill(password)
-    page.get_by_role("button", name="Iniciar sesión").click()
+    page.get_by_label(e2e_copy("username")).fill(username)
+    page.get_by_label(e2e_copy("password")).fill(password)
+    page.get_by_role("button", name=e2e_copy("sign_in")).click()
 
 
 def _change_confined_password(page: Page, *, current: str, new: str) -> None:
     """Complete the confined password change through the real form."""
-    page.get_by_label("Contraseña actual").fill(current)
-    page.get_by_label("Nueva contraseña", exact=True).fill(new)
-    page.get_by_label("Confirmar nueva contraseña").fill(new)
-    page.get_by_role("button", name="Guardar contraseña").click()
+    page.get_by_label(e2e_copy("current_password")).fill(current)
+    page.get_by_label(e2e_copy("new_password"), exact=True).fill(new)
+    page.get_by_label(e2e_copy("confirm_password")).fill(new)
+    page.get_by_role("button", name=e2e_copy("save_password")).click()
 
 
 # ---------------------------------------------------------------------------
@@ -319,19 +320,17 @@ def test_the_impact_preview_renders_before_the_button(page: Page, api: ApiClient
     # The draft: the delete action with its impact above the button.
     _open_drawer(page, "sale", draft_id)
     body = page.locator(_DETAIL_INNER)
-    expect(body).to_contain_text("Se elimina el borrador y su 1 línea")
-    expect(body).to_contain_text("Nunca se confirmó")
+    expect(body).to_contain_text(e2e_copy("delete_draft_impact"))
+    expect(body).to_contain_text(e2e_copy("never_confirmed"))
     delete_button = body.locator('button[hx-delete="/web/sales/%d"]' % draft_id)
     expect(delete_button).to_be_visible()
 
     # The confirmed sale: the annulment's effects, listed before its button.
     _open_drawer(page, "sale", confirmed_id)
-    expect(body).to_contain_text(
-        "Se devuelve el stock de «Impact Widget» (1) con un movimiento In · Sale-return."
-    )
-    expect(body).to_contain_text(
-        "Se reembolsa «10.00» en «Caja» con un asiento Expense."
-    )
+    expect(body).to_contain_text(e2e_copy("sale_return_stock"))
+    expect(body).to_contain_text("Impact Widget")
+    expect(body).to_contain_text(e2e_copy("refund_account"))
+    expect(body).to_contain_text("Caja")
     expect(body.locator('form[hx-post="/web/sales/cancel"]')).to_be_visible()
 
 
@@ -355,7 +354,7 @@ def test_deleting_a_draft_refreshes_the_feed_and_closes_the_drawer(
 
     _open_documents_page(page, api)
     listing = page.locator(_DOCUMENT_LIST)
-    expect(listing).to_contain_text(f"Draft #{sale_id}")
+    expect(listing).to_contain_text(f"{e2e_copy('draft_ref')}{sale_id}")
 
     _open_drawer(page, "sale", sale_id)
     seen = _answer_next_dialog(page, accept=True)
@@ -363,7 +362,7 @@ def test_deleting_a_draft_refreshes_the_feed_and_closes_the_drawer(
         page.locator(_DETAIL_INNER).locator(
             f'button[hx-delete="/web/sales/{sale_id}"]'
         ).click()
-    assert "no se puede deshacer" in seen[0], seen
+    assert e2e_copy("no_undo") in seen[0], seen
 
     # The feed re-read lands the row's disappearance; expect() polls for it
     # instead of sleeping.
@@ -409,12 +408,12 @@ def test_annulling_a_confirmed_sale_refreshes_the_feed_and_closes_the_drawer(
     seen = _answer_next_dialog(page, accept=True)
     with page.expect_response(_response_for("/web/sales/cancel", "POST")):
         form.locator('button[type="submit"]').click()
-    assert "no se puede deshacer" in seen[0], seen
+    assert e2e_copy("no_undo") in seen[0], seen
 
     # The feed re-read lands the row's new state; expect() polls for it.
     expect(
         listing.locator('[data-document-kind="sale"]', has_text=sale_number)
-    ).to_contain_text("Cancelled")
+    ).to_contain_text(e2e_copy("cancelled"))
     expect(page.locator(_DRAWER)).not_to_be_visible()
     assert page.evaluate(
         "document.getElementById('document-drawer-body').innerHTML"
@@ -471,7 +470,7 @@ def test_a_refused_annul_names_the_action_and_the_server_message(
 
     # The refusal names the pressed action, then the server's own message.
     notice = page.locator("[data-notice='error']")
-    expect(notice).to_contain_text("Anular documento failed")
+    expect(notice).to_contain_text(e2e_copy("annul_failed"))
     expect(notice).to_contain_text("negative balance")
     # The refusal leaves the operator with the document, not a closed drawer.
     expect(page.locator(_DRAWER)).to_be_visible()

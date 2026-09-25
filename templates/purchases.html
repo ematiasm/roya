@@ -1,15 +1,15 @@
 {% extends "base.html" %}
 {% import "partials/supplier_picker.html" as supplier_picker %}
-{% block title %}Roya — Purchases{% endblock %}
+{% block title %}Roya — {{ localization.tr(crate::localization::MessageKey::NavigationPurchases) }}{% endblock %}
 {% block content %}
-{% let page_title = "Purchases" %}
+{% let page_title = localization.tr(crate::localization::MessageKey::NavigationPurchases) %}
 {% let page_breadcrumb_label = "" %}
 {% let page_breadcrumb_href = "" %}
 {% include "partials/page_header.html" %}
 <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Purchases</h2>
+        <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::NavigationPurchases) }}</h2>
       </div>
       {# The shared list-filter bar: `filter_module` is the singular form-id and
          list-target prefix, `filter_list` the plural endpoint path segment and
@@ -19,13 +19,13 @@
       {% let filter_list = "purchases" %}
       {% include "partials/list_filters_open.html" %}
         <select class="field min-w-[110px] flex-1" name="status">
-          <option value="">All statuses</option>
-          <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>Draft</option>
-          <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>Confirmed</option>
-          <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>Cancelled</option>
+          <option value="">{{ localization.tr(crate::localization::MessageKey::PurchasesFilterStatus) }}</option>
+          <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</option>
+          <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}</option>
+          <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}</option>
         </select>
-        <input class="field min-w-[120px] flex-1" type="text" name="supplier" placeholder="Supplier" value="{{ filter_supplier }}" />
-        <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="Purchase number" value="{{ filter_number }}" />
+        <input class="field min-w-[120px] flex-1" type="text" name="supplier" placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesSupplier) }}" value="{{ filter_supplier }}" />
+        <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesNumber) }}" value="{{ filter_number }}" />
         <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
         <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
       {% include "partials/list_filters_close.html" %}
@@ -49,8 +49,8 @@
     {% if show_suggestions %}
     <div class="rounded-2xl border border-border bg-card p-5" id="suggestion-section">
       <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Suggestions</h2>
-        <button class="btn-secondary" hx-get="/web/purchases/suggestions" hx-target="#suggestion-list" hx-swap="innerHTML">↻ Refresh</button>
+        <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::PurchasesSuggestions) }}</h2>
+        <button class="btn-secondary" hx-get="/web/purchases/suggestions" hx-target="#suggestion-list" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonRefresh) }}</button>
       </div>
       <div id="suggestion-list"
            hx-get="/web/purchases/suggestions"
@@ -58,57 +58,35 @@
            hx-swap="innerHTML">
         {% include "partials/suggestion_list.html" %}
       </div>
-      <div class="mt-2 text-[13px] text-muted">Suggested = max − stock when stock ≤ min. Supplier = preferred satellite row, else cheapest current cost. Products without a cost row are listed separately. Serving a suggestion opens its new draft record.</div>
+      <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesSuggestionsHelp) }}</div>
     </div>
     {% endif %}
 </div>
 
-{# The creation dialog (purchases-create-and-header T3, locked decisions 5
-   and the hazard note): the primary action opens it, and CHOOSING is what
-   creates — the picker's post to the existing `POST /web/purchases` answers
-   `HX-Redirect` to `/purchases/{id}`, so a successful create lands on the
-   new draft's record.
-
-   The supplier is never silently guessed (the feature doc's hazard: the
-   supplier resolves every line's default cost): the picker arrives
-   pre-filled with the LAST USED supplier as a real, editable value (the
-   handler resolves the name server-side); with no purchases yet the field
-   renders empty and the operator must choose.
-
-   Host wiring, per the T2 picker's documented contract: the `include`
-   parameter is EMPTY — it must never carry a `supplier_id`, because htmx
-   accumulates colliding values instead of overwriting, and a clicked
-   result's own form already carries the explicit id that must win. The date
-   needs no field either: the route defaults an absent `purchase_date` to
-   today, and invoice/notes are edited on the record page. The Create draft
-   button posts only the picker's TEXT input (by id): the field's text is
-   the picker's whole contract — the picker's own form carries NO hidden
-   `supplier_id`, so Enter, the button and an accepted pre-fill all resolve
-   the typed (or pre-filled) name server-side and create the RIGHT supplier,
-   never the previous one. A clicked result posts its own explicit id, which
-   the route prefers. #}
+{# The creation dialog: the primary action opens it, and choosing the supplier
+   creates the draft. The supplier picker posts the existing web route and the
+   successful create navigates to the new draft. #}
 {% if page_action_dialog != "" %}
 <dialog id="new-purchase-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="flex flex-col gap-3">
-    <h2 class="text-lg font-semibold">New purchase</h2>
-    <p class="text-[13px] text-muted">The draft gets today's date; invoice and notes are edited on its page.</p>
-    {% call supplier_picker::supplier_picker("/web/purchases", "#new-purchase-dialog", "new-purchase-supplier", current_supplier_name, "") %}
+    <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::PurchasesNew) }}</h2>
+    <p class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesNewHelp) }}</p>
+    {% call supplier_picker::supplier_picker("/web/purchases", "#new-purchase-dialog", "new-purchase-supplier", current_supplier_name, "", localization) %}
     <form hx-post="/web/purchases" hx-include="#new-purchase-supplier" hx-swap="none"
-          data-action="Create purchase" class="flex flex-col gap-2.5">
-      <button type="submit" class="btn-primary">Create draft</button>
-      <p class="text-[13px] text-muted">Creating opens the new draft's page.</p>
+          data-action="{{ localization.tr(crate::localization::MessageKey::PurchasesCreateAction) }}" class="flex flex-col gap-2.5">
+      <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesCreateDraft) }}</button>
+      <p class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesCreateHelp) }}</p>
     </form>
   </div>
 </dialog>
 {% endif %}
 
-{# The purchase peek shell, the same pattern the documents drawer uses: a
-   fixed right panel whose body the list rows swap the detail fragment into
-   (`#purchase-drawer-body`). No backdrop, like the sibling drawer. #}
+{# The purchase peek shell: a fixed right panel whose body the list rows swap
+   the detail fragment into. #}
 <div id="purchase-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-    <span class="text-sm font-semibold">Purchase</span>
-    <button type="button" class="btn-secondary" onclick="closePurchaseDrawer()" aria-label="Close detail">✕</button>
+    <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::DocumentsPurchase) }}</span>
+    <button type="button" class="btn-secondary" onclick="closePurchaseDrawer()" aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
   </div>
   <div id="purchase-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
 </div>

@@ -1,17 +1,9 @@
-{# The role assignment form (S3 part 2, corrected round): replaces the user's
-   whole role set through POST /web/users/roles (identity.roles.manage: the
-   tier that decides who administers the instance), one checkbox per role,
-   checked when held. The backend refuses — with its reason in Spanish — when
-   the change would deactivate the last administrator, and refuses ANY change
-   of the actor's own set: nobody edits their own roles, so no principal can
-   escalate or lock itself out through this form (the button is hidden for
-   the acting user's row; the refusal is real regardless). #}
 <div class="mb-3 flex items-center justify-between gap-6">
-  <h2 class="text-lg font-semibold">Roles de {{ user.user.username }}</h2>
-  <button type="button" class="btn-secondary" onclick="document.getElementById('user-edit-dialog').close()">✕</button>
+  <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::NavigationRoles) }} — {{ user.user.username }}</h2>
+  <button type="button" class="btn-secondary" onclick="document.getElementById('user-edit-dialog').close()" aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}">✕</button>
 </div>
 <form class="flex flex-col gap-2.5"
-      data-action="Assign roles"
+      data-action="{{ localization.tr(crate::localization::MessageKey::IdentityAssignRoles) }}"
       hx-post="/web/users/roles"
       hx-target="#user-list"
       hx-swap="innerHTML"
@@ -22,13 +14,13 @@
     <label class="choice rounded-[10px] border border-border bg-surface px-3 py-2 text-sm">
       <input type="checkbox" name="role_ids" value="{{ role.id }}"
              {% for held in user.roles %}{% if held.id == role.id %}checked{% endif %}{% endfor %} />
-      <span class="font-semibold">{{ role.name }}</span>
+      <span class="font-semibold">{{ localization.seeded_role_display_name(role.code.as_str(), role.name.as_str()) }}</span>
       <span class="text-[12px] text-muted">{{ role.code }}</span>
       {% if role.is_system %}
-      <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] text-muted">protegido</span>
+      <span class="rounded-full border border-border bg-card px-2 py-0.5 text-[11px] text-muted">{{ localization.tr(crate::localization::MessageKey::IdentityProtected) }}</span>
       {% endif %}
     </label>
     {% endfor %}
   </div>
-  <button type="submit" class="btn-primary">Guardar roles</button>
+  <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::IdentitySaveRoles) }}</button>
 </form>

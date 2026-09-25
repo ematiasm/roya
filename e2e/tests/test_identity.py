@@ -47,7 +47,7 @@ from conftest import (
     _free_port,
     _wait_until_ready,
 )
-from helpers import ApiClient, expire_session_in_database, setup_fresh_server
+from helpers import ApiClient, e2e_copy, expire_session_in_database, setup_fresh_server
 
 
 @pytest.fixture
@@ -83,9 +83,9 @@ def test_an_unauthenticated_browser_is_redirected_and_the_form_login_reaches_the
     page.goto(f"{live_server.url}/")
     assert "/login" in page.url, f"expected the login page, got {page.url}"
 
-    page.get_by_label("Usuario").fill(TEST_ADMIN_USERNAME)
-    page.get_by_label("Contraseña").fill(TEST_ADMIN_PASSWORD)
-    page.get_by_role("button", name="Iniciar sesión").click()
+    page.get_by_label(e2e_copy("username")).fill(TEST_ADMIN_USERNAME)
+    page.get_by_label(e2e_copy("password")).fill(TEST_ADMIN_PASSWORD)
+    page.get_by_role("button", name=e2e_copy("sign_in")).click()
 
     expect(page).to_have_url(f"{live_server.url}/")
     expect(page.locator("#total-balance")).to_be_visible()
@@ -101,9 +101,9 @@ def test_a_wrong_password_stays_on_the_login_form_with_the_generic_error(
     """
     page = anonymous_page
     page.goto(f"{live_server.url}/login")
-    page.get_by_label("Usuario").fill(TEST_ADMIN_USERNAME)
-    page.get_by_label("Contraseña").fill("definitely-not-the-password")
-    page.get_by_role("button", name="Iniciar sesión").click()
+    page.get_by_label(e2e_copy("username")).fill(TEST_ADMIN_USERNAME)
+    page.get_by_label(e2e_copy("password")).fill("definitely-not-the-password")
+    page.get_by_role("button", name=e2e_copy("sign_in")).click()
 
     expect(page.locator("[data-notice='error']")).to_be_visible()
     expect(page.locator("#username")).to_be_visible()
@@ -209,9 +209,9 @@ def _log_in_through_the_form(
 ) -> None:
     """Drive the real login form; the caller asserts where the browser lands."""
     page.goto(f"{live_server.url}/login")
-    page.get_by_label("Usuario").fill(username)
-    page.get_by_label("Contraseña").fill(password)
-    page.get_by_role("button", name="Iniciar sesión").click()
+    page.get_by_label(e2e_copy("username")).fill(username)
+    page.get_by_label(e2e_copy("password")).fill(password)
+    page.get_by_role("button", name=e2e_copy("sign_in")).click()
 
 
 def _create_user_through_the_screen(
@@ -222,15 +222,15 @@ def _create_user_through_the_screen(
     Creating through the screen is the point: the screen is what sets
     ``must_change_password``, and the refreshed list is the effect read back.
     """
-    page.get_by_role("button", name="Nuevo usuario").click()
+    page.get_by_role("button", name=e2e_copy("new_user")).click()
     dialog = page.locator("#new-user-dialog")
     dialog.locator('input[name="username"]').fill(username)
     dialog.locator('input[name="display_name"]').fill(display_name)
     dialog.locator('input[name="password"]').fill(password)
     with page.expect_response(_response_for("/web/users", "POST")):
-        dialog.get_by_role("button", name="Crear usuario").click()
+        dialog.get_by_role("button", name=e2e_copy("create_user")).click()
     expect(page.locator("#user-list")).to_contain_text(username)
-    expect(page.locator("#user-list")).to_contain_text("debe cambiar la contraseña")
+    expect(page.locator("#user-list")).to_contain_text(e2e_copy("must_change"))
 
 
 def _assign_role_through_the_screen(
@@ -244,25 +244,25 @@ def _assign_role_through_the_screen(
     whose row it means instead of assuming a single match.
     """
     page.locator("#user-list-inner > div > div", has_text=username).locator(
-        'button[aria-label="Asignar roles"]'
+        f'button[aria-label="{e2e_copy("assign_roles")}"]'
     ).click()
     dialog = page.locator("#user-edit-dialog")
-    expect(dialog).to_contain_text(f"Roles de {username}")
+    expect(dialog).to_contain_text(f"Roles — {username}")
     dialog.locator("label", has_text=role_name).locator(
         'input[name="role_ids"]'
     ).check()
     with page.expect_response(_response_for("/web/users/roles", "POST")):
-        dialog.get_by_role("button", name="Guardar roles").click()
+        dialog.get_by_role("button", name=e2e_copy("save_roles")).click()
     expect(page.locator("#user-list")).to_contain_text(role_name)
 
 
 def _change_confined_password(page: Page, *, current: str, new: str) -> None:
     """Complete the confined password change through the real form."""
-    page.get_by_label("Contraseña actual").fill(current)
+    page.get_by_label(e2e_copy("current_password")).fill(current)
     # exact=True: the confirm field's label contains this one as a substring.
-    page.get_by_label("Nueva contraseña", exact=True).fill(new)
-    page.get_by_label("Confirmar nueva contraseña").fill(new)
-    page.get_by_role("button", name="Guardar contraseña").click()
+    page.get_by_label(e2e_copy("new_password"), exact=True).fill(new)
+    page.get_by_label(e2e_copy("confirm_password")).fill(new)
+    page.get_by_role("button", name=e2e_copy("save_password")).click()
 
 
 def test_a_created_user_is_confined_to_the_password_change_until_it_changes_it(
@@ -285,13 +285,13 @@ def test_a_created_user_is_confined_to_the_password_change_until_it_changes_it(
     _create_user_through_the_screen(
         page, username="caja1", display_name="Caja Uno", password=INITIAL_PASSWORD
     )
-    _assign_role_through_the_screen(page, username="caja1", role_name="Vendedor")
+    _assign_role_through_the_screen(page, username="caja1", role_name="Salesperson")
 
     # First login: the flag confines the session to the change form.
     visitor = anonymous_page
     _log_in_through_the_form(visitor, live_server, "caja1", INITIAL_PASSWORD)
     expect(visitor).to_have_url(f"{url}/password")
-    expect(visitor.get_by_text("Tu sesión está confinada")).to_be_visible()
+    expect(visitor.get_by_text(e2e_copy("confined"))).to_be_visible()
 
     # The confinement is real against a URL typed by hand, not only against
     # the app's own links: /products is bounced back to /password.
@@ -339,14 +339,14 @@ def test_an_htmx_request_into_an_expired_session_navigates_to_the_login_page(
     expire_session_in_database(live_server.db_path, cookies["roya_session"])
 
     with visitor.expect_response(_response_for("/web/users", "GET")) as response_info:
-        visitor.get_by_role("button", name="Actualizar").click()
+        visitor.get_by_role("button", name=e2e_copy("refresh")).click()
     response = response_info.value
     assert response.status == 401, "the expired session must be refused in its HTMX shape"
     assert response.headers.get("hx-redirect") == "/login", response.headers
 
     # The claim no Rust test can make: htmx 1.9.12 performed the navigation.
     expect(visitor).to_have_url(f"{url}/login")
-    expect(visitor.get_by_label("Usuario")).to_be_visible()
+    expect(visitor.get_by_label("Username")).to_be_visible()
 
 
 def test_a_permission_denied_htmx_form_reaches_the_notice_and_never_swaps(
@@ -367,24 +367,24 @@ def test_a_permission_denied_htmx_form_reaches_the_notice_and_never_swaps(
     # A role whose matrix holds exactly sales.read, ticked through the roles
     # screen's matrix editor; saving replaces the whole set.
     page.goto(f"{url}/roles")
-    page.get_by_role("button", name="Nuevo rol").click()
+    page.get_by_role("button", name=e2e_copy("new_role")).click()
     new_role = page.locator("#new-role-dialog")
     new_role.locator('input[name="code"]').fill("solo_consulta")
     new_role.locator('input[name="name"]').fill("Sólo consulta")
     new_role.locator('input[name="description"]').fill("Ver ventas; ninguna otra acción.")
     with page.expect_response(_response_for("/web/roles", "POST")):
-        new_role.get_by_role("button", name="Crear rol").click()
+        new_role.get_by_role("button", name=e2e_copy("create_role")).click()
     expect(page.locator("#role-list")).to_contain_text("solo_consulta")
 
     role_row = page.locator("#role-list-inner > div > div", has_text="solo_consulta")
-    role_row.locator('button[aria-label="Editar rol y permisos"]').click()
+    role_row.locator(f'button[aria-label="{e2e_copy("edit_role")}"]').click()
     edit_dialog = page.locator("#role-edit-dialog")
     expect(edit_dialog).to_contain_text("solo_consulta")
     edit_dialog.locator("label", has_text="sales.read").locator(
         'input[name="permission_ids"]'
     ).check()
     with page.expect_response(_response_for("/web/roles/matrix", "POST")):
-        edit_dialog.get_by_role("button", name="Guardar permisos").click()
+        edit_dialog.get_by_role("button", name=e2e_copy("save_permissions")).click()
 
     page.goto(f"{url}/users")
     _create_user_through_the_screen(
@@ -408,7 +408,7 @@ def test_a_permission_denied_htmx_form_reaches_the_notice_and_never_swaps(
         visitor, current=INITIAL_PASSWORD, new=CHANGED_PASSWORD
     )
     expect(visitor.locator("[data-notice='error']")).to_contain_text(
-        "Se necesita el permiso «dashboard.read» para esta acción"
+        e2e_copy("permission_required")
     )
 
     # -- the denied HTMX form --------------------------------------------------

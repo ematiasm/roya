@@ -1,26 +1,18 @@
-{# Users administration (slice S3 part 2, T13). Follows the customers/suppliers
-   pattern: the full page renders the list shell and the create `<dialog>`; the
-   list fragment (`partials/user_list.html`) is swapped by htmx and refreshed
-   out of band after every mutation; a second `<dialog>` loads the role
-   assignment and password reset forms as id-final fragments
-   (`/web/users/roles-form/{id}`, `/web/users/password-form/{id}`), following
-   the customer edit-form idiom. Copy is Spanish, like the rest of the identity
-   screens (login, password, forbidden). AC21 (hiding the sidebar entry from
-   principals that cannot read it) is deferred to S7: the entry stays visible
-   and the route itself is what refuses. #}
+{# Users administration: the full page renders the list shell and create dialog;
+   HTMX swaps the list and id-final role/password forms. #}
 {% extends "base.html" %}
-{% block title %}Usuarios — Roya{% endblock %}
+{% block title %}{{ localization.tr(crate::localization::MessageKey::IdentityUsersTitle) }} — Roya{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
-  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">usuarios · roles y credenciales</span>
+  <a href="/" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CommonBackDashboard) }}</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::IdentityUsersContext) }}</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
-  <h2 class="text-lg font-semibold">Usuarios</h2>
+  <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::IdentityUsersTitle) }}</h2>
   {% if can_manage %}
   <div class="flex items-center gap-2">
-    <button type="button" class="btn-secondary" hx-get="/web/users" hx-target="#user-list" hx-swap="innerHTML">↻ Actualizar</button>
-    <button type="button" onclick="document.getElementById('new-user-dialog').showModal()" class="btn-primary">Nuevo usuario</button>
+    <button type="button" class="btn-secondary" hx-get="/web/users" hx-target="#user-list" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonRefresh) }}</button>
+    <button type="button" onclick="document.getElementById('new-user-dialog').showModal()" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::IdentityNewUser) }}</button>
   </div>
   {% endif %}
 </div>
@@ -34,32 +26,29 @@
 <dialog id="new-user-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   {% if can_manage %}
   <div class="mb-3 flex items-center justify-between gap-6">
-    <h2 class="text-lg font-semibold">Nuevo usuario</h2>
-    <button type="button" class="btn-secondary" onclick="document.getElementById('new-user-dialog').close()">✕</button>
+    <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::IdentityNewUser) }}</h2>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-user-dialog').close()" aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}">✕</button>
   </div>
   <form class="flex flex-col gap-2.5"
-        data-action="Create user"
+        data-action="{{ localization.tr(crate::localization::MessageKey::IdentityCreateUser) }}"
         hx-post="/web/users"
         hx-target="#user-list"
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label class="field-label">Usuario</label>
-      <input type="text" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" placeholder="caja1…" class="field" />
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldUsername) }}</label>
+      <input type="text" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityUsernamePlaceholder) }}" class="field" />
     </div>
     <div>
-      <label class="field-label">Nombre para mostrar</label>
-      <input type="text" name="display_name" required maxlength="128" placeholder="María Pérez…" class="field" />
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldDisplayName) }}</label>
+      <input type="text" name="display_name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityDisplayNamePlaceholder) }}" class="field" />
     </div>
     <div>
-      <label class="field-label">Contraseña inicial</label>
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::IdentityInitialPassword) }}</label>
       <input type="password" name="password" required minlength="12" autocomplete="new-password" class="field" />
     </div>
-    <button type="submit" class="btn-primary">Crear usuario</button>
-    <div class="text-[13px] text-muted">
-      El usuario deberá cambiar esta contraseña en su primer inicio de sesión.
-      Sólo letras minúsculas, números y . _ - en el nombre de usuario.
-    </div>
+    <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::IdentityCreateUser) }}</button>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::IdentityCreateUserHelp) }}</div>
   </form>
   {% endif %}
 </dialog>

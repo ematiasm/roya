@@ -1,41 +1,27 @@
-{# The documents list fragment: the region `/web/documents` renders and the
-   `/documents` page includes for the first paint. The route owns everything
-   permission-related before this template runs — the rows are already narrowed
-   to the families the principal may read, and the truncation notice is the
-   feed's honest "the cap cut" flag, never a guess. #}
 <div id="document-list-inner">
-  <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ rows.len() }} documents</div>
+  <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ localization.tr_count(crate::localization::MessageKey::DocumentsCount, rows.len()) }}</div>
   {% if rows.is_empty() %}
-    <div class="empty">Nothing here yet.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::DocumentsNothing) }}</div>
   {% else %}
     {% for v in rows %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" data-document-kind="{{ v.kind.token() }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
           <span class="chip border-border">{{ v.kind_label }}</span>
-          {# The identifier opens the drawer: the detail fragment swaps into the
-             page's `#document-drawer-body` (the route is registered for GET,
-             so the wiring guard can prove the target). #}
           <button type="button" class="btn-primary font-semibold underline-offset-2 hover:underline" hx-get="/web/documents/detail/{{ v.kind_token }}/{{ v.id }}" hx-target="#document-drawer-body" hx-swap="innerHTML">{{ v.reference }}</button>
           <span class="text-xs text-muted">{{ v.party }}</span>
         </div>
         <span class="text-[13px] text-muted">{{ localization.format_date(v.date.clone()) }} • {{ v.detail }}{% if let Some(name) = v.actor_name %} • {{ name }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
-        {% if let Some(amount) = v.amount %}
-        <span class="font-bold tabular-nums">{{ localization.format_currency(amount.clone()) }}</span>
-        {% endif %}
-        {% if let Some(quantity) = v.quantity %}
-        <span class="font-bold tabular-nums">{{ localization.format_quantity(quantity.clone()) }}</span>
-        {% endif %}
-        <a href="{{ v.href }}" class="btn-secondary bg-card font-normal hover:opacity-100">Open</a>
+        {% if let Some(amount) = v.amount %}<span class="font-bold tabular-nums">{{ localization.format_currency(amount.clone()) }}</span>{% endif %}
+        {% if let Some(quantity) = v.quantity %}<span class="font-bold tabular-nums">{{ localization.format_quantity(quantity.clone()) }}</span>{% endif %}
+        <a href="{{ v.href }}" class="btn-secondary bg-card font-normal hover:opacity-100">{{ localization.tr(crate::localization::MessageKey::DocumentsOpen) }}</a>
       </div>
     </div>
     {% endfor %}
   {% endif %}
   {% if truncated %}
-    <div class="mt-2 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-[13px] text-muted" data-document-truncated="true">
-      The feed shows the newest {{ limit }} documents and there are more — narrow the date range or the filters to see older ones.
-    </div>
+    <div class="mt-2 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-[13px] text-muted" data-document-truncated="true">{{ truncated_message }}</div>
   {% endif %}
 </div>

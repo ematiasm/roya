@@ -95,6 +95,21 @@ async fn get(app: &axum::Router, uri: &str, cookie: &str) -> axum::response::Res
         .unwrap()
 }
 
+async fn post_form(app: &axum::Router, cookie: &str, payload: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/settings")
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(payload.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
 async fn body(response: axum::response::Response) -> String {
     String::from_utf8_lossy(
         &axum::body::to_bytes(response.into_body(), 1024 * 1024)
@@ -290,6 +305,57 @@ async fn settings_page_is_gated_and_its_sidebar_entry_is_permission_matched() {
 }
 
 #[tokio::test]
+async fn settings_validation_renders_localized_known_errors_without_changing_service_contracts() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+    let form = |currency: &str| {
+        format!(
+            "business_name=Acme+Store&default_locale_code=es-AR&currency_code={currency}\
+             &timezone=America%2FArgentina%2FBuenos_Aires\
+             &locale_code_0=es-AR&locale_code_1=en-US\
+             &display_name_0=Espa%C3%B1ol+(Argentina)&display_name_1=English+(United+States)\
+             &enabled_0=on&enabled_1=on"
+        )
+    };
+
+    let spanish = post_form(&app, &cookie, &form("usd")).await;
+    assert_eq!(spanish.status(), StatusCode::BAD_REQUEST);
+    let spanish = body(spanish).await;
+    assert!(
+        spanish.contains("La moneda debe ser un código de tres letras mayúsculas."),
+        "{spanish}"
+    );
+
+    let valid_update = form("USD")
+        .replace("default_locale_code=es-AR", "default_locale_code=en-US")
+        .replace("&enabled_0=on", "");
+    let update = post_form(&app, &cookie, &valid_update).await;
+    assert_eq!(update.status(), StatusCode::SEE_OTHER);
+
+    let english_form =
+        form("usd").replace("default_locale_code=es-AR", "default_locale_code=en-US");
+    let english = post_form(&app, &cookie, &english_form).await;
+    assert_eq!(english.status(), StatusCode::BAD_REQUEST);
+    let english = body(english).await;
+    assert!(
+        english.contains("The currency must be a three-letter uppercase code."),
+        "{english}"
+    );
+
+    let persisted: (String, String) = sqlx::query_as(
+        "SELECT default_locale_code, currency_code FROM business_settings WHERE id = 1",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(persisted, ("en-US".into(), "USD".into()));
+}
+
+#[tokio::test]
 async fn settings_form_persists_the_complete_profile_and_renders_the_new_configuration() {
     let state = configured_state().await;
     let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
@@ -331,7 +397,9 @@ async fn settings_form_persists_the_complete_profile_and_renders_the_new_configu
     let page = get(&app, "/settings?saved=true", &cookie).await;
     assert_eq!(page.status(), StatusCode::OK);
     let page = body(page).await;
-    assert!(page.contains("Configuración guardada"));
+    assert!(page.contains("Settings saved"));
+    assert!(page.contains(">Business settings</h2>"));
+    assert!(page.contains("data-action=\"Save settings\""));
     assert!(page.contains("value=\"Roya Market\""));
     assert!(page.contains("value=\"USD\""));
     assert!(page.contains("value=\"en-US\" selected"));

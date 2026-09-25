@@ -3,7 +3,7 @@
   <section class="rounded-2xl border border-border bg-card p-5">
     {% if over_limit %}
     <div class="mb-3">
-      <span class="chip chip-expense">over limit</span>
+      <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::CustomerOverLimit) }}</span>
     </div>
     {% endif %}
     {% include "partials/customer_statement.html" %}
@@ -12,25 +12,25 @@
       {% if c.is_active %}
       <form hx-post="/web/customers/deactivate" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
         <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
-        <button type="submit" class="btn-secondary">Deactivate</button>
+        <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
       </form>
       {% else %}
       <form hx-post="/web/customers/activate" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
         <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
-        <button type="submit" class="btn-secondary">Activate</button>
+        <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}</button>
       </form>
       {% endif %}
       {% if !c.is_walkin %}
       <form hx-post="/web/customers/delete" hx-target="#customer-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeCustomerDrawer()">
         <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
-        <button type="submit" class="btn-secondary">Delete</button>
+        <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
       </form>
       {% endif %}
     </div>
   </section>
 
   <section class="rounded-2xl border border-border bg-card p-5">
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Collect payment</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerCollectPayment) }}</div>
     <form class="flex flex-col gap-2.5"
           hx-post="/web/customer-receipts"
           hx-target="#customer-drawer-body"
@@ -39,54 +39,54 @@
       <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Amount</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
           <input type="text" inputmode="decimal" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label class="field-label">Date</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
           <input type="date" name="date" required value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label class="field-label">Method (the account is derived from it)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerMethodDerived) }}</label>
         <select name="method_id" required class="field">
           {% for m in method_options %}
-          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
+          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_deref()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
           {% endfor %}
         </select>
       </div>
       <div>
-        <label class="field-label">Notes (optional)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
         <input type="text" name="notes" placeholder="…" maxlength="256" class="field" />
       </div>
-      <button type="submit" class="btn-primary">Collect</button>
-      <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered sale grouped under the new receipt. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account.</div>
+      <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CustomerCollect) }}</button>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerCollectHelp) }}</div>
     </form>
   </section>
 
   <section class="rounded-2xl border border-border bg-card p-5">
     {% if let Some(st) = statement %}
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Receivable sales ({{ debt_sales.len() }})</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerReceivableSales) }} ({{ debt_sales.len() }})</div>
     {% if debt_sales.is_empty() %}
-      <div class="text-[13px] text-muted">No outstanding credit sales.</div>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerNoCreditSales) }}</div>
     {% else %}
       {% for d in debt_sales %}
       <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="chip chip-expense">{{ d.payment_status }}</span>
-            <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}sale #{{ d.sale.id }}{% endif %}</span>
+            <span class="chip chip-expense">{% if d.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::CustomerStatusPaid) }}{% else if d.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::CustomerStatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::CustomerStatusUnpaid) }}{% endif %}</span>
+            <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::CustomerSaleNumber) }} {{ d.sale.id }}{% endif %}</span>
           </div>
-           <span class="text-[13px] text-muted">{{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due) = d.sale.due_date %} • due {{ localization.format_date(due.clone()) }}{% endif %} • total {{ localization.format_currency(d.total.clone()) }} • paid {{ localization.format_currency(d.paid.clone()) }}</span>
+           <span class="text-[13px] text-muted">{{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due) = d.sale.due_date %} • {{ localization.tr(crate::localization::MessageKey::CustomerDue) }} {{ localization.format_date(due.clone()) }}{% endif %} • {{ localization.tr(crate::localization::MessageKey::CustomerTotal) }} {{ localization.format_currency(d.total.clone()) }} • {{ localization.tr(crate::localization::MessageKey::CustomerPaid) }} {{ localization.format_currency(d.paid.clone()) }}</span>
         </div>
          <span class="font-bold tabular-nums text-expense">{{ localization.format_currency(d.due.clone()) }}</span>
       </div>
       {% endfor %}
     {% endif %}
 
-    <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Statement ledger ({{ st.entries.len() }})</div>
+    <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerStatementLedger) }} ({{ st.entries.len() }})</div>
     {% if st.entries.is_empty() %}
-      <div class="text-[13px] text-muted">No confirmed credit sales yet.</div>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerNoConfirmedSales) }}</div>
     {% else %}
       {% for e in st.entries %}
       <div class="mb-1.5 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3 py-2">
@@ -109,7 +109,7 @@
     {% endif %}
     {% endif %}
 
-    <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Payment history</div>
+    <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerPaymentHistory) }}</div>
     <div id="customer-detail-receipts">
       {% include "partials/receipt_list.html" %}
     </div>

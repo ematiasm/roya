@@ -26,7 +26,7 @@
    as text, not HTML. #}
 <div hx-swap-oob="innerHTML:#notice">
   <div class="notice notice-success" data-notice="success" data-notice-server="true" role="status">
-    <div class="min-w-0 flex-1 break-words">{{ product_name }} scanned again — merged into the existing line; its quantity is now {{ quantity }}.</div>
-    <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="Dismiss">✕</button>
+    <div class="min-w-0 flex-1 break-words">{{ message }}</div>
+    <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="{{ dismiss_label }}">✕</button>
   </div>
 </div>

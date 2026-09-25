@@ -1,26 +1,26 @@
 {% extends "base.html" %}
-{% block title %}Configuración inicial — Roya{% endblock %}
+{% block title %}{{ localization.tr(crate::localization::MessageKey::SetupTitle) }} — Roya{% endblock %}
 {% block sidebar %}{% endblock %}
 {% block content %}
 <div class="flex min-h-[70vh] items-center justify-center">
   <section class="card w-full max-w-2xl">
     <div class="mb-6 flex items-center gap-3">
       <span class="text-lg font-bold tracking-[-0.02em] text-text">roya <span class="text-accent">◆</span></span>
-      <span class="chip chip-muted">First run</span>
+      <span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::SetupFirstRun) }}</span>
     </div>
 
-    <h1 class="text-2xl font-semibold">Configuración inicial</h1>
-    <p class="mt-2 text-sm text-muted">Definí los datos del negocio y creá el primer administrador.</p>
+    <h1 class="text-2xl font-semibold">{{ localization.tr(crate::localization::MessageKey::SetupTitle) }}</h1>
+    <p class="mt-2 text-sm text-muted">{{ localization.tr(crate::localization::MessageKey::SetupIntro) }}</p>
 
     <form method="post" action="/setup" class="mt-8 flex flex-col gap-5">
       <div>
-        <label for="business-name" class="field-label">Nombre del negocio</label>
+        <label for="business-name" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldBusinessName) }}</label>
         <input id="business-name" name="business_name" required maxlength="160" autocomplete="organization" class="field" />
       </div>
 
       <div class="grid gap-5 sm:grid-cols-2">
         <div>
-          <label for="default-locale" class="field-label">Locale predeterminado</label>
+          <label for="default-locale" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldDefaultLocale) }}</label>
           <select id="default-locale" name="default_locale_code" required class="field">
             {% for locale in locales %}
             <option value="{{ locale.code }}"{% if locale.code == "es-AR" %} selected{% endif %}>{{ locale.display_name }}</option>
@@ -28,35 +28,35 @@
           </select>
         </div>
         <div>
-          <label for="currency-code" class="field-label">Código de moneda</label>
+          <label for="currency-code" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldCurrencyCode) }}</label>
           <input id="currency-code" name="currency_code" value="ARS" required maxlength="3" pattern="[A-Z]{3}" autocomplete="off" class="field" />
         </div>
       </div>
 
       <div>
-        <label for="timezone" class="field-label">Zona horaria</label>
+        <label for="timezone" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldTimezone) }}</label>
         <input id="timezone" name="timezone" value="America/Argentina/Buenos_Aires" required maxlength="64" autocomplete="off" class="field" />
       </div>
 
       <div class="grid gap-5 sm:grid-cols-2">
         <div>
-          <label for="username" class="field-label">Usuario administrador</label>
+          <label for="username" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldAdminUsername) }}</label>
           <input id="username" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" autocomplete="username" autocapitalize="none" spellcheck="false" class="field" />
         </div>
         <div>
-          <label for="display-name" class="field-label">Nombre para mostrar</label>
+          <label for="display-name" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldDisplayName) }}</label>
           <input id="display-name" name="display_name" required maxlength="128" autocomplete="name" class="field" />
         </div>
       </div>
 
       <div>
-        <label for="password" class="field-label">Contraseña</label>
+        <label for="password" class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldPassword) }}</label>
         <input id="password" type="password" name="password" required minlength="12" autocomplete="new-password" class="field" />
-        <p class="mt-1 text-xs text-muted">Usá al menos 12 caracteres.</p>
+        <p class="mt-1 text-xs text-muted">{{ localization.tr(crate::localization::MessageKey::SetupPasswordHelp) }}</p>
       </div>
 
       <div class="flex items-center justify-end border-t border-border pt-5">
-        <button type="submit" class="btn-primary">Completar configuración</button>
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SetupSubmit) }}</button>
       </div>
     </form>
   </section>

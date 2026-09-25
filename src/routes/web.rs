@@ -59,6 +59,7 @@ struct DashboardTemplate {
 /// the interface shows a name and never an id.
 struct TransactionRow {
     tx: crate::models::Transaction,
+    delete_confirm: String,
     /// Display name of the user that created the movement; `None` only when
     /// the id resolves to nothing (a concurrent deactivation).
     created_by_name: Option<String>,
@@ -139,7 +140,10 @@ fn is_htmx(headers: &HeaderMap) -> bool {
 
 async fn missing_methods(state: &AppState) -> AppResult<AccountsWithoutMethods> {
     Ok(AccountsWithoutMethods {
-        ids: state.payment_method_service.accounts_without_methods().await?,
+        ids: state
+            .payment_method_service
+            .accounts_without_methods()
+            .await?,
     })
 }
 
@@ -179,7 +183,10 @@ async fn dashboard(
         nav_key: "dashboard",
         nav: Nav::for_principal(&principal),
     };
-    Ok(Html(tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?))
+    Ok(Html(
+        tmpl.render()
+            .map_err(|e| AppError::Internal(e.to_string()))?,
+    ))
 }
 
 async fn account_detail(
@@ -210,6 +217,7 @@ async fn account_detail(
         .transactions
         .iter()
         .map(|tx| TransactionRow {
+            delete_confirm: localization.account_delete_confirm(&tx.id),
             created_by_name: name_for(tx.created_by),
             updated_by_name: tx.updated_by.and_then(name_for),
             tx: tx.clone(),
@@ -228,7 +236,9 @@ async fn account_detail(
         nav_key: "accounts",
         nav: Nav::for_principal(&principal),
     };
-    let html = tmpl.render().map_err(|e| AppError::Internal(e.to_string()))?;
+    let html = tmpl
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if is_htmx(&headers) {
         Ok(Html(html).into_response())
@@ -279,8 +289,7 @@ impl<'de> Deserialize<'de> for CreateAccountForm {
                 _ => {}
             }
         }
-        let name =
-            name.ok_or_else(|| <D::Error as serde::de::Error>::missing_field("name"))?;
+        let name = name.ok_or_else(|| <D::Error as serde::de::Error>::missing_field("name"))?;
         Ok(Self { name, method_ids })
     }
 }
@@ -353,8 +362,8 @@ async fn web_create_account(
             accounts,
             localization: localization.clone(),
         }
-            .render()
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
         // Return combined: account list + options via OOB swap
         // HTMX out-of-band swap: element with hx-swap-oob
@@ -402,7 +411,14 @@ async fn web_create_transaction(
 
     state
         .transaction_service
-        .create(principal.user_id, form.account_id, kind, amount, form.description, date)
+        .create(
+            principal.user_id,
+            form.account_id,
+            kind,
+            amount,
+            form.description,
+            date,
+        )
         .await?;
 
     if is_htmx(&headers) {
@@ -503,8 +519,8 @@ async fn web_account_options(
         accounts,
         localization,
     }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -516,7 +532,10 @@ pub fn router() -> Router<AppState> {
             "/accounts/{id}/payment-methods",
             post(web_update_payment_methods),
         )
-        .route("/web/accounts", get(web_account_list).post(web_create_account))
+        .route(
+            "/web/accounts",
+            get(web_account_list).post(web_create_account),
+        )
         .route("/web/account-options", get(web_account_options))
         .route(
             "/web/transactions",
@@ -637,8 +656,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
         assert!(
-            body.contains("Acción no permitida"),
-            "the refusal must speak Spanish: {body:.400}"
+            body.contains("Action not permitted"),
+            "the refusal must use the English fallback: {body:.400}"
         );
         assert!(
             body.contains("finance.methods.manage"),
@@ -682,7 +701,16 @@ mod tests {
         let cookie = test_support::cookie_for(&token);
         let app = crate::routes::router(state.clone());
 
-        let (status, page) = send_as(app.clone(), "GET", "/", Some(&cookie), None, &[], String::new()).await;
+        let (status, page) = send_as(
+            app.clone(),
+            "GET",
+            "/",
+            Some(&cookie),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{page:.400}");
 
         // Stage an account as the shared full-permission principal, then the
@@ -757,8 +785,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
         assert!(
-            body.contains("Acción no permitida"),
-            "the refusal must speak Spanish: {body:.400}"
+            body.contains("Action not permitted"),
+            "the refusal must use the English fallback: {body:.400}"
         );
         assert!(
             body.contains("dashboard.read"),
@@ -843,7 +871,16 @@ mod tests {
     async fn ac21_the_full_permission_principal_sees_every_entry() {
         let state = test_state().await;
         let app = crate::routes::router(state.clone());
-        let (status, html) = send_as(app.clone(), "GET", "/", Some(test_support::TEST_COOKIE), None, &[], String::new()).await;
+        let (status, html) = send_as(
+            app.clone(),
+            "GET",
+            "/",
+            Some(test_support::TEST_COOKIE),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         for key in [
             "dashboard",
@@ -871,7 +908,16 @@ mod tests {
     async fn ac21_the_sidebar_shows_the_signed_in_user_next_to_logout() {
         let state = test_state().await;
         let app = crate::routes::router(state.clone());
-        let (status, html) = send_as(app.clone(), "GET", "/", Some(test_support::TEST_COOKIE), None, &[], String::new()).await;
+        let (status, html) = send_as(
+            app.clone(),
+            "GET",
+            "/",
+            Some(test_support::TEST_COOKIE),
+            None,
+            &[],
+            String::new(),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
             html.contains("data-sidebar-user"),
@@ -898,9 +944,10 @@ mod tests {
     #[tokio::test]
     async fn ac21_the_two_code_accounts_entry_shows_only_to_principals_holding_both() {
         let state = test_state().await;
-        let finance_only = test_support::seed_session_with_permissions(&state.pool, &["finance.read"])
-            .await
-            .unwrap();
+        let finance_only =
+            test_support::seed_session_with_permissions(&state.pool, &["finance.read"])
+                .await
+                .unwrap();
         let dashboard_only =
             test_support::seed_session_with_permissions(&state.pool, &["dashboard.read"])
                 .await
@@ -1062,7 +1109,14 @@ mod tests {
             .map(|id| format!("method_ids={id}"))
             .collect();
         parts.push(format!("name={name}"));
-        send(app.clone(), "POST", "/web/accounts", Some(FORM), parts.join("&")).await
+        send(
+            app.clone(),
+            "POST",
+            "/web/accounts",
+            Some(FORM),
+            parts.join("&"),
+        )
+        .await
     }
 
     async fn seed_product(app: &Router, sku: &str) -> i64 {
@@ -1096,14 +1150,13 @@ mod tests {
     }
 
     async fn seed_credit_sale(app: &Router, pool: &sqlx::SqlitePool) -> i64 {
-        let (customer_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO customers (name, created_by) VALUES (?, ?) RETURNING id",
-        )
-        .bind("Regression Buyer")
-        .bind(test_support::audit_actor_id(pool).await.unwrap())
-        .fetch_one(pool)
-        .await
-        .unwrap();
+        let (customer_id,): (i64,) =
+            sqlx::query_as("INSERT INTO customers (name, created_by) VALUES (?, ?) RETURNING id")
+                .bind("Regression Buyer")
+                .bind(test_support::audit_actor_id(pool).await.unwrap())
+                .fetch_one(pool)
+                .await
+                .unwrap();
         let (status, body) = post_json(
             app,
             "/api/sales",
@@ -1119,12 +1172,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn pay(
-        app: &Router,
-        sale_id: i64,
-        method: i64,
-        amount: &str,
-    ) -> (StatusCode, String) {
+    async fn pay(app: &Router, sale_id: i64, method: i64, amount: &str) -> (StatusCode, String) {
         post_json(
             app,
             &format!("/api/sales/{sale_id}/payments"),
@@ -1172,11 +1220,12 @@ mod tests {
             StatusCode::CREATED,
             "payment must be accepted after web creation with the method: {body}"
         );
-        let payments: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
-            .bind(sale)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let payments: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
+                .bind(sale)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(payments.0, 1, "payment row persisted");
     }
 
@@ -1226,11 +1275,12 @@ mod tests {
             msg.contains("not assigned to any account"),
             "message must tell the user what to do, got {msg}"
         );
-        let payments: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
-            .bind(sale)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let payments: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
+                .bind(sale)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(payments.0, 0, "no side effects on rejection");
     }
 

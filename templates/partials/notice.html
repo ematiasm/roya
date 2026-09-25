@@ -24,9 +24,9 @@
    characters (`<`, `>`, `&`, `"`) reaches the operator as text, not HTML. #}
 <div hx-swap-oob="innerHTML:#notice">
   <div class="notice notice-success" data-notice="success" data-notice-server="true" role="status">
-    <div class="min-w-0 flex-1 break-words">{{ product_name }} created — the active catalogue filter is keeping it out of the list.
-      <a class="btn-secondary font-normal hover:opacity-100" href="/products">Clear filter</a>
+    <div class="min-w-0 flex-1 break-words">{{ message }}
+      <a class="btn-secondary font-normal hover:opacity-100" href="/products">{{ clear_filter_label }}</a>
     </div>
-    <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="Dismiss">✕</button>
+    <button type="button" class="notice-dismiss" data-notice-dismiss="true" aria-label="{{ dismiss_label }}">✕</button>
   </div>
 </div>

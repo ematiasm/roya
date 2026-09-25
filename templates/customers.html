@@ -2,15 +2,15 @@
 {% block title %}{{ title }}{% endblock %}
 {% block content %}
 <div class="mb-4 flex items-center gap-2">
-  <a href="/" class="link text-[13px] text-muted">← Dashboard</a>
-  <a href="/sales" class="link text-[13px] text-muted">Sales</a>
-  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">customers • derived balance and ageing</span>
+  <a href="/" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CommonBackDashboard) }}</a>
+  <a href="/sales" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::NavigationSales) }}</a>
+  <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerContext) }}</span>
 </div>
 <div class="mb-4 flex items-center justify-between gap-2">
-  <h2 class="text-lg font-semibold">Customers</h2>
+  <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerTitle) }}</h2>
   <div class="flex items-center gap-2">
-    <button type="button" class="btn-secondary" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">↻ Refresh</button>
-    <button type="button" onclick="document.getElementById('new-customer-dialog').showModal()" class="btn-primary">New customer</button>
+    <button type="button" class="btn-secondary" hx-get="/web/customers" hx-target="#customer-list" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonRefresh) }}</button>
+    <button type="button" onclick="document.getElementById('new-customer-dialog').showModal()" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CustomerNew) }}</button>
   </div>
 </div>
 <div id="customer-list"
@@ -19,52 +19,53 @@
      hx-swap="innerHTML">
   {% include "partials/customer_list.html" %}
 </div>
-<div class="mt-2 text-[13px] text-muted">Select a name to see its balance, ageing and documents.</div>
+<div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerHelp) }}</div>
 
 <dialog id="new-customer-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
-    <h2 class="text-lg font-semibold">New customer</h2>
-    <button type="button" class="btn-secondary" onclick="document.getElementById('new-customer-dialog').close()">✕</button>
+    <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerNew) }}</h2>
+    <button type="button" class="btn-secondary" onclick="document.getElementById('new-customer-dialog').close()" aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}">✕</button>
   </div>
   <form class="flex flex-col gap-2.5"
+        data-action="{{ localization.tr(crate::localization::MessageKey::CustomerCreateAction) }}"
         hx-post="/web/customers"
         hx-target="#customer-list"
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label class="field-label">Name</label>
-      <input type="text" name="name" required maxlength="128" placeholder="Ana Pérez…" class="field" />
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+      <input type="text" name="name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::CustomerNamePlaceholder) }}" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label class="field-label">Phone (optional)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerPhone) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
         <input type="text" name="phone" maxlength="32" placeholder="555-1234" class="field" />
       </div>
       <div>
-        <label class="field-label">Tax ID (optional)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerTaxId) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
         <input type="text" name="tax_id" maxlength="32" class="field" />
       </div>
     </div>
     <div>
-      <label class="field-label">Address (optional)</label>
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerAddress) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
       <input type="text" name="address" maxlength="256" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label class="field-label">Credit limit (empty = no limit)</label>
-        <input type="text" inputmode="decimal" name="credit_limit" step="0.01" min="0" placeholder="unlimited" class="field" />
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerCreditLimit) }}</label>
+        <input type="text" inputmode="decimal" name="credit_limit" step="0.01" min="0" placeholder="{{ localization.tr(crate::localization::MessageKey::CustomerNoLimit) }}" class="field" />
       </div>
       <div>
-        <label class="field-label">Payment days (empty = no term)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerPaymentDays) }}</label>
         <input type="number" name="due_days" min="0" step="1" placeholder="30" class="field" />
       </div>
     </div>
     <div>
-      <label class="field-label">Notes (optional)</label>
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
       <input type="text" name="notes" maxlength="512" class="field" />
     </div>
-    <button type="submit" class="btn-primary">Create Customer</button>
-    <div class="text-[13px] text-muted">Duplicate names are allowed; the existing match is reported as a warning. Also at <code>POST /api/customers</code></div>
+    <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CustomerCreateAction) }}</button>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerCreateHelp) }}</div>
   </form>
 </dialog>
 
@@ -74,10 +75,10 @@
 
 <div id="customer-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl {% if drawer_open %}flex{% else %}hidden{% endif %}">
   <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-    <span class="text-sm font-semibold">Customer detail</span>
+    <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerDetail) }}</span>
     <div class="flex items-center gap-2">
-      <a class="btn-secondary font-normal hover:opacity-100" href="/customers">All customers</a>
-      <button type="button" class="btn-secondary" onclick="closeCustomerDrawer()" aria-label="Close detail">✕</button>
+      <a class="btn-secondary font-normal hover:opacity-100" href="/customers">{{ localization.tr(crate::localization::MessageKey::CustomerAllCustomers) }}</a>
+      <button type="button" class="btn-secondary" onclick="closeCustomerDrawer()" aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
     </div>
   </div>
   <div id="customer-drawer-body" class="flex-1 overflow-y-auto p-4">

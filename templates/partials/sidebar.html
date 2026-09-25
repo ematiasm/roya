@@ -43,14 +43,15 @@
     </a>
   </div>
 
-  <nav class="flex flex-1 flex-col gap-5 overflow-y-auto px-2 py-4" aria-label="Main navigation">
+  <nav class="flex flex-1 flex-col gap-5 overflow-y-auto px-2 py-4"
+       aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityMainNavigation) }}">
     {% if nav.group_visible("operation") %}
     <div data-nav-group="operation">
-      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Operation</div>
+      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">{{ localization.tr(crate::localization::MessageKey::NavigationOperation) }}</div>
       <div class="flex flex-col gap-0.5">
-        {% call nav_item("dashboard", "/", "Dashboard", "M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75") %}
-        {% call nav_item("sales", "/sales", "Sales", "M2.25 3h1.386c.51 0 .955.343 1.087.835l.383 1.437M7.5 14.25a3 3 0 00-3 3h15.75m-12.75-3h11.218c1.121-2.3 2.1-4.684 2.924-7.138a60.114 60.114 0 00-16.536-1.84M7.5 14.25L5.106 5.272M6 20.25a.75.75 0 11-1.5 0 .75.75 0 011.5 0zm12.75 0a.75.75 0 11-1.5 0 .75.75 0 011.5 0z") %}
-        {% call nav_item("purchases", "/purchases", "Purchases", "M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.129-.504 1.09-1.124a17.902 17.902 0 00-3.213-9.193 2.056 2.056 0 00-1.58-.86H14.25M16.5 18.75h-2.25m0-11.177v-.958c0-.568-.422-1.048-.987-1.106a48.554 48.554 0 00-10.026 0 1.106 1.106 0 00-.987 1.106v7.635m12-6.677v6.677m0 4.5v-4.5m0 0h-12") %}
+        {% call nav_item("dashboard", "/", localization.tr(crate::localization::MessageKey::NavigationDashboard), "M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75") %}
+        {% call nav_item("sales", "/sales", localization.tr(crate::localization::MessageKey::NavigationSales), "M2.25 3h1.386c.51 0 .955.343 1.087.835l.383 1.437M7.5 14.25a3 3 0 00-3 3h15.75m-12.75-3h11.218c1.121-2.3 2.1-4.684 2.924-7.138a60.114 60.114 0 00-16.536-1.84M7.5 14.25L5.106 5.272M6 20.25a.75.75 0 11-1.5 0 .75.75 0 011.5 0zm12.75 0a.75.75 0 11-1.5 0 .75.75 0 011.5 0z") %}
+        {% call nav_item("purchases", "/purchases", localization.tr(crate::localization::MessageKey::NavigationPurchases), "M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.129-.504 1.09-1.124a17.902 17.902 0 00-3.213-9.193 2.056 2.056 0 00-1.58-.86H14.25M16.5 18.75h-2.25m0-11.177v-.958c0-.568-.422-1.048-.987-1.106a48.554 48.554 0 00-10.026 0 1.106 1.106 0 00-.987 1.106v7.635m12-6.677v6.677m0 4.5v-4.5m0 0h-12") %}
         {# The documents index: the first entry whose codes are an ANY-OF —
            four departments' read tiers each open part of the same screen
            (`sales.read` the sale documents, `purchases.read` the purchases,
@@ -59,25 +60,25 @@
            tier. The mapping row in `authz.rs` declares the same four codes
            the route's `RequireAny` names, so the nav never promises a screen
            the route refuses. #}
-        {% call nav_item("documents", "/documents", "Documents", "M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z") %}
+        {% call nav_item("documents", "/documents", localization.tr(crate::localization::MessageKey::NavigationDocuments), "M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z") %}
       </div>
     </div>
     {% endif %}
 
     {% if nav.group_visible("catalogue") %}
     <div data-nav-group="catalogue">
-      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Catalogue</div>
+      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">{{ localization.tr(crate::localization::MessageKey::NavigationCatalogue) }}</div>
       <div class="flex flex-col gap-0.5">
-        {% call nav_item("products", "/products", "Products", "M21 7.5l-9-5.25L3 7.5m18 0l-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9") %}
-        {% call nav_item("suppliers", "/suppliers", "Suppliers", "M13.5 21v-7.5a.75.75 0 01.75-.75h3a.75.75 0 01.75.75V21m-4.5 0H2.36m11.14 0H18m0 0h3.64m-1.39 0V9.349m-16.5 11.65V9.35m0 0a3.001 3.001 0 003.75-.615A2.993 2.993 0 009.75 9.75c.896 0 1.7-.393 2.25-1.016a2.993 2.993 0 002.25 1.016c.896 0 1.7-.393 2.25-1.016a3.001 3.001 0 003.75.614m-16.5 0a3.004 3.004 0 01-.621-4.72L4.318 3.44A1.5 1.5 0 015.378 3h13.243a1.5 1.5 0 011.06.44l1.19 1.189a3 3 0 01-.621 4.72m-13.5 8.65h3.75a.75.75 0 00.75-.75V13.5a.75.75 0 00-.75-.75H6.75a.75.75 0 00-.75.75v3.75c0 .415.336.75.75.75z") %}
-        {% call nav_item("customers", "/customers", "Customers", "M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z") %}
+        {% call nav_item("products", "/products", localization.tr(crate::localization::MessageKey::NavigationProducts), "M21 7.5l-9-5.25L3 7.5m18 0l-9 5.25m9-5.25v9l-9 5.25M3 7.5l9 5.25M3 7.5v9l9 5.25m0-9v9") %}
+        {% call nav_item("suppliers", "/suppliers", localization.tr(crate::localization::MessageKey::NavigationSuppliers), "M13.5 21v-7.5a.75.75 0 01.75-.75h3a.75.75 0 01.75.75V21m-4.5 0H2.36m11.14 0H18m0 0h3.64m-1.39 0V9.349m-16.5 11.65V9.35m0 0a3.001 3.001 0 003.75-.615A2.993 2.993 0 009.75 9.75c.896 0 1.7-.393 2.25-1.016a2.993 2.993 0 002.25 1.016c.896 0 1.7-.393 2.25-1.016a3.001 3.001 0 003.75.614m-16.5 0a3.004 3.004 0 01-.621-4.72L4.318 3.44A1.5 1.5 0 015.378 3h13.243a1.5 1.5 0 011.06.44l1.19 1.189a3 3 0 01-.621 4.72m-13.5 8.65h3.75a.75.75 0 00.75-.75V13.5a.75.75 0 00-.75-.75H6.75a.75.75 0 00-.75.75v3.75c0 .415.336.75.75.75z") %}
+        {% call nav_item("customers", "/customers", localization.tr(crate::localization::MessageKey::NavigationCustomers), "M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z") %}
       </div>
     </div>
     {% endif %}
 
     {% if nav.group_visible("cash") %}
     <div data-nav-group="cash">
-      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Cash</div>
+      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">{{ localization.tr(crate::localization::MessageKey::NavigationCash) }}</div>
       <div class="flex flex-col gap-0.5">
         {# No accounts page exists yet; the entry points at the dashboard
            section. The entry needs TWO codes (declared in `authz.rs`): the
@@ -86,35 +87,35 @@
            (`finance.read`, which also gates the block's data routes) — the
            dashboard renders the block conditionally on that same code, so a
            principal that cannot see the block never sees the entry either. #}
-        {% call nav_item("accounts", "/#accounts", "Accounts", "M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5v-.75A.75.75 0 003 15h-.75M15 10.5a3 3 0 11-6 0 3 3 0 016 0zm3 0h.008v.008H18V10.5zm-12 0h.008v.008H6V10.5z") %}
+        {% call nav_item("accounts", "/#accounts", localization.tr(crate::localization::MessageKey::NavigationAccounts), "M2.25 18.75a60.07 60.07 0 0115.797 2.101c.727.198 1.453-.342 1.453-1.096V18.75M3.75 4.5v.75A.75.75 0 013 6h-.75m0 0v-.375c0-.621.504-1.125 1.125-1.125H20.25M2.25 6v9m18-10.5v.75c0 .414.336.75.75.75h.75m-1.5-1.5h.375c.621 0 1.125.504 1.125 1.125v9.75c0 .621-.504 1.125-1.125 1.125h-.375m1.5-1.5H21a.75.75 0 00-.75.75v.75m0 0H3.75m0 0h-.375a1.125 1.125 0 01-1.125-1.125V15m1.5 1.5v-.75A.75.75 0 003 15h-.75M15 10.5a3 3 0 11-6 0 3 3 0 016 0zm3 0h.008v.008H18V10.5zm-12 0h.008v.008H6V10.5z") %}
       </div>
     </div>
     {% endif %}
     {% if nav.group_visible("account") %}
     <div data-nav-group="account">
-      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">Account</div>
+      <div class="px-3 pb-1 text-[11px] font-semibold tracking-[0.12em] text-muted uppercase md:hidden lg:block">{{ localization.tr(crate::localization::MessageKey::NavigationAccount) }}</div>
       <div class="flex flex-col gap-0.5">
         {# The users administration screen (slice S3 part 2). The route
            requires `identity.users.read`, and the mapping in `authz.rs`
            declares the same code for this entry: a principal that cannot
            read the screen never sees the entry either (AC21). #}
-        {% call nav_item("users", "/users", "Usuarios", "M15 9.75a3 3 0 11-6 0 3 3 0 016 0zM15 12a3.75 3.75 0 013.75 3.75v3.375c0 .207-.168.375-.375.375h-1.5a.375.375 0 01-.375-.375V17.25m-6-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25m14.25-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25a3.75 3.75 0 00-3.75-3.75h-.375zM6.75 6a3.75 3.75 0 013.75 3.75v3.375c0 .207.168.375.375.375h7.5a.375.375 0 00.375-.375V9.75A3.75 3.75 0 0015 6h-1.5") %}
+        {% call nav_item("users", "/users", localization.tr(crate::localization::MessageKey::NavigationUsers), "M15 9.75a3 3 0 11-6 0 3 3 0 016 0zM15 12a3.75 3.75 0 013.75 3.75v3.375c0 .207-.168.375-.375.375h-1.5a.375.375 0 01-.375-.375V17.25m-6-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25m14.25-3.75a3.75 3.75 0 00-3.75 3.75v3.375c0 .207.168.375.375.375h1.5a.375.375 0 00.375-.375V17.25a3.75 3.75 0 00-3.75-3.75h-.375zM6.75 6a3.75 3.75 0 013.75 3.75v3.375c0 .207.168.375.375.375h7.5a.375.375 0 00.375-.375V9.75A3.75 3.75 0 0015 6h-1.5") %}
         {# The roles administration screen and the permission matrix (slice
            S4). The route requires `identity.roles.manage` — the whole
            surface is gated by the management tier, because the catalog has
            no `identity.roles.read` and inventing one would need a
            migration (the deliberate mapping the S4 spec records). The
            entry declares the same code, so the nav agrees with the gate. #}
-        {% call nav_item("roles", "/roles", "Roles", "M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.585 3.477 10.374 9 11.625 5.526-1.25 9-6.04 9-11.625 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z") %}
+        {% call nav_item("roles", "/roles", localization.tr(crate::localization::MessageKey::NavigationRoles), "M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.585 3.477 10.374 9 11.625 5.526-1.25 9-6.04 9-11.625 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z") %}
         {# Post-setup business configuration. The `/settings` route and this
            entry both use `settings.manage`, so the item is visible exactly to
            principals that can open the administration panel. #}
-        {% call nav_item("settings", "/settings", "Configuración", "M10.343 3.94c.09-.542.56-.94 1.11-.94h1.093c.55 0 1.02.398 1.11.94l.149.894c.07.424.384.764.78.93.398.164.855.142 1.205-.108l.737-.527a1.125 1.125 0 011.45.12l.773.774c.39.389.44 1.002.12 1.45l-.527.737c-.25.35-.272.806-.107 1.204.165.397.505.71.93.78l.893.15c.543.09.94.559.94 1.109v1.094c0 .55-.397 1.02-.94 1.11l-.894.149c-.424.07-.764.383-.929.78-.165.398-.143.854.107 1.204l.527.738c.32.447.269 1.06-.12 1.45l-.774.773a1.125 1.125 0 01-1.449.12l-.738-.527c-.35-.25-.806-.272-1.203-.107-.398.165-.71.505-.781.93l-.149.894c-.09.542-.56.94-1.11.94h-1.094c-.55 0-1.019-.398-1.11-.94l-.148-.894c-.071-.425-.384-.765-.781-.93-.398-.164-.854-.142-1.205.108l-.737.527c-.448.32-1.06.269-1.45-.12l-.774-.774a1.125 1.125 0 01-.12-1.45l.528-.737c.25-.35.272-.806.108-1.204-.165-.397-.506-.71-.93-.78l-.894-.15c-.542-.09-.94-.56-.94-1.109v-1.094c0-.55.398-1.019.94-1.11l.894-.149c.425-.07.765-.383.93-.78.165-.398.143-.854-.108-1.204l-.526-.738a1.125 1.125 0 01.12-1.45l.773-.773a1.125 1.125 0 011.45-.12l.737.527c.35.25.806.272 1.204.107.397-.165.71-.505.78-.929l.15-.894z M15 12a3 3 0 11-6 0 3 3 0 016 0z") %}
+        {% call nav_item("settings", "/settings", localization.tr(crate::localization::MessageKey::NavigationSettings), "M10.343 3.94c.09-.542.56-.94 1.11-.94h1.093c.55 0 1.02.398 1.11.94l.149.894c.07.424.384.764.78.93.398.164.855.142 1.205-.108l.737-.527a1.125 1.125 0 011.45.12l.773.774c.39.389.44 1.002.12 1.45l-.527.737c-.25.35-.272.806-.107 1.204.165.397.505.71.93.78l.893.15c.543.09.94.559.94 1.109v1.094c0 .55-.397 1.02-.94 1.11l-.894.149c-.424.07-.764.383-.929.78-.165.398-.143.854.107 1.204l.527.738c.32.447.269 1.06-.12 1.45l-.774.773a1.125 1.125 0 01-1.449.12l-.738-.527c-.35-.25-.806-.272-1.203-.107-.398.165-.71.505-.781.93l-.149.894c-.09.542-.56.94-1.11.94h-1.094c-.55 0-1.019-.398-1.11-.94l-.148-.894c-.071-.425-.384-.765-.781-.93-.398-.164-.854-.142-1.205.108l-.737.527c-.448.32-1.06.269-1.45-.12l-.774-.774a1.125 1.125 0 01-.12-1.45l.528-.737c.25-.35.272-.806.108-1.204-.165-.397-.506-.71-.93-.78l-.894-.15c-.542-.09-.94-.56-.94-1.109v-1.094c0-.55.398-1.019.94-1.11l.894-.149c.425-.07.765-.383.93-.78.165-.398.143-.854-.108-1.204l-.526-.738a1.125 1.125 0 01.12-1.45l.773-.773a1.125 1.125 0 011.45-.12l.737.527c.35.25.806.272 1.204.107.397-.165.71-.505.78-.929l.15-.894z M15 12a3 3 0 11-6 0 3 3 0 016 0z") %}
         {# The password page (slice S3 part 1): reachable from the sidebar for
            every signed-in operator, and the one page a confined session may
            still open. Its nav_key is "password", which the page's struct
            carries so the entry shows as active there. #}
-        {% call nav_item("password", "/password", "Password", "M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z") %}
+        {% call nav_item("password", "/password", localization.tr(crate::localization::MessageKey::NavigationPassword), "M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z") %}
       </div>
     </div>
     {% endif %}
@@ -135,7 +136,7 @@
     <div class="truncate md:hidden lg:block">local · SQLite</div>
     <a href="/api/accounts" target="_blank" rel="noreferrer"
        class="link mt-1 inline-block text-[12px] font-normal text-muted hover:text-text">
-      <span class="md:hidden lg:inline">REST API ↗</span><span class="hidden md:inline lg:hidden">API</span>
+      <span class="md:hidden lg:inline">{{ localization.tr(crate::localization::MessageKey::NavigationRestApi) }} ↗</span><span class="hidden md:inline lg:hidden">API</span>
     </a>
     {# Static logout (S1b part 2): a plain POST, no htmx — logout must work
        without JavaScript, and the middleware's origin check accepts a
@@ -143,7 +144,7 @@
        gate with a redirect to /login, so the button is harmless when signed
        out. The signed-in user's name renders just above (S7 part 2). #}
     <form method="post" action="/logout" class="mt-2">
-      <button type="submit" class="btn-primary w-full">Cerrar sesión</button>
+      <button type="submit" class="btn-primary w-full">{{ localization.tr(crate::localization::MessageKey::NavigationLogout) }}</button>
     </form>
   </div>
 </aside>

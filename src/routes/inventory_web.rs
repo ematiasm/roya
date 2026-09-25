@@ -82,7 +82,9 @@ struct TaxListPartial {
 #[derive(Template)]
 #[template(path = "partials/notice.html")]
 struct HiddenByFilterNotice {
-    product_name: String,
+    message: String,
+    clear_filter_label: String,
+    dismiss_label: String,
 }
 
 #[derive(Template)]
@@ -262,9 +264,21 @@ fn body_filter_is_active(q: &str, category_id: &str) -> bool {
 /// response body itself carries this marker, and both directions fail safe:
 /// an ordinary create (no marker) keeps the generic notice, and if the server
 /// ever stops rendering this box the generic notice comes back untouched.
-fn hidden_by_filter_notice_html(product_name: &str) -> AppResult<String> {
+fn hidden_by_filter_notice_html(
+    product_name: &str,
+    localization: &LocalizationContext,
+) -> AppResult<String> {
     HiddenByFilterNotice {
-        product_name: product_name.to_string(),
+        message: localization.tr_with(
+            crate::localization::MessageKey::NoticeCreated,
+            &[("product_name", product_name)],
+        ),
+        clear_filter_label: localization
+            .tr(crate::localization::MessageKey::NoticeCreatedFilterClear)
+            .to_string(),
+        dismiss_label: localization
+            .tr(crate::localization::MessageKey::AccessibilityDismiss)
+            .to_string(),
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))
@@ -438,16 +452,20 @@ pub struct CategoryOptionsQuery {
 async fn web_category_options(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(q): Query<CategoryOptionsQuery>,
 ) -> Result<Html<String>, AppError> {
     let cats = state.inventory_service.categories.list().await?;
-    let empty_label = q
-        .empty
-        .as_deref()
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-        .unwrap_or("All categories");
-    let mut html = format!("<option value=\"\">{}</option>", html_escape(empty_label));
+    let empty_label = match q.empty.as_deref().map(str::trim) {
+        Some("none") => localization
+            .tr(crate::localization::MessageKey::CommonNoCategory)
+            .to_string(),
+        Some(label) if !label.is_empty() => label.to_string(),
+        _ => localization
+            .tr(crate::localization::MessageKey::CommonAllCategories)
+            .to_string(),
+    };
+    let mut html = format!("<option value=\"\">{}</option>", html_escape(&empty_label));
     for c in cats {
         html.push_str(&format!(
             "<option value=\"{}\">{}</option>",
@@ -573,7 +591,13 @@ async fn product_detail_html(
                 .iter()
                 .find(|s| s.id == cost.supplier_id)
                 .map(|s| s.name.clone())
-                .unwrap_or_else(|| format!("supplier #{}", cost.supplier_id));
+                .unwrap_or_else(|| {
+                    format!(
+                        "{} #{}",
+                        localization.tr(crate::localization::MessageKey::ProductSupplier),
+                        cost.supplier_id
+                    )
+                });
             ProductCostView {
                 cost,
                 supplier_name,
@@ -961,7 +985,7 @@ async fn web_create_product(
             // removes the wrapper from the main swap either way. The
             // transport (body, not header), the template home and the marker
             // are documented on `hidden_by_filter_notice_html`.
-            html = hidden_by_filter_notice_html(&created.name)? + &html;
+            html = hidden_by_filter_notice_html(&created.name, &localization)? + &html;
         }
         let mut resp = Html(html).into_response();
         resp.headers_mut()
@@ -1642,8 +1666,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{html:.400}");
         assert!(
-            html.contains("Acción no permitida"),
-            "the refusal must speak Spanish: {html:.400}"
+            html.contains("Action not permitted"),
+            "the refusal must use the English fallback: {html:.400}"
         );
         assert!(
             html.contains("inventory.write"),
@@ -1915,8 +1939,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{html:.400}");
         assert!(
-            html.contains("Acción no permitida"),
-            "the refusal must speak Spanish: {html:.400}"
+            html.contains("Action not permitted"),
+            "the refusal must use the English fallback: {html:.400}"
         );
         assert!(
             html.contains("inventory.write"),
@@ -1996,15 +2020,19 @@ mod tests {
 
     #[tokio::test]
     async fn web_products_page_renders() {
-        let app = crate::routes::router(test_state().await);
+        let state = test_state().await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
         let (status, html) = get_html(app, "/products").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
-            html.contains("Products") || html.contains("products"),
+            html.contains("Productos") || html.contains("Products"),
             "page should mention products"
         );
         assert!(
-            html.contains("Low Stock"),
+            html.contains(localization.tr(crate::localization::MessageKey::ProductLowStock)),
             "page should have low-stock section"
         );
     }
@@ -2018,10 +2046,14 @@ mod tests {
 
     #[tokio::test]
     async fn web_low_stock_fragment_renders() {
-        let app = crate::routes::router(test_state().await);
+        let state = test_state().await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
         let (status, html) = get_html(app, "/web/low-stock").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(html.contains("Stock OK") || html.contains("stock-") || html.contains("low"));
+        assert!(html.contains(localization.tr(crate::localization::MessageKey::ProductStockOk)));
     }
 
     #[tokio::test]
@@ -2341,16 +2373,23 @@ mod tests {
             .await
             .unwrap();
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let app = crate::routes::router(state);
         let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
+        let stock_summary = format!(
+            "{} 5",
+            localization.tr(crate::localization::MessageKey::ProductStock)
+        );
         for expected in [
             "product-detail-inner",
             "prod DETAIL-1",
-            "stock 5",
+            stock_summary.as_str(),
             "Detail Sup",
             "12.50",
-            "preferred",
+            localization.tr(crate::localization::MessageKey::ProductPreferred),
         ] {
             assert!(
                 html.contains(expected),
@@ -2364,10 +2403,10 @@ mod tests {
         // the toast text degrades. Pin the exact three labels and forbid any
         // other `data-action` in the fragment.
         for label in [
-            "Save product",
-            "Link product tax",
-            "Record product cost",
-            "Record movement",
+            localization.tr(crate::localization::MessageKey::ProductSave),
+            localization.tr(crate::localization::MessageKey::ProductLinkTax),
+            localization.tr(crate::localization::MessageKey::ProductRecordCost),
+            localization.tr(crate::localization::MessageKey::ProductRecordMovement),
         ] {
             let attr = format!("data-action=\"{label}\"");
             assert_eq!(
@@ -2481,10 +2520,26 @@ mod tests {
         )
         .await;
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let app = crate::routes::router(state);
         let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
-        for expected in ["stale cost", "reference 12.50 USD", "stored 5 USD"] {
+        let expected = vec![
+            localization
+                .tr(crate::localization::MessageKey::ProductStaleCost)
+                .to_string(),
+            format!(
+                "{} 12.50 USD",
+                localization.tr(crate::localization::MessageKey::ProductReferenceCost)
+            ),
+            format!(
+                "{} 5 USD",
+                localization.tr(crate::localization::MessageKey::ProductStoredCost)
+            ),
+        ];
+        for expected in &expected {
             assert!(
                 html.contains(expected),
                 "stale badge must show {expected}: {html:.900}"
@@ -2499,11 +2554,14 @@ mod tests {
         let product = seed_product_with_cost(&state, "STALE-2", Decimal::from(5)).await;
         seed_supplier_cost(&state, product.id, "Fresh Sup", Decimal::from(5), true).await;
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let app = crate::routes::router(state);
         let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
-            !html.contains("stale cost"),
+            !html.contains(localization.tr(crate::localization::MessageKey::ProductStaleCost)),
             "equal costs must not render the badge: {html:.900}"
         );
     }
@@ -2515,11 +2573,14 @@ mod tests {
         let state = test_state().await;
         let product = seed_product_with_cost(&state, "STALE-3", Decimal::from(5)).await;
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let app = crate::routes::router(state);
         let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
-            !html.contains("stale cost"),
+            !html.contains(localization.tr(crate::localization::MessageKey::ProductStaleCost)),
             "no supplier rows must not render the badge: {html:.900}"
         );
     }
@@ -2540,11 +2601,14 @@ mod tests {
         )
         .await;
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let app = crate::routes::router(state);
         let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
-            !html.contains("stale cost"),
+            !html.contains(localization.tr(crate::localization::MessageKey::ProductStaleCost)),
             "stored cost 0 must not render the badge: {html:.900}"
         );
     }
@@ -2558,15 +2622,19 @@ mod tests {
         seed_supplier_cost(&state, product.id, "Cheap Sup", Decimal::from(8), false).await;
         seed_supplier_cost(&state, product.id, "Preferred Sup", Decimal::from(20), true).await;
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let app = crate::routes::router(state);
         let (status, html) = get_html(app, &format!("/web/products/detail/{}", product.id)).await;
         assert_eq!(status, StatusCode::OK, "{html}");
+        let reference = localization.tr(crate::localization::MessageKey::ProductReferenceCost);
         assert!(
-            html.contains("reference 20 USD"),
+            html.contains(&format!("{reference} 20 USD")),
             "badge must show the preferred supplier's cost: {html:.900}"
         );
         assert!(
-            !html.contains("reference 8 USD"),
+            !html.contains(&format!("{reference} 8 USD")),
             "badge must not fall back to the cheapest row: {html:.900}"
         );
     }
@@ -3231,6 +3299,9 @@ mod tests {
             )
             .await
             .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let app = crate::routes::router(state);
 
         let body = format!(
@@ -3246,7 +3317,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{html}");
         assert!(
-            html.contains("product-detail-inner") && html.contains("stock 5"),
+            html.contains("product-detail-inner")
+                && html.contains(&format!(
+                    "{} 5",
+                    localization.tr(crate::localization::MessageKey::ProductStock)
+                )),
             "drawer answer must be the fresh detail with derived stock: {html:.600}"
         );
         assert!(
@@ -3478,20 +3553,31 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{resp}");
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let (status, page) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
         assert_eq!(status, StatusCode::OK, "{page}");
+        let registered_by = format!(
+            "{} Test Admin",
+            localization.tr(crate::localization::MessageKey::AuditRegisteredBy)
+        );
+        let updated_by = format!(
+            "{} Test Probe",
+            localization.tr(crate::localization::MessageKey::AuditUpdatedBy)
+        );
         assert_eq!(
-            page.matches("Registrado por Test Admin").count(),
+            page.matches(&registered_by).count(),
             1,
             "the detail names the creator's display name: {page}"
         );
         assert_eq!(
-            page.matches("Actualizado por Test Probe").count(),
+            page.matches(&updated_by).count(),
             1,
             "the edit names its editor: {page}"
         );
         assert!(
-            !page.contains("Registrado por 1"),
+            !page.contains(&format!("{registered_by}").replace("Test Admin", "1")),
             "the interface never renders a raw user id: {page}"
         );
     }
@@ -3533,15 +3619,22 @@ mod tests {
             .await
             .unwrap();
 
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         let (status, html) = get_html(app, "/web/low-stock").await;
         assert_eq!(status, StatusCode::OK, "{html}");
+        let registered_by = format!(
+            "{} Test Admin",
+            localization.tr(crate::localization::MessageKey::AuditRegisteredBy)
+        );
         assert_eq!(
-            html.matches("Producto registrado por Test Admin").count(),
+            html.matches(&registered_by).count(),
             1,
             "the stock row names the product's creator, and says that is what it names: {html}"
         );
         assert!(
-            !html.contains("Producto registrado por 1"),
+            !html.contains(&registered_by.replace("Test Admin", "1")),
             "the fragment never renders a raw user id: {html}"
         );
     }

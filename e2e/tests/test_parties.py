@@ -204,10 +204,10 @@ def test_clicking_a_customer_name_opens_the_drawer_with_statement(
     body = page.locator("#customer-detail-inner")
     expect(body).to_contain_text("Drawer Buyer")
     expect(body).to_contain_text("555-0142")
-    expect(body).to_contain_text("limit 500.00")
+    expect(body).to_contain_text("Limit 500.00")
     expect(body).to_contain_text("term 30d")
     expect(page.locator("#customer-statement-inner .text-2xl")).to_contain_text(
-        "balance as of"
+        "Balance as of"
     )
     expect(page.locator("#customer-statement-inner .text-2xl")).to_contain_text("10.00")
     expect(body).to_contain_text("Receivable sales (1)")
@@ -445,7 +445,7 @@ def test_supplier_edit_modal_is_prefilled_and_saves(page: Page, api: ApiClient) 
     expect(dialog.locator('input[name="phone"]')).to_have_value("555-0133")
     expect(dialog.locator('input[name="notes"]')).to_have_value("old notes")
     dialog.locator('input[name="name"]').fill("Edited Supplier")
-    dialog.get_by_role("button", name="Save Changes").click()
+    dialog.get_by_role("button", name="Save").click()
 
     listing = page.locator(f"#{_SUPPLIERS_INNER}")
     expect(listing).to_contain_text("Edited Supplier")

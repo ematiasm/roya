@@ -1,18 +1,18 @@
 {% extends "base.html" %}
-{% block title %}Roya — Sales{% endblock %}
+{% block title %}Roya — {{ localization.tr(crate::localization::MessageKey::NavigationSales) }}{% endblock %}
 {% block content %}
-{% let page_title = "Sales" %}
+{% let page_title = localization.tr(crate::localization::MessageKey::NavigationSales) %}
 {% let page_breadcrumb_label = "" %}
 {% let page_breadcrumb_href = "" %}
 {% let page_action_href = "#new-sale" %}
-{% let page_action_label = "New sale" %}
+{% let page_action_label = localization.tr(crate::localization::MessageKey::SalesNew) %}
 {% let page_action_dialog = "" %}
 {% include "partials/page_header.html" %}
 <div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
   <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Sales</h2>
+        <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::NavigationSales) }}</h2>
       </div>
       {# The shared list-filter bar: `filter_module` is the singular form-id and
          list-target prefix, `filter_list` the plural endpoint path segment and
@@ -22,13 +22,13 @@
       {% let filter_list = "sales" %}
       {% include "partials/list_filters_open.html" %}
         <select class="field min-w-[110px] flex-1" name="status">
-          <option value="">All statuses</option>
-          <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>Draft</option>
-          <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>Confirmed</option>
-          <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>Cancelled</option>
+          <option value="">{{ localization.tr(crate::localization::MessageKey::SalesFilterStatus) }}</option>
+          <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</option>
+          <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}</option>
+          <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}</option>
         </select>
-        <input class="field min-w-[120px] flex-1" type="text" name="customer" placeholder="Customer" value="{{ filter_customer }}" />
-        <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="Sale number" value="{{ filter_number }}" />
+        <input class="field min-w-[120px] flex-1" type="text" name="customer" placeholder="{{ localization.tr(crate::localization::MessageKey::SalesCustomer) }}" value="{{ filter_customer }}" />
+        <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="{{ localization.tr(crate::localization::MessageKey::SalesNumber) }}" value="{{ filter_number }}" />
         <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
         <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
       {% include "partials/list_filters_close.html" %}
@@ -47,8 +47,8 @@
 
     <div class="rounded-2xl border border-border bg-card p-5" id="debt-section">
       <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Outstanding Debt</h2>
-        <button class="btn-secondary" hx-get="/web/sales/debt" hx-target="#sale-debt" hx-swap="innerHTML">↻ Refresh</button>
+        <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesDebt) }}</h2>
+        <button class="btn-secondary" hx-get="/web/sales/debt" hx-target="#sale-debt" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonRefresh) }}</button>
       </div>
       <div id="sale-debt"
            hx-get="/web/sales/debt"
@@ -56,16 +56,16 @@
            hx-swap="innerHTML">
         {% include "partials/sale_debt.html" %}
       </div>
-      <div class="mt-2 text-[13px] text-muted">Confirmed sales with due &gt; 0 (total − paid). Open a record to record its payment.</div>
+      <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesDebtHelp) }}</div>
     </div>
   </div>
 
   <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5" id="new-sale">
-      <h2 class="mb-3 text-lg font-semibold">New Sale (Draft)</h2>
-      <form class="flex flex-col gap-2.5" data-action="Create sale" hx-post="/web/sales" hx-swap="none">
+      <h2 class="mb-3 text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesNewDraft) }}</h2>
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesCreateAction) }}" hx-post="/web/sales" hx-swap="none">
         <div>
-          <label class="field-label">Customer</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesCustomer) }}</label>
           <select name="customer_id" required class="field">
             {% for c in customers %}
             <option value="{{ c.id }}" {% if c.is_walkin %}selected{% endif %}>{{ c.name }}</option>
@@ -74,31 +74,31 @@
         </div>
         <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
-            <label class="field-label">Type</label>
+            <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesType) }}</label>
             <select name="payment_type" required class="field">
-              <option value="Cash">Cash</option>
-              <option value="Credit">Credit</option>
+              <option value="Cash">{{ localization.tr(crate::localization::MessageKey::ValueCash) }}</option>
+              <option value="Credit">{{ localization.tr(crate::localization::MessageKey::ValueCredit) }}</option>
             </select>
           </div>
           <div>
-            <label class="field-label">Sale date</label>
+            <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesDate) }}</label>
             <input type="date" name="sale_date" required value="{{ today }}" class="field" />
           </div>
         </div>
         <div>
-          <label class="field-label">Due date (Credit only)</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesDueCredit) }}</label>
           <input type="date" name="due_date" class="field" />
         </div>
         <div>
-          <label class="field-label">Receipt no (optional)</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesReceiptOptional) }}</label>
           <input type="text" name="receipt_no" placeholder="ticket-123" maxlength="64" class="field" />
         </div>
         <div>
-          <label class="field-label">Notes</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }}</label>
           <input type="text" name="notes" placeholder="…" maxlength="512" class="field" />
         </div>
-        <button type="submit" class="btn-primary">Create Draft</button>
-        <div class="text-[13px] text-muted">Creating opens the new draft's page. Also at <code>POST /api/sales</code></div>
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesCreateDraft) }}</button>
+        <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesCreateHelp) }}</div>
       </form>
     </div>
   </div>

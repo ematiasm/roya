@@ -589,5 +589,5 @@ async fn tax_web_uses_locale_input_and_display_and_refreshes_product_drawer() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains("inactive"), "{body}");
+    assert!(body.contains("Inactivo"), "{body}");
 }

@@ -1,16 +1,16 @@
 <div id="stock-list-inner">
   {% if items.is_empty() %}
-    <div class="empty">Stock OK — nothing to reorder.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::ProductStockOk) }}</div>
   {% else %}
     {% for row in items %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="stock-{{ row.ps.product.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="chip chip-expense">low</span>
+          <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductLow) }}</span>
           <span class="font-semibold">{{ row.ps.product.name }}</span>
           <span class="text-xs text-muted">{{ row.ps.product.sku }}</span>
         </div>
-        <span class="text-[13px] text-muted">stock {{ localization.format_quantity(row.ps.stock.clone()) }}{% if let Some(min) = row.ps.product.min_stock %} • min {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = row.ps.product.max_stock %} • max {{ localization.format_quantity(max.clone()) }}{% endif %} • Producto registrado por {{ row.created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = row.updated_by_name %} • Actualizado por {{ name }}{% endif %}</span>
+        <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(row.ps.stock.clone()) }}{% if let Some(min) = row.ps.product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = row.ps.product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %} • {{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ row.created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = row.updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ name }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
         {% if let Some(sug) = row.ps.suggested %}

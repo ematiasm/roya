@@ -13,15 +13,15 @@
 // resolves and inserts into request extensions. Departments receive it as an
 // opaque value from the kernel; they never resolve permissions themselves and
 // never depend on the identity service (AC20).
+use askama::Template;
 use axum::{
     extract::FromRequestParts,
     http::{request::Parts, StatusCode},
     response::{Html, IntoResponse, Response},
 };
-use askama::Template;
 
 use crate::error::AppError;
-use crate::localization::LocalizationContext;
+use crate::localization::{LocalizationContext, MessageKey};
 use crate::models::User;
 
 // ---------------------------------------------------------------------------
@@ -48,15 +48,27 @@ macro_rules! permission {
 }
 
 permission!(DashboardRead, "dashboard.read", "View the dashboard.");
-permission!(FinanceRead, "finance.read", "View accounts and transactions.");
-permission!(FinanceWrite, "finance.write", "Record and edit transactions.");
+permission!(
+    FinanceRead,
+    "finance.read",
+    "View accounts and transactions."
+);
+permission!(
+    FinanceWrite,
+    "finance.write",
+    "Record and edit transactions."
+);
 permission!(
     FinanceMethodsManage,
     "finance.methods.manage",
     "Manage accounts and payment methods."
 );
 permission!(InventoryRead, "inventory.read", "View products and stock.");
-permission!(InventoryWrite, "inventory.write", "Create and edit products.");
+permission!(
+    InventoryWrite,
+    "inventory.write",
+    "Create and edit products."
+);
 permission!(
     InventoryStockWrite,
     "inventory.stock.write",
@@ -66,7 +78,11 @@ permission!(SalesRead, "sales.read", "View sales.");
 permission!(SalesCreate, "sales.create", "Record sales.");
 permission!(SalesCancel, "sales.cancel", "Cancel sales.");
 permission!(CustomersRead, "customers.read", "View customers.");
-permission!(CustomersWrite, "customers.write", "Create and edit customers.");
+permission!(
+    CustomersWrite,
+    "customers.write",
+    "Create and edit customers."
+);
 permission!(CustomersCollect, "customers.collect", "Record collections.");
 permission!(PurchasesRead, "purchases.read", "View purchases.");
 permission!(PurchasesCreate, "purchases.create", "Record purchases.");
@@ -82,7 +98,11 @@ permission!(
     "Edit per-supplier costs."
 );
 permission!(SuppliersRead, "suppliers.read", "View suppliers.");
-permission!(SuppliersWrite, "suppliers.write", "Create and edit suppliers.");
+permission!(
+    SuppliersWrite,
+    "suppliers.write",
+    "Create and edit suppliers."
+);
 permission!(IdentityUsersRead, "identity.users.read", "View users.");
 permission!(
     IdentityUsersManage,
@@ -122,7 +142,10 @@ pub const PERMISSION_DESCRIPTIONS: &[(&str, &str)] = &[
     (DashboardRead::CODE, "Ver el panel principal"),
     (FinanceRead::CODE, "Ver cuentas y movimientos"),
     (FinanceWrite::CODE, "Registrar y editar movimientos"),
-    (FinanceMethodsManage::CODE, "Administrar cuentas y medios de pago"),
+    (
+        FinanceMethodsManage::CODE,
+        "Administrar cuentas y medios de pago",
+    ),
     (InventoryRead::CODE, "Ver productos y stock"),
     (InventoryWrite::CODE, "Crear y editar productos"),
     (InventoryStockWrite::CODE, "Ajustar stock"),
@@ -281,9 +304,15 @@ where
                 _marker: std::marker::PhantomData,
             })
         } else {
-            Err(forbidden_response(
+            let api_message = format!("Se necesita el permiso «{}» para esta acción", P::CODE);
+            let page_message = request_localization(parts).tr_with(
+                MessageKey::ForbiddenPermissionRequired,
+                &[("permission", P::CODE)],
+            );
+            Err(forbidden_response_with_page_message(
                 parts,
-                format!("Se necesita el permiso «{}» para esta acción", P::CODE),
+                api_message,
+                page_message,
             ))
         }
     }
@@ -360,9 +389,16 @@ where
                 .map(|code| format!("«{code}»"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(forbidden_response(
+            let api_message =
+                format!("Se necesita alguno de los permisos {listed} para esta acción");
+            let page_message = request_localization(parts).tr_with(
+                MessageKey::ForbiddenAnyPermissionRequired,
+                &[("permissions", &listed)],
+            );
+            Err(forbidden_response_with_page_message(
                 parts,
-                format!("Se necesita alguno de los permisos {listed} para esta acción"),
+                api_message,
+                page_message,
             ))
         }
     }
@@ -376,10 +412,20 @@ where
 /// `/api/*` and for HTMX requests (the global `htmx:responseError` handler in
 /// base.html turns it into the dismissible notice box, so no new fragment is
 /// needed), and a minimal HTML page (`templates/forbidden.html`, extending
-/// `base.html` so the navigation survives) for a full-page navigation. The
-/// message is written in Spanish like the rest of the interface copy, because
-/// the operator is the one reading it. A refusal writes nothing.
+/// `base.html` so the navigation survives) for a full-page navigation. A
+/// refusal writes nothing.
 pub fn forbidden_response(parts: &Parts, message: String) -> Response {
+    let page_message = message.clone();
+    forbidden_response_with_page_message(parts, message, page_message)
+}
+
+/// Render an HTML refusal with localized presentation while preserving the
+/// service/API error string byte-for-byte for API and HTMX callers.
+pub fn forbidden_response_with_page_message(
+    parts: &Parts,
+    api_message: String,
+    page_message: String,
+) -> Response {
     let is_api = parts.uri.path().starts_with("/api/");
     let is_htmx = parts
         .headers
@@ -388,14 +434,10 @@ pub fn forbidden_response(parts: &Parts, message: String) -> Response {
     if is_api || is_htmx {
         // The one constructor `AppError::Forbidden` ever needs: the extractor
         // refusing an under-permissioned principal.
-        return AppError::Forbidden(message).into_response();
+        return AppError::Forbidden(api_message).into_response();
     }
     match (ForbiddenTemplate {
-        localization: parts
-            .extensions
-            .get::<LocalizationContext>()
-            .cloned()
-            .unwrap_or_else(LocalizationContext::fallback),
+        localization: request_localization(parts),
         nav_key: String::new(),
         // The shell obeys the same nav rule every page renders: the entries
         // this principal may read, or the anonymous fallback when the
@@ -405,7 +447,7 @@ pub fn forbidden_response(parts: &Parts, message: String) -> Response {
             .get::<Principal>()
             .map(Nav::for_principal)
             .unwrap_or_else(Nav::anonymous),
-        message,
+        message: page_message,
     })
     .render()
     {
@@ -413,6 +455,14 @@ pub fn forbidden_response(parts: &Parts, message: String) -> Response {
         // A template failure is an internal error, never a silent pass.
         Err(e) => AppError::Internal(e.to_string()).into_response(),
     }
+}
+
+fn request_localization(parts: &Parts) -> LocalizationContext {
+    parts
+        .extensions
+        .get::<LocalizationContext>()
+        .cloned()
+        .unwrap_or_else(LocalizationContext::fallback)
 }
 
 // ---------------------------------------------------------------------------
@@ -456,9 +506,21 @@ struct NavEntry {
 }
 
 const NAV_ENTRIES: &[NavEntry] = &[
-    NavEntry { key: "dashboard", visibility: NavVisibility::All(&[DashboardRead::CODE]), group: "operation" },
-    NavEntry { key: "sales", visibility: NavVisibility::All(&[SalesRead::CODE]), group: "operation" },
-    NavEntry { key: "purchases", visibility: NavVisibility::All(&[PurchasesRead::CODE]), group: "operation" },
+    NavEntry {
+        key: "dashboard",
+        visibility: NavVisibility::All(&[DashboardRead::CODE]),
+        group: "operation",
+    },
+    NavEntry {
+        key: "sales",
+        visibility: NavVisibility::All(&[SalesRead::CODE]),
+        group: "operation",
+    },
+    NavEntry {
+        key: "purchases",
+        visibility: NavVisibility::All(&[PurchasesRead::CODE]),
+        group: "operation",
+    },
     // `documents` is the first any-of row: four departments' read tiers each
     // open part of the same screen — sales.read the sale documents,
     // purchases.read the purchases, inventory.read the stock movements,
@@ -466,25 +528,66 @@ const NAV_ENTRIES: &[NavEntry] = &[
     // screen, and the page itself narrows the content per tier. The route's
     // `RequireAny` names the same four codes; the kernel's drift tests tie
     // the nav row and the route together.
-    NavEntry { key: "documents", visibility: NavVisibility::Any(&[SalesRead::CODE, PurchasesRead::CODE, InventoryRead::CODE, CustomersRead::CODE]), group: "operation" },
-    NavEntry { key: "products", visibility: NavVisibility::All(&[InventoryRead::CODE]), group: "catalogue" },
-    NavEntry { key: "suppliers", visibility: NavVisibility::All(&[SuppliersRead::CODE]), group: "catalogue" },
-    NavEntry { key: "customers", visibility: NavVisibility::All(&[CustomersRead::CODE]), group: "catalogue" },
+    NavEntry {
+        key: "documents",
+        visibility: NavVisibility::Any(&[
+            SalesRead::CODE,
+            PurchasesRead::CODE,
+            InventoryRead::CODE,
+            CustomersRead::CODE,
+        ]),
+        group: "operation",
+    },
+    NavEntry {
+        key: "products",
+        visibility: NavVisibility::All(&[InventoryRead::CODE]),
+        group: "catalogue",
+    },
+    NavEntry {
+        key: "suppliers",
+        visibility: NavVisibility::All(&[SuppliersRead::CODE]),
+        group: "catalogue",
+    },
+    NavEntry {
+        key: "customers",
+        visibility: NavVisibility::All(&[CustomersRead::CODE]),
+        group: "catalogue",
+    },
     // The accounts entry opens `/#accounts`, which is the `/` route's
     // dashboard section: the route itself declares `dashboard.read`, and the
     // entry's label names the accounts block, whose data owner is
     // `finance.read`. The entry carries BOTH, and the dashboard renders the
     // accounts block conditionally on `finance.read` (web.rs) — the same
     // shape the suggestions block uses in purchases_web.rs.
-    NavEntry { key: "accounts", visibility: NavVisibility::All(&[DashboardRead::CODE, FinanceRead::CODE]), group: "cash" },
-    NavEntry { key: "users", visibility: NavVisibility::All(&[IdentityUsersRead::CODE]), group: "account" },
-    NavEntry { key: "roles", visibility: NavVisibility::All(&[IdentityRolesManage::CODE]), group: "account" },
-    NavEntry { key: "settings", visibility: NavVisibility::All(&[SettingsManage::CODE]), group: "account" },
+    NavEntry {
+        key: "accounts",
+        visibility: NavVisibility::All(&[DashboardRead::CODE, FinanceRead::CODE]),
+        group: "cash",
+    },
+    NavEntry {
+        key: "users",
+        visibility: NavVisibility::All(&[IdentityUsersRead::CODE]),
+        group: "account",
+    },
+    NavEntry {
+        key: "roles",
+        visibility: NavVisibility::All(&[IdentityRolesManage::CODE]),
+        group: "account",
+    },
+    NavEntry {
+        key: "settings",
+        visibility: NavVisibility::All(&[SettingsManage::CODE]),
+        group: "account",
+    },
     // No permission gates the password page: every signed-in operator — a
     // confined session included — must always be able to reach it. The empty
     // `All` list is vacuously true: that entry is the one visible to every
     // signed-in principal.
-    NavEntry { key: "password", visibility: NavVisibility::All(&[]), group: "account" },
+    NavEntry {
+        key: "password",
+        visibility: NavVisibility::All(&[]),
+        group: "account",
+    },
 ];
 
 /// What the sidebar renders for one signed-in request: the acting user's name
@@ -561,9 +664,7 @@ impl Nav {
                         // A no-permission entry is for every signed-in operator.
                         || codes.iter().all(|code| permissions.contains(*code))
                 }
-                NavVisibility::Any(codes) => {
-                    codes.iter().any(|code| permissions.contains(*code))
-                }
+                NavVisibility::Any(codes) => codes.iter().any(|code| permissions.contains(*code)),
             };
             if allowed {
                 visible_keys.insert(entry.key);
@@ -728,9 +829,9 @@ mod tests {
             "INSERT INTO roles (code, name, created_by) VALUES ('probe-writer', 'probe', \
              (SELECT id FROM users WHERE username = 'sistema' COLLATE NOCASE))",
         )
-            .execute(&state.pool)
-            .await
-            .unwrap();
+        .execute(&state.pool)
+        .await
+        .unwrap();
         "handler-ran"
     }
 
@@ -753,7 +854,9 @@ mod tests {
     }
 
     async fn body_string(resp: axum::http::Response<axum::body::Body>) -> String {
-        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         String::from_utf8_lossy(&bytes).to_string()
     }
 
@@ -769,15 +872,15 @@ mod tests {
             "text/html; charset=utf-8"
         );
         let html = body_string(resp).await;
-        // The interface copy is Spanish; the page extends base.html, so the
-        // navigation shell the principal may still use survives. The rendered
-        // message is the extractor's Spanish sentence naming the missing code.
+        // The page extends base.html, so the navigation shell the principal may
+        // still use survives. Without a localization extension, the existing
+        // English fallback is explicit and names the missing canonical code.
         assert!(
-            html.contains("Acción no permitida"),
-            "the refusal must speak Spanish: {html}"
+            html.contains("Action not permitted"),
+            "the refusal must use the English fallback: {html}"
         );
         assert!(
-            html.contains("Se necesita el permiso «customers.write» para esta acción"),
+            html.contains("Permission «customers.write» is required for this action"),
             "the refusal must name the missing permission: {html}"
         );
         assert!(
@@ -795,13 +898,11 @@ mod tests {
         let (app, _state) = guarded_app(&[]).await;
         let resp = send(&app, "/api/kernel-gated", &[]).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
-        assert!(
-            json.get("error")
-                .and_then(|e| e.as_str())
-                .is_some_and(|message| message.contains("finance.read")),
-            "the JSON refusal must name the missing permission: {json}"
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(
+            json.get("error").and_then(|e| e.as_str()),
+            Some("Se necesita el permiso «finance.read» para esta acción"),
+            "the JSON refusal must preserve the authorization error contract: {json}"
         );
     }
 
@@ -810,8 +911,7 @@ mod tests {
         let (app, _state) = guarded_app(&[]).await;
         let resp = send(&app, "/kernel-gated", &[("HX-Request", "true")]).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert!(
             json.get("error").is_some(),
             "an HTMX refusal must be the JSON shape the global htmx:responseError handler reads: {json}"
@@ -830,12 +930,11 @@ mod tests {
             .with_state(state.clone());
         let resp = send(&writer, "/kernel-writer", &[]).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM roles WHERE code = 'probe-writer'",
-        )
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+        let count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM roles WHERE code = 'probe-writer'")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
         assert_eq!(count.0, 0, "a refused request must write nothing");
     }
 
@@ -843,7 +942,11 @@ mod tests {
     async fn ac10_the_same_handler_runs_when_any_role_grants_the_permission() {
         let (app, _state) = guarded_app(&["vendedor"]).await;
         let resp = send(&app, "/kernel-gated", &[]).await;
-        assert_eq!(resp.status(), StatusCode::OK, "vendedor holds customers.write");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "vendedor holds customers.write"
+        );
         assert_eq!(body_string(resp).await, "handler-ran");
     }
 
@@ -869,11 +972,7 @@ mod tests {
             .fetch_one(&state.pool)
             .await
             .unwrap();
-        let cajero = roles_repo
-            .find_by_code("cajero")
-            .await
-            .unwrap()
-            .unwrap();
+        let cajero = roles_repo.find_by_code("cajero").await.unwrap().unwrap();
         roles_repo
             .grant(&NewUserRole {
                 user_id,
@@ -883,9 +982,17 @@ mod tests {
             .await
             .unwrap();
         let both = send(&app, "/api/kernel-gated", &[]).await;
-        assert_eq!(both.status(), StatusCode::OK, "the union must hold finance.read");
+        assert_eq!(
+            both.status(),
+            StatusCode::OK,
+            "the union must hold finance.read"
+        );
         let still = send(&app, "/kernel-gated", &[]).await;
-        assert_eq!(still.status(), StatusCode::OK, "vendedor's grant must survive");
+        assert_eq!(
+            still.status(),
+            StatusCode::OK,
+            "vendedor's grant must survive"
+        );
 
         // Revoke cajero: the very next request is refused again, no restart.
         roles_repo.revoke(user_id, cajero.id).await.unwrap();
@@ -913,8 +1020,14 @@ mod tests {
         let roles_repo = SqliteRoleRepository::new(state.pool.clone());
         let vendedor = roles_repo.find_by_code("vendedor").await.unwrap().unwrap();
         let mut kept: Vec<i64> = Vec::new();
-        for code in ["dashboard.read", "inventory.read", "sales.read", "sales.create",
-                     "customers.read", "customers.collect"] {
+        for code in [
+            "dashboard.read",
+            "inventory.read",
+            "sales.read",
+            "sales.create",
+            "customers.read",
+            "customers.collect",
+        ] {
             let id: (i64,) = sqlx::query_as("SELECT id FROM permissions WHERE code = ?")
                 .bind(code)
                 .fetch_one(&state.pool)
@@ -1040,7 +1153,10 @@ mod tests {
         let vendedor = repo.find_by_code("vendedor").await.unwrap().unwrap();
         assert_eq!(vendedor.code, "vendedor");
         assert_eq!(vendedor.name, "Vendedor");
-        assert_eq!(vendedor.description.as_deref(), Some("Ventas y clientes; consulta de stock."));
+        assert_eq!(
+            vendedor.description.as_deref(),
+            Some("Ventas y clientes; consulta de stock.")
+        );
         assert!(!vendedor.is_system);
         let by_id = repo.find_by_id(vendedor.id).await.unwrap().unwrap();
         assert_eq!(by_id.code, vendedor.code);
@@ -1096,8 +1212,7 @@ mod tests {
     /// codes and description mismatches named. Empty means the two catalogs
     /// agree on both codes and descriptions.
     fn catalog_drift(compiled: &[(&str, &str)], database: &[(String, String)]) -> String {
-        let compiled: std::collections::BTreeMap<&str, &str> =
-            compiled.iter().copied().collect();
+        let compiled: std::collections::BTreeMap<&str, &str> = compiled.iter().copied().collect();
         let database: std::collections::BTreeMap<&str, &str> = database
             .iter()
             .map(|(code, description)| (code.as_str(), description.as_str()))
@@ -1281,7 +1396,10 @@ mod tests {
                 .fetch_optional(&db)
                 .await
                 .unwrap();
-            assert!(row.is_some(), "catalog code {code} must exist in the database");
+            assert!(
+                row.is_some(),
+                "catalog code {code} must exist in the database"
+            );
         }
     }
 
@@ -1293,8 +1411,8 @@ mod tests {
     /// parallel list that could drift from it.
     fn sidebar_nav_item_keys() -> Vec<String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/partials/sidebar.html");
-        let content =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let needle = "nav_item(\"";
         let mut keys = Vec::new();
         let mut cursor = 0;
@@ -1334,10 +1452,8 @@ mod tests {
         // The template direction of the same drift: a declared entry with no
         // sidebar item is a mapping row that decides nothing.
         let rendered_keys = sidebar_nav_item_keys();
-        let rendered: std::collections::BTreeSet<&str> = rendered_keys
-            .iter()
-            .map(String::as_str)
-            .collect();
+        let rendered: std::collections::BTreeSet<&str> =
+            rendered_keys.iter().map(String::as_str).collect();
         for entry in NAV_ENTRIES {
             assert!(
                 rendered.contains(entry.key),
@@ -1361,8 +1477,8 @@ mod tests {
     /// the href a real click opens, not a parallel list that could drift.
     fn sidebar_nav_items() -> Vec<(String, String)> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/partials/sidebar.html");
-        let content =
-            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
         let needle = "nav_item(\"";
         let mut items = Vec::new();
         let mut cursor = 0;
@@ -1409,22 +1525,22 @@ mod tests {
     /// any-of entry has to state what each code buys.
     fn any_of_entry_markers(key: &str, code: &str) -> Option<(&'static str, &'static str)> {
         match (key, code) {
-            (
-                "documents",
-                "sales.read",
-            ) => Some((r#"data-document-group="sales""#, r#"data-document-group="purchases""#)),
-            (
-                "documents",
-                "purchases.read",
-            ) => Some((r#"data-document-group="purchases""#, r#"data-document-group="sales""#)),
-            (
-                "documents",
-                "inventory.read",
-            ) => Some((r#"data-document-group="stock""#, r#"data-document-group="sales""#)),
-            (
-                "documents",
-                "customers.read",
-            ) => Some((r#"data-document-group="payments""#, r#"data-document-group="sales""#)),
+            ("documents", "sales.read") => Some((
+                r#"data-document-group="sales""#,
+                r#"data-document-group="purchases""#,
+            )),
+            ("documents", "purchases.read") => Some((
+                r#"data-document-group="purchases""#,
+                r#"data-document-group="sales""#,
+            )),
+            ("documents", "inventory.read") => Some((
+                r#"data-document-group="stock""#,
+                r#"data-document-group="sales""#,
+            )),
+            ("documents", "customers.read") => Some((
+                r#"data-document-group="payments""#,
+                r#"data-document-group="sales""#,
+            )),
             _ => None,
         }
     }
@@ -1497,10 +1613,9 @@ mod tests {
                             .copied()
                             .filter(|held| *held != *code)
                             .collect();
-                        let token =
-                            test_support::seed_session_with_permissions(&db, &reduced)
-                                .await
-                                .unwrap();
+                        let token = test_support::seed_session_with_permissions(&db, &reduced)
+                            .await
+                            .unwrap();
                         minus_one.push((code, token));
                     }
                     let state = test_support::app_state(db);
@@ -1555,14 +1670,14 @@ mod tests {
                     let exact = test_support::seed_session_with_permissions(&db, &declared)
                         .await
                         .unwrap();
-                    let none =
-                        test_support::seed_session_with_permissions(&db, &[]).await.unwrap();
+                    let none = test_support::seed_session_with_permissions(&db, &[])
+                        .await
+                        .unwrap();
                     let mut singles = Vec::new();
                     for code in codes {
-                        let token =
-                            test_support::seed_session_with_permissions(&db, &[*code])
-                                .await
-                                .unwrap();
+                        let token = test_support::seed_session_with_permissions(&db, &[*code])
+                            .await
+                            .unwrap();
                         singles.push((code, token));
                     }
                     let state = test_support::app_state(db);
@@ -1593,8 +1708,7 @@ mod tests {
                     // fragment route is `/web/documents` because `documents` is
                     // the first (and only) any-of row; a second any-of row adds
                     // its own fragment probe to its markers here.
-                    let (status, _) =
-                        get_page(&app, &href, &test_support::cookie_for(&none)).await;
+                    let (status, _) = get_page(&app, &href, &test_support::cookie_for(&none)).await;
                     assert_eq!(
                         status,
                         StatusCode::FORBIDDEN,
@@ -1622,12 +1736,14 @@ mod tests {
                             entry.key
                         );
                         let (present, absent) = any_of_entry_markers(entry.key, code)
-                            .unwrap_or_else(|| panic!(
-                                "nav entry {:?} declares Any but its code {code} states no \
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "nav entry {:?} declares Any but its code {code} states no \
                                  marker pair: every any-of code must say what it renders \
                                  and what it must not",
-                                entry.key
-                            ));
+                                    entry.key
+                                )
+                            });
                         assert!(
                             html.contains(present),
                             "holding exactly {code} must render {present:?}: {html:.600}"
@@ -1726,12 +1842,9 @@ mod tests {
                 .iter()
                 .filter(|entry| match entry.visibility {
                     NavVisibility::All(codes) => {
-                        codes.is_empty()
-                            || codes.iter().all(|c| permissions.contains(*c))
+                        codes.is_empty() || codes.iter().all(|c| permissions.contains(*c))
                     }
-                    NavVisibility::Any(codes) => {
-                        codes.iter().any(|c| permissions.contains(*c))
-                    }
+                    NavVisibility::Any(codes) => codes.iter().any(|c| permissions.contains(*c)),
                 })
                 .map(|entry| entry.key)
                 .collect()
@@ -1767,7 +1880,10 @@ mod tests {
         // The full catalog: every declared entry.
         let admin = Nav::for_principal(&principal_with(catalog));
         for entry in NAV_ENTRIES {
-            assert!(admin.visible(entry.key), "the full catalog must show {entry:?}");
+            assert!(
+                admin.visible(entry.key),
+                "the full catalog must show {entry:?}"
+            );
         }
     }
 
@@ -1807,11 +1923,7 @@ mod tests {
     }
 
     /// GET one page of the real router with one cookie, as a browser does.
-    async fn get_page(
-        app: &axum::Router,
-        uri: &str,
-        cookie: &str,
-    ) -> (StatusCode, String) {
+    async fn get_page(app: &axum::Router, uri: &str, cookie: &str) -> (StatusCode, String) {
         let resp = app
             .clone()
             .oneshot(
@@ -1833,11 +1945,7 @@ mod tests {
 
     /// Same as [`get_page`] plus the `HX-Request: true` header: the request
     /// the browser's filter form sends when it fetches a fragment route.
-    async fn get_page_htmx(
-        app: &axum::Router,
-        uri: &str,
-        cookie: &str,
-    ) -> (StatusCode, String) {
+    async fn get_page_htmx(app: &axum::Router, uri: &str, cookie: &str) -> (StatusCode, String) {
         let resp = app
             .clone()
             .oneshot(
@@ -1865,7 +1973,11 @@ mod tests {
     /// mechanism (a declared `Any` row must wait for the sidebar entry that
     /// renders it — the ac21 declaration test would fail it).
     fn probe_entry(visibility: NavVisibility) -> NavEntry {
-        NavEntry { key: "probe", visibility, group: "probe-group" }
+        NavEntry {
+            key: "probe",
+            visibility,
+            group: "probe-group",
+        }
     }
 
     /// The truth table `Nav::from_parts` implements through `NavVisibility`:
@@ -1881,21 +1993,23 @@ mod tests {
         let held = |values: &[&str]| -> std::collections::BTreeSet<String> {
             values.iter().map(|c| c.to_string()).collect()
         };
-        let nav_for =
-            |visibility: NavVisibility, held: &std::collections::BTreeSet<String>| {
-                Nav::from_entries(
-                    "Probe".to_string(),
-                    "probe".to_string(),
-                    false,
-                    held,
-                    &[probe_entry(visibility)],
-                )
-            };
+        let nav_for = |visibility: NavVisibility, held: &std::collections::BTreeSet<String>| {
+            Nav::from_entries(
+                "Probe".to_string(),
+                "probe".to_string(),
+                false,
+                held,
+                &[probe_entry(visibility)],
+            )
+        };
 
         // All: every code, vacuously true when the list is empty.
         assert!(
-            nav_for(NavVisibility::All(codes), &held(&["sales.read", "customers.read"]))
-                .visible("probe"),
+            nav_for(
+                NavVisibility::All(codes),
+                &held(&["sales.read", "customers.read"])
+            )
+            .visible("probe"),
             "All with both codes held must be visible"
         );
         assert!(
@@ -1975,13 +2089,16 @@ mod tests {
             }
             assert!(
                 !codes.is_empty(),
-                "nav entry {:?} declares no code", entry.key
+                "nav entry {:?} declares no code",
+                entry.key
             );
             let held: std::collections::BTreeSet<String> =
                 codes.iter().map(|c| c.to_string()).collect();
             assert!(
                 Nav::for_principal(&principal_with(held.clone())).visible(entry.key),
-                "holding exactly {:?} must show {:?}", codes, entry.key
+                "holding exactly {:?} must show {:?}",
+                codes,
+                entry.key
             );
             for dropped in codes.iter().copied() {
                 let reduced: std::collections::BTreeSet<String> = held
@@ -1991,7 +2108,9 @@ mod tests {
                     .collect();
                 assert!(
                     !Nav::for_principal(&principal_with(reduced)).visible(entry.key),
-                    "holding {:?} minus {dropped} must hide {:?}", codes, entry.key
+                    "holding {:?} minus {dropped} must hide {:?}",
+                    codes,
+                    entry.key
                 );
             }
         }
@@ -2057,19 +2176,17 @@ mod tests {
             test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
                 .await
                 .unwrap();
-        let (status, body) =
-            get_page(&app, "/any", &test_support::cookie_for(&customers)).await;
+        let (status, body) = get_page(&app, "/any", &test_support::cookie_for(&customers)).await;
         assert_eq!(
             status,
             StatusCode::OK,
             "customers.read is one of the declared codes: {body:.600}"
         );
         assert_eq!(body, "handler-ran");
-        let (status, body) =
-            get_page(&app, "/all", &test_support::cookie_for(&customers)).await;
+        let (status, body) = get_page(&app, "/all", &test_support::cookie_for(&customers)).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(
-            body.contains("Se necesita el permiso «sales.read» para esta acción"),
+            body.contains("Permission «sales.read» is required for this action"),
             "the control's refusal must name its own single code: {body:.600}"
         );
 
@@ -2082,8 +2199,8 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(
             body.contains(
-                "Se necesita alguno de los permisos «sales.read», «purchases.read», \
-                 «inventory.read», «customers.read» para esta acción",
+                "One of these permissions is required for this action: «sales.read», \
+                 «purchases.read», «inventory.read», «customers.read»",
             ),
             "the any-of refusal must name every declared code: {body:.600}"
         );
@@ -2243,7 +2360,10 @@ mod tests {
         for (name, content) in department_sources("src/routes", DEPARTMENT_ROUTE_FILES)
             .into_iter()
             .chain(department_sources("src/services", DEPARTMENT_SERVICE_FILES))
-            .chain(department_sources("src/repositories", DEPARTMENT_REPO_FILES))
+            .chain(department_sources(
+                "src/repositories",
+                DEPARTMENT_REPO_FILES,
+            ))
         {
             for fragment in IDENTITY_SQL_FRAGMENTS {
                 assert!(

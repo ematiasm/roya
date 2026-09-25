@@ -135,7 +135,7 @@ def test_the_picker_island_owns_the_sale_search(page: Page, api: ApiClient) -> N
 
     expect(buttons).to_have_count(2)
     expect(results).to_contain_text(data.product_name)
-    expect(results).to_contain_text("HARNESS-WIDGET • 25.00 USD • stock 5")
+    expect(results).to_contain_text("HARNESS-WIDGET • 25.00 USD • Stock 5")
     expect(results).to_contain_text("Harness Spare")
     expect(status).to_have_text("2 matches.")
 
@@ -337,7 +337,7 @@ def test_the_picker_island_owns_the_purchase_search(page: Page, api: ApiClient) 
 
     expect(buttons).to_have_count(2)
     expect(results).to_contain_text("Harness Spare")
-    expect(results).to_contain_text("cost 2.00 USD")
+    expect(results).to_contain_text("Cost 2.00 USD")
 
     # Clicking the match adds the line with the island's selected id and the
     # quantity the operator typed. The field held "Harness" — no exact match
@@ -385,7 +385,7 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     expect(results).to_contain_text("Harness Spare")
     # The purchase picker quotes cost, not the sale price, so the fragment really
     # travelled through the purchase host's parameters.
-    expect(results).to_contain_text("cost 2.00 USD")
+    expect(results).to_contain_text("Cost 2.00 USD")
 
     page.locator("#line-qty").fill("4")
     page.locator("#product-search-results button", has_text="Harness Spare").click()

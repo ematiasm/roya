@@ -2,8 +2,8 @@
 // POST /login` and `POST /logout`, thin handlers over `IdentityService` (the
 // same service the deny-by-default guard resolves sessions through — no second
 // credential opinion anywhere). The login page is a plain HTML form (no htmx):
-// a failed login re-renders it with the generic Spanish message the service
-// returns, and a success sets the session cookie and redirects to the
+// a failed login re-renders it with localized generic presentation copy, and
+// a success sets the session cookie and redirects to the
 // validated `next` path or `/`. Logout revokes the session behind the cookie,
 // always clears it, and is idempotent for dead or absent tokens.
 //
@@ -24,7 +24,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-use crate::localization::LocalizationContext;
+use crate::localization::{LocalizationContext, MessageKey};
 use crate::routes::AppState;
 use crate::security::authz::Nav;
 use crate::security::guard::{current_session, local_next};
@@ -34,7 +34,7 @@ use crate::security::guard::{current_session, local_next};
 // ---------------------------------------------------------------------------
 
 /// The login card: rendered anonymously (no error), after a failed attempt
-/// (generic Spanish error, `next` preserved) and never when a session already
+/// (localized generic error, `next` preserved) and never when a session already
 /// resolves (those requests redirect to `/` before rendering).
 #[derive(Template)]
 #[template(path = "login.html")]
@@ -119,7 +119,10 @@ async fn login_submit(
             if let Err(e) = state.identity_service.prune_sessions().await {
                 tracing::warn!(error = %e, "session prune failed");
             }
-            let cookie = state.identity_service.policy.serialize_cookie(&outcome.token);
+            let cookie = state
+                .identity_service
+                .policy
+                .serialize_cookie(&outcome.token);
             let target = form.next.as_deref().and_then(local_next).unwrap_or("/");
             Ok((
                 [(header::SET_COOKIE, cookie.as_str())],
@@ -128,12 +131,16 @@ async fn login_submit(
                 .into_response())
         }
         // The generic failure (unknown user, wrong password, inactive user or
-        // throttled attempt): re-render the form, same message, `next` kept.
-        Err(AppError::Unauthorized(message)) => {
+        // throttled attempt): re-render the form with localized presentation
+        // copy, preserving the service's generic contract and `next`.
+        Err(AppError::Unauthorized(_)) => {
+            let error = localization
+                .tr(MessageKey::LoginInvalidCredentials)
+                .to_owned();
             let template = LoginTemplate {
                 localization,
                 next: next_value(form.next.as_deref()),
-                error: Some(message),
+                error: Some(error),
             };
             let html = render_login(template)?;
             Ok((StatusCode::UNAUTHORIZED, Html(html)).into_response())
@@ -212,7 +219,12 @@ async fn password_submit(
     // Confirmation matching is the form's own job (two fields, one value);
     // the credential rules live in the service, the one layer that owns them.
     if form.new_password != form.confirm_password {
-        return password_refusal(&principal, localization.clone(), "Las contraseñas nuevas no coinciden.", StatusCode::BAD_REQUEST);
+        return password_refusal(
+            &principal,
+            localization.clone(),
+            localization.tr(MessageKey::PasswordMismatch),
+            StatusCode::BAD_REQUEST,
+        );
     }
     match state
         .identity_service
@@ -227,16 +239,35 @@ async fn password_submit(
         Ok(()) => Ok(Redirect::to("/").into_response()),
         // The current password did not verify: same card, precise reason, and
         // nothing was written (the service verifies before its first write).
-        Err(AppError::Unauthorized(_)) => {
-            password_refusal(&principal, localization.clone(), "La contraseña actual no es correcta.", StatusCode::UNAUTHORIZED)
-        }
-        // The service's validation (length, difference) speaks Spanish: the
-        // message is operator-facing through this form.
-        Err(AppError::Validation(message)) => {
-            password_refusal(&principal, localization.clone(), &message, StatusCode::BAD_REQUEST)
-        }
+        Err(AppError::Unauthorized(_)) => password_refusal(
+            &principal,
+            localization.clone(),
+            localization.tr(MessageKey::PasswordCurrentIncorrect),
+            StatusCode::UNAUTHORIZED,
+        ),
+        // The service remains the validation authority and keeps its existing
+        // error contract. This HTML adapter translates only the two known
+        // password rules and falls back to the original message for anything
+        // new rather than guessing at domain meaning.
+        Err(AppError::Validation(message)) => password_refusal(
+            &principal,
+            localization.clone(),
+            &password_validation_message(&localization, &message),
+            StatusCode::BAD_REQUEST,
+        ),
         Err(other) => Err(other),
     }
+}
+
+fn password_validation_message(localization: &LocalizationContext, message: &str) -> String {
+    let key = match message {
+        "La nueva contraseña debe tener al menos 12 caracteres." => {
+            MessageKey::PasswordMinimumLength
+        }
+        "La nueva contraseña debe ser distinta de la actual." => MessageKey::PasswordMustDiffer,
+        _ => return message.to_owned(),
+    };
+    localization.tr(key).to_owned()
 }
 
 fn password_refusal(
@@ -354,12 +385,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        set_cookie
-            .split(';')
-            .next()
-            .unwrap()
-            .trim()
-            .to_string()
+        set_cookie.split(';').next().unwrap().trim().to_string()
     }
 
     // -- the login page ---------------------------------------------------------
@@ -382,7 +408,14 @@ mod tests {
             "the login page must not render a navigation item: {html}"
         );
         // The shell the login dropped is still everywhere else.
-        let home = send(&app, "GET", "/", &[("cookie", test_support::TEST_COOKIE)], "").await;
+        let home = send(
+            &app,
+            "GET",
+            "/",
+            &[("cookie", test_support::TEST_COOKIE)],
+            "",
+        )
+        .await;
         assert_eq!(home.status(), StatusCode::OK);
         let html = body_string(home).await;
         assert!(
@@ -441,7 +474,7 @@ mod tests {
         );
         let html = body_string(resp).await;
         assert!(
-            html.contains("Usuario o contraseña incorrectos"),
+            html.contains("Incorrect username or password"),
             "generic message required: {html}"
         );
     }
@@ -459,15 +492,33 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
         assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/");
-        let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
-        assert!(set_cookie.starts_with(&format!("{SESSION_COOKIE}=")), "{set_cookie}");
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.starts_with(&format!("{SESSION_COOKIE}=")),
+            "{set_cookie}"
+        );
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
         assert!(set_cookie.contains("Path=/"));
-        assert!(set_cookie.contains("Max-Age=43200"), "absolute TTL: {set_cookie}");
+        assert!(
+            set_cookie.contains("Max-Age=43200"),
+            "absolute TTL: {set_cookie}"
+        );
 
         // The minted cookie authenticates a subsequent page request.
-        let resp = send(&app, "GET", "/", &[("cookie", cookie_pair(&resp).as_str())], "").await;
+        let resp = send(
+            &app,
+            "GET",
+            "/",
+            &[("cookie", cookie_pair(&resp).as_str())],
+            "",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -544,9 +595,7 @@ mod tests {
             (" /evil.com", "%20%2Fevil.com"),
             ("", ""),
         ] {
-            let body = format!(
-                "username=admin&password=bootstrap%20password%201&next={encoded}"
-            );
+            let body = format!("username=admin&password=bootstrap%20password%201&next={encoded}");
             let resp = send(&app, "POST", "/login", &form_headers(), &body).await;
             assert_eq!(
                 resp.status(),
@@ -612,7 +661,10 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/products?q=a&b=c");
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "/products?q=a&b=c"
+        );
     }
 
     // -- logout ----------------------------------------------------------------
@@ -633,11 +685,13 @@ mod tests {
 
         let logout = send(&app, "POST", "/logout", &[("cookie", pair.as_str())], "").await;
         assert_eq!(logout.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            logout.headers().get(header::LOCATION).unwrap(),
-            "/login"
-        );
-        let cleared = logout.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert_eq!(logout.headers().get(header::LOCATION).unwrap(), "/login");
+        let cleared = logout
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(cleared.contains("Max-Age=0"), "{cleared}");
 
         // The same cookie afterwards is refused: the session row is revoked.
@@ -660,7 +714,12 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-        let cleared = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        let cleared = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(cleared.contains("Max-Age=0"), "{cleared}");
     }
 
@@ -740,7 +799,11 @@ mod tests {
 
         // Confined: any full-page request lands on the change form.
         let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
-        assert_eq!(home.status(), StatusCode::SEE_OTHER, "AC1: the bootstrap without ROYA_ADMIN_PASSWORD ends confined");
+        assert_eq!(
+            home.status(),
+            StatusCode::SEE_OTHER,
+            "AC1: the bootstrap without ROYA_ADMIN_PASSWORD ends confined"
+        );
         assert_eq!(home.headers().get(header::LOCATION).unwrap(), "/password");
 
         let form = send(&app, "GET", "/password", &[("cookie", cookie.as_str())], "").await;
@@ -764,12 +827,20 @@ mod tests {
             &change_body,
         )
         .await;
-        assert_eq!(change.status(), StatusCode::SEE_OTHER, "a successful change redirects back to the app");
+        assert_eq!(
+            change.status(),
+            StatusCode::SEE_OTHER,
+            "a successful change redirects back to the app"
+        );
         assert_eq!(change.headers().get(header::LOCATION).unwrap(), "/");
 
         // The same session continues into the app, unconfined.
         let home = send(&app, "GET", "/", &[("cookie", cookie.as_str())], "").await;
-        assert_eq!(home.status(), StatusCode::OK, "AC16: after the change the same session reaches /");
+        assert_eq!(
+            home.status(),
+            StatusCode::OK,
+            "AC16: after the change the same session reaches /"
+        );
     }
 
     /// The password page says why it is confining: a flagged session sees the
@@ -796,16 +867,23 @@ mod tests {
         assert_eq!(form.status(), StatusCode::OK);
         let html = body_string(form).await;
         assert!(
-            html.contains("Tu sesión está confinada"),
+            html.contains("Your session is restricted"),
             "the flagged session must see why it is confined: {html:.600}"
         );
 
         // The unflagged shared principal: no confinement notice.
-        let plain = send(&app, "GET", "/password", &[("cookie", test_support::TEST_COOKIE)], "").await;
+        let plain = send(
+            &app,
+            "GET",
+            "/password",
+            &[("cookie", test_support::TEST_COOKIE)],
+            "",
+        )
+        .await;
         assert_eq!(plain.status(), StatusCode::OK);
         let html = body_string(plain).await;
         assert!(
-            !html.contains("Tu sesión está confinada"),
+            !html.contains("Your session is restricted"),
             "an unflagged session must not see the confinement notice: {html:.600}"
         );
     }
@@ -840,11 +918,27 @@ mod tests {
         // The acting session survives; the other one of the same user is dead
         // (an anonymous-looking refusal, exactly like an absent token).
         let actor = send(&app, "GET", "/", &[("cookie", acting.as_str())], "").await;
-        assert_eq!(actor.status(), StatusCode::OK, "the acting session must survive");
+        assert_eq!(
+            actor.status(),
+            StatusCode::OK,
+            "the acting session must survive"
+        );
         let dead = send(&app, "GET", "/", &[("cookie", other.as_str())], "").await;
-        assert_eq!(dead.status(), StatusCode::SEE_OTHER, "the other session must be revoked");
-        let location = dead.headers().get(header::LOCATION).unwrap().to_str().unwrap();
-        assert!(location.starts_with("/login"), "a dead session is refused like an absent one: {location}");
+        assert_eq!(
+            dead.status(),
+            StatusCode::SEE_OTHER,
+            "the other session must be revoked"
+        );
+        let location = dead
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            location.starts_with("/login"),
+            "a dead session is refused like an absent one: {location}"
+        );
     }
 
     #[tokio::test]
@@ -869,7 +963,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let html = body_string(resp).await;
         assert!(
-            html.contains("La contraseña actual no es correcta"),
+            html.contains("The current password is incorrect"),
             "the form must say why: {html}"
         );
 
@@ -892,7 +986,11 @@ mod tests {
             &retry_body,
         )
         .await;
-        assert_eq!(retry.status(), StatusCode::SEE_OTHER, "the generated credential must still verify after the failed attempt");
+        assert_eq!(
+            retry.status(),
+            StatusCode::SEE_OTHER,
+            "the generated credential must still verify after the failed attempt"
+        );
     }
 
     /// The service's credential rules, exercised through the form: a too-short
@@ -916,12 +1014,14 @@ mod tests {
             "POST",
             "/password",
             &form_headers_with_cookie,
-            &format!("current_password={generated}&new_password=short%20pw&confirm_password=short%20pw"),
+            &format!(
+                "current_password={generated}&new_password=short%20pw&confirm_password=short%20pw"
+            ),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let html = body_string(resp).await;
-        assert!(html.contains("al menos 12 caracteres"), "{html}");
+        assert!(html.contains("at least 12 characters"), "{html}");
 
         // Identical to the current one.
         let resp = send(
@@ -934,7 +1034,10 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let html = body_string(resp).await;
-        assert!(html.contains("distinta de la actual"), "{html}");
+        assert!(
+            html.contains("must differ from the current password"),
+            "{html}"
+        );
 
         // Confirmation mismatch (the form's own check).
         let resp = send(
@@ -947,7 +1050,7 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let html = body_string(resp).await;
-        assert!(html.contains("no coinciden"), "{html}");
+        assert!(html.contains("do not match"), "{html}");
 
         // Every refusal left the world unchanged: still confined, and the
         // generated credential still verifies.
@@ -993,7 +1096,14 @@ mod tests {
     #[tokio::test]
     async fn the_sidebar_links_to_the_password_page_and_the_page_marks_itself_active() {
         let (app, _state) = test_app().await;
-        let home = send(&app, "GET", "/", &[("cookie", test_support::TEST_COOKIE)], "").await;
+        let home = send(
+            &app,
+            "GET",
+            "/",
+            &[("cookie", test_support::TEST_COOKIE)],
+            "",
+        )
+        .await;
         assert_eq!(home.status(), StatusCode::OK);
         let html = body_string(home).await;
         assert!(

@@ -58,6 +58,16 @@
     // island never parses or reformats money, so the server keeps the one
     // formatting rule.
     var priceKind = container.dataset.priceKind === 'cost' ? 'cost' : 'sale';
+    var messages = {
+      idle: container.dataset.pickerStatusIdle,
+      searching: container.dataset.pickerStatusSearching,
+      failed: container.dataset.pickerStatusFailed,
+      noResults: container.dataset.pickerNoResults,
+      matchCountOne: container.dataset.pickerMatchCountOne,
+      matchCountMany: container.dataset.pickerMatchCountMany,
+      cost: container.dataset.pickerCostLabel,
+      stock: container.dataset.pickerStockLabel
+    };
 
     var state = {
       query: '',
@@ -71,17 +81,24 @@
     // while in flight; the count when it lands; the empty-state message when
     // the query is non-empty and nothing matches; the failure state when the
     // request did not. No second region announces beside it.
+    function interpolate(template, name, value) {
+      return template.replace('{' + name + '}', value);
+    }
+
+    function noResultsMessage() {
+      return interpolate(messages.noResults, 'query', state.query);
+    }
+
     function statusMessage() {
-      if (state.status === 'idle') return 'Type a name, SKU or barcode.';
-      if (state.status === 'searching') return 'Searching…';
-      if (state.status === 'failed') return 'Search failed.';
+      if (state.status === 'idle') return messages.idle;
+      if (state.status === 'searching') return messages.searching;
+      if (state.status === 'failed') return messages.failed;
       if (state.matches.length === 0) {
-        return state.query === ''
-          ? 'Type a name, SKU or barcode.'
-          : 'No products match "' + state.query + '".';
+        return state.query === '' ? messages.idle : noResultsMessage();
       }
       var n = state.matches.length;
-      return n === 1 ? '1 match.' : n + ' matches.';
+      var template = n === 1 ? messages.matchCountOne : messages.matchCountMany;
+      return interpolate(template, 'count', String(n));
     }
 
     function statusNode() {
@@ -108,8 +125,10 @@
       meta.textContent =
         product.sku +
         ' • ' +
-        (priceKind === 'cost' ? 'cost ' + product.cost_price : product.sale_price) +
-        ' • stock ' +
+        (priceKind === 'cost' ? messages.cost + ' ' + product.cost_price : product.sale_price) +
+        ' • ' +
+        messages.stock +
+        ' ' +
         product.stock;
       btn.appendChild(name);
       btn.appendChild(meta);
@@ -126,10 +145,7 @@
         if (state.status !== 'done') return null;
         var empty = document.createElement('div');
         empty.className = 'empty px-3.5 py-2.5 text-start';
-        empty.textContent =
-          state.query === ''
-            ? 'Type a name, SKU or barcode.'
-            : 'No products match "' + state.query + '".';
+        empty.textContent = state.query === '' ? messages.idle : noResultsMessage();
         return empty;
       }
       var off = document.createElement('div');

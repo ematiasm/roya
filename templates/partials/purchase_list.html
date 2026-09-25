@@ -1,31 +1,21 @@
 <div id="purchase-list-inner">
-  <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ purchases.len() }} purchases</div>
+  <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ localization.tr_count(crate::localization::MessageKey::PurchasesCount, purchases.len()) }}</div>
   {% if purchases.is_empty() %}
-    <div class="empty">Nothing here yet.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::PurchasesNothing) }}</div>
   {% else %}
     {% for v in purchases %}
-    {# One row, three zones in reading order: identifier → supplier → money.
-       Responsive by one markup: stacked below `sm`, three aligned columns from
-       `sm` up. The total is neutral text — the state colour lives on the one
-       status chip (`payment_state`, derived in `purchase_views`), never on the
-       number. The chip replaces the old badge cloud: no payable/settled badge,
-       no payment-type chip (Cash is the default; Credit rides the meta line),
-       and no chip for `Confirmed`, the normal state — it surfaces as Paid, or
-       Due/Overdue plus the bare amount still owed, so an operator never has to
-       subtract from the total. The row keeps the S3 peek contract unchanged.
-       No control component: the anchor is the row, and the row's grid layout
-       and colour are its appearance rather than a control's. #}
+    {# One row, three zones in reading order: identifier → supplier → money. #}
     <a class="mb-2 grid grid-cols-1 gap-1 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-text sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)_minmax(0,10rem)] sm:items-center sm:gap-4" id="purchase-{{ v.detail.purchase.id }}" href="/purchases/{{ v.detail.purchase.id }}" hx-get="/web/documents/detail/purchase/{{ v.detail.purchase.id }}" hx-target="#purchase-drawer-body" hx-swap="innerHTML">
-      <span class="font-semibold tabular-nums">{% if let Some(n) = v.detail.purchase.purchase_number %}{{ n }}{% else %}Draft #{{ v.detail.purchase.id }}{% endif %}</span>
+      <span class="font-semibold tabular-nums">{% if let Some(n) = v.detail.purchase.purchase_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }} #{{ v.detail.purchase.id }}{% endif %}</span>
       <span class="min-w-0">
         <span class="block truncate font-semibold">{{ v.supplier_name }}</span>
-        <span class="block truncate text-[13px] text-muted">{{ localization.format_date(v.detail.purchase.purchase_date.clone()) }}{% if let Some(due_date) = v.detail.purchase.due_date %} · due {{ localization.format_date(due_date.clone()) }}{% endif %} · {{ v.detail.lines.len() }} items{% if v.detail.purchase.payment_type.to_string() == "Credit" %} · Credit{% endif %}{% if v.partially_paid %} · paid {{ localization.format_currency(v.detail.paid.clone()) }}{% endif %}</span>
+        <span class="block truncate text-[13px] text-muted">{{ localization.format_date(v.detail.purchase.purchase_date.clone()) }}{% if let Some(due_date) = v.detail.purchase.due_date %} · {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_date(due_date.clone()) }}{% endif %} · {{ localization.tr_count(crate::localization::MessageKey::PurchasesItems, v.detail.lines.len()) }}{% if v.detail.purchase.payment_type.to_string() == "Credit" %} · {{ localization.tr(crate::localization::MessageKey::ValueCredit) }}{% endif %}{% if v.partially_paid %} · {{ localization.tr(crate::localization::MessageKey::PurchasesPaid) }} {{ localization.format_currency(v.detail.paid.clone()) }}{% endif %}</span>
       </span>
       <span class="flex items-center justify-between gap-2 sm:flex-col sm:items-end sm:justify-center">
-        {% if v.detail.purchase.status.to_string() == "Draft" %}<span class="chip border-border text-muted">Draft</span>{% else if v.detail.purchase.status.to_string() == "Cancelled" %}<span class="chip border-border text-muted">Cancelled</span>{% else if v.payment_state.to_string() == "Paid" %}<span class="chip chip-income">Paid</span>{% else if v.payment_state.to_string() == "Due" %}<span class="chip chip-warning">Due {{ localization.format_currency(v.detail.due.clone()) }}</span>{% else if v.payment_state.to_string() == "Overdue" %}<span class="chip chip-expense">Overdue {{ localization.format_currency(v.detail.due.clone()) }}</span>{% else %}<span class="chip border-border text-muted">{{ v.payment_state }}</span>{% endif %}
+        {% if v.detail.purchase.status.to_string() == "Draft" %}<span class="chip border-border text-muted">{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</span>{% else if v.detail.purchase.status.to_string() == "Cancelled" %}<span class="chip border-border text-muted">{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}</span>{% else if v.payment_state.to_string() == "Paid" %}<span class="chip chip-income">{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}</span>{% else if v.payment_state.to_string() == "Due" %}<span class="chip chip-warning">{{ localization.tr(crate::localization::MessageKey::PurchasesDue) }} {{ localization.format_currency(v.detail.due.clone()) }}</span>{% else if v.payment_state.to_string() == "Overdue" %}<span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::PurchasesOverdue) }} {{ localization.format_currency(v.detail.due.clone()) }}</span>{% else %}<span class="chip border-border text-muted">{{ v.payment_state }}</span>{% endif %}
         <span class="text-right">
           <span class="block font-bold tabular-nums text-text">{{ localization.format_currency(v.detail.total.clone()) }}</span>
-          <span class="block text-[11px] uppercase tracking-[0.04em] text-muted sm:hidden">Total</span>
+          <span class="block text-[11px] uppercase tracking-[0.04em] text-muted sm:hidden">{{ localization.tr(crate::localization::MessageKey::DocumentsAmount) }}</span>
         </span>
       </span>
     </a>

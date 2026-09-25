@@ -3,6 +3,6 @@
    locals (`filter_module`, `filter_list`) and the opening shell are documented
    in `partials/list_filters_open.html`, which every including page pairs with
    this half around its own field block. #}
-  <a class="btn-secondary font-normal hover:opacity-100" href="/{{ filter_list }}">Clear</a>
-  <button type="button" class="btn-secondary" hx-get="/web/{{ filter_list }}" hx-include="#{{ filter_module }}-filters" hx-target="#{{ filter_module }}-list" hx-swap="innerHTML">↻ Refresh</button>
+  <a class="btn-secondary font-normal hover:opacity-100" href="/{{ filter_list }}">{{ localization.tr(crate::localization::MessageKey::CommonClear) }}</a>
+  <button type="button" class="btn-secondary" hx-get="/web/{{ filter_list }}" hx-include="#{{ filter_module }}-filters" hx-target="#{{ filter_module }}-list" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonRefresh) }}</button>
 </form>

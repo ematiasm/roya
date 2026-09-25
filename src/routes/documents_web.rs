@@ -54,6 +54,7 @@ struct DocumentsTemplate {
     rows: Vec<DocumentView>,
     truncated: bool,
     limit: usize,
+    truncated_message: String,
     groups: Vec<DocumentGroupOption>,
     filter_user: String,
     filter_from: String,
@@ -74,6 +75,7 @@ struct DocumentListPartial {
     rows: Vec<DocumentView>,
     truncated: bool,
     limit: usize,
+    truncated_message: String,
 }
 
 /// One row resolved for the page: the feed's facts plus the three things only
@@ -147,6 +149,7 @@ fn selected_kinds(
 fn group_options(
     permitted: &[DocumentKind],
     requested: Option<DocumentGroup>,
+    localization: &LocalizationContext,
 ) -> Vec<DocumentGroupOption> {
     DocumentGroup::ALL
         .iter()
@@ -154,7 +157,21 @@ fn group_options(
         .filter(|group| group.kinds().iter().any(|kind| permitted.contains(kind)))
         .map(|group| DocumentGroupOption {
             token: group.token().to_string(),
-            label: group.label().to_string(),
+            label: match group {
+                DocumentGroup::Sales => {
+                    localization.tr(crate::localization::MessageKey::DocumentGroupSales)
+                }
+                DocumentGroup::Purchases => {
+                    localization.tr(crate::localization::MessageKey::DocumentGroupPurchases)
+                }
+                DocumentGroup::Stock => {
+                    localization.tr(crate::localization::MessageKey::DocumentGroupStock)
+                }
+                DocumentGroup::Payments => {
+                    localization.tr(crate::localization::MessageKey::DocumentGroupPayments)
+                }
+            }
+            .to_string(),
             selected: requested == Some(group),
         })
         .collect()
@@ -225,14 +242,45 @@ fn document_href(kind: DocumentKind, owner_id: i64) -> String {
 /// the kind and the owning document) and the actor's display name, resolved in
 /// ONE `audit_actor_names` call over the whole page and then mapped (AC20: the
 /// route layer is the only layer allowed to resolve identity names).
-async fn resolve_views(state: &AppState, rows: Vec<DocumentRow>) -> AppResult<Vec<DocumentView>> {
+fn document_kind_label(kind: &DocumentKind, localization: &LocalizationContext) -> String {
+    let key = match kind {
+        DocumentKind::Sale => crate::localization::MessageKey::DocumentSale,
+        DocumentKind::SalePayment => crate::localization::MessageKey::DocumentSalePayment,
+        DocumentKind::Purchase => crate::localization::MessageKey::DocumentsPurchase,
+        DocumentKind::PurchasePayment => crate::localization::MessageKey::DocumentPurchasePayment,
+        DocumentKind::StockMovement => crate::localization::MessageKey::DocumentStockMovement,
+        DocumentKind::Receipt => crate::localization::MessageKey::DocumentReceipt,
+    };
+    localization.tr(key).to_string()
+}
+
+fn document_truncation_message(
+    truncated: bool,
+    limit: usize,
+    localization: &LocalizationContext,
+) -> String {
+    if truncated {
+        localization.tr_with(
+            crate::localization::MessageKey::DocumentsTruncated,
+            &[("limit", &limit.to_string())],
+        )
+    } else {
+        String::new()
+    }
+}
+
+async fn resolve_views(
+    state: &AppState,
+    rows: Vec<DocumentRow>,
+    localization: &LocalizationContext,
+) -> AppResult<Vec<DocumentView>> {
     let actor_ids: Vec<i64> = rows.iter().map(|row| row.created_by).collect();
     let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
     Ok(rows
         .into_iter()
         .map(|row| DocumentView {
             kind: row.kind,
-            kind_label: row.kind.label().to_string(),
+            kind_label: document_kind_label(&row.kind, localization),
             id: row.id,
             kind_token: row.kind.token().to_string(),
             href: document_href(row.kind, row.owner_id),
@@ -260,6 +308,7 @@ async fn documents_model(
     state: &AppState,
     principal: &Principal,
     query: &DocumentListQuery,
+    localization: &LocalizationContext,
 ) -> AppResult<DocumentsModel> {
     let permitted = permitted_kinds(principal);
     let requested = DocumentGroup::parse(query.group.trim());
@@ -277,12 +326,12 @@ async fn documents_model(
     let feed = state.document_service.list(&filter).await?;
     let truncated = feed.truncated;
     let limit = feed.limit;
-    let rows = resolve_views(state, feed.rows).await?;
+    let rows = resolve_views(state, feed.rows, localization).await?;
     Ok(DocumentsModel {
         rows,
         truncated,
         limit,
-        groups: group_options(&permitted, requested),
+        groups: group_options(&permitted, requested, localization),
     })
 }
 
@@ -297,13 +346,19 @@ async fn documents_page(
     principal: axum::Extension<Principal>,
     Query(query): Query<DocumentListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let model = documents_model(&state, &principal, &query).await?;
+    let model = documents_model(&state, &principal, &query, &localization).await?;
+    let truncated_message =
+        document_truncation_message(model.truncated, model.limit, &localization);
+    let title = localization
+        .tr(crate::localization::MessageKey::DocumentsAll)
+        .to_string();
     let tmpl = DocumentsTemplate {
-        title: "All documents".to_string(),
+        title,
         localization,
         rows: model.rows,
         truncated: model.truncated,
         limit: model.limit,
+        truncated_message,
         groups: model.groups,
         filter_user: query.user.trim().to_string(),
         filter_from: query.from.trim().to_string(),
@@ -327,13 +382,18 @@ async fn web_document_list(
     principal: axum::Extension<Principal>,
     Query(query): Query<DocumentListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let model = documents_model(&state, &principal, &query).await?;
+    let model = documents_model(&state, &principal, &query, &localization).await?;
+    let truncated_message =
+        document_truncation_message(model.truncated, model.limit, &localization);
     let html = DocumentListPartial {
-        title: "All documents".to_string(),
+        title: localization
+            .tr(crate::localization::MessageKey::DocumentsAll)
+            .to_string(),
         localization,
         rows: model.rows,
         truncated: model.truncated,
         limit: model.limit,
+        truncated_message,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -356,24 +416,25 @@ async fn web_document_list(
 /// One `(label, value)` line of the drawer's fact list. `value` is already the
 /// display form: the route resolved every name before building it.
 struct DrawerFact {
-    label: &'static str,
+    label: String,
     value: String,
 }
 
 impl DrawerFact {
-    fn new(label: &'static str, value: impl Into<String>) -> Self {
+    fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
-            label,
+            label: label.into(),
             value: value.into(),
         }
     }
 
     /// The fact only when `value` is non-empty: optional facts (notes, due
     /// dates, cancel reasons) vanish instead of rendering as empty rows.
-    fn when_non_empty(label: &'static str, value: Option<String>) -> Option<Self> {
-        value
-            .filter(|v| !v.is_empty())
-            .map(|v| Self { label, value: v })
+    fn when_non_empty(label: impl Into<String>, value: Option<String>) -> Option<Self> {
+        value.filter(|v| !v.is_empty()).map(|v| Self {
+            label: label.into(),
+            value: v,
+        })
     }
 }
 
@@ -386,8 +447,8 @@ struct DrawerTableRow {
 }
 
 struct DrawerTable {
-    title: &'static str,
-    headers: Vec<&'static str>,
+    title: String,
+    headers: Vec<String>,
     rows: Vec<DrawerTableRow>,
 }
 
@@ -445,6 +506,7 @@ struct DrawerAction {
 #[derive(Template)]
 #[template(path = "partials/document_detail.html")]
 struct DocumentDetailPartial {
+    localization: LocalizationContext,
     kind_label: String,
     title: String,
     status_line: String,
@@ -464,10 +526,11 @@ struct DocumentDetailPartial {
 async fn web_document_detail(
     State(state): State<AppState>,
     _: RequireAny<(SalesRead, PurchasesRead, InventoryRead, CustomersRead)>,
+    Extension(localization): Extension<LocalizationContext>,
     axum::Extension(principal): axum::Extension<Principal>,
     axum::extract::Path((kind, id)): axum::extract::Path<(String, i64)>,
 ) -> Result<Html<String>, AppError> {
-    let tmpl = document_detail(&state, &principal, &kind, id).await?;
+    let tmpl = document_detail(&state, &principal, &kind, id, &localization).await?;
     let html = tmpl
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -482,6 +545,7 @@ async fn document_detail(
     principal: &Principal,
     kind_token: &str,
     id: i64,
+    localization: &LocalizationContext,
 ) -> AppResult<DocumentDetailPartial> {
     let kind = DocumentKind::parse(kind_token).ok_or_else(|| {
         AppError::NotFound(format!(
@@ -500,21 +564,97 @@ async fn document_detail(
         )));
     }
     match kind {
-        DocumentKind::Sale => sale_drawer(state, &principal, id).await,
-        DocumentKind::SalePayment => sale_payment_drawer(state, &principal, id).await,
-        DocumentKind::Purchase => purchase_drawer(state, &principal, id).await,
-        DocumentKind::PurchasePayment => purchase_payment_drawer(state, &principal, id).await,
-        DocumentKind::StockMovement => stock_movement_drawer(state, id).await,
-        DocumentKind::Receipt => receipt_drawer(state, &principal, id).await,
+        DocumentKind::Sale => sale_drawer(state, &principal, id, localization).await,
+        DocumentKind::SalePayment => sale_payment_drawer(state, &principal, id, localization).await,
+        DocumentKind::Purchase => purchase_drawer(state, &principal, id, localization).await,
+        DocumentKind::PurchasePayment => {
+            purchase_payment_drawer(state, &principal, id, localization).await
+        }
+        DocumentKind::StockMovement => stock_movement_drawer(state, id, localization).await,
+        DocumentKind::Receipt => receipt_drawer(state, &principal, id, localization).await,
     }
 }
 
 /// The identifier a document answers by, the way every list already shows it:
 /// the assigned number, or `Draft #id` while a draft has none.
-fn document_title(number: Option<&str>, id: i64) -> String {
-    number
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("Draft #{id}"))
+fn copy(localization: &LocalizationContext, key: crate::localization::MessageKey) -> String {
+    localization.tr(key).to_string()
+}
+
+fn status_copy(localization: &LocalizationContext, status: &str) -> String {
+    match status {
+        "Draft" => copy(localization, crate::localization::MessageKey::StatusDraft),
+        "Confirmed" => copy(
+            localization,
+            crate::localization::MessageKey::StatusConfirmed,
+        ),
+        "Cancelled" => copy(
+            localization,
+            crate::localization::MessageKey::StatusCancelled,
+        ),
+        "Paid" => copy(localization, crate::localization::MessageKey::StatusPaid),
+        "Partial" => copy(localization, crate::localization::MessageKey::StatusPartial),
+        _ => copy(localization, crate::localization::MessageKey::StatusUnpaid),
+    }
+}
+
+fn transaction_kind_copy(localization: &LocalizationContext, kind: &str) -> String {
+    if kind == "Income" {
+        copy(
+            localization,
+            crate::localization::MessageKey::DashboardIncome,
+        )
+    } else {
+        copy(
+            localization,
+            crate::localization::MessageKey::DashboardExpense,
+        )
+    }
+}
+
+fn movement_type_copy(localization: &LocalizationContext, movement_type: &str) -> String {
+    match movement_type {
+        "In" => copy(
+            localization,
+            crate::localization::MessageKey::ProductValueIn,
+        ),
+        "Out" => copy(
+            localization,
+            crate::localization::MessageKey::ProductValueOut,
+        ),
+        _ => copy(
+            localization,
+            crate::localization::MessageKey::ProductValueAdjust,
+        ),
+    }
+}
+
+fn reason_copy(localization: &LocalizationContext, reason: &str) -> String {
+    let key = match reason {
+        "Initial" => crate::localization::MessageKey::ProductReasonInitial,
+        "Purchase" => crate::localization::MessageKey::ProductReasonPurchase,
+        "Sale" => crate::localization::MessageKey::ProductReasonSale,
+        "Loss" => crate::localization::MessageKey::ProductReasonLoss,
+        _ => return reason.to_string(),
+    };
+    copy(localization, key)
+}
+
+fn payment_type_copy(localization: &LocalizationContext, payment_type: &str) -> String {
+    if payment_type == "Cash" {
+        copy(localization, crate::localization::MessageKey::ValueCash)
+    } else {
+        copy(localization, crate::localization::MessageKey::ValueCredit)
+    }
+}
+
+fn document_title(number: Option<&str>, id: i64, localization: &LocalizationContext) -> String {
+    number.map(str::to_string).unwrap_or_else(|| {
+        localization.tr_with(
+            crate::localization::MessageKey::PurchasesDraftRef,
+            &[("id", &id.to_string())],
+        )
+    })
 }
 
 /// The edit affordance the user asked for as a real BUTTON-styled link: the
@@ -527,11 +667,17 @@ fn document_title(number: Option<&str>, id: i64) -> String {
 /// page is where the identity fields, the lines and the confirmation are
 /// worked on, and one order is one object — the header is not a separate
 /// thing from its lines (user correction on the draft drawer's wording).
-fn edit_affordance_link(status: &str, href: String) -> DrawerLink {
-    let label = match status {
-        "Draft" => "Editar el documento",
-        _ => "Abrir el documento",
+fn edit_affordance_link(
+    status: &str,
+    href: String,
+    localization: &LocalizationContext,
+) -> DrawerLink {
+    let key = if status == "Draft" {
+        crate::localization::MessageKey::DocumentsEditDraft
+    } else {
+        crate::localization::MessageKey::DocumentsOpenDocument
     };
+    let label = copy(localization, key);
     DrawerLink {
         label: label.to_string(),
         href,
@@ -543,31 +689,42 @@ fn edit_affordance_link(status: &str, href: String) -> DrawerLink {
 /// to keep in lockstep with the endpoints. A draft cannot take payments —
 /// only a Confirmed document does — so the payments mention belongs to the
 /// confirmed state's sentence, never to the draft's.
-fn edit_affordance_notice(status: &str) -> String {
-    match status {
-        // The document is the subject and its parts are the list — the same
-        // one-order emphasis as the link label above, which leads with the
-        // header no more.
-        "Draft" => "La cabecera, las líneas y la confirmación se editan en el documento.".to_string(),
-        "Confirmed" => {
-            "Para registrar pagos o ver el detalle completo, abrí el documento.".to_string()
-        }
-        _ => {
-            "El documento está anulado. Para ver el detalle completo y su historia, abrí el documento."
-                .to_string()
-        }
-    }
+fn edit_affordance_notice(status: &str, localization: &LocalizationContext) -> String {
+    let key = match status {
+        "Draft" => crate::localization::MessageKey::DocumentsDraftNotice,
+        "Confirmed" => crate::localization::MessageKey::DocumentsConfirmedNotice,
+        _ => crate::localization::MessageKey::DocumentsCancelledNotice,
+    };
+    copy(localization, key)
 }
 
 /// The draft line count, worded once so the preview and the confirm question
 /// cannot disagree: "1 línea" for a single line, "N líneas" otherwise, with
 /// the possessive and the parenthetical agreeing.
-fn draft_lines_phrase(n: usize) -> (String, String) {
-    if n == 1 {
-        ("su 1 línea".to_string(), "listada arriba".to_string())
+fn draft_lines_phrase(n: usize, localization: &LocalizationContext) -> (String, String) {
+    let lines = if n == 1 {
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsDraftLineOne,
+        )
     } else {
-        (format!("sus {n} líneas"), "listadas arriba".to_string())
-    }
+        localization.tr_with(
+            crate::localization::MessageKey::DocumentsDraftLineMany,
+            &[("count", &n.to_string())],
+        )
+    };
+    let listed = if n == 1 {
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsLinesListedOne,
+        )
+    } else {
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsLinesListedMany,
+        )
+    };
+    (lines, listed)
 }
 
 /// The SALE drawer's action block, per state and permission. Real actions
@@ -582,6 +739,7 @@ async fn sale_actions(
     state: &AppState,
     principal: &Principal,
     record: &SaleRecord,
+    localization: &LocalizationContext,
 ) -> AppResult<Vec<DrawerAction>> {
     let sale = &record.sale;
     let mut actions = Vec::new();
@@ -589,35 +747,63 @@ async fn sale_actions(
         SaleStatus::Draft => {
             if principal.has(SalesCreate::CODE) {
                 let n = record.lines.len();
-                let (lines_phrase, listed) = draft_lines_phrase(n);
+                let (lines_phrase, listed) = draft_lines_phrase(n, localization);
                 actions.push(DrawerAction {
-                    label: "Eliminar borrador".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
                     method: "delete".to_string(),
                     path: format!("/web/sales/{}", sale.id),
                     fields: vec![],
                     reason: false,
-                    data_action: "Eliminar borrador".to_string(),
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
                     impact: vec![
-                        format!("Se elimina el borrador y {lines_phrase} ({listed})."),
-                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
-                            .to_string(),
+                        localization.tr_with(
+                            if n == 1 {
+                                crate::localization::MessageKey::DocumentsDeleteDraftImpactOne
+                            } else {
+                                crate::localization::MessageKey::DocumentsDeleteDraftImpactMany
+                            },
+                            &[("count", &n.to_string()), ("listed", listed.as_str())],
+                        ),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsNeverConfirmed,
+                        ),
                     ],
-                    confirm: Some(format!(
-                        "¿Eliminar el borrador y {lines_phrase}? Esta acción no se puede deshacer."
+                    confirm: Some(localization.tr_with(
+                        crate::localization::MessageKey::DocumentsDeleteDraftConfirm,
+                        &[("lines", lines_phrase.as_str())],
                     )),
                 });
             }
             if principal.has(SalesCancel::CODE) {
                 actions.push(DrawerAction {
-                    label: "Descartar".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDiscard,
+                    ),
                     method: "post".to_string(),
                     path: "/web/sales/cancel".to_string(),
                     fields: vec![("sale_id".to_string(), sale.id.to_string())],
                     reason: true,
-                    data_action: "Descartar borrador".to_string(),
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::PurchasesDiscard,
+                    ),
                     impact: vec![
-                        "El borrador pasa a Anulado y deja de aparecer como editable.".to_string(),
-                        "No hay stock, ni pagos, ni asientos que revertir.".to_string(),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsDiscardImpact,
+                        ),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsNothingToReverse,
+                        ),
                     ],
                     confirm: None,
                 });
@@ -625,7 +811,7 @@ async fn sale_actions(
         }
         SaleStatus::Confirmed => {
             if principal.has(SalesCancel::CODE) {
-                actions.push(sale_annul_action(state, record).await?);
+                actions.push(sale_annul_action(state, record, localization).await?);
             }
         }
         SaleStatus::Cancelled => {
@@ -634,21 +820,36 @@ async fn sale_actions(
             // (refund transactions reference its payments), no action.
             if sale.sale_number.is_none() && principal.has(SalesCreate::CODE) {
                 let n = record.lines.len();
-                let (lines_phrase, listed) = draft_lines_phrase(n);
+                let (lines_phrase, listed) = draft_lines_phrase(n, localization);
                 actions.push(DrawerAction {
-                    label: "Eliminar descarte".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDiscard,
+                    ),
                     method: "delete".to_string(),
                     path: format!("/web/sales/{}", sale.id),
                     fields: vec![],
                     reason: false,
-                    data_action: "Eliminar descarte".to_string(),
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDiscard,
+                    ),
                     impact: vec![
-                        format!("Se elimina el descarte y {lines_phrase} ({listed})."),
-                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
-                            .to_string(),
+                        localization.tr_with(
+                            crate::localization::MessageKey::DocumentsDeleteDiscardImpact,
+                            &[
+                                ("lines", lines_phrase.as_str()),
+                                ("listed", listed.as_str()),
+                            ],
+                        ),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsNeverConfirmed,
+                        ),
                     ],
-                    confirm: Some(format!(
-                        "¿Eliminar el descarte y {lines_phrase}? Esta acción no se puede deshacer."
+                    confirm: Some(localization.tr_with(
+                        crate::localization::MessageKey::DocumentsDeleteDiscardConfirm,
+                        &[("lines", lines_phrase.as_str())],
                     )),
                 });
             }
@@ -667,7 +868,11 @@ async fn sale_actions(
 /// will be refused, never hiding the operator's only path. With
 /// `allow_negative = false` the refusal caveat the endpoint enforces renders
 /// too.
-async fn sale_annul_action(state: &AppState, record: &SaleRecord) -> AppResult<DrawerAction> {
+async fn sale_annul_action(
+    state: &AppState,
+    record: &SaleRecord,
+    localization: &LocalizationContext,
+) -> AppResult<DrawerAction> {
     let sale = &record.sale;
     let mut impact = Vec::new();
     for line in &record.lines {
@@ -676,39 +881,58 @@ async fn sale_annul_action(state: &AppState, record: &SaleRecord) -> AppResult<D
         }
         let product = state.inventory_service.get_product(line.product_id).await?;
         if !product.is_active {
-            impact.push(format!(
-                "No se puede anular: el producto «{}» está inactivo.",
-                product.name
+            impact.push(localization.tr_with(
+                crate::localization::MessageKey::DocumentsProductInactive,
+                &[("name", product.name.as_str())],
             ));
         } else {
-            impact.push(format!(
-                "Se devuelve el stock de «{}» ({}) con un movimiento In · Sale-return.",
-                line.product_name, line.qty
+            impact.push(localization.tr_with(
+                crate::localization::MessageKey::DocumentsSaleReturnStock,
+                &[
+                    ("name", line.product_name.as_str()),
+                    ("quantity", &localization.format_quantity(line.qty)),
+                ],
             ));
         }
     }
     for payment in &record.payments {
-        impact.push(format!(
-            "Se reembolsa «{}» en «{}» con un asiento Expense.",
-            payment.amount, payment.account_name
+        impact.push(localization.tr_with(
+            crate::localization::MessageKey::DocumentsRefundAccount,
+            &[
+                ("amount", &localization.format_currency(payment.amount)),
+                ("account", payment.account_name.as_str()),
+                ("kind", "Expense"),
+            ],
         ));
     }
-    impact.push("El documento pasa a Anulado y deja de contar como deuda del cliente.".to_string());
+    impact.push(copy(
+        localization,
+        crate::localization::MessageKey::DocumentsAnnulStateSale,
+    ));
     if !state.allow_negative {
-        impact.push(
-            "Si algún reembolso dejaría una cuenta en negativo, la anulación se rechaza y verás el motivo."
-                .to_string(),
-        );
+        impact.push(copy(
+            localization,
+            crate::localization::MessageKey::DocumentsNegativeBlock,
+        ));
     }
     Ok(DrawerAction {
-        label: "Anular".to_string(),
+        label: copy(
+            localization,
+            crate::localization::MessageKey::DocumentsAnnul,
+        ),
         method: "post".to_string(),
         path: "/web/sales/cancel".to_string(),
         fields: vec![("sale_id".to_string(), sale.id.to_string())],
         reason: true,
-        data_action: "Anular documento".to_string(),
+        data_action: copy(
+            localization,
+            crate::localization::MessageKey::DocumentsAnnul,
+        ),
         impact,
-        confirm: Some("¿Anular este documento? Esta acción no se puede deshacer.".to_string()),
+        confirm: Some(copy(
+            localization,
+            crate::localization::MessageKey::DocumentsAnnulConfirm,
+        )),
     })
 }
 
@@ -725,6 +949,7 @@ async fn purchase_actions(
     state: &AppState,
     principal: &Principal,
     record: &PurchaseRecord,
+    localization: &LocalizationContext,
 ) -> AppResult<Vec<DrawerAction>> {
     let purchase = &record.purchase;
     let mut actions = Vec::new();
@@ -732,35 +957,63 @@ async fn purchase_actions(
         PurchaseStatus::Draft => {
             if principal.has(PurchasesCreate::CODE) {
                 let n = record.lines.len();
-                let (lines_phrase, listed) = draft_lines_phrase(n);
+                let (lines_phrase, listed) = draft_lines_phrase(n, localization);
                 actions.push(DrawerAction {
-                    label: "Eliminar borrador".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
                     method: "delete".to_string(),
                     path: format!("/web/purchases/{}", purchase.id),
                     fields: vec![],
                     reason: false,
-                    data_action: "Eliminar borrador".to_string(),
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
                     impact: vec![
-                        format!("Se elimina el borrador y {lines_phrase} ({listed})."),
-                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
-                            .to_string(),
+                        localization.tr_with(
+                            if n == 1 {
+                                crate::localization::MessageKey::DocumentsDeleteDraftImpactOne
+                            } else {
+                                crate::localization::MessageKey::DocumentsDeleteDraftImpactMany
+                            },
+                            &[("count", &n.to_string()), ("listed", listed.as_str())],
+                        ),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsNeverConfirmed,
+                        ),
                     ],
-                    confirm: Some(format!(
-                        "¿Eliminar el borrador y {lines_phrase}? Esta acción no se puede deshacer."
+                    confirm: Some(localization.tr_with(
+                        crate::localization::MessageKey::DocumentsDeleteDraftConfirm,
+                        &[("lines", lines_phrase.as_str())],
                     )),
                 });
             }
             if principal.has(PurchasesCancel::CODE) {
                 actions.push(DrawerAction {
-                    label: "Descartar".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDiscard,
+                    ),
                     method: "post".to_string(),
                     path: "/web/purchases/cancel".to_string(),
                     fields: vec![("purchase_id".to_string(), purchase.id.to_string())],
                     reason: true,
-                    data_action: "Descartar borrador".to_string(),
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::PurchasesDiscard,
+                    ),
                     impact: vec![
-                        "El borrador pasa a Anulado y deja de aparecer como editable.".to_string(),
-                        "No hay stock, ni pagos, ni asientos que revertir.".to_string(),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsDiscardImpact,
+                        ),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsNothingToReverse,
+                        ),
                     ],
                     confirm: None,
                 });
@@ -775,38 +1028,52 @@ async fn purchase_actions(
                     }
                     let product = state.inventory_service.get_product(line.product_id).await?;
                     if !product.is_active {
-                        impact.push(format!(
-                            "No se puede anular: el producto «{}» está inactivo.",
-                            product.name
+                        impact.push(localization.tr_with(
+                            crate::localization::MessageKey::DocumentsProductInactive,
+                            &[("name", product.name.as_str())],
                         ));
                     } else {
-                        impact.push(format!(
-                            "Se devuelve el stock de «{}» ({}) con un movimiento Out · Purchase-return.",
-                            line.product_name, line.qty
+                        impact.push(localization.tr_with(
+                            crate::localization::MessageKey::DocumentsPurchaseReturnStock,
+                            &[
+                                ("name", line.product_name.as_str()),
+                                ("quantity", &localization.format_quantity(line.qty)),
+                            ],
                         ));
                     }
                 }
                 for payment in &record.payments {
-                    impact.push(format!(
-                        "Se reembolsa «{}» en «{}» con un asiento Income.",
-                        payment.amount, payment.account_name
+                    impact.push(localization.tr_with(
+                        crate::localization::MessageKey::DocumentsRefundAccount,
+                        &[
+                            ("amount", &localization.format_currency(payment.amount)),
+                            ("account", payment.account_name.as_str()),
+                            ("kind", "Income"),
+                        ],
                     ));
                 }
-                impact.push(
-                    "El documento pasa a Anulado y deja de contar como deuda con el proveedor."
-                        .to_string(),
-                );
+                impact.push(copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsAnnulStatePurchase,
+                ));
                 actions.push(DrawerAction {
-                    label: "Anular".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsAnnul,
+                    ),
                     method: "post".to_string(),
                     path: "/web/purchases/cancel".to_string(),
                     fields: vec![("purchase_id".to_string(), purchase.id.to_string())],
                     reason: true,
-                    data_action: "Anular documento".to_string(),
-                    impact,
-                    confirm: Some(
-                        "¿Anular este documento? Esta acción no se puede deshacer.".to_string(),
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsAnnul,
                     ),
+                    impact,
+                    confirm: Some(copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsAnnulConfirm,
+                    )),
                 });
             }
         }
@@ -816,21 +1083,36 @@ async fn purchase_actions(
             // trail, no action.
             if purchase.purchase_number.is_none() && principal.has(PurchasesCreate::CODE) {
                 let n = record.lines.len();
-                let (lines_phrase, listed) = draft_lines_phrase(n);
+                let (lines_phrase, listed) = draft_lines_phrase(n, localization);
                 actions.push(DrawerAction {
-                    label: "Eliminar descarte".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDiscard,
+                    ),
                     method: "delete".to_string(),
                     path: format!("/web/purchases/{}", purchase.id),
                     fields: vec![],
                     reason: false,
-                    data_action: "Eliminar descarte".to_string(),
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDiscard,
+                    ),
                     impact: vec![
-                        format!("Se elimina el descarte y {lines_phrase} ({listed})."),
-                        "Nunca se confirmó: no dejó movimientos de stock, ni pagos, ni asientos de caja."
-                            .to_string(),
+                        localization.tr_with(
+                            crate::localization::MessageKey::DocumentsDeleteDiscardImpact,
+                            &[
+                                ("lines", lines_phrase.as_str()),
+                                ("listed", listed.as_str()),
+                            ],
+                        ),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsNeverConfirmed,
+                        ),
                     ],
-                    confirm: Some(format!(
-                        "¿Eliminar el descarte y {lines_phrase}? Esta acción no se puede deshacer."
+                    confirm: Some(localization.tr_with(
+                        crate::localization::MessageKey::DocumentsDeleteDiscardConfirm,
+                        &[("lines", lines_phrase.as_str())],
                     )),
                 });
             }
@@ -847,18 +1129,35 @@ async fn actor_facts(
     state: &AppState,
     created_by: i64,
     updated_by: Option<i64>,
+    localization: &LocalizationContext,
 ) -> AppResult<(DrawerFact, Option<DrawerFact>)> {
     let mut ids = vec![created_by];
     ids.extend(updated_by);
     let names = crate::routes::audit_actor_names(&state.pool, &ids).await?;
     let name_for = |id: i64| {
-        names
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| "(sistema)".to_string())
+        names.get(&id).cloned().unwrap_or_else(|| {
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsSystem,
+            )
+        })
     };
-    let created = DrawerFact::new("Registrado por", name_for(created_by));
-    let updated = updated_by.map(|id| DrawerFact::new("Actualizado por", name_for(id)));
+    let created = DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsActor,
+        ),
+        name_for(created_by),
+    );
+    let updated = updated_by.map(|id| {
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::AuditUpdatedBy,
+            ),
+            name_for(id),
+        )
+    });
     Ok((created, updated))
 }
 
@@ -869,73 +1168,156 @@ async fn sale_drawer(
     state: &AppState,
     principal: &Principal,
     id: i64,
+    localization: &LocalizationContext,
 ) -> AppResult<DocumentDetailPartial> {
     let record = state.sales_service.get_record(id).await?;
     let sale = &record.sale;
-    let actions = sale_actions(state, principal, &record).await?;
-    let (created_by, updated_by) = actor_facts(state, sale.created_by, sale.updated_by).await?;
+    let actions = sale_actions(state, principal, &record, localization).await?;
+    let (created_by, updated_by) =
+        actor_facts(state, sale.created_by, sale.updated_by, localization).await?;
 
     let mut facts = vec![
-        DrawerFact::new("Cliente", &sale.customer_name),
-        DrawerFact::new("Tipo de pago", sale.payment_type.to_string()),
-        DrawerFact::new("Fecha", sale.sale_date.to_string()),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsCustomer,
+            ),
+            &sale.customer_name,
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsPaymentType,
+            ),
+            payment_type_copy(localization, &sale.payment_type.to_string()),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(sale.sale_date),
+        ),
     ];
     facts.extend(DrawerFact::when_non_empty(
-        "Vencimiento",
-        sale.due_date.map(|d| d.to_string()),
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsDueDate,
+        ),
+        sale.due_date.map(|d| localization.format_date(d)),
     ));
     facts.extend(DrawerFact::when_non_empty(
-        "Recibo",
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsReceipt,
+        ),
         sale.receipt_no.clone(),
     ));
     facts.extend(DrawerFact::when_non_empty(
-        "Notas",
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsNotes,
+        ),
         Some(sale.notes.clone()).filter(|n| !n.is_empty()),
     ));
     facts.extend(DrawerFact::when_non_empty(
-        "Motivo de anulación",
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsCancellationReason,
+        ),
         sale.cancel_reason.clone(),
     ));
-    facts.push(DrawerFact::new("Total", record.total.to_string()));
-    facts.push(DrawerFact::new("Pagado", record.paid.to_string()));
-    facts.push(DrawerFact::new("Saldo", record.due.to_string()));
     facts.push(DrawerFact::new(
-        "Estado de pago",
-        record.payment_status.to_string(),
+        copy(localization, crate::localization::MessageKey::CustomerTotal),
+        localization.format_currency(record.total),
+    ));
+    facts.push(DrawerFact::new(
+        copy(localization, crate::localization::MessageKey::CustomerPaid),
+        localization.format_currency(record.paid),
+    ));
+    facts.push(DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsBalance,
+        ),
+        localization.format_currency(record.due),
+    ));
+    facts.push(DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsPaymentStatus,
+        ),
+        status_copy(localization, &record.payment_status.to_string()),
     ));
     facts.push(created_by);
     facts.extend(updated_by);
 
     let tables = vec![
         DrawerTable {
-            title: "Líneas",
-            headers: vec!["Producto", "Cant.", "Precio unit.", "Subtotal"],
+            title: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsLines,
+            ),
+            headers: vec![
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsProduct,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsQuantityShort,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsUnitPrice,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsSubtotal,
+                ),
+            ],
             rows: record
                 .lines
                 .iter()
                 .map(|line| DrawerTableRow {
                     cells: vec![
                         line.product_name.clone(),
-                        line.qty.to_string(),
-                        line.unit_price.to_string(),
-                        line.subtotal.to_string(),
+                        localization.format_quantity(line.qty),
+                        localization.format_currency(line.unit_price),
+                        localization.format_currency(line.subtotal),
                     ],
                     href: None,
                 })
                 .collect(),
         },
         DrawerTable {
-            title: "Pagos",
-            headers: vec!["Fecha", "Cuenta", "Medio", "Monto"],
+            title: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsPayments,
+            ),
+            headers: vec![
+                copy(localization, crate::localization::MessageKey::DocumentsDate),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsAccount,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsMethod,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsAmount,
+                ),
+            ],
             rows: record
                 .payments
                 .iter()
                 .map(|payment| DrawerTableRow {
                     cells: vec![
-                        payment.date.to_string(),
+                        localization.format_date(payment.date),
                         payment.account_name.clone(),
-                        payment.method_name.clone(),
-                        payment.amount.to_string(),
+                        localization
+                            .payment_method_display_name(&payment.method_name)
+                            .into_owned(),
+                        localization.format_currency(payment.amount),
                     ],
                     href: None,
                 })
@@ -944,17 +1326,22 @@ async fn sale_drawer(
     ];
 
     Ok(DocumentDetailPartial {
-        kind_label: DocumentKind::Sale.label().to_string(),
-        title: document_title(sale.sale_number.as_deref(), sale.id),
-        status_line: sale.status.to_string(),
+        localization: localization.clone(),
+        kind_label: document_kind_label(&DocumentKind::Sale, localization),
+        title: document_title(sale.sale_number.as_deref(), sale.id, localization),
+        status_line: status_copy(localization, &sale.status.to_string()),
         facts,
         tables,
         parent: None,
         actions,
-        notice: Some(edit_affordance_notice(&sale.status.to_string())),
+        notice: Some(edit_affordance_notice(
+            &sale.status.to_string(),
+            localization,
+        )),
         links: vec![edit_affordance_link(
             &sale.status.to_string(),
             format!("/sales/{}", sale.id),
+            localization,
         )],
     })
 }
@@ -968,6 +1355,7 @@ async fn sale_payment_drawer(
     state: &AppState,
     principal: &Principal,
     id: i64,
+    localization: &LocalizationContext,
 ) -> AppResult<DocumentDetailPartial> {
     let payment = state.sales_service.find_payment(id).await?;
     let record = state.sales_service.get_record(payment.sale_id).await?;
@@ -983,7 +1371,7 @@ async fn sale_payment_drawer(
             ))
         })?;
     let (created_by, updated_by) =
-        actor_facts(state, payment.created_by, payment.updated_by).await?;
+        actor_facts(state, payment.created_by, payment.updated_by, localization).await?;
 
     // The ledger links: the account page owns the transaction's name and
     // balance, so the drawer links there instead of re-reading an account.
@@ -996,7 +1384,10 @@ async fn sale_payment_drawer(
             let tx = state.transaction_service.get(tx_id).await?;
             if principal.has(FinanceRead::CODE) {
                 links.push(DrawerLink {
-                    label: "Ver asiento en Caja".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsViewLedger,
+                    ),
                     href: format!("/accounts/{}", tx.account_id),
                 });
             }
@@ -1009,7 +1400,10 @@ async fn sale_payment_drawer(
             let tx = state.transaction_service.get(tx_id).await?;
             if principal.has(FinanceRead::CODE) {
                 links.push(DrawerLink {
-                    label: "Ver reembolso en Caja".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsViewRefund,
+                    ),
                     href: format!("/accounts/{}", tx.account_id),
                 });
             }
@@ -1022,63 +1416,148 @@ async fn sale_payment_drawer(
     // stays a fact below either way.
     if payment.receipt_id.is_some() && principal.has(CustomersRead::CODE) {
         links.push(DrawerLink {
-            label: "Ver el cliente del recibo".to_string(),
+            label: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsViewCustomer,
+            ),
             href: format!("/customers/{}", sale.customer_id),
         });
     }
     links.push(DrawerLink {
-        label: "Abrir en Ventas".to_string(),
+        label: copy(
+            localization,
+            crate::localization::MessageKey::DocumentsOpenSales,
+        ),
         href: format!("/sales/{}", sale.id),
     });
 
     let mut facts = vec![
-        DrawerFact::new("Monto", payment.amount.to_string()),
-        DrawerFact::new("Fecha", payment.date.to_string()),
-        DrawerFact::new("Cuenta", &view.account_name),
-        DrawerFact::new("Medio", &view.method_name),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsAmount,
+            ),
+            localization.format_currency(payment.amount),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(payment.date),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsAccount,
+            ),
+            &view.account_name,
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsMethod,
+            ),
+            &localization
+                .payment_method_display_name(&view.method_name)
+                .into_owned(),
+        ),
     ];
     if let Some(tx) = &original {
         facts.push(DrawerFact::new(
-            "Asiento",
-            format!("{} · {} · {}", tx.kind, tx.amount, tx.date),
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsEntry,
+            ),
+            format!(
+                "{} · {} · {}",
+                transaction_kind_copy(localization, &tx.kind.to_string()),
+                localization.format_currency(tx.amount),
+                localization.format_date(tx.date),
+            ),
         ));
     }
     if let Some(tx) = &refund {
         facts.push(DrawerFact::new(
-            "Reembolso",
-            format!("{} · {} · {}", tx.kind, tx.amount, tx.date),
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsRefund,
+            ),
+            format!(
+                "{} · {} · {}",
+                transaction_kind_copy(localization, &tx.kind.to_string()),
+                localization.format_currency(tx.amount),
+                localization.format_date(tx.date),
+            ),
         ));
     }
     if let Some(receipt_id) = payment.receipt_id {
-        facts.push(DrawerFact::new("Recibo", format!("Recibo #{receipt_id}")));
+        facts.push(DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsReceipt,
+            ),
+            format!(
+                "{} #{receipt_id}",
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsReceipt
+                )
+            ),
+        ));
     }
     facts.push(created_by);
     facts.extend(updated_by);
 
     let parent = DrawerParent {
-        label: DocumentKind::Sale.label().to_string(),
-        title: document_title(sale.sale_number.as_deref(), sale.id),
-        status_line: sale.status.to_string(),
+        label: document_kind_label(&DocumentKind::Sale, localization),
+        title: document_title(sale.sale_number.as_deref(), sale.id, localization),
+        status_line: status_copy(localization, &sale.status.to_string()),
         facts: vec![
-            DrawerFact::new("Total", record.total.to_string()),
-            DrawerFact::new("Pagado", record.paid.to_string()),
-            DrawerFact::new("Saldo", record.due.to_string()),
+            DrawerFact::new(
+                copy(localization, crate::localization::MessageKey::CustomerTotal),
+                localization.format_currency(record.total),
+            ),
+            DrawerFact::new(
+                copy(localization, crate::localization::MessageKey::CustomerPaid),
+                localization.format_currency(record.paid),
+            ),
+            DrawerFact::new(
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsBalance,
+                ),
+                localization.format_currency(record.due),
+            ),
         ],
         href: format!("/sales/{}", sale.id),
     };
 
     Ok(DocumentDetailPartial {
-        kind_label: DocumentKind::SalePayment.label().to_string(),
-        title: format!("Pago de {}", document_title(sale.sale_number.as_deref(), sale.id)),
-        status_line: format!("Pago · {} · {}", payment.date, sale.status),
+        localization: localization.clone(),
+        kind_label: document_kind_label(&DocumentKind::SalePayment, localization),
+        title: localization.tr_with(
+            crate::localization::MessageKey::DocumentsPaymentOf,
+            &[(
+                "title",
+                document_title(sale.sale_number.as_deref(), sale.id, localization).as_str(),
+            )],
+        ),
+        status_line: localization.tr_with(
+            crate::localization::MessageKey::DocumentsPaymentStatusLine,
+            &[
+                ("date", localization.format_date(payment.date).as_str()),
+                (
+                    "status",
+                    status_copy(localization, &sale.status.to_string()).as_str(),
+                ),
+            ],
+        ),
         facts,
         tables: Vec::new(),
         parent: Some(parent),
         actions: Vec::new(),
-        notice: Some(
-            "El pago no se edita ni se elimina: el dinero ya está en la caja y el asiento queda. Si el documento se anula, el reembolso lo registra la anulación, no una edición manual."
-                .to_string(),
-        ),
+        notice: Some(copy(
+            localization,
+            crate::localization::MessageKey::DocumentsPaymentImmutable,
+        )),
         links,
     })
 }
@@ -1089,74 +1568,161 @@ async fn purchase_drawer(
     state: &AppState,
     principal: &Principal,
     id: i64,
+    localization: &LocalizationContext,
 ) -> AppResult<DocumentDetailPartial> {
     let record = state.purchases_service.get_record(id).await?;
     let purchase = &record.purchase;
-    let actions = purchase_actions(state, principal, &record).await?;
-    let (created_by, updated_by) =
-        actor_facts(state, purchase.created_by, purchase.updated_by).await?;
+    let actions = purchase_actions(state, principal, &record, localization).await?;
+    let (created_by, updated_by) = actor_facts(
+        state,
+        purchase.created_by,
+        purchase.updated_by,
+        localization,
+    )
+    .await?;
 
     let mut facts = vec![
-        DrawerFact::new("Proveedor", &record.supplier_name),
-        DrawerFact::new("Tipo de pago", purchase.payment_type.to_string()),
-        DrawerFact::new("Fecha", purchase.purchase_date.to_string()),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsSupplier,
+            ),
+            &record.supplier_name,
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsPaymentType,
+            ),
+            payment_type_copy(localization, &purchase.payment_type.to_string()),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(purchase.purchase_date),
+        ),
     ];
     facts.extend(DrawerFact::when_non_empty(
-        "Vencimiento",
-        purchase.due_date.map(|d| d.to_string()),
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsDueDate,
+        ),
+        purchase.due_date.map(|d| localization.format_date(d)),
     ));
     facts.extend(DrawerFact::when_non_empty(
-        "Factura del proveedor",
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsSupplierInvoice,
+        ),
         purchase.supplier_invoice_no.clone(),
     ));
     facts.extend(DrawerFact::when_non_empty(
-        "Notas",
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsNotes,
+        ),
         Some(purchase.notes.clone()).filter(|n| !n.is_empty()),
     ));
     facts.extend(DrawerFact::when_non_empty(
-        "Motivo de anulación",
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsCancellationReason,
+        ),
         purchase.cancel_reason.clone(),
     ));
-    facts.push(DrawerFact::new("Total", record.total.to_string()));
-    facts.push(DrawerFact::new("Pagado", record.paid.to_string()));
-    facts.push(DrawerFact::new("Saldo", record.due.to_string()));
     facts.push(DrawerFact::new(
-        "Estado de pago",
-        record.payment_status.to_string(),
+        copy(localization, crate::localization::MessageKey::CustomerTotal),
+        localization.format_currency(record.total),
+    ));
+    facts.push(DrawerFact::new(
+        copy(localization, crate::localization::MessageKey::CustomerPaid),
+        localization.format_currency(record.paid),
+    ));
+    facts.push(DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsBalance,
+        ),
+        localization.format_currency(record.due),
+    ));
+    facts.push(DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsPaymentStatus,
+        ),
+        status_copy(localization, &record.payment_status.to_string()),
     ));
     facts.push(created_by);
     facts.extend(updated_by);
 
     let tables = vec![
         DrawerTable {
-            title: "Líneas",
-            headers: vec!["Producto", "Cant.", "Costo unit.", "Subtotal"],
+            title: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsLines,
+            ),
+            headers: vec![
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsProduct,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsQuantityShort,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsUnitCost,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsSubtotal,
+                ),
+            ],
             rows: record
                 .lines
                 .iter()
                 .map(|line| DrawerTableRow {
                     cells: vec![
                         line.product_name.clone(),
-                        line.qty.to_string(),
-                        line.unit_cost.to_string(),
-                        line.subtotal.to_string(),
+                        localization.format_quantity(line.qty),
+                        localization.format_currency(line.unit_cost),
+                        localization.format_currency(line.subtotal),
                     ],
                     href: None,
                 })
                 .collect(),
         },
         DrawerTable {
-            title: "Pagos",
-            headers: vec!["Fecha", "Cuenta", "Medio", "Monto"],
+            title: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsPayments,
+            ),
+            headers: vec![
+                copy(localization, crate::localization::MessageKey::DocumentsDate),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsAccount,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsMethod,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsAmount,
+                ),
+            ],
             rows: record
                 .payments
                 .iter()
                 .map(|payment| DrawerTableRow {
                     cells: vec![
-                        payment.date.to_string(),
+                        localization.format_date(payment.date),
                         payment.account_name.clone(),
-                        payment.method_name.clone(),
-                        payment.amount.to_string(),
+                        localization
+                            .payment_method_display_name(&payment.method_name)
+                            .into_owned(),
+                        localization.format_currency(payment.amount),
                     ],
                     href: None,
                 })
@@ -1165,17 +1731,26 @@ async fn purchase_drawer(
     ];
 
     Ok(DocumentDetailPartial {
-        kind_label: DocumentKind::Purchase.label().to_string(),
-        title: document_title(purchase.purchase_number.as_deref(), purchase.id),
-        status_line: purchase.status.to_string(),
+        localization: localization.clone(),
+        kind_label: document_kind_label(&DocumentKind::Purchase, localization),
+        title: document_title(
+            purchase.purchase_number.as_deref(),
+            purchase.id,
+            localization,
+        ),
+        status_line: status_copy(localization, &purchase.status.to_string()),
         facts,
         tables,
         parent: None,
         actions,
-        notice: Some(edit_affordance_notice(&purchase.status.to_string())),
+        notice: Some(edit_affordance_notice(
+            &purchase.status.to_string(),
+            localization,
+        )),
         links: vec![edit_affordance_link(
             &purchase.status.to_string(),
             format!("/purchases/{}", purchase.id),
+            localization,
         )],
     })
 }
@@ -1186,6 +1761,7 @@ async fn purchase_payment_drawer(
     state: &AppState,
     principal: &Principal,
     id: i64,
+    localization: &LocalizationContext,
 ) -> AppResult<DocumentDetailPartial> {
     let payment = state.purchases_service.find_payment(id).await?;
     let record = state
@@ -1204,7 +1780,7 @@ async fn purchase_payment_drawer(
             ))
         })?;
     let (created_by, updated_by) =
-        actor_facts(state, payment.created_by, payment.updated_by).await?;
+        actor_facts(state, payment.created_by, payment.updated_by, localization).await?;
 
     // The ledger links, gated like the sale side: `/accounts/{id}` declares
     // `finance.read`, so the link renders only for a finance reader while the
@@ -1215,7 +1791,10 @@ async fn purchase_payment_drawer(
             let tx = state.transaction_service.get(tx_id).await?;
             if principal.has(FinanceRead::CODE) {
                 links.push(DrawerLink {
-                    label: "Ver asiento en Caja".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsViewLedger,
+                    ),
                     href: format!("/accounts/{}", tx.account_id),
                 });
             }
@@ -1228,7 +1807,10 @@ async fn purchase_payment_drawer(
             let tx = state.transaction_service.get(tx_id).await?;
             if principal.has(FinanceRead::CODE) {
                 links.push(DrawerLink {
-                    label: "Ver reembolso en Caja".to_string(),
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsViewRefund,
+                    ),
                     href: format!("/accounts/{}", tx.account_id),
                 });
             }
@@ -1237,58 +1819,134 @@ async fn purchase_payment_drawer(
         None => None,
     };
     links.push(DrawerLink {
-        label: "Abrir en Compras".to_string(),
+        label: copy(
+            localization,
+            crate::localization::MessageKey::DocumentsOpenPurchases,
+        ),
         href: format!("/purchases/{}", purchase.id),
     });
 
     let mut facts = vec![
-        DrawerFact::new("Monto", payment.amount.to_string()),
-        DrawerFact::new("Fecha", payment.date.to_string()),
-        DrawerFact::new("Cuenta", &view.account_name),
-        DrawerFact::new("Medio", &view.method_name),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsAmount,
+            ),
+            localization.format_currency(payment.amount),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(payment.date),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsAccount,
+            ),
+            &view.account_name,
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsMethod,
+            ),
+            &localization
+                .payment_method_display_name(&view.method_name)
+                .into_owned(),
+        ),
     ];
     if let Some(tx) = &original {
         facts.push(DrawerFact::new(
-            "Asiento",
-            format!("{} · {} · {}", tx.kind, tx.amount, tx.date),
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsEntry,
+            ),
+            format!(
+                "{} · {} · {}",
+                transaction_kind_copy(localization, &tx.kind.to_string()),
+                localization.format_currency(tx.amount),
+                localization.format_date(tx.date),
+            ),
         ));
     }
     if let Some(tx) = &refund {
         facts.push(DrawerFact::new(
-            "Reembolso",
-            format!("{} · {} · {}", tx.kind, tx.amount, tx.date),
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsRefund,
+            ),
+            format!(
+                "{} · {} · {}",
+                transaction_kind_copy(localization, &tx.kind.to_string()),
+                localization.format_currency(tx.amount),
+                localization.format_date(tx.date),
+            ),
         ));
     }
     facts.push(created_by);
     facts.extend(updated_by);
 
     let parent = DrawerParent {
-        label: DocumentKind::Purchase.label().to_string(),
-        title: document_title(purchase.purchase_number.as_deref(), purchase.id),
-        status_line: purchase.status.to_string(),
+        label: document_kind_label(&DocumentKind::Purchase, localization),
+        title: document_title(
+            purchase.purchase_number.as_deref(),
+            purchase.id,
+            localization,
+        ),
+        status_line: status_copy(localization, &purchase.status.to_string()),
         facts: vec![
-            DrawerFact::new("Total", record.total.to_string()),
-            DrawerFact::new("Pagado", record.paid.to_string()),
-            DrawerFact::new("Saldo", record.due.to_string()),
+            DrawerFact::new(
+                copy(localization, crate::localization::MessageKey::CustomerTotal),
+                localization.format_currency(record.total),
+            ),
+            DrawerFact::new(
+                copy(localization, crate::localization::MessageKey::CustomerPaid),
+                localization.format_currency(record.paid),
+            ),
+            DrawerFact::new(
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsBalance,
+                ),
+                localization.format_currency(record.due),
+            ),
         ],
         href: format!("/purchases/{}", purchase.id),
     };
 
     Ok(DocumentDetailPartial {
-        kind_label: DocumentKind::PurchasePayment.label().to_string(),
-        title: format!(
-            "Pago de {}",
-            document_title(purchase.purchase_number.as_deref(), purchase.id)
+        localization: localization.clone(),
+        kind_label: document_kind_label(&DocumentKind::PurchasePayment, localization),
+        title: localization.tr_with(
+            crate::localization::MessageKey::DocumentsPaymentOf,
+            &[(
+                "title",
+                document_title(
+                    purchase.purchase_number.as_deref(),
+                    purchase.id,
+                    localization,
+                )
+                .as_str(),
+            )],
         ),
-        status_line: format!("Pago · {} · {}", payment.date, purchase.status),
+        status_line: localization.tr_with(
+            crate::localization::MessageKey::DocumentsPaymentStatusLine,
+            &[
+                ("date", localization.format_date(payment.date).as_str()),
+                (
+                    "status",
+                    status_copy(localization, &purchase.status.to_string()).as_str(),
+                ),
+            ],
+        ),
         facts,
         tables: Vec::new(),
         parent: Some(parent),
         actions: Vec::new(),
-        notice: Some(
-            "El pago no se edita ni se elimina: el dinero ya está en la caja y el asiento queda. Si el documento se anula, el reembolso lo registra la anulación, no una edición manual."
-                .to_string(),
-        ),
+        notice: Some(copy(
+            localization,
+            crate::localization::MessageKey::DocumentsPaymentImmutable,
+        )),
         links,
     })
 }
@@ -1296,44 +1954,91 @@ async fn purchase_payment_drawer(
 /// The STOCK-MOVEMENT family: the movement's facts plus the product's current
 /// derived stock. The movement is append-only history — no edit, no delete —
 /// and the drawer says so; the action slice builds on that guarantee.
-async fn stock_movement_drawer(state: &AppState, id: i64) -> AppResult<DocumentDetailPartial> {
+async fn stock_movement_drawer(
+    state: &AppState,
+    id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<DocumentDetailPartial> {
     let movement = state.inventory_service.get_movement(id).await?;
     let stock = state
         .inventory_service
         .product_stock(movement.product_id)
         .await?;
-    let (created_by, updated_by) =
-        actor_facts(state, movement.created_by, movement.updated_by).await?;
+    let (created_by, updated_by) = actor_facts(
+        state,
+        movement.created_by,
+        movement.updated_by,
+        localization,
+    )
+    .await?;
 
     let mut facts = vec![
         DrawerFact::new(
-            "Producto",
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsProduct,
+            ),
             format!("{} ({})", stock.product.name, stock.product.sku),
         ),
-        DrawerFact::new("Tipo", movement.movement_type.to_string()),
-        DrawerFact::new("Motivo", movement.reason.to_string()),
-        DrawerFact::new("Cantidad", movement.qty.to_string()),
-        DrawerFact::new("Referencia", &movement.reference),
-        DrawerFact::new("Fecha", movement.date.to_string()),
-        DrawerFact::new("Stock actual", stock.stock.to_string()),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::ProductKind),
+            movement_type_copy(localization, &movement.movement_type.to_string()),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::ProductReason),
+            reason_copy(localization, &movement.reason.to_string()),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::ProductQuantity,
+            ),
+            localization.format_quantity(movement.qty),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::ProductMovementReference,
+            ),
+            &movement.reference,
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(movement.date),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::ProductStock),
+            localization.format_quantity(stock.stock),
+        ),
     ];
     facts.push(created_by);
     facts.extend(updated_by);
 
     Ok(DocumentDetailPartial {
-        kind_label: DocumentKind::StockMovement.label().to_string(),
-        title: format!("Movimiento #{}", movement.id),
-        status_line: format!("{} · {}", movement.movement_type, movement.reason),
+        localization: localization.clone(),
+        kind_label: document_kind_label(&DocumentKind::StockMovement, localization),
+        title: localization.tr_with(
+            crate::localization::MessageKey::DocumentsMovement,
+            &[("id", &movement.id.to_string())],
+        ),
+        status_line: format!(
+            "{} · {}",
+            movement_type_copy(localization, &movement.movement_type.to_string()),
+            reason_copy(localization, &movement.reason.to_string())
+        ),
         facts,
         tables: Vec::new(),
         parent: None,
         actions: Vec::new(),
-        notice: Some(
-                "El movimiento es historia append-only: no se edita ni se elimina. Para compensarlo, registrá un ajuste en el producto."
-                .to_string(),
-        ),
+        notice: Some(copy(
+            localization,
+            crate::localization::MessageKey::DocumentsMovementImmutable,
+        )),
         links: vec![DrawerLink {
-            label: "Ver producto".to_string(),
+            label: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsViewProduct,
+            ),
             href: format!("/products#product-{}", movement.product_id),
         }],
     })
@@ -1348,47 +2053,97 @@ async fn receipt_drawer(
     state: &AppState,
     principal: &Principal,
     id: i64,
+    localization: &LocalizationContext,
 ) -> AppResult<DocumentDetailPartial> {
     let detail = state.customer_receipt_service.get_receipt(id).await?;
     let customer = state
         .customer_service
         .get_customer(detail.receipt.customer_id)
         .await?;
-    let (created_by, updated_by) =
-        actor_facts(state, detail.receipt.created_by, detail.receipt.updated_by).await?;
+    let (created_by, updated_by) = actor_facts(
+        state,
+        detail.receipt.created_by,
+        detail.receipt.updated_by,
+        localization,
+    )
+    .await?;
 
     let mut facts = vec![
-        DrawerFact::new("Cliente", &customer.name),
-        DrawerFact::new("Fecha", detail.receipt.date.to_string()),
-        DrawerFact::new("Cuenta", &detail.account_name),
-        DrawerFact::new("Medio", &detail.method_name),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsCustomer,
+            ),
+            &customer.name,
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(detail.receipt.date),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsAccount,
+            ),
+            &detail.account_name,
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsMethod,
+            ),
+            &localization
+                .payment_method_display_name(&detail.method_name)
+                .into_owned(),
+        ),
     ];
     facts.extend(DrawerFact::when_non_empty(
-        "Notas",
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsNotes,
+        ),
         detail.receipt.notes.clone(),
     ));
-    facts.push(DrawerFact::new("Total", detail.total.to_string()));
     facts.push(DrawerFact::new(
-        "Asignaciones",
+        copy(localization, crate::localization::MessageKey::CustomerTotal),
+        localization.format_currency(detail.total),
+    ));
+    facts.push(DrawerFact::new(
+        copy(
+            localization,
+            crate::localization::MessageKey::CustomerAllocations,
+        ),
         detail.allocations.len().to_string(),
     ));
     facts.push(created_by);
     facts.extend(updated_by);
 
     let tables = vec![DrawerTable {
-        title: "Asignaciones",
-        headers: vec!["Venta", "Fecha", "Monto"],
+        title: copy(
+            localization,
+            crate::localization::MessageKey::CustomerAllocations,
+        ),
+        headers: vec![
+            copy(localization, crate::localization::MessageKey::DocumentSale),
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsAmount,
+            ),
+        ],
         rows: detail
             .allocations
             .iter()
             .map(|payment| DrawerTableRow {
                 cells: vec![
-                    payment
-                        .sale_number
-                        .clone()
-                        .unwrap_or_else(|| format!("Venta #{}", payment.sale_id)),
-                    payment.date.to_string(),
-                    payment.amount.to_string(),
+                    payment.sale_number.clone().unwrap_or_else(|| {
+                        localization.tr_with(
+                            crate::localization::MessageKey::CustomerSaleNumber,
+                            &[("id", &payment.sale_id.to_string())],
+                        )
+                    }),
+                    localization.format_date(payment.date),
+                    localization.format_currency(payment.amount),
                 ],
                 // The sale page declares `sales.read`; the receipt drawer
                 // opens with `customers.read`, so the link renders only for
@@ -1403,19 +2158,33 @@ async fn receipt_drawer(
     }];
 
     Ok(DocumentDetailPartial {
-        kind_label: DocumentKind::Receipt.label().to_string(),
-        title: format!("Recibo #{}", detail.receipt.id),
-        status_line: "Cobro".to_string(),
+        localization: localization.clone(),
+        kind_label: document_kind_label(&DocumentKind::Receipt, localization),
+        title: format!(
+            "{} #{}",
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsReceipt
+            ),
+            detail.receipt.id
+        ),
+        status_line: copy(
+            localization,
+            crate::localization::MessageKey::DocumentsCollection,
+        ),
         facts,
         tables,
         parent: None,
         actions: Vec::new(),
-        notice: Some(
-            "El recibo agrupa los pagos de un cobro: mientras los explique, la base rechaza eliminarlo."
-                .to_string(),
-        ),
+        notice: Some(copy(
+            localization,
+            crate::localization::MessageKey::DocumentsReceiptNotice,
+        )),
         links: vec![DrawerLink {
-            label: "Abrir en Clientes".to_string(),
+            label: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsOpenCustomers,
+            ),
             href: format!("/customers/{}", detail.receipt.customer_id),
         }],
     })
@@ -1448,6 +2217,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES ('es-ES', 'es', 'Español (España)', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', 'es-ES', 'USD', 'UTC')")
+            .execute(&pool)
+            .await
+            .unwrap();
         test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, true)
     }
@@ -1467,6 +2244,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES ('es-ES', 'es', 'Español (España)', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', 'es-ES', 'USD', 'UTC')")
+            .execute(&pool)
+            .await
+            .unwrap();
         test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, true, true)
     }
@@ -1642,7 +2427,7 @@ mod tests {
         assert!(html.contains("Eliminar borrador"), "{html:.800}");
         assert!(html.contains("Descartar"), "{html:.800}");
         assert!(
-            html.contains("Editar el documento"),
+            html.contains("Editar documento"),
             "the edit affordance is a button-styled link: {html:.800}"
         );
         assert!(
@@ -1673,7 +2458,7 @@ mod tests {
         assert!(!html.contains("Descartar"), "{html:.800}");
         assert!(!html.contains("hx-delete"), "{html:.800}");
         assert!(
-            html.contains("Editar el documento"),
+            html.contains("Editar documento"),
             "the edit affordance is a LINK every reader keeps, whatever their code: {html:.800}"
         );
 
@@ -1725,7 +2510,7 @@ mod tests {
             "a confirmed document is annulled, never deleted: {html:.800}"
         );
         assert!(
-            html.contains("In · Sale-return"),
+            html.contains("Entrada · Devolución de venta"),
             "one movement per tracked line: {html:.800}"
         );
         assert!(
@@ -1745,7 +2530,7 @@ mod tests {
             "{html:.800}"
         );
         assert!(
-            html.contains("Si algún reembolso dejaría una cuenta en negativo"),
+            html.contains("Si algún reembolso deja una cuenta en negativo"),
             "allow_negative = false, so the caveat renders: {html:.800}"
         );
         let _ = account;
@@ -1781,7 +2566,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
-            html.contains("No se puede anular"),
+            html.contains("no se puede anular"),
             "the blocker must be visible before the click: {html:.800}"
         );
         assert!(html.contains("está inactivo"), "{html:.800}");
@@ -1958,7 +2743,7 @@ mod tests {
         assert!(!html.contains("hx-delete"), "{html:.800}");
         assert!(!html.contains("hx-post"), "{html:.800}");
         assert!(
-            html.contains("ya está en la caja"),
+            html.contains("El pago no se edita"),
             "the payment drawer explains why there is no action: {html:.800}"
         );
 
@@ -1972,7 +2757,7 @@ mod tests {
         assert!(!html.contains("hx-delete"), "{html:.800}");
         assert!(!html.contains("hx-post"), "{html:.800}");
         assert!(
-            html.contains("ajuste"),
+            html.contains("Ajuste"),
             "the movement drawer points at the compensation path: {html:.800}"
         );
 
@@ -2073,7 +2858,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(html.contains("Ver asiento en Caja"), "{html:.800}");
         assert!(html.contains("/accounts/"), "{html:.800}");
-        assert!(html.contains("Ver el cliente del recibo"), "{html:.800}");
+        assert!(html.contains("Ver cliente del recibo"), "{html:.800}");
         assert!(html.contains("Recibo #"), "the receipt fact: {html:.800}");
 
         // `sales.read` only: the drawer still opens, but no link may point
@@ -2088,13 +2873,13 @@ mod tests {
             "the account page declares finance.read: {html:.800}"
         );
         assert!(!html.contains("Ver asiento en Caja"), "{html:.800}");
-        assert!(!html.contains("Ver el cliente del recibo"), "{html:.800}");
+        assert!(!html.contains("Ver cliente del recibo"), "{html:.800}");
         assert!(
             html.contains("Asiento"),
             "the ledger entry stays readable as a fact: {html:.800}"
         );
         assert!(
-            html.contains("Income"),
+            html.contains("Ingreso"),
             "the entry's kind stays visible: {html:.800}"
         );
         assert!(
@@ -2399,7 +3184,7 @@ mod tests {
             "{html:.800}"
         );
         assert!(
-            html.contains("Editar el documento"),
+            html.contains("Editar documento"),
             "the purchase mirror keeps the same state-labelled edit link: {html:.800}"
         );
 
@@ -2433,7 +3218,7 @@ mod tests {
         assert!(html.contains("Anular"), "{html:.800}");
         assert!(!html.contains("Eliminar borrador"), "{html:.800}");
         assert!(
-            html.contains("Out · Purchase-return"),
+            html.contains("Salida · Devolución de compra"),
             "the purchase wording differs from the sale's: {html:.800}"
         );
         assert!(
@@ -2441,7 +3226,7 @@ mod tests {
             "a purchase refund is money entering: {html:.800}"
         );
         assert!(
-            !html.contains("Si algún reembolso dejaría una cuenta en negativo"),
+            !html.contains("Si algún reembolso deja una cuenta en negativo"),
             "purchase refunds are Income: no negative-balance caveat exists to state: {html:.800}"
         );
     }
@@ -2502,7 +3287,7 @@ mod tests {
         let headers = table_headers(&html, "Líneas");
         assert_eq!(
             headers,
-            vec!["Producto", "Cant.", "Precio unit.", "Subtotal"],
+            vec!["Producto", "Cant.", "Precio unitario", "Subtotal"],
             "{html:.800}"
         );
         assert_eq!(
@@ -2590,7 +3375,7 @@ mod tests {
         let headers = table_headers(&html, "Líneas");
         assert_eq!(
             headers,
-            vec!["Producto", "Cant.", "Costo unit.", "Subtotal"],
+            vec!["Producto", "Cant.", "Costo unitario", "Subtotal"],
             "{html:.800}"
         );
         assert_eq!(

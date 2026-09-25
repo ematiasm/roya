@@ -11,7 +11,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-use crate::localization::LocalizationContext;
+use crate::localization::{LocalizationContext, MessageKey};
 use crate::models::{
     BusinessLocale, BusinessSettings, UpdateBusinessLocale, UpdateBusinessSettings,
 };
@@ -35,7 +35,7 @@ struct SettingsPage {
     nav: Nav,
     saved: bool,
     error: Option<String>,
-    preview: String,
+    preview_message: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -124,7 +124,7 @@ async fn settings_submit(
             invalid_page_response(
                 &state,
                 form,
-                validation_message(&error),
+                validation_message(&error, &localization),
                 localization,
                 &principal,
             )
@@ -182,6 +182,10 @@ fn page_response(
 
     let preview =
         localization.format_currency(rust_decimal::Decimal::from_i128_with_scale(123_450, 2));
+    let preview_message = localization.tr_with(
+        MessageKey::SettingsPreview,
+        &[("preview", preview.as_str())],
+    );
     let page = SettingsPage {
         settings: BusinessSettings {
             id: settings.id,
@@ -209,17 +213,37 @@ fn page_response(
         nav: Nav::for_principal(principal),
         saved,
         error,
-        preview,
+        preview_message,
     };
     Ok(page)
 }
 
-fn validation_message(error: &AppError) -> String {
+fn validation_message(error: &AppError, localization: &LocalizationContext) -> String {
     let message = error.to_string();
-    message
+    let message = message
         .strip_prefix("validation error: ")
-        .unwrap_or(&message)
-        .to_string()
+        .unwrap_or(&message);
+    let key = match message {
+        "El nombre del negocio debe tener entre 1 y 160 caracteres." => {
+            MessageKey::ValidationBusinessNameLength
+        }
+        "La moneda debe ser un código de tres letras mayúsculas." => {
+            MessageKey::ValidationCurrencyCode
+        }
+        "La zona horaria es obligatoria." => MessageKey::ValidationTimezoneRequired,
+        "The submitted locale profiles do not match the configured locales." => {
+            MessageKey::ValidationLocaleProfiles
+        }
+        "El nombre visible del locale debe tener entre 1 y 128 caracteres." => {
+            MessageKey::ValidationLocaleDisplayName
+        }
+        "A locale profile was submitted more than once." => MessageKey::ValidationLocaleDuplicate,
+        "The default locale must exist and remain enabled." => {
+            MessageKey::ValidationDefaultLocaleEnabled
+        }
+        _ => return message.to_owned(),
+    };
+    localization.tr(key).to_owned()
 }
 
 fn render<T: Template>(template: T) -> AppResult<String> {

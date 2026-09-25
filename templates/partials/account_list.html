@@ -1,7 +1,7 @@
 <div>
-  <div class="mb-2.5 text-[13px] text-muted">Total: <span class="font-bold text-text">{{ localization.format_currency(total_balance.clone()) }}</span> across {{ accounts.len() }} accounts</div>
+  <div class="mb-2.5 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardTotalBalance) }}: <span class="font-bold text-text">{{ localization.format_currency(total_balance.clone()) }}</span> • {{ localization.tr_count(crate::localization::MessageKey::AccountCount, accounts.len()) }}</div>
   {% if accounts.is_empty() %}
-    <div class="empty">No accounts yet — create one on the right.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::AccountNoAccounts) }}</div>
   {% else %}
     {% for acc in accounts %}
     {# A row, not a control: the anchor is the row, carrying the flex layout
@@ -12,7 +12,7 @@
           <div class="font-semibold">{{ acc.name }}</div>
           <div class="text-[13px] text-muted">#{{ acc.id }} • {{ localization.format_date(acc.created_at.date()) }}</div>
           {% if accounts_without_methods.missing(acc.id) %}
-          <div class="mt-1.5 inline-block rounded-full border border-danger/40 bg-danger/10 px-2 py-0.5 text-[11px] font-bold tracking-[0.02em] text-danger" data-payment-methods-warning="true">⚠ No payment methods configured</div>
+          <div class="mt-1.5 inline-block rounded-full border border-danger/40 bg-danger/10 px-2 py-0.5 text-[11px] font-bold tracking-[0.02em] text-danger" data-payment-methods-warning="true">⚠ {{ localization.tr(crate::localization::MessageKey::AccountNoMethods) }}</div>
           {% endif %}
         </div>
         <div class="font-bold tabular-nums {% if acc.is_negative() %}text-danger{% else %}text-income{% endif %}">{{ localization.format_currency(acc.balance.clone()) }}</div>

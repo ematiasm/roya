@@ -1,16 +1,8 @@
-{# The users list fragment, swapped by htmx. Every row shows username,
-   display name, state and the Spanish labels of the roles the user holds.
-   Actions render only for the tier that may perform them — `can_manage`
-   (identity.users.manage: credentials, state) and `can_manage_roles`
-   (identity.roles.manage: the role set): the role assignment is its own
-   tier, so a principal that may reset passwords but not grant roles sees
-   only its own actions. The routes refuse anyway — the markup is courtesy,
-   the handler is the enforcement. Mutations post to collection endpoints
-   with the id in the body (the wiring guard: htmx cannot interpolate a path
-   segment from an input value). #}
+{# The users list fragment. User data stays canonical; seeded role names use
+   display-only labels and custom role names fall back unchanged. #}
 <div id="user-list-inner">
   {% if users.is_empty() %}
-    <div class="empty">No hay usuarios — usá «Nuevo usuario» arriba.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::IdentityUsersEmpty) }}</div>
   {% else %}
     <div class="flex flex-col gap-1.5">
       {% for r in users %}
@@ -19,54 +11,48 @@
           <div class="truncate font-semibold {% if r.user.is_active %}text-text{% else %}text-muted{% endif %}">
             {{ r.user.username }}
             {% if r.user.must_change_password %}
-            <span class="ml-1 rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-normal text-muted">debe cambiar la contraseña</span>
+            <span class="ml-1 rounded-full border border-border bg-card px-2 py-0.5 text-[11px] font-normal text-muted">{{ localization.tr(crate::localization::MessageKey::IdentityMustChangePassword) }}</span>
             {% endif %}
           </div>
-          <div class="truncate text-[13px] text-muted">{{ r.user.display_name }}{% if !r.roles.is_empty() %} · {% for role in r.roles %}{{ role.name }}{% if !loop.last %}, {% endif %}{% endfor %}{% endif %}</div>
-          {# The grant trail (slice S13): for every granted role, who granted it
-             and when — the `user_roles` columns the RBAC slice has recorded
-             since S2. Names, never ids. #}
+          <div class="truncate text-[13px] text-muted">{{ r.user.display_name }}{% if !r.roles.is_empty() %} · {% for role in r.roles %}{{ localization.seeded_role_display_name(role.code.as_str(), role.name.as_str()) }}{% if !loop.last %}, {% endif %}{% endfor %}{% endif %}</div>
           {% if !r.grants.is_empty() %}
           <div class="truncate text-[12px] text-muted" data-grant-trail>
-            {% for g in r.grants %}{{ g.role_name }}: otorgado por {{ g.granted_by_label }} el {{ g.granted_on }}{% if !loop.last %} · {% endif %}{% endfor %}
+            {% for g in r.grants %}{{ g.trail }}{% if !loop.last %} · {% endif %}{% endfor %}
           </div>
           {% endif %}
-          {# The audit attribution (slice S13): who created the row and who last
-             edited it. NULL means the system did it — the sentinel, the
-             bootstrap administrator — and renders as the honest label. #}
           <div class="truncate text-[12px] text-muted" data-user-actor>
-            Creado por {{ r.created_by_label }}{% if let Some(name) = r.updated_by_label %} · Actualizado por {{ name }}{% endif %}
+            {{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ r.created_by_label }}{% if let Some(name) = r.updated_by_label %} · {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ name }}{% endif %}
           </div>
         </div>
         <span class="shrink-0 rounded-full border border-border bg-card px-2.5 py-1 text-[11px] {% if r.user.is_active %}text-accent{% else %}text-muted{% endif %}">
-          {% if r.user.is_active %}Activo{% else %}Inactivo{% endif %}
+          {% if r.user.is_active %}{{ localization.tr(crate::localization::MessageKey::CommonActive) }}{% else %}{{ localization.tr(crate::localization::MessageKey::CommonInactive) }}{% endif %}
         </span>
         {% if can_manage_roles && r.user.id != acting_user_id %}
         <button type="button"
                 class="btn-secondary shrink-0"
-                title="Asignar roles"
-                aria-label="Asignar roles"
+                title="{{ localization.tr(crate::localization::MessageKey::IdentityAssignRoles) }}"
+                aria-label="{{ localization.tr(crate::localization::MessageKey::IdentityAssignRoles) }}"
                 hx-get="/web/users/roles-form/{{ r.user.id }}"
                 hx-target="#user-edit-dialog-body"
                 hx-swap="innerHTML"
-                hx-on::after-request="if(event.detail.successful) document.getElementById('user-edit-dialog').showModal()">Roles</button>
+                hx-on::after-request="if(event.detail.successful) document.getElementById('user-edit-dialog').showModal()">{{ localization.tr(crate::localization::MessageKey::NavigationRoles) }}</button>
         {% endif %}
         {% if can_manage %}
         <button type="button"
                 class="btn-secondary shrink-0"
-                title="Nueva contraseña"
-                aria-label="Nueva contraseña"
+                title="{{ localization.tr(crate::localization::MessageKey::IdentityNewPassword) }}"
+                aria-label="{{ localization.tr(crate::localization::MessageKey::IdentityNewPassword) }}"
                 hx-get="/web/users/password-form/{{ r.user.id }}"
                 hx-target="#user-edit-dialog-body"
                 hx-swap="innerHTML"
-                hx-on::after-request="if(event.detail.successful) document.getElementById('user-edit-dialog').showModal()">Contraseña</button>
+                hx-on::after-request="if(event.detail.successful) document.getElementById('user-edit-dialog').showModal()">{{ localization.tr(crate::localization::MessageKey::IdentityPassword) }}</button>
         <form hx-post="/web/users/{% if r.user.is_active %}deactivate{% else %}activate{% endif %}"
               hx-target="#user-list"
               hx-swap="innerHTML"
               class="shrink-0">
           <input type="hidden" name="user_id" value="{{ r.user.id }}" class="field" />
           <button type="submit" class="btn-secondary">
-            {% if r.user.is_active %}Desactivar{% else %}Activar{% endif %}
+            {% if r.user.is_active %}{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}{% else %}{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}{% endif %}
           </button>
         </form>
         {% endif %}

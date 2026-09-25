@@ -19,22 +19,22 @@
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="flex flex-wrap items-center gap-2">
       <span class="text-lg font-semibold">{{ product.name }}</span>
-      <span class="chip {% if product.kind.to_string() == "Service" %}chip-expense{% else %}chip-income{% endif %}">{{ product.kind }}</span>
-      <span class="chip {% if product.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if product.is_active %}active{% else %}inactive{% endif %}</span>
+      <span class="chip {% if product.kind.to_string() == "Service" %}chip-expense{% else %}chip-income{% endif %}">{% if product.kind.to_string() == "Service" %}{{ localization.tr(crate::localization::MessageKey::ProductValueService) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ProductValueProduct) }}{% endif %}</span>
+      <span class="chip {% if product.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if product.is_active %}{{ localization.tr(crate::localization::MessageKey::CommonActive) }}{% else %}{{ localization.tr(crate::localization::MessageKey::CommonInactive) }}{% endif %}</span>
       {% if let Some(sug) = suggested %}
-      <span class="chip chip-expense">low • suggest {{ localization.format_quantity(sug.clone()) }}</span>
+      <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductLow) }} • {{ localization.tr(crate::localization::MessageKey::ProductSuggest) }} {{ localization.format_quantity(sug.clone()) }}</span>
       {% endif %}
       {% if stock.is_sign_negative() %}
-      <span class="chip chip-expense">negative</span>
+      <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductNegative) }}</span>
       {% endif %}
     </div>
     <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • {{ localization.format_currency(product.sale_price.clone()) }}</div>
-    <div class="text-[13px] text-muted">stock {{ localization.format_quantity(stock.clone()) }}{% if let Some(min) = product.min_stock %} • min {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • max {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(stock.clone()) }}{% if let Some(min) = product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
     {# Audit attribution (M5 Phase B): who registered the product and who last
        changed it, shown as a display name resolved in the wiring layer — the
        same rows the finance detail shows. The sentinel renders as its own
        name, which says what happened instead of hiding it. #}
-    <div class="text-[13px] text-muted">Registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = updated_by_name %} • Actualizado por {{ name }}{% endif %}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ name }}{% endif %}</div>
 
     {# Lifecycle actions live beside the header like the customers drawer: hidden
        id, POST, list swap, drawer closes only when the request succeeded. The
@@ -45,17 +45,17 @@
       {% if product.is_active %}
       <form hx-post="/web/products/deactivate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
         <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
-        <button type="submit" class="btn-secondary">Deactivate</button>
+        <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
       </form>
       {% else %}
       <form hx-post="/web/products/activate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
         <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
-        <button type="submit" class="btn-secondary">Activate</button>
+        <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}</button>
       </form>
       {% endif %}
       <form hx-post="/web/products/delete" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
         <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
-        <button type="submit" class="btn-secondary">Delete</button>
+        <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
       </form>
     </div>
 
@@ -66,7 +66,7 @@
        `closeProductDrawer()`. A failed save swaps nothing and keeps the drawer
        open. #}
     <form class="mt-4 flex flex-col gap-2.5"
-          data-action="Save product"
+          data-action="{{ localization.tr(crate::localization::MessageKey::ProductSave) }}"
           hx-post="/web/products/edit"
           hx-target="#product-drawer-body"
           hx-swap="innerHTML">
@@ -77,26 +77,26 @@
           <input type="text" name="sku" required maxlength="64" value="{{ product.sku }}" class="field" />
         </div>
         <div>
-          <label class="field-label">Name</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
           <input type="text" name="name" required maxlength="128" value="{{ product.name }}" class="field" />
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Kind</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductKind) }}</label>
           <select name="kind" class="field">
-            <option value="Product" {% if product.kind.to_string() == "Product" %}selected{% endif %}>Product</option>
-            <option value="Service" {% if product.kind.to_string() == "Service" %}selected{% endif %}>Service</option>
+            <option value="Product" {% if product.kind.to_string() == "Product" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::ProductValueProduct) }}</option>
+            <option value="Service" {% if product.kind.to_string() == "Service" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::ProductValueService) }}</option>
           </select>
         </div>
         <div>
-          <label class="field-label">Unit</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductUnit) }}</label>
           <input type="text" name="unit" required maxlength="16" value="{{ product.unit }}" class="field" />
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Sale price</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductSalePrice) }}</label>
           {# Courtesy only (product-markup T6): the edit handler is the
              enforcement — whenever a markup is present the server ignores
              this field and derives the price from the cost, so the readonly
@@ -106,52 +106,52 @@
           {# The readonly field shows the stored price from the last save; the
              derivation from the cost is server-side, so the number only moves
              when the product is saved. #}
-          <div class="text-[13px] text-muted">Recalculated from the cost and the {{ localization.format_percentage(product.markup_pct.unwrap()) }} markup when you save.</div>
+          <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductMarkupRecalculated) }} {{ localization.format_percentage(product.markup_pct.unwrap()) }}</div>
           {% endif %}
         </div>
         <div>
-          <label class="field-label">Cost price</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCostPrice) }}</label>
           <input type="text" inputmode="decimal" name="cost_price" step="0.01" value="{{ localization.format_decimal(product.cost_price.clone()) }}" class="field" />
         </div>
       </div>
       <div>
-        <label class="field-label">Markup % (optional)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMarkup) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
         <input id="edit-product-markup" type="text" inputmode="decimal" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ localization.format_decimal(m.clone()) }}"{% endif %} class="field" />
       </div>
       <div>
-        <label class="field-label">Category</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCategory) }}</label>
         <select name="category_id" class="field">
           {# An empty value means "clear": the edit handler sends Some(None) so an
              untied category is a real edit, not "leave unchanged". #}
-          <option value="">No category</option>
+          <option value="">{{ localization.tr(crate::localization::MessageKey::CommonNoCategory) }}</option>
           {% for c in categories %}
           <option value="{{ c.id }}" {% if product.category_is(c.id) %}selected{% endif %}>{{ c.name }}</option>
           {% endfor %}
         </select>
       </div>
       <div>
-        <label class="choice"><input type="checkbox" name="track_stock" value="1" {% if product.track_stock %}checked{% endif %} /> Track stock</label>
+        <label class="choice"><input type="checkbox" name="track_stock" value="1" {% if product.track_stock %}checked{% endif %} /> {{ localization.tr(crate::localization::MessageKey::ProductTrackStock) }}</label>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Min stock</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMinStock) }}</label>
           <input type="text" inputmode="decimal" name="min_stock" step="0.01" {% if let Some(v) = product.min_stock %}value="{{ localization.format_decimal(v.clone()) }}"{% endif %} class="field" />
         </div>
         <div>
-          <label class="field-label">Max stock</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMaxStock) }}</label>
           <input type="text" inputmode="decimal" name="max_stock" step="0.01" {% if let Some(v) = product.max_stock %}value="{{ localization.format_decimal(v.clone()) }}"{% endif %} class="field" />
         </div>
       </div>
       <div>
-        <label class="field-label">Location</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductLocation) }}</label>
         <input type="text" name="location" maxlength="64" {% if let Some(v) = product.location %}value="{{ v }}"{% endif %} class="field" />
       </div>
       <div>
-        <label class="field-label">Notes</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }}</label>
         <input type="text" name="notes" maxlength="1024" {% if let Some(v) = product.notes %}value="{{ v }}"{% endif %} class="field" />
       </div>
-      <button type="submit" class="btn-primary">Save product</button>
-      <div class="text-[13px] text-muted">The same rules as creation apply: services cannot track stock, tracked products need min and max, and the SKU cannot collide with another product (⇒ 400/409).</div>
+      <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::ProductSave) }}</button>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductSaveHelp) }}</div>
     </form>
     {# Markup courtesy only (product-markup T6): the edit handler is the
        enforcement — whenever a markup is present the server ignores the price
@@ -175,41 +175,41 @@
   </section>
 
   <section class="rounded-2xl border border-border bg-card p-5">
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Taxes ({{ product_taxes.len() }})</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductTaxes) }} ({{ product_taxes.len() }})</div>
     {% if product_taxes.is_empty() %}
-    <div class="mb-3 text-[13px] text-muted">No taxes linked to this product.</div>
+    <div class="mb-3 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductNoLinkedTaxes) }}</div>
     {% else %}
     <div class="mb-3 flex flex-col gap-2">
       {% for linked in product_taxes %}
       <div class="flex items-center justify-between gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-2.5">
         <div>
           <div class="font-semibold">{{ linked.tax.code }} — {{ linked.tax.name }}</div>
-          <div class="text-[13px] text-muted">{{ localization.format_percentage(linked.tax.rate.clone()) }}{% if !linked.tax.is_active %} • inactive{% endif %}</div>
+          <div class="text-[13px] text-muted">{{ localization.format_percentage(linked.tax.rate.clone()) }}{% if !linked.tax.is_active %} • {{ localization.tr(crate::localization::MessageKey::CommonInactive) }}{% endif %}</div>
         </div>
         <form hx-post="/web/product-taxes/unlink" hx-target="#product-drawer-body" hx-swap="innerHTML">
           <input type="hidden" name="product_id" value="{{ product.id }}" />
           <input type="hidden" name="tax_id" value="{{ linked.tax.id }}" />
-          <button class="btn-secondary" type="submit">Unlink</button>
+          <button class="btn-secondary" type="submit">{{ localization.tr(crate::localization::MessageKey::ProductUnlinkTax) }}</button>
         </form>
       </div>
       {% endfor %}
     </div>
     {% endif %}
     <form class="flex items-end gap-2"
-          data-action="Link product tax"
+          data-action="{{ localization.tr(crate::localization::MessageKey::ProductLinkTax) }}"
           hx-post="/web/product-taxes"
           hx-target="#product-drawer-body"
           hx-swap="innerHTML">
       <input type="hidden" name="product_id" value="{{ product.id }}" />
       <div class="flex-1">
-        <label class="field-label">Active tax</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductActiveTax) }}</label>
         <select class="field" name="tax_id" required {% if available_taxes.is_empty() %}disabled{% endif %}>
           {% for tax in available_taxes %}
           <option value="{{ tax.id }}">{{ tax.code }} — {{ tax.name }} ({{ localization.format_percentage(tax.rate.clone()) }})</option>
           {% endfor %}
         </select>
       </div>
-      <button class="btn-primary" type="submit" {% if available_taxes.is_empty() %}disabled{% endif %}>Link tax</button>
+      <button class="btn-primary" type="submit" {% if available_taxes.is_empty() %}disabled{% endif %}>{{ localization.tr(crate::localization::MessageKey::ProductLinkTax) }}</button>
     </form>
   </section>
 
@@ -217,7 +217,7 @@
      alert is derived (previous vs current), never stored; `products.cost_price`
      is only the fallback when this list is empty. #}
   <section class="rounded-2xl border border-border bg-card p-5">
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Supplier costs ({{ supplier_costs.len() }})</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductSupplierCosts) }} ({{ supplier_costs.len() }})</div>
     {# Derived stale-cost badge (cost-freshness S1): rendered only when the
        supplier reference cost genuinely disagrees with the stored cost — the
        Rust side already filtered the no-rows, zero-cost and equal cases.
@@ -226,12 +226,12 @@
        variant), no new Tailwind classes. #}
     {% if let Some(stale) = stale_cost %}
     <div class="mb-3 flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
-      <span class="chip chip-muted">stale cost</span>
-      <span class="text-[13px] text-muted">reference {{ localization.format_currency(stale.reference.clone()) }} • stored {{ localization.format_currency(stale.stored.clone()) }}</span>
+      <span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductStaleCost) }}</span>
+      <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductReferenceCost) }} {{ localization.format_currency(stale.reference.clone()) }} • {{ localization.tr(crate::localization::MessageKey::ProductStoredCost) }} {{ localization.format_currency(stale.stored.clone()) }}</span>
     </div>
     {% endif %}
     {% if supplier_costs.is_empty() %}
-      <div class="mb-3 text-[13px] text-muted">No supplier rows yet — the reference cost falls back to the product's cost price until one is recorded here.</div>
+      <div class="mb-3 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductNoSupplierCosts) }}</div>
     {% else %}
       {% for cost in supplier_costs %}
       <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3">
@@ -239,19 +239,19 @@
           <div class="flex flex-wrap items-center gap-2">
             <span class="font-semibold">{{ cost.supplier_name }}</span>
             {% if cost.cost.previous_cost.is_some() %}
-            <span class="chip {% if cost.cost.price_alert().to_string() == "Raised" %}chip-expense{% else if cost.cost.price_alert().to_string() == "Lowered" %}chip-income{% else %}chip-muted{% endif %}">{{ cost.cost.price_alert() }}</span>
+            <span class="chip {% if cost.cost.price_alert().to_string() == "Raised" %}chip-expense{% else if cost.cost.price_alert().to_string() == "Lowered" %}chip-income{% else %}chip-muted{% endif %}">{% if cost.cost.price_alert().to_string() == "Raised" %}{{ localization.tr(crate::localization::MessageKey::ProductCostRaised) }}{% else if cost.cost.price_alert().to_string() == "Lowered" %}{{ localization.tr(crate::localization::MessageKey::ProductCostLowered) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ProductCostUnchanged) }}{% endif %}</span>
             {% endif %}
           </div>
-          <span class="text-[13px] text-muted">{{ localization.format_currency(cost.cost.current_cost.clone()) }}{% if let Some(prev) = cost.cost.previous_cost %} • previous {{ localization.format_currency(prev.clone()) }}{% endif %} • since {{ localization.format_date(cost.cost.current_cost_date.clone()) }}</span>
+          <span class="text-[13px] text-muted">{{ localization.format_currency(cost.cost.current_cost.clone()) }}{% if let Some(prev) = cost.cost.previous_cost %} • {{ localization.tr(crate::localization::MessageKey::ProductPreviousCost) }} {{ localization.format_currency(prev.clone()) }}{% endif %} • {{ localization.tr(crate::localization::MessageKey::ProductSince) }} {{ localization.format_date(cost.cost.current_cost_date.clone()) }}</span>
         </div>
         <div>
           {% if cost.cost.is_preferred %}
-          <span class="chip chip-income">preferred</span>
+          <span class="chip chip-income">{{ localization.tr(crate::localization::MessageKey::ProductPreferred) }}</span>
           {% else %}
           <form hx-post="/web/product-costs/preferred" hx-include="#product-filters" hx-target="#product-drawer-body" hx-swap="innerHTML">
             <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
             <input type="hidden" name="supplier_id" value="{{ cost.cost.supplier_id }}" class="field" />
-            <button type="submit" class="btn-secondary">Set preferred</button>
+            <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::ProductSetPreferred) }}</button>
           </form>
           {% endif %}
         </div>
@@ -260,7 +260,7 @@
     {% endif %}
 
     <form class="mt-4 flex flex-col gap-2.5"
-          data-action="Record product cost"
+          data-action="{{ localization.tr(crate::localization::MessageKey::ProductRecordCost) }}"
           hx-post="/web/product-costs"
           hx-include="#product-filters"
           hx-target="#product-drawer-body"
@@ -268,7 +268,7 @@
           hx-on::after-request="if(event.detail.successful) this.reset()">
       <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
       <div>
-        <label class="field-label">Supplier</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductSupplier) }}</label>
         <select name="supplier_id" required class="field">
           {% for s in suppliers %}
           <option value="{{ s.id }}">{{ s.name }}</option>
@@ -277,16 +277,16 @@
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Cost</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCost) }}</label>
           <input type="text" inputmode="decimal" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label class="field-label">Date</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
           <input type="date" name="date" value="{{ today }}" class="field" />
         </div>
       </div>
-      <button type="submit" class="btn-primary">Record cost</button>
-      <div class="text-[13px] text-muted">First call creates the row; a different cost shifts the current one into previous; the same cost only refreshes the date; a date older than the current one ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
+      <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::ProductRecordCost) }}</button>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductRecordCostHelp) }}</div>
     </form>
   </section>
 
@@ -295,9 +295,9 @@
      where a movement is possible; otherwise show the derived stock and why. #}
   <section class="rounded-2xl border border-border bg-card p-5">
     {% if product.track_stock && product.kind.to_string() == "Product" %}
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Stock movement</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStockMovement) }}</div>
     <form class="flex flex-col gap-2.5"
-          data-action="Record movement"
+          data-action="{{ localization.tr(crate::localization::MessageKey::ProductRecordMovement) }}"
           hx-post="/web/stock-movements"
           hx-include="#product-filters"
           hx-target="#product-drawer-body"
@@ -306,43 +306,43 @@
       <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Type</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardType) }}</label>
           <select name="type" class="field">
-            <option value="In">In</option>
-            <option value="Out">Out</option>
-            <option value="Adjust">Adjust</option>
+            <option value="In">{{ localization.tr(crate::localization::MessageKey::ProductValueIn) }}</option>
+            <option value="Out">{{ localization.tr(crate::localization::MessageKey::ProductValueOut) }}</option>
+            <option value="Adjust">{{ localization.tr(crate::localization::MessageKey::ProductValueAdjust) }}</option>
           </select>
         </div>
         <div>
-          <label class="field-label">Qty</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductQuantity) }}</label>
           <input type="text" inputmode="decimal" name="qty" step="0.01" required placeholder="10.00" class="field" />
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Reason</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductReason) }}</label>
           <select name="reason" class="field">
-            <option value="Initial">Initial</option>
-            <option value="Purchase">Purchase</option>
-            <option value="Sale">Sale</option>
-            <option value="Loss">Loss</option>
-            <option value="Adjust">Adjust</option>
+            <option value="Initial">{{ localization.tr(crate::localization::MessageKey::ProductReasonInitial) }}</option>
+            <option value="Purchase">{{ localization.tr(crate::localization::MessageKey::ProductReasonPurchase) }}</option>
+            <option value="Sale">{{ localization.tr(crate::localization::MessageKey::ProductReasonSale) }}</option>
+            <option value="Loss">{{ localization.tr(crate::localization::MessageKey::ProductReasonLoss) }}</option>
+            <option value="Adjust">{{ localization.tr(crate::localization::MessageKey::ProductValueAdjust) }}</option>
           </select>
         </div>
         <div>
-          <label class="field-label">Date</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
           <input type="date" name="date" value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label class="field-label">Reference (optional)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMovementReference) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
         <input type="text" name="reference" maxlength="256" class="field" />
       </div>
-      <button type="submit" class="btn-primary">Record movement</button>
-      <div class="text-[13px] text-muted">In=+qty, Out=−qty, Adjust=signed delta.</div>
+      <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::ProductRecordMovement) }}</button>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductMovementHelp) }}</div>
     </form>
     {% else %}
-    <div class="text-[13px] text-muted">Stock movement is not available for services and untracked products. Derived stock: {{ localization.format_quantity(stock.clone()) }}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStockUnavailable) }} {{ localization.format_quantity(stock.clone()) }}</div>
     {% endif %}
   </section>
 </div>

@@ -377,7 +377,7 @@ def test_creating_with_a_markup_derives_the_price_and_locks_the_field(
     expect(price).not_to_be_editable()
     expect(price).to_have_value("15.00")
     expect(page.locator("#product-detail-inner")).to_contain_text(
-        "Recalculated from the cost and the 50 % markup when you save"
+        "Recalculated from the cost and the markup when you save: 50 %"
     )
 
 
@@ -478,7 +478,7 @@ def test_clicking_a_product_name_opens_the_drawer_with_the_edit_form(
     expect(page.locator("#product-drawer")).to_be_visible()
     body = page.locator("#product-detail-inner")
     expect(body).to_contain_text("Drawer Widget")
-    expect(body).to_contain_text("stock 10")
+    expect(body).to_contain_text("Stock 10")
 
     form = body.locator('form[hx-post="/web/products/edit"]')
     expect(form.locator('input[name="sku"]')).to_have_value("DRAW-SKU-04")
@@ -975,10 +975,10 @@ def test_recording_a_supplier_cost_and_setting_preferred_from_the_drawer(
     rows = page.locator("#product-detail-inner div.mb-2.justify-between")
     expect(rows).to_have_count(2)
     row_a = rows.filter(has_text="Cost Supplier Alpha")
-    expect(row_a.get_by_text("preferred", exact=True)).to_have_count(1)
+    expect(row_a.get_by_text("Preferred", exact=True)).to_have_count(1)
     # The other supplier keeps its button and must not inherit the marker.
     row_b = rows.filter(has_text="Cost Supplier Beta")
-    expect(row_b.get_by_text("preferred", exact=True)).to_have_count(0)
+    expect(row_b.get_by_text("Preferred", exact=True)).to_have_count(0)
     expect(row_b.locator('form[hx-post="/web/product-costs/preferred"]')).to_have_count(1)
 
 
@@ -1028,12 +1028,12 @@ def test_drawer_shows_stale_cost_badge_with_both_values_when_costs_disagree(
 
     drawer = _open_drawer_for_cost_scenario(page, api, product, "Stale Widget")
 
-    badge = drawer.get_by_text("stale cost", exact=True)
+    badge = drawer.get_by_text("Stale cost", exact=True)
     expect(badge).to_be_visible()
     # Both values in the badge's own sentence, as one exact text node: a
     # supplier row repeating an amount cannot satisfy it, and the bullet joins
     # them so either half dropping silently breaks the match.
-    values = drawer.get_by_text("reference 12.50 USD • stored 5.00 USD", exact=True)
+    values = drawer.get_by_text("Reference 12.50 USD • Stored 5.00 USD", exact=True)
     expect(values).to_be_visible()
     expect(values).to_have_count(1)
 
@@ -1062,11 +1062,11 @@ def test_drawer_hides_stale_cost_badge_when_reference_equals_stored(
 
     drawer = _open_drawer_for_cost_scenario(page, api, product, "Fresh Widget")
 
-    # The badge's own label is the anchor: `stale cost` appears nowhere else in
+    # The badge's own label is the anchor: `Stale cost` appears nowhere else in
     # the templates (grep over the tree finds it only in the product detail
     # partial), so a page-level absence is discriminating and would catch the
     # badge rendering even outside the drawer body.
-    expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
+    expect(page.get_by_text("Stale cost", exact=True)).to_have_count(0)
     expect(drawer.get_by_text("reference 8.00 USD")).to_have_count(0)
 
 
@@ -1094,9 +1094,9 @@ def test_drawer_hides_stale_cost_badge_when_the_product_has_no_supplier_rows(
         page, api, product, "Supplierless Widget"
     )
 
-    expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
+    expect(page.get_by_text("Stale cost", exact=True)).to_have_count(0)
     # The card still tells the operator why there is no comparison to make.
-    expect(drawer).to_contain_text("No supplier rows yet")
+    expect(drawer).to_contain_text("No supplier costs yet")
 
 
 def test_drawer_hides_stale_cost_badge_when_the_stored_cost_is_zero(
@@ -1123,7 +1123,7 @@ def test_drawer_hides_stale_cost_badge_when_the_stored_cost_is_zero(
 
     drawer = _open_drawer_for_cost_scenario(page, api, product, "Zero Cost Widget")
 
-    expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
+    expect(page.get_by_text("Stale cost", exact=True)).to_have_count(0)
     expect(drawer.get_by_text("reference 7.25 USD")).to_have_count(0)
 
 
@@ -1148,7 +1148,7 @@ def test_recording_a_stock_movement_from_the_drawer_updates_both_surfaces(
     product_id = int(product["id"])
     _open_products_list(page, api, name="Movement Widget")
     _open_product_drawer(page, product_id)
-    expect(page.locator("#product-detail-inner")).to_contain_text("stock 10")
+    expect(page.locator("#product-detail-inner")).to_contain_text("Stock 10")
 
     movement_form = page.locator(
         '#product-detail-inner form[hx-post="/web/stock-movements"]'
@@ -1163,13 +1163,13 @@ def test_recording_a_stock_movement_from_the_drawer_updates_both_surfaces(
     # open: only the Save product form closes it.
     expect(page.locator("#product-drawer")).to_be_visible()
     drawer = page.locator("#product-detail-inner")
-    expect(drawer).to_contain_text("stock 15")
-    expect(drawer).not_to_contain_text("stock 10")
+    expect(drawer).to_contain_text("Stock 15")
+    expect(drawer).not_to_contain_text("Stock 10")
 
     # The list row behind the drawer was refreshed by the trigger too.
     row = page.locator(f"#product-{product_id}")
-    expect(row).to_contain_text("stock 15")
-    expect(row).not_to_contain_text("stock 10")
+    expect(row).to_contain_text("Stock 15")
+    expect(row).not_to_contain_text("Stock 10")
 
 
 # ---------------------------------------------------------------------------
@@ -1255,7 +1255,7 @@ def test_design_screenshots_probe(page: Page, api: ApiClient) -> None:
     movement_form.locator('input[name="qty"]').fill("5")
     with page.expect_response(_response_for("/web/stock-movements", "POST")):
         movement_form.get_by_role("button", name="Record movement").click()
-    expect(page.locator("#product-detail-inner")).to_contain_text("stock 15")
+    expect(page.locator("#product-detail-inner")).to_contain_text("Stock 15")
     # The drawer body scrolls internally (the slide-over is fixed), so bring the
     # movement card into view before capturing it.
     page.locator("#product-drawer-body").evaluate("el => { el.scrollTop = el.scrollHeight; }")

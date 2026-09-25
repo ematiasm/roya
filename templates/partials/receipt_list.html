@@ -1,20 +1,20 @@
 <div id="receipt-list-inner">
   {% if receipts.is_empty() %}
-    <div class="empty">No receipts yet — collect with the form.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::CustomerNoReceipts) }}</div>
   {% else %}
     {% for r in receipts %}
     <div class="mb-3 rounded-[10px] border border-border bg-surface px-3.5 py-3" id="receipt-{{ r.receipt.id }}">
       <div class="flex flex-wrap items-center justify-between gap-2">
         <div class="flex flex-col">
-           <span class="font-semibold">Receipt #{{ r.receipt.id }} • {{ localization.format_date(r.receipt.date.clone()) }}</span>
-          <span class="text-[13px] text-muted">{{ r.account_name }} • {{ r.method_name }}{% if let Some(notes) = r.receipt.notes %} • {{ notes }}{% endif %}</span>
+           <span class="font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerReceipt) }} {{ r.receipt.id }} • {{ localization.format_date(r.receipt.date.clone()) }}</span>
+          <span class="text-[13px] text-muted">{{ r.account_name }} • {{ localization.payment_method_display_name(r.method_name.as_str()) }}{% if let Some(notes) = r.receipt.notes %} • {{ notes }}{% endif %}</span>
         </div>
         <span class="font-bold tabular-nums text-income">{{ localization.format_currency(r.total.clone()) }}</span>
       </div>
-      <div class="mt-2 mb-1 font-bold text-[13px] text-muted">Allocations ({{ r.allocations.len() }})</div>
+      <div class="mt-2 mb-1 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerAllocations) }} ({{ r.allocations.len() }})</div>
       {% for a in r.allocations %}
       <div class="mb-1.5 flex items-center justify-between rounded-[10px] border border-border bg-card px-3 py-2">
-         <span class="text-[13px]">{% if let Some(n) = a.sale_number %}{{ n }}{% else %}sale #{{ a.sale_id }}{% endif %} • {{ localization.format_date(a.date.clone()) }}{% if let Some(tx) = a.transaction_id %} • income #{{ tx }}{% endif %}</span>
+         <span class="text-[13px]">{% if let Some(n) = a.sale_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::CustomerSaleNumber) }} {{ a.sale_id }}{% endif %} • {{ localization.format_date(a.date.clone()) }}{% if let Some(tx) = a.transaction_id %} • {{ localization.tr(crate::localization::MessageKey::CustomerIncome) }} {{ tx }}{% endif %}</span>
          <span class="font-semibold tabular-nums">{{ localization.format_currency(a.amount.clone()) }}</span>
       </div>
       {% endfor %}

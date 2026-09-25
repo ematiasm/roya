@@ -35,7 +35,7 @@
    Escape clearing and result traversal stay in base.html's document-level
    keydown handler: they work for both pickers because they address ids, not
    transports. #}
-{% macro line_picker(oob, resource, id, money_target, price_field_id, price_field_name, price_label, price_placeholder, price_kind) %}
+{% macro line_picker(oob, resource, id, money_target, price_field_id, price_field_name, price_label, price_placeholder, price_kind, localization) %}
 {# The island's shell (static/picker.js mounts into `[data-picker]`). One state
    object and one render function own everything visible here, so the markup
    carries no search state at all: no `hx-vals`, no per-row forms, no
@@ -51,8 +51,19 @@
    inputs should inherit nothing at all if a verb is ever added there. The
    island's fetch is not an htmx request, so the shell's attributes cannot
    reach it. #}
-<div id="line-picker" data-picker data-price-kind="{{ price_kind }}"{% if oob %} hx-swap-oob="true"{% endif %}>
-  <form class="flex flex-col gap-2.5" data-action="Add line"
+<div id="line-picker"
+     data-picker="product"
+     data-price-kind="{{ price_kind }}"
+     data-picker-status-idle="{{ localization.tr(crate::localization::MessageKey::PickerIdleStatus) }}"
+     data-picker-status-searching="{{ localization.tr(crate::localization::MessageKey::PickerSearchingStatus) }}"
+     data-picker-status-failed="{{ localization.tr(crate::localization::MessageKey::PickerFailedStatus) }}"
+     data-picker-no-results="{{ localization.tr(crate::localization::MessageKey::PickerNoResultsStatus) }}"
+     data-picker-match-count-one="{{ localization.tr_count(crate::localization::MessageKey::PickerMatchCount, 1) }}"
+     data-picker-match-count-many="{{ localization.tr_count(crate::localization::MessageKey::PickerMatchCount, 2) }}"
+     data-picker-cost-label="{{ localization.tr(crate::localization::MessageKey::PickerCostLabel) }}"
+     data-picker-stock-label="{{ localization.tr(crate::localization::MessageKey::PickerStockLabel) }}"
+     {% if oob %}hx-swap-oob="true"{% endif %}>
+  <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::ActionAddLine) }}"
         hx-post="/web/{{ resource }}/{{ id }}/lines"
         hx-disinherit="hx-select hx-target hx-swap"
         hx-target="{{ money_target }}" hx-swap="outerHTML" hx-select="{{ money_target }}">
@@ -61,16 +72,16 @@
        with a stale id. #}
     <input type="hidden" name="product_id" disabled class="field" />
     <div>
-      <label for="product-picker" class="field-label">Product</label>
+      <label for="product-picker" class="field-label">{{ localization.tr(crate::localization::MessageKey::PickerProduct) }}</label>
       <input type="text" id="product-picker" name="product" required autocomplete="off"
-             placeholder="Scan barcode or type name, SKU…"
+             placeholder="{{ localization.tr(crate::localization::MessageKey::PickerProductPlaceholder) }}"
              aria-controls="product-search-results"
              aria-describedby="product-search-status"
              {% if oob %}autofocus{% endif %} class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label for="line-qty" class="field-label">Qty</label>
+        <label for="line-qty" class="field-label">{{ localization.tr(crate::localization::MessageKey::PickerQuantity) }}</label>
         <input type="text" inputmode="decimal" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" class="field" />
       </div>
       <div>
@@ -78,16 +89,16 @@
         <input type="text" inputmode="decimal" id="{{ price_field_id }}" name="{{ price_field_name }}" step="0.01" min="0" placeholder="{{ price_placeholder }}" class="field" />
       </div>
     </div>
-    <button type="submit" class="btn-primary">Add line</button>
+    <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::PickerAddLine) }}</button>
   </form>
   {# The busy cue's `htmx-request` class is toggled by the island from its
      status while its search request is in flight (htmx used to toggle it for
      the input's GET). It is `aria-hidden` because `#product-search-status`
      (the single polite live region) announces the same state; without this,
      assistive tech would read "Searching…" twice. #}
-  <p id="product-search-busy" class="htmx-indicator mt-2 text-[13px] text-muted" aria-hidden="true">Searching…</p>
+  <p id="product-search-busy" class="htmx-indicator mt-2 text-[13px] text-muted" aria-hidden="true">{{ localization.tr(crate::localization::MessageKey::PickerSearchingStatus) }}</p>
   <div id="product-search-results" role="status" aria-live="polite" aria-atomic="false" class="mt-2">
-    <p id="product-search-status" class="sr-only">Type a name, SKU or barcode.</p>
+    <p id="product-search-status" class="sr-only">{{ localization.tr(crate::localization::MessageKey::PickerIdleStatus) }}</p>
   </div>
 </div>
 {% endmacro %}

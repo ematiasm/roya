@@ -24,7 +24,9 @@
 <header class="mb-6 flex flex-wrap items-end justify-between gap-4" data-page-header>
   <div class="min-w-0">
     {% if page_breadcrumb_label != "" %}
-    <nav class="mb-1 text-[13px] text-muted" aria-label="Breadcrumb" data-page-breadcrumb>
+    <nav class="mb-1 text-[13px] text-muted"
+         aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityBreadcrumb) }}"
+         data-page-breadcrumb>
       {% if page_breadcrumb_href != "" %}
       <a href="{{ page_breadcrumb_href }}" class="link text-muted">{{ page_breadcrumb_label }}</a>
       {% else %}

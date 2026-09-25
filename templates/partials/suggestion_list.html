@@ -1,49 +1,44 @@
 <div id="suggestion-list-inner">
-  {# Sugerido seed options (purchase-payment-at-confirm): purchase date ONLY —
-     payment type is imputed at confirm, so the seed never asks it (the route
-     defaults an omitted type to Cash server-side). #}
+  {# Purchase date is the only seed option; payment type is decided at confirm. #}
   <div class="mb-3 flex flex-wrap gap-2 [&>*]:flex-1" id="suggestion-seed-options">
     <div>
-      <label class="field-label">Purchase date</label>
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::PurchasesDate) }}</label>
       <input type="date" name="purchase_date" value="{{ today }}" class="field" />
     </div>
   </div>
   {% if !has_suggestions %}
-    <div class="empty">Stock OK — nothing to reorder.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::ProductStockOk) }}</div>
   {% else %}
     {% for s in suggestions.suggestions %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="suggestion-{{ s.product.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="chip chip-expense">low</span>
+          <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductLow) }}</span>
           <span class="font-semibold">{{ s.product.name }}</span>
           <span class="text-xs text-muted">{{ s.product.sku }}</span>
         </div>
-        <span class="text-[13px] text-muted">stock {{ localization.format_quantity(s.stock.clone()) }} • suggested {{ localization.format_quantity(s.suggested_qty.clone()) }} × {{ localization.format_currency(s.unit_cost.clone()) }} • {{ s.supplier_name }}</span>
+        <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesStock) }} {{ localization.format_quantity(s.stock.clone()) }} • {{ localization.tr(crate::localization::MessageKey::PurchasesSuggestions) }} {{ localization.format_quantity(s.suggested_qty.clone()) }} × {{ localization.format_currency(s.unit_cost.clone()) }} • {{ s.supplier_name }}</span>
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums text-expense">{{ localization.format_currency(s.subtotal.clone()) }}</span>
-        {# Seeding answers `HX-Redirect: /purchases/{id}`, so this is a navigation,
-           not a swap: it deliberately carries no hx-target (nothing on this page
-           is replaced), and hx-swap="none" says so. #}
         <button class="btn-secondary"
                 hx-post="/web/purchases/from-suggestion"
                 hx-vals='{"product_id": {{ s.product.id }}}'
                 hx-include="#suggestion-seed-options"
                 hx-swap="none"
-                hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">→ Draft</button>
+                hx-on::after-request="if(event.detail.successful) htmx.trigger('#purchase-list','refresh')">→ {{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</button>
       </div>
     </div>
     {% endfor %}
     {% if !suggestions.without_supplier.is_empty() %}
-      <div class="mt-2 mb-1.5 font-bold text-[13px] text-muted">Without supplier cost ({{ suggestions.without_supplier.len() }})</div>
+      <div class="mt-2 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesWithoutSupplierCost) }} ({{ suggestions.without_supplier.len() }})</div>
       {% for w in suggestions.without_supplier %}
       <div class="mb-2 flex items-center justify-between rounded-[10px] border border-dashed border-border px-3.5 py-3" id="suggestion-nosup-{{ w.product.id }}">
         <div class="flex flex-col">
           <span class="font-semibold">{{ w.product.name }}</span>
-          <span class="text-[13px] text-muted">{{ w.product.sku }} • stock {{ localization.format_quantity(w.stock.clone()) }} • suggested {{ localization.format_quantity(w.suggested_qty.clone()) }}</span>
+          <span class="text-[13px] text-muted">{{ w.product.sku }} • {{ localization.tr(crate::localization::MessageKey::PurchasesStock) }} {{ localization.format_quantity(w.stock.clone()) }} • {{ localization.tr(crate::localization::MessageKey::PurchasesSuggestions) }} {{ localization.format_quantity(w.suggested_qty.clone()) }}</span>
         </div>
-        <a href="/suppliers" class="link text-xs">record cost</a>
+        <a href="/suppliers" class="link text-xs">{{ localization.tr(crate::localization::MessageKey::PurchasesRecordCost) }}</a>
       </div>
       {% endfor %}
     {% endif %}

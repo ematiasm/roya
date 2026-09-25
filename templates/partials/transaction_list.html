@@ -1,17 +1,17 @@
 <div id="tx-list-inner">
   {% if transactions.is_empty() %}
-    <div class="empty">No transactions for this filter.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::AccountNoTransactionsFilter) }}</div>
   {% else %}
     {% for tx in transactions %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="tx-{{ tx.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="chip {% if tx.is_income() %}chip-income{% else %}chip-expense{% endif %}">{{ tx.kind }}</span>
+          <span class="chip {% if tx.is_income() %}chip-income{% else %}chip-expense{% endif %}">{% if tx.is_income() %}{{ localization.tr(crate::localization::MessageKey::DashboardIncome) }}{% else %}{{ localization.tr(crate::localization::MessageKey::DashboardExpense) }}{% endif %}</span>
           <span class="font-semibold">{{ tx.description }}</span>
           {% if let Some(reference) = tx.reference %}
-          <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-semibold text-muted" title="Source document">ref {{ reference }}</span>
+          <span class="rounded-full border border-border px-2 py-0.5 text-[11px] font-semibold text-muted" title="{{ localization.tr(crate::localization::MessageKey::AccountSourceDocument) }}">ref. {{ reference }}</span>
           {% endif %}
-          <span class="text-xs text-muted">acct #{{ tx.account_id }}</span>
+          <span class="text-xs text-muted">{{ localization.tr(crate::localization::MessageKey::AccountIdLabel) }} #{{ tx.account_id }}</span>
         </div>
         <span class="text-[13px] text-muted">{{ localization.format_date(tx.date.clone()) }} • #{{ tx.id }}</span>
       </div>
@@ -23,7 +23,7 @@
                 hx-delete="/web/transactions/{{ tx.id }}"
                 hx-target="#tx-{{ tx.id }}"
                 hx-swap="outerHTML"
-                hx-confirm="Delete transaction #{{ tx.id }}?">✕</button>
+                hx-confirm="{{ localization.account_delete_confirm(tx.id) }}">✕</button>
       </div>
     </div>
     {% endfor %}

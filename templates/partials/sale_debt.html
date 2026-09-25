@@ -4,22 +4,22 @@
    panel. #}
 <div id="sale-debt-summary">
   {% if debt.count == 0 %}
-    <div class="empty">No outstanding debt.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::SalesNoDebt) }}</div>
   {% else %}
     <div class="mb-2 flex flex-wrap items-baseline gap-2">
       <span class="text-2xl font-bold tabular-nums text-expense">{{ localization.format_currency(debt.total.clone()) }}</span>
-      <span class="text-[13px] text-muted">owed across {{ debt.count }} document{% if debt.count != 1 %}s{% endif %}</span>
+      <span class="text-[13px] text-muted">{{ debt.count }} {{ localization.tr(crate::localization::MessageKey::SalesOwedDocuments) }}</span>
     </div>
     {% if debt.oldest.len() < debt.count %}
-    <div class="mb-1.5 text-[13px] text-muted">Oldest {{ debt.oldest.len() }}:</div>
+    <div class="mb-1.5 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesOldest) }} {{ debt.oldest.len() }}:</div>
     {% endif %}
     {% for d in debt.oldest %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-debt-{{ d.sale.id }}">
       <div class="flex flex-col">
-        <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}Draft sale{% endif %}</span>
-        <span class="text-[13px] text-muted">{% if d.sale.customer_name.is_empty() %}Walk-in{% else %}{{ d.sale.customer_name }}{% endif %} • {{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due) = d.sale.due_date %} • due {{ localization.format_date(due.clone()) }}{% endif %} • owed {{ localization.format_currency(d.due.clone()) }}</span>
+        <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::SalesDraft) }}{% endif %}</span>
+        <span class="text-[13px] text-muted">{% if d.sale.customer_name.is_empty() %}{{ localization.tr(crate::localization::MessageKey::SalesWalkIn) }}{% else %}{{ d.sale.customer_name }}{% endif %} • {{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due) = d.sale.due_date %} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_date(due.clone()) }}{% endif %} • {{ localization.tr(crate::localization::MessageKey::SalesOwedDocuments) }} {{ localization.format_currency(d.due.clone()) }}</span>
       </div>
-      <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">Open</a>
+      <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">{{ localization.tr(crate::localization::MessageKey::SalesOpen) }}</a>
     </div>
     {% endfor %}
   {% endif %}

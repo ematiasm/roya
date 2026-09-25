@@ -1,20 +1,10 @@
-{# Effects preview (receiving-desk T4): what confirming this draft WILL do —
-   projections only, never a payment input (the Cash method select lives in
-   the confirm dialog; the server stays the authority and this card never
-   replaces its validation). The stock row counts `record.tracked_units`, the
-   sum the record derives from the same per-line `tracks_stock` flags confirm
-   uses, so "+N units (tracked)" cannot drift from the flow it describes.
-   Rendered inside the money region, so an add-line swap refreshes it with
-   the totals. Draft-only: confirming is the moment these projections become
-   facts, and a confirmed or cancelled document shows nothing to project. #}
+{# Effects preview: what confirming this draft will do. The projections are
+   presentation only; the service remains the authority. #}
 {% macro effects_preview(record, localization) %}
 <div id="effects-preview" class="card mt-2 bg-surface px-3.5 py-3 text-[13px] text-muted">
-  <div class="mb-1 font-bold">Effects on confirm</div>
-  <div>Stock · {% if !record.tracked_units.is_zero() %}+{{ localization.format_quantity(record.tracked_units.clone()) }} units (tracked){% else %}no stock movement{% endif %}</div>
-  {# Both scenarios (purchase-payment-at-confirm T3): the stored type is a
-     server-side default while Draft, never a fact — so the preview projects
-     what EITHER choice would do at confirm, and the badge stays hidden. #}
-  <div>Cash scenario · −{{ localization.format_currency(record.total.clone()) }} at confirm · no amount due</div>
-  <div>Credit scenario · no cash movement · due +{{ localization.format_currency(record.total.clone()) }} at confirm</div>
+  <div class="mb-1 font-bold">{{ localization.tr(crate::localization::MessageKey::PurchasesEffects) }}</div>
+  <div>{{ localization.tr(crate::localization::MessageKey::PurchasesStock) }} · {% if !record.tracked_units.is_zero() %}+{{ localization.format_quantity(record.tracked_units.clone()) }} {{ localization.tr(crate::localization::MessageKey::PurchasesUnitsTracked) }}{% else %}{{ localization.tr(crate::localization::MessageKey::PurchasesNoStockMovement) }}{% endif %}</div>
+  <div>{{ localization.tr(crate::localization::MessageKey::PurchasesCashScenario) }} · −{{ localization.format_currency(record.total.clone()) }} {{ localization.tr(crate::localization::MessageKey::PurchasesAtConfirmNoDue) }}</div>
+  <div>{{ localization.tr(crate::localization::MessageKey::PurchasesCreditScenario) }} · {{ localization.tr(crate::localization::MessageKey::PurchasesAtConfirmDue) }} +{{ localization.format_currency(record.total.clone()) }}</div>
 </div>
 {% endmacro %}

@@ -1,6 +1,6 @@
 use askama::Template;
 use axum::{
-    extract::{Extension, Form, Request, State},
+    extract::{Form, Request, State},
     middleware::Next,
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
@@ -9,7 +9,7 @@ use axum::{
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-use crate::localization::LocalizationContext;
+use crate::localization::{LocalizationContext, MessageKey};
 use crate::routes::AppState;
 use crate::services::setup::{SetupInput, LOCALE_CATALOG};
 
@@ -31,24 +31,43 @@ pub struct SetupForm {
     pub password: String,
 }
 
+struct SetupLocale {
+    code: &'static str,
+    display_name: &'static str,
+}
+
 #[derive(Template)]
 #[template(path = "setup.html")]
 struct SetupPage {
-    locales: &'static [crate::services::setup::LocaleDefinition],
+    locales: Vec<SetupLocale>,
     localization: LocalizationContext,
 }
 
-pub async fn setup_page(
-    State(state): State<AppState>,
-    Extension(localization): Extension<LocalizationContext>,
-) -> AppResult<Response> {
+pub async fn setup_page(State(state): State<AppState>) -> AppResult<Response> {
     state.refresh_setup_requirement().await?;
     if !state.setup_required() {
         return Ok(Redirect::to("/login").into_response());
     }
 
+    // No business configuration exists yet, so the selected form locale is not
+    // an effective language yet. The GET bootstrap deliberately uses the
+    // existing fallback until a configuration is persisted; POST values remain
+    // canonical and are never used to infer the presentation language.
+    let localization = LocalizationContext::fallback();
+    let locales = LOCALE_CATALOG
+        .iter()
+        .map(|locale| SetupLocale {
+            code: locale.code,
+            display_name: match locale.code {
+                "es-AR" => localization.tr(MessageKey::SetupLocaleEsAr),
+                "es-ES" => localization.tr(MessageKey::SetupLocaleEsEs),
+                "en-US" => localization.tr(MessageKey::SetupLocaleEnUs),
+                _ => locale.display_name,
+            },
+        })
+        .collect();
     let html = SetupPage {
-        locales: LOCALE_CATALOG,
+        locales,
         localization,
     }
     .render()
