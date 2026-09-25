@@ -27,7 +27,8 @@
       <header class="sticky top-0 z-30 flex items-center gap-3 border-b border-border bg-bg px-4 py-3 md:hidden">
         <button id="drawer-toggle" type="button" data-drawer-toggle
                 class="btn-secondary bg-card p-2 text-base"
-                aria-controls="sidebar" aria-expanded="false" aria-label="Open navigation">
+                aria-controls="sidebar" aria-expanded="false"
+                aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityOpenNavigation) }}">
           <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M3.75 6.75h16.5M3.75 12h16.5M3.75 17.25h16.5"/></svg>
         </button>
         {# The wordmark, not a control: it navigates home but has no button or
@@ -62,6 +63,12 @@
         node.textContent = text;
         return node;
       }
+      var translations = {
+        dismiss: "{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}",
+        requestFailed: "{{ localization.tr(crate::localization::MessageKey::NoticeRequestFailed) }}",
+        actionFailed: "{{ localization.tr(crate::localization::MessageKey::NoticeActionFailed) }}",
+        actionSaved: "{{ localization.tr(crate::localization::MessageKey::NoticeActionSaved) }}"
+      };
       // Notice: non-blocking feedback region; replaces the old blocking browser dialog.
       // The server can also render this success box itself for the
       // create-under-filter case (issue #37): the create answer swaps it out
@@ -83,7 +90,7 @@
         box.setAttribute('data-notice', kind);
         box.setAttribute('role', kind === 'error' ? 'alert' : 'status');
         box.appendChild(el('div', { class: 'min-w-0 flex-1 break-words' }, text));
-        box.appendChild(el('button', { type: 'button', class: 'notice-dismiss', 'data-notice-dismiss': 'true', 'aria-label': 'Dismiss' }, '✕'));
+        box.appendChild(el('button', { type: 'button', class: 'notice-dismiss', 'data-notice-dismiss': 'true', 'aria-label': translations.dismiss }, '✕'));
         region.replaceChildren(box);
       }
       document.addEventListener('click', function (evt) {
@@ -123,8 +130,9 @@
         var message = evt.detail.xhr.responseText;
         try { message = JSON.parse(message).error || message; } catch (e) { /* keep the raw body */ }
         var action = failedAction(evt)
-          || (evt.detail.pathInfo && evt.detail.pathInfo.requestPath) || 'The request';
-        notice('error', action + ' failed — ' + message);
+          || (evt.detail.pathInfo && evt.detail.pathInfo.requestPath) || '';
+        var template = action ? translations.actionFailed : translations.requestFailed;
+        notice('error', template.replace('{action}', action).replace('{message}', message));
       });
       document.body.addEventListener('htmx:afterRequest', function (evt) {
         if (!evt.detail.successful) return;
@@ -150,7 +158,7 @@
         // tiebreak above stays ahead of this. Failures are unaffected: the
         // error path below still names the action via data-action.
         if (form.hasAttribute('data-silent-save')) return;
-        notice('success', form.getAttribute('data-action') + ' saved');
+        notice('success', translations.actionSaved.replace('{action}', form.getAttribute('data-action')));
       });
 
       // List filters are addressable pages (slice E3). The filter forms fetch a

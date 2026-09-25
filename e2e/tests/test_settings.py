@@ -5,6 +5,7 @@ from __future__ import annotations
 from playwright.sync_api import Page, expect
 
 from conftest import LiveServer
+from helpers import E2E_LANGUAGE, e2e_copy
 
 
 def test_admin_can_open_and_update_business_settings(
@@ -19,7 +20,7 @@ def test_admin_can_open_and_update_business_settings(
     settings_link.click()
 
     expect(page).to_have_url(f"{live_server.url}/settings")
-    expect(page.get_by_role("heading", name="Configuración del negocio")).to_be_visible()
+    expect(page.get_by_role("heading", name=e2e_copy("settings"))).to_be_visible()
     expect(page.locator('[data-nav="settings"]')).to_have_attribute(
         "aria-current", "page"
     )
@@ -28,20 +29,20 @@ def test_admin_can_open_and_update_business_settings(
     expect(page.locator("#currency_code")).to_have_value("USD")
     expect(page.locator("#timezone")).to_have_value("UTC")
     expect(page.locator("#display_name_0")).to_have_value(
-        "English (United States)"
+        "English (United States)" if E2E_LANGUAGE == "en" else "Inglés (Estados Unidos)"
     )
 
     page.locator("#business_name").fill("Roya Settings E2E")
     page.locator("#currency_code").fill("EUR")
     page.locator("#timezone").fill("Europe/Madrid")
-    page.locator("#display_name_0").fill("English (E2E)")
-    page.get_by_role("button", name="Guardar configuración").click()
+    page.locator("#display_name_0").fill("E2E locale")
+    page.get_by_role("button", name=e2e_copy("save_settings")).click()
 
     expect(page).to_have_url(f"{live_server.url}/settings?saved=true")
     expect(page.locator("[data-notice='success']")).to_contain_text(
-        "Configuración guardada"
+        e2e_copy("settings_saved")
     )
     expect(page.locator("#business_name")).to_have_value("Roya Settings E2E")
     expect(page.locator("#currency_code")).to_have_value("EUR")
     expect(page.locator("#timezone")).to_have_value("Europe/Madrid")
-    expect(page.locator("#display_name_0")).to_have_value("English (E2E)")
+    expect(page.locator("#display_name_0")).to_have_value("E2E locale")

@@ -51,6 +51,96 @@ E2E_SETUP_FORM = {
     "password": E2E_ADMIN_PASSWORD,
 }
 
+# Browser expectations follow the configured business language. Canonical form
+# values, API enum values, and test seed names never come from this map.
+E2E_LANGUAGE = E2E_SETUP_FORM["default_locale_code"].split("-", 1)[0]
+_E2E_COPY = {
+    "en": {
+        "username": "Username",
+        "password": "Password",
+        "current_password": "Current password",
+        "new_password": "New password",
+        "confirm_password": "Confirm new password",
+        "sign_in": "Sign in",
+        "save_password": "Save password",
+        "confined": "Your session is restricted",
+        "permission_required": "Permission",
+        "delete_draft_impact": "The draft and its 1 line are deleted",
+        "never_confirmed": "It was never confirmed",
+        "sale_return_stock": "Stock for",
+        "refund_account": "is refunded to",
+        "no_undo": "This action cannot be undone",
+        "cancelled": "Cancelled",
+        "draft_ref": "Draft #",
+        "annul": "Cancel",
+        "annul_failed": "Cancel failed",
+        "refresh": "↻ Refresh",
+        "new_role": "New role",
+        "save_permissions": "Save permissions",
+        "edit_role": "Edit role and permissions",
+        "create_role": "Create role",
+        "save_roles": "Save roles",
+        "new_user": "New user",
+        "create_user": "Create user",
+        "must_change": "must change password",
+        "assign_roles": "Assign roles",
+        "new_purchase": "New purchase",
+        "create_draft": "Create Draft",
+        "add_line": "Add line",
+        "no_products": "No products match",
+        "searching": "Searching",
+        "two_matches": "2 matches.",
+        "settings": "Business settings",
+        "save_settings": "Save settings",
+        "settings_saved": "Settings saved",
+    },
+    "es": {
+        "username": "Usuario",
+        "password": "Contraseña",
+        "current_password": "Contraseña actual",
+        "new_password": "Nueva contraseña",
+        "confirm_password": "Confirmar nueva contraseña",
+        "sign_in": "Iniciar sesión",
+        "save_password": "Guardar contraseña",
+        "confined": "Su sesión está restringida",
+        "permission_required": "Se necesita el permiso",
+        "delete_draft_impact": "Se eliminan el borrador y su 1 línea",
+        "never_confirmed": "Nunca se confirmó",
+        "sale_return_stock": "Se devuelve el stock de",
+        "refund_account": "Se reembolsa",
+        "no_undo": "Esta acción no se puede deshacer",
+        "cancelled": "Anulada",
+        "draft_ref": "Borrador n.º",
+        "annul": "Anular",
+        "annul_failed": "Anular falló",
+        "refresh": "↻ Actualizar",
+        "new_role": "Nuevo rol",
+        "save_permissions": "Guardar permisos",
+        "edit_role": "Editar rol y permisos",
+        "create_role": "Crear rol",
+        "save_roles": "Guardar roles",
+        "new_user": "Nuevo usuario",
+        "create_user": "Crear usuario",
+        "must_change": "debe cambiar la contraseña",
+        "assign_roles": "Asignar roles",
+        "new_purchase": "Nueva compra",
+        "create_draft": "Crear borrador",
+        "add_line": "Agregar línea",
+        "no_products": "Ningún producto coincide",
+        "searching": "Buscando",
+        "two_matches": "2 coincidencias.",
+        "settings": "Configuración del negocio",
+        "save_settings": "Guardar configuración",
+        "settings_saved": "Configuración guardada",
+    },
+}
+
+
+def e2e_copy(key: str) -> str:
+    """Return presentation copy for the locale configured by this harness."""
+    return _E2E_COPY.get(E2E_LANGUAGE, _E2E_COPY["en"])[key]
+
+
 
 class SeedError(RuntimeError):
     """A seed request failed; the endpoint is broken and the suite must say so."""

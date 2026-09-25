@@ -50,6 +50,7 @@ pub struct GrantRowView {
     pub role_name: String,
     pub granted_by_label: String,
     pub granted_on: String,
+    pub trail: String,
 }
 
 /// One users-list row with the audit attribution resolved (slice S13): the
@@ -91,6 +92,7 @@ struct UsersTemplate {
 #[derive(Template)]
 #[template(path = "partials/user_list.html")]
 struct UserListPartial {
+    localization: LocalizationContext,
     users: Vec<UserRowView>,
     can_manage: bool,
     can_manage_roles: bool,
@@ -102,6 +104,7 @@ struct UserListPartial {
 #[derive(Template)]
 #[template(path = "partials/user_roles_form.html")]
 struct UserRolesFormPartial {
+    localization: LocalizationContext,
     user: UserWithRoles,
     roles: Vec<Role>,
 }
@@ -110,6 +113,7 @@ struct UserRolesFormPartial {
 #[derive(Template)]
 #[template(path = "partials/user_password_form.html")]
 struct UserPasswordFormPartial {
+    localization: LocalizationContext,
     user: UserWithRoles,
 }
 
@@ -130,9 +134,12 @@ fn render<T: Template>(template: T) -> AppResult<String> {
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
-async fn user_rows(state: &AppState) -> AppResult<Vec<UserRowView>> {
+async fn user_rows(
+    state: &AppState,
+    localization: &LocalizationContext,
+) -> AppResult<Vec<UserRowView>> {
     let users = state.identity_service.list_users_with_roles().await?;
-    Ok(resolve_user_rows(state, users).await?)
+    Ok(resolve_user_rows(state, users, localization).await?)
 }
 
 /// Resolve the audit attribution of the users list: every actor id (the row's
@@ -144,6 +151,7 @@ async fn user_rows(state: &AppState) -> AppResult<Vec<UserRowView>> {
 async fn resolve_user_rows(
     state: &AppState,
     users: Vec<UserWithRoles>,
+    localization: &LocalizationContext,
 ) -> AppResult<Vec<UserRowView>> {
     let mut actor_ids: Vec<i64> = Vec::new();
     for row in &users {
@@ -160,25 +168,47 @@ async fn resolve_user_rows(
     // documents: the established explicit marker, never a raw id.
     let system_label = |id: Option<i64>| -> String {
         id.and_then(|actor| names.get(&actor).cloned())
-            .unwrap_or_else(|| "el sistema".to_string())
+            .unwrap_or_else(|| {
+                localization
+                    .tr(crate::localization::MessageKey::DocumentsSystem)
+                    .to_string()
+            })
     };
-    let resolved = |id: i64| -> String {
-        names.get(&id).cloned().unwrap_or_else(|| "—".to_string())
-    };
+    let resolved =
+        |id: i64| -> String { names.get(&id).cloned().unwrap_or_else(|| "—".to_string()) };
     let mut rows = Vec::with_capacity(users.len());
     for row in users {
         let grants = row
             .grants
             .iter()
-            .map(|grant| GrantRowView {
-                role_name: grant.role.name.clone(),
-                granted_by_label: resolved(grant.granted_by),
-                granted_on: grant.granted_at.format("%Y-%m-%d").to_string(),
+            .map(|grant| {
+                let granted_by_label = resolved(grant.granted_by);
+                let granted_on = localization.format_date(grant.granted_at.date());
+                let role_name = localization
+                    .seeded_role_display_name(grant.role.code.as_str(), grant.role.name.as_str())
+                    .into_owned();
+                let trail = format!(
+                    "{}: {} {} {} {}",
+                    role_name,
+                    localization.tr(crate::localization::MessageKey::IdentityGrantedBy),
+                    granted_by_label,
+                    localization.tr(crate::localization::MessageKey::IdentityGrantOn),
+                    granted_on,
+                );
+                GrantRowView {
+                    role_name,
+                    granted_by_label,
+                    granted_on,
+                    trail,
+                }
             })
             .collect();
         rows.push(UserRowView {
             created_by_label: system_label(row.user.created_by),
-            updated_by_label: row.user.updated_by.and_then(|actor| names.get(&actor).cloned()),
+            updated_by_label: row
+                .user
+                .updated_by
+                .and_then(|actor| names.get(&actor).cloned()),
             user: row.user,
             roles: row.roles,
             grants,
@@ -188,19 +218,19 @@ async fn resolve_user_rows(
 }
 
 fn render_list(
+    localization: LocalizationContext,
     users: Vec<UserRowView>,
     can_manage: bool,
     can_manage_roles: bool,
     acting_user_id: i64,
 ) -> AppResult<Html<String>> {
-    Ok(Html(
-        render(UserListPartial {
-            users,
-            can_manage,
-            can_manage_roles,
-            acting_user_id,
-        })?,
-    ))
+    Ok(Html(render(UserListPartial {
+        localization,
+        users,
+        can_manage,
+        can_manage_roles,
+        acting_user_id,
+    })?))
 }
 
 async fn list_response(
@@ -209,8 +239,16 @@ async fn list_response(
     can_manage_roles: bool,
     acting_user_id: i64,
 ) -> AppResult<Response> {
-    let users = user_rows(state).await?;
-    Ok(render_list(users, can_manage, can_manage_roles, acting_user_id)?.into_response())
+    let localization = crate::localization::load_context(&state.pool).await?;
+    let users = user_rows(state, &localization).await?;
+    Ok(render_list(
+        localization,
+        users,
+        can_manage,
+        can_manage_roles,
+        acting_user_id,
+    )?
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +261,7 @@ async fn users_page(
     Extension(principal): Extension<Principal>,
     _: Require<IdentityUsersRead>,
 ) -> Result<Html<String>, AppError> {
-    let users = user_rows(&state).await?;
+    let users = user_rows(&state, &localization).await?;
     let tmpl = UsersTemplate {
         localization,
         users,
@@ -529,7 +567,12 @@ async fn web_assign_roles(
     let permissions = crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
     state
         .identity_service
-        .assign_roles(&permissions, principal.user_id, form.user_id, &form.role_ids)
+        .assign_roles(
+            &permissions,
+            principal.user_id,
+            form.user_id,
+            &form.role_ids,
+        )
         .await?;
     if is_htmx(&headers) {
         let mut resp = list_response(
@@ -555,6 +598,7 @@ async fn web_assign_roles(
 /// roles never sees the form it could not use.
 async fn web_user_roles_form(
     State(state): State<AppState>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     _: Require<IdentityRolesManage>,
 ) -> AppResult<Html<String>> {
@@ -564,13 +608,16 @@ async fn web_user_roles_form(
         .find(|u| u.user.id == id)
         .ok_or_else(|| AppError::NotFound("El usuario no existe.".into()))?;
     let roles: Vec<Role> = state.identity_service.role_list().await?;
-    Ok(Html(
-        render(UserRolesFormPartial { user, roles })?,
-    ))
+    Ok(Html(render(UserRolesFormPartial {
+        localization,
+        user,
+        roles,
+    })?))
 }
 
 async fn web_user_password_form(
     State(state): State<AppState>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     _: Require<IdentityUsersManage>,
 ) -> AppResult<Html<String>> {
@@ -579,18 +626,16 @@ async fn web_user_password_form(
         .into_iter()
         .find(|u| u.user.id == id)
         .ok_or_else(|| AppError::NotFound("El usuario no existe.".into()))?;
-    Ok(Html(
-        render(UserPasswordFormPartial { user })?,
-    ))
+    Ok(Html(render(UserPasswordFormPartial {
+        localization,
+        user,
+    })?))
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/users", get(users_page))
-        .route(
-            "/web/users",
-            get(web_user_list).post(web_create_user),
-        )
+        .route("/web/users", get(web_user_list).post(web_create_user))
         .route("/web/users/activate", post(web_activate_user))
         .route("/web/users/deactivate", post(web_deactivate_user))
         .route("/web/users/password", post(web_reset_password))
@@ -627,13 +672,23 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES ('es-ES', 'es', 'Español (España)', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', 'es-ES', 'USD', 'UTC')")
+            .execute(&pool)
+            .await
+            .unwrap();
         // Fixture wiring (S5): the permissionless variant. The shared principal
         // this screen's tests build on holds NO roles — the refusal fixtures
         // and the read-only principal depend on that premise, and the
         // happy-path tests grant their own permission sets through
         // app_with_permissions. The full-permission seed (seed_session) is for
         // the department fixtures, not this one.
-        test_support::seed_session_without_roles(&pool).await.unwrap();
+        test_support::seed_session_without_roles(&pool)
+            .await
+            .unwrap();
         pool
     }
 
@@ -666,12 +721,11 @@ mod tests {
             }
             let roles = SqliteRoleRepository::new(pool.clone());
             let role = roles.find_by_code("usuarios").await.unwrap().unwrap();
-            let user_id: i64 =
-                sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-                    .bind(test_support::TEST_USERNAME)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+                .bind(test_support::TEST_USERNAME)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             roles
                 .grant(&crate::models::NewUserRole {
                     user_id,
@@ -696,11 +750,7 @@ mod tests {
             builder = builder.header(*name, *value);
         }
         app.clone()
-            .oneshot(
-                builder
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap()
     }
@@ -720,6 +770,17 @@ mod tests {
 
     fn cookie() -> [(&'static str, &'static str); 1] {
         [("cookie", test_support::TEST_COOKIE)]
+    }
+
+    async fn use_english(pool: &sqlx::SqlitePool) {
+        sqlx::query("INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES ('en-US', 'en', 'English (United States)', 1)")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = 'en-US' WHERE id = 1")
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn user_id_by_username(state: &crate::routes::AppState, username: &str) -> i64 {
@@ -812,8 +873,7 @@ mod tests {
     // -- the screen round trips -------------------------------------------------
 
     #[tokio::test]
-    async fn the_page_lists_users_roles_and_state_and_the_actions_the_principal_may_perform(
-    ) {
+    async fn the_page_lists_users_roles_and_state_and_the_actions_the_principal_may_perform() {
         let (app, state) = app_with_permissions(&[
             "identity.users.read",
             "identity.users.manage",
@@ -826,8 +886,7 @@ mod tests {
             .create_user(actor_id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
-        let permissions =
-            crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
+        let permissions = crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
         let vendedor = state
             .identity_service
             .role_list()
@@ -857,7 +916,10 @@ mod tests {
             "debe cambiar la contraseña",
             "data-nav=\"users\"",
         ] {
-            assert!(html.contains(expected), "page must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "page must show {expected}: {html:.600}"
+            );
         }
 
         // The fragment: same list, smaller body.
@@ -869,27 +931,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeded_role_names_render_in_english_while_persistence_stays_spanish() {
+        let (app, state) = app_with_permissions(&[
+            "identity.users.read",
+            "identity.users.manage",
+            "identity.roles.manage",
+        ])
+        .await;
+        let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
+        let target = state
+            .identity_service
+            .create_user(actor_id, "teller", "Teller", "initial password 1")
+            .await
+            .unwrap();
+        let permissions = crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
+        let vendedor = state
+            .identity_service
+            .role_list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|role| role.code == "vendedor")
+            .unwrap();
+        state
+            .identity_service
+            .assign_roles(&permissions, actor_id, target.id, &[vendedor.id])
+            .await
+            .unwrap();
+        use_english(&state.pool).await;
+
+        let html = body_string(send(&app, "GET", "/users", &cookie(), "").await).await;
+        assert!(html.contains("Salesperson"), "{html:.800}");
+        assert!(html.contains("granted by"), "{html:.800}");
+
+        let html = body_string(
+            send(
+                &app,
+                "GET",
+                &format!("/web/users/roles-form/{}", target.id),
+                &cookie(),
+                "",
+            )
+            .await,
+        )
+        .await;
+        assert!(html.contains("Salesperson"), "{html:.800}");
+        assert!(html.contains("vendedor"), "{html:.800}");
+
+        let stored = SqliteRoleRepository::new(state.pool)
+            .find_by_id(vendedor.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.name, "Vendedor");
+        assert_eq!(
+            stored.description.as_deref(),
+            Some("Ventas y clientes; consulta de stock.")
+        );
+    }
+
+    #[tokio::test]
     async fn a_read_only_principal_sees_the_list_but_not_the_actions() {
         let (app, _state) = app_with_permissions(&["identity.users.read"]).await;
         let resp = send(&app, "GET", "/users", &cookie(), "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let html = body_string(resp).await;
         assert!(html.contains("test-admin"), "{html:.400}");
-        for absent in ["Nuevo usuario", "Desactivar", ">Roles</button>", "Contraseña"] {
+        let listing = html
+            .split("<div id=\"user-list-inner\">")
+            .nth(1)
+            .expect("users list is rendered");
+        for absent in [
+            "Nuevo usuario",
+            "Desactivar",
+            ">Roles</button>",
+            "Contraseña",
+        ] {
             assert!(
-                !html.contains(absent),
+                !listing.contains(absent),
                 "a read-only principal must not see {absent}: {html:.600}"
             );
         }
         // The mutation endpoint refuses them anyway.
-        let resp = send(&app, "POST", "/web/users", &form_headers(), "username=ghost&display_name=G&password=initial password 1").await;
+        let resp = send(
+            &app,
+            "POST",
+            "/web/users",
+            &form_headers(),
+            "username=ghost&display_name=G&password=initial password 1",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn create_activate_and_deactivate_round_trip_through_the_screen() {
-        let (app, state) = app_with_permissions(&["identity.users.read", "identity.users.manage"])
-            .await;
+        let (app, state) =
+            app_with_permissions(&["identity.users.read", "identity.users.manage"]).await;
 
         // Create through the collection endpoint.
         let resp = send(
@@ -912,8 +1050,17 @@ mod tests {
         assert!(html.contains("caja1"), "{html:.400}");
         assert_eq!(trigger, "user-created", "the create answers with its event");
         let id = user_id_by_username(&state, "caja1").await;
-        let created = state.identity_service.users.find_by_id(id).await.unwrap().unwrap();
-        assert!(created.must_change_password, "the created user owes the change");
+        let created = state
+            .identity_service
+            .users
+            .find_by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            created.must_change_password,
+            "the created user owes the change"
+        );
 
         // A duplicate username is refused with the Spanish conflict.
         let resp = send(
@@ -928,7 +1075,9 @@ mod tests {
         let body = body_string(resp).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("ya existe")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("ya existe")),
             "{json}"
         );
 
@@ -942,7 +1091,13 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let user = state.identity_service.users.find_by_id(id).await.unwrap().unwrap();
+        let user = state
+            .identity_service
+            .users
+            .find_by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!user.is_active);
 
         // ... and activate again.
@@ -955,7 +1110,13 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let user = state.identity_service.users.find_by_id(id).await.unwrap().unwrap();
+        let user = state
+            .identity_service
+            .users
+            .find_by_id(id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(user.is_active);
     }
 
@@ -976,11 +1137,10 @@ mod tests {
             .await
             .unwrap();
         let admin_id = user_id_by_username(&state, "admin").await;
-        let admin_role_id: i64 =
-            sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let admin_role_id: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
 
         // The refusal: 409 with the Spanish reason, nothing written.
         let resp = send(
@@ -998,7 +1158,13 @@ mod tests {
         assert!(message.contains("último"), "{json}");
         assert!(message.contains("rol protegido"), "{json}");
         assert!(!message.contains("cannot deactivate"), "{json}");
-        let admin = state.identity_service.users.find_by_id(admin_id).await.unwrap().unwrap();
+        let admin = state
+            .identity_service
+            .users
+            .find_by_id(admin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(admin.is_active, "the refused deactivation writes nothing");
 
         // A second administrator is created and granted the role THROUGH the
@@ -1027,7 +1193,13 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let admin = state.identity_service.users.find_by_id(admin_id).await.unwrap().unwrap();
+        let admin = state
+            .identity_service
+            .users
+            .find_by_id(admin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!admin.is_active);
     }
 
@@ -1064,7 +1236,9 @@ mod tests {
         let body = body_string(resp).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("Cambiar contraseña")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("Cambiar contraseña")),
             "{json}"
         );
 
@@ -1078,9 +1252,21 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let target = state.identity_service.users.find_by_id(admin_id).await.unwrap().unwrap();
+        let target = state
+            .identity_service
+            .users
+            .find_by_id(admin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(target.must_change_password, "the target owes the change");
-        let actor = state.identity_service.users.find_by_id(actor_id).await.unwrap().unwrap();
+        let actor = state
+            .identity_service
+            .users
+            .find_by_id(actor_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!actor.must_change_password, "the actor's flag stays clear");
     }
 
@@ -1100,8 +1286,7 @@ mod tests {
             .create_user(actor_id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
-        let permissions =
-            crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
+        let permissions = crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
         let vendedor = state
             .identity_service
             .role_list()
@@ -1144,7 +1329,10 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let html = body_string(resp).await;
-        assert!(html.contains("hx-post=\"/web/users/password\""), "{html:.600}");
+        assert!(
+            html.contains("hx-post=\"/web/users/password\""),
+            "{html:.600}"
+        );
         assert!(
             html.contains(&format!("name=\"user_id\" value=\"{}\"", target.id)),
             "{html:.600}"
@@ -1163,8 +1351,8 @@ mod tests {
     /// Escalation formerly lived in exactly this endpoint.
     #[tokio::test]
     async fn a_users_manage_principal_is_refused_the_role_set_endpoint_at_the_gate() {
-        let (app, state) = app_with_permissions(&["identity.users.read", "identity.users.manage"])
-            .await;
+        let (app, state) =
+            app_with_permissions(&["identity.users.read", "identity.users.manage"]).await;
         let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
         state
             .identity_service
@@ -1176,18 +1364,25 @@ mod tests {
             .create_user(actor_id, "protege", "Protege", "initial password 1")
             .await
             .unwrap();
-        let admin_role_id: i64 =
-            sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let admin_role_id: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = 'admin'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
         let admin_id = user_id_by_username(&state, "admin").await;
 
         for (label, target_id, role_ids) in [
             ("self-grant", actor_id, format!("role_ids={admin_role_id}")),
-            ("grant to a created account", created.id, format!("role_ids={admin_role_id}")),
-            ("strip another administrator", admin_id, "role_ids=".to_string()),
+            (
+                "grant to a created account",
+                created.id,
+                format!("role_ids={admin_role_id}"),
+            ),
+            (
+                "strip another administrator",
+                admin_id,
+                "role_ids=".to_string(),
+            ),
         ] {
             let resp = send(
                 &app,
@@ -1201,7 +1396,9 @@ mod tests {
             let body = body_string(resp).await;
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(
-                json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("identity.roles.manage")),
+                json.get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|m| m.contains("identity.roles.manage")),
                 "{label}: {json}"
             );
         }
@@ -1231,11 +1428,10 @@ mod tests {
         ])
         .await;
         let actor_id = user_id_by_username(&state, test_support::TEST_USERNAME).await;
-        let vendedor_id: i64 =
-            sqlx::query_scalar("SELECT id FROM roles WHERE code = 'vendedor'")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
+        let vendedor_id: i64 = sqlx::query_scalar("SELECT id FROM roles WHERE code = 'vendedor'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
 
         let resp = send(
             &app,
@@ -1249,7 +1445,9 @@ mod tests {
         let body = body_string(resp).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("propios roles")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("propios roles")),
             "{json}"
         );
         // The refusal changed nothing.
@@ -1269,9 +1467,10 @@ mod tests {
     /// holder's password at all (the takeover path is gone), while the
     /// ordinary user's reset still succeeds for the same actor.
     #[tokio::test]
-    async fn the_reset_tier_rule_through_the_endpoint_refuses_protected_targets_and_the_ordinary_still_succeeds() {
-        let (app, state) = app_with_permissions(&["identity.users.read", "identity.users.manage"])
-            .await;
+    async fn the_reset_tier_rule_through_the_endpoint_refuses_protected_targets_and_the_ordinary_still_succeeds(
+    ) {
+        let (app, state) =
+            app_with_permissions(&["identity.users.read", "identity.users.manage"]).await;
         let boot = state
             .identity_service
             .bootstrap_admin(Some(ADMIN_PASSWORD))
@@ -1298,10 +1497,18 @@ mod tests {
         let body = body_string(resp).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("identity.roles.manage")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("identity.roles.manage")),
             "{json}"
         );
-        let admin = state.identity_service.users.find_by_id(admin_id).await.unwrap().unwrap();
+        let admin = state
+            .identity_service
+            .users
+            .find_by_id(admin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!admin.must_change_password);
 
         // (e) the ordinary user: the same actor's reset succeeds.
@@ -1314,7 +1521,13 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let teller_after = state.identity_service.users.find_by_id(teller.id).await.unwrap().unwrap();
+        let teller_after = state
+            .identity_service
+            .users
+            .find_by_id(teller.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(teller_after.must_change_password);
     }
 
@@ -1329,12 +1542,21 @@ mod tests {
         ])
         .await;
         let oversized = format!("user_id=1&junk={}", "x".repeat(128 * 1024));
-        let resp = send(&app, "POST", "/web/users/roles", &form_headers(), &oversized).await;
+        let resp = send(
+            &app,
+            "POST",
+            "/web/users/roles",
+            &form_headers(),
+            &oversized,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = body_string(resp).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("demasiado grande")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("demasiado grande")),
             "{json}"
         );
         assert!(
@@ -1366,7 +1588,9 @@ mod tests {
         let body = body_string(resp).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("identificador del usuario")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("identificador del usuario")),
             "{json}"
         );
     }
@@ -1389,8 +1613,7 @@ mod tests {
             .create_user(actor_id, "teller", "Teller", "initial password 1")
             .await
             .unwrap();
-        let permissions =
-            crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
+        let permissions = crate::repositories::SqlitePermissionRepository::new(state.pool.clone());
         let vendedor = state
             .identity_service
             .role_list()
@@ -1435,7 +1658,9 @@ mod tests {
             let body = body_string(resp).await;
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert!(
-                json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("roles indicados")),
+                json.get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|m| m.contains("roles indicados")),
                 "role_ids={value}: {json}"
             );
         }

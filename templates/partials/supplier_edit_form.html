@@ -1,6 +1,6 @@
 <div class="mb-3 flex items-center justify-between gap-6">
-  <h2 class="text-lg font-semibold">Edit supplier</h2>
-  <button type="button" class="btn-secondary" onclick="document.getElementById('supplier-edit-dialog').close()">✕</button>
+  <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::CommonEdit) }}</h2>
+  <button type="button" class="btn-secondary" onclick="document.getElementById('supplier-edit-dialog').close()" aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}">✕</button>
 </div>
 <form class="flex flex-col gap-2.5"
       hx-post="/web/suppliers/edit"
@@ -9,20 +9,20 @@
       hx-on::after-request="if(event.detail.successful) document.getElementById('supplier-edit-dialog').close()">
   <input type="hidden" name="id" value="{{ supplier.id }}" class="field" />
   <div>
-    <label class="field-label">Name</label>
+    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersName) }}</label>
     <input type="text" name="name" required maxlength="128" value="{{ supplier.name }}" class="field" />
   </div>
   <div>
-    <label class="field-label">Phone (optional)</label>
+    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersPhoneOptional) }}</label>
     <input type="text" name="phone" maxlength="32" value="{% if let Some(phone) = supplier.phone %}{{ phone }}{% endif %}" class="field" />
   </div>
   <div>
-    <label class="field-label">Due days (empty = no default term)</label>
+    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersDueDays) }}</label>
     <input type="number" name="due_days" min="0" step="1" placeholder="30" value="{% if let Some(days) = supplier.due_days %}{{ days }}{% endif %}" class="field" />
   </div>
   <div>
-    <label class="field-label">Notes (optional)</label>
+    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersNotesOptional) }}</label>
     <input type="text" name="notes" maxlength="512" value="{% if let Some(notes) = supplier.notes %}{{ notes }}{% endif %}" class="field" />
   </div>
-  <button type="submit" class="btn-primary">Save Changes</button>
+  <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CommonSave) }}</button>
 </form>

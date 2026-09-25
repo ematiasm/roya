@@ -68,6 +68,7 @@ struct SuppliersTemplate {
 #[derive(Template)]
 #[template(path = "partials/supplier_list.html")]
 struct SupplierListPartial {
+    localization: LocalizationContext,
     suppliers: Vec<SupplierView>,
 }
 
@@ -100,6 +101,7 @@ struct SupplierDetailPartial {
 #[derive(Template)]
 #[template(path = "partials/supplier_edit_form.html")]
 struct SupplierEditFormPartial {
+    localization: LocalizationContext,
     supplier: Supplier,
 }
 
@@ -201,17 +203,24 @@ fn triggered(html: String, event: &str) -> Response {
     resp
 }
 
-async fn render_list(suppliers: Vec<SupplierView>) -> AppResult<Html<String>> {
-    let html = SupplierListPartial { suppliers }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+async fn render_list(
+    suppliers: Vec<SupplierView>,
+    localization: LocalizationContext,
+) -> AppResult<Html<String>> {
+    let html = SupplierListPartial {
+        localization,
+        suppliers,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
 /// Supplier fragment + `HX-Trigger` refresh event, for mutating web handlers.
 async fn list_response(state: &AppState, event: &str) -> AppResult<Response> {
+    let localization = crate::localization::load_context(&state.pool).await?;
     let suppliers = supplier_views(state).await?;
-    let html = render_list(suppliers).await?;
+    let html = render_list(suppliers, localization).await?;
     Ok(triggered(html.0, event))
 }
 
@@ -244,9 +253,10 @@ async fn suppliers_page(
 async fn web_supplier_list(
     State(state): State<AppState>,
     _: Require<SuppliersRead>,
+    Extension(localization): Extension<LocalizationContext>,
 ) -> AppResult<Response> {
     let suppliers = supplier_views(&state).await?;
-    Ok(render_list(suppliers).await?.into_response())
+    Ok(render_list(suppliers, localization).await?.into_response())
 }
 
 /// The supplier picker's search query: `q` is the documented query name; the
@@ -284,6 +294,7 @@ struct SupplierSearchQuery {
 async fn web_supplier_search(
     State(state): State<AppState>,
     _: RequireAny<(SuppliersRead, PurchasesCreate)>,
+    Extension(localization): Extension<LocalizationContext>,
     Query(params): Query<SupplierSearchQuery>,
 ) -> Result<Html<String>, AppError> {
     // The browser sends the triggering input under its own name
@@ -294,9 +305,40 @@ async fn web_supplier_search(
     } else {
         params.q
     };
-    let matches = state.supplier_service.search_suppliers(raw.trim()).await?;
+    let query = raw.trim().to_string();
+    let matches = state.supplier_service.search_suppliers(&query).await?;
+    let status_text = if matches.is_empty() {
+        if query.is_empty() {
+            localization
+                .tr(crate::localization::MessageKey::SupplierPickerIdle)
+                .to_string()
+        } else {
+            localization.tr_with(
+                crate::localization::MessageKey::SupplierPickerNoResults,
+                &[("query", query.as_str())],
+            )
+        }
+    } else {
+        localization.tr_count(
+            crate::localization::MessageKey::SupplierPickerMatchCount,
+            matches.len(),
+        )
+    };
+    let empty_text = if query.is_empty() {
+        localization
+            .tr(crate::localization::MessageKey::SupplierPickerIdle)
+            .to_string()
+    } else {
+        localization.tr_with(
+            crate::localization::MessageKey::SupplierPickerNoResults,
+            &[("query", query.as_str())],
+        )
+    };
     let html = SupplierSearchResultsPartial {
-        query: raw.trim().to_string(),
+        localization,
+        query,
+        status_text,
+        empty_text,
         matches,
         action: params.action.trim().to_string(),
         target: params.target.trim().to_string(),
@@ -310,7 +352,10 @@ async fn web_supplier_search(
 #[derive(Template)]
 #[template(path = "partials/supplier_search_results.html")]
 struct SupplierSearchResultsPartial {
+    localization: LocalizationContext,
     query: String,
+    status_text: String,
+    empty_text: String,
     matches: Vec<Supplier>,
     action: String,
     target: String,
@@ -390,12 +435,16 @@ async fn supplier_detail_html(
 async fn web_supplier_edit_form(
     State(state): State<AppState>,
     _: Require<SuppliersRead>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Html<String>> {
     let supplier = state.supplier_service.get_supplier(id).await?;
-    let html = SupplierEditFormPartial { supplier }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let html = SupplierEditFormPartial {
+        localization,
+        supplier,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -680,6 +729,26 @@ mod tests {
         // S1b part 1: seed the fixed test session every request will authenticate with.
         test_support::seed_session(&pool).await.unwrap();
         AppState::new(pool, false, true)
+    }
+
+    async fn set_locale(state: &AppState, locale_code: &str, language_code: &str) {
+        sqlx::query("INSERT OR IGNORE INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES (?, ?, ?, 1)")
+            .bind(locale_code)
+            .bind(language_code)
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', ?, 'USD', 'UTC')")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = ? WHERE id = 1")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
     }
 
     async fn get_html(app: axum::Router, uri: &str) -> (StatusCode, String) {
@@ -1173,6 +1242,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeded_payment_method_labels_are_bilingual_and_ids_stay_canonical() {
+        use crate::models::NewSupplier;
+
+        let state = test_state().await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(
+                audit_actor(&state).await,
+                NewSupplier {
+                    name: "Localized Supplier".into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
+            .await
+            .unwrap();
+        let cash_id: i64 = sqlx::query_scalar("SELECT id FROM payment_methods WHERE name = 'Cash'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        set_locale(&state, "en-US", "en").await;
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/web/suppliers/{}/detail", supplier.id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let method_options = html.split("name=\"method_id\"").nth(1).unwrap_or(&html);
+        assert!(
+            method_options.contains("Cash — unassigned"),
+            "{method_options}"
+        );
+        assert!(
+            method_options.contains("Bank transfer — unassigned"),
+            "{method_options}"
+        );
+        assert!(
+            html.contains(&format!("value=\"{cash_id}\"")),
+            "the canonical method id must remain unchanged: {html:.1200}"
+        );
+
+        set_locale(&state, "es-ES", "es").await;
+        let (status, html) = get_html(app, &format!("/web/suppliers/{}/detail", supplier.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Efectivo — sin asignar"), "{html:.1200}");
+        assert!(
+            html.contains("Transferencia bancaria — sin asignar"),
+            "{html:.1200}"
+        );
+    }
+
+    #[tokio::test]
     async fn web_pay_supplier_from_drawer_reduces_balance_in_place() {
         use crate::models::{
             NewProduct, NewPurchase, NewSupplier, PaymentType, ProductKind, TransactionKind,
@@ -1416,7 +1540,7 @@ mod tests {
             let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
             assert!(
-                html.contains("Acción no permitida") && html.contains("suppliers.read"),
+                html.contains("Action not permitted") && html.contains("suppliers.read"),
                 "{uri} must refuse naming suppliers.read: {html:.300}"
             );
         }
@@ -1466,7 +1590,7 @@ mod tests {
             get_html_as(app.clone(), &uri, Some(&test_support::cookie_for(&probe))).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{html:.200}");
         assert!(
-            html.contains("Acción no permitida") && html.contains("suppliers.read"),
+            html.contains("Action not permitted") && html.contains("suppliers.read"),
             "the drawer must refuse a costs-only principal naming suppliers.read: {html:.300}"
         );
 
@@ -1541,8 +1665,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
         assert!(
-            body.contains("Acción no permitida") && body.contains("suppliers.write"),
-            "the refusal must speak Spanish and name the gate: {body:.400}"
+            body.contains("Action not permitted") && body.contains("suppliers.write"),
+            "the refusal must use the English fallback and name the gate: {body:.400}"
         );
 
         // Edit, activate, deactivate and delete: the entity gate, each in the
@@ -2038,7 +2162,7 @@ mod tests {
         let (status, html) = search_html(&state, "picker").await;
         assert_eq!(status, StatusCode::OK, "{html:.400}");
         assert!(
-            html.contains("inactive"),
+            html.contains("Inactive"),
             "the fragment reports whether a match is active: {html:.800}"
         );
         assert!(
@@ -2173,7 +2297,7 @@ mod tests {
         // current-id parameter: the field's text is the whole contract.
         assert!(
             picker
-                .contains("macro supplier_picker(action, target, field_id, current_name, include)"),
+                .contains("macro supplier_picker(action, target, field_id, current_name, include, localization)"),
             "the macro takes the caller's context: {picker:.400}"
         );
         assert!(

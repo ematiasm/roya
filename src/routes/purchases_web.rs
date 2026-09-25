@@ -208,8 +208,8 @@ struct PurchaseListPartial {
 #[derive(Template)]
 #[template(path = "partials/purchase_merge_notice.html")]
 struct PurchaseMergeNotice {
-    product_name: String,
-    quantity: Decimal,
+    message: String,
+    dismiss_label: String,
 }
 
 /// The record body, shared by the page and by every action response that swaps
@@ -537,7 +537,9 @@ async fn purchases_page(
             let last = state.purchases_service.last_used_supplier().await?;
             (
                 String::new(),
-                "New purchase".to_string(),
+                localization
+                    .tr(crate::localization::MessageKey::PurchasesNew)
+                    .to_string(),
                 "new-purchase-dialog".to_string(),
                 last.map(|s| s.name).unwrap_or_default(),
             )
@@ -548,7 +550,9 @@ async fn purchases_page(
     // as the seed form's default purchase date (see the struct field comment).
     let today = today.to_string();
     let tmpl = PurchasesTemplate {
-        title: "All purchases".to_string(),
+        title: localization
+            .tr(crate::localization::MessageKey::PurchasesAll)
+            .to_string(),
         localization,
         purchases,
         suggestions,
@@ -651,18 +655,30 @@ async fn purchase_record_page(
     let context = record_context(&state, id, localization).await?;
     let label = match &context.record.purchase.purchase_number {
         Some(number) => number.clone(),
-        None => "Draft purchase".to_string(),
+        None => context
+            .localization
+            .tr(crate::localization::MessageKey::PurchasesDraft)
+            .to_string(),
     };
     let (action_href, action_label) = if context.record.purchase.status == PurchaseStatus::Confirmed
         && context.record.purchase.payment_type == PaymentType::Credit
     {
-        ("#record-payment".to_string(), "Record payment".to_string())
+        (
+            "#record-payment".to_string(),
+            context
+                .localization
+                .tr(crate::localization::MessageKey::SalesRecordPayment)
+                .to_string(),
+        )
     } else {
         (String::new(), String::new())
     };
     let tmpl = PurchasePageTemplate {
         page_title: label,
-        page_breadcrumb_label: "Purchases".to_string(),
+        page_breadcrumb_label: context
+            .localization
+            .tr(crate::localization::MessageKey::NavigationPurchases)
+            .to_string(),
         page_breadcrumb_href: "/purchases".to_string(),
         page_action_href: action_href,
         page_action_label: action_label,
@@ -698,7 +714,10 @@ async fn web_purchase_list(
         .parse()
         .map_err(|_| AppError::Internal("invalid localized date".into()))?;
     let view = purchase_views(&state, &query.to_filter(), today).await?;
-    Ok(render_list(view, "All purchases", localization)?.into_response())
+    let title = localization
+        .tr(crate::localization::MessageKey::PurchasesAll)
+        .to_string();
+    Ok(render_list(view, &title, localization)?.into_response())
 }
 
 async fn web_purchase_detail(
@@ -991,8 +1010,16 @@ async fn web_add_line_impl(
         let notice = match &outcome {
             LineAddOutcome::Merged { line, product_name } => Some(
                 PurchaseMergeNotice {
-                    product_name: product_name.clone(),
-                    quantity: line.qty,
+                    message: localization.tr_with(
+                        crate::localization::MessageKey::NoticeMerged,
+                        &[
+                            ("product_name", product_name),
+                            ("quantity", &localization.format_quantity(line.qty)),
+                        ],
+                    ),
+                    dismiss_label: localization
+                        .tr(crate::localization::MessageKey::AccessibilityDismiss)
+                        .to_string(),
                 }
                 .render()
                 .map_err(|e| AppError::Internal(e.to_string()))?,
@@ -1526,6 +1553,26 @@ mod tests {
         AppState::new(pool, false, true)
     }
 
+    async fn set_locale(state: &AppState, locale_code: &str, language_code: &str) {
+        sqlx::query("INSERT OR IGNORE INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES (?, ?, ?, 1)")
+            .bind(locale_code)
+            .bind(language_code)
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', ?, 'USD', 'UTC')")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = ? WHERE id = 1")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
     async fn get_html(app: axum::Router, uri: &str) -> (StatusCode, String) {
         let req = Request::builder()
             .method("GET")
@@ -1893,6 +1940,37 @@ mod tests {
             account_name: account.name,
             method_name: method.name,
         }
+    }
+
+    #[tokio::test]
+    async fn seeded_payment_method_labels_are_bilingual_and_ids_stay_canonical() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        set_locale(&state, "en-US", "en").await;
+        let (status, html) =
+            get_html(app.clone(), &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let method_options = html.split("name=\"method_id\"").nth(1).unwrap_or(&html);
+        assert!(method_options.contains("Cash — Caja"), "{method_options}");
+        assert!(
+            method_options.contains("Bank transfer — unassigned"),
+            "{method_options}"
+        );
+        assert!(
+            html.contains(&format!("value=\"{}\"", fixture.method_id)),
+            "the canonical method id must remain unchanged: {html:.1200}"
+        );
+
+        set_locale(&state, "es-ES", "es").await;
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Efectivo — Caja"), "{html:.1200}");
+        assert!(
+            html.contains("Transferencia bancaria — sin asignar"),
+            "{html:.1200}"
+        );
     }
 
     /// A second product for scan and click flows, so the fixture's own line is
@@ -3083,7 +3161,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
         assert!(
-            body.contains("inventory.write") || body.contains("Acción no permitida"),
+            body.contains("inventory.write") || body.contains("Action not permitted"),
             "the refusal must be visible, not silent: {body:.400}"
         );
 
@@ -3827,12 +3905,14 @@ mod tests {
             .total
             .to_string();
         assert!(
-            preview.contains(&format!("Cash scenario · −{total} USD at confirm")),
+            preview.contains(&format!(
+                "Cash scenario · −{total} USD at confirmation · no amount due"
+            )),
             "the cash projection is the document total: {preview}"
         );
         assert!(
             preview.contains(&format!(
-                "Credit scenario · no cash movement · due +{total} USD at confirm"
+                "Credit scenario · at confirmation · due +{total} USD"
             )),
             "a draft previews BOTH scenarios until confirm: {preview}"
         );
@@ -3879,12 +3959,14 @@ mod tests {
             .to_string();
         assert!(
             preview.contains(&format!(
-                "Credit scenario · no cash movement · due +{credit_total} USD at confirm"
+                "Credit scenario · at confirmation · due +{credit_total} USD"
             )),
             "the due projection is what confirm establishes: {preview}"
         );
         assert!(
-            preview.contains(&format!("Cash scenario · −{credit_total} USD at confirm")),
+            preview.contains(&format!(
+                "Cash scenario · −{credit_total} USD at confirmation · no amount due"
+            )),
             "the preview does not trust the stored type: both scenarios show: {preview}"
         );
         assert!(
@@ -4259,9 +4341,9 @@ mod tests {
         // its `include` names the date, invoice and notes ids and NEVER a
         // supplier_id (htmx accumulates colliding values — T3's defect).
         let form_pos = html
-            .find("data-action=\"Save supplier\"")
+            .find("data-action=\"Save\"")
             .expect("the record hosts the picker's own form");
-        let picker_form = enclosing_form(&html[..], &format!("data-action=\"Save supplier\""));
+        let picker_form = enclosing_form(&html[..], &format!("data-action=\"Save\""));
         let _ = form_pos;
         let include = picker_form
             .split("hx-include=\"")
@@ -4338,7 +4420,7 @@ mod tests {
         // The picker's OWN form is what Enter submits. Collect its inputs —
         // exactly what the browser posts — from the form tag plus everything
         // `hx-include` names (the sibling inputs live outside the form tag).
-        let form = enclosing_form(&html, "data-action=\"Save supplier\"");
+        let form = enclosing_form(&html, "data-action=\"Save\"");
         let include = form
             .split("hx-include=\"")
             .nth(1)
@@ -5257,7 +5339,7 @@ mod tests {
             let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
             assert!(
-                html.contains("Acción no permitida") && html.contains(code),
+                html.contains("Action not permitted") && html.contains(code),
                 "{uri} must refuse naming {code}: {html:.300}"
             );
         }
@@ -5514,8 +5596,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
         assert!(
-            body.contains("Acción no permitida") && body.contains("purchases.create"),
-            "the refusal must speak Spanish and name the gate: {body:.400}"
+            body.contains("Action not permitted") && body.contains("purchases.create"),
+            "the refusal must use the English fallback and name the gate: {body:.400}"
         );
 
         // Seeding from a suggestion creates a purchase: purchases.create.

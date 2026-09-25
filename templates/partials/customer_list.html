@@ -3,7 +3,7 @@
     <div class="mb-3 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger">{{ w }}</div>
   {% endif %}
   {% if customers.is_empty() %}
-    <div class="empty">No customers yet — use New customer above.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::CustomerNoCustomers) }}</div>
   {% else %}
     <div class="flex flex-col gap-1.5">
       {% for r in customers %}
@@ -15,8 +15,8 @@
                 hx-swap="innerHTML">{{ r.customer.name }}</button>
         <button type="button"
                 class="btn-secondary shrink-0"
-                title="Edit"
-                aria-label="Edit"
+                title="{{ localization.tr(crate::localization::MessageKey::CommonEdit) }}"
+                aria-label="{{ localization.tr(crate::localization::MessageKey::CommonEdit) }}"
                 hx-get="/web/customers/edit-form/{{ r.customer.id }}"
                 hx-target="#customer-edit-dialog-body"
                 hx-swap="innerHTML"

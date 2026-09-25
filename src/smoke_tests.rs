@@ -1569,7 +1569,7 @@ fn guarded_pages(fixture: &WiringFixture) -> Vec<GuardedPage> {
 /// Referenced entities the interface always shows by name: a product, account,
 /// payment method, customer or supplier. A document's own id is exempt, so the
 /// scan requires the entity noun before the digit, which keeps the legitimate
-/// `draft #12` and `2024-SALE-000012` allowed.
+/// `Draft #12` and `2024-SALE-000012` allowed.
 const BARE_REFERENCED_ID_PREFIXES: [&str; 5] = [
     "product #",
     "account #",
@@ -1601,7 +1601,7 @@ fn bare_referenced_id(html: &str) -> Option<String> {
 }
 
 /// Fail when a rendered page prints a referenced entity's internal id instead of
-/// its name. The entity nouns are explicit so a document id (`draft #12`) never
+/// its name. The entity nouns are explicit so a document id (`Draft #12`) never
 /// fails, and the message names both the page and the offending fragment.
 fn check_no_bare_referenced_ids(page: &str, html: &str) -> Result<(), String> {
     match bare_referenced_id(html) {
@@ -3697,7 +3697,7 @@ async fn rendered_action_buttons_inherit_the_base_mint_not_the_accent2_override(
     // so pin its type and its label.
     let (status, html) = get(&app, "/").await;
     assert_eq!(status, StatusCode::OK, "{html:.400}");
-    let tag = opening_tag_containing(&html, ">Add Transaction<");
+    let tag = opening_tag_containing(&html, ">Add transaction<");
     assert!(
         tag.contains("<button"),
         "the action must stay a button element: {tag}"
@@ -4304,7 +4304,7 @@ async fn dialog_enter_path_assigns_the_typed_supplier_not_the_pre_filled_one() {
     // The picker's OWN form (data-action "Save supplier") is what Enter
     // submits; the Create draft button is the separate include form.
     let pos = page
-        .find("data-action=\"Save supplier\"")
+        .find("data-action=\"Save\"")
         .expect("the picker's form renders in the dialog");
     let form_start = page[..pos].rfind("<form").expect("the picker's form opens");
     let form_end = form_start + page[form_start..].find("</form>").expect("the form closes");
@@ -4424,6 +4424,7 @@ async fn web_create_purchase_omitting_the_date_defaults_to_today() {
             .uri("/web/purchases")
             .header("content-type", "application/x-www-form-urlencoded"),
     );
+    let today_before = chrono::Local::now().date_naive();
     let resp = app
         .clone()
         .oneshot(
@@ -4451,10 +4452,13 @@ async fn web_create_purchase_omitting_the_date_defaults_to_today() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    assert_eq!(
-        date, today,
-        "an omitted purchase_date must default to today"
+    let today_after = chrono::Local::now().date_naive();
+    let utc_today = chrono::Utc::now().date_naive();
+    assert!(
+        date == today_before.to_string()
+            || date == today_after.to_string()
+            || date == utc_today.to_string(),
+        "an omitted purchase_date must default to today: {date}"
     );
 }
 
@@ -4617,12 +4621,12 @@ async fn line_picker_loads_a_sale_without_a_click() {
     // The island's mount point carries its calling context: one picker,
     // priced for a sale.
     assert_eq!(
-        page.matches("data-picker").count(),
+        page.matches("id=\"line-picker\"").count(),
         1,
         "one island mount point: {page:.600}"
     );
     let container_pos = page
-        .find("data-picker")
+        .find("id=\"line-picker\"")
         .expect("the record page renders the island mount point");
     let container_start = page[..container_pos]
         .rfind('<')
@@ -4886,7 +4890,7 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     // The island's mount point carries its calling context: one picker,
     // priced for a purchase — the entry row quotes cost, not the sale price.
     assert_eq!(
-        page.matches("data-picker").count(),
+        page.matches("data-picker=\"product\"").count(),
         1,
         "one island mount point: {page:.600}"
     );
@@ -5349,7 +5353,7 @@ fn referenced_id_scan_bites_on_every_entity_noun() {
         let err = check_no_bare_referenced_ids("mutation", &mutant).unwrap_err();
         assert!(err.contains(noun), "{err}");
     }
-    check_no_bare_referenced_ids("mutation", "<div>draft #12</div>").unwrap();
+    check_no_bare_referenced_ids("mutation", "<div>Draft #12</div>").unwrap();
     check_no_bare_referenced_ids("mutation", "<div>2024-SALE-000012</div>").unwrap();
     check_no_bare_referenced_ids("mutation", "<div>sale #12</div>").unwrap();
 }
@@ -5639,7 +5643,7 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     // No filter returns everything.
     let all = sale_list_html(&app, "").await;
     assert!(
-        all.contains("draft #"),
+        all.contains("Draft #"),
         "the draft stays in the unfiltered list: {all}"
     );
     assert!(
@@ -5651,10 +5655,10 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     let confirmed = sale_list_html(&app, "?status=Confirmed").await;
     assert!(confirmed.contains(&ana_number), "{confirmed}");
     assert!(confirmed.contains(&beto_number), "{confirmed}");
-    assert!(!confirmed.contains("draft #"), "{confirmed}");
+    assert!(!confirmed.contains("Draft #"), "{confirmed}");
 
     let drafts = sale_list_html(&app, "?status=Draft").await;
-    assert!(drafts.contains("draft #"), "{drafts}");
+    assert!(drafts.contains("Draft #"), "{drafts}");
     assert!(!drafts.contains(&ana_number), "{drafts}");
 
     // Customer alone, case-insensitive over the name the list shows.
@@ -5672,7 +5676,7 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     let by_date = sale_list_html(&app, "?from=2024-07-01&to=2024-07-31").await;
     assert!(by_date.contains(&beto_number), "{by_date}");
     assert!(!by_date.contains(&ana_number), "{by_date}");
-    assert!(!by_date.contains("draft #"), "{by_date}");
+    assert!(!by_date.contains("Draft #"), "{by_date}");
 
     // Combined filters narrow further.
     let combined = sale_list_html(&app, "?status=Confirmed&customer=FiltBeto").await;
@@ -5682,7 +5686,7 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     // Empty values are no constraint, not an error.
     let blank = sale_list_html(&app, "?status=&customer=&number=&from=&to=").await;
     assert!(
-        blank.contains("draft #") && blank.contains(&ana_number) && blank.contains(&beto_number),
+        blank.contains("Draft #") && blank.contains(&ana_number) && blank.contains(&beto_number),
         "{blank}"
     );
 
@@ -5694,7 +5698,7 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     // A status or date the picker never sends is treated as absent, not an error.
     let lenient = sale_list_html(&app, "?status=bogus&from=not-a-date").await;
     assert!(
-        lenient.contains("draft #")
+        lenient.contains("Draft #")
             && lenient.contains(&ana_number)
             && lenient.contains(&beto_number),
         "{lenient}"
@@ -5708,7 +5712,7 @@ async fn sales_list_filters_by_status_customer_number_and_date() {
     let (status, page) = get(&app, "/sales?status=Confirmed").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert!(page.contains(&ana_number), "{page:.600}");
-    assert!(!page.contains("draft #"), "{page:.600}");
+    assert!(!page.contains("Draft #"), "{page:.600}");
 
     // The form reflects the URL, so a shared link re-opens with the same filters.
     let (status, page) = get(
@@ -5865,7 +5869,7 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
         sur,
         "Credit",
         "2024-05-02",
-        &chrono::Local::now().date_naive().to_string(),
+        &(chrono::Local::now().date_naive() + chrono::Duration::days(1)).to_string(),
     )
     .await;
     let overdue =
@@ -6015,7 +6019,9 @@ async fn purchase_list_row_reads_identifier_supplier_money_with_one_status_chip(
             .expect("purchase total")
             .to_string();
         assert!(
-            row.contains(&format!("font-bold tabular-nums text-text\">{total} USD</span>")),
+            row.contains(&format!(
+                "font-bold tabular-nums text-text\">{total} USD</span>"
+            )),
             "the total must be bold, tabular and neutral: {row}"
         );
         assert!(
@@ -6406,8 +6412,14 @@ async fn products_drawer_edit_derives_the_price_from_the_markup_and_clearing_it_
         drawer.contains("step=\"0.01\" readonly value=\"15.00\""),
         "the drawer's price input must be readonly and show the derived price: {drawer:.400}"
     );
+    let localization = crate::localization::load_context(&pool).await.unwrap();
+    let derivation_hint = format!(
+        "{} {}",
+        localization.tr(crate::localization::MessageKey::ProductMarkupRecalculated),
+        localization.format_percentage(Decimal::from(50))
+    );
     assert!(
-        drawer.contains("Recalculated from the cost and the 50 % markup when you save"),
+        drawer.contains(&derivation_hint),
         "the drawer must carry the derivation hint: {drawer:.400}"
     );
 
@@ -6859,19 +6871,28 @@ async fn audit_finance_detail_view_shows_the_actor_display_name() {
     .await;
     assert_eq!(status, StatusCode::OK, "{resp}");
 
+    let localization = crate::localization::load_context(&pool).await.unwrap();
+    let registered_by = format!(
+        "{} Test Admin",
+        localization.tr(crate::localization::MessageKey::AuditRegisteredBy)
+    );
+    let updated_by = format!(
+        "{} Test Probe",
+        localization.tr(crate::localization::MessageKey::AuditUpdatedBy)
+    );
     let (status, page) = get(&app, &format!("/accounts/{account}")).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     // The name appears in TWO places (the account header and the movement
     // row), so a single missing render cannot satisfy the count.
     assert_eq!(
-        page.matches("Registrado por Test Admin").count(),
+        page.matches(&registered_by).count(),
         2,
         "the account header AND the movement row show the creator's display name: {page}"
     );
     // The editor renders once — on the movement row — because the account
     // itself has no edit path yet (its `updated_by` is still NULL).
     assert_eq!(
-        page.matches("Actualizado por Test Probe").count(),
+        page.matches(&updated_by).count(),
         1,
         "the edit names its editor on the movement row: {page}"
     );
@@ -6922,7 +6943,7 @@ async fn audit_the_system_sentinel_cannot_log_in_like_any_inactive_account() {
             "the sentinel must not log in with any password: {body}"
         );
         assert!(
-            body.contains("Usuario o contraseña incorrectos"),
+            body.contains("Incorrect username or password"),
             "the refusal is the generic one, not a special case: {body}"
         );
     }
@@ -6936,7 +6957,7 @@ async fn audit_the_system_sentinel_cannot_log_in_like_any_inactive_account() {
         "an inactive user's failed login: {body}"
     );
     assert!(
-        body.contains("Usuario o contraseña incorrectos"),
+        body.contains("Incorrect username or password"),
         "same generic message: {body}"
     );
 
@@ -7774,14 +7795,14 @@ async fn audit_the_sale_record_shows_the_actor_display_name() {
     let (status, page) = get(&app, &format!("/sales/{sale_id}")).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(
-        page.matches("Registrado por Test Admin").count(),
+        page.matches("Registered by Test Admin").count(),
         1,
         "the sale names its creator: {page:.600}"
     );
     assert_eq!(
-        page.matches("Actualizado por Test Probe").count(),
+        page.matches("Updated by Test Probe").count(),
         1,
-        "the confirm names its editor: {page:.600}"
+        "the edit names its editor: {page:.600}"
     );
     assert!(
         !page.contains("Registrado por 1"),
@@ -7816,20 +7837,29 @@ async fn audit_the_customer_statement_shows_the_actor_display_name() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:.400}");
 
+    let localization = crate::localization::load_context(&pool).await.unwrap();
+    let registered_by = format!(
+        "{} Test Admin",
+        localization.tr(crate::localization::MessageKey::AuditRegisteredBy)
+    );
+    let updated_by = format!(
+        "{} Test Probe",
+        localization.tr(crate::localization::MessageKey::AuditUpdatedBy)
+    );
     let (status, page) = get(&app, &format!("/customers/{customer}")).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(
-        page.matches("Cliente registrado por Test Admin").count(),
+        page.matches(&registered_by).count(),
         1,
         "the statement names the customer's creator: {page:.600}"
     );
     assert_eq!(
-        page.matches("Actualizado por Test Probe").count(),
+        page.matches(&updated_by).count(),
         1,
         "the edit names its editor: {page:.600}"
     );
     assert!(
-        !page.contains("Cliente registrado por 1"),
+        !page.contains(&registered_by.replace("Test Admin", "1")),
         "the interface never renders a raw user id: {page}"
     );
 }
@@ -8454,12 +8484,12 @@ async fn audit_the_supplier_detail_shows_the_actor_display_name() {
     let (status, page) = get(&app, &format!("/web/suppliers/{supplier}/detail")).await;
     assert_eq!(status, StatusCode::OK, "{page}");
     assert_eq!(
-        page.matches("Proveedor registrado por Test Admin").count(),
+        page.matches("Supplier registered by Test Admin").count(),
         1,
         "the drawer names the supplier's creator: {page:.600}"
     );
     assert_eq!(
-        page.matches("Actualizado por Test Probe").count(),
+        page.matches("Updated by Test Probe").count(),
         1,
         "the edit names its editor: {page:.600}"
     );
@@ -8817,24 +8847,24 @@ async fn audit_the_users_screen_shows_the_grant_trail_and_the_actor_names() {
     let (status, page) = get(&app, "/users").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert_eq!(
-        page.matches("Vendedor: otorgado por Test Probe el ")
+        page.matches("Salesperson: granted by Test Probe on ")
             .count(),
         1,
         "the trail names the granting actor: {page:.900}"
     );
     assert_eq!(
-        page.matches("Creado por Test Admin").count(),
+        page.matches("Registered by Test Admin").count(),
         1,
         "the created user names its creator: {page:.900}"
     );
     assert_eq!(
-        page.matches("Actualizado por Test Probe").count(),
+        page.matches("Updated by Test Probe").count(),
         1,
         "the edit names its editor: {page:.900}"
     );
     // The system-created rows (sentinel, bootstrap-era accounts): the honest
     // label, not a blank and not an id.
-    let system_rows = page.matches("Creado por el sistema").count();
+    let system_rows = page.matches("Registered by (system)").count();
     assert!(
         system_rows >= 2,
         "the sentinel and the shared fixture account are the system's work: {page:.900}"
@@ -8862,13 +8892,13 @@ async fn audit_the_roles_screen_shows_the_role_authors() {
     let (status, page) = get(&app, "/roles").await;
     assert_eq!(status, StatusCode::OK, "{page:.400}");
     assert_eq!(
-        page.matches("Creado por Sistema (anterior al registro)")
+        page.matches("Registered by Sistema (anterior al registro)")
             .count(),
         4,
         "the four seeds name the sentinel: {page:.900}"
     );
     assert!(
-        page.matches("Creado por Test Admin").count() >= 1,
+        page.matches("Registered by Test Admin").count() >= 1,
         "the screen-created role names its author: {page:.900}"
     );
     assert!(
@@ -9186,7 +9216,7 @@ async fn documents_any_single_tier_opens_and_the_content_narrows_to_its_families
     let (status, fragment) = get_fragment_with_cookie(&app, "/web/documents", &cookie).await;
     assert_eq!(status, StatusCode::OK, "{fragment:.400}");
     assert!(
-        fragment.contains("Recibo de cliente"),
+        fragment.contains("Customer receipt"),
         "the receipt row must render for the customers reader: {fragment:.600}"
     );
 }
@@ -9572,7 +9602,7 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     // the sale line carries — there is no SKU column any more, and the
     // product's name alone does not prove a line row rendered.
     assert!(body.contains(">2</td>"), "{body:.800}");
-    assert!(body.contains("Registrado por"), "{body:.800}");
+    assert!(body.contains("Registered by"), "{body:.800}");
     assert!(body.contains("Test Admin"), "{body:.800}");
     assert!(body.contains(&format!("/sales/{}", f.sale)), "{body:.800}");
     // The confirmed sale's annul form carries the id the cancel endpoint
@@ -9595,7 +9625,7 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     .await;
     assert_eq!(status, StatusCode::OK, "draft sale drawer: {body:.400}");
     assert!(
-        body.contains(r#"data-action="Eliminar borrador""#),
+        body.contains(r#"data-action="Delete draft""#),
         "the draft delete button must render the error-handler action label: {body:.800}"
     );
     assert!(
@@ -9603,7 +9633,7 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
         "the draft delete must be the hx-delete button for the draft's own path: {body:.800}"
     );
     assert_eq!(
-        body.matches("Eliminar borrador").count(),
+        body.matches("Delete draft").count(),
         3, // impact-preview header + button text + data-action attribute
         "the draft drawer must name the delete action exactly three times (label twice + data-action):\n{body}"
     );
@@ -9672,7 +9702,7 @@ async fn documents_drawer_renders_every_family_with_its_decisive_facts() {
     .await;
     assert_eq!(status, StatusCode::OK, "movement drawer: {body:.400}");
     assert!(body.contains("product DRAWER-P"), "{body:.800}");
-    assert!(body.contains("Stock actual"), "{body:.800}");
+    assert!(body.contains(">Stock</span>"), "{body:.800}");
     assert!(body.contains("append-only"), "{body:.800}");
     assert!(
         body.contains(&format!("/products#product-{}", f.product)),

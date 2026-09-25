@@ -5,7 +5,7 @@
    shared page-header component reads them without locals. The record page's
    action navigates (Record payment), so the dialog id stays empty. #}
 {% include "partials/page_header.html" %}
-<div id="purchase-record">
+<div id="purchase-record" data-saved-label="{{ localization.tr(crate::localization::MessageKey::PurchasesSaved) }}">
   {% include "partials/purchase_detail.html" %}
 </div>
 {# Receiving-desk T3 interactions (bar menu, dialogs).
@@ -76,7 +76,8 @@
     if (!detail.successful || !elt || !elt.matches || !elt.matches('#purchase-header-form')) return;
     var saved = document.getElementById('header-saved');
     if (!saved) return;
-    saved.textContent = 'Saved';
+    var record = document.getElementById('purchase-record');
+    saved.textContent = record ? record.dataset.savedLabel : '';
     if (headerSavedTimer) clearTimeout(headerSavedTimer);
     headerSavedTimer = setTimeout(function () { saved.textContent = ''; }, 2000);
   });

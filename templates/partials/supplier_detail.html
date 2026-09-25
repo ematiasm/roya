@@ -2,37 +2,31 @@
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="flex flex-wrap items-center gap-2">
       <span class="text-lg font-semibold">{{ supplier.name }}</span>
-      <span class="chip {% if supplier.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if supplier.is_active %}active{% else %}inactive{% endif %}</span>
+      <span class="chip {% if supplier.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if supplier.is_active %}{{ localization.tr(crate::localization::MessageKey::CommonActive) }}{% else %}{{ localization.tr(crate::localization::MessageKey::CommonInactive) }}{% endif %}</span>
     </div>
     {% if let Some(phone) = supplier.phone %}
-    <div class="text-[13px] text-muted">phone {{ phone }}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersPhone) }}: {{ phone }}</div>
     {% endif %}
     <div class="text-[13px] text-muted">
-      {% if let Some(days) = supplier.due_days %}default due term: {{ days }} days{% else %}default due term: none{% endif %}
+      {% if let Some(days) = supplier.due_days %}{{ localization.tr(crate::localization::MessageKey::SuppliersDefaultTerm) }}: {{ days }}{% else %}{{ localization.tr(crate::localization::MessageKey::SuppliersTermNone) }}{% endif %}
     </div>
     {% if let Some(notes) = supplier.notes %}
     <div class="text-[13px] text-muted">{{ notes }}</div>
     {% endif %}
-    {# Audit attribution (slice S12): the SUPPLIER row's creator and last
-       editor, rendered as display names the wiring layer resolved. Labelled
-       for what it is — the supplier record's attribution, not the balance or
-       the purchases below — so neither can be misread as this person's work. #}
-    <div class="text-[13px] text-muted" data-supplier-actor>Proveedor registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
-
-    <div class="my-2 text-2xl font-bold">{{ localization.format_currency(balance.clone()) }} <span class="text-[13px] text-muted">outstanding across Confirmed purchases</span></div>
-
+    <div class="text-[13px] text-muted" data-supplier-actor>{{ localization.tr(crate::localization::MessageKey::SuppliersRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ editor }}{% endif %}</div>
+    <div class="my-2 text-2xl font-bold">{{ localization.format_currency(balance.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersOutstanding) }}</span></div>
     <div class="mt-4 flex items-center gap-2">
       {% if supplier.is_active %}
-      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Deactivate</button>
+      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
       {% else %}
-      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/activate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Activate</button>
+      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/activate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}</button>
       {% endif %}
-      <button type="button" class="btn-secondary" hx-delete="/web/suppliers/{{ supplier.id }}" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">Delete</button>
+      <button type="button" class="btn-secondary" hx-delete="/web/suppliers/{{ supplier.id }}" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
     </div>
   </section>
 
   <section class="rounded-2xl border border-border bg-card p-5">
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Pay supplier</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersPay) }}</div>
     <form class="flex flex-col gap-2.5"
           hx-post="/web/supplier-payments"
           hx-target="#supplier-drawer-body"
@@ -41,29 +35,29 @@
       <input type="hidden" name="supplier_id" value="{{ supplier.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Amount</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
           <input type="text" inputmode="decimal" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label class="field-label">Date</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
           <input type="date" name="date" required value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label class="field-label">Method (the account is derived from it)</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersMethodDerived) }}</label>
         <select name="method_id" required class="field">
           {% for m in method_options %}
-          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
+          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_deref()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
           {% endfor %}
         </select>
       </div>
-      <button type="submit" class="btn-primary">Pay supplier</button>
-      <div class="text-[13px] text-muted">Applies oldest debt first, one payment per covered purchase. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account.</div>
+      <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SuppliersPay) }}</button>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersPayHelp) }}</div>
     </form>
   </section>
 
   <section class="rounded-2xl border border-border bg-card p-5">
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Record Product Cost</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersRecordCost) }}</div>
     <form class="flex flex-col gap-2.5"
           hx-post="/web/supplier-costs"
           hx-target="#supplier-drawer-body"
@@ -71,7 +65,7 @@
           hx-on::after-request="if(event.detail.successful) this.reset()">
       <input type="hidden" name="supplier_id" value="{{ supplier.id }}" class="field" />
       <div>
-        <label class="field-label">Product</label>
+        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesProduct) }}</label>
         <select name="product_id" required class="field">
           {% for p in products %}
           <option value="{{ p.id }}">{{ p.sku }} — {{ p.name }}</option>
@@ -80,34 +74,32 @@
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">Cost</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCost) }}</label>
           <input type="text" inputmode="decimal" name="cost" step="0.01" min="0" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label class="field-label">Date</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
           <input type="date" name="date" value="{{ today }}" class="field" />
         </div>
       </div>
-      <button type="submit" class="btn-primary">Record Cost</button>
-      <div class="text-[13px] text-muted">Unknown product ⇒ 400; a date older than the current cost date ⇒ 400. Also at <code>POST /api/product-supplier-costs</code></div>
+      <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SuppliersRecordCost) }}</button>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersRecordCostHelp) }}</div>
     </form>
   </section>
 
   <section class="rounded-2xl border border-border bg-card p-5">
-    <div class="mb-1.5 font-bold text-[13px] text-muted">Purchases ({{ purchases.len() }})</div>
+    <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::NavigationPurchases) }} ({{ purchases.len() }})</div>
     {% if purchases.is_empty() %}
-      <div class="text-[13px] text-muted">No purchases from this supplier yet.</div>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersNoPurchases) }}</div>
     {% else %}
       {% for d in purchases %}
-      {# A row, not a control: the anchor is the row, carrying the flex layout
-         and its colour — the row's appearance is the layout rather than a control's. #}
       <a href="/purchases/{{ d.purchase.id }}" class="mb-2 flex items-center justify-between gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-text hover:border-accent2">
         <div class="flex flex-col">
           <div class="flex flex-wrap items-center gap-2">
-            <span class="chip chip-muted">{{ d.purchase.status }}</span>
-            <span class="font-semibold">{% if let Some(n) = d.purchase.purchase_number %}{{ n }}{% else %}purchase #{{ d.purchase.id }}{% endif %}</span>
+            <span class="chip chip-muted">{% if d.purchase.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if d.purchase.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
+            <span class="font-semibold">{% if let Some(n) = d.purchase.purchase_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::DocumentsPurchase) }} #{{ d.purchase.id }}{% endif %}</span>
           </div>
-          <span class="text-[13px] text-muted">{{ localization.format_date(d.purchase.purchase_date.clone()) }} • total {{ localization.format_currency(d.total.clone()) }} • paid {{ localization.format_currency(d.paid.clone()) }}</span>
+          <span class="text-[13px] text-muted">{{ localization.format_date(d.purchase.purchase_date.clone()) }} • {{ localization.format_currency(d.total.clone()) }} • {{ localization.tr(crate::localization::MessageKey::PurchasesPaid) }} {{ localization.format_currency(d.paid.clone()) }}</span>
         </div>
         <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_currency(d.due.clone()) }}</span>
       </a>

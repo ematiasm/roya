@@ -89,6 +89,7 @@ struct CustomersTemplate {
 struct CustomerListPartial {
     customers: Vec<CustomerRow>,
     warning: Option<String>,
+    localization: LocalizationContext,
 }
 
 /// The slide-over drawer body: the statement (header, balance, ageing,
@@ -256,10 +257,18 @@ async fn customer_rows(
         .collect())
 }
 
-fn render_list(customers: Vec<CustomerRow>, warning: Option<String>) -> AppResult<Html<String>> {
-    let html = CustomerListPartial { customers, warning }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+fn render_list(
+    customers: Vec<CustomerRow>,
+    warning: Option<String>,
+    localization: &LocalizationContext,
+) -> AppResult<Html<String>> {
+    let html = CustomerListPartial {
+        customers,
+        warning,
+        localization: localization.clone(),
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -269,7 +278,7 @@ async fn list_response(
     localization: &LocalizationContext,
 ) -> AppResult<Response> {
     let rows = customer_rows(state, localization).await?;
-    Ok(render_list(rows, warning)?.into_response())
+    Ok(render_list(rows, warning, localization)?.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +293,10 @@ async fn customers_page(
 ) -> Result<Html<String>, AppError> {
     let customers = customer_rows(&state, &localization).await?;
     let tmpl = CustomersTemplate {
-        title: "Roya — Customers".to_string(),
+        title: format!(
+            "Roya — {}",
+            localization.tr(crate::localization::MessageKey::CustomerTitle)
+        ),
         localization,
         customers,
         statement: None,
@@ -326,7 +338,11 @@ async fn customer_statement_page(
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let (created_by_name, updated_by_name) = customer_actor_names(&state, &customer).await?;
     let tmpl = CustomersTemplate {
-        title: format!("Roya — Statement: {}", customer.name),
+        title: format!(
+            "Roya — {}: {}",
+            localization.tr(crate::localization::MessageKey::CustomerTitle),
+            customer.name
+        ),
         localization: localization.clone(),
         customers: customer_rows(&state, &localization).await?,
         statement: Some(statement),
@@ -427,8 +443,8 @@ async fn web_customer_receipts(
         localization,
         receipts,
     }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -528,10 +544,12 @@ async fn web_create_customer(
             .iter()
             .map(|c| format!("#{} {}", c.id, c.name))
             .collect();
-        Some(format!(
-            "A customer named \"{}\" already exists: {}. Duplicate names are allowed.",
-            result.customer.name,
-            matches.join(", ")
+        Some(localization.tr_with(
+            crate::localization::MessageKey::CustomerDuplicateWarning,
+            &[
+                ("name", &result.customer.name),
+                ("matches", &matches.join(", ")),
+            ],
         ))
     };
     if is_htmx(&headers) {
@@ -669,7 +687,9 @@ async fn web_collect_receipt(
         )
         .await?;
     if is_htmx(&headers) {
-        return Ok(detail_html(&state, form.customer_id, localization).await?.into_response());
+        return Ok(detail_html(&state, form.customer_id, localization)
+            .await?
+            .into_response());
     }
     Ok(Redirect::to(&format!("/customers/{}", form.customer_id)).into_response())
 }
@@ -737,6 +757,26 @@ mod tests {
         // must report the customer as over limit (the 400 path is covered by the
         // REST and smoke suites).
         AppState::new_with_credit_limit(pool, false, true, false)
+    }
+
+    async fn set_locale(state: &AppState, locale_code: &str, language_code: &str) {
+        sqlx::query("INSERT OR IGNORE INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES (?, ?, ?, 1)")
+            .bind(locale_code)
+            .bind(language_code)
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', ?, 'USD', 'UTC')")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = ? WHERE id = 1")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
     }
 
     async fn get_html(app: axum::Router, uri: &str) -> (StatusCode, String) {
@@ -906,6 +946,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seeded_payment_method_labels_are_bilingual_and_ids_stay_canonical() {
+        let state = test_state().await;
+        let fixture = seed_fixture(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        set_locale(&state, "en-US", "en").await;
+        let (status, html) = get_html(
+            app.clone(),
+            &format!("/web/customers/detail/{}", fixture.customer),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let method_options = html.split("name=\"method_id\"").nth(1).unwrap_or(&html);
+        assert!(method_options.contains("Cash — Caja"), "{method_options}");
+        assert!(
+            method_options.contains("Bank transfer — unassigned"),
+            "{method_options}"
+        );
+        assert!(
+            html.contains(&format!("value=\"{}\"", fixture.cash)),
+            "the canonical method id must remain unchanged: {html:.1200}"
+        );
+
+        set_locale(&state, "es-ES", "es").await;
+        let (status, html) =
+            get_html(app, &format!("/web/customers/detail/{}", fixture.customer)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Efectivo — Caja"), "{html:.1200}");
+        assert!(
+            html.contains("Transferencia bancaria — sin asignar"),
+            "{html:.1200}"
+        );
+    }
+
+    #[tokio::test]
     async fn web_customers_page_is_names_only_with_drawer_and_modal() {
         let state = test_state().await;
         let fixture = seed_fixture(&state).await;
@@ -962,7 +1037,7 @@ mod tests {
             "Ageing",
             "Receivable sales",
             "75",
-            "over limit",
+            "Over limit",
             "Collect",
             "Payment history",
         ] {
@@ -986,10 +1061,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         for expected in [
             "Ana Web",
-            "current",
-            "1-30",
+            "Current",
+            "1–30",
             "75",
-            "over limit",
+            "Over limit",
             "Collect",
             "Payment history",
         ] {
@@ -1455,8 +1530,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.300}");
         assert!(
-            body.contains("Acción no permitida"),
-            "the refusal must speak Spanish: {body:.300}"
+            body.contains("Action not permitted"),
+            "the refusal must use the English fallback: {body:.300}"
         );
         assert!(
             body.contains("customers.write"),
@@ -1566,7 +1641,7 @@ mod tests {
             let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
             assert!(
-                html.contains("Acción no permitida") && html.contains("customers.read"),
+                html.contains("Action not permitted") && html.contains("customers.read"),
                 "{uri} must refuse naming customers.read: {html:.300}"
             );
         }

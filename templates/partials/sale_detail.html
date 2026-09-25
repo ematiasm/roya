@@ -11,20 +11,20 @@
 {% import "partials/product_search_results.html" as picker %}
 {% macro record_money(record, localization) %}
 <div id="sale-record-money">
-  <div class="my-2 text-2xl font-bold">{{ localization.format_currency(record.total.clone()) }} <span class="text-[13px] text-muted">paid {{ localization.format_currency(record.paid.clone()) }} • due {{ localization.format_currency(record.due.clone()) }}</span></div>
+  <div class="my-2 text-2xl font-bold">{{ localization.format_currency(record.total.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesPaid) }} {{ localization.format_currency(record.paid.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_currency(record.due.clone()) }}</span></div>
 
-  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Lines ({{ record.lines.len() }})</div>
+  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr_count(crate::localization::MessageKey::SalesLines, record.lines.len()) }}</div>
   {% if record.lines.is_empty() %}
-    <div class="empty p-3">No lines yet{% if record.sale.status.to_string() == "Draft" %} — add one below.{% else %}.{% endif %}</div>
+    <div class="empty p-3">{{ localization.tr(crate::localization::MessageKey::SalesNoLines) }}{% if record.sale.status.to_string() == "Draft" %} — add one below.{% else %}.{% endif %}</div>
   {% else %}
     <div class="overflow-x-auto">
       <table class="w-full border-collapse text-sm">
         <thead>
           <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
-            <th class="py-2 pr-3">Product</th>
-            <th class="py-2 pr-3 text-right">Qty</th>
-            <th class="py-2 pr-3 text-right">Unit price</th>
-            <th class="py-2 pr-3 text-right">Subtotal</th>
+            <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::SalesProduct) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::SalesQuantity) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::SalesUnitPrice) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::SalesSubtotal) }}</th>
             {% if record.sale.status.to_string() == "Draft" %}<th class="py-2"></th>{% endif %}
           </tr>
         </thead>
@@ -43,7 +43,7 @@
               <button class="btn-secondary"
                       hx-delete="/web/sales/{{ record.sale.id }}/lines/{{ line.id }}"
                       hx-target="#sale-record" hx-swap="innerHTML"
-                      aria-label="Remove line">✕</button>
+                      aria-label="{{ localization.tr(crate::localization::MessageKey::SalesRemoveLine) }}">✕</button>
             </td>
             {% endif %}
           </tr>
@@ -57,46 +57,45 @@
 
 <div id="sale-record-inner" data-sale-record>
   <div class="mb-3 flex flex-wrap items-center gap-2">
-    <span class="chip {% if record.sale.status.to_string() == "Confirmed" %}chip-income{% else if record.sale.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{{ record.sale.status }}</span>
-    <span class="chip {% if record.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{{ record.payment_status }}</span>
-    <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{{ record.sale.payment_type }}</span>
+    <span class="chip {% if record.sale.status.to_string() == "Confirmed" %}chip-income{% else if record.sale.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{% if record.sale.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if record.sale.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
+    <span class="chip {% if record.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{% if record.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if record.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>
+    <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{% if record.sale.payment_type.to_string() == "Cash" %}{{ localization.tr(crate::localization::MessageKey::ValueCash) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ValueCredit) }}{% endif %}</span>
     <span class="text-base font-bold">
-      {% if let Some(n) = record.sale.sale_number %}{{ n }}{% else %}Draft sale{% endif %}
+      {% if let Some(n) = record.sale.sale_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::SalesDraft) }}{% endif %}
     </span>
   </div>
   <div class="mb-1 text-[13px] text-muted">
-    {% if record.sale.customer_name.is_empty() %}Walk-in{% else %}{{ record.sale.customer_name }}{% endif %}
-     • {{ localization.format_date(record.sale.sale_date.clone()) }}{% if let Some(due) = record.sale.due_date %} • due {{ localization.format_date(due.clone()) }}{% endif %}
+    {% if record.sale.customer_name.is_empty() %}{{ localization.tr(crate::localization::MessageKey::SalesWalkIn) }}{% else %}{{ record.sale.customer_name }}{% endif %}
+     • {{ localization.format_date(record.sale.sale_date.clone()) }}{% if let Some(due) = record.sale.due_date %} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_date(due.clone()) }}{% endif %}
   </div>
   {% if let Some(r) = record.sale.receipt_no %}
-    <div class="text-[13px] text-muted">receipt {{ r }}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesReceipt) }} {{ r }}</div>
   {% endif %}
   {# Audit attribution (slice S11): the sale's creator and its last editor (a
      header edit, the confirm or the cancel), rendered as display names the
      wiring layer resolved. #}
-  <div class="text-[13px] text-muted" data-sale-actor>Registrado por {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
+  <div class="text-[13px] text-muted" data-sale-actor>{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ editor }}{% endif %}</div>
   {% if !record.sale.notes.is_empty() %}
     <div class="text-[13px] text-muted">{{ record.sale.notes }}</div>
   {% endif %}
   {% if let Some(c) = record.sale.cancel_reason %}
-    <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-cancel-reason>Cancelled: {{ c }}</div>
+    <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-cancel-reason>{{ localization.tr(crate::localization::MessageKey::SalesCancelled) }}: {{ c }}</div>
   {% endif %}
-
 
            {% call record_money(record, localization) %}
 
-  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">Payments ({{ record.payments.len() }})</div>
+  <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr_count(crate::localization::MessageKey::SalesPayments, record.payments.len()) }}</div>
   {% if record.payments.is_empty() %}
-    <div class="text-[13px] text-muted">No payments recorded.</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesNoPayments) }}</div>
   {% else %}
     <div class="overflow-x-auto">
       <table class="w-full border-collapse text-sm">
         <thead>
           <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
-            <th class="py-2 pr-3">Date</th>
-            <th class="py-2 pr-3">Account</th>
-            <th class="py-2 pr-3">Method</th>
-            <th class="py-2 pr-3 text-right">Amount</th>
+            <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</th>
+            <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::NavigationAccount) }}</th>
+            <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::DocumentsMethod) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</th>
           </tr>
         </thead>
         <tbody>
@@ -104,7 +103,7 @@
           <tr class="border-b border-border/60" id="sale-payment-{{ pay.id }}">
              <td class="py-2.5 pr-3 tabular-nums">{{ localization.format_date(pay.date.clone()) }}</td>
             <td class="py-2.5 pr-3">{{ pay.account_name }}</td>
-            <td class="py-2.5 pr-3">{{ pay.method_name }}</td>
+            <td class="py-2.5 pr-3">{{ localization.payment_method_display_name(pay.method_name.as_str()) }}</td>
              <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-income">{{ localization.format_currency(pay.amount.clone()) }}</td>
           </tr>
           {% endfor %}
@@ -117,66 +116,66 @@
   {% if record.sale.status.to_string() == "Draft" %}
   <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
     <div class="rounded-2xl border border-border bg-card p-4" id="add-line">
-      <h2 class="mb-3 text-base font-semibold">Add line</h2>
-      {% call picker::line_picker(false, "sales", record.sale.id, "#sale-record-money", "line-unit-price", "unit_price", "Unit price (empty = list)", "list price", "sale") %}
+      <h2 class="mb-3 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesAddLine) }}</h2>
+      {% call picker::line_picker(false, "sales", record.sale.id, "#sale-record-money", "line-unit-price", "unit_price", localization.tr(crate::localization::MessageKey::SalesUnitPriceList), localization.tr(crate::localization::MessageKey::SalesListPrice), "sale", localization) %}
     </div>
 
     <div class="rounded-2xl border border-border bg-card p-4" id="confirm-sale">
-      <h2 class="mb-3 text-base font-semibold">Confirm sale</h2>
-      <form class="flex flex-col gap-2.5" data-action="Confirm sale"
+      <h2 class="mb-3 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesConfirm) }}</h2>
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesConfirm) }}"
             hx-post="/web/sales/{{ record.sale.id }}/confirm"
             hx-target="#sale-record" hx-swap="innerHTML">
         <div>
-          <label for="confirm-method" class="field-label">Method (Cash only; the account is derived from it)</label>
+          <label for="confirm-method" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesMethodCash) }}</label>
           <select id="confirm-method" name="method_id" class="field">
-            <option value="">— none (Credit) —</option>
+            <option value="">{{ localization.tr(crate::localization::MessageKey::SalesNoMethodCredit) }}</option>
             {% for m in method_options %}
-            <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
+            <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_deref()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
             {% endfor %}
           </select>
         </div>
-        <button type="submit" class="btn-primary">Confirm</button>
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesConfirmAction) }}</button>
       </form>
     </div>
 
     <div class="rounded-2xl border border-border bg-card p-4" id="edit-header">
-      <h2 class="mb-3 text-base font-semibold">Edit header</h2>
-      <form class="flex flex-col gap-2.5" data-action="Edit header"
+      <h2 class="mb-3 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesEditHeader) }}</h2>
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesEditHeader) }}"
             hx-post="/web/sales/{{ record.sale.id }}/header"
             hx-target="#sale-record" hx-swap="innerHTML">
         <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
-            <label for="header-sale-date" class="field-label">Sale date</label>
+            <label for="header-sale-date" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesDate) }}</label>
             <input type="date" id="header-sale-date" name="sale_date" required value="{{ record.sale.sale_date }}" class="field" />
           </div>
           <div>
-            <label for="header-due-date" class="field-label">Due date (Credit only)</label>
+            <label for="header-due-date" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesDueCredit) }}</label>
             <input type="date" id="header-due-date" name="due_date" value="{% if let Some(due) = record.sale.due_date %}{{ due }}{% endif %}" class="field" />
           </div>
         </div>
         <div>
-          <label for="header-receipt-no" class="field-label">Receipt no (optional)</label>
+          <label for="header-receipt-no" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesReceiptOptional) }}</label>
           <input type="text" id="header-receipt-no" name="receipt_no" maxlength="64" value="{% if let Some(r) = record.sale.receipt_no %}{{ r }}{% endif %}" class="field" />
         </div>
         <div>
-          <label for="header-notes" class="field-label">Notes</label>
+          <label for="header-notes" class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }}</label>
           <input type="text" id="header-notes" name="notes" maxlength="512" value="{{ record.sale.notes }}" class="field" />
         </div>
-        <button type="submit" class="btn-primary">Save header</button>
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesSaveHeader) }}</button>
       </form>
     </div>
 
     <div class="rounded-2xl border border-border bg-card p-4" id="discard-sale">
-      <h2 class="mb-3 text-base font-semibold">Discard draft</h2>
-      <form class="flex flex-col gap-2.5" data-action="Discard draft"
+      <h2 class="mb-3 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesDiscard) }}</h2>
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesDiscard) }}"
             hx-post="/web/sales/{{ record.sale.id }}/cancel"
-            hx-confirm="Discard this draft? Nothing was posted to stock or finance yet."
+            hx-confirm="{{ localization.tr(crate::localization::MessageKey::SalesDiscardConfirm) }}"
             hx-target="#sale-record" hx-swap="innerHTML">
         <div>
-          <label for="discard-reason" class="field-label">Reason (optional)</label>
+          <label for="discard-reason" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesReasonOptional) }}</label>
           <input type="text" id="discard-reason" name="reason" maxlength="256" class="field" />
         </div>
-        <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Discard draft</button>
+        <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">{{ localization.tr(crate::localization::MessageKey::SalesDiscard) }}</button>
       </form>
     </div>
   </div>
@@ -185,62 +184,56 @@
     <div class="mt-5 grid grid-cols-1 gap-4 min-[760px]:grid-cols-2">
       {% if record.sale.payment_type.to_string() == "Credit" %}
       <div class="rounded-2xl border border-border bg-card p-4" id="record-payment">
-        <h2 class="mb-3 text-base font-semibold">Record payment</h2>
-        <form class="flex flex-col gap-2.5" data-action="Record payment"
+        <h2 class="mb-3 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesRecordPayment) }}</h2>
+        <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesRecordPayment) }}"
               hx-post="/web/sales/{{ record.sale.id }}/payments"
               hx-target="#sale-record" hx-swap="innerHTML">
           <div>
-            <label for="payment-method" class="field-label">Method (the account is derived from it)</label>
+            <label for="payment-method" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesMethodDerived) }}</label>
             <select id="payment-method" name="method_id" required class="field">
               {% for m in method_options %}
-              <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ m.label() }}{% if !m.is_active %} (inactive){% endif %}</option>
+              <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_deref()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
               {% endfor %}
             </select>
           </div>
           <div class="flex gap-2.5 [&>*]:flex-1">
             <div>
-              <label for="payment-amount" class="field-label">Amount</label>
+              <label for="payment-amount" class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
               <input type="text" inputmode="decimal" id="payment-amount" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
             </div>
             <div>
-              <label for="payment-date" class="field-label">Date</label>
+              <label for="payment-date" class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
               <input type="date" id="payment-date" name="date" required value="{{ today }}" class="field" />
             </div>
           </div>
-          <button type="submit" class="btn-primary">Record payment</button>
+          <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesRecordPayment) }}</button>
         </form>
       </div>
       {% endif %}
 
       <div class="rounded-2xl border border-border bg-card p-4" id="cancel-sale">
-        <h2 class="mb-3 text-base font-semibold">Cancel sale</h2>
-        <form class="flex flex-col gap-2.5" data-action="Cancel sale"
+        <h2 class="mb-3 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesCancel) }}</h2>
+        <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesCancel) }}"
               hx-post="/web/sales/{{ record.sale.id }}/cancel"
-              hx-confirm="Cancel this sale? Stock returns and recorded payments are refunded."
+              hx-confirm="{{ localization.tr(crate::localization::MessageKey::SalesCancelConfirm) }}"
               hx-target="#sale-record" hx-swap="innerHTML">
           <div>
-            <label for="cancel-reason" class="field-label">Reason</label>
-            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="customer return…" class="field" />
+            <label for="cancel-reason" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesReason) }}</label>
+            <input type="text" id="cancel-reason" name="reason" maxlength="256" placeholder="{{ localization.tr(crate::localization::MessageKey::SalesCancelReasonPlaceholder) }}" class="field" />
           </div>
-          <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">Cancel sale</button>
+          <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">{{ localization.tr(crate::localization::MessageKey::SalesCancel) }}</button>
         </form>
       </div>
     </div>
     {% else if record.sale.status.to_string() == "Cancelled" %}
     {% if record.sale.sale_number.is_none() %}
-    {# A sale discarded while still Draft: `sale_number` never got assigned,
-       so nothing was posted and the row is garbage — offer its delete with
-       the native confirm the destructive controls use. The empty 200
-       response (its `HX-Trigger` refreshes the listening pages) clears
-       `#sale-record`; a cancelled-after-confirmed record carries a number
-       and renders nothing here — the service would refuse anyway. #}
     <div class="mt-3 mb-1">
       <button type="button"
               class="btn-danger"
-              data-action="Delete sale"
+              data-action="{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}"
               hx-delete="/web/sales/{{ record.sale.id }}"
-              hx-confirm="Delete this discarded sale? This cannot be undone."
-              hx-target="#sale-record" hx-swap="innerHTML">Delete</button>
+              hx-confirm="{{ localization.tr(crate::localization::MessageKey::SalesDeleteDiscarded) }}"
+              hx-target="#sale-record" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
     </div>
     {% endif %}
     {% endif %}
@@ -249,4 +242,4 @@
 
 {# The line response keeps the picker outside the swapped money region and swaps
    it out of band with an empty, focused field, so the next scan lands there. #}
-{% if oob_picker %}{% call picker::line_picker(true, "sales", record.sale.id, "#sale-record-money", "line-unit-price", "unit_price", "Unit price (empty = list)", "list price", "sale") %}{% endif %}
+{% if oob_picker %}{% call picker::line_picker(true, "sales", record.sale.id, "#sale-record-money", "line-unit-price", "unit_price", localization.tr(crate::localization::MessageKey::SalesUnitPriceList), localization.tr(crate::localization::MessageKey::SalesListPrice), "sale", localization) %}{% endif %}

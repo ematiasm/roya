@@ -1,21 +1,21 @@
 {% extends "base.html" %}
 {% block html_lang %}{{ localization.locale_code }}{% endblock %}
-{% block title %}Roya — Dashboard{% endblock %}
+{% block title %}Roya — {{ localization.tr(crate::localization::MessageKey::NavigationDashboard) }}{% endblock %}
 {% block content %}
-{% let page_title = "Dashboard" %}
+{% let page_title = localization.tr(crate::localization::MessageKey::NavigationDashboard) %}
 {% let page_breadcrumb_label = "" %}
 {% let page_breadcrumb_href = "" %}
 {% let page_action_href = "#new-transaction" %}
-{% let page_action_label = "New transaction" %}
+{% let page_action_label = localization.tr(crate::localization::MessageKey::DashboardNewTransaction) %}
 {% let page_action_dialog = "" %}
 {% include "partials/page_header.html" %}
 <div class="grid grid-cols-1 gap-6 min-[900px]:grid-cols-[minmax(0,1fr)_360px]">
   <div class="flex flex-col gap-6">
     <!-- Total -->
     <div class="rounded-2xl border border-border bg-card p-5">
-      <div class="text-[13px] text-muted">Total Balance</div>
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardTotalBalance) }}</div>
       <div class="text-[32px] font-bold" id="total-balance">{{ localization.format_currency(total_balance.clone()) }}</div>
-      <div class="text-[13px] text-muted">{% if allow_negative %}Negative balances allowed{% else %}Negative balances blocked{% endif %} • Derived from transactions</div>
+      <div class="text-[13px] text-muted">{% if allow_negative %}{{ localization.tr(crate::localization::MessageKey::DashboardNegativeAllowed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::DashboardNegativeBlocked) }}{% endif %} • {{ localization.tr(crate::localization::MessageKey::DashboardDerivedTransactions) }}</div>
     </div>
 
     <!-- Accounts: the block the `accounts` nav entry names. It renders only
@@ -26,8 +26,8 @@
     {% if show_accounts %}
     <div class="rounded-2xl border border-border bg-card p-5" id="accounts">
       <div class="mb-3 flex items-center justify-between">
-        <h2 class="text-lg font-semibold">Accounts</h2>
-        <button class="btn-secondary" hx-get="/web/accounts" hx-target="#account-list" hx-swap="innerHTML">↻ Refresh</button>
+        <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::DashboardAccounts) }}</h2>
+        <button class="btn-secondary" hx-get="/web/accounts" hx-target="#account-list" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonRefresh) }}</button>
       </div>
       <div id="account-list"
            hx-get="/web/accounts"
@@ -40,19 +40,19 @@
 
     <!-- Transaction history (filtered) -->
     <div class="rounded-2xl border border-border bg-card p-5" id="tx-section">
-      <h2 class="mb-3 text-lg font-semibold">Recent Transactions</h2>
+      <h2 class="mb-3 text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::DashboardRecentTransactions) }}</h2>
       <div class="mb-3 flex flex-wrap gap-2">
         <select class="field min-w-[120px] flex-1" id="filter-account" name="account_id" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-from,#filter-to" hx-trigger="change">
-          <option value="">All accounts</option>
+          <option value="">{{ localization.tr(crate::localization::MessageKey::CommonAllAccounts) }}</option>
           {% for acc in accounts %}
           <option value="{{ acc.id }}">{{ acc.name }}</option>
           {% endfor %}
         </select>
-        <input class="field min-w-[120px] flex-1" id="filter-from" type="date" name="from" placeholder="From" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-to" hx-trigger="change" />
-        <input class="field min-w-[120px] flex-1" id="filter-to" type="date" name="to" placeholder="To" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-from" hx-trigger="change" />
+        <input class="field min-w-[120px] flex-1" id="filter-from" type="date" name="from" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardFrom) }}" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-to" hx-trigger="change" />
+        <input class="field min-w-[120px] flex-1" id="filter-to" type="date" name="to" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardTo) }}" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-from" hx-trigger="change" />
       </div>
       <div id="tx-list" hx-get="/web/transactions" hx-trigger="load" hx-swap="innerHTML">
-        <div class="text-[13px] text-muted">Loading…</div>
+        <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CommonLoading) }}</div>
       </div>
     </div>
   </div>
@@ -60,26 +60,26 @@
   <div class="flex flex-col gap-6">
     <!-- Create Account -->
     <div class="rounded-2xl border border-border bg-card p-5">
-      <h2 class="mb-3 text-lg font-semibold">Create Account</h2>
-      <form class="flex flex-col gap-2.5" data-action="Create account" hx-post="/web/accounts" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
+      <h2 class="mb-3 text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::DashboardCreateAccount) }}</h2>
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::DashboardCreateAccount) }}" hx-post="/web/accounts" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
         <div>
-          <label class="field-label">Name</label>
-          <input type="text" name="name" placeholder="Cash, Bank, MercadoPago…" required maxlength="64" class="field" />
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+          <input type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardAccountNamePlaceholder) }}" required maxlength="64" class="field" />
         </div>
         <fieldset class="card p-3 bg-transparent">
-          <legend class="px-1 text-[13px] text-muted">Accepted payment methods</legend>
+          <legend class="px-1 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardAcceptedMethods) }}</legend>
           <div class="flex flex-wrap gap-x-4 gap-y-2">
             {% for m in methods %}
             <label class="choice">
               <input type="checkbox" name="method_ids" value="{{ m.id }}" />
-              {{ m.name }}
+              {{ localization.payment_method_display_name(m.name.as_str()) }}
             </label>
             {% endfor %}
           </div>
-          <div class="mt-2 text-[13px] text-muted">Ticked methods join the new account (unassigned ones are assigned; ones owned elsewhere are duplicated). An account with no methods cannot record payments.</div>
+          <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardAccountMethodsHelp) }}</div>
         </fieldset>
-        <button type="submit" class="btn-primary">Create Account</button>
-        <div class="text-[13px] text-muted">HTMX — no page reload. Also available at <code>POST /api/accounts</code> + <code>PUT /api/accounts/:id/payment-methods</code></div>
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::DashboardCreateAccount) }}</button>
+        <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardCreateAccountHelp) }}</div>
       </form>
       <!-- hidden OOB target for account options refresh -->
       <div id="account-options" class="hidden"></div>
@@ -87,40 +87,40 @@
 
     <!-- Create Transaction -->
     <div class="rounded-2xl border border-border bg-card p-5" id="new-transaction">
-      <h2 class="mb-3 text-lg font-semibold">New Transaction</h2>
-      <form class="flex flex-col gap-2.5" data-action="Add transaction" hx-post="/web/transactions" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#tx-list','refresh'); }">
+      <h2 class="mb-3 text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::DashboardNewTransaction) }}</h2>
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::DashboardAddTransaction) }}" hx-post="/web/transactions" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#tx-list','refresh'); }">
         <div>
-          <label class="field-label">Account</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardAccount) }}</label>
           <select name="account_id" required id="tx-account-select" class="field">
             {% for acc in accounts %}
             <option value="{{ acc.id }}">{{ acc.name }} — {{ localization.format_currency(acc.balance.clone()) }}</option>
             {% endfor %}
           </select>
-          <div class="text-[13px] text-muted">If empty, create an account first.</div>
+          <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardAccountRequired) }}</div>
         </div>
         <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
-            <label class="field-label">Type</label>
+            <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardType) }}</label>
             <select name="type" required class="field">
-              <option value="Income">Income</option>
-              <option value="Expense">Expense</option>
+              <option value="Income">{{ localization.tr(crate::localization::MessageKey::DashboardIncome) }}</option>
+              <option value="Expense">{{ localization.tr(crate::localization::MessageKey::DashboardExpense) }}</option>
             </select>
           </div>
           <div>
-            <label class="field-label">Amount</label>
+            <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
             <input type="text" inputmode="decimal" name="amount" min="0.01" placeholder="100.00" required class="field" />
           </div>
         </div>
         <div>
-          <label class="field-label">Description</label>
-          <input type="text" name="description" placeholder="Salary, Groceries…" maxlength="256" class="field" />
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardDescription) }}</label>
+          <input type="text" name="description" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardDescriptionPlaceholder) }}" maxlength="256" class="field" />
         </div>
         <div>
-          <label class="field-label">Date</label>
+          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
           <input type="date" name="date" required value="{{ today }}" class="field" />
         </div>
-        <button type="submit" class="btn-primary">Add Transaction</button>
-        <div class="text-[13px] text-muted">Balance is always derived <code>SUM(Income) − SUM(Expense)</code>. Amount must be &gt; 0.</div>
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::DashboardAddTransaction) }}</button>
+        <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardTransactionHelp) }}</div>
       </form>
     </div>
 

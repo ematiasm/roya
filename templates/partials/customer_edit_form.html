@@ -1,6 +1,6 @@
 <div class="mb-3 flex items-center justify-between gap-6">
-  <h2 class="text-lg font-semibold">Edit customer</h2>
-  <button type="button" class="btn-secondary" onclick="document.getElementById('customer-edit-dialog').close()">✕</button>
+  <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerEdit) }}</h2>
+  <button type="button" class="btn-secondary" onclick="document.getElementById('customer-edit-dialog').close()" aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}">✕</button>
 </div>
 <form class="flex flex-col gap-2.5"
       hx-post="/web/customers/edit"
@@ -9,36 +9,36 @@
       hx-on::after-request="if(event.detail.successful) document.getElementById('customer-edit-dialog').close()">
   <input type="hidden" name="customer_id" value="{{ customer.id }}" class="field" />
   <div>
-    <label class="field-label">Name</label>
+    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
     <input type="text" name="name" required maxlength="128" value="{{ customer.name }}" class="field" />
   </div>
   <div class="flex gap-2.5 [&>*]:flex-1">
     <div>
-      <label class="field-label">Phone (optional)</label>
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerPhone) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
       <input type="text" name="phone" maxlength="32" value="{% if let Some(phone) = customer.phone %}{{ phone }}{% endif %}" class="field" />
     </div>
     <div>
-      <label class="field-label">Tax ID (optional)</label>
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerTaxId) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
       <input type="text" name="tax_id" maxlength="32" value="{% if let Some(tax_id) = customer.tax_id %}{{ tax_id }}{% endif %}" class="field" />
     </div>
   </div>
   <div>
-    <label class="field-label">Address (optional)</label>
+    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerAddress) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
     <input type="text" name="address" maxlength="256" value="{% if let Some(address) = customer.address %}{{ address }}{% endif %}" class="field" />
   </div>
   <div class="flex gap-2.5 [&>*]:flex-1">
     <div>
-      <label class="field-label">Credit limit (empty = no limit)</label>
-      <input type="text" inputmode="decimal" name="credit_limit" step="0.01" min="0" placeholder="unlimited" value="{% if let Some(limit) = customer.credit_limit %}{{ localization.format_decimal(limit.clone()) }}{% endif %}" class="field" />
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerCreditLimit) }}</label>
+      <input type="text" inputmode="decimal" name="credit_limit" step="0.01" min="0" placeholder="{{ localization.tr(crate::localization::MessageKey::CustomerNoLimit) }}" value="{% if let Some(limit) = customer.credit_limit %}{{ localization.format_decimal(limit.clone()) }}{% endif %}" class="field" />
     </div>
     <div>
-      <label class="field-label">Payment days (empty = no term)</label>
+      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerPaymentDays) }}</label>
       <input type="number" name="due_days" min="0" step="1" placeholder="30" value="{% if let Some(days) = customer.due_days %}{{ days }}{% endif %}" class="field" />
     </div>
   </div>
   <div>
-    <label class="field-label">Notes (optional)</label>
+    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
     <input type="text" name="notes" maxlength="512" value="{% if let Some(notes) = customer.notes %}{{ notes }}{% endif %}" class="field" />
   </div>
-  <button type="submit" class="btn-primary">Save Changes</button>
+  <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CustomerSaveChanges) }}</button>
 </form>

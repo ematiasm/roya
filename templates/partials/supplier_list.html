@@ -1,6 +1,6 @@
 <div id="supplier-list-inner">
   {% if suppliers.is_empty() %}
-    <div class="empty">No suppliers yet — use New supplier above.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::SuppliersEmpty) }}</div>
   {% else %}
     <div class="flex flex-col gap-1.5">
       {% for v in suppliers %}
@@ -12,8 +12,8 @@
                 hx-swap="innerHTML">{{ v.supplier.name }}</button>
         <button type="button"
                 class="btn-secondary shrink-0"
-                title="Edit"
-                aria-label="Edit"
+                title="{{ localization.tr(crate::localization::MessageKey::CommonEdit) }}"
+                aria-label="{{ localization.tr(crate::localization::MessageKey::CommonEdit) }}"
                 hx-get="/web/suppliers/{{ v.supplier.id }}/edit-form"
                 hx-target="#supplier-edit-dialog-body"
                 hx-swap="innerHTML"

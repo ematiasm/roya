@@ -1,13 +1,13 @@
 <div id="product-list-inner">
-  <div class="mb-2.5 text-[13px] text-muted">{{ products.len() }} products • stock derived from movements</div>
+  <div class="mb-2.5 text-[13px] text-muted">{{ localization.tr_count(crate::localization::MessageKey::ProductCount, products.len()) }} • {{ localization.tr(crate::localization::MessageKey::ProductStock) }}</div>
   {% if products.is_empty() %}
-    <div class="empty">No products yet — use the New product button.</div>
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::ProductNoProducts) }}</div>
   {% else %}
     {% for ps in products %}
     <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="product-{{ ps.product.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="chip {% if ps.product.kind.to_string() == "Service" %}chip-expense{% else %}chip-income{% endif %}">{{ ps.product.kind }}</span>
+          <span class="chip {% if ps.product.kind.to_string() == "Service" %}chip-expense{% else %}chip-income{% endif %}">{% if ps.product.kind.to_string() == "Service" %}{{ localization.tr(crate::localization::MessageKey::ProductValueService) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ProductValueProduct) }}{% endif %}</span>
           {# The name is the drawer trigger: the same button-as-row pattern as the
              party lists, fetching the detail fragment into the drawer body. #}
           <button type="button"
@@ -17,17 +17,17 @@
                   hx-swap="innerHTML">{{ ps.product.name }}</button>
           <span class="text-xs text-muted">{{ ps.product.sku }} • {{ ps.product.unit }} • {{ localization.format_currency(ps.product.sale_price.clone()) }}</span>
           {% if !ps.product.track_stock %}
-            <span class="text-xs text-muted">untracked</span>
+            <span class="text-xs text-muted">{{ localization.tr(crate::localization::MessageKey::ProductUntracked) }}</span>
           {% else %}
             {% if ps.stock.is_sign_negative() %}
-              <span class="chip chip-expense">negative</span>
+              <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductNegative) }}</span>
             {% endif %}
           {% endif %}
           {% if let Some(sug) = ps.suggested %}
-            <span class="chip chip-expense">low • suggest {{ localization.format_quantity(sug.clone()) }}</span>
+            <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductLow) }} • {{ localization.tr(crate::localization::MessageKey::ProductSuggest) }} {{ localization.format_quantity(sug.clone()) }}</span>
           {% endif %}
         </div>
-        <span class="text-[13px] text-muted">stock {{ localization.format_quantity(ps.stock.clone()) }}{% if let Some(min) = ps.product.min_stock %} • min {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • max {{ localization.format_quantity(max.clone()) }}{% endif %}</span>
+        <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(ps.stock.clone()) }}{% if let Some(min) = ps.product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
         <span class="font-bold tabular-nums {% if ps.stock.is_sign_negative() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_quantity(ps.stock.clone()) }}</span>

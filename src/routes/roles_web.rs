@@ -1,7 +1,7 @@
 // M5 identity (slice S4): the roles administration screen and the permission
 // matrix. `/roles` list + create `<dialog>` + an edit dialog that loads, per
 // role, the details form (name, description) AND the permission matrix — the
-// 23 seeded codes grouped by module, each carrying its Spanish description the
+// 24 seeded codes grouped by module, each carrying its localized description the
 // operator reads before ticking — on the exact customers/users pattern:
 // Askama + HTMX, thin handlers with no SQL, collection endpoints with the id
 // in the body (`/web/roles`, `/web/roles/edit`, `/web/roles/delete`,
@@ -70,6 +70,7 @@ struct RolesTemplate {
 #[derive(Template)]
 #[template(path = "partials/role_list.html")]
 struct RoleListPartial {
+    localization: LocalizationContext,
     roles: Vec<RoleRowView>,
 }
 
@@ -81,7 +82,7 @@ struct MatrixPermission {
 }
 
 /// The catalog grouped by module — the matrix renders one section per module,
-/// every row showing its code and its seeded Spanish description.
+/// every row showing its code and localized seeded description.
 struct ModuleGroup {
     module: String,
     permissions: Vec<MatrixPermission>,
@@ -96,6 +97,7 @@ struct ModuleGroup {
 #[derive(Template)]
 #[template(path = "partials/role_edit_form.html")]
 struct RoleEditFormPartial {
+    localization: LocalizationContext,
     role: Role,
     description_value: String,
     groups: Vec<ModuleGroup>,
@@ -131,7 +133,9 @@ fn module_groups(catalog: Vec<Permission>, held_ids: &[i64]) -> Vec<ModuleGroup>
         let held = held_ids.contains(&permission.id);
         match groups.last_mut() {
             Some(group) if group.module == permission.module => {
-                group.permissions.push(MatrixPermission { permission, held });
+                group
+                    .permissions
+                    .push(MatrixPermission { permission, held });
             }
             _ => groups.push(ModuleGroup {
                 module: permission.module.clone(),
@@ -163,7 +167,10 @@ async fn resolve_role_rows(
                 .get(&row.role.created_by)
                 .cloned()
                 .unwrap_or_else(|| "—".to_string()),
-            updated_by_label: row.role.updated_by.and_then(|actor| names.get(&actor).cloned()),
+            updated_by_label: row
+                .role
+                .updated_by
+                .and_then(|actor| names.get(&actor).cloned()),
             role: row.role,
             holders: row.holders,
         });
@@ -172,9 +179,14 @@ async fn resolve_role_rows(
 }
 
 async fn list_response(state: &AppState) -> AppResult<Response> {
+    let localization = crate::localization::load_context(&state.pool).await?;
     let roles = state.identity_service.list_roles_with_holders().await?;
     let roles = resolve_role_rows(&state, roles).await?;
-    Ok(Html(render(RoleListPartial { roles })?).into_response())
+    Ok(Html(render(RoleListPartial {
+        localization,
+        roles,
+    })?)
+    .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -459,27 +471,27 @@ async fn web_set_matrix(
 /// actions the triggers refuse.
 async fn web_role_edit_form(
     State(state): State<AppState>,
+    Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     _: Require<IdentityRolesManage>,
 ) -> AppResult<Html<String>> {
-    let matrix = state.identity_service.role_matrix(&permissions_repo(&state), id).await?;
+    let matrix = state
+        .identity_service
+        .role_matrix(&permissions_repo(&state), id)
+        .await?;
     let groups = module_groups(matrix.catalog, &matrix.held_ids);
-    Ok(Html(
-        render(RoleEditFormPartial {
-            description_value: matrix.role.description.clone().unwrap_or_default(),
-            role: matrix.role,
-            groups,
-        })?,
-    ))
+    Ok(Html(render(RoleEditFormPartial {
+        localization,
+        description_value: matrix.role.description.clone().unwrap_or_default(),
+        role: matrix.role,
+        groups,
+    })?))
 }
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/roles", get(roles_page))
-        .route(
-            "/web/roles",
-            get(web_role_list).post(web_create_role),
-        )
+        .route("/web/roles", get(web_role_list).post(web_create_role))
         .route("/web/roles/edit", post(web_edit_role))
         .route("/web/roles/delete", post(web_delete_role))
         .route("/web/roles/matrix", post(web_set_matrix))
@@ -515,13 +527,23 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES ('es-ES', 'es', 'Español (España)', 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', 'es-ES', 'USD', 'UTC')")
+            .execute(&pool)
+            .await
+            .unwrap();
         // Fixture wiring (S5): the permissionless variant. The shared principal
         // this screen's tests build on holds NO roles — the refusal fixtures
         // and the deliberately-narrow principals depend on that premise, and
         // every grant here comes through app_with_permissions' custom role.
         // The full-permission seed (seed_session) is for the department
         // fixtures, not this one.
-        test_support::seed_session_without_roles(&pool).await.unwrap();
+        test_support::seed_session_without_roles(&pool)
+            .await
+            .unwrap();
         pool
     }
 
@@ -554,12 +576,11 @@ mod tests {
             }
             let roles = SqliteRoleRepository::new(pool.clone());
             let role = roles.find_by_code("operador").await.unwrap().unwrap();
-            let user_id: i64 =
-                sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-                    .bind(test_support::TEST_USERNAME)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
+                .bind(test_support::TEST_USERNAME)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             roles
                 .grant(&NewUserRole {
                     user_id,
@@ -584,11 +605,7 @@ mod tests {
             builder = builder.header(*name, *value);
         }
         app.clone()
-            .oneshot(
-                builder
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap()
     }
@@ -608,6 +625,17 @@ mod tests {
 
     fn cookie() -> [(&'static str, &'static str); 1] {
         [("cookie", test_support::TEST_COOKIE)]
+    }
+
+    async fn use_english(pool: &sqlx::SqlitePool) {
+        sqlx::query("INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES ('en-US', 'en', 'English (United States)', 1)")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = 'en-US' WHERE id = 1")
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn role_id_by_code(pool: &sqlx::SqlitePool, code: &str) -> i64 {
@@ -677,20 +705,23 @@ mod tests {
         let (app, state) = app_with_permissions(&[]).await;
         let vendedor_id = role_id_by_code(&state.pool, "vendedor").await;
         let before = held_codes(&state.pool, vendedor_id).await;
-        let roles_before: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM roles").fetch_one(&state.pool).await.unwrap();
+        let roles_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roles")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
 
         // The page and its fragment.
         for uri in ["/roles", "/web/roles"] {
             let resp = send(&app, "GET", uri, &cookie(), "").await;
-            assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "GET {uri}");
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "GET {uri}"
+            );
         }
         // Every mutation, in the HTMX JSON shape the notice box renders.
         let mutations: [(&str, String); 4] = [
-            (
-                "/web/roles",
-                "code=fantasma&name=Fantasma".to_string(),
-            ),
+            ("/web/roles", "code=fantasma&name=Fantasma".to_string()),
             (
                 "/web/roles/edit",
                 format!("role_id={vendedor_id}&name=Otro"),
@@ -703,9 +734,12 @@ mod tests {
         ];
         for (uri, body) in mutations {
             let resp = send(&app, "POST", uri, &form_headers(), &body).await;
-            assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "POST {uri}");
-            let json: serde_json::Value =
-                serde_json::from_str(&body_string(resp).await).unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "POST {uri}"
+            );
+            let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
             assert!(
                 json.get("error")
                     .and_then(|e| e.as_str())
@@ -719,8 +753,10 @@ mod tests {
 
         // Nothing was written anywhere.
         assert_eq!(before, held_codes(&state.pool, vendedor_id).await);
-        let roles_after: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM roles").fetch_one(&state.pool).await.unwrap();
+        let roles_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roles")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         assert_eq!(roles_after, roles_before);
     }
 
@@ -733,11 +769,8 @@ mod tests {
     /// broken fixture.
     #[tokio::test]
     async fn a_users_manage_only_principal_is_refused_the_roles_screen_and_its_matrix() {
-        let (app, state) = app_with_permissions(&[
-            "identity.users.read",
-            "identity.users.manage",
-        ])
-        .await;
+        let (app, state) =
+            app_with_permissions(&["identity.users.read", "identity.users.manage"]).await;
         let vendedor_id = role_id_by_code(&state.pool, "vendedor").await;
         let before = held_codes(&state.pool, vendedor_id).await;
 
@@ -765,8 +798,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert!(
             json.get("error")
                 .and_then(|e| e.as_str())
@@ -782,15 +814,22 @@ mod tests {
 
     #[tokio::test]
     async fn the_page_lists_the_roles_their_descriptions_and_the_users_that_hold_them() {
-        let (app, state) = app_with_permissions(&[
-            "identity.users.read",
-            "identity.roles.manage",
-        ])
-        .await;
-        state.identity_service.bootstrap_admin(Some(ADMIN_PASSWORD)).await.unwrap();
+        let (app, state) =
+            app_with_permissions(&["identity.users.read", "identity.roles.manage"]).await;
+        state
+            .identity_service
+            .bootstrap_admin(Some(ADMIN_PASSWORD))
+            .await
+            .unwrap();
         let permissions = SqlitePermissionRepository::new(state.pool.clone());
-        let vendedor = state.identity_service.role_list().await.unwrap().into_iter()
-            .find(|r| r.code == "vendedor").unwrap();
+        let vendedor = state
+            .identity_service
+            .role_list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.code == "vendedor")
+            .unwrap();
         let actor_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
             .bind(test_support::TEST_USERNAME)
             .fetch_one(&state.pool)
@@ -821,7 +860,10 @@ mod tests {
             "Nuevo rol",
             "data-nav=\"roles\"",
         ] {
-            assert!(html.contains(expected), "page must show {expected}: {html:.600}");
+            assert!(
+                html.contains(expected),
+                "page must show {expected}: {html:.600}"
+            );
         }
         // The fragment: same list, smaller body.
         let resp = send(&app, "GET", "/web/roles", &cookie(), "").await;
@@ -832,9 +874,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_role_and_tick_a_permission_round_trip_through_the_screen() {
+    async fn seeded_role_and_permission_copy_renders_bilingually_while_forms_keep_canonical_values()
+    {
         let (app, state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+            app_with_permissions(&["identity.users.read", "identity.roles.manage"]).await;
+        let admin_id = role_id_by_code(&state.pool, "admin").await;
+
+        let resp = send(
+            &app,
+            "GET",
+            &format!("/web/roles/edit-form/{admin_id}"),
+            &cookie(),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let spanish_form = body_string(resp).await;
+        assert!(
+            spanish_form.contains("settings.manage")
+                && spanish_form.contains("Administrar la configuración del negocio"),
+            "the Spanish matrix must localize the seeded settings permission without changing its code: {spanish_form:.2400}"
+        );
+        let (code, description): (String, String) = sqlx::query_as(
+            "SELECT code, description FROM permissions WHERE code = 'settings.manage'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(code, "settings.manage");
+        assert_eq!(description, "Administrar la configuración del negocio");
+
+        use_english(&state.pool).await;
+        let resp = send(&app, "GET", "/web/roles", &cookie(), "").await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let list = body_string(resp).await;
+        for expected in [
+            "Administrator",
+            "Full access. Protected role: it cannot be deleted or have its permissions reduced.",
+            "Salesperson",
+            "Sales and customers; stock inquiries.",
+            "Cashier",
+            "Counter collections and account inquiries.",
+            "Warehouse",
+            "Stock and purchases; supplier inquiries.",
+        ] {
+            assert!(
+                list.contains(expected),
+                "role list must show {expected}: {list:.1200}"
+            );
+        }
+
+        let resp = send(
+            &app,
+            "GET",
+            &format!("/web/roles/edit-form/{admin_id}"),
+            &cookie(),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let form = body_string(resp).await;
+        for expected in [
+            "View the main dashboard",
+            "View accounts and transactions",
+            "Record and edit transactions",
+            "Manage accounts and payment methods",
+            "View products and stock",
+            "Create and edit products",
+            "Adjust stock",
+            "View sales",
+            "Record sales",
+            "Cancel sales",
+            "View customers",
+            "Create and edit customers",
+            "Record collections",
+            "View purchases",
+            "Record purchases",
+            "Cancel purchases",
+            "View supplier costs",
+            "Edit supplier costs",
+            "View suppliers",
+            "Create and edit suppliers",
+            "View users",
+            "Create users, assign roles, and reset passwords",
+            "Create roles and edit the permission matrix",
+            "Manage business settings",
+        ] {
+            assert!(
+                form.contains(expected),
+                "matrix must show {expected}: {form:.2400}"
+            );
+        }
+        assert!(
+            form.contains("settings.manage"),
+            "the English matrix must keep the canonical permission code: {form:.2400}"
+        );
+        assert!(
+            form.contains("Full access. Protected role: it cannot be deleted or have its permissions reduced."),
+            "the edit form uses localized seeded descriptions: {form:.1600}"
+        );
+        assert!(
+            form.contains("value=\"Administrador\""),
+            "the canonical role form value remains Spanish: {form:.1200}"
+        );
+        assert!(
+            form.contains(
+                "value=\"Acceso total. Rol protegido: no se puede eliminar ni reducir sus permisos.\""
+            ),
+            "the canonical role description form value remains Spanish: {form:.1600}"
+        );
+
+        let stored = SqliteRoleRepository::new(state.pool)
+            .find_by_id(admin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.name, "Administrador");
+        assert_eq!(
+            stored.description.as_deref(),
+            Some("Acceso total. Rol protegido: no se puede eliminar ni reducir sus permisos.")
+        );
+    }
+
+    #[tokio::test]
+    async fn create_role_and_tick_a_permission_round_trip_through_the_screen() {
+        let (app, state) = app_with_permissions(&["identity.roles.manage"]).await;
 
         // Create through the collection endpoint.
         let resp = create_role_via_screen(&app, "supervisor").await;
@@ -856,15 +1020,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!created.is_system, "a created role is ordinary");
-        assert_eq!(created.description.as_deref(), Some("creado por la pantalla"));
+        assert_eq!(
+            created.description.as_deref(),
+            Some("creado por la pantalla")
+        );
 
         // A duplicate code is refused with the Spanish conflict.
         let resp = create_role_via_screen(&app, "supervisor").await;
         assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("Ya existe un rol")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("Ya existe un rol")),
             "{json}"
         );
 
@@ -878,16 +1046,23 @@ mod tests {
                 &format!("code={code}&name=Nombre"),
             )
             .await;
-            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "code={code}");
-            let json: serde_json::Value =
-                serde_json::from_str(&body_string(resp).await).unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "code={code}"
+            );
+            let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
             assert!(
-                json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("código del rol")),
+                json.get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|m| m.contains("código del rol")),
                 "code={code}: {json}"
             );
         }
-        let roles_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM roles").fetch_one(&state.pool).await.unwrap();
+        let roles_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roles")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         // The four seeded roles + the fixture's operador + the created
         // supervisor: the refused creations added nothing.
         assert_eq!(roles_count, 6, "the refused creations wrote nothing");
@@ -996,7 +1171,9 @@ mod tests {
             "POST",
             "/web/roles/matrix",
             &form_headers(),
-            &format!("role_id={operador_id}&permission_ids={roles_manage}&permission_ids={users_read}"),
+            &format!(
+                "role_id={operador_id}&permission_ids={roles_manage}&permission_ids={users_read}"
+            ),
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -1034,10 +1211,11 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("No podés")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("No podés")),
             "{json}"
         );
     }
@@ -1046,8 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn ac13_the_protected_role_is_locked_through_the_screen() {
-        let (app, state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, state) = app_with_permissions(&["identity.roles.manage"]).await;
         let admin_id = role_id_by_code(&state.pool, "admin").await;
 
         // The list marks it as protected: no delete button is offered for it.
@@ -1072,8 +1249,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         let message = json.get("error").and_then(|e| e.as_str()).unwrap_or("");
         assert!(message.contains("rol protegido"), "{json}");
         assert!(
@@ -1096,10 +1272,11 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("rol protegido")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("rol protegido")),
             "{json}"
         );
         assert!(
@@ -1146,8 +1323,7 @@ mod tests {
     /// operator finally reads here).
     #[tokio::test]
     async fn the_matrix_renders_the_whole_catalog_with_descriptions() {
-        let (app, state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, state) = app_with_permissions(&["identity.roles.manage"]).await;
         let admin_id = role_id_by_code(&state.pool, "admin").await;
         let resp = send(
             &app,
@@ -1176,10 +1352,13 @@ mod tests {
             "Registrar cobros",
             "Ver costos por proveedor",
             "Crear y editar proveedores",
-            "Crear usuarios y restablecer contraseñas de cuentas sin roles protegidos",
-            "Crear roles, editar la matriz de permisos y cambiar los roles de otras cuentas",
+            "Crear usuarios, asignar roles y restablecer contraseñas",
+            "Crear roles y editar la matriz de permisos",
         ] {
-            assert!(html.contains(expected), "matrix must show {expected}: {html:.800}");
+            assert!(
+                html.contains(expected),
+                "matrix must show {expected}: {html:.800}"
+            );
         }
     }
 
@@ -1187,11 +1366,16 @@ mod tests {
 
     #[tokio::test]
     async fn ac15_deleting_a_held_role_is_refused_and_names_the_blocking_users() {
-        let (app, state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, state) = app_with_permissions(&["identity.roles.manage"]).await;
         let permissions = SqlitePermissionRepository::new(state.pool.clone());
-        let vendedor = state.identity_service.role_list().await.unwrap().into_iter()
-            .find(|r| r.code == "vendedor").unwrap();
+        let vendedor = state
+            .identity_service
+            .role_list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.code == "vendedor")
+            .unwrap();
         let actor_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
             .bind(test_support::TEST_USERNAME)
             .fetch_one(&state.pool)
@@ -1217,8 +1401,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::CONFLICT);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         let message = json.get("error").and_then(|e| e.as_str()).unwrap_or("");
         // The refusal NAMES the users that block it.
         assert!(message.contains("caja1"), "{json}");
@@ -1244,8 +1427,7 @@ mod tests {
     /// written, and the same edit on a role the actor does NOT hold succeeds.
     #[tokio::test]
     async fn the_matrix_self_lockout_is_refused_and_writes_nothing() {
-        let (app, state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, state) = app_with_permissions(&["identity.roles.manage"]).await;
         let operador_id = role_id_by_code(&state.pool, "operador").await;
         let roles_manage = permission_id_by_code(&state.pool, "identity.roles.manage").await;
         let dashboard = permission_id_by_code(&state.pool, "dashboard.read").await;
@@ -1261,8 +1443,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         let message = json.get("error").and_then(|e| e.as_str()).unwrap_or("");
         assert!(message.contains("No podés"), "{json}");
         assert!(message.contains("identity.roles.manage"), "{json}");
@@ -1333,15 +1514,23 @@ mod tests {
     /// the extractor's English plain-text buffering error.
     #[tokio::test]
     async fn an_oversized_matrix_form_body_answers_413_in_the_app_shape() {
-        let (app, _state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, _state) = app_with_permissions(&["identity.roles.manage"]).await;
         let oversized = format!("role_id=1&junk={}", "x".repeat(128 * 1024));
-        let resp = send(&app, "POST", "/web/roles/matrix", &form_headers(), &oversized).await;
+        let resp = send(
+            &app,
+            "POST",
+            "/web/roles/matrix",
+            &form_headers(),
+            &oversized,
+        )
+        .await;
         assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         let body = body_string(resp).await;
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("demasiado grande")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("demasiado grande")),
             "{json}"
         );
         assert!(
@@ -1355,8 +1544,7 @@ mod tests {
     /// checkboxes were rendered for.
     #[tokio::test]
     async fn a_duplicated_role_id_in_the_matrix_form_is_refused() {
-        let (app, _state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, _state) = app_with_permissions(&["identity.roles.manage"]).await;
         let resp = send(
             &app,
             "POST",
@@ -1366,10 +1554,11 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-        let json: serde_json::Value =
-            serde_json::from_str(&body_string(resp).await).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
         assert!(
-            json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("identificador del rol")),
+            json.get("error")
+                .and_then(|e| e.as_str())
+                .is_some_and(|m| m.contains("identificador del rol")),
             "{json}"
         );
     }
@@ -1379,8 +1568,7 @@ mod tests {
     /// none), while genuinely malformed values stay refused.
     #[tokio::test]
     async fn a_present_but_empty_permission_ids_value_is_an_empty_set_not_a_400() {
-        let (app, state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, state) = app_with_permissions(&["identity.roles.manage"]).await;
         let visor = create_role_via_screen(&app, "visor").await;
         assert_eq!(visor.status(), axum::http::StatusCode::OK);
         let visor_id = role_id_by_code(&state.pool, "visor").await;
@@ -1418,11 +1606,16 @@ mod tests {
                 &format!("role_id={visor_id}&permission_ids={value}"),
             )
             .await;
-            assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST, "permission_ids={value}");
-            let json: serde_json::Value =
-                serde_json::from_str(&body_string(resp).await).unwrap();
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "permission_ids={value}"
+            );
+            let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
             assert!(
-                json.get("error").and_then(|e| e.as_str()).is_some_and(|m| m.contains("permisos indicados")),
+                json.get("error")
+                    .and_then(|e| e.as_str())
+                    .is_some_and(|m| m.contains("permisos indicados")),
                 "permission_ids={value}: {json}"
             );
         }
@@ -1430,13 +1623,12 @@ mod tests {
 
     // -- the catalog census holds across the matrix reads ----------------------
 
-    /// The matrix read returns exactly the 23 seeded codes (AC12's set-level
+    /// The matrix read returns exactly the 24 seeded codes (AC12's set-level
     /// shape), and the round trip of ticking one permission keeps the rest
     /// out — the editor replaces the WHOLE matrix, never appends.
     #[tokio::test]
     async fn the_matrix_editor_replaces_the_whole_set() {
-        let (app, state) =
-            app_with_permissions(&["identity.roles.manage"]).await;
+        let (app, state) = app_with_permissions(&["identity.roles.manage"]).await;
         let visor = create_role_via_screen(&app, "visor").await;
         assert_eq!(visor.status(), axum::http::StatusCode::OK);
         let visor_id = role_id_by_code(&state.pool, "visor").await;
@@ -1445,7 +1637,13 @@ mod tests {
         for code in sales {
             ids.push(permission_id_by_code(&state.pool, code).await);
         }
-        let body = format!("role_id={visor_id}&{}", ids.iter().map(|id| format!("permission_ids={id}")).collect::<Vec<_>>().join("&"));
+        let body = format!(
+            "role_id={visor_id}&{}",
+            ids.iter()
+                .map(|id| format!("permission_ids={id}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
         let resp = send(&app, "POST", "/web/roles/matrix", &form_headers(), &body).await;
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let held = held_codes(&state.pool, visor_id).await;
@@ -1456,10 +1654,17 @@ mod tests {
         // The full matrix read carries the whole catalog.
         let matrix = state
             .identity_service
-            .role_matrix(&SqlitePermissionRepository::new(state.pool.clone()), visor_id)
+            .role_matrix(
+                &SqlitePermissionRepository::new(state.pool.clone()),
+                visor_id,
+            )
             .await
             .unwrap();
         assert_eq!(matrix.catalog.len(), 24, "the catalog is the whole catalog");
-        assert_eq!(matrix.held_ids.len(), 2, "the held ids are the submitted set");
+        assert_eq!(
+            matrix.held_ids.len(),
+            2,
+            "the held ids are the submitted set"
+        );
     }
 }

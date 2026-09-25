@@ -2,20 +2,20 @@
   {% if let Some(c) = selected %}
   <div class="flex flex-wrap items-center gap-2">
     <span class="font-semibold">{{ c.name }}</span>
-    <span class="chip {% if c.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if c.is_active %}active{% else %}inactive{% endif %}</span>
+    <span class="chip {% if c.is_active %}chip-income{% else %}chip-expense{% endif %}">{% if c.is_active %}{{ localization.tr(crate::localization::MessageKey::CommonActive) }}{% else %}{{ localization.tr(crate::localization::MessageKey::CommonInactive) }}{% endif %}</span>
     {% if c.is_walkin %}
-    <span class="chip chip-muted">walk-in</span>
+    <span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::CustomerWalkIn) }}</span>
     {% endif %}
-     <span class="text-xs text-muted">{% if let Some(limit) = c.credit_limit %}limit {{ localization.format_currency(limit.clone()) }}{% else %}no limit{% endif %}{% if let Some(days) = c.due_days %} • term {{ days }}d{% endif %}</span>
+     <span class="text-xs text-muted">{% if let Some(limit) = c.credit_limit %}{{ localization.tr(crate::localization::MessageKey::CustomerLimit) }} {{ localization.format_currency(limit.clone()) }}{% else %}{{ localization.tr(crate::localization::MessageKey::CustomerNoLimit) }}{% endif %}{% if let Some(days) = c.due_days %} • {{ localization.tr(crate::localization::MessageKey::CustomerTermDays) }} {{ days }}d{% endif %}</span>
   </div>
   {% if let Some(phone) = c.phone %}
-  <div class="text-[13px] text-muted">phone {{ phone }}</div>
+  <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerPhone) }}: {{ phone }}</div>
   {% endif %}
   {% if let Some(address) = c.address %}
   <div class="text-[13px] text-muted">{{ address }}</div>
   {% endif %}
   {% if let Some(tax_id) = c.tax_id %}
-  <div class="text-[13px] text-muted">tax id {{ tax_id }}</div>
+  <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerTaxId) }}: {{ tax_id }}</div>
   {% endif %}
   {% if let Some(notes) = c.notes %}
   <div class="text-[13px] text-muted">{{ notes }}</div>
@@ -25,29 +25,29 @@
      is — the customer record's attribution, not the statement's — so the
      documents below cannot be misread as this person's work. #}
   {% if let Some(who) = created_by_name %}
-  <div class="text-[13px] text-muted" data-customer-actor>Cliente registrado por {{ who }}{% if let Some(editor) = updated_by_name %} • Actualizado por {{ editor }}{% endif %}</div>
+  <div class="text-[13px] text-muted" data-customer-actor>{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ who }}{% if let Some(editor) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ editor }}{% endif %}</div>
   {% endif %}
   {% endif %}
 
   {% if let Some(st) = statement %}
-   <div class="my-2 text-2xl font-bold">{{ localization.format_currency(st.balance.clone()) }} <span class="text-[13px] text-muted">balance as of {{ localization.format_date(st.as_of.clone()) }}</span></div>
+   <div class="my-2 text-2xl font-bold">{{ localization.format_currency(st.balance.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerBalanceAsOf) }} {{ localization.format_date(st.as_of.clone()) }}</span></div>
 
-  <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">Ageing</div>
+  <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerAgeing) }}</div>
   <div class="flex flex-wrap gap-2 [&>*]:flex-1">
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
-      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">current</div>
+      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerCurrent) }}</div>
        <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.current.clone()) }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
-      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">1-30</div>
+      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerOverdue1To30) }}</div>
        <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_1_30.clone()) }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
-      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">31-60</div>
+      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerOverdue31To60) }}</div>
        <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_31_60.clone()) }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
-      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">61+</div>
+      <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerOverdue61Plus) }}</div>
        <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_61_plus.clone()) }}</div>
     </div>
   </div>

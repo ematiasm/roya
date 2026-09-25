@@ -77,7 +77,11 @@ async fn fresh_installation_exposes_setup_blocks_normal_routes_and_keeps_static_
         .await
         .unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
-    assert!(body.contains("Configuración inicial"));
+    assert!(
+        body.contains("Initial setup"),
+        "pre-setup presentation must use the explicit English fallback: {body}"
+    );
+    assert!(body.contains("Spanish (Argentina)"));
     assert!(body.contains("value=\"es-AR\" selected"));
 
     let dashboard = get(&app, "/").await;
@@ -288,6 +292,20 @@ async fn administrator_can_use_the_existing_login_and_session_flow_after_setup()
     assert_eq!(
         post_form(&app, "/setup", valid_form()).await.status(),
         StatusCode::SEE_OTHER
+    );
+
+    let setup_redirect = get(&app, "/setup").await;
+    assert_eq!(setup_redirect.status(), StatusCode::SEE_OTHER);
+
+    let login_page = get(&app, "/login").await;
+    assert_eq!(login_page.status(), StatusCode::OK);
+    let login_page = axum::body::to_bytes(login_page.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let login_page = String::from_utf8(login_page.to_vec()).unwrap();
+    assert!(
+        login_page.contains("Iniciar sesión"),
+        "the saved es-AR locale selects Spanish only after setup is persisted: {login_page}"
     );
 
     let login = post_form(

@@ -56,6 +56,7 @@ from helpers import (
     create_supplier,
     fund_account,
     seed_harness_data,
+    e2e_copy,
 )
 from test_identity import (
     CHANGED_PASSWORD,
@@ -445,10 +446,10 @@ def test_visual_baseline(
     # The password form's dismiss button lives only in its failure re-render.
     # A wrong current password verifies before any write, so nothing changes.
     page.goto(f"{api.base_url}/password")
-    page.get_by_label("Contraseña actual").fill("definitely-not-the-password")
-    page.get_by_label("Nueva contraseña", exact=True).fill(CHANGED_PASSWORD)
-    page.get_by_label("Confirmar nueva contraseña").fill(CHANGED_PASSWORD)
-    page.get_by_role("button", name="Guardar contraseña").click()
+    page.get_by_label(e2e_copy("current_password")).fill("definitely-not-the-password")
+    page.get_by_label(e2e_copy("new_password"), exact=True).fill(CHANGED_PASSWORD)
+    page.get_by_label(e2e_copy("confirm_password")).fill(CHANGED_PASSWORD)
+    page.get_by_role("button", name=e2e_copy("save_password")).click()
     expect(page.locator("[data-notice='error']")).to_be_visible()
     page.wait_for_timeout(400)
     capture(page, "password-error")
@@ -464,9 +465,9 @@ def test_visual_baseline(
         anonymous.wait_for_load_state("networkidle")
         capture(anonymous, "login")
         # The login page's dismiss button lives only in the failure re-render.
-        anonymous.get_by_label("Usuario").fill(TEST_ADMIN_USERNAME)
-        anonymous.get_by_label("Contraseña").fill("definitely-not-the-password")
-        anonymous.get_by_role("button", name="Iniciar sesión").click()
+        anonymous.get_by_label(e2e_copy("username")).fill(TEST_ADMIN_USERNAME)
+        anonymous.get_by_label(e2e_copy("password")).fill("definitely-not-the-password")
+        anonymous.get_by_role("button", name=e2e_copy("sign_in")).click()
         expect(anonymous.locator("[data-notice='error']")).to_be_visible()
         anonymous.wait_for_timeout(400)
         capture(anonymous, "login-error")
@@ -479,7 +480,7 @@ def test_visual_baseline(
         # missing dashboard.read, and the full-page refusal card is the
         # state the net captures.
         page.goto(f"{api.base_url}/roles")
-        page.get_by_role("button", name="Nuevo rol").click()
+        page.get_by_role("button", name=e2e_copy("new_role")).click()
         role_dialog = page.locator("#new-role-dialog")
         role_dialog.locator('input[name="code"]').fill("sin_permisos")
         role_dialog.locator('input[name="name"]').fill("Sin permisos")
@@ -487,7 +488,7 @@ def test_visual_baseline(
             "Cero permisos: lo siembra la red visual para /forbidden."
         )
         with page.expect_response(_response_for("/web/roles", "POST")):
-            role_dialog.get_by_role("button", name="Crear rol").click()
+            role_dialog.get_by_role("button", name=e2e_copy("create_role")).click()
         expect(page.locator("#role-list")).to_contain_text("sin_permisos")
 
         page.goto(f"{api.base_url}/users")

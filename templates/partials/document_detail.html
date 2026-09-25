@@ -80,7 +80,7 @@
         {% endfor %}
         {% if a.reason %}
         <input class="field w-full rounded-[10px] border border-border bg-transparent px-2.5 py-1.5 text-xs"
-               type="text" name="reason" maxlength="256" placeholder="Motivo (opcional)" />
+               type="text" name="reason" maxlength="256" placeholder="{{ localization.tr(crate::localization::MessageKey::DocumentsReasonOptional) }}" />
         {% endif %}
         <button type="submit"
                 class="btn-secondary">{{ a.label }}</button>
@@ -106,7 +106,7 @@
       </div>
       {% endfor %}
     </div>
-    <a class="btn-secondary font-normal mt-3 inline-block hover:opacity-100" href="{{ p.href }}">Abrir</a>
+    <a class="btn-secondary font-normal mt-3 inline-block hover:opacity-100" href="{{ p.href }}">{{ localization.tr(crate::localization::MessageKey::DocumentsOpen) }}</a>
   </section>
   {% endif %}
 

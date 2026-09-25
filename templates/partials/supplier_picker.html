@@ -30,7 +30,7 @@
 
    The results container is a sibling of the form because a form inside a
    form is invalid HTML — the product picker's stated reason. #}
-{% macro supplier_picker(action, target, field_id, current_name, include) %}
+{% macro supplier_picker(action, target, field_id, current_name, include, localization) %}
 {# Inheritance audit (the product picker's documented trap): the form's
    hx-target/hx-swap/hx-select leak into the field, and the inherited
    hx-select would filter the search GET to an element the results fragment
@@ -38,16 +38,16 @@
    HTTP test can see that). The form disinherits those attributes; the field
    keeps its own hx-target/hx-swap and inherits no hx-select. #}
 <div id="supplier-picker">
-  <form class="flex flex-col gap-2.5" data-action="Save supplier"
+  <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::CommonSave) }}"
         hx-post="{{ action }}"
         hx-target="{{ target }}" hx-swap="outerHTML" hx-select="{{ target }}"
         hx-disinherit="hx-select hx-target hx-swap"
         {% if !include.is_empty() %}hx-include="{{ include }}"{% endif %}>
     <div>
-      <label for="{{ field_id }}" class="field-label">Supplier</label>
+      <label for="{{ field_id }}" class="field-label">{{ localization.tr(crate::localization::MessageKey::PurchasesSupplier) }}</label>
       <input type="text" id="{{ field_id }}" name="supplier_name"
              value="{{ current_name }}" autocomplete="off"
-             placeholder="Type a supplier name…"
+             placeholder="{{ localization.tr(crate::localization::MessageKey::SupplierPickerPlaceholder) }}"
              aria-controls="supplier-search-results"
              aria-describedby="supplier-search-status"
              hx-get="/web/supplier-search"
@@ -63,9 +63,9 @@
      element, which the compiled stylesheet turns from display:none into a
      visible status. It is `aria-hidden` because `#supplier-search-status`
      (the single polite live region) announces the same state. #}
-  <p id="supplier-search-busy" class="htmx-indicator mt-2 text-[13px] text-muted" aria-hidden="true">Searching…</p>
+  <p id="supplier-search-busy" class="htmx-indicator mt-2 text-[13px] text-muted" aria-hidden="true">{{ localization.tr(crate::localization::MessageKey::SupplierPickerSearching) }}</p>
   <div id="supplier-search-results" role="status" aria-live="polite" aria-atomic="false" class="mt-2">
-    <p id="supplier-search-status" class="sr-only">Type a supplier name.</p>
+    <p id="supplier-search-status" class="sr-only">{{ localization.tr(crate::localization::MessageKey::SupplierPickerIdle) }}</p>
   </div>
 </div>
 {% endmacro %}

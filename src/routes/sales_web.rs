@@ -198,16 +198,10 @@ fn render_list(
     Ok(Html(html))
 }
 
-fn render_debt(
-    debt: DebtSummary,
-    localization: LocalizationContext,
-) -> AppResult<Html<String>> {
-    let html = SaleDebtPartial {
-        localization,
-        debt,
-    }
-    .render()
-    .map_err(|e| AppError::Internal(e.to_string()))?;
+fn render_debt(debt: DebtSummary, localization: LocalizationContext) -> AppResult<Html<String>> {
+    let html = SaleDebtPartial { localization, debt }
+        .render()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -311,8 +305,11 @@ async fn sales_page(
     let debt = state.sales_service.debt_summary(DEBT_BANNER_LIMIT).await?;
     let customers = state.customer_service.list_customers(true).await?;
     let today = localization.today_iso();
+    let title = localization
+        .tr(crate::localization::MessageKey::SalesAll)
+        .to_string();
     let tmpl = SalesTemplate {
-        title: "All sales".to_string(),
+        title,
         localization,
         sales,
         debt,
@@ -398,7 +395,10 @@ async fn web_sale_list(
         .sales_service
         .list_details_filtered(&query.to_filter())
         .await?;
-    render_list(sales, "All sales", localization)
+    let title = localization
+        .tr(crate::localization::MessageKey::SalesAll)
+        .to_string();
+    render_list(sales, &title, localization)
 }
 
 async fn web_sale_debt(
@@ -422,21 +422,39 @@ async fn sale_record_page(
     let context = record_context(&state, id, localization.clone()).await?;
     let label = match &context.record.sale.sale_number {
         Some(number) => number.clone(),
-        None => "Draft sale".to_string(),
+        None => context
+            .localization
+            .tr(crate::localization::MessageKey::SalesDraft)
+            .to_string(),
     };
     let (action_href, action_label) = if context.record.sale.status == SaleStatus::Draft {
-        ("#add-line".to_string(), "Add line".to_string())
+        (
+            "#add-line".to_string(),
+            context
+                .localization
+                .tr(crate::localization::MessageKey::SalesAddLine)
+                .to_string(),
+        )
     } else if context.record.sale.status == SaleStatus::Confirmed
         && context.record.sale.payment_type == PaymentType::Credit
     {
-        ("#record-payment".to_string(), "Record payment".to_string())
+        (
+            "#record-payment".to_string(),
+            context
+                .localization
+                .tr(crate::localization::MessageKey::SalesRecordPayment)
+                .to_string(),
+        )
     } else {
         (String::new(), String::new())
     };
     let tmpl = SalePageTemplate {
         localization: context.localization.clone(),
         page_title: label,
-        page_breadcrumb_label: "Sales".to_string(),
+        page_breadcrumb_label: context
+            .localization
+            .tr(crate::localization::MessageKey::NavigationSales)
+            .to_string(),
         page_breadcrumb_href: "/sales".to_string(),
         page_action_href: action_href,
         page_action_label: action_label,
@@ -976,6 +994,26 @@ mod tests {
         AppState::new(pool, false, true)
     }
 
+    async fn set_locale(state: &AppState, locale_code: &str, language_code: &str) {
+        sqlx::query("INSERT OR IGNORE INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES (?, ?, ?, 1)")
+            .bind(locale_code)
+            .bind(language_code)
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', ?, 'USD', 'UTC')")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = ? WHERE id = 1")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
     async fn seed_customer(state: &AppState, name: &str) -> crate::models::Customer {
         state
             .customer_service
@@ -1185,6 +1223,36 @@ mod tests {
             account_name: account.name,
             method_name: method.name,
         }
+    }
+
+    #[tokio::test]
+    async fn seeded_payment_method_labels_are_bilingual_and_ids_stay_canonical() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+
+        set_locale(&state, "en-US", "en").await;
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        let method_options = html.split("name=\"method_id\"").nth(1).unwrap_or(&html);
+        assert!(method_options.contains("Cash — Caja"), "{method_options}");
+        assert!(
+            method_options.contains("Bank transfer — unassigned"),
+            "{method_options}"
+        );
+        assert!(
+            html.contains(&format!("value=\"{}\"", fixture.method_id)),
+            "the canonical method id must remain unchanged: {html:.1200}"
+        );
+
+        set_locale(&state, "es-ES", "es").await;
+        let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("Efectivo — Caja"), "{html:.1200}");
+        assert!(
+            html.contains("Transferencia bancaria — sin asignar"),
+            "{html:.1200}"
+        );
     }
 
     /// The opening tag that carries `needle`, for attribute assertions such as
@@ -2215,8 +2283,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body:.400}");
         assert!(
-            body.contains("Acción no permitida"),
-            "the refusal must speak Spanish: {body:.400}"
+            body.contains("Action not permitted"),
+            "the refusal must use the English fallback: {body:.400}"
         );
         assert!(
             body.contains("sales.create"),
@@ -2561,7 +2629,7 @@ mod tests {
             let (status, html) = get_html_as(app.clone(), uri, Some(&cookie)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.200}");
             assert!(
-                html.contains("Acción no permitida") && html.contains("sales.read"),
+                html.contains("Action not permitted") && html.contains("sales.read"),
                 "{uri} must refuse naming sales.read: {html:.300}"
             );
         }
