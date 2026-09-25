@@ -119,7 +119,8 @@ Substantial delegated-direct ODD work. Two work units, each delegated to one bou
 - User decision: the net sale price is the truth; taxes derive the gross and never rewrite the net.
 - Feature document: `odd/tasks/product-price-ladder.md`.
 - Engram mirror topic: `odd/product-price-ladder/tasks`.
-- Next step: U2 strict-TDD price ladder.
+- U1 delivery: work-unit commit `121293d` (`refactor(tax): make Settings the only web surface for tax definitions`).
+- Next step: U2 server-computed product price ladder.
 
 ### U1 — tax catalogue de-duplication
 
