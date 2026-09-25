@@ -16,7 +16,7 @@ Normalize the repository's pre-existing Rust formatting drift so `cargo fmt --ch
 - [x] Run `rtk cargo test`.
 - [x] Run `bash scripts/e2e.sh`.
 - [x] Run `rtk cargo fmt --check` and `rtk git diff --check`.
-- [ ] Commit as `style: format Rust sources`.
+- [x] Commit as `style: format Rust sources`.
 
 Verification:
 - `rtk cargo fmt --check`: passed.
@@ -40,3 +40,4 @@ Verification:
 ## Progress
 
 - Created `chore/format-rust-sources` from the latest `origin/main` including PRs #103 and #104.
+- Committed the formatter cleanup as `72b4b08` (`style: format Rust sources`).
