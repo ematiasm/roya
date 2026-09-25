@@ -134,5 +134,5 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
 - T1 verification: 38 focused tax-snapshot tests and 1005 full Rust tests pass. Independent verification forced and closed three real blockers: non-atomic snapshot/aggregate writes, a legacy public line-write bypass, and unguarded confirmed-line deletion. Final independent verdict: PASS. `cargo check --all-targets` reports 0 errors and 82 warnings; transitional dead-code suppressions are documented for removal in T2.
 - T1 delivery: work-unit commit `88176a9` (`feat(tax): persist line tax snapshots atomically`).
 - T2 verification: every sale/purchase money path reconciles through the per-line rounded tax-inclusive rule. Independent verification confirmed no `qty * price` bypass, no double counting in refunds or receipt-driven sales, confirmed-document immutability, and correct canonical/localized separation. The required visual baseline was regenerated with 14 intentionally changed captures and no lost appearance; the locale leak guard and duplicate product no-tax notice were fixed. Final verdict: PASS.
-- T2 delivery: no commit recorded yet.
+- T2 delivery: work-unit commit `a8fa64c` (`feat(tax): make document totals tax-inclusive`).
 - Next step: T3 Settings Taxes tab plus product-association and document-snapshot hard-delete safeguards.
