@@ -13,14 +13,14 @@ use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{
     LadderInput, MovementReason, MovementType, NewMovement, NewProduct, PriceField, PriceFields,
-    Product, ProductKind, ProductPriceLadder, ProductStock, ProductSupplierCost, ProductTaxView,
-    Tax, UpdateProduct,
+    PriceRefusal, Product, ProductKind, ProductPriceLadder, ProductStock, ProductSupplierCost,
+    ProductTaxView, Tax, UpdateProduct,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, ProductSupplierCostRepository,
     StockMovementRepository,
 };
-use crate::routes::AppState;
+use crate::routes::{localized_refusal_error, price_refusal_message, AppState};
 use crate::security::authz::{
     InventoryRead, InventoryStockWrite, InventoryWrite, Nav, PurchasesCostsRead,
     PurchasesCostsWrite, Require,
@@ -156,15 +156,34 @@ pub struct StaleCostView {
 struct ProductPriceLadderPartial {
     localization: LocalizationContext,
     ladder: ProductPriceLadder,
+    /// The refusal the ladder states, already in the active locale. Resolved
+    /// HERE, by the one shared mapping, so the fragment never renders a refusal
+    /// in a language of its own.
+    net_refusal_message: Option<String>,
+}
+
+/// The refusal a ladder publishes, as the active locale words it — or `None`,
+/// because a ladder with a price has no refusal to state. The single place the
+/// fragment's text is produced, for the drawer's own first render and for the
+/// preview endpoint alike.
+fn ladder_refusal_message(
+    ladder: &ProductPriceLadder,
+    localization: &LocalizationContext,
+) -> Option<String> {
+    ladder
+        .net_refusal
+        .map(|refusal| price_refusal_message(&refusal, localization))
 }
 
 fn product_price_ladder_html(
     localization: &LocalizationContext,
     ladder: ProductPriceLadder,
 ) -> AppResult<Html<String>> {
+    let net_refusal_message = ladder_refusal_message(&ladder, localization);
     ProductPriceLadderPartial {
         localization: localization.clone(),
         ladder,
+        net_refusal_message,
     }
     .render()
     .map(Html)
@@ -199,6 +218,10 @@ struct ProductDetailPartial {
     /// money figures lives here (U2). The stored net price is what a save
     /// persists, untouched by the taxes.
     ladder: ProductPriceLadder,
+    /// The same field the standalone ladder partial carries: the drawer embeds
+    /// that fragment, so the sentence it states is resolved by the same shared
+    /// mapping rather than by a rendering rule of its own.
+    net_refusal_message: Option<String>,
     supplier_costs: Vec<ProductCostView>,
     suppliers: Vec<crate::models::Supplier>,
     stale_cost: Option<StaleCostView>,
@@ -655,8 +678,8 @@ async fn web_product_price_ladder(
         // THE LADDER'S OWN PRECEDENCE, and it is documented on
         // `LadderInput::Unreadable`: an unreadable field stops the preview
         // before any form-shape gate is considered. The save path checks the
-        // sale price before the cost, so the same request would answer
-        // "sale_price is required" and never mention the field the operator is
+        // sale price before the cost, so the same request would be answered for
+        // the missing price and never mention the field the operator is
         // actually typing into. The ladder answers what the operator needs
         // instead — WHICH field cannot be read — because a preview has nothing
         // to say once a field is not a number.
@@ -667,8 +690,8 @@ async fn web_product_price_ladder(
             // A refusal the SAVE would also answer (an empty manual price) is a
             // state the ladder reports, not an error of its own. The cost the
             // form does hold still belongs on the ladder.
-            Err(PriceFieldError::Refusal(message)) => Some(LadderInput::Refused {
-                message,
+            Err(PriceFieldError::Refusal(refusal)) => Some(LadderInput::Refused {
+                refusal,
                 cost_price: fields.cost_price.as_value().unwrap_or(Decimal::ZERO),
             }),
             // Unreachable by the check above; kept total so a future field
@@ -742,6 +765,13 @@ async fn product_detail_html(
         }),
         _ => None,
     };
+    // The drawer has no form values on its first render, so the ladder reports
+    // the stored state — the very figures the form is prefilled with, so the
+    // two cannot disagree on arrival. Read ONCE: the refusal sentence the
+    // embedded fragment prints is derived from this same value, through the one
+    // shared mapping the product save form also goes through.
+    let ladder = state.tax_service.product_price_ladder(id, None).await?;
+    let net_refusal_message = ladder_refusal_message(&ladder, localization);
     let html = ProductDetailPartial {
         localization: localization.clone(),
         product: ps.product,
@@ -755,7 +785,9 @@ async fn product_detail_html(
         // The drawer has no form values on its first render, so the ladder
         // reports the stored state — the very figures the form is prefilled
         // with, so the two cannot disagree on arrival.
-        ladder: state.tax_service.product_price_ladder(id, None).await?,
+        ladder,
+        // The embedded ladder fragment reads this.
+        net_refusal_message,
         supplier_costs,
         suppliers,
         stale_cost,
@@ -986,22 +1018,48 @@ fn read_price_field(raw: &str, localization: &LocalizationContext) -> PriceField
     }
 }
 
+/// The three form price fields, read the one way, and — if they refuse — answered
+/// in the operator's language.
+///
+/// Both save routes go through here, so a refusal produced by the FORM's shape
+/// (an emptied manual price) reaches the operator through the same mapping a
+/// refusal produced by a price RULE does. A route that resolved its own fields
+/// would be free to answer one of the two in English, and the ladder would then
+/// disagree with it in the one case the two are most likely to hit.
+fn resolved_form_prices(
+    sale_price: &str,
+    cost_price: &str,
+    markup_pct: &str,
+    localization: &LocalizationContext,
+) -> AppResult<ResolvedPrices> {
+    resolve_price_fields(form_price_fields(
+        sale_price,
+        cost_price,
+        markup_pct,
+        localization,
+    ))
+    .map_err(PriceFieldError::into_app_error)
+    .map_err(|error| localized_refusal_error(error, localization))
+}
+
 /// Why a form's price fields could not become a product's prices.
 #[derive(Debug)]
 enum PriceFieldError {
     /// A field was not a number in this locale. The payload is the save path's
     /// own refusal for that exact field, so answering 400 changes nothing an
-    /// existing caller can observe.
+    /// existing caller can observe. It is NOT a price RULE — nothing was refused
+    /// for being out of range, the text simply is not a number here — so it
+    /// stays a plain message and is out of this module's localization scope.
     Unreadable(&'static str),
-    /// The save path's own form-shape refusal, verbatim.
-    Refusal(String),
+    /// The save path's own form-shape refusal, as the rule it is.
+    Refusal(PriceRefusal),
 }
 
 impl PriceFieldError {
     fn into_app_error(self) -> AppError {
         match self {
             Self::Unreadable(message) => AppError::Validation(message.into()),
-            Self::Refusal(message) => AppError::Validation(message),
+            Self::Refusal(refusal) => AppError::PriceRefused(refusal),
         }
     }
 }
@@ -1030,7 +1088,7 @@ fn resolve_price_fields(fields: PriceFields) -> Result<ResolvedPrices, PriceFiel
     let sale_price = match fields.sale_price {
         PriceField::Value(value) => value,
         PriceField::Empty if markup_pct.is_some() => Decimal::ZERO,
-        PriceField::Empty => return Err(PriceFieldError::Refusal("sale_price is required".into())),
+        PriceField::Empty => return Err(PriceFieldError::Refusal(PriceRefusal::SalePriceRequired)),
         PriceField::Unreadable => return Err(PriceFieldError::Unreadable("invalid sale_price")),
     };
     let cost_price = match fields.cost_price {
@@ -1105,13 +1163,12 @@ async fn web_create_product(
     } else {
         form.kind.parse().map_err(AppError::Validation)?
     };
-    let prices = resolve_price_fields(form_price_fields(
+    let prices = resolved_form_prices(
         &form.sale_price,
         &form.cost_price,
         &form.markup_pct,
         &localization,
-    ))
-    .map_err(PriceFieldError::into_app_error)?;
+    )?;
     // Checkbox: present means checked (value "1"/"on"/"true"); absent means false.
     // A hidden default of checked in the template sends Some("1").
     let track_stock = match form.track_stock.as_deref() {
@@ -1150,7 +1207,8 @@ async fn web_create_product(
     let created = state
         .inventory_service
         .create_product(principal.user_id, input)
-        .await?;
+        .await
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         // The answer is the list the caller is looking at: the filter rides the
         // body via `hx-include="#product-filters"` (issue #37), so an active
@@ -1320,13 +1378,12 @@ async fn web_edit_product(
     } else {
         form.kind.parse().map_err(AppError::Validation)?
     };
-    let prices = resolve_price_fields(form_price_fields(
+    let prices = resolved_form_prices(
         &form.sale_price,
         &form.cost_price,
         &form.markup_pct,
         &localization,
-    ))
-    .map_err(PriceFieldError::into_app_error)?;
+    )?;
     // Checkbox: present means checked; absent means false, like creation.
     let track_stock = match form.track_stock.as_deref() {
         None => false,
@@ -1366,7 +1423,8 @@ async fn web_edit_product(
     state
         .inventory_service
         .update_product(principal.user_id, form.id, patch)
-        .await?;
+        .await
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         let from_drawer = headers
             .get("HX-Target")
@@ -2343,7 +2401,7 @@ mod tests {
 
     // -- T2 redesign-products: the product drawer routes -----------------------
 
-    use crate::models::{NewProduct, NewSupplier, ProductKind};
+    use crate::models::{NewProduct, NewSupplier, PriceRefusal, ProductKind};
     use rust_decimal::Decimal;
 
     async fn post_form_full(
@@ -5437,6 +5495,688 @@ mod tests {
                 !sources.iter().any(|(scanned, _)| scanned.ends_with(name)),
                 "{name} is vendored and must stay out of the authored scan"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Localized price refusals: the ladder preview and the product save tell the
+    // operator the same thing, in the active locale.
+    // -----------------------------------------------------------------------
+
+    /// A refusal the operator READS needs a real locale, and `test_state` seeds
+    /// no business configuration, so every answer would come back in the
+    /// pre-setup English fallback. This seeds the two rows `load_context`
+    /// resolves from — the default locale and both enabled profiles — the same
+    /// way the ladder's own bilingual test does, and asserts the resolution
+    /// rather than assuming it.
+    async fn localized_state(locale_code: &str, language_code: &str) -> AppState {
+        let state = test_state().await;
+        sqlx::query(
+            "INSERT INTO business_settings \
+             (id, business_name, default_locale_code, currency_code, timezone) \
+             VALUES (1, 'Acme', ?, 'ARS', 'UTC')",
+        )
+        .bind(locale_code)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        for (code, language) in [("en-US", "en"), ("es-AR", "es")] {
+            sqlx::query(
+                "INSERT INTO business_locales (locale_code, language_code, display_name, is_enabled) \
+                 VALUES (?, ?, ?, 1)",
+            )
+            .bind(code)
+            .bind(language)
+            .bind(code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let resolved = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(resolved.locale_code, locale_code);
+        assert_eq!(resolved.language_code, language_code);
+        state
+    }
+
+    /// A zero-priced PRODUCT, submitted as the create form sends it: no markup,
+    /// so the manual price is the effective one and the product price rule is
+    /// what refuses. The drawer's ladder is asked about the SAME three fields.
+    const ZERO_PRICED_PRODUCT_SAVE: &str =
+        "sku=LOC-PRICE&name=Localized+price&kind=Product&unit=un&sale_price=0&cost_price=5";
+
+    /// The one sentence both surfaces answer for a zero-priced product, in each
+    /// enabled locale. Both strings are written out on purpose: a test that
+    /// asked the code under test for the expected wording would agree with any
+    /// wording, and the wording is the whole point of this work unit.
+    ///
+    /// The English entry has no final period because it is the exact string the
+    /// refusal has always answered with — the ladder's existing tests and the
+    /// browser suite both assert it verbatim. The Spanish one is a real
+    /// translation and reads as a sentence.
+    const ZERO_PRICE_REFUSAL: [(&str, &str, &str); 2] = [
+        ("en-US", "en", "sale_price must be > 0 for products"),
+        (
+            "es-AR",
+            "es",
+            "El precio de venta debe ser mayor que 0 en los productos.",
+        ),
+    ];
+
+    /// The emptied MANUAL price, the one price refusal the form's shape produces
+    /// before the service is ever asked. It is a price refusal too, so it is
+    /// translated by the same rule and not left in English on a Spanish ladder.
+    const REQUIRED_PRICE_REFUSAL: [(&str, &str, &str); 2] = [
+        ("en-US", "en", "sale_price is required"),
+        ("es-AR", "es", "El precio de venta es obligatorio."),
+    ];
+
+    /// The fragment renders its text through Askama, which escapes `>` like any
+    /// other rendered text; the JSON refusal body is not escaped. Asserting both
+    /// surfaces against one sentence therefore needs its wire form for the HTML.
+    fn wire(sentence: &str) -> String {
+        sentence.replace('>', "&gt;")
+    }
+
+    /// THE RED, stated as behavior: a Spanish operator saving a product with a
+    /// price the save refuses reads that refusal in Spanish. The English locale
+    /// is in the same table because "it changed" is only a defect if the
+    /// language that already worked kept working, byte for byte.
+    #[tokio::test]
+    async fn a_product_save_refused_by_a_price_rule_answers_in_the_active_locale() {
+        for (locale_code, language_code, sentence) in ZERO_PRICE_REFUSAL {
+            let state = localized_state(locale_code, language_code).await;
+            let app = crate::routes::router(state);
+            let (status, _, body) =
+                post_form_full(app, "/web/products", ZERO_PRICED_PRODUCT_SAVE, &[]).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{locale_code}: a refused price is still a 400: {body}"
+            );
+            assert!(
+                body.contains(sentence),
+                "{locale_code}: the operator must read the refusal in their own language: {body}"
+            );
+            if language_code == "es" {
+                assert!(
+                    !body.contains("sale_price must be"),
+                    "a Spanish operator must never read the English refusal: {body}"
+                );
+            }
+        }
+    }
+
+    /// The htmx answer and the plain-browser answer must be the SAME answer.
+    ///
+    /// Every save test above goes through `post_form_full`, which sets
+    /// `HX-Request: true` unconditionally, so the other half of both save routes
+    /// — the branch that redirects a plain browser to `/products` — has never
+    /// been asserted through the wire. The refusal is mapped BEFORE that branch,
+    /// so the localized sentence cannot depend on it, and this test is what makes
+    /// that structural claim an observed one instead.
+    ///
+    /// The refusal is a 400 with a body either way: `AppError`'s single
+    /// `IntoResponse` is the only way a handler's error becomes a response, and
+    /// it does not know whether the request was htmx.
+    #[tokio::test]
+    async fn a_plain_browser_save_refused_by_a_price_rule_answers_in_the_active_locale() {
+        for (locale_code, language_code, sentence) in ZERO_PRICE_REFUSAL {
+            let state = localized_state(locale_code, language_code).await;
+            let app = crate::routes::router(state.clone());
+
+            // THE CONTROL, and it is what makes the refusal below mean something:
+            // an ACCEPTED plain-browser post answers 303 to `/products`, which is
+            // the branch `is_htmx` sends a browser to — the htmx branch answers
+            // 200 with the list fragment instead. If this ever stopped being a
+            // redirect, the helper would no longer be exercising the non-htmx
+            // path and the refusal assertion would be proving nothing about it.
+            let (accepted, _) = post_form_with_cookie(
+                app.clone(),
+                "/web/products",
+                "sku=LOC-PLAIN-OK&name=Plain+browser&kind=Product&unit=un&sale_price=10&cost_price=5",
+                &[],
+                test_support::TEST_COOKIE,
+            )
+            .await;
+            assert_eq!(
+                accepted,
+                StatusCode::SEE_OTHER,
+                "{locale_code}: this helper must be the plain-browser path, or the refusal \
+                 below says nothing about it"
+            );
+
+            // `post_form_with_cookie` sends NO `HX-Request` header: this is the
+            // full-page form post, the branch `post_form_full` never reaches.
+            let (status, body) = post_form_with_cookie(
+                app,
+                "/web/products",
+                ZERO_PRICED_PRODUCT_SAVE,
+                &[],
+                test_support::TEST_COOKIE,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{locale_code}: a plain browser post is refused exactly as an htmx one is: {body}"
+            );
+            assert!(
+                body.contains(sentence),
+                "{locale_code}: the full-page post must answer the same sentence the htmx post \
+                 does, or the language of a refusal would depend on how the form was submitted: \
+                 {body}"
+            );
+            if language_code == "es" {
+                assert!(
+                    !body.contains("sale_price must be"),
+                    "a Spanish operator must never read the English refusal: {body}"
+                );
+            }
+        }
+    }
+
+    /// The ladder's whole value is that it never lies about the save, and a
+    /// preview that answered in a different language would be that lie in a new
+    /// form. ONE sentence, in the identical locale, from both surfaces.
+    #[tokio::test]
+    async fn the_ladder_and_the_save_answer_the_identical_sentence_in_the_identical_locale() {
+        for (locale_code, language_code, sentence) in ZERO_PRICE_REFUSAL {
+            let state = localized_state(locale_code, language_code).await;
+            let app = crate::routes::router(state.clone());
+            let product_id = product_with_taxes(&state, "LOC-LADDER", "42").await;
+
+            let (status, _, save) =
+                post_form_full(app.clone(), "/web/products", ZERO_PRICED_PRODUCT_SAVE, &[]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{locale_code}: {save}");
+
+            let (status, ladder) = preview(
+                app,
+                product_id,
+                "kind=Product&cost_price=5&markup_pct=&sale_price=0",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{locale_code}: {ladder}");
+            assert!(
+                ladder.contains("data-product-ladder-net-refused"),
+                "{locale_code}: the ladder must still state a refusal, not a figure: {ladder}"
+            );
+            assert!(
+                ladder.contains(&wire(sentence)),
+                "{locale_code}: the ladder must say what the save says, in the same language: \
+                 the save answered {save}, the ladder answered {ladder}"
+            );
+            assert!(
+                save.contains(sentence),
+                "{locale_code}: the save must say what the ladder says: {save}"
+            );
+        }
+    }
+
+    /// The emptied manual price is the same rule on both surfaces, in the same
+    /// language: a Spanish ladder that answered it in English would be the
+    /// disagreement this work unit exists to remove, one row further down.
+    #[tokio::test]
+    async fn the_emptied_manual_price_refusal_is_the_same_sentence_on_both_surfaces() {
+        for (locale_code, language_code, sentence) in REQUIRED_PRICE_REFUSAL {
+            let state = localized_state(locale_code, language_code).await;
+            let app = crate::routes::router(state.clone());
+            let product_id = product_with_taxes(&state, "LOC-REQUIRED", "42").await;
+
+            let (status, _, save) = post_form_full(
+                app.clone(),
+                "/web/products",
+                "sku=LOC-REQUIRED-SAVE&name=Localized+price&kind=Product&unit=un&sale_price=&cost_price=5",
+                &[],
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{locale_code}: {save}");
+            assert!(
+                save.contains(sentence),
+                "{locale_code}: the save answers its own form-shape refusal: {save}"
+            );
+
+            let (status, ladder) = preview(
+                app,
+                product_id,
+                "kind=Product&cost_price=5&markup_pct=&sale_price=",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{locale_code}: {ladder}");
+            assert!(
+                ladder.contains(&wire(sentence)),
+                "{locale_code}: the ladder must answer the same refusal, in the same language: {ladder}"
+            );
+        }
+    }
+
+    /// The JSON API is not localized, and this task must not change that: a
+    /// consumer reading the error body gets TODAY's exact bytes, English, even
+    /// when the business itself is configured in Spanish. Asserted as a whole
+    /// body, because "the message is right" is weaker than "the response is
+    /// unchanged".
+    #[tokio::test]
+    async fn the_json_api_still_answers_the_exact_english_price_refusal_body() {
+        let state = localized_state("es-AR", "es").await;
+        let app = crate::routes::router(state);
+        let (status, body) = post_json(
+            app,
+            "/api/products",
+            r#"{"sku":"LOC-API","name":"API refusal","kind":"Product","unit":"un","sale_price":"0","cost_price":"5","track_stock":false}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body, r#"{"error":"sale_price must be > 0 for products"}"#,
+            "the API body is the exact English sentence this task must not change"
+        );
+    }
+
+    /// EVERY price refusal, with the form the SAVE submits, the form the ladder
+    /// is asked about, and the sentence each must answer in each locale. One row
+    /// per `PriceRefusal`, so "the two surfaces agree" is a claim about the whole
+    /// rule set and not about the one rule that happened to be picked first.
+    ///
+    /// The two columns are the SAME request in the two shapes it travels in: the
+    /// create form's body, and the drawer's `hx-include="closest form"` query. A
+    /// row where those two shapes could not express one input would be a row
+    /// about a different rule, so both are written from the form's own fields.
+    const REFUSAL_PARITY: [(&str, &str, &str, &str, &str); 7] = [
+        (
+            "a zero-priced product",
+            "sku=LOC-P1&name=Parity+1&kind=Product&unit=un&sale_price=0&cost_price=5",
+            "kind=Product&cost_price=5&markup_pct=&sale_price=0",
+            "sale_price must be > 0 for products",
+            "El precio de venta debe ser mayor que 0 en los productos.",
+        ),
+        (
+            "an emptied manual price",
+            "sku=LOC-P2&name=Parity+2&kind=Product&unit=un&sale_price=&cost_price=5",
+            "kind=Product&cost_price=5&markup_pct=&sale_price=",
+            "sale_price is required",
+            "El precio de venta es obligatorio.",
+        ),
+        (
+            "a markup with no cost",
+            "sku=LOC-P3&name=Parity+3&kind=Product&unit=un&sale_price=&cost_price=0&markup_pct=50",
+            "kind=Product&cost_price=0&markup_pct=50&sale_price=0",
+            "cost_price must be > 0 when markup_pct is set",
+            "El costo debe ser mayor que 0 cuando se indica un margen.",
+        ),
+        (
+            "a markup at the -100 boundary",
+            "sku=LOC-P4&name=Parity+4&kind=Product&unit=un&sale_price=&cost_price=5&markup_pct=-100",
+            "kind=Product&cost_price=5&markup_pct=-100&sale_price=0",
+            "markup_pct must be > -100",
+            "El margen debe ser mayor que -100.",
+        ),
+        (
+            "a markup that overflows",
+            "sku=LOC-P5&name=Parity+5&kind=Product&unit=un&sale_price=&cost_price=1000&markup_pct=79228162514264337593543950335",
+            "kind=Product&cost_price=1000&markup_pct=79228162514264337593543950335&sale_price=0",
+            "markup_pct or cost_price is too large to derive a sale_price",
+            "El margen o el costo son demasiado grandes para derivar el precio de venta.",
+        ),
+        (
+            "a negative cost",
+            "sku=LOC-P6&name=Parity+6&kind=Service&unit=un&sale_price=10&cost_price=-5",
+            "kind=Service&cost_price=-5&markup_pct=&sale_price=10",
+            "cost_price cannot be negative",
+            "El costo no puede ser negativo.",
+        ),
+        (
+            "a negative service price",
+            "sku=LOC-P7&name=Parity+7&kind=Service&unit=un&sale_price=-1&cost_price=5",
+            "kind=Service&cost_price=5&markup_pct=&sale_price=-1",
+            "sale_price cannot be negative",
+            "El precio de venta no puede ser negativo.",
+        ),
+    ];
+
+    /// The sentence a refusal body carries, read out of the JSON rather than
+    /// matched inside it: `{"error": "…"}` is the whole body, so the value IS
+    /// the message the notice box will paint.
+    fn save_refusal_sentence(body: &str) -> String {
+        let json: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("a refused save answers JSON, got {body} ({error})"));
+        json["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the refusal body has no error message: {body}"))
+            .to_string()
+    }
+
+    /// The sentence the ladder's refusal cell states, read out of the fragment:
+    /// the cell is the one carrying the refusal marker, and the sentence is the
+    /// only thing inside its own emphasis, so the surrounding lead and figures
+    /// cannot be mistaken for it. The wire form is decoded, because the fragment
+    /// escapes its text the way it escapes any other.
+    fn ladder_refusal_sentence(html: &str) -> Option<String> {
+        let cell = html
+            .split("data-product-ladder-net-refused")
+            .nth(1)?
+            .split("</td>")
+            .next()?;
+        let sentence = cell.split(r#"<span class="font-semibold">"#).nth(1)?;
+        Some(
+            sentence
+                .split("</span>")
+                .next()?
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&")
+                .trim()
+                .to_string(),
+        )
+    }
+
+    /// The claim, over the WHOLE rule set: for every price refusal, the ladder
+    /// and the save answer the identical sentence in the identical locale, and
+    /// that sentence is the locale's own — never the English one handed to a
+    /// Spanish operator.
+    ///
+    /// Both surfaces are driven through HTTP, in the request shapes the browser
+    /// sends, because a shared helper that only one of them calls would still
+    /// pass a test that exercised the helper directly.
+    #[tokio::test]
+    async fn the_ladder_and_the_save_never_differ_for_any_price_refusal() {
+        for (locale_code, language_code) in [("en-US", "en"), ("es-AR", "es")] {
+            let state = localized_state(locale_code, language_code).await;
+            let app = crate::routes::router(state.clone());
+            let product_id = product_with_taxes(&state, "LOC-PARITY", "42").await;
+
+            for (label, save_form, ladder_query, english, spanish) in REFUSAL_PARITY {
+                let expected = if language_code == "es" {
+                    spanish
+                } else {
+                    english
+                };
+
+                let (status, _, body) =
+                    post_form_full(app.clone(), "/web/products", save_form, &[]).await;
+                assert_eq!(
+                    status,
+                    StatusCode::BAD_REQUEST,
+                    "{locale_code} {label}: {body}"
+                );
+                let save_sentence = save_refusal_sentence(&body);
+                assert_eq!(
+                    save_sentence, expected,
+                    "{locale_code} {label}: the save answers this refusal in the active language"
+                );
+
+                let (status, html) = preview(app.clone(), product_id, ladder_query).await;
+                assert_eq!(status, StatusCode::OK, "{locale_code} {label}: {html}");
+                let ladder_sentence = ladder_refusal_sentence(&html).unwrap_or_else(|| {
+                    panic!("{locale_code} {label}: the ladder must state a refusal: {html}")
+                });
+                assert_eq!(
+                    ladder_sentence, save_sentence,
+                    "{locale_code} {label}: the preview must say what the save says, in the same \
+                     language, or it is lying about the save"
+                );
+            }
+        }
+    }
+
+    /// The two catalogs as an operator's request resolves them: the closed key
+    /// set, the English row and the Spanish row, with no database behind it.
+    fn catalog_contexts() -> (
+        crate::localization::LocalizationContext,
+        crate::localization::LocalizationContext,
+    ) {
+        let english = crate::localization::LocalizationContext {
+            locale_code: "en-US".into(),
+            language_code: "en".into(),
+            currency_code: "USD".into(),
+            timezone: "UTC".into(),
+        };
+        let spanish = crate::localization::LocalizationContext {
+            language_code: "es".into(),
+            ..english.clone()
+        };
+        (english, spanish)
+    }
+
+    /// EVERY price refusal is translated in BOTH catalogs, and the English row
+    /// is the exact text the JSON API still answers with. Three claims in one
+    /// test because they are three ways this coupling could break:
+    ///
+    /// * a `PriceRefusal` variant with no catalog row renders as
+    ///   "Translation unavailable" — a key leak into the operator's notice;
+    /// * a row with only an English entry leaves a Spanish operator reading
+    ///   English, which is the exact defect this work unit removes;
+    /// * an English row re-worded away from `PriceRefusal::as_str` would make
+    ///   the API's body and the web's sentence two different sentences for one
+    ///   rule.
+    ///
+    /// The loop is over `PriceRefusal::ALL`, so a NEW variant fails here until
+    /// it is mapped and translated — a variant cannot be added silently.
+    #[test]
+    fn every_price_refusal_is_translated_in_both_catalogs_and_keeps_its_api_text() {
+        let (english, spanish) = catalog_contexts();
+        for refusal in PriceRefusal::ALL {
+            let key = crate::routes::price_refusal_key(refusal);
+            let en = english.tr(key);
+            let es = spanish.tr(key);
+            assert_ne!(
+                en, "Translation unavailable",
+                "{refusal:?} is missing from the English catalog"
+            );
+            assert_ne!(
+                es, "Translation unavailable",
+                "{refusal:?} is missing from the Spanish catalog"
+            );
+            assert_ne!(
+                es, en,
+                "{refusal:?} falls back to English in the Spanish catalog: the operator needs a \
+                 real translation, not a copy of the English row"
+            );
+            assert_eq!(
+                en,
+                refusal.as_str(),
+                "{refusal:?}: the English catalog IS the API body, byte for byte, and the ladder \
+                 and the save read the same row"
+            );
+        }
+    }
+
+    async fn post_json(app: axum::Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// No price refusal may be matched by string on the path that ANSWERS one.
+    /// A rule that lives only in a literal can be re-worded in one place and
+    /// matched in another, which is precisely how a ladder and a save end up
+    /// disagreeing; the typed refusal removes the second home.
+    ///
+    /// The sentences are allowed in exactly two files: the `PriceRefusal`
+    /// definition, which owns the English text every non-localized consumer
+    /// still receives, and the catalogs, which own the translation. Every other
+    /// file on the price path must not contain them at all — including the
+    /// purchase record page's "apply line cost" action, which writes a product's
+    /// cost and can therefore answer a price refusal of its own.
+    ///
+    /// Each file's test half is excluded, exactly as the `sale_repo` AC17 guard
+    /// excludes its own migration fixture: a guard that matched the needles of
+    /// the test asserting it would prove nothing.
+    #[test]
+    fn no_price_refusal_is_matched_by_string_on_the_price_path() {
+        /// The owner of the English text, and the only file allowed to state it
+        /// exactly once.
+        const OWNER: &str = "src/models.rs";
+        /// The catalogs hold the English sentence as the English translation.
+        /// Any number of rows is fine here; the closed-parity test in
+        /// `localization_tests` already pins the key set, and the totality test
+        /// pins that the Spanish row is a real translation.
+        const CATALOGS: &str = "src/localization/mod.rs";
+        let sentences = [
+            "markup_pct must be > -100",
+            "cost_price must be > 0 when markup_pct is set",
+            "markup_pct or cost_price is too large to derive a sale_price",
+            "sale_price must be > 0 for products",
+            "sale_price cannot be negative",
+            "cost_price cannot be negative",
+            "sale_price is required",
+        ];
+        let mut checked = 0;
+        for path in [
+            "src/error.rs",
+            OWNER,
+            "src/services/inventory.rs",
+            "src/services/taxes.rs",
+            "src/routes/inventory_web.rs",
+            "src/routes/inventory_api.rs",
+            "src/routes/purchases_web.rs",
+            CATALOGS,
+        ] {
+            let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+            let source = std::fs::read_to_string(&full)
+                .unwrap_or_else(|error| panic!("cannot read {path}: {error}"));
+            let production = source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("every source has a production half");
+            for sentence in sentences {
+                let occurrences = production.matches(sentence).count();
+                if path == OWNER {
+                    assert_eq!(
+                        occurrences, 1,
+                        "{path} owns the English text of every price refusal exactly once: \
+                         {sentence:?} appears {occurrences} times"
+                    );
+                } else if path == CATALOGS {
+                    assert!(
+                        occurrences >= 1,
+                        "{path} must carry the English translation of {sentence:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        occurrences, 0,
+                        "{path} must not carry the string {sentence:?}: a price refusal has a \
+                         typed identity, and a rule written as a literal here is a second rule \
+                         waiting to drift from the one the save enforces"
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked,
+            8 * 7,
+            "the guard must read every file and every sentence, or it proves nothing"
+        );
+    }
+
+    /// Exactly ONE place in the whole source tree turns a price refusal into a
+    /// sentence, and it is `routes::price_refusal_key` — not this module's, even
+    /// though this module owns the ladder and both save routes. The purchase
+    /// record page's "apply line cost" action writes a product's `cost_price`
+    /// through the same service, so it answers price refusals too, and all four
+    /// surfaces reach that one function.
+    ///
+    /// Two needles, because a second renderer can take either shape:
+    ///
+    /// * `=> MessageKey::PriceRefusal` — any renderer that maps a variant onto a
+    ///   catalog key writes this, whether it is a function or a `match` inlined
+    ///   in a handler. A renderer that answered with a raw sentence instead would
+    ///   restate one of the English strings, and the sentence guard below refuses
+    ///   that in every file but `models.rs` and the catalogs.
+    /// * the three function names — a second `price_refusal_message` would be a
+    ///   second renderer wearing a different name.
+    ///
+    /// Counted over every file `src/` holds, recursively: "no second mapping" is a
+    /// claim about the tree, not about a chosen list of files. Each file's TEST
+    /// half is excluded — this test's own needles live in one, and a guard that
+    /// matches the needles of the test asserting it proves nothing at all.
+    #[test]
+    fn only_one_place_in_the_tree_maps_a_price_refusal_to_a_sentence() {
+        const HOME: &str = "src/routes/mod.rs";
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let sources = rs_files(&root);
+        assert!(
+            sources.len() > 40,
+            "the walk must reach the whole source tree, or the counts below prove nothing: \
+             {} files",
+            sources.len()
+        );
+        let production: Vec<(String, String)> = sources
+            .iter()
+            .map(|path| {
+                let source = std::fs::read_to_string(path).unwrap_or_else(|error| {
+                    panic!("cannot read {}: {error}", path.display());
+                });
+                let head = source
+                    .split("#[cfg(test)]")
+                    .next()
+                    .expect("every source has a production half");
+                (path.display().to_string(), head.to_string())
+            })
+            .collect();
+
+        for needle in [
+            "=> MessageKey::PriceRefusal",
+            "fn price_refusal_key",
+            "fn price_refusal_message",
+            "fn localized_refusal_error",
+        ] {
+            let sites: Vec<&str> = production
+                .iter()
+                .filter(|(_, head)| head.contains(needle))
+                .map(|(path, _)| path.as_str())
+                .collect();
+            assert!(
+                !sites.is_empty(),
+                "{needle} must exist exactly once: the guard found none, so it is scanning \
+                 nothing and proves nothing"
+            );
+            assert_eq!(
+                sites.len(),
+                1,
+                "{needle} must appear in exactly one place: a second one is a second wording of \
+                 one rule, and it must go through {HOME} instead"
+            );
+            assert!(
+                sites[0].ends_with(HOME),
+                "{needle} is in {} and the only renderer lives in {HOME}",
+                sites[0]
+            );
+        }
+    }
+
+    /// Every `.rs` file under `dir`, RECURSIVELY, sorted, so a failure names the
+    /// same file in the same order on every machine. The recursion is the point:
+    /// a walk that only read the top level would find 11 files and would happily
+    /// report "exactly one renderer" while `routes/` went unread.
+    fn rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        collect_rs_files(dir, &mut out);
+        out
+    }
+
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|error| panic!("{dir:?} must be readable: {error}"))
+            .map(|entry| entry.expect("a readable directory entry").path())
+            .filter(|path| path.is_dir() || path.extension().is_some_and(|ext| ext == "rs"))
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else {
+                out.push(path);
+            }
         }
     }
 }

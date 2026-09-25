@@ -274,6 +274,19 @@ define_message_keys! {
     ProductLadderNetRefused => "product.ladder_net_refused",
     ProductLadderNetDerived => "product.ladder_net_derived",
     ProductLadderNetManual => "product.ladder_net_manual",
+    // The product price refusals. ONE key per `PriceRefusal` variant, reached
+    // only through the one shared mapping in `routes/inventory_web.rs`, so the
+    // ladder preview and the product save form can only ever answer the same
+    // sentence in the same language. The ENGLISH rows are byte-identical to
+    // `PriceRefusal::as_str`, which is the body the JSON API still receives:
+    // `routes::inventory_web::tests` fails if the two ever drift.
+    PriceRefusalMarkupNotAboveMinus100 => "price_refusal.markup_not_above_minus_100",
+    PriceRefusalMarkupNeedsPositiveCost => "price_refusal.markup_needs_positive_cost",
+    PriceRefusalDerivationOverflow => "price_refusal.derivation_overflow",
+    PriceRefusalSalePriceNotPositiveForProduct => "price_refusal.sale_price_not_positive_for_product",
+    PriceRefusalSalePriceNegative => "price_refusal.sale_price_negative",
+    PriceRefusalCostPriceNegative => "price_refusal.cost_price_negative",
+    PriceRefusalSalePriceRequired => "price_refusal.sale_price_required",
     ProductSave => "product.save",
     ProductSaveHelp => "product.save_help",
     ProductNoTaxesConfigured => "product.no_taxes_configured",
@@ -1189,6 +1202,17 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderNetRefused, "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:", "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:"),
     (MessageKey::ProductLadderNetDerived, "Derived from the cost and the markup", "Derived from the cost and the markup"),
     (MessageKey::ProductLadderNetManual, "Manual price", "Manual price"),
+    // The price refusals, byte-identical to `PriceRefusal::as_str` because this
+    // row IS the body the JSON API answers with. The English sentence carries no
+    // final period: it is the exact text the refusal has always returned, and the
+    // ladder's tests and the browser suite both read it verbatim.
+    (MessageKey::PriceRefusalMarkupNotAboveMinus100, "markup_pct must be > -100", "markup_pct must be > -100"),
+    (MessageKey::PriceRefusalMarkupNeedsPositiveCost, "cost_price must be > 0 when markup_pct is set", "cost_price must be > 0 when markup_pct is set"),
+    (MessageKey::PriceRefusalDerivationOverflow, "markup_pct or cost_price is too large to derive a sale_price", "markup_pct or cost_price is too large to derive a sale_price"),
+    (MessageKey::PriceRefusalSalePriceNotPositiveForProduct, "sale_price must be > 0 for products", "sale_price must be > 0 for products"),
+    (MessageKey::PriceRefusalSalePriceNegative, "sale_price cannot be negative", "sale_price cannot be negative"),
+    (MessageKey::PriceRefusalCostPriceNegative, "cost_price cannot be negative", "cost_price cannot be negative"),
+    (MessageKey::PriceRefusalSalePriceRequired, "sale_price is required", "sale_price is required"),
     (MessageKey::ProductSave, "Save product", "Save product"),
     (MessageKey::ProductSaveHelp, "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique.", "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique."),
     (MessageKey::ProductNoTaxesConfigured, "No taxes configured yet.", "No taxes configured yet."),
@@ -2125,6 +2149,21 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderNetRefused, "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:", "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:"),
     (MessageKey::ProductLadderNetDerived, "Derivado del costo y del margen", "Derivado del costo y del margen"),
     (MessageKey::ProductLadderNetManual, "Precio manual", "Precio manual"),
+    // The price refusals, in the operator's own words. These are TRANSLATIONS,
+    // not the English rows copied: the English row is the API body the machine
+    // reads, and a Spanish operator who has to decode a column name to learn
+    // that a price was refused is being handed a refusal they cannot act on.
+    // "Un rechazo que el operador no puede leer es un rechazo que no puede
+    // usar", which is why each sentence names the FIELD in the product's own
+    // vocabulary (costo, margen, precio de venta) rather than repeating the
+    // column identifier.
+    (MessageKey::PriceRefusalMarkupNotAboveMinus100, "El margen debe ser mayor que -100.", "El margen debe ser mayor que -100."),
+    (MessageKey::PriceRefusalMarkupNeedsPositiveCost, "El costo debe ser mayor que 0 cuando se indica un margen.", "El costo debe ser mayor que 0 cuando se indica un margen."),
+    (MessageKey::PriceRefusalDerivationOverflow, "El margen o el costo son demasiado grandes para derivar el precio de venta.", "El margen o el costo son demasiado grandes para derivar el precio de venta."),
+    (MessageKey::PriceRefusalSalePriceNotPositiveForProduct, "El precio de venta debe ser mayor que 0 en los productos.", "El precio de venta debe ser mayor que 0 en los productos."),
+    (MessageKey::PriceRefusalSalePriceNegative, "El precio de venta no puede ser negativo.", "El precio de venta no puede ser negativo."),
+    (MessageKey::PriceRefusalCostPriceNegative, "El costo no puede ser negativo.", "El costo no puede ser negativo."),
+    (MessageKey::PriceRefusalSalePriceRequired, "El precio de venta es obligatorio.", "El precio de venta es obligatorio."),
     (MessageKey::ProductSave, "Guardar producto", "Guardar producto"),
     (MessageKey::ProductSaveHelp, "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos.", "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos."),
     (MessageKey::ProductNoTaxesConfigured, "Todavía no hay impuestos configurados.", "Todavía no hay impuestos configurados."),

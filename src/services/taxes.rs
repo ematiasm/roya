@@ -246,9 +246,12 @@ where
     /// the ladder cannot be a cent away from either:
     ///
     /// * [`derive_net_sale_price`] decides the net price, including whether one
-    ///   can be derived at all. Its refusals are carried through verbatim
-    ///   instead of being turned into a zero, and a refusal publishes NO tax
-    ///   money: there is no net price for a tax to apply to.
+    ///   can be derived at all. Its refusals are carried through as themselves
+    ///   — a `PriceRefusal`, never a message — instead of being turned into a
+    ///   zero, and a refusal publishes NO tax money: there is no net price for a
+    ///   tax to apply to. The rendering that turns the carried rule into a
+    ///   sentence in the operator's language belongs to the route, and it is one
+    ///   function the save form and this ladder both go through.
     /// * [`calculate_line_taxes`] totals the taxes, resolved through the same
     ///   `list_active_for_product` read a line write uses, so linking or
     ///   unlinking a tax moves the ladder.
@@ -338,10 +341,9 @@ where
                 // price rule. Either way the ladder holds a refusal and no
                 // figure, which is the only honest answer for a state a save
                 // would reject.
-                let net = derive_net_sale_price(cost_price, markup_pct, sale_price)
-                    .map_err(err_message)
-                    .and_then(|net| {
-                        validate_effective_prices(kind, net, cost_price).map_err(err_message)?;
+                let net =
+                    derive_net_sale_price(cost_price, markup_pct, sale_price).and_then(|net| {
+                        validate_effective_prices(kind, net, cost_price)?;
                         Ok(net)
                     });
                 let (net_price, net_refusal) = match net {
@@ -364,14 +366,14 @@ where
             // A form-shape refusal the save shares, carrying the cost the form
             // does hold: there is no manual price, so there is no net price.
             LadderInput::Refused {
-                message,
+                refusal,
                 cost_price,
             } => ProductPriceLadder {
                 cost_price,
                 markup_pct: None,
                 net_price: Decimal::ZERO,
                 net_is_derived: false,
-                net_refusal: Some(message),
+                net_refusal: Some(refusal),
                 inputs_unreadable: false,
                 from_form: true,
                 breakdown: Vec::new(),
@@ -407,16 +409,6 @@ where
             ladder.total = calc.total;
         }
         Ok(ladder)
-    }
-}
-
-/// The operator-facing text of a validation refusal. The ladder shows the save
-/// path's own message so the operator reads exactly what a save would answer,
-/// instead of a second wording of the same rule.
-fn err_message(error: AppError) -> String {
-    match error {
-        AppError::Validation(message) => message,
-        other => other.to_string(),
     }
 }
 
@@ -490,7 +482,7 @@ fn delete_refusal(references: &TaxReferenceCounts) -> Option<AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NewProduct, ProductKind};
+    use crate::models::{NewProduct, PriceRefusal, ProductKind};
     use crate::repositories::{
         SqliteBarcodeRepository, SqliteCategoryRepository, SqliteProductRepository,
         SqliteProductTaxRepository, SqliteStockMovementRepository, SqliteTaxRepository,
@@ -724,9 +716,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            ladder.net_refusal.as_deref(),
-            Some("cost_price must be > 0 when markup_pct is set"),
-            "the save path's own message, not a second wording of the rule"
+            ladder.net_refusal,
+            Some(PriceRefusal::MarkupNeedsPositiveCost),
+            "the save path's own rule, not a second wording of it"
         );
         assert!(!ladder.net_is_derived);
         assert!(ladder.breakdown.is_empty());
@@ -766,7 +758,7 @@ mod tests {
         s.link_product_tax(1, product_id, iva).await.unwrap();
 
         // (label, form values, the save path's own refusal)
-        let cases: [(&str, LadderInput, Option<&str>); 5] = [
+        let cases: [(&str, LadderInput, Option<PriceRefusal>); 5] = [
             (
                 "markup at the -100 boundary",
                 LadderInput::Form {
@@ -775,7 +767,7 @@ mod tests {
                     cost_price: dec("10"),
                     markup_pct: Some(dec("-100")),
                 },
-                Some("markup_pct must be > -100"),
+                Some(PriceRefusal::MarkupNotAboveMinus100),
             ),
             (
                 "a markup with no cost",
@@ -785,7 +777,7 @@ mod tests {
                     cost_price: Decimal::ZERO,
                     markup_pct: Some(dec("50")),
                 },
-                Some("cost_price must be > 0 when markup_pct is set"),
+                Some(PriceRefusal::MarkupNeedsPositiveCost),
             ),
             (
                 "a derived price that pins to zero",
@@ -795,7 +787,7 @@ mod tests {
                     cost_price: dec("0.05"),
                     markup_pct: Some(dec("-99")),
                 },
-                Some("sale_price must be > 0 for products"),
+                Some(PriceRefusal::SalePriceNotPositiveForProduct),
             ),
             (
                 "a negative cost with a manual price",
@@ -805,7 +797,7 @@ mod tests {
                     cost_price: dec("-5"),
                     markup_pct: None,
                 },
-                Some("cost_price cannot be negative"),
+                Some(PriceRefusal::CostPriceNegative),
             ),
             (
                 "an emptied manual price",
@@ -818,7 +810,7 @@ mod tests {
                 // A manual price of zero on a PRODUCT is the price rule, not the
                 // form-shape one; the form-shape refusal is the route's, and it
                 // arrives here already resolved as `Refused`.
-                Some("sale_price must be > 0 for products"),
+                Some(PriceRefusal::SalePriceNotPositiveForProduct),
             ),
         ];
         for (label, input, expected) in cases {
@@ -827,8 +819,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                ladder.net_refusal.as_deref(),
-                expected,
+                ladder.net_refusal, expected,
                 "{label}: the ladder must carry the save path's own refusal"
             );
             assert!(
@@ -868,7 +859,7 @@ mod tests {
         assert_eq!(zero.breakdown.len(), 1, "and its tax still applies");
         assert_eq!(zero.total, Decimal::ZERO);
 
-        // A NEGATIVE price is refused for a service too, with its own message.
+        // A NEGATIVE price is refused for a service too, with its own rule.
         let negative = s
             .product_price_ladder(
                 service,
@@ -882,8 +873,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            negative.net_refusal.as_deref(),
-            Some("sale_price cannot be negative"),
+            negative.net_refusal,
+            Some(PriceRefusal::SalePriceNegative),
             "the service rule is its own, not the product rule"
         );
         assert!(negative.breakdown.is_empty());

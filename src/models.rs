@@ -213,6 +213,96 @@ pub struct PriceFields {
     pub markup_pct: PriceField,
 }
 
+/// EVERY price and cost rule that can change a figure the product price ladder
+/// publishes or a save accepts. One variant per rule, never a string: the ladder
+/// preview and the product form answer the same refusal for the same input, and
+/// they can only do that structurally while the refusal has an identity both
+/// surfaces can hold.
+///
+/// A variant here is a RULE, not a message. `as_str` is the English text this
+/// refusal has always answered with — the body every non-localized consumer
+/// (the JSON API above all) still receives, byte for byte — and the localized
+/// sentence is the catalog's, reached through the one shared mapping. The two
+/// are pinned together by a test, so neither can be re-worded alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceRefusal {
+    /// `derive_net_sale_price`: a markup at or below -100 would derive a price
+    /// that is not a price.
+    MarkupNotAboveMinus100,
+    /// `derive_net_sale_price`: a markup with no positive cost has nothing to
+    /// derive from. "No cost" is the column's zero, never a NULL.
+    MarkupNeedsPositiveCost,
+    /// `derive_net_sale_price`: the operands are user-supplied and unbounded, and
+    /// `Decimal` arithmetic panics on overflow, so an unbounded pair is refused
+    /// instead of crashing the handler.
+    DerivationOverflow,
+    /// `validate_effective_prices`: a product must sell for something.
+    SalePriceNotPositiveForProduct,
+    /// `validate_effective_prices`: a negative price is refused for a service
+    /// too, with its own sentence — the rules differ, so the identities do.
+    SalePriceNegative,
+    /// `validate_effective_prices`: a negative cost is refused for both kinds.
+    CostPriceNegative,
+    /// The form's own shape: a manual sale price the operator emptied. The save
+    /// refuses it before the service is reached, and the ladder reports the same
+    /// refusal rather than inventing a price.
+    SalePriceRequired,
+}
+
+impl PriceRefusal {
+    /// Every rule, in the order the helpers apply them.
+    ///
+    /// It exists for the tests that must be TOTAL over the enum: the
+    /// catalog-translation test walks it, so a new variant cannot ship without a
+    /// key in BOTH catalogs and an English row byte-identical to `as_str`. A
+    /// production build has no reader — which is why the attribute below is here
+    /// rather than a `use` nobody would find: this is a list FOR the totality
+    /// test, exactly as `MessageKey::ALL` is, and this crate is a binary, where
+    /// `pub` does not by itself exempt an item from the dead-code pass.
+    #[allow(dead_code)]
+    pub const ALL: &'static [Self] = &[
+        Self::MarkupNotAboveMinus100,
+        Self::MarkupNeedsPositiveCost,
+        Self::DerivationOverflow,
+        Self::SalePriceNotPositiveForProduct,
+        Self::SalePriceNegative,
+        Self::CostPriceNegative,
+        Self::SalePriceRequired,
+    ];
+
+    /// The English text this refusal has always answered with. It is the
+    /// `AppError` body, so it is not a presentation choice: a non-localized
+    /// consumer reads exactly these bytes, and the closed-catalog test pins the
+    /// English translation to the same string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MarkupNotAboveMinus100 => "markup_pct must be > -100",
+            Self::MarkupNeedsPositiveCost => "cost_price must be > 0 when markup_pct is set",
+            Self::DerivationOverflow => {
+                "markup_pct or cost_price is too large to derive a sale_price"
+            }
+            Self::SalePriceNotPositiveForProduct => "sale_price must be > 0 for products",
+            Self::SalePriceNegative => "sale_price cannot be negative",
+            Self::CostPriceNegative => "cost_price cannot be negative",
+            Self::SalePriceRequired => "sale_price is required",
+        }
+    }
+}
+
+impl std::fmt::Display for PriceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for PriceRefusal {
+    /// Serialized as the sentence, not as a variant name: a refusal that reaches
+    /// a JSON body must look exactly as it did when it was a `String`.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 /// What the ladder is asked to price. The form values arrive already gated by
 /// the caller's own form-shape rules, so this module never re-decides what an
 /// empty field means — it only derives and totals.
@@ -244,16 +334,18 @@ pub enum LadderInput {
     /// This takes PRECEDENCE over every form-shape gate, which is a decision of
     /// the ladder and not of the save path: the save path checks the sale price
     /// before the cost, so a request with an unreadable cost and an empty
-    /// manual price is answered "sale_price is required" and never mentions the
+    /// manual price is answered for the missing price and never mentions the
     /// field the operator is typing into. A preview has nothing to say once a
     /// field is not a number, so the ladder names that instead.
     Unreadable,
     /// A form-shape refusal the SAVE would answer too — a manual price that is
     /// empty, say — so the ladder reports the same refusal rather than being
-    /// the only surface that invents a price. It keeps the cost, which the form
-    /// does hold, so the operator can still see the rung being edited.
+    /// the only surface that invents a price. It is a `PriceRefusal`, not a
+    /// message, so the ladder and the save can only ever render it through the
+    /// one shared mapping. It keeps the cost, which the form does hold, so the
+    /// operator can still see the rung being edited.
     Refused {
-        message: String,
+        refusal: PriceRefusal,
         cost_price: Decimal,
     },
 }
@@ -283,8 +375,11 @@ pub struct ProductPriceLadder {
     /// manual price. The ladder states which, because "why is it this number"
     /// is the first question an operator asks of a price.
     pub net_is_derived: bool,
-    /// The save path's own refusal, verbatim, when no net price can be stated.
-    pub net_refusal: Option<String>,
+    /// The save path's own refusal, when no net price can be stated. Typed, not
+    /// a message: the ladder renders it through the same mapping the save form
+    /// renders it through, so the preview cannot say in one language what the
+    /// save says in another.
+    pub net_refusal: Option<PriceRefusal>,
     /// True when a form field was not a number, so the ladder reports the last
     /// state the save path accepted instead of a preview of a value that does
     /// not exist.

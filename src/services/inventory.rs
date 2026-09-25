@@ -5,8 +5,8 @@ use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    Category, MovementReason, MovementType, NewMovement, NewProduct, Product, ProductBarcode,
-    ProductKind, ProductStock, StockMovement, UpdateProduct,
+    Category, MovementReason, MovementType, NewMovement, NewProduct, PriceRefusal, Product,
+    ProductBarcode, ProductKind, ProductStock, StockMovement, UpdateProduct,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
@@ -36,30 +36,32 @@ where
 /// `manual_sale_price` entirely, so a caller that supplies a markup must not
 /// also be forced to send a meaningful price.
 ///
-/// The refusals are the save path's own, verbatim, because the ladder shows
-/// them instead of a fabricated figure: a markup needs a positive cost, the
-/// markup itself must be above -100, and an unbounded pair must not overflow
-/// `Decimal` into a panic. Extracted from `validate_product` so the preview
-/// cannot drift from the enforcement: there is now one definition, and the
-/// product drawer's ladder and the save both go through it.
+/// The refusals are the save path's own, and they are a `PriceRefusal` rather
+/// than a message, because the ladder shows them instead of a fabricated figure:
+/// a markup needs a positive cost, the markup itself must be above -100, and an
+/// unbounded pair must not overflow `Decimal` into a panic. Each caller decides
+/// how to PRESENT the refusal — the ladder and the save form in the operator's
+/// language, everything else in the English the refusal has always carried —
+/// and no caller can answer a different rule, because there is no string left
+/// to answer with. Extracted from `validate_product` so the preview cannot
+/// drift from the enforcement: there is now one definition, and the product
+/// drawer's ladder and the save both go through it.
 pub fn derive_net_sale_price(
     cost_price: Decimal,
     markup_pct: Option<Decimal>,
     manual_sale_price: Decimal,
-) -> AppResult<Decimal> {
+) -> Result<Decimal, PriceRefusal> {
     let Some(markup) = markup_pct else {
         return Ok(manual_sale_price);
     };
     if markup <= Decimal::from(-100) {
-        return Err(AppError::Validation("markup_pct must be > -100".into()));
+        return Err(PriceRefusal::MarkupNotAboveMinus100);
     }
     // `cost_price` is NOT NULL DEFAULT '0': "no cost" manifests as 0, not
     // NULL. A zero (or negative) cost must be rejected instead of silently
     // deriving a free price.
     if cost_price <= Decimal::ZERO {
-        return Err(AppError::Validation(
-            "cost_price must be > 0 when markup_pct is set".into(),
-        ));
+        return Err(PriceRefusal::MarkupNeedsPositiveCost);
     }
     // sale_price = cost_price * (1 + markup_pct/100). The percentage's scale
     // shift is a multiplication by 0.01, because this project never divides a
@@ -68,18 +70,16 @@ pub fn derive_net_sale_price(
     // Every operand here is user-supplied and unbounded, and rust_decimal's
     // `Mul`/`Add` PANIC on overflow, so the bare operators would let an
     // authenticated caller 500 the handler. The checked forms turn the same
-    // inputs into a validation error instead. There is deliberately no upper
-    // bound on `markup_pct`: whether a markup is plausible is a product
-    // decision, not an arithmetic one.
+    // inputs into a refusal instead. There is deliberately no upper bound on
+    // `markup_pct`: whether a markup is plausible is a product decision, not an
+    // arithmetic one.
     let factor = markup
         .checked_mul(Decimal::new(1, 2))
         .and_then(|shift| Decimal::ONE.checked_add(shift))
         .and_then(|f| cost_price.checked_mul(f));
     match factor {
         Some(f) => Ok(round_derived_price_to_cents(f)),
-        None => Err(AppError::Validation(
-            "markup_pct or cost_price is too large to derive a sale_price".into(),
-        )),
+        None => Err(PriceRefusal::DerivationOverflow),
     }
 }
 
@@ -87,7 +87,7 @@ pub fn derive_net_sale_price(
 /// one when a markup is set, the incoming one otherwise — and to the cost.
 ///
 /// ONE definition, shared by the save path and the read-only product price
-/// ladder, in the same order and with the same messages the save has always
+/// ladder, in the same order and with the same refusals the save has always
 /// answered. A caller that supplies a markup must not also be forced to send a
 /// meaningful price, so the price rule reads the EFFECTIVE value, never the
 /// incoming one.
@@ -101,23 +101,21 @@ pub fn validate_effective_prices(
     kind: ProductKind,
     sale_price: Decimal,
     cost_price: Decimal,
-) -> AppResult<()> {
+) -> Result<(), PriceRefusal> {
     match kind {
         ProductKind::Product => {
             if sale_price <= Decimal::ZERO {
-                return Err(AppError::Validation(
-                    "sale_price must be > 0 for products".into(),
-                ));
+                return Err(PriceRefusal::SalePriceNotPositiveForProduct);
             }
         }
         ProductKind::Service => {
             if sale_price < Decimal::ZERO {
-                return Err(AppError::Validation("sale_price cannot be negative".into()));
+                return Err(PriceRefusal::SalePriceNegative);
             }
         }
     }
     if cost_price < Decimal::ZERO {
-        return Err(AppError::Validation("cost_price cannot be negative".into()));
+        return Err(PriceRefusal::CostPriceNegative);
     }
     Ok(())
 }
@@ -331,20 +329,27 @@ where
         // one rule the product price ladder previews with: a preview that
         // re-implemented the formula here would be a second definition of the
         // price, which is exactly what this feature exists to prevent.
+        //
+        // The `PriceRefusal` becomes the `AppError` HERE, at the one boundary
+        // between the domain rule and the wire: the service above speaks
+        // `AppResult`, and every non-localized consumer still receives the same
+        // English body it always did.
         let (sale_price, markup_pct) = match input.markup_pct {
             None => (input.sale_price, None),
             Some(m) => (
-                derive_net_sale_price(input.cost_price, Some(m), input.sale_price)?,
+                derive_net_sale_price(input.cost_price, Some(m), input.sale_price)
+                    .map_err(AppError::PriceRefused)?,
                 Some(m),
             ),
         };
         // The price and cost rules, in the save path's own order and with the
-        // save path's own messages. They live in
+        // save path's own refusals. They live in
         // `validate_effective_prices` so the product price ladder previews with
         // the same definition: a ladder that re-derived these two checks would
         // be a second set of price rules, which is what this feature exists to
         // prevent.
-        validate_effective_prices(input.kind, sale_price, input.cost_price)?;
+        validate_effective_prices(input.kind, sale_price, input.cost_price)
+            .map_err(AppError::PriceRefused)?;
         if let Some(cid) = input.category_id {
             if !self.categories.exists(cid).await? {
                 return Err(AppError::NotFound(format!("category {cid} not found")));
@@ -1652,7 +1657,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                AppError::PriceRefused(PriceRefusal::SalePriceNotPositiveForProduct)
+            ),
+            "got {err:?}"
+        );
 
         // No failed patch left a partial write behind.
         let after = s.get_product(p.id).await.unwrap();
@@ -1921,7 +1932,13 @@ mod tests {
             .create_product(actor(&s).await, markup_input("MK-5", "0", "50"))
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                AppError::PriceRefused(PriceRefusal::MarkupNeedsPositiveCost)
+            ),
+            "got {err:?}"
+        );
         assert!(
             s.products.find_by_sku("MK-5").await.unwrap().is_none(),
             "a rejected derivation must write nothing"
@@ -1937,7 +1954,10 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(err, AppError::Validation(_)),
+                matches!(
+                    err,
+                    AppError::PriceRefused(PriceRefusal::MarkupNotAboveMinus100)
+                ),
                 "markup {m}: {err:?}"
             );
             assert!(
@@ -1967,7 +1987,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                AppError::PriceRefused(PriceRefusal::DerivationOverflow)
+            ),
+            "got {err:?}"
+        );
         assert!(
             s.products.find_by_sku("MK-OVF-1").await.unwrap().is_none(),
             "a rejected derivation must write nothing"
@@ -1986,7 +2012,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                AppError::PriceRefused(PriceRefusal::DerivationOverflow)
+            ),
+            "got {err:?}"
+        );
         assert!(
             s.products.find_by_sku("MK-OVF-2").await.unwrap().is_none(),
             "a rejected derivation must write nothing"
@@ -2045,12 +2077,18 @@ mod tests {
                 p.id,
                 UpdateProduct {
                     cost_price: Some(dec("0")),
-                    ..UpdateProduct::default()
+                    ..Default::default()
                 },
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                AppError::PriceRefused(PriceRefusal::MarkupNeedsPositiveCost)
+            ),
+            "got {err:?}"
+        );
         let stored = s.get_product(p.id).await.unwrap();
         assert_eq!(stored.cost_price, dec("5"));
         assert_eq!(stored.sale_price, dec("10"));
@@ -2070,7 +2108,13 @@ mod tests {
             .create_product(actor(&s).await, markup_input("MK-10", "0.01", "-99.5"))
             .await
             .unwrap_err();
-        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            matches!(
+                err,
+                AppError::PriceRefused(PriceRefusal::SalePriceNotPositiveForProduct)
+            ),
+            "got {err:?}"
+        );
         assert!(
             s.products.find_by_sku("MK-10").await.unwrap().is_none(),
             "a rejected derivation must write nothing"
@@ -2150,5 +2194,212 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(p.sale_price, dec("10.01"));
+    }
+
+    // -----------------------------------------------------------------------
+    // THE REFUSAL SET, pinned as a matrix
+    //
+    // These two helpers are the whole price-and-cost rule set: what the save
+    // accepts, what it refuses, and WHICH refusal it answers when a request
+    // breaks more than one rule. Everything downstream — the product form, the
+    // drawer ladder, the JSON API — only presents what this matrix decides, so
+    // a row here is a row everywhere.
+    //
+    // It is written against the helpers DIRECTLY, not against `create_product`,
+    // so the rows state the rule and its boundary instead of restating a
+    // service that has other validations in it.
+    //
+    // It was written BEFORE the refusals were typed, asserting the exact message
+    // every row answered, and re-pointed at the variants afterwards with the same
+    // rows. That is what makes "the refusal set did not change" a claim this
+    // table supports, rather than one the diff has to be trusted about.
+    // -----------------------------------------------------------------------
+
+    /// One matrix row: the inputs, and whether the price rules ACCEPT them or
+    /// answer this exact refusal. `None` means accepted — "the same inputs are
+    /// accepted" is half of what a presentation change must not alter, and a
+    /// matrix that only listed refusals could not falsify it.
+    type PriceCase = (
+        &'static str,
+        ProductKind,
+        &'static str,
+        Option<&'static str>,
+        &'static str,
+        Option<PriceRefusal>,
+    );
+
+    /// The whole set, in one table. Each row is a real boundary, and the
+    /// overflow rows use the extreme of the representable range so a panic
+    /// fails them (the checked arithmetic is the reason they are refusals).
+    const PRICE_CASES: [PriceCase; 17] = [
+        // A manual price the save accepts.
+        (
+            "a manual price",
+            ProductKind::Product,
+            "5",
+            None,
+            "10",
+            None,
+        ),
+        (
+            "a manual price for a service",
+            ProductKind::Service,
+            "5",
+            None,
+            "0",
+            None,
+        ),
+        // The price rule, per kind.
+        (
+            "a zero product price",
+            ProductKind::Product,
+            "5",
+            None,
+            "0",
+            Some(PriceRefusal::SalePriceNotPositiveForProduct),
+        ),
+        (
+            "a negative product price",
+            ProductKind::Product,
+            "5",
+            None,
+            "-1",
+            Some(PriceRefusal::SalePriceNotPositiveForProduct),
+        ),
+        (
+            "a negative service price",
+            ProductKind::Service,
+            "5",
+            None,
+            "-1",
+            Some(PriceRefusal::SalePriceNegative),
+        ),
+        // The cost rule.
+        (
+            "a negative cost",
+            ProductKind::Product,
+            "-5",
+            None,
+            "42",
+            Some(PriceRefusal::CostPriceNegative),
+        ),
+        // A markup that derives, and the two the derivation refuses.
+        (
+            "a derivable markup",
+            ProductKind::Product,
+            "5",
+            Some("100"),
+            "999",
+            None,
+        ),
+        (
+            "a markup at the -100 boundary",
+            ProductKind::Product,
+            "5",
+            Some("-100"),
+            "0",
+            Some(PriceRefusal::MarkupNotAboveMinus100),
+        ),
+        (
+            "a markup below -100",
+            ProductKind::Product,
+            "5",
+            Some("-150"),
+            "0",
+            Some(PriceRefusal::MarkupNotAboveMinus100),
+        ),
+        (
+            "a markup with no cost",
+            ProductKind::Product,
+            "0",
+            Some("50"),
+            "0",
+            Some(PriceRefusal::MarkupNeedsPositiveCost),
+        ),
+        (
+            "a markup with a negative cost",
+            ProductKind::Product,
+            "-5",
+            Some("50"),
+            "0",
+            Some(PriceRefusal::MarkupNeedsPositiveCost),
+        ),
+        (
+            "a markup that overflows",
+            ProductKind::Product,
+            "1000",
+            Some("79228162514264337593543950335"),
+            "0",
+            Some(PriceRefusal::DerivationOverflow),
+        ),
+        (
+            "a cost that overflows",
+            ProductKind::Product,
+            "79228162514264337593543950335",
+            Some("50"),
+            "0",
+            Some(PriceRefusal::DerivationOverflow),
+        ),
+        // A derived price that pins to zero is the PRODUCT rule, and for a
+        // service it is a legal price the save accepts.
+        (
+            "a derived price that pins to zero",
+            ProductKind::Product,
+            "0.05",
+            Some("-99"),
+            "1",
+            Some(PriceRefusal::SalePriceNotPositiveForProduct),
+        ),
+        (
+            "a free derived service",
+            ProductKind::Service,
+            "0.05",
+            Some("-99"),
+            "1",
+            None,
+        ),
+        // ORDER: a request that breaks two rules answers the derivation's, and
+        // the price rule answers before the cost rule. A matrix that let either
+        // order slide would not pin the refusal an operator is shown.
+        (
+            "a bad markup and a negative cost",
+            ProductKind::Product,
+            "-5",
+            Some("-100"),
+            "0",
+            Some(PriceRefusal::MarkupNotAboveMinus100),
+        ),
+        (
+            "a zero price and a negative cost",
+            ProductKind::Product,
+            "-5",
+            None,
+            "0",
+            Some(PriceRefusal::SalePriceNotPositiveForProduct),
+        ),
+    ];
+
+    /// The set itself, asserted row by row: accepted inputs stay accepted, and
+    /// refused inputs keep the EXACT rule they answered before the refusal
+    /// became a typed value. No message is compared here — the message is
+    /// presentation, and the presentation tests live with the surfaces that
+    /// render it.
+    #[test]
+    fn the_price_rules_refuse_exactly_this_set() {
+        for (label, kind, cost, markup, sale, expected) in PRICE_CASES {
+            let outcome = derive_net_sale_price(dec(cost), markup.map(dec), dec(sale))
+                .and_then(|net| validate_effective_prices(kind, net, dec(cost)).map(|_| net));
+            match expected {
+                None => assert!(
+                    outcome.is_ok(),
+                    "{label}: the save path accepts these inputs, so nothing here may change that"
+                ),
+                Some(refusal) => assert_eq!(
+                    outcome,
+                    Err(refusal),
+                    "{label}: the save path refuses these inputs, and it refuses them with this rule"
+                ),
+            }
+        }
     }
 }
