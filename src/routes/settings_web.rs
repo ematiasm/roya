@@ -411,32 +411,51 @@ fn render<T: Template>(template: T) -> AppResult<String> {
 //
 // THE URL DECISION, stated once so the next reader does not have to infer it.
 //
-// Tax administration has exactly ONE canonical address space, and it is this
-// one: `/web/settings/taxes…`, gated by `settings.manage`, on the page at
-// `/settings?tab=taxes`. Every mutation the tab issues is here, including the
-// ones that do not exist anywhere else (activation and the hard delete).
+// SCOPE FIRST, because it is the thing most easily over-claimed: everything
+// below is about the WEB surface (`/web/…`, the operator's browser). The JSON
+// API is a DIFFERENT surface with different permissions, and this comment says
+// nothing about it. See the residual named at the bottom.
 //
-// The pre-existing `/web/taxes`, `/web/taxes/edit` and `/web/taxes/deactivate`
-// routes are NOT this surface and were deliberately left untouched. They belong
-// to the Products screen's tax catalogue, they are gated by `inventory.write`,
-// and the product drawer renders their fragments.
+// On the web, tax administration has exactly ONE canonical address space, and
+// it is this one: `/web/settings/taxes…`, gated by `settings.manage`, on the
+// page at `/settings?tab=taxes`. Every mutation a tax DEFINITION needs is here:
+// create, rename, re-rate, activate, deactivate, and the hard delete that no
+// other WEB route offers.
 //
-// WHAT IS AND IS NOT GATED BY `settings.manage`, stated exactly so the next
-// reader does not over-claim:
+// THE OTHER WEB SURFACE IS GONE. `/web/taxes`, `/web/taxes/edit` and
+// `/web/taxes/deactivate` used to be a SECOND address space for the same
+// operations, gated by `inventory.write` and rendered by the Products screen's
+// tax catalogue. The product-price-ladder unit (U1) removed that catalogue and
+// unregistered those routes, so this is now the only web address for a tax
+// definition and the same form is no longer reachable from two screens.
 //
-//   * IRREVERSIBLE tax administration is settings-only. A hard delete — the one
-//     operation that removes a definition instead of editing it — exists on no
-//     other route, and `inventory.write` cannot reach it. That is what this
-//     feature actually decided.
-//   * The catalogue itself is NOT settings-only, and this unit did not make it
-//     so. A principal holding `inventory.write` can still create, rename,
-//     re-rate and deactivate/activate taxes from the Products catalogue, exactly
-//     as before. Whether that should narrow is a separate authorization
-//     decision, not a side effect of moving the hard delete behind a gate.
+// WHAT IS AND IS NOT GATED BY `settings.manage` ON THE WEB, stated exactly so
+// the next reader does not over-claim:
 //
-// Merging the two surfaces would mean either handing deletion to
-// `inventory.write` or breaking the product page, its catalogue and the tests
-// that drive it. Two surfaces, two owners, two permissions, no shared handler.
+//   * Tax DEFINITION administration is settings-only ON THE WEB. Create, rename,
+//     re-rate, activate, deactivate and the hard delete all require
+//     `settings.manage`, and no `inventory.write` web route reaches any of them
+//     — not even by a route that refuses instead of disappearing, because those
+//     routes are not registered at all.
+//     `tax_web_definition_administration_is_exclusive_to_settings_manage` in
+//     `tax_tests.rs` proves both halves, and it probes only `/web/taxes…`.
+//   * The product-tax ASSOCIATION is NOT settings-only and never will be, on
+//     either surface. Linking and unlinking a tax to a product is inventory
+//     state, so it stays on `POST /web/product-taxes` and
+//     `POST /web/product-taxes/unlink` behind `inventory.write`. One owner per
+//     concern, and the two never share a handler: a principal may hold one
+//     permission and not the other.
+//
+// THE RESIDUAL, stated rather than left for the next reader to discover: the
+// JSON API still administers tax DEFINITIONS behind `inventory.write` —
+// `POST /api/taxes` (create), `PUT /api/taxes/{id}` (rename, re-rate, and
+// `is_active`) and `POST /api/taxes/{id}/deactivate`, all
+// `Require<InventoryWrite>` in `src/routes/inventory_api.rs`. This is
+// PRE-EXISTING, it is NOT a U1 regression, and U1 deliberately left it alone:
+// narrowing the API's permissions is a separate product decision nobody has
+// made yet. So the honest one-line summary is "the WEB catalogue is
+// settings-only", never "tax administration is settings-only". Read
+// `odd/tasks/product-price-ladder.md` for that open decision.
 
 /// The tax form the catalogue rows and the create row submit.
 #[derive(Debug, Deserialize)]

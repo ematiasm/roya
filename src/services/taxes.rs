@@ -2,10 +2,11 @@ use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    NewTax, ProductTax, ProductTaxBreakdownRow, ProductTaxPreview, ProductTaxView, Tax,
-    TaxReferenceCounts, UpdateTax,
+    LadderInput, NewTax, ProductPriceLadder, ProductTax, ProductTaxBreakdownRow, ProductTaxView,
+    Tax, TaxReferenceCounts, UpdateTax,
 };
 use crate::repositories::{ProductRepository, ProductTaxRepository, TaxRepository};
+use crate::services::inventory::{derive_net_sale_price, validate_effective_prices};
 use crate::services::line_taxes::calculate_line_taxes;
 
 /// Canonical reason a hard delete was refused because a `product_taxes` row
@@ -230,27 +231,166 @@ where
         Ok(())
     }
 
-    /// The product's tax-inclusive unit price preview: the stored net sale price
-    /// plus every ACTIVE linked tax, run through the same calculation contract a
-    /// document line write runs, so the two can never disagree by a cent.
+    async fn require_product(&self, product_id: i64) -> AppResult<crate::models::Product> {
+        self.products
+            .find_by_id(product_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("product {product_id} not found")))
+    }
+
+    /// The product price ladder: cost, markup, net sale price, every active
+    /// linked tax with the amount it adds, the tax total and the tax-inclusive
+    /// price — in the order an operator can sanity-check a price.
     ///
-    /// Purely derived. Nothing here writes: the stored `sale_price` stays net,
-    /// which is what a document line snapshots and what the API reports.
-    pub async fn product_price_preview(&self, product_id: i64) -> AppResult<ProductTaxPreview> {
+    /// Two contracts, both the ones a save and a document line already use, so
+    /// the ladder cannot be a cent away from either:
+    ///
+    /// * [`derive_net_sale_price`] decides the net price, including whether one
+    ///   can be derived at all. Its refusals are carried through verbatim
+    ///   instead of being turned into a zero, and a refusal publishes NO tax
+    ///   money: there is no net price for a tax to apply to.
+    /// * [`calculate_line_taxes`] totals the taxes, resolved through the same
+    ///   `list_active_for_product` read a line write uses, so linking or
+    ///   unlinking a tax moves the ladder.
+    ///
+    /// Purely derived: this reads the product and the associations and writes
+    /// nothing, on any path. The stored net price is what a save will persist
+    /// and is never rewritten here.
+    ///
+    /// `None` is the drawer's own first render: no form values exist yet, and
+    /// the stored row IS the answer. It is the same state `LadderInput::
+    /// Unreadable` reports, minus the operator-facing hint, because nothing is
+    /// wrong: nothing has been typed.
+    ///
+    /// THE AUDITED BOUNDARY, stated because "refuse everything the save refuses"
+    /// is only meaningful with a list. The ladder mirrors every rule that can
+    /// change a FIGURE it publishes, and each of them is the save path's own
+    /// function, not a copy of it:
+    ///
+    /// | state | source | ladder |
+    /// |---|---|---|
+    /// | markup at or below -100 | `derive_net_sale_price` | refusal, no figure |
+    /// | a markup with no positive cost | `derive_net_sale_price` | refusal, no figure |
+    /// | a derived price that pins to zero | `validate_effective_prices` | refusal, no figure |
+    /// | a negative price, product or service | `validate_effective_prices` | refusal, no figure |
+    /// | a negative cost | `validate_effective_prices` | refusal, no figure |
+    /// | an emptied manual price | the form-shape gate, as `LadderInput::Refused` | refusal, no figure |
+    ///
+    /// The price rule is applied to the kind IN THE FORM when the request names
+    /// one, and to the product's STORED kind when it names none or names
+    /// something that is not a kind. That is the whole reason a free service
+    /// switched to a product in the form refuses here: the ladder is a preview
+    /// of the save, and the save would refuse it.
+    ///
+    /// (One documented divergence, unreachable from the drawer's own select: the
+    /// SAVE reads an EMPTY `kind` as `Product`, while the ladder reads an absent
+    /// or unreadable one as the stored kind. The drawer\'s select always carries
+    /// a value, so a browser cannot reach it; if a future form could, the two
+    /// surfaces would answer differently for an empty select and only for that.)
+    ///
+    /// The remaining `validate_product` rules are deliberately NOT mirrored, and
+    /// the reason is that none of them can change a number this fragment shows:
+    /// the SKU/name/unit lengths, the category's existence, the track-stock
+    /// flag, the min/max bounds and the "services cannot track stock" rule. A
+    /// form that violates one of those is refused by the save for a reason that
+    /// has nothing to do with a price, and the ladder keeps previewing the price
+    /// it was asked about rather than refusing to answer a different question.
+    /// If a future rule ever does touch a figure, it belongs in
+    /// `derive_net_sale_price` or `validate_effective_prices` and in this table.
+    pub async fn product_price_ladder(
+        &self,
+        product_id: i64,
+        input: Option<LadderInput>,
+    ) -> AppResult<ProductPriceLadder> {
         let product = self.require_product(product_id).await?;
+        // The save path's price rule branches on the kind (a product must sell
+        // for something, a service may cost nothing), so the ladder carries both
+        // candidates: the form's when the request named one, this one otherwise.
+        let stored_kind = product.kind;
         // The same resolution boundary the line write uses: linked AND active,
-        // ordered by code then id so the breakdown is deterministic.
+        // ordered by code then id so the ladder is deterministic.
         let taxes = self
             .product_taxes
             .list_active_for_product(product_id)
             .await?;
-        let calc = calculate_line_taxes(product.sale_price, &taxes);
-        Ok(ProductTaxPreview {
-            // The net the taxes were actually applied to, read from the
-            // calculation itself instead of re-read from the product: one
-            // source of truth for the figure the breakdown adds up to.
-            net_price: calc.net_subtotal,
-            breakdown: calc
+
+        // First the PRICE half of the ladder, from the form or from the stored
+        // row, including the two states in which there is no net price to
+        // publish.
+        let mut ladder = match input.unwrap_or(LadderInput::Stored) {
+            LadderInput::Form {
+                kind,
+                sale_price,
+                cost_price,
+                markup_pct,
+            } => {
+                // The price rule is the FORM's rule: the kind the operator has
+                // selected right now, not the one the row was saved with. A free
+                // service switched to a product is refused by the save for
+                // being 0.00, and the ladder has to refuse it too, or it
+                // publishes a price no save would accept. With no readable kind
+                // in the form the product's own stored kind applies.
+                let kind = kind.unwrap_or(stored_kind);
+                // Derive, then apply the save path's OWN price and cost rules to
+                // the effective price. Two refusals in a row are possible and
+                // both are the save path's: a markup with no cost fails
+                // derivation, and a derived price that pins to zero fails the
+                // price rule. Either way the ladder holds a refusal and no
+                // figure, which is the only honest answer for a state a save
+                // would reject.
+                let net = derive_net_sale_price(cost_price, markup_pct, sale_price)
+                    .map_err(err_message)
+                    .and_then(|net| {
+                        validate_effective_prices(kind, net, cost_price).map_err(err_message)?;
+                        Ok(net)
+                    });
+                let (net_price, net_refusal) = match net {
+                    Ok(net) => (net, None),
+                    Err(refusal) => (Decimal::ZERO, Some(refusal)),
+                };
+                ProductPriceLadder {
+                    cost_price,
+                    markup_pct,
+                    net_price,
+                    net_is_derived: net_refusal.is_none() && markup_pct.is_some(),
+                    net_refusal,
+                    inputs_unreadable: false,
+                    from_form: true,
+                    breakdown: Vec::new(),
+                    tax_total: Decimal::ZERO,
+                    total: Decimal::ZERO,
+                }
+            }
+            // A form-shape refusal the save shares, carrying the cost the form
+            // does hold: there is no manual price, so there is no net price.
+            LadderInput::Refused {
+                message,
+                cost_price,
+            } => ProductPriceLadder {
+                cost_price,
+                markup_pct: None,
+                net_price: Decimal::ZERO,
+                net_is_derived: false,
+                net_refusal: Some(message),
+                inputs_unreadable: false,
+                from_form: true,
+                breakdown: Vec::new(),
+                tax_total: Decimal::ZERO,
+                total: Decimal::ZERO,
+            },
+            // No form values at all, or one that is not a number. The stored row
+            // is the last state the save path accepted, and reporting it is the
+            // only answer that is not invented.
+            LadderInput::Stored => stored_ladder(&product, false),
+            LadderInput::Unreadable => stored_ladder(&product, true),
+        };
+
+        // Then the TAX half, and only when there is a net price to apply them
+        // to: a breakdown computed from a price that does not exist would be
+        // exactly the fabrication this ladder exists to avoid.
+        if ladder.net_refusal.is_none() {
+            let calc = calculate_line_taxes(ladder.net_price, &taxes);
+            ladder.breakdown = calc
                 .taxes
                 .iter()
                 .map(|row| ProductTaxBreakdownRow {
@@ -259,17 +399,42 @@ where
                     rate: row.rate,
                     amount: row.amount,
                 })
-                .collect(),
-            tax_total: calc.tax_total,
-            total: calc.total,
-        })
+                .collect();
+            // The net is read back off the calculation, never re-derived here:
+            // one source of truth for the figure the breakdown adds up to.
+            ladder.net_price = calc.net_subtotal;
+            ladder.tax_total = calc.tax_total;
+            ladder.total = calc.total;
+        }
+        Ok(ladder)
     }
+}
 
-    async fn require_product(&self, product_id: i64) -> AppResult<crate::models::Product> {
-        self.products
-            .find_by_id(product_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound(format!("product {product_id} not found")))
+/// The operator-facing text of a validation refusal. The ladder shows the save
+/// path's own message so the operator reads exactly what a save would answer,
+/// instead of a second wording of the same rule.
+fn err_message(error: AppError) -> String {
+    match error {
+        AppError::Validation(message) => message,
+        other => other.to_string(),
+    }
+}
+
+/// The stored row read as a ladder: the last state the save path accepted.
+/// `unreadable` says whether the operator has to be told why the ladder is not
+/// previewing their typing.
+fn stored_ladder(product: &crate::models::Product, unreadable: bool) -> ProductPriceLadder {
+    ProductPriceLadder {
+        cost_price: product.cost_price,
+        markup_pct: product.markup_pct,
+        net_price: product.sale_price,
+        net_is_derived: product.markup_pct.is_some(),
+        net_refusal: None,
+        inputs_unreadable: unreadable,
+        from_form: false,
+        breakdown: Vec::new(),
+        tax_total: Decimal::ZERO,
+        total: Decimal::ZERO,
     }
 }
 
@@ -414,58 +579,59 @@ mod tests {
         .id
     }
 
-    /// The preview is a read of the CURRENT catalogue: a product with no linked
-    /// tax previews as its net price, and a linked tax changes nothing about the
-    /// stored price.
+    /// The ladder is a read of the CURRENT catalogue: a product with no linked
+    /// tax ladders to its own net price, and a linked tax changes nothing about
+    /// the stored price.
     #[tokio::test]
-    async fn tax_preview_without_taxes_is_the_stored_net_price() {
+    async fn price_ladder_without_taxes_is_the_stored_net_price() {
         let (s, _pool, product_id) = svc_with_product("100").await;
 
-        let preview = s.product_price_preview(product_id).await.unwrap();
-        assert_eq!(preview.net_price, dec("100"));
-        assert!(preview.breakdown.is_empty());
-        assert_eq!(preview.tax_total, dec("0"));
-        assert_eq!(preview.total, dec("100"));
+        let ladder = s.product_price_ladder(product_id, None).await.unwrap();
+        assert_eq!(ladder.net_price, dec("100"));
+        assert!(ladder.net_refusal.is_none());
+        assert!(ladder.breakdown.is_empty());
+        assert_eq!(ladder.tax_total, dec("0"));
+        assert_eq!(ladder.total, dec("100"));
 
         let product = s.products.find_by_id(product_id).await.unwrap().unwrap();
         assert_eq!(
             product.sale_price,
             dec("100"),
-            "the preview must never write the stored net price"
+            "the ladder must never write the stored net price"
         );
     }
 
     /// Several linked taxes are additive, and the breakdown the operator reads
     /// reconciles with the total they are shown.
     #[tokio::test]
-    async fn tax_preview_sums_every_linked_tax_additively() {
+    async fn price_ladder_sums_every_linked_tax_additively() {
         let (s, _pool, product_id) = svc_with_product("100").await;
         let iva = link(&s, "IVA21", "21").await;
         let iibb = link(&s, "IIBB10", "10").await;
         s.link_product_tax(1, product_id, iva).await.unwrap();
         s.link_product_tax(1, product_id, iibb).await.unwrap();
 
-        let preview = s.product_price_preview(product_id).await.unwrap();
-        assert_eq!(preview.net_price, dec("100"));
-        assert_eq!(preview.breakdown.len(), 2);
+        let ladder = s.product_price_ladder(product_id, None).await.unwrap();
+        assert_eq!(ladder.net_price, dec("100"));
+        assert_eq!(ladder.breakdown.len(), 2);
         assert_eq!(
-            preview.breakdown[0].code, "IIBB10",
+            ladder.breakdown[0].code, "IIBB10",
             "ordered by code, then id"
         );
-        assert_eq!(preview.breakdown[0].rate, dec("10"));
-        assert_eq!(preview.breakdown[0].amount, dec("10"));
-        assert_eq!(preview.breakdown[1].code, "IVA21");
-        assert_eq!(preview.breakdown[1].amount, dec("21"));
-        assert_eq!(preview.tax_total, dec("31"), "additive, not compounded");
-        assert_eq!(preview.total, dec("131"));
-        let sum: Decimal = preview.breakdown.iter().map(|row| row.amount).sum();
-        assert_eq!(sum, preview.tax_total, "the breakdown must reconcile");
+        assert_eq!(ladder.breakdown[0].rate, dec("10"));
+        assert_eq!(ladder.breakdown[0].amount, dec("10"));
+        assert_eq!(ladder.breakdown[1].code, "IVA21");
+        assert_eq!(ladder.breakdown[1].amount, dec("21"));
+        assert_eq!(ladder.tax_total, dec("31"), "additive, not compounded");
+        assert_eq!(ladder.total, dec("131"));
+        let sum: Decimal = ladder.breakdown.iter().map(|row| row.amount).sum();
+        assert_eq!(sum, ladder.tax_total, "the breakdown must reconcile");
     }
 
     /// A DEACTIVATED tax is not a tax the product will be charged, so it leaves
-    /// the preview — the same exclusion the document line write performs.
+    /// the ladder — the same exclusion the document line write performs.
     #[tokio::test]
-    async fn tax_preview_excludes_a_deactivated_tax() {
+    async fn price_ladder_excludes_a_deactivated_tax() {
         let (s, _pool, product_id) = svc_with_product("100").await;
         let iva = link(&s, "IVA21", "21").await;
         let iibb = link(&s, "IIBB10", "10").await;
@@ -473,38 +639,296 @@ mod tests {
         s.link_product_tax(1, product_id, iibb).await.unwrap();
         s.deactivate_tax(1, iibb).await.unwrap();
 
-        let preview = s.product_price_preview(product_id).await.unwrap();
-        assert_eq!(preview.breakdown.len(), 1);
-        assert_eq!(preview.breakdown[0].code, "IVA21");
-        assert_eq!(preview.tax_total, dec("21"));
-        assert_eq!(preview.total, dec("121"));
+        let ladder = s.product_price_ladder(product_id, None).await.unwrap();
+        assert_eq!(ladder.breakdown.len(), 1);
+        assert_eq!(ladder.breakdown[0].code, "IVA21");
+        assert_eq!(ladder.tax_total, dec("21"));
+        assert_eq!(ladder.total, dec("121"));
     }
 
-    /// The preview shares the one half-up money rule, so a net price with a
-    /// third decimal previews as the value a line would charge.
+    /// The ladder shares the one half-up money rule, so a net price with a
+    /// third decimal ladders to the value a line would charge.
     #[tokio::test]
-    async fn tax_preview_rounds_the_tax_inclusive_price_half_up() {
+    async fn price_ladder_rounds_the_tax_inclusive_price_half_up() {
         let (s, _pool, product_id) = svc_with_product("10.005").await;
         let iva = link(&s, "IVA21", "21").await;
         s.link_product_tax(1, product_id, iva).await.unwrap();
 
-        let preview = s.product_price_preview(product_id).await.unwrap();
-        assert_eq!(preview.net_price, dec("10.005"), "shown net, unrounded");
-        assert_eq!(preview.breakdown[0].amount, dec("2.10"));
-        assert_eq!(preview.tax_total, dec("2.10"));
+        let ladder = s.product_price_ladder(product_id, None).await.unwrap();
+        assert_eq!(ladder.net_price, dec("10.005"), "shown net, unrounded");
+        assert_eq!(ladder.breakdown[0].amount, dec("2.10"));
+        assert_eq!(ladder.tax_total, dec("2.10"));
         assert_eq!(
-            preview.total,
+            ladder.total,
             dec("12.11"),
             "half-up, the same total a line of this product would carry"
         );
     }
 
-    /// An unknown product is a 404, not a silent zero preview: the drawer already
+    /// The ladder derives the net price through the SAME rule the save path
+    /// enforces, so a preview can never state a price a save would refuse or a
+    /// different one. A markup over a positive cost derives; the stored row
+    /// never changes because of the preview.
+    #[tokio::test]
+    async fn price_ladder_derives_the_net_price_through_the_save_paths_rule() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+
+        let ladder = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("999"),
+                    cost_price: dec("10"),
+                    markup_pct: Some(dec("100")),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ladder.net_price, dec("20"), "10 * (1 + 100/100)");
+        assert!(ladder.net_is_derived);
+        assert!(ladder.net_refusal.is_none());
+        assert_eq!(ladder.breakdown[0].amount, dec("4.20"));
+        assert_eq!(ladder.total, dec("24.20"));
+
+        let product = s.products.find_by_id(product_id).await.unwrap().unwrap();
+        assert_eq!(
+            product.sale_price,
+            dec("100"),
+            "a ladder over unsaved values persists nothing"
+        );
+    }
+
+    /// A markup with no cost cannot produce a price, so the ladder carries the
+    /// SAVE PATH'S OWN refusal and publishes no tax money at all — a breakdown
+    /// built on a price that does not exist is the fabrication this ladder
+    /// exists to prevent.
+    #[tokio::test]
+    async fn price_ladder_refuses_to_publish_tax_money_without_a_net_price() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+
+        let ladder = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("0"),
+                    cost_price: Decimal::ZERO,
+                    markup_pct: Some(dec("50")),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ladder.net_refusal.as_deref(),
+            Some("cost_price must be > 0 when markup_pct is set"),
+            "the save path's own message, not a second wording of the rule"
+        );
+        assert!(!ladder.net_is_derived);
+        assert!(ladder.breakdown.is_empty());
+        assert_eq!(ladder.tax_total, Decimal::ZERO);
+        assert_eq!(ladder.total, Decimal::ZERO);
+    }
+
+    /// An unreadable field previews nothing: the ladder reports the last state
+    /// the save path accepted and says why, rather than guessing at a price.
+    #[tokio::test]
+    async fn price_ladder_of_an_unreadable_field_shows_the_last_saved_state() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+
+        let ladder = s
+            .product_price_ladder(product_id, Some(LadderInput::Unreadable))
+            .await
+            .unwrap();
+        assert!(ladder.inputs_unreadable);
+        assert_eq!(ladder.net_price, dec("100"));
+        assert!(ladder.net_refusal.is_none());
+
+        let fresh = s.product_price_ladder(product_id, None).await.unwrap();
+        assert!(
+            !fresh.inputs_unreadable,
+            "no form at all is not a problem: nothing has been typed"
+        );
+    }
+
+    /// THE REFUSAL MATRIX, in one place: every state the SAVE path refuses must
+    /// leave the ladder with no net price, no per-tax amount, no tax total and
+    /// no tax-inclusive price. Each row is a real save refusal, taken from the
+    /// rules `validate_product` applies to the EFFECTIVE price and the cost.
+    #[tokio::test]
+    async fn price_ladder_refuses_exactly_what_the_save_path_refuses() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+
+        // (label, form values, the save path's own refusal)
+        let cases: [(&str, LadderInput, Option<&str>); 5] = [
+            (
+                "markup at the -100 boundary",
+                LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("0"),
+                    cost_price: dec("10"),
+                    markup_pct: Some(dec("-100")),
+                },
+                Some("markup_pct must be > -100"),
+            ),
+            (
+                "a markup with no cost",
+                LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("0"),
+                    cost_price: Decimal::ZERO,
+                    markup_pct: Some(dec("50")),
+                },
+                Some("cost_price must be > 0 when markup_pct is set"),
+            ),
+            (
+                "a derived price that pins to zero",
+                LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("0"),
+                    cost_price: dec("0.05"),
+                    markup_pct: Some(dec("-99")),
+                },
+                Some("sale_price must be > 0 for products"),
+            ),
+            (
+                "a negative cost with a manual price",
+                LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("42"),
+                    cost_price: dec("-5"),
+                    markup_pct: None,
+                },
+                Some("cost_price cannot be negative"),
+            ),
+            (
+                "an emptied manual price",
+                LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("0"),
+                    cost_price: dec("5"),
+                    markup_pct: None,
+                },
+                // A manual price of zero on a PRODUCT is the price rule, not the
+                // form-shape one; the form-shape refusal is the route's, and it
+                // arrives here already resolved as `Refused`.
+                Some("sale_price must be > 0 for products"),
+            ),
+        ];
+        for (label, input, expected) in cases {
+            let ladder = s
+                .product_price_ladder(product_id, Some(input))
+                .await
+                .unwrap();
+            assert_eq!(
+                ladder.net_refusal.as_deref(),
+                expected,
+                "{label}: the ladder must carry the save path's own refusal"
+            );
+            assert!(
+                ladder.breakdown.is_empty(),
+                "{label}: a refused price publishes no per-tax amount: {ladder:?}"
+            );
+            assert_eq!(ladder.tax_total, Decimal::ZERO, "{label}");
+            assert_eq!(ladder.total, Decimal::ZERO, "{label}");
+            assert!(!ladder.net_is_derived, "{label}");
+        }
+
+        // The mirror is KIND-AWARE, not a blanket "zero is bad": a SERVICE may
+        // legitimately cost nothing, and the save path accepts it, so the ladder
+        // must publish the figure instead of inventing a refusal.
+        let pool = _pool;
+        let service = seed_service(&s, &pool, "LADDER-SVC").await;
+        // The same tax, linked to the service too: a zero-priced service must
+        // still publish the tax that applies to it.
+        s.link_product_tax(1, service, iva).await.unwrap();
+        let zero = s
+            .product_price_ladder(
+                service,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("0"),
+                    cost_price: dec("0.05"),
+                    markup_pct: Some(dec("-99")),
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            zero.net_refusal.is_none(),
+            "a service priced at zero is a price the save path accepts: {zero:?}"
+        );
+        assert_eq!(zero.net_price, Decimal::ZERO);
+        assert_eq!(zero.breakdown.len(), 1, "and its tax still applies");
+        assert_eq!(zero.total, Decimal::ZERO);
+
+        // A NEGATIVE price is refused for a service too, with its own message.
+        let negative = s
+            .product_price_ladder(
+                service,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("-1"),
+                    cost_price: dec("5"),
+                    markup_pct: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            negative.net_refusal.as_deref(),
+            Some("sale_price cannot be negative"),
+            "the service rule is its own, not the product rule"
+        );
+        assert!(negative.breakdown.is_empty());
+    }
+
+    /// A service seeded for the kind-aware rules: the ladder mirrors
+    /// `validate_product`, and that validation branches on the product kind.
+    async fn seed_service(s: &Svc, pool: &sqlx::SqlitePool, sku: &str) -> i64 {
+        let inventory = InventoryService::new(
+            SqliteCategoryRepository::new(pool.clone()),
+            s.products.clone(),
+            SqliteBarcodeRepository::new(pool.clone()),
+            SqliteStockMovementRepository::new(pool.clone()),
+            true,
+        );
+        inventory
+            .create_product(
+                test_support::audit_actor_id(pool).await.unwrap(),
+                NewProduct {
+                    sku: sku.into(),
+                    name: "a service".into(),
+                    kind: ProductKind::Service,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec("20"),
+                    cost_price: dec("5"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// An unknown product is a 404, not a silent zero ladder: the drawer already
     /// resolved the product, so this only guards the contract.
     #[tokio::test]
-    async fn tax_preview_of_an_unknown_product_is_not_found() {
+    async fn price_ladder_of_an_unknown_product_is_not_found() {
         let (s, _pool, _product_id) = svc_with_product("100").await;
-        let err = s.product_price_preview(999_999).await.unwrap_err();
+        let err = s.product_price_ladder(999_999, None).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
     }
 }

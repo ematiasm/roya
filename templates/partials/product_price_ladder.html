@@ -1,0 +1,116 @@
+{# The product price ladder (product price ladder U2): ONE ordered set of price
+   facts, in the order an operator can sanity-check a price — cost, markup, net
+   sale price, each tax with its rate and amount, total taxes, tax-inclusive
+   price. This is the only place the products screen shows money.
+
+   Everything here is computed on the server, through the two contracts the
+   save and a document line already use (`inventory::derive_net_sale_price` and
+   `line_taxes::calculate_line_taxes`), and formatted here in the active
+   locale. The browser computes nothing: a `change` on the cost, markup or sale
+   price field asks `/web/product-price-ladder` for this fragment back, and htmx
+   swaps `outerHTML` so the island replaces itself.
+
+   Two states are part of the answer rather than an error, because the ladder's
+   job is to say what a save WOULD do before the operator saves:
+
+   * `net_refusal` — the save path refuses this exact input, so the ladder
+     states its message and publishes no tax money at all. There is no net
+     price for a tax to apply to.
+   * `inputs_unreadable` — a field is not a number yet, so the ladder reports
+     the last state the save path accepted and says that is what it is showing.
+
+   Every utility class here already exists in the committed stylesheet: the
+   vocabulary is the removed breakdown table's and the cards' own. #}
+<div id="product-price-ladder" data-product-price-ladder>
+  <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductPriceLadder) }}</div>
+  <div class="mb-3 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderPreviewHelp) }}</div>
+  <div class="overflow-x-auto">
+    <table class="w-full border-collapse text-sm">
+      <thead>
+        <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+          <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductLadderStep) }}</th>
+          <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductLadderSource) }}</th>
+          <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxRate) }}</th>
+          <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxAmount) }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="border-b border-border/60" data-product-ladder-source="{% if ladder.from_form %}unsaved{% else %}stored{% endif %}">
+          <td class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductCostPrice) }}</td>
+          <td class="py-2 pr-3">{% if ladder.from_form %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderUnsaved) }}</span>{% else %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderStored) }}</span>{% endif %}</td>
+          <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
+          <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(ladder.cost_price.clone()) }}</td>
+        </tr>
+        <tr class="border-b border-border/60" data-product-ladder-source="{% if ladder.from_form %}unsaved{% else %}stored{% endif %}">
+          <td class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductMarkup) }}</td>
+          <td class="py-2 pr-3">{% if ladder.from_form %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderUnsaved) }}</span>{% else %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderStored) }}</span>{% endif %}</td>
+          <td class="py-2 pr-3 text-right tabular-nums">{% if ladder.markup_pct.is_some() %}{{ localization.format_percentage(ladder.markup_pct.clone().unwrap()) }}{% else %}—{% endif %}</td>
+          <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
+        </tr>
+        <tr class="border-b border-border/60" data-product-ladder-source="{% if ladder.from_form %}unsaved{% else %}stored{% endif %}">
+          {# `TaxNetPrice`, not a product-specific word for it: the tax money
+             vocabulary is one namespace on purpose, so the net price of a
+             product and the net subtotal of a line cannot read as two things.
+             It is also the label the drawer already used before the ladder
+             existed, so no operator sees the same figure renamed. #}
+          <td class="py-2 pr-3 font-semibold">{{ localization.tr(crate::localization::MessageKey::TaxNetPrice) }}</td>
+          {# The chip states WHERE the figure comes from and the note below the
+             table states WHY it has that value, so the row can never claim to
+             be stored while its own footer explains that it is derived. #}
+          <td class="py-2 pr-3">{% if ladder.from_form %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderUnsaved) }}</span>{% else %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderStored) }}</span>{% endif %}</td>
+          <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
+          <td class="py-2 pr-3 text-right font-bold tabular-nums">{% if let Some(refusal) = ladder.net_refusal.clone() %}<span class="font-medium text-muted">—</span>{% else %}{{ localization.format_currency(ladder.net_price.clone()) }}{% endif %}</td>
+        </tr>
+        {% if let Some(refusal) = ladder.net_refusal.clone() %}
+        <tr>
+          {# The refusal is the save path's own message, verbatim, under a
+             localized lead: the operator reads what a save would answer, in
+             their own language, and no figure is invented beside it. #}
+          <td colspan="4" class="py-2 pr-3 text-[13px] text-muted" data-product-ladder-net-refused>{{ localization.tr(crate::localization::MessageKey::ProductLadderNetRefused) }} <span class="font-semibold">{{ refusal }}</span></td>
+        </tr>
+        {% else %}
+        {% for row in ladder.breakdown.clone() %}
+        <tr class="border-b border-border/60">
+          <td class="py-2 pr-3"><span class="font-semibold">{{ row.code }}</span> <span class="text-[13px] text-muted">— {{ row.name }}</span></td>
+          <td class="py-2 pr-3"><span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderDerived) }}</span></td>
+          <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_percentage(row.rate.clone()) }}</td>
+          <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(row.amount.clone()) }}</td>
+        </tr>
+        {% endfor %}
+        {% endif %}
+      </tbody>
+      {% if ladder.net_refusal.is_none() %}
+      <tfoot>
+        <tr class="border-t border-border">
+          <td class="py-2 pr-3 font-semibold">{{ localization.tr(crate::localization::MessageKey::TaxTotal) }}</td>
+          <td class="py-2 pr-3"><span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderDerived) }}</span></td>
+          <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
+          <td class="py-2 pr-3 text-right font-semibold tabular-nums">{{ localization.format_currency(ladder.tax_total.clone()) }}</td>
+        </tr>
+        <tr class="border-t border-border font-bold">
+          <td class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::TaxInclusivePrice) }}</td>
+          <td class="py-2 pr-3"><span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderDerived) }}</span></td>
+          <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
+          <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(ladder.total.clone()) }}</td>
+        </tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+  {% if ladder.net_refusal.is_none() && ladder.breakdown.is_empty() %}
+  {# An untaxed product says so ONCE, here: the ladder is the only place that
+     explains why its two last figures are equal. #}
+  <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::TaxNoBreakdown) }}</div>
+  {% endif %}
+  {% if ladder.inputs_unreadable %}
+  <div class="mt-2 text-[13px] text-muted" data-product-ladder-unreadable>{{ localization.tr(crate::localization::MessageKey::ProductLadderUnreadable) }}</div>
+  {% endif %}
+  <div class="mt-2 text-[13px] text-muted">
+    {% if ladder.net_refusal.is_none() %}
+    {% if ladder.net_is_derived %}
+    {{ localization.tr(crate::localization::MessageKey::ProductLadderNetDerived) }} • {% else %}
+    {{ localization.tr(crate::localization::MessageKey::ProductLadderNetManual) }} • {% endif %}
+    {% endif %}
+    {{ localization.tr(crate::localization::MessageKey::ProductLadderLegend) }}
+  </div>
+</div>

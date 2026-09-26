@@ -28,17 +28,10 @@
       <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductNegative) }}</span>
       {% endif %}
     </div>
-    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }} • {{ localization.tr(crate::localization::MessageKey::TaxNetPrice) }} {{ localization.format_currency(tax_preview.net_price.clone()) }}</div>
-    {# Tax-inclusive price preview (tax calculation T2): derived from the CURRENT
-       active linked taxes and never written back. The stored `sale_price` above
-       stays net, which is what a document line snapshots. #}
-    <div class="text-[13px] text-muted" data-product-tax-preview>
-      {% if tax_preview.breakdown.is_empty() %}
-      {{ localization.tr(crate::localization::MessageKey::TaxInclusivePrice) }} {{ localization.format_currency(tax_preview.total.clone()) }} — {{ localization.tr(crate::localization::MessageKey::TaxNoBreakdown) }}
-      {% else %}
-      {{ localization.tr(crate::localization::MessageKey::TaxInclusivePrice) }} <span class="font-bold tabular-nums">{{ localization.format_currency(tax_preview.total.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxTotal) }} {{ localization.format_currency(tax_preview.tax_total.clone()) }}
-      {% endif %}
-    </div>
+    {# The header states the SKU and the unit and nothing else: every money
+       figure in this drawer belongs to the price ladder below, so a price can
+       only be read in one place (product price ladder U2). #}
+    <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }}</div>
     <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(stock.clone()) }}{% if let Some(min) = product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
     {# Audit attribution (M5 Phase B): who registered the product and who last
        changed it, shown as a display name resolved in the wiring layer — the
@@ -94,7 +87,11 @@
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
           <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductKind) }}</label>
-          <select name="kind" class="field">
+          {# The kind is a ladder input like the three price fields: the price
+             rule branches on it (a product must sell for something, a service
+             may cost nothing), so switching a free service to a product has to
+             move the ladder before any save. #}
+          <select name="kind" class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form">
             <option value="Product" {% if product.kind.to_string() == "Product" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::ProductValueProduct) }}</option>
             <option value="Service" {% if product.kind.to_string() == "Service" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::ProductValueService) }}</option>
           </select>
@@ -110,8 +107,10 @@
           {# Courtesy only (product-markup T6): the edit handler is the
              enforcement — whenever a markup is present the server ignores
              this field and derives the price from the cost, so the readonly
-             state here only mirrors what the server already does. #}
-          <input id="edit-product-sale-price" type="text" inputmode="decimal" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ localization.format_decimal(product.sale_price.clone()) }}" class="field" />
+             state here only mirrors what the server already does. The ladder
+             below previews that derivation live, while this note explains why
+             the field is locked. #}
+          <input id="edit-product-sale-price" type="text" inputmode="decimal" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ localization.format_decimal(product.sale_price.clone()) }}" class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />
           {% if product.markup_pct.is_some() %}
           {# The readonly field shows the stored price from the last save; the
              derivation from the cost is server-side, so the number only moves
@@ -121,12 +120,12 @@
         </div>
         <div>
           <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCostPrice) }}</label>
-          <input type="text" inputmode="decimal" name="cost_price" step="0.01" value="{{ localization.format_decimal(product.cost_price.clone()) }}" class="field" />
+          <input type="text" inputmode="decimal" name="cost_price" step="0.01" value="{{ localization.format_decimal(product.cost_price.clone()) }}" class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />
         </div>
       </div>
       <div>
         <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMarkup) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-        <input id="edit-product-markup" type="text" inputmode="decimal" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ localization.format_decimal(m.clone()) }}"{% endif %} class="field" />
+        <input id="edit-product-markup" type="text" inputmode="decimal" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ localization.format_decimal(m.clone()) }}"{% endif %} class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />
       </div>
       <div>
         <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCategory) }}</label>
@@ -184,47 +183,30 @@
     </script>
   </section>
 
+  {# The price ladder (product price ladder U2), right under the fields that
+     drive it. This is the ONE place the drawer shows money: the header states
+     the SKU and unit, and the tax card below keeps only the association. The
+     three price fields above ask `/web/product-price-ladder` for this fragment
+     back on `change`, so the derivation is the server's on every keystroke and
+     the browser never multiplies or rounds a cent. #}
+  <section class="rounded-2xl border border-border bg-card p-5">
+    {% include "partials/product_price_ladder.html" %}
+  </section>
+
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductTaxes) }} ({{ product_taxes.len() }})</div>
-    {# The derived price breakdown, so the tax-inclusive figure in the header is
-       auditable: every active tax, its rate, and what it adds to the net price.
-       Rendered only when there IS a breakdown — an untaxed product already says
-       so in the header (which explains why its two prices are equal) and again
-       on the association list below, and a third copy here would be noise. The
-       card still lists the ASSOCIATIONS, including inactive ones, because
-       unlinking is an association edit, not a calculation. #}
-    {% if !tax_preview.breakdown.is_empty() %}
-    <div class="mb-3 overflow-x-auto">
-      <table class="w-full border-collapse text-sm">
-        <thead>
-          <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
-            <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductTaxes) }}</th>
-            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxRate) }}</th>
-            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxAmount) }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in tax_preview.breakdown %}
-          <tr class="border-b border-border/60">
-            <td class="py-2 pr-3"><span class="font-semibold">{{ row.code }}</span> <span class="text-[13px] text-muted">— {{ row.name }}</span></td>
-            <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_percentage(row.rate.clone()) }}</td>
-            <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(row.amount.clone()) }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-        <tfoot>
-          <tr class="border-t border-border font-bold">
-            <td class="py-2 pr-3" colspan="2">{{ localization.tr(crate::localization::MessageKey::TaxTotal) }}</td>
-            <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(tax_preview.tax_total.clone()) }}</td>
-          </tr>
-        </tfoot>
-      </table>
-    </div>
-    {% endif %}
+    {# ASSOCIATION only: the identity of each linked tax and the control that
+       unlinks it, plus the link control. The amounts, the rates as money and
+       the tax-inclusive figure live in the price ladder above, so this card
+       cannot show a second copy of a number the ladder owns. The list includes
+       INACTIVE taxes, because unlinking is an association edit, not a
+       calculation: an inactive tax charges nothing, so the ladder leaves it
+       out without a word about it, and this list is where an operator finds
+       out that one is linked at all. #}
     {% if product_taxes.is_empty() %}
     <div class="mb-3 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductNoLinkedTaxes) }}</div>
     {% else %}
-    <div class="mb-3 flex flex-col gap-2">
+    <div class="mb-3 flex flex-col gap-2" data-product-tax-associations>
       {% for linked in product_taxes %}
       <div class="flex items-center justify-between gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-2.5">
         <div>

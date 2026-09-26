@@ -1173,6 +1173,229 @@ def test_recording_a_stock_movement_from_the_drawer_updates_both_surfaces(
 
 
 # ---------------------------------------------------------------------------
+# The server-computed price ladder (product price ladder U2)
+# ---------------------------------------------------------------------------
+
+_LADDER_PATH = "/web/product-price-ladder"
+
+
+def _ladder(page: Page):
+    """The price ladder island inside the open drawer."""
+    return page.locator("#product-price-ladder")
+
+
+def _ladder_amounts(page: Page) -> dict[str, str]:
+    """Every money figure the ladder renders, keyed by the step that owns it.
+
+    Read from the DOM rather than asserted as prose: the point of this test is
+    that the FIGURES move, and a substring assertion over the whole island
+    cannot tell a new net price from a new tax line.
+    """
+    rows = _ladder(page).locator("tr")
+    amounts: dict[str, str] = {}
+    for index in range(rows.count()):
+        cells = rows.nth(index).locator("td")
+        if cells.count() < 4:
+            continue  # the refusal row spans the table; it publishes no figure
+        amounts[cells.nth(0).inner_text().strip()] = cells.nth(3).inner_text().strip()
+    return amounts
+
+
+def test_typing_a_cost_in_the_drawer_moves_the_server_computed_ladder(
+    page: Page, api: ApiClient
+) -> None:
+    """The ladder must follow the form in a REAL browser, before any save.
+
+    This is the test the Rust suite could not be: the ladder's refresh rides
+    ``hx-include="closest form"``, so the request the browser sends is the whole
+    edit form, with the product under the form's own ``id`` key. A Rust test
+    that hand-builds its own query can never catch a mismatch between the form's
+    field names and the endpoint's, and this one did exactly that: the endpoint
+    demanded a ``product_id`` the browser does not send, answered 400 to every
+    real refresh, and the whole suite stayed green.
+
+    So the assertions are about what the browser got back:
+
+    * typing a new cost must move the derived net price AND the tax-inclusive
+      price, because both are computed from the net;
+    * the tax amounts must move with it, since a tax is a share of the net;
+    * nothing may be saved: the product's stored net price, read back through
+      the API, is still the price the drawer was opened with.
+
+    A markup product is the sharp case: its net price is DERIVED, so a cost
+    change has to move a figure the browser never computes.
+    """
+    product = create_product(
+        api,
+        sku="LADDER-SKU-20",
+        name="Ladder Widget",
+        sale_price="20.00",
+        cost_price="10.00",
+        markup_pct="100",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    tax = api.post_json(
+        "/api/taxes",
+        {"code": "IVA21", "name": "IVA 21%", "rate": "21", "is_active": True},
+    )
+    api.post_json(f"/api/products/{product_id}/taxes", {"tax_id": int(tax["id"])})
+
+    _open_products_list(page, api, name="Ladder Widget")
+    _open_product_drawer(page, product_id)
+    expect(_ladder(page)).to_be_visible()
+
+    # The drawer arrives showing the stored state: cost 10 with a 100% markup
+    # derives 20.00, and 21% of that is 4.20, so 24.20 with tax.
+    before = _ladder_amounts(page)
+    assert before["Cost price"] == "10.00 USD", before
+    assert before["Net price"] == "20.00 USD", before
+    assert before["Price with tax"] == "24.20 USD", before
+
+    form = _edit_form(page)
+    form.locator('input[name="cost_price"]').fill("25.00")
+    # The ladder is refreshed BY THE SERVER: wait for its own response, which is
+    # the only thing that can move these figures.
+    with page.expect_response(_response_for(_LADDER_PATH)):
+        form.locator('input[name="cost_price"]').blur()
+
+    # 25 * (1 + 100/100) = 50.00 net; 21% of 50.00 is 10.50; 60.50 with tax.
+    after = _ladder_amounts(page)
+    assert after["Cost price"] == "25.00 USD", after
+    assert after["Net price"] == "50.00 USD", after
+    assert after["IVA21 — IVA 21%"] == "10.50 USD", after
+    assert after["Tax total"] == "10.50 USD", after
+    assert after["Price with tax"] == "60.50 USD", after
+
+    # And the preview changed NOTHING: the stored net price is still the one the
+    # drawer was opened with, which is the whole point of a preview.
+    stored = api.get_json(f"/api/products/{product_id}")
+    assert stored["sale_price"] == "20.00", stored
+    assert stored["cost_price"] == "10.00", stored
+
+
+def test_the_ladder_says_a_refused_price_instead_of_showing_one(
+    page: Page, api: ApiClient
+) -> None:
+    """A markup with no cost is a save refusal, and the ladder must say so.
+
+    Cost 0 with a markup derives nothing, so the save path refuses the request.
+    The ladder has to carry that refusal and publish no money: an operator who
+    sees a tax total here would price a document with a number the server will
+    never accept.
+    """
+    product = create_product(
+        api,
+        sku="LADDER-SKU-21",
+        name="Refusal Widget",
+        sale_price="20.00",
+        cost_price="10.00",
+        markup_pct="100",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    _open_products_list(page, api, name="Refusal Widget")
+    _open_product_drawer(page, product_id)
+
+    form = _edit_form(page)
+    form.locator('input[name="cost_price"]').fill("0")
+    with page.expect_response(_response_for(_LADDER_PATH)):
+        form.locator('input[name="cost_price"]').blur()
+
+    ladder = _ladder(page)
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_be_visible()
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_contain_text(
+        "cost_price must be > 0 when markup_pct is set"
+    )
+    expect(ladder).not_to_contain_text("Price with tax")
+    expect(ladder).not_to_contain_text("Tax total")
+
+    # An unreadable field is the other half: the ladder stops previewing and
+    # says the figures are the last saved ones, rather than reading "abc" as a
+    # zero.
+    form.locator('input[name="cost_price"]').fill("abc")
+    with page.expect_response(_response_for(_LADDER_PATH)):
+        form.locator('input[name="cost_price"]').blur()
+    expect(ladder.locator("[data-product-ladder-unreadable]")).to_be_visible()
+    fallback = _ladder_amounts(page)
+    assert fallback["Cost price"] == "10.00 USD", fallback
+    assert fallback["Net price"] == "20.00 USD", fallback
+
+
+def test_switching_the_kind_in_the_drawer_moves_the_ladder_threshold(
+    page: Page, api: ApiClient
+) -> None:
+    """The price rule branches on the kind, so the kind select must move the ladder.
+
+    A Service may cost exactly 0.00; a Product may not. A service created at
+    0.00 is therefore a legal state that the ladder publishes — and switching it
+    to Product in the form must move the ladder onto the product threshold,
+    which refuses that price. If the ladder bound the STORED kind it would keep
+    publishing 0.00 while a save refuses, which is the defect this covers.
+
+    Asserted through the real select, because the alternative — reading the
+    ``hx-get`` off the markup — passes just as happily against a dead endpoint.
+    """
+    # A Service cannot track stock, so this one is seeded through the API
+    # directly rather than through the tracked-product helper.
+    service = api.post_json(
+        "/api/products",
+        {
+            "sku": "LADDER-SVC-22",
+            "name": "Free Service",
+            "kind": "Service",
+            "category_id": None,
+            "unit": "un",
+            "sale_price": "0.00",
+            "cost_price": "5.00",
+            "track_stock": False,
+            "min_stock": None,
+            "max_stock": None,
+            "location": None,
+            "notes": None,
+        },
+    )
+    product_id = int(service["id"])
+    tax = api.post_json(
+        "/api/taxes",
+        {"code": "IVA21", "name": "IVA 21%", "rate": "21", "is_active": True},
+    )
+    api.post_json(f"/api/products/{product_id}/taxes", {"tax_id": int(tax["id"])})
+
+    _open_products_list(page, api, name="Free Service")
+    _open_product_drawer(page, product_id)
+    ladder = _ladder(page)
+
+    # As stored: a free service is a price the server accepts.
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_have_count(0)
+    amounts = _ladder_amounts(page)
+    assert amounts["Net price"] == "0.00 USD", amounts
+    # The tax on a zero net is a zero: pinned to cents, and a zero keeps the
+    # scale the arithmetic produced, so the server renders "0 USD".
+    assert amounts["IVA21 — IVA 21%"] == "0 USD", amounts
+
+    # Switched to Product in the form: the product rule refuses 0.00, so the
+    # ladder must carry the refusal and withdraw every derived figure.
+    form = _edit_form(page)
+    with page.expect_response(_response_for(_LADDER_PATH)):
+        form.locator('select[name="kind"]').select_option("Product")
+
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_be_visible()
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_contain_text(
+        "sale_price must be > 0 for products"
+    )
+    expect(ladder).not_to_contain_text("Price with tax")
+    expect(ladder).not_to_contain_text("Tax total")
+
+    # And the stored kind is still a service: a preview changes nothing.
+    stored = api.get_json(f"/api/products/{product_id}")
+    assert stored["kind"] == "Service", stored
+    assert stored["sale_price"] == "0.00", stored
+
+
+# ---------------------------------------------------------------------------
 # Visual evidence (opt-in)
 # ---------------------------------------------------------------------------
 

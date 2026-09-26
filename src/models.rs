@@ -174,19 +174,130 @@ pub struct ProductTaxBreakdownRow {
     pub amount: Decimal,
 }
 
-/// Derived, never stored: what ONE UNIT of a product costs with every tax
-/// currently linked to it added.
+/// How one price field of the product drawer's edit form reads.
 ///
-/// This is a preview of the CURRENT catalogue, not of a document: it resolves
-/// the ACTIVE linked taxes and runs them through the same calculation contract
-/// a document line write runs, so the number an operator prices against is the
-/// number the line will charge. The stored `sale_price` is untouched by it.
+/// Empty and unreadable are DIFFERENT on purpose, because the save path treats
+/// them differently and a preview that collapsed them would invent a number:
+/// an empty cost is the "no cost recorded" zero the column defaults to and the
+/// save accepts, while an unreadable one is a typo the save rejects and a
+/// preview must refuse to guess at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriceField {
+    /// The form sent a number, already parsed in the request's locale.
+    Value(Decimal),
+    /// The form sent nothing.
+    Empty,
+    /// The form sent text that is not a number in this locale.
+    Unreadable,
+}
+
+impl PriceField {
+    /// The number this field carries, or `None` for the two states that carry
+    /// no number. Never a zero: an absent value and a zero are different facts
+    /// and only the caller knows which one it meant.
+    pub fn as_value(self) -> Option<Decimal> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Empty | Self::Unreadable => None,
+        }
+    }
+}
+
+/// The three price fields the drawer's edit form owns, each read on its own.
+/// Reading them is one shared step for the save path and for the preview, so a
+/// preview can never disagree with the save it previews.
+#[derive(Debug, Clone, Copy)]
+pub struct PriceFields {
+    pub sale_price: PriceField,
+    pub cost_price: PriceField,
+    pub markup_pct: PriceField,
+}
+
+/// What the ladder is asked to price. The form values arrive already gated by
+/// the caller's own form-shape rules, so this module never re-decides what an
+/// empty field means — it only derives and totals.
+#[derive(Debug, Clone)]
+pub enum LadderInput {
+    /// The drawer's current form values: the manual sale price, the cost and
+    /// the markup (`None` for a manual-price product). These are the exact
+    /// values a save would submit.
+    ///
+    /// `kind` is the kind the FORM carries, which is `None` when the request
+    /// sent none or sent one that is not a kind. The price rule branches on the
+    /// kind — a product must sell for something, a service may cost nothing —
+    /// so binding the STORED kind here would let a free service, switched to a
+    /// product in the form, publish a 0.00 the save would refuse. `None` means
+    /// "no readable kind in the form", and the ladder then uses the product's
+    /// own stored kind.
+    Form {
+        kind: Option<ProductKind>,
+        sale_price: Decimal,
+        cost_price: Decimal,
+        markup_pct: Option<Decimal>,
+    },
+    /// No form values exist yet: the drawer's first render. The stored row is
+    /// the answer and nothing is wrong.
+    Stored,
+    /// A form field was not a number in this locale. The ladder reports the
+    /// product's last saved state instead of guessing at a price, and says so.
+    ///
+    /// This takes PRECEDENCE over every form-shape gate, which is a decision of
+    /// the ladder and not of the save path: the save path checks the sale price
+    /// before the cost, so a request with an unreadable cost and an empty
+    /// manual price is answered "sale_price is required" and never mentions the
+    /// field the operator is typing into. A preview has nothing to say once a
+    /// field is not a number, so the ladder names that instead.
+    Unreadable,
+    /// A form-shape refusal the SAVE would answer too — a manual price that is
+    /// empty, say — so the ladder reports the same refusal rather than being
+    /// the only surface that invents a price. It keeps the cost, which the form
+    /// does hold, so the operator can still see the rung being edited.
+    Refused {
+        message: String,
+        cost_price: Decimal,
+    },
+}
+
+/// Derived, never stored: the product price ladder, in the order an operator
+/// reads it — cost, markup, net sale price, each tax with its amount, total
+/// taxes, tax-inclusive price.
+///
+/// Everything here is a preview of what saving the form would do, computed by
+/// the same two contracts the save and a document line use
+/// (`inventory::derive_net_sale_price` and `line_taxes::calculate_line_taxes`).
+/// The two refusal states are part of the answer rather than an error, because
+/// the ladder's job is to tell the operator what a save would do BEFORE they
+/// save it: `Some` means there is no net price to show and no tax money may be
+/// derived from one.
 #[derive(Debug, Clone, Serialize)]
-pub struct ProductTaxPreview {
-    /// The product's stored NET sale price, exactly as persisted.
+pub struct ProductPriceLadder {
+    /// The cost the ladder reports: the form's value, or the stored cost when
+    /// the form could not be read at all.
+    pub cost_price: Decimal,
+    /// The markup the ladder reports, or `None` for a manual-price product.
+    pub markup_pct: Option<Decimal>,
+    /// The net sale price the taxes are applied to. Meaningless when
+    /// `net_refusal` is `Some`.
     pub net_price: Decimal,
-    /// One row per active linked tax, ordered by code then id. Empty when the
-    /// product has no linked tax.
+    /// True when `net_price` came out of the cost and the markup; false for a
+    /// manual price. The ladder states which, because "why is it this number"
+    /// is the first question an operator asks of a price.
+    pub net_is_derived: bool,
+    /// The save path's own refusal, verbatim, when no net price can be stated.
+    pub net_refusal: Option<String>,
+    /// True when a form field was not a number, so the ladder reports the last
+    /// state the save path accepted instead of a preview of a value that does
+    /// not exist.
+    pub inputs_unreadable: bool,
+    /// PROVENANCE, and the reason it is on the model rather than in the
+    /// template: `cost_price`, `markup_pct` and `net_price` are columns of the
+    /// product, but on a preview they are the FORM's values, which a save would
+    /// store and nothing has stored yet. Rendering a value the operator has
+    /// typed as "stored" is a lie the ladder's own legend then contradicts, so
+    /// the distinction is a fact about the answer, not about the markup.
+    pub from_form: bool,
+    /// One row per active linked tax, in the calculation contract's order.
+    /// Always empty when `net_refusal` is `Some`.
     pub breakdown: Vec<ProductTaxBreakdownRow>,
     /// The sum of `breakdown`, at two decimals.
     pub tax_total: Decimal,

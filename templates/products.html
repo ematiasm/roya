@@ -64,36 +64,11 @@
     </div>
     <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductReorderHelp) }}</div>
   </div>
-
-  <div class="rounded-2xl border border-border bg-card p-5" id="tax-catalog-section">
-    <div class="mb-3 flex items-center justify-between">
-      <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::ProductTaxes) }}</h2>
-      <button class="btn-secondary" hx-get="/web/taxes" hx-target="#tax-list" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonRefresh) }}</button>
-    </div>
-    <div id="tax-list">
-      {% include "partials/tax_list.html" %}
-    </div>
-    <form class="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-[100px_1fr_120px_auto]"
-          data-action="{{ localization.tr(crate::localization::MessageKey::ProductCreateTax) }}"
-          hx-post="/web/taxes"
-          hx-target="#tax-list"
-          hx-swap="innerHTML"
-          hx-on::after-request="if(event.detail.successful) this.reset()">
-      <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCode) }}</label>
-        <input class="field" type="text" name="code" required maxlength="32" />
-      </div>
-      <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
-        <input class="field" type="text" name="name" required maxlength="128" />
-      </div>
-      <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductRate) }}</label>
-        <input class="field" type="text" inputmode="decimal" name="rate" required />
-      </div>
-      <button class="btn-primary self-end" type="submit">{{ localization.tr(crate::localization::MessageKey::ProductCreateTax) }}</button>
-    </form>
-  </div>
+  {# The tax CATALOGUE that used to live here is gone: a tax definition is
+     business configuration and Settings owns it alone (`/settings?tab=taxes`),
+     so the same form is no longer reachable from two screens under two
+     permissions. What stays on this screen is the ASSOCIATION — the product
+     drawer links and unlinks a tax from an existing definition. #}
 </div>
 
 {# New category modal. On success the form resets, the list refreshes and BOTH
