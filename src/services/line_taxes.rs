@@ -185,10 +185,26 @@ pub fn line_net_amount(qty: Decimal, price: Decimal) -> Result<Decimal, PriceRef
 /// fits, and only `net + tax_total` leaves the range: the top of the `Decimal`
 /// range with a single 1% rate multiplies to the top of the range again, the
 /// contribution is a hundredth of it, and adding a hundredth of the maximum to
-/// the maximum overflows. The governing bound is therefore the PAIR
-/// `net * (1 + SUM rate_i/100) <= MAX`, never the per-multiply
-/// `net * rate <= MAX`, and the checked add is what enforces it. For a
-/// non-negative rate set the pair is the tighter of the two.
+/// the maximum overflows. So the final add is checked, and the multiply is
+/// checked, and the governing bound is whichever of the two is TIGHTER — never
+/// one of them alone:
+///
+/// * the PAIR, `net * (1 + SUM rate_i/100) <= MAX`, which the checked running
+///   add and the checked final add enforce, and
+/// * the PER-MULTIPLY, `net * max(rate_i) <= MAX`, which the checked multiply
+///   enforces.
+///
+/// Which of the two binds is not a matter of taste, and the naive reading of
+/// "the pair is always tighter" is wrong. The multiply happens BEFORE the
+/// division by 100 (see the loop below), so for a single rate `R` the two
+/// bounds are `net <= MAX/(1 + R/100)` and `net <= MAX/R`, and the per-multiply
+/// is the tighter one as soon as `R > 1/(1 - 1/100) ≈ 1.0101%` — not above
+/// 100%, and not only for extreme rates. At the 1000% rate ceiling the
+/// per-multiply is what binds, and it leaves `MAX/1000 ≈ 7.92e25`; the pair
+/// would leave `MAX/11 ≈ 7.2e27`, looser by `1000/11 ≈ 91×`. Anyone quoting a
+/// "largest safe net" for a rate must take the MINIMUM of the two, and must
+/// remember that a per-LINE bound still says nothing about a per-DOCUMENT sum
+/// (work unit T3).
 ///
 /// No ceiling is hand-rolled to pre-empt any of this: a separate bound would be
 /// a second place where the arithmetic's limit is stated, and it would have to

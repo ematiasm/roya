@@ -9,7 +9,7 @@ use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, SqlitePool};
 use tower::ServiceExt;
 
 use crate::error::AppError;
-use crate::models::NewTax;
+use crate::models::{NewTax, UpdateTax};
 use crate::repositories::{
     ProductTaxRepository, PurchaseRepository, SaleRepository, SqliteProductTaxRepository,
     SqlitePurchaseRepository, SqliteSaleRepository, SqliteTaxRepository,
@@ -1613,5 +1613,373 @@ async fn tax_hard_delete_conflicts_never_carry_raw_sqlite_text() {
     );
     for leak in ["FOREIGN KEY", "SQLITE", "sqlite", "product_taxes", "SELECT"] {
         assert!(!message.contains(leak), "{leak} leaked: {message}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rate ceiling
+// ---------------------------------------------------------------------------
+
+/// The message a rate above the ceiling is refused with, as the exact
+/// `Validation` payload the service raises. Matched rather than merely
+/// inspected, because a rate is a tax DEFINITION: the refusal is the ordinary
+/// tax-validation convention, so it must be `AppError::Validation` and not a
+/// `PriceRefusal`. A rate above the ceiling is a bad form value an operator can
+/// fix by typing a smaller number; `PriceRefusal` is the vocabulary for money
+/// the arithmetic cannot carry, and putting a definition in it would blur the
+/// distinction that enum exists to keep.
+fn rate_ceiling_refusal(error: &AppError) -> String {
+    let AppError::Validation(message) = error else {
+        panic!("a rate above the ceiling is a validation refusal, got {error:?}");
+    };
+    message.clone()
+}
+
+async fn stored_rate(pool: &SqlitePool, code: &str) -> Option<Decimal> {
+    let raw: Option<String> = sqlx::query_scalar("SELECT rate FROM taxes WHERE code = ?")
+        .bind(code)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+    raw.map(|value| Decimal::from_str(value.as_str()).unwrap())
+}
+
+/// The ceiling is a BOUND, and the only way to prove a bound is a bound is to
+/// stand on both sides of it in one test.
+///
+/// Above the ceiling: refused, with the ceiling's own message, and the catalogue
+/// is untouched — a refusal that still wrote a row would leave an operator
+/// staring at a rate they were just told was impossible. Exactly AT the ceiling:
+/// accepted, because a bound nobody can point at is a blanket rejection wearing
+/// a bound's clothes, and the whole reason the number is a business-plausibility
+/// figure rather than `Decimal::MAX` is that ordinary extremes must still work.
+#[tokio::test]
+async fn tax_rate_above_the_ceiling_is_refused_and_the_ceiling_itself_is_accepted() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let ceiling = crate::services::taxes::MAX_TAX_RATE_PERCENT;
+    let one_over = ceiling + Decimal::ONE;
+
+    let refused = state
+        .tax_service
+        .create_tax(actor, tax_input("OVER", &one_over.to_string()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rate_ceiling_refusal(&refused),
+        crate::services::taxes::TAX_RATE_ABOVE_CEILING,
+        "the refusal names the ceiling, and it is the tax-validation convention \
+         rather than a price refusal"
+    );
+    assert_eq!(
+        stored_rate(&state.pool, "OVER").await,
+        None,
+        "a refused rate must leave the catalogue untouched"
+    );
+
+    let accepted = state
+        .tax_service
+        .create_tax(actor, tax_input("AT", &ceiling.to_string()))
+        .await
+        .expect("a rate exactly AT the ceiling is a bound's edge, not its outside");
+    assert_eq!(accepted.rate, ceiling);
+    assert_eq!(
+        stored_rate(&state.pool, "AT").await,
+        Some(ceiling),
+        "the accepted edge is really stored, at the exact rate that was accepted"
+    );
+}
+
+/// The ceiling is enforced on the EDIT as well as the create, and a refused edit
+/// leaves the stored rate alone. `create_tax` and `update_tax` are two of the
+/// three callers of the rate validation (the third is `activate_tax`, pinned by
+/// its own test below), so a bound that only guarded one of them would leave
+/// another as a way to store an unplausible rate.
+#[tokio::test]
+async fn tax_rate_ceiling_is_enforced_on_update_as_well_as_on_create() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let ceiling = crate::services::taxes::MAX_TAX_RATE_PERCENT;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+
+    let refused = state
+        .tax_service
+        .update_tax(
+            actor,
+            tax.id,
+            UpdateTax {
+                code: Some("IVA21".into()),
+                name: Some("IVA 21".into()),
+                rate: Some(ceiling + Decimal::ONE),
+                is_active: Some(true),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rate_ceiling_refusal(&refused),
+        crate::services::taxes::TAX_RATE_ABOVE_CEILING
+    );
+    assert_eq!(
+        stored_rate(&state.pool, "IVA21").await,
+        Some(Decimal::from_str("21").unwrap()),
+        "a refused re-rate writes nothing"
+    );
+
+    let accepted = state
+        .tax_service
+        .update_tax(
+            actor,
+            tax.id,
+            UpdateTax {
+                code: Some("IVA21".into()),
+                name: Some("IVA 21".into()),
+                rate: Some(ceiling),
+                is_active: Some(true),
+            },
+        )
+        .await
+        .expect("the same bound accepts its own edge on the edit path too");
+    assert_eq!(accepted.rate, ceiling);
+    assert_eq!(stored_rate(&state.pool, "IVA21").await, Some(ceiling));
+}
+
+/// The THIRD caller of the rate validation, and the one that is easiest to forget:
+/// `activate_tax` does not take a rate from the operator, it re-persists the
+/// stored one, and it still WRITES the `rate` column.
+///
+/// The row under test is inserted through SQL, which is the point: it is the only
+/// way to produce the shape this guards — a LEGACY row written before the ceiling
+/// existed. The document lists the existence of such a row in a real deployment
+/// as UNVERIFIED, because the database was deliberately never read, and an
+/// unverified precondition is exactly the kind that must not be assumed away in
+/// code. Before the fix this test was RED: `activate_tax` reached
+/// `TaxRepository::update` directly and reactivated the row.
+///
+/// Refusal is the whole behaviour, and so is the recoverability, because "we
+/// refuse" is only defensible if the operator is not locked out: the rate can be
+/// brought under the ceiling with the ordinary edit, and the tax then activates.
+#[tokio::test]
+async fn tax_activate_refuses_a_legacy_rate_above_the_ceiling_and_leaves_it_recoverable() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let ceiling = crate::services::taxes::MAX_TAX_RATE_PERCENT;
+    let legacy = ceiling + Decimal::ONE;
+
+    // The legacy row, inserted the only way one can exist: not through any
+    // service, because no service would write it any more.
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO taxes (code, name, rate, is_active, created_by)
+         VALUES ('LEGACY', 'Legacy levy', ?, 0, ?) RETURNING id",
+    )
+    .bind(legacy.to_string())
+    .bind(actor)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+
+    let refused = state.tax_service.activate_tax(actor, id).await.unwrap_err();
+    assert_eq!(
+        rate_ceiling_refusal(&refused),
+        crate::services::taxes::TAX_RATE_ABOVE_CEILING,
+        "reactivating a stored rate is a write of that rate, so it goes through \
+         the same chokepoint a create or an edit does"
+    );
+    let (rate, is_active): (String, i64) =
+        sqlx::query_as("SELECT rate, is_active FROM taxes WHERE id = ?")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(is_active, 0, "a refused activation leaves the row inactive");
+    assert_eq!(
+        rate,
+        legacy.to_string(),
+        "and writes nothing at all: the rate is the stored one either way"
+    );
+
+    // RECOVERABLE, and this is the half that justifies the refusal. The operator
+    // is never locked out of their own catalogue: correcting the rate is an
+    // ordinary edit, and the activate that was refused succeeds afterwards.
+    state
+        .tax_service
+        .update_tax(
+            actor,
+            id,
+            UpdateTax {
+                code: None,
+                name: None,
+                rate: Some(ceiling),
+                is_active: None,
+            },
+        )
+        .await
+        .expect("lowering the rate is the remedy, and it is a form field away");
+    let reactivated = state
+        .tax_service
+        .activate_tax(actor, id)
+        .await
+        .expect("an in-ceiling rate reactivates exactly as before the bound existed");
+    assert!(reactivated.is_active);
+    assert_eq!(reactivated.rate, ceiling);
+}
+
+/// The opposite half, and the reason the refusal above is a BOUND and not a ban
+/// on the lifecycle action: an ordinary tax still activates, and a tax that
+/// carries a tax at the ceiling activates too. A guard that had quietly made
+/// reactivation unreachable for plausible rates would leave the catalogue
+/// permanently shrunk, and no refusal message would explain it.
+#[tokio::test]
+async fn tax_activate_still_works_for_an_ordinary_rate_and_for_the_ceiling_itself() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let ceiling = crate::services::taxes::MAX_TAX_RATE_PERCENT;
+
+    let ordinary = state
+        .tax_service
+        .create_tax(actor, tax_input("ORD", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .deactivate_tax(actor, ordinary.id)
+        .await
+        .unwrap();
+    let activated = state
+        .tax_service
+        .activate_tax(actor, ordinary.id)
+        .await
+        .expect("an ordinary rate reactivates");
+    assert!(activated.is_active);
+    assert_eq!(activated.rate, Decimal::from_str("21").unwrap());
+
+    let edge = state
+        .tax_service
+        .create_tax(actor, tax_input("EDGE", &ceiling.to_string()))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .deactivate_tax(actor, edge.id)
+        .await
+        .unwrap();
+    let edge_activated = state
+        .tax_service
+        .activate_tax(actor, edge.id)
+        .await
+        .expect("a rate exactly at the ceiling is inside the bound, not outside it");
+    assert!(edge_activated.is_active);
+    assert_eq!(edge_activated.rate, ceiling);
+}
+
+/// A ceiling added next to an existing rule must not have displaced it.
+///
+/// The negative-rate refusal is asserted on its EXACT message, and the two
+/// refusals are asserted to be different strings: an implementation that
+/// collapsed "too small" and "too large" into one rule would still pass a test
+/// that only checked that both are refused, and the operator would be told the
+/// wrong thing about which end of the range their number was at.
+#[tokio::test]
+async fn tax_rate_negative_is_still_refused_with_its_own_message() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+
+    let negative = state
+        .tax_service
+        .create_tax(actor, tax_input("NEG", "-0.01"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rate_ceiling_refusal(&negative),
+        "tax rate cannot be negative",
+        "the pre-existing rule keeps its own sentence"
+    );
+    assert_ne!(
+        crate::services::taxes::TAX_RATE_ABOVE_CEILING,
+        "tax rate cannot be negative",
+        "the two bounds are two rules with two remedies, so they get two messages"
+    );
+    assert_eq!(stored_rate(&state.pool, "NEG").await, None);
+
+    // The upper bound does not move the lower one: zero is still legal, which
+    // is what makes the negative rule a bound rather than a "no small rates".
+    let zero = state
+        .tax_service
+        .create_tax(actor, tax_input("ZERO", "0"))
+        .await
+        .expect("a 0% tax is a real exemption, not a negative rate");
+    assert_eq!(zero.rate, Decimal::ZERO);
+}
+
+/// `Decimal::MAX` is the value that made the arithmetic refusal three layers
+/// down necessary in the first place, so it is named here as the case the
+/// ceiling exists to catch at the form. It is a rate like any other to
+/// `validate_rate`, which is the whole point: the bound is a plain comparison
+/// on a number the operator typed, not a separate code path.
+#[tokio::test]
+async fn tax_rate_decimal_max_is_refused_at_the_ceiling_rather_than_downstream() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+
+    let refused = state
+        .tax_service
+        .create_tax(actor, tax_input("HUGE", &Decimal::MAX.to_string()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        rate_ceiling_refusal(&refused),
+        crate::services::taxes::TAX_RATE_ABOVE_CEILING
+    );
+    assert_eq!(
+        crate::services::taxes::MAX_TAX_RATE_PERCENT < Decimal::MAX,
+        true,
+        "the ceiling is far below the type's own limit, which is what makes it a \
+         plausibility bound rather than the arithmetic bound"
+    );
+}
+
+/// The ceiling number appears in four places, and they are four PLACES rather
+/// than one source: the constant the service compares against, the domain
+/// message marker the API answers with, and the two catalog sentences an
+/// operator reads. Changing the number without moving the other three would
+/// leave a service that refuses `1001` while telling the operator the limit is
+/// something else — so the four are pinned together here, which is the test a
+/// maintainer changing the number will hit.
+#[test]
+fn tax_rate_ceiling_number_is_the_same_in_the_constant_the_marker_and_both_catalogs() {
+    let number = crate::services::taxes::MAX_TAX_RATE_PERCENT.to_string();
+    assert_eq!(number, "1000", "the ceiling is 1000%");
+    assert!(
+        crate::services::taxes::TAX_RATE_ABOVE_CEILING.contains(&number),
+        "the domain marker must name the ceiling it enforces: {}",
+        crate::services::taxes::TAX_RATE_ABOVE_CEILING
+    );
+
+    let english = crate::localization::LocalizationContext::fallback();
+    let spanish = crate::localization::LocalizationContext {
+        language_code: "es".into(),
+        ..english.clone()
+    };
+    for (label, context) in [("EN", english), ("ES", spanish)] {
+        let sentence = context.tr(crate::localization::MessageKey::ValidationTaxRateTooHigh);
+        assert!(
+            sentence.contains(&number),
+            "the {label} sentence must name the ceiling: {sentence}"
+        );
+        assert!(
+            !sentence.contains(crate::services::taxes::TAX_RATE_ABOVE_CEILING),
+            "the {label} copy must not BE the marker, or 'the marker never reaches \
+             an operator' is a check that cannot discriminate: {sentence}"
+        );
+        assert!(
+            sentence
+                != crate::localization::LocalizationContext::fallback()
+                    .tr(crate::localization::MessageKey::ValidationTaxRateNegative),
+            "the {label} ceiling sentence is not the negative-rate sentence"
+        );
     }
 }

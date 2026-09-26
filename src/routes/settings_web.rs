@@ -22,6 +22,7 @@ use crate::security::authz::{Nav, Principal, Require, SettingsManage};
 use crate::services::settings::UpdateBusinessConfiguration;
 use crate::services::taxes::{
     TAX_DELETE_BLOCKED, TAX_DELETE_BLOCKED_BY_HISTORY, TAX_DELETE_BLOCKED_BY_PRODUCTS,
+    TAX_RATE_ABOVE_CEILING,
 };
 
 struct SettingsLocaleRow {
@@ -672,6 +673,7 @@ fn tax_error_message(error: &AppError, localization: &LocalizationContext) -> St
             MessageKey::ValidationTaxName
         }
         "tax rate cannot be negative" => MessageKey::ValidationTaxRateNegative,
+        TAX_RATE_ABOVE_CEILING => MessageKey::ValidationTaxRateTooHigh,
         "invalid tax rate" => MessageKey::ValidationTaxRateInvalid,
         "tax delete needs an explicit confirmation" => MessageKey::TaxDeleteConfirmationRequired,
         // A submission that never named a tax is malformed, not a decision the

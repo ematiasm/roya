@@ -112,23 +112,60 @@ Confirmed by read-only investigation with file:line evidence. Facts, not inferen
    definition, not a price refusal; putting it in `PriceRefusal` would blur the
    domain that enum was created to keep precise.
 5. **The rate ceiling value is 1000%**, held as a named constant. This is a
-   business-plausibility bound, not an arithmetic one: with the ceiling in place the
-   worst safe net is still ≈7.2e27, so the ceiling cannot cause a false refusal, and
-   its real job is to turn `Decimal::MAX` into a form error in Settings rather than an
-   arithmetic refusal three layers down. If the business ever needs a higher levy the
-   constant and its argument move together.
-6. **The governing bound is `net × (1 + Σ Rᵢ/100) ≤ MAX`**, not the per-multiply
-   `net × Rᵢ ≤ MAX`. For a non-negative rate set the pair is tighter, and the probe
-   shows the final add is the site that actually fails.
-7. **The read path is closed by the write bound, not by its own guards.** If a write
-   refuses any amount that cannot be represented, then `SaleLine::subtotal` and
-   `PurchaseLine::subtotal` can only ever multiply values that already passed that
-   bound. This is a real invariant and it is exactly the kind of load-bearing
-   assumption that rots silently, so it gets a test that pins it rather than a
-   comment that states it.
+   business-plausibility bound, not an arithmetic one. With the ceiling in place the
+   largest net a SINGLE tax at the ceiling can still compute against is
+   `MAX / 1000 ≈ 7.92e25` — see Decision 6 for why the per-multiply bound and not
+   the pair bound is the binding one, which is the correction that moved this figure
+   from the `MAX / 11 ≈ 7.2e27` this document originally recorded. `7.92e25` is still
+   not a number an operator types into a price box, so the ceiling cannot cause a
+   false refusal, and its real job is to turn `Decimal::MAX` into a form error in
+   Settings rather than an arithmetic refusal three layers down. If the business ever
+   needs a higher levy the constant and its argument move together.
+6. **The governing bound is the TIGHTER of two, both of which are checked** — the
+   pair `net × (1 + Σ Rᵢ/100) ≤ MAX` (enforced by the checked running add and the
+   checked final add) and the per-multiply `net × max(Rᵢ) ≤ MAX` (enforced by the
+   checked multiply). **This corrects this document's earlier claim that the pair is
+   always the tighter of the two. It is not.** The contract multiplies by the rate
+   BEFORE dividing by 100 (`line_taxes.rs:207-210`), so for a single rate `R` the two
+   bounds are `net ≤ MAX/(1 + R/100)` and `net ≤ MAX/R`, and the per-multiply binds
+   as soon as `R > 1/(1 − 1/100) ≈ 1.0101%` — not above 100%, and not only for
+   extreme rates. At `R = 1000` the per-multiply leaves `MAX/1000 ≈ 7.92e25` while
+   the pair leaves `MAX/11 ≈ 7.2e27`, looser by `1000/11 ≈ 91×`. Anyone quoting a
+   "largest safe net" must take the minimum of the two. The final add is still the
+   site the probe isolated: an input exists where every multiply fits, the running sum
+   fits, and only `net + tax_total` leaves the range.
+7. **The read path is closed by the write bound, not by its own guards — PER LINE.**
+   If a write refuses any amount that cannot be represented, then
+   `SaleLine::subtotal` and `PurchaseLine::subtotal` can only ever multiply values
+   that already passed that bound, and `tax_inclusive_total` can only ever add a
+   `tax_total` that was already proven addable. That is a real invariant and it gets
+   a test that pins it rather than a comment that states it. **It is not a
+   document-level invariant, and this document's T2 test originally over-claimed that
+   it was.** Per-line carryability does not carry a document SUM: see T3. A per-line
+   census cannot pin a document invariant, because the property T3 needs is a
+   statement about a SET of rows, and a census that only ever looks at one row at a
+   time cannot see it.
 8. **A refusal is not a crash.** Every refusal must reach the operator in their
    language through the existing single renderer, on the same screens that today
    return nothing at all.
+9. **The rate validation is a real chokepoint, so `activate_tax` had to join it.**
+   `create_tax` and `update_tax` were not the only two places that write the `rate`
+   column: `activate_tax` reached `TaxRepository::update` directly with
+   `current.rate`, so the ceiling had a third way around it and the "single
+   production chokepoint" claim was false as written. `activate_tax` now calls
+   `validate_rate` before persisting. It cannot INTRODUCE an over-ceiling rate — it
+   re-persists what is already stored — but a legacy over-ceiling row (whose
+   existence in the real deployment is **unverified**, because the database was
+   deliberately never read) could otherwise be reactivated and re-persisted, which is
+   exactly the row no other path can produce any more. Refusing is **recoverable**:
+   `deactivate_tax` and `delete_tax` never look at the rate, `update_tax` accepts any
+   rate at or under the ceiling, so the remedy is one form field — lower the rate,
+   then activate. The refusal is an `AppError::Validation`, which
+   `taxes_refusal_response` already answers 400 with the ceiling's own localized
+   sentence, so no new status and no new render path was needed. Note this also means
+   an over-ceiling row cannot be edited for its NAME or CODE either, because
+   `update_tax` validates the effective rate — a deliberate consequence of the same
+   chokepoint, and the same one-field remedy covers it.
 
 ## Constraints
 
@@ -167,18 +204,99 @@ test that proves the operator receives a message rather than a dropped connectio
 RED first: a rate above the ceiling is refused in both languages, and a rate at the
 ceiling is still accepted so the boundary is a bound and not a blanket rejection.
 
+### T3 — document-level accumulation (NOT STARTED, and it is the open violation)
+
+- Make the cross-line accumulators checked, and refuse rather than panic.
+- Ripple-check everything that consumes a document total.
+
+RED first, and the RED must be the real construction, not a unit-level multiply: a
+draft sale with two `unit_price = 4e28` lines, then a `GET /sales/{id}` that panics
+today. A RED that only proves `a + b` overflows proves the operator's symptom is
+nothing to do with this defect and will be satisfied by a fix that misses the fold.
+
+**The defect.** Every document total is a SUM of its lines, and the sum is taken by
+raw operators that no write guard covers. `SalesService::tax_split`
+(`sales.rs:200-202`) and `PurchaseService::tax_split` (`purchases.rs:183-191`) fold
+`net +=`, `tax +=` and `total += tax_inclusive_total(..)`, and the two
+`list_document_rows` folds do the same at `sale_repo.rs:1023` and
+`purchase_repo.rs:921`. Per-line carryability — everything T1 and T2 established —
+says nothing about the sum. rust_decimal's raw operators panic, this crate has no
+`catch_unwind`, and `Cargo.toml` has no `[profile]`, so the default unwind applies.
+
+**Four reachable surfaces**, all HTTP, none requiring a crafted request:
+
+1. `GET /sales/{id}`;
+2. the add-line response itself, on the second line: `add_line_impl` →
+   `record_context` → `get_record`;
+3. `GET /purchases/{id}`;
+4. the documents list page, through the two `list_document_rows` folds.
+
+**The worst part, and the reason this cannot be deferred casually:** the second
+line's INSERT COMMITS before the response renders, so the panic does not roll the
+write back. The operator is left holding a document that is permanently unreadable
+— every one of the four surfaces above panics on it, and nothing in the application
+can open, print, confirm, cancel or take payment for it. The data is not merely
+unrenderable; it is stranded.
+
+**The honest fix shape.**
+
+* `tax_split` (both families) and the two `list_document_rows` folds become CHECKED,
+  and an overflow is mapped to a **THIRD distinct `PriceRefusal`**, not shared with
+  either line-amount refusal. Decision 3 forbids sharing for the same reason it
+  separated the first two: the remedy is a different operator action. A
+  line-amount refusal is "lower the quantity or the unit price". A document-total
+  refusal is "this document is too large to total as a whole" — the operator must
+  reduce the document, split it, or have it corrected at the source. One variant
+  would tell the operator to fix a number that is already fine.
+* Ripple-check, because every one of these consumes a `tax_split` total and cannot
+  be left raw by accident: `SalesService::totals` and
+  `PurchaseService::totals`, `assemble_detail` on both families,
+  `record_from_detail` on both families, and the confirm, cancel and payment paths
+  (each payment ceiling, overpayment refusal, due balance and debt figure is
+  measured against the tax-inclusive total). Every raw `+`/`-` on a document total
+  is a candidate for the same overflow, including `total - paid`.
+
+**Why bounding the WRITE at the document level is NOT the fix**, stated so a future
+maintainer does not take the cheap-looking shortcut:
+
+* it does not survive a direct SQL insert. A migration, a bulk import, an admin
+  repair script or any future repository method that writes `sale_lines` /
+  `purchase_lines` without the write bound re-creates the exact panic, and the
+  "document invariant" would be a claim with nothing enforcing it;
+* the T2 census cannot be extended to cover it. The census reads one row at a time,
+  and the property T3 needs is a statement about a SET of rows — a per-line census
+  cannot pin a document invariant, because the per-line facts it can observe are all
+  individually true for the two-line counter-example;
+* it is the wrong layer. The arithmetic is a READ-side sum, and rust_decimal's
+  operators are total or they are panics; the only layer that can make the sum total
+  is the one that performs it.
+
+So: CHECK THE ACCUMULATION, do not bound around it.
+
 ## Acceptance criteria
 
-- [ ] No code path reachable from an HTTP request can panic on tax arithmetic.
-- [ ] `calculate_line_taxes` cannot panic, and its totality is proven by a test, not
-      asserted in a comment.
-- [ ] Every refusal reaches the operator as a localized message, on the sale, purchase
-      and product paths.
-- [ ] A rate above the ceiling is refused; a rate at the ceiling is accepted.
-- [ ] The closed-set refusal and localization tests still pass with no duplicate and
-      no missing row.
-- [ ] No new money rounding rule and no second final-price formula.
-- [ ] No test panics anywhere in the suite.
+- [ ] **OPEN — VIOLATED, and the violation is real.** No code path reachable from an
+      HTTP request can panic on tax arithmetic. **T1 satisfied this only PER LINE and
+      the document-level accumulation still panics.** Construction: a draft sale with
+      two lines, each `qty = 1`, `unit_price = 4e28`, no tax linked. Each line is
+      individually carryable and each is stored by the real checked write, so no
+      per-line guard can refuse either one; the overflow happens on the READ, in the
+      raw `+=` of `tax_split`, because `4e28 + 4e28 = 8e28 > MAX`. Minimum line count
+      is 2; with an ordinary 21% tax the write bound caps a line's net at
+      `MAX / 21 ≈ 3.77e27` and the same overflow needs 18 lines. Tracked as T3.
+- [x] `calculate_line_taxes` cannot panic, and its totality is proven by a test, not
+      asserted in a comment. — **T1, `fc1b0da`.** Per LINE and per calculation; it
+      does not cover the sums a document folds (T3).
+- [x] Every refusal reaches the operator as a localized message, on the sale, purchase
+      and product paths. — **T1, `fc1b0da`.**
+- [x] A rate above the ceiling is refused; a rate at the ceiling is accepted. — **T2,
+      uncommitted.** Enforced on create, on update, and on `activate_tax` (Decision 9).
+- [x] The closed-set refusal and localization tests still pass with no duplicate and
+      no missing row. — **T1 and T2.**
+- [x] No new money rounding rule and no second final-price formula. — **T1.**
+- [ ] No test panics anywhere in the suite. — **no test panics today (T1 and T2 both
+      GREEN), but this criterion is only as good as the last one, and T3's RED will be
+      a panic until the document-level accumulators are checked.**
 
 ## Verification
 
@@ -213,15 +331,25 @@ check is **not** N/A for either unit here: both change what an operator sees.
   (`record_cost` validates only `cost >= 0`; `suggestion_for` returns
   `max - stock` from operator-set stock levels with no ceiling). An operator stores
   an extreme supplier cost and the request is dropped on an ordinary page load.
-  Neither this nor `purchases.rs:487` is *tax* arithmetic, so the T1 acceptance
-  criterion holds as written; both are the same family and both are unfixed.
-- **A rate ceiling changes what is storable.** An existing deployment with a stored
-  rate above the ceiling would still load, but could no longer be updated through
-  Settings. Whether that is acceptable is a data question, and the data was not read.
-- **The read-path invariant is a single point of failure.** If a future write path or
-  a migration inserts an unrepresentable amount directly, the read multiplies panic.
-  T2's test is the guard against that; it must assert the invariant, not just the
-  absence of a bug today.
+  Neither this nor `purchases.rs:487` is *tax* arithmetic, so they are not the
+  acceptance criterion's violation. **The criterion IS violated, by `tax_split` and
+  the two `list_document_rows` folds — that IS tax arithmetic, and it is T3.** The
+  statement that the criterion "holds as written" was itself part of the over-claim
+  corrected during T2 verification: it is withdrawn. All four sites are the same
+  family and all four are unfixed.
+- **A rate ceiling changes what is storable, and T2 widened that by one path.** An
+  existing deployment with a stored rate above the ceiling would still load, but could
+  no longer be updated through Settings, and as of Decision 9 it can no longer be
+  REACTIVATED either. Whether that is acceptable is a data question, and the data was
+  not read. The mitigation is that the refusal is recoverable through one form field,
+  and that `deactivate_tax` and `delete_tax` never consult the rate at all.
+- **The read-path invariant is a single point of failure, and it is only per line.**
+  If a future write path or a migration inserts an unrepresentable amount directly, the
+  read multiplies panic, and T2's census is the guard against that. But the census is
+  proven load-bearing for the LINE only: two individually carryable lines still panic
+  in the document fold, and no extension of a per-line census can see that. T3 is the
+  real fix, and until it lands the invariant is a statement about a row, not about a
+  document.
 - **Whether a panic inside the open transaction leaves the connection usable is
   unverified.** This feature removes the trigger, not the uncertainty.
 
@@ -229,12 +357,63 @@ check is **not** N/A for either unit here: both change what an operator sees.
 
 - Evidence gathered by read-only investigation; the census, the blast radius, the
   limits, and the two raw-operator sites are confirmed above.
-- No implementation yet.
+- Independent verification of T1 fuzzed 400,000 `(net, rate-set)` pairs and 800,000
+  operand pairs with zero panics and found no new warnings.
+- Independent verification of T2 found the work behaviourally correct and green, but
+  raised four claims and gaps. All four are corrected: the census documentation now
+  states per-line carryability and names the document-level gap (which is now T3 and an
+  OPEN acceptance criterion), the ceiling argument is corrected from `MAX/11 ≈ 7.2e27`
+  to `MAX/1000 ≈ 7.92e25` with the reason (the contract multiplies before dividing by
+  100), the same over-claim in `line_taxes.rs` is corrected to "the tighter of the two,
+  and the per-multiply binds above ≈1.01%", and `activate_tax` now goes through
+  `validate_rate` so the chokepoint claim is true (Decision 9).
 
 ### T1 — contract total + five sites
 
-Not started.
+**LANDED, committed as `fc1b0da` — `fix(taxes): refuse instead of panicking on tax arithmetic overflow`.**
+
+- `calculate_line_taxes` returns `Result<LineTaxCalculation, PriceRefusal>`; every
+  step inside it is checked, including the final add.
+- `line_net_amount` makes the raw `qty * price` argument checked, at the four
+  repository sites that computed it before entering the contract.
+- Five production call sites propagate the refusal instead of panicking.
+- Two new variants, `LineAmountTooLarge` and `TaxArithmeticTooLarge`, with EN and ES
+  catalog rows wired through `price_refusal_key`. The product drawer answers 200 with
+  the refusal rendered rather than an error, so a storable product stays reachable.
+- Tests: 1161 pass, no test panics. e2e 112 passed / 4 skipped.
+- **What T1 did NOT establish, and this is now recorded rather than glossed:** the
+  read path's safety argument is per LINE. T1's own commit message repeated the
+  over-claim corrected in T2 — it says "for a non-negative rate set the pair is
+  tighter", which is false (see Decision 6). The message cannot be amended without a
+  history rewrite, so the correction lives here, in `line_taxes.rs` beside the
+  arithmetic, and in the constant's own doc, which is where a maintainer reads it.
 
 ### T2 — rate ceiling + write-bound invariant
 
-Not started.
+**LANDED, UNCOMMITTED on `feat/final-price-markup`.** Six files, and the tests live
+with the behaviour they verify.
+
+- `src/services/taxes.rs` — `MAX_TAX_RATE_PERCENT` (1000%), the
+  `TAX_RATE_ABOVE_CEILING` marker, the second rule in `validate_rate`, and
+  `activate_tax` routed through `validate_rate` (Decision 9).
+- `src/localization/mod.rs` — `ValidationTaxRateTooHigh` plus the EN and ES catalog
+  rows.
+- `src/routes/settings_web.rs` — the marker mapped to the message key by
+  `tax_error_message`, which is what makes the refusal an operator sentence instead of
+  an internal marker.
+- `src/tax_tests.rs` — the bound proven on both sides, on both the create and the edit
+  path, the negative rule preserved, and `activate_tax` refused on a legacy
+  over-ceiling row with the recovery proven; the ceiling number pinned across the
+  constant, the marker and both catalogs.
+- `src/settings_tests.rs` — the refusal reaching the operator in their own language on
+  the real form, both languages, plain render and HTMX, with the no-write assertion
+  read AFTER both posts so the HTMX branch is genuinely covered.
+- `src/tax_snapshot_tests.rs` — the write-bound census over every stored line of both
+  families, plus a counter-example that smuggles a row in through SQL to prove the
+  census can fail. Documentation states per-line carryability and names the
+  document-level gap.
+
+### T3 — document-level accumulation
+
+**NOT STARTED. The open acceptance criterion above is this unit.** RED-first, with
+its own test, on the two-line construction.
