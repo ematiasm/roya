@@ -15,6 +15,8 @@ mod setup_tests;
 #[cfg(test)]
 mod smoke_tests;
 #[cfg(test)]
+mod stylesheet_tests;
+#[cfg(test)]
 mod t1_schema_tests;
 #[cfg(test)]
 mod tax_snapshot_tests;
