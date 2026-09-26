@@ -83,8 +83,7 @@ One bounded delegated-direct ODD work unit. It touches the fixture decomposition
 - Feature document: `odd/tasks/e2e-first-run-lifecycle.md`.
 - Engram mirror topic: `odd/e2e-first-run-lifecycle/tasks`.
 - The stylesheet feature's known-gap entry about this gap is closed by U1; the parent records the closing pointer in that document.
-- U1 delivery: no commit recorded yet.
-- Next step: delivery is the user's decision. No push, PR creation, or merge has been performed.
+- U1 delivery: work-unit commit `a351e76` (`test(e2e): capture the first-run wizard on a real fresh install`), which carries the fixture decomposition, `first_run_server` and `first_run_page`, the `/setup` capture trio, the restored failure artifacts, the deletion of `reopen_first_run_setup_in_database`, and this document. Rollback boundary: reverting that one commit removes the two new fixtures, the `/setup` capture trio and the artifact prefix, and restores the mutation helper — no application source, template, stylesheet or migration is involved, so the stylesheet feature and every other e2e test are untouched by a revert.
 
 ## Gotchas discovered here
 
