@@ -31,8 +31,9 @@ use std::sync::{
 };
 use tower_http::services::ServeDir;
 
-use crate::error::AppResult;
-use crate::localization::load_context;
+use crate::error::{AppError, AppResult};
+use crate::localization::{load_context, LocalizationContext, MessageKey};
+use crate::models::PriceRefusal;
 
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteBusinessConfigurationRepository,
@@ -176,6 +177,68 @@ pub(crate) fn currency_options(current_code: &str) -> Vec<CurrencyOption> {
         });
     }
     options
+}
+
+// ---------------------------------------------------------------------------
+// The ONE price-refusal renderer, shared by every surface that can answer one
+// ---------------------------------------------------------------------------
+
+/// The ONE mapping from a price refusal to a sentence. It lives here, in the
+/// module every route shares, and not in the product module, because a price
+/// refusal does not only reach the product form: the purchase record page's
+/// "apply line cost" action writes a product's `cost_price` through
+/// `InventoryService::update_product`, so the price rules run there too. Three
+/// surfaces — the ladder preview, the product save routes and that purchase
+/// action — reach this function, and they can only disagree in wording or in
+/// language if someone edits it here.
+///
+/// Total by construction: the match has no fallback arm, so a new `PriceRefusal`
+/// variant does not compile until it is translated, and the closed-catalog test
+/// in `localization_tests` pins both catalogs to the same set.
+pub(crate) fn price_refusal_key(refusal: &PriceRefusal) -> MessageKey {
+    match refusal {
+        PriceRefusal::MarkupNotAboveMinus100 => MessageKey::PriceRefusalMarkupNotAboveMinus100,
+        PriceRefusal::MarkupNeedsPositiveCost => MessageKey::PriceRefusalMarkupNeedsPositiveCost,
+        PriceRefusal::DerivationOverflow => MessageKey::PriceRefusalDerivationOverflow,
+        PriceRefusal::SalePriceNotPositiveForProduct => {
+            MessageKey::PriceRefusalSalePriceNotPositiveForProduct
+        }
+        PriceRefusal::SalePriceNegative => MessageKey::PriceRefusalSalePriceNegative,
+        PriceRefusal::CostPriceNegative => MessageKey::PriceRefusalCostPriceNegative,
+        PriceRefusal::SalePriceRequired => MessageKey::PriceRefusalSalePriceRequired,
+    }
+}
+
+/// The refusal as the active locale words it. Every surface that states a price
+/// refusal calls this, so one operator reading two of them reads the same
+/// sentence twice.
+pub(crate) fn price_refusal_message(
+    refusal: &PriceRefusal,
+    localization: &LocalizationContext,
+) -> String {
+    localization.tr(price_refusal_key(refusal)).to_owned()
+}
+
+/// A price refusal leaves a service as a typed `AppError`, and this is where a
+/// surface that holds the operator's language turns it back into something they
+/// can read. Everything else travels untouched: a conflict, a 404 or a database
+/// fault must reach the operator exactly as it did before, and a caller that has
+/// no `LocalizationContext` simply does not call this.
+///
+/// The localized sentence rides a `Validation`, which is the same 400 with the
+/// same body shape the refusal always answered with — the global
+/// `htmx:responseError` handler paints either one verbatim, and a plain browser
+/// post reads the same JSON.
+pub(crate) fn localized_refusal_error(
+    error: AppError,
+    localization: &LocalizationContext,
+) -> AppError {
+    match error {
+        AppError::PriceRefused(refusal) => {
+            AppError::Validation(price_refusal_message(&refusal, localization))
+        }
+        other => other,
+    }
 }
 
 #[derive(Clone)]

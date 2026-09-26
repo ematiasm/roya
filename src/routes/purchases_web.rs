@@ -22,7 +22,7 @@ use crate::models::{
     NewPurchase, PaymentType, PurchaseDetail, PurchaseListFilter, PurchaseRecord, PurchaseStatus,
     PurchaseSuggestions, UpdateProduct,
 };
-use crate::routes::AppState;
+use crate::routes::{localized_refusal_error, AppState};
 use crate::services::purchases::LineAddOutcome;
 
 // S7 enforcement: every registered handler declares the permission its action
@@ -1155,7 +1155,15 @@ async fn web_apply_line_cost(
                 ..Default::default()
             },
         )
-        .await?;
+        .await
+        // A cost-only patch re-runs the price rules, so this surface can answer a
+        // PRICE refusal — a zero cost on a product carrying a markup, most of all.
+        // It answers it through the shared renderer the product form and the
+        // ladder use, not a wording of its own: one rule, one sentence, in every
+        // locale. `localized_refusal_error` passes every other error through
+        // untouched, so the status and the body of a non-price refusal are
+        // exactly what they were.
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         return changed(&state, purchase_id, &localization).await;
     }
@@ -3121,6 +3129,108 @@ mod tests {
             Decimal::from(18),
             "the markup must re-derive the sale price from the applied cost"
         );
+    }
+
+    /// A THIRD surface writes a product's price inputs, and it is the one the
+    /// product drawer cannot warn about: this action patches `cost_price` only,
+    /// through `InventoryService::update_product`, so it re-runs the very price
+    /// rules the drawer previews. A zero cost on a product that carries a markup
+    /// is refused — there is nothing to derive a price from — and a Spanish
+    /// operator must read that refusal in Spanish, through the SAME shared
+    /// renderer the product form and the ladder go through. A second mapping here
+    /// would be a second wording of one rule, which is the failure the shared
+    /// renderer exists to make impossible.
+    #[tokio::test]
+    async fn web_apply_line_cost_answers_a_price_refusal_in_the_active_locale() {
+        for (locale_code, language_code, expected) in [
+            (
+                "en-US",
+                "en",
+                "cost_price must be > 0 when markup_pct is set",
+            ),
+            (
+                "es-AR",
+                "es",
+                "El costo debe ser mayor que 0 cuando se indica un margen.",
+            ),
+        ] {
+            let state = test_state().await;
+            let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+            set_locale(&state, locale_code, language_code).await;
+            // The product now DERIVES its price from the cost (its stored cost
+            // is 10, so the markup validates), and the line the operator applies
+            // costs 0: the derivation has nothing to derive from.
+            state
+                .inventory_service
+                .update_product(
+                    audit_actor(&state).await,
+                    fixture.product_id,
+                    UpdateProduct {
+                        markup_pct: Some(Some(Decimal::from(50))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            state
+                .purchases_service
+                .update_line(
+                    audit_actor(&state).await,
+                    fixture.line_id,
+                    Decimal::from(2),
+                    Decimal::ZERO,
+                )
+                .await
+                .unwrap();
+            state
+                .purchases_service
+                .confirm(
+                    audit_actor(&state).await,
+                    fixture.purchase_id,
+                    Some(fixture.method_id),
+                )
+                .await
+                .unwrap();
+            let app = crate::routes::router(state.clone());
+
+            let (status, _, body) = post_form_response(
+                app,
+                &format!(
+                    "/web/purchases/{}/lines/{}/apply-cost",
+                    fixture.purchase_id, fixture.line_id
+                ),
+                "",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{locale_code}: a refused cost is still a 400: {body}"
+            );
+            assert!(
+                body.contains(expected),
+                "{locale_code}: the purchase flow must answer this price refusal in the \
+                 operator's own language: {body}"
+            );
+            if language_code == "es" {
+                assert!(
+                    !body.contains("cost_price must be"),
+                    "a Spanish operator must never read the English refusal: {body}"
+                );
+            }
+            // And the refusal wrote nothing: the product still carries the cost
+            // the fixture gave it, because a language change is not a rule change.
+            let product = state
+                .inventory_service
+                .get_product(fixture.product_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                product.cost_price,
+                dec_web("10"),
+                "{locale_code}: a refused apply must leave the product untouched"
+            );
+        }
     }
 
     /// T5: the action writes a PRODUCT, so it is gated `inventory.write` like

@@ -14,8 +14,10 @@
    job is to say what a save WOULD do before the operator saves:
 
    * `net_refusal` — the save path refuses this exact input, so the ladder
-     states its message and publishes no tax money at all. There is no net
-     price for a tax to apply to.
+     states its own refusal — through the same mapping the product save form
+     uses, so the two can never word it differently or in different languages
+     — and publishes no tax money at all. There is no net price for a tax to
+     apply to.
    * `inputs_unreadable` — a field is not a number yet, so the ladder reports
      the last state the save path accepted and says that is what it is showing.
 
@@ -59,14 +61,16 @@
              be stored while its own footer explains that it is derived. #}
           <td class="py-2 pr-3">{% if ladder.from_form %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderUnsaved) }}</span>{% else %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderStored) }}</span>{% endif %}</td>
           <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
-          <td class="py-2 pr-3 text-right font-bold tabular-nums">{% if let Some(refusal) = ladder.net_refusal.clone() %}<span class="font-medium text-muted">—</span>{% else %}{{ localization.format_currency(ladder.net_price.clone()) }}{% endif %}</td>
+          <td class="py-2 pr-3 text-right font-bold tabular-nums">{% if ladder.net_refusal.is_some() %}<span class="font-medium text-muted">—</span>{% else %}{{ localization.format_currency(ladder.net_price.clone()) }}{% endif %}</td>
         </tr>
-        {% if let Some(refusal) = ladder.net_refusal.clone() %}
+        {% if let Some(refusal_message) = net_refusal_message.clone() %}
         <tr>
-          {# The refusal is the save path's own message, verbatim, under a
-             localized lead: the operator reads what a save would answer, in
-             their own language, and no figure is invented beside it. #}
-          <td colspan="4" class="py-2 pr-3 text-[13px] text-muted" data-product-ladder-net-refused>{{ localization.tr(crate::localization::MessageKey::ProductLadderNetRefused) }} <span class="font-semibold">{{ refusal }}</span></td>
+          {# The refusal is the save path's own rule, rendered by the ONE shared
+             mapping the product form uses — `net_refusal_message` is that
+             sentence in the active locale, so the preview cannot say in one
+             language what the save says in another. The lead below it is
+             localized here, and no figure is invented beside either. #}
+          <td colspan="4" class="py-2 pr-3 text-[13px] text-muted" data-product-ladder-net-refused>{{ localization.tr(crate::localization::MessageKey::ProductLadderNetRefused) }} <span class="font-semibold">{{ refusal_message }}</span></td>
         </tr>
         {% else %}
         {% for row in ladder.breakdown.clone() %}
