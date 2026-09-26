@@ -436,8 +436,206 @@ async fn tax_api_keeps_canonical_json_and_manages_product_links() {
     assert_eq!(inactive["is_active"], false);
 }
 
+/// THE JSON AUTHORIZATION INVARIANT for tax DEFINITIONS, in both halves.
+///
+/// This test REPLACES `tax_api_preserves_inventory_permission_boundaries`. What
+/// that test did and did not pin is worth stating exactly, because it decided
+/// where this unit's RED came from.
+///
+/// WHAT IT PINNED: the three JSON definition endpoints were refused an
+/// `inventory.read`-ONLY principal, which is consistent with them being
+/// `inventory.write` and is still true here. That is a weaker claim than it
+/// looks.
+///
+/// WHAT IT DID NOT PIN: it never asserted that an `inventory.write` principal
+/// COULD create, rename, re-rate or deactivate a tax definition. No test ever
+/// did. The admission was pinned by the three `Require<InventoryWrite>` extractor
+/// declarations in `src/routes/inventory_api.rs` and by the prose that recorded
+/// the gap as an open decision — by code and comments, not by a test.
+///
+/// So this is NOT a flipped expectation. HALF ONE below is a NEW assertion: the
+/// declared gate is now also an asserted gate. That is why it went RED against
+/// unchanged gates, and why no test in HEAD could have gone RED for it. The old
+/// record stays in `odd/tasks/product-price-ladder.md`.
+///
+/// HALF ONE — no `inventory.write` JSON route administers a definition, and a
+/// refusal WRITES NOTHING: create, rename/re-rate and deactivate are all 403,
+/// the stored row keeps its code, name, rate and active flag, and the refused
+/// create left no tax behind. An `inventory.read`-only principal is refused the
+/// same three, because reading the catalogue is not configuring it.
+///
+/// HALF TWO — `settings.manage`, and nothing else, still performs every
+/// definition mutation the JSON API offers: create, rename, re-rate, deactivate
+/// and activate. Without this half the test would pass by breaking tax
+/// administration entirely, which is not what this unit does. Note the
+/// asymmetry that creates, and that it is intended: this principal cannot READ
+/// the catalogue back through JSON (`GET /api/taxes` is `inventory.read`) and
+/// cannot link a tax to a product. Reading stayed on `inventory.read` on
+/// purpose, so a settings-only JSON client writes definitions it cannot list.
+/// The web Settings tab is unaffected because it renders through the service,
+/// not through the JSON gate.
+///
+/// The concerns that did NOT move are not asserted here; they have their own
+/// test below, so a failure names the boundary that broke.
 #[tokio::test]
-async fn tax_api_preserves_inventory_permission_boundaries() {
+async fn tax_api_definition_administration_is_exclusive_to_settings_manage() {
+    let state = test_state().await;
+    let app = crate::routes::router(state.clone());
+    let actor = sentinel(&state.pool).await;
+    let tax = SqliteTaxRepository::new(state.pool.clone())
+        .create(actor, &tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+    let original = state.tax_service.get_tax(tax.id).await.unwrap();
+
+    // -- HALF ONE: an inventory principal cannot define a tax ---------------
+    for permissions in [&["inventory.write"][..], &["inventory.read"][..]] {
+        let probe = test_support::seed_session_with_permissions(&state.pool, permissions)
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        for (method, uri, body) in [
+            (
+                "POST",
+                "/api/taxes".to_string(),
+                Some(serde_json::json!({
+                    "code": "DENIED",
+                    "name": "Denied",
+                    "rate": "1",
+                    "is_active": true
+                })),
+            ),
+            (
+                "PUT",
+                format!("/api/taxes/{}", tax.id),
+                Some(serde_json::json!({ "name": "Denied", "rate": "99" })),
+            ),
+            ("POST", format!("/api/taxes/{}/deactivate", tax.id), None),
+        ] {
+            let (status, response) = json_request(app.clone(), method, &uri, &cookie, body).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{permissions:?} administered a definition: {method} {uri} answered {status}: {response}"
+            );
+        }
+    }
+
+    // A refusal is not a partial write: the row is byte-for-byte unchanged and
+    // the refused create left no tax behind.
+    let stored = state.tax_service.get_tax(tax.id).await.unwrap();
+    assert_eq!(stored.code, original.code);
+    assert_eq!(stored.name, original.name);
+    assert_eq!(stored.rate, original.rate);
+    assert_eq!(stored.is_active, original.is_active);
+    let codes: Vec<String> = state
+        .tax_service
+        .list_taxes()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|tax| tax.code)
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["IVA21".to_string()],
+        "a refused create wrote a tax"
+    );
+
+    // -- HALF TWO: settings.manage still defines taxes ----------------------
+    let probe = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&probe);
+    let tax_uri = format!("/api/taxes/{}", tax.id);
+
+    let (status, created) = json_request(
+        app.clone(),
+        "POST",
+        "/api/taxes",
+        &cookie,
+        Some(serde_json::json!({
+            "code": "IIBB10",
+            "name": "IIBB 10",
+            "rate": "10",
+            "is_active": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let (status, renamed) = json_request(
+        app.clone(),
+        "PUT",
+        &tax_uri,
+        &cookie,
+        Some(serde_json::json!({ "name": "IVA 21 renamed" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["name"], "IVA 21 renamed");
+
+    let (status, rerated) = json_request(
+        app.clone(),
+        "PUT",
+        &tax_uri,
+        &cookie,
+        Some(serde_json::json!({ "rate": "22.5" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rerated}");
+    assert_eq!(
+        state.tax_service.get_tax(tax.id).await.unwrap().rate,
+        Decimal::from_str("22.5").unwrap()
+    );
+
+    let (status, deactivated) = json_request(
+        app.clone(),
+        "POST",
+        &format!("/api/taxes/{}/deactivate", tax.id),
+        &cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deactivated}");
+    assert_eq!(deactivated["is_active"], false);
+
+    // Activation is the fifth mutation and the only one the dedicated
+    // deactivate route does not offer: it is an `is_active` patch on the update
+    // route, so a narrowed update gate that could only re-rate would lock a tax
+    // out of the catalogue permanently. Every call below runs as a principal
+    // holding `settings.manage` and NOTHING else — no `inventory.read`, no
+    // `inventory.write` — so this half also proves a tax definition is
+    // administered with no inventory permission at all.
+    let (status, activated) = json_request(
+        app.clone(),
+        "PUT",
+        &tax_uri,
+        &cookie,
+        Some(serde_json::json!({ "is_active": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    assert!(state.tax_service.get_tax(tax.id).await.unwrap().is_active);
+}
+
+/// THE HALF OF THE TAX BOUNDARY THAT DID NOT MOVE, pinned so it cannot drift
+/// while the definition gates were being narrowed.
+///
+///   * READING a definition is `inventory.read`. `GET /api/taxes` and
+///     `GET /api/taxes/{id}` are unchanged, because an inventory surface has to
+///     render its tax pickers and previews from the catalogue; a rate is not
+///     configuration to read.
+///   * ASSOCIATING a definition with a product is `inventory.write`.
+///     `POST /api/products/{id}/taxes` and
+///     `DELETE /api/products/{id}/taxes/{tax_id}` are unchanged, because linking
+///     a tax to a product is inventory work, not defining a tax. Reading the
+///     association back is `inventory.read`.
+///   * The hard delete has NO JSON route at all, on any permission: it stays
+///     exclusive to the Settings web tab, so the router itself refuses the
+///     method rather than a permission refusing the handler.
+#[tokio::test]
+async fn tax_api_preserves_inventory_read_and_association_boundaries() {
     let state = test_state().await;
     let app = crate::routes::router(state.clone());
     let actor = sentinel(&state.pool).await;
@@ -446,39 +644,23 @@ async fn tax_api_preserves_inventory_permission_boundaries() {
         .await
         .unwrap();
     let product_id = create_product(&state.pool, "TAX-AUTH").await;
-    SqliteProductTaxRepository::new(state.pool.clone())
-        .link(actor, product_id, tax.id)
-        .await
-        .unwrap();
+    let tax_uri = format!("/api/taxes/{}", tax.id);
 
-    let probe = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+    // -- READS stay on inventory.read ---------------------------------------
+    let reader = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
         .await
         .unwrap();
-    let cookie = test_support::cookie_for(&probe);
-    for (method, uri) in [
-        ("GET", "/api/taxes".to_string()),
-        ("GET", format!("/api/products/{product_id}/taxes")),
-    ] {
-        let (status, body) = json_request(app.clone(), method, &uri, &cookie, None).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-    }
+    let reader_cookie = test_support::cookie_for(&reader);
+    let (status, listed) =
+        json_request(app.clone(), "GET", "/api/taxes", &reader_cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["taxes"].as_array().unwrap().len(), 1);
+    let (status, one) = json_request(app.clone(), "GET", &tax_uri, &reader_cookie, None).await;
+    assert_eq!(status, StatusCode::OK, "{one}");
+    assert_eq!(one["code"], "IVA21");
+    // A reader is still not a writer: association is `inventory.write`, so the
+    // reader cannot link or unlink either, and it writes nothing trying.
     for (method, uri, body) in [
-        (
-            "POST",
-            "/api/taxes".to_string(),
-            Some(serde_json::json!({
-                "code": "DENIED",
-                "name": "Denied",
-                "rate": "1",
-                "is_active": true
-            })),
-        ),
-        (
-            "PUT",
-            format!("/api/taxes/{}", tax.id),
-            Some(serde_json::json!({ "name": "Denied" })),
-        ),
-        ("POST", format!("/api/taxes/{}/deactivate", tax.id), None),
         (
             "POST",
             format!("/api/products/{product_id}/taxes"),
@@ -490,21 +672,100 @@ async fn tax_api_preserves_inventory_permission_boundaries() {
             None,
         ),
     ] {
-        let (status, response) = json_request(app.clone(), method, &uri, &cookie, body).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+        let (status, response) =
+            json_request(app.clone(), method, &uri, &reader_cookie, body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{method} {uri} answered {status}: {response}"
+        );
     }
-
-    let stored = state.tax_service.get_tax(tax.id).await.unwrap();
-    assert_eq!(stored.name, "Tax IVA21");
-    assert!(stored.is_active);
-    assert_eq!(
-        SqliteProductTaxRepository::new(state.pool.clone())
-            .list_by_product(product_id)
+    assert!(
+        state
+            .tax_service
+            .list_product_taxes(product_id)
             .await
             .unwrap()
-            .len(),
-        1
+            .is_empty(),
+        "a refused association wrote a link"
     );
+
+    // -- ASSOCIATION stays on inventory.write -------------------------------
+    let writer = test_support::seed_session_with_permissions(&state.pool, &["inventory.write"])
+        .await
+        .unwrap();
+    let writer_cookie = test_support::cookie_for(&writer);
+    // The same principal is refused the association READ: that read is
+    // `inventory.read`, so an `inventory.write` principal links without ever
+    // being able to see the catalogue it just wrote into.
+    let (status, response) = json_request(
+        app.clone(),
+        "GET",
+        &format!("/api/products/{product_id}/taxes"),
+        &writer_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    let (status, link) = json_request(
+        app.clone(),
+        "POST",
+        &format!("/api/products/{product_id}/taxes"),
+        &writer_cookie,
+        Some(serde_json::json!({ "tax_id": tax.id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{link}");
+    // Reading the association back is `inventory.read`, not `inventory.write`,
+    // so the reader is the principal that can see it: the write gate and the
+    // read gate are separate and this test keeps them separate.
+    let (status, links) = json_request(
+        app.clone(),
+        "GET",
+        &format!("/api/products/{product_id}/taxes"),
+        &reader_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{links}");
+    assert_eq!(links["taxes"].as_array().unwrap().len(), 1);
+    let (status, unlinked) = json_request(
+        app.clone(),
+        "DELETE",
+        &format!("/api/products/{product_id}/taxes/{}", tax.id),
+        &writer_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{unlinked}");
+    assert!(state
+        .tax_service
+        .list_product_taxes(product_id)
+        .await
+        .unwrap()
+        .is_empty());
+    // Linking a tax is not defining one: the definition survives the association
+    // work untouched, so a writer links without ever being able to define.
+    assert!(state.tax_service.get_tax(tax.id).await.is_ok());
+
+    // -- NO JSON hard delete, on ANY permission -----------------------------
+    for permissions in [
+        &["settings.manage"][..],
+        &["inventory.write"][..],
+        &["inventory.read"][..],
+    ] {
+        let probe = test_support::seed_session_with_permissions(&state.pool, permissions)
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let (status, response) = json_request(app.clone(), "DELETE", &tax_uri, &cookie, None).await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{permissions:?} could hard-delete through JSON: DELETE {tax_uri} answered {status}: {response}"
+        );
+    }
+    assert!(state.tax_service.get_tax(tax.id).await.is_ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -519,15 +780,14 @@ async fn tax_api_preserves_inventory_permission_boundaries() {
 // from two screens under two different permissions. U1 removes the catalogue
 // from Products and keeps the association.
 //
-// "Settings alone" is scoped to the WEB surface throughout this block. The JSON
-// API is a different surface: `POST /api/taxes`, `PUT /api/taxes/{id}` and
-// `POST /api/taxes/{id}/deactivate` are still `Require<InventoryWrite>` in
-// `src/routes/inventory_api.rs`, and `tax_api_preserves_inventory_permission_
-// boundaries` above pins that. Pre-existing, not a U1 regression, and left
-// alone because narrowing it is an open product decision — see
-// `odd/tasks/product-price-ladder.md`.
-//
-// What U1 therefore proves, in three tests, all of it on the web:
+// "Settings alone" was scoped to the WEB surface throughout this block, because
+// at U1 time it was only true there. The JSON API's `POST /api/taxes`,
+// `PUT /api/taxes/{id}` and `POST /api/taxes/{id}/deactivate` were still
+// `Require<InventoryWrite>`, and `tax_api_preserves_inventory_permission_
+// boundaries` above pinned that. Those three gates are `Require<SettingsManage>`
+// now, so the ownership claim above holds on every surface and the residual this
+// block used to record no longer exists. What U1 proved on the web, in three
+// tests:
 //   1. the Products screen offers no catalogue at all;
 //   2. no `inventory.write` WEB route can create, rename, re-rate or
 //      activate/deactivate a tax definition — they are GONE, not refused;
@@ -597,9 +857,11 @@ async fn tax_products_screen_offers_no_tax_catalogue() {
 ///
 /// THE NAME IS SCOPED ON PURPOSE: `…_web_definition_…`. Everything this test
 /// asserts is about the `/web/…` surface only, and the test probes only
-/// `/web/taxes…`. It must not be read as a claim that `inventory.write` cannot
-/// reach a tax definition ANYWHERE in the app — it can, through the JSON API.
-/// See THE RESIDUAL at the bottom.
+/// `/web/taxes…`. Its scope is where the PROOF comes from, not where the rule
+/// stops: the same rule now holds on the JSON API, and
+/// `tax_api_definition_administration_is_exclusive_to_settings_manage` is the
+/// test that proves it there. A future surface has to be proved the same way
+/// rather than assumed from this one.
 ///
 /// This test deliberately REPLACES
 /// `tax_inventory_catalogue_keeps_its_own_write_access_for_an_inventory_writer`,
@@ -621,19 +883,6 @@ async fn tax_products_screen_offers_no_tax_catalogue() {
 /// rename, re-rate, deactivate, activate, and the hard delete that no other
 /// web route offers. Without this half the test would pass by breaking tax
 /// administration entirely, which is not what this unit does.
-///
-/// THE RESIDUAL, so nobody upgrades this test's scope by reading its name: the
-/// JSON API still administers tax definitions behind `inventory.write` —
-/// `POST /api/taxes`, `PUT /api/taxes/{id}` and `POST /api/taxes/{id}/deactivate`
-/// are all `Require<InventoryWrite>` in `src/routes/inventory_api.rs`, and
-/// `tax_api_preserves_inventory_permission_boundaries` above pins that half of
-/// the story from the other direction. That is PRE-EXISTING, not a U1
-/// regression, and U1 deliberately left it alone: narrowing the API is an open
-/// product decision recorded in `odd/tasks/product-price-ladder.md`, not a side
-/// effect of de-duplicating the web catalogue. This test is therefore
-/// deliberately NOT a global exclusivity test, and it is not allowed to become
-/// one by omission — if someone later narrows the API too, the honest move is a
-/// new test that says so, not a silent widening of this one.
 #[tokio::test]
 async fn tax_web_definition_administration_is_exclusive_to_settings_manage() {
     let state = test_state().await;
@@ -648,9 +897,10 @@ async fn tax_web_definition_administration_is_exclusive_to_settings_manage() {
     let htmx = [("HX-Request", "true")];
 
     // -- HALF ONE: no inventory.write WEB route administers a definition ------
-    // Every URI below is a `/web/…` address on purpose. The JSON API is a
-    // separate surface that still admits this permission, and listing it here
-    // would be asserting the opposite of what this test is scoped to prove.
+    // Every URI below is a `/web/…` address on purpose: this test's subject is
+    // the web address space. The JSON API enforces the same rule and is proved
+    // by its own test; listing it here would blur the two surfaces rather than
+    // strengthen either claim.
     let token = test_support::seed_session_with_permissions(&state.pool, &["inventory.write"])
         .await
         .unwrap();

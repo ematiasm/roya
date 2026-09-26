@@ -113,6 +113,17 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
   them would either hand deletion to `inventory.write` or break the product page, its catalogue
   and their tests. Whether the catalogue's write access should eventually narrow to
   `settings.manage` is a separate authorization decision, not a side effect of T3.
+  - **LATER, 2026-09-25 — that follow-up is decided and closed; the two bullets above are T3
+    evidence, not a live claim.** U1 removed the Products catalogue, and then
+    `odd/tasks/api-tax-permissions.md` narrowed the JSON API's `POST /api/taxes`,
+    `PUT /api/taxes/{id}` and `POST /api/taxes/{id}/deactivate` to
+    `Require<SettingsManage>`. Tax DEFINITION administration is `settings.manage` on every
+    surface now. Reading a definition (`GET /api/taxes`, `GET /api/taxes/{id}`) is still
+    `inventory.read`, the product-tax association is still `inventory.write` on both
+    surfaces, and the hard delete is still `settings.manage` and still has no JSON route.
+    The web claim this document makes is therefore true application-wide, and
+    `tax_api_definition_administration_is_exclusive_to_settings_manage` in `src/tax_tests.rs`
+    is the proof. Nothing in the T3 evidence above was rewritten.
 - **Tab mechanism.** One `?tab=` query parameter on the existing `/settings` route, business tab
   as the default. The business form keeps its own URL, its own submission and its own markup; the
   taxes catalogue is read only when the taxes tab is selected.
@@ -184,5 +195,5 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
 - T3 delivery: work-unit commit `3b9a927` (`feat(tax): add settings taxes tab with hard-delete safeguard`).
 - T4 verification: PASS. No failed check and no environment blocker. The four browser skips are intentional opt-in artifact/screenshot probes, not regressions. The development database was verified byte-identical (size, mtime, md5) after every check.
 - Delivery accounting: branch `feat/tax-calculation-settings` is 34 files, approximately 7,856 authored changed lines versus `main` (excluding the generated visual baseline). T1 = 2,885, T2 = 2,295, T3 = 2,744. Each cohesive work unit individually exceeds the 400-line advisory budget; the recorded `ask-on-risk` → `stacked-to-main` decision covers the delivery route, and a single-PR route would require maintainer-approved `size:exception`. No push, PR creation, or merge has been performed.
-- Follow-ups outside this feature: add `/settings` and `/settings?tab=taxes` to the visual baseline; refine the delete-confirmation panel placement and dialog semantics; decide whether the Products catalogue's `inventory.write` tax access should eventually narrow to `settings.manage`; rebuild `static/tailwind.css`, which is stale for 14 pre-existing classes across 11 templates.
+- Follow-ups outside this feature: add `/settings` and `/settings?tab=taxes` to the visual baseline; refine the delete-confirmation panel placement and dialog semantics; rebuild `static/tailwind.css`, which is stale for 14 pre-existing classes across 11 templates. (The fourth follow-up — whether the Products catalogue's `inventory.write` tax access should eventually narrow to `settings.manage` — is **no longer open**: decided and implemented on 2026-09-25 in `odd/tasks/api-tax-permissions.md`, on the web by U1 and in the JSON API by the three `Require<SettingsManage>` gates. See the dated note in Decisions above.)
 - Next step: delivery is the user's decision. The feature is implemented, verified, and committed on a local feature branch.
