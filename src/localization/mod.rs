@@ -293,6 +293,13 @@ define_message_keys! {
     PriceRefusalFinalPriceTooLarge => "price_refusal.final_price_too_large",
     PriceRefusalTaxRateTooLargeToPrice => "price_refusal.tax_rate_too_large_to_price",
     PriceRefusalNetPriceTooLarge => "price_refusal.net_price_too_large",
+    // The tax contract's own two refusals, from `line_taxes::calculate_line_taxes`
+    // and from the raw `qty * price` its document callers evaluate before it.
+    // They are two rules and not one because the remedies are two: an
+    // unrepresentable line amount is fixed by the quantity or the unit price,
+    // an unrepresentable tax total by the amount OR the rate.
+    PriceRefusalLineAmountTooLarge => "price_refusal.line_amount_too_large",
+    PriceRefusalTaxArithmeticTooLarge => "price_refusal.tax_arithmetic_too_large",
     ProductSave => "product.save",
     ProductSaveHelp => "product.save_help",
     ProductNoTaxesConfigured => "product.no_taxes_configured",
@@ -1225,6 +1232,8 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalFinalPriceTooLarge, "final_price is too large to solve a net_price from", "final_price is too large to solve a net_price from"),
     (MessageKey::PriceRefusalTaxRateTooLargeToPrice, "a linked tax rate is too large to price this final_price", "a linked tax rate is too large to price this final_price"),
     (MessageKey::PriceRefusalNetPriceTooLarge, "the linked tax rates gross this final_price down to a net_price that is too large to store", "the linked tax rates gross this final_price down to a net_price that is too large to store"),
+    (MessageKey::PriceRefusalLineAmountTooLarge, "qty * price is too large to store on this line", "qty * price is too large to store on this line"),
+    (MessageKey::PriceRefusalTaxArithmeticTooLarge, "the line amount is too large to calculate its taxes", "the line amount is too large to calculate its taxes"),
     (MessageKey::ProductSave, "Save product", "Save product"),
     (MessageKey::ProductSaveHelp, "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique.", "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique."),
     (MessageKey::ProductNoTaxesConfigured, "No taxes configured yet.", "No taxes configured yet."),
@@ -2182,6 +2191,8 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalFinalPriceTooLarge, "El precio final es demasiado grande para derivar un precio neto a partir de él.", "El precio final es demasiado grande para derivar un precio neto a partir de él."),
     (MessageKey::PriceRefusalTaxRateTooLargeToPrice, "Una tasa de impuesto vinculada es demasiado grande para calcular este precio final.", "Una tasa de impuesto vinculada es demasiado grande para calcular este precio final."),
     (MessageKey::PriceRefusalNetPriceTooLarge, "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar.", "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar."),
+    (MessageKey::PriceRefusalLineAmountTooLarge, "La cantidad por el precio es demasiado grande para guardarse en esta línea.", "La cantidad por el precio es demasiado grande para guardarse en esta línea."),
+    (MessageKey::PriceRefusalTaxArithmeticTooLarge, "El importe de la línea es demasiado grande para calcular sus impuestos.", "El importe de la línea es demasiado grande para calcular sus impuestos."),
     (MessageKey::ProductSave, "Guardar producto", "Guardar producto"),
     (MessageKey::ProductSaveHelp, "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos.", "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos."),
     (MessageKey::ProductNoTaxesConfigured, "Todavía no hay impuestos configurados.", "Todavía no hay impuestos configurados."),

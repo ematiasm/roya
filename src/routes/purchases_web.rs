@@ -1005,7 +1005,12 @@ async fn web_add_line_impl(
     let outcome = state
         .purchases_service
         .add_or_increment_line(actor, id, product_id, qty, unit_cost)
-        .await?;
+        .await
+        // A line write runs the shared tax contract, which REFUSES an amount or
+        // a tax arithmetic it cannot carry instead of panicking. The refusal
+        // answers through the one shared renderer, in the operator's own
+        // language; every other error passes through untouched.
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         let notice = match &outcome {
             LineAddOutcome::Merged { line, product_name } => Some(
@@ -1066,7 +1071,9 @@ async fn web_update_line(
     state
         .purchases_service
         .update_line(principal.user_id, line_id, qty, unit_cost)
-        .await?;
+        .await
+        // Same contract, same renderer, same reason as the add.
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         return changed(&state, purchase_id, &localization).await;
     }
@@ -6278,5 +6285,90 @@ mod tests {
             .get_detail(fixture.purchase_id)
             .await
             .is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tax-contract overflow (tax contract overflow T1).
+    //
+    // The purchase twin of the sale assertion, and it is a separate production
+    // path with its own repository: `SqlitePurchaseRepository` evaluates
+    // `qty * unit_cost` with the raw operator before entering the shared tax
+    // contract, so an amount of `1e20 * 1e9` panics here independently of
+    // anything the sale path does.
+    // -----------------------------------------------------------------------
+
+    /// A product of its own, so the post cannot land on the fixture's product:
+    /// a repeat product takes the scan-merge branch, and this test is about the
+    /// amount's own arithmetic, not about which branch answered.
+    async fn product_with_sku(state: &AppState, sku: &str) -> i64 {
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor(state).await,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: format!("Overflow {sku}"),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        product.id
+    }
+
+    /// The same defect on the purchase path: an unrepresentable line amount is a
+    /// refusal carrying a sentence, not a dropped connection. The operator is
+    /// typing a received quantity on this screen, so an unbounded `qty` is
+    /// theirs to type, exactly like a sale's.
+    #[tokio::test]
+    async fn a_purchase_line_whose_amount_overflows_is_a_localized_refusal_not_a_panic() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let product_id = product_with_sku(&state, "PUR-OVF-1").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, _, body) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            &format!("product_id={product_id}&qty=100000000000000000000&unit_cost=1000000000"),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unrepresentable line amount is a refusal, not a dropped connection: {body:.400}"
+        );
+        let expected =
+            localization.tr(crate::localization::MessageKey::PriceRefusalLineAmountTooLarge);
+        assert!(
+            body.contains(&expected),
+            "the operator must read the refusal in their own language: {body:.400}"
+        );
+        assert!(
+            !state
+                .purchases_service
+                .get_detail(fixture.purchase_id)
+                .await
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.product_id == product_id),
+            "a refused line writes nothing"
+        );
     }
 }

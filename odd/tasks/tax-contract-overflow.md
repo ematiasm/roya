@@ -203,9 +203,18 @@ check is **not** N/A for either unit here: both change what an operator sees.
 
 ## Risks and open questions
 
-- **`existing.qty + qty` at `purchases.rs:487` is out of scope but unverified.** If
+- **`purchases.rs:487` `existing.qty + qty` is out of scope but unverified.** If
   the scan-merge path can accumulate a quantity that overflows when added, that is
   a third defect from the same family. Not fixed, not disproved.
+- **The Evidence table is NOT a complete census, and this is a known gap in it.**
+  Independent verification of T1 found `src/services/purchases.rs:1349`,
+  `subtotal: suggested_qty * unit_cost` — a raw `*` on the
+  `GET /api/purchases/suggestions` path, with neither operand bounded
+  (`record_cost` validates only `cost >= 0`; `suggestion_for` returns
+  `max - stock` from operator-set stock levels with no ceiling). An operator stores
+  an extreme supplier cost and the request is dropped on an ordinary page load.
+  Neither this nor `purchases.rs:487` is *tax* arithmetic, so the T1 acceptance
+  criterion holds as written; both are the same family and both are unfixed.
 - **A rate ceiling changes what is storable.** An existing deployment with a stored
   rate above the ceiling would still load, but could no longer be updated through
   Settings. Whether that is acceptable is a data question, and the data was not read.

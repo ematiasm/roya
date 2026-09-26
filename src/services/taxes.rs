@@ -391,22 +391,43 @@ where
         // to: a breakdown computed from a price that does not exist would be
         // exactly the fabrication this ladder exists to avoid.
         if ladder.net_refusal.is_none() {
-            let calc = calculate_line_taxes(ladder.net_price, &taxes);
-            ladder.breakdown = calc
-                .taxes
-                .iter()
-                .map(|row| ProductTaxBreakdownRow {
-                    code: row.code.clone(),
-                    name: row.name.clone(),
-                    rate: row.rate,
-                    amount: row.amount,
-                })
-                .collect();
-            // The net is read back off the calculation, never re-derived here:
-            // one source of truth for the figure the breakdown adds up to.
-            ladder.net_price = calc.net_subtotal;
-            ladder.tax_total = calc.tax_total;
-            ladder.total = calc.total;
+            // The contract REFUSES rather than panicking, and the ladder carries
+            // that refusal in the one typed slot it already has, which the
+            // fragment renders through the one shared mapping. It does NOT
+            // become an error of the caller's, and the reason is the drawer's:
+            // this is an ORDINARY page load on a STORED net. The price rule
+            // (`validate_effective_prices`) has no upper ceiling by design, so
+            // a product saved with a very large price plus a linked extreme rate
+            // is a row the operator still has to be able to OPEN and EDIT.
+            // Failing the whole drawer would replace today's dropped connection
+            // with a refusal that makes the product unreachable.
+            //
+            // A refusal here means the same thing it means everywhere else on
+            // this ladder: no money is published, because there is no arithmetic
+            // to publish it from. `breakdown`, `tax_total` and `total` are
+            // already empty and zero — this ladder is built that way in every
+            // arm above and nothing has written to them yet.
+            match calculate_line_taxes(ladder.net_price, &taxes) {
+                Ok(calc) => {
+                    ladder.breakdown = calc
+                        .taxes
+                        .iter()
+                        .map(|row| ProductTaxBreakdownRow {
+                            code: row.code.clone(),
+                            name: row.name.clone(),
+                            rate: row.rate,
+                            amount: row.amount,
+                        })
+                        .collect();
+                    // The net is read back off the calculation, never
+                    // re-derived here: one source of truth for the figure the
+                    // breakdown adds up to.
+                    ladder.net_price = calc.net_subtotal;
+                    ladder.tax_total = calc.tax_total;
+                    ladder.total = calc.total;
+                }
+                Err(refusal) => ladder.net_refusal = Some(refusal),
+            }
         }
         Ok(ladder)
     }

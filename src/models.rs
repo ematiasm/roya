@@ -233,8 +233,11 @@ pub enum PriceRefusal {
     /// derive from. "No cost" is the column's zero, never a NULL.
     MarkupNeedsPositiveCost,
     /// `derive_net_sale_price`: the operands are user-supplied and unbounded, and
-    /// `Decimal` arithmetic panics on overflow, so an unbounded pair is refused
-    /// instead of crashing the handler.
+    /// rust_decimal's raw arithmetic operators panic on overflow, so an
+    /// unbounded pair is refused instead of crashing the handler. The same
+    /// applies to every other variant here: none of them is a defect report, and
+    /// each one exists so a value that cannot be carried reaches an operator as
+    /// a sentence.
     DerivationOverflow,
     /// `validate_effective_prices`: a product must sell for something.
     SalePriceNotPositiveForProduct,
@@ -266,16 +269,22 @@ pub enum PriceRefusal {
     /// different remedy. The solve says which one happened.
     FinalPriceMarkupUnreachable,
     /// `final_price::solve_final_price`: the typed final price is above
-    /// `final_price::max_solvable_final_price`. The tax contract multiplies with
-    /// the raw `Decimal` operator, which PANICS on overflow, so a price this
-    /// large has to be refused before any arithmetic touches it — a price that
-    /// crashes the handler is not a price the operator can be shown.
+    /// `final_price::max_solvable_final_price`.
+    ///
+    /// The ceiling was introduced while the tax contract still multiplied with
+    /// rust_decimal's raw operator and PANICKED on overflow, and it stays: the
+    /// contract is now total and refuses in its own right, but a solve that
+    /// already knows the price is outside what the arithmetic can carry must
+    /// say so with the solve's OWN variant rather than depending on which of its
+    /// two mechanisms notices first.
     FinalPriceTooLarge,
     /// `final_price::solve_final_price`: a linked rate is so large that
     /// `net * rate` leaves the representable range for a final price the solve
     /// otherwise accepts. Refused for the same reason as `FinalPriceTooLarge`,
     /// and separately named because the remedy differs: this one is the tax, not
-    /// the price.
+    /// the price. Distinct from `TaxArithmeticTooLarge`, which the shared
+    /// contract raises on a document line and which names the same arithmetic
+    /// with the line's own vocabulary.
     TaxRateTooLargeToPrice,
     /// `final_price::solve_final_price`: the NET this final price would need is
     /// above `Decimal::MAX`, so no net price can be stored for it. The typed
@@ -290,6 +299,28 @@ pub enum PriceRefusal {
     /// the honest answer because the remedy is a third thing: the rate SET has to
     /// stop grossing the price down that far.
     NetPriceTooLarge,
+    /// A document line's net amount is `qty * price`, and BOTH operands are
+    /// user-supplied with no ceiling of their own, so the PRODUCT leaves the
+    /// 28-digit `Decimal` range before any tax is even read. The remedy is
+    /// wholly the operator's: the quantity or the unit price has to come down.
+    LineAmountTooLarge,
+    /// The net amount is representable, and so is every individual tax
+    /// contribution, but the PAIR is not: `net + SUM round2(net * rate / 100)`
+    /// is what leaves the range.
+    ///
+    /// This is deliberately NOT `LineAmountTooLarge`, and the probe that found
+    /// the difference is the reason. There are inputs where every individual
+    /// multiply fits, the running tax total fits, and only the FINAL ADD
+    /// overflows — `net` at the top of the range with a single 1% rate is one.
+    /// The governing bound is therefore the pair `net * (1 + SUM rate/100) <=
+    /// MAX`, not the per-multiply `net * rate <= MAX`, and a guard that checked
+    /// only the multiplies would still crash on exactly those inputs.
+    ///
+    /// The remedy differs for the same reason. Lowering the quantity or the unit
+    /// price is what fixes an unrepresentable amount; here either the amount OR
+    /// the rate has to come down, so an operator who only lowers the price of a
+    /// 1%-rate line is refused again for the same arithmetic.
+    TaxArithmeticTooLarge,
 }
 
 impl PriceRefusal {
@@ -317,6 +348,8 @@ impl PriceRefusal {
         Self::FinalPriceTooLarge,
         Self::TaxRateTooLargeToPrice,
         Self::NetPriceTooLarge,
+        Self::LineAmountTooLarge,
+        Self::TaxArithmeticTooLarge,
     ];
 
     /// The English text this refusal has always answered with. It is the
@@ -351,6 +384,11 @@ impl PriceRefusal {
                 "the linked tax rates gross this final_price down to a net_price that is too \
                  large to store"
             }
+            // No trailing period, like every other row here: this text IS the
+            // body the JSON API answers with, and the closed-catalog test pins
+            // the English row to these bytes.
+            Self::LineAmountTooLarge => "qty * price is too large to store on this line",
+            Self::TaxArithmeticTooLarge => "the line amount is too large to calculate its taxes",
         }
     }
 }
@@ -435,16 +473,32 @@ pub struct ProductPriceLadder {
     /// The markup the ladder reports, or `None` for a manual-price product.
     pub markup_pct: Option<Decimal>,
     /// The net sale price the taxes are applied to. Meaningless when
-    /// `net_refusal` is `Some`.
+    /// `net_refusal` is `Some` — which includes a tax-arithmetic refusal, where
+    /// the net itself is perfectly storable and is simply not shown beside a
+    /// breakdown that does not exist. The form field above the ladder still
+    /// shows the stored value, so nothing is hidden from the operator.
     pub net_price: Decimal,
     /// True when `net_price` came out of the cost and the markup; false for a
     /// manual price. The ladder states which, because "why is it this number"
     /// is the first question an operator asks of a price.
     pub net_is_derived: bool,
-    /// The save path's own refusal, when no net price can be stated. Typed, not
-    /// a message: the ladder renders it through the same mapping the save form
+    /// The ladder's own refusal, when no money can be stated. Typed, not a
+    /// message: the ladder renders it through the same mapping the save form
     /// renders it through, so the preview cannot say in one language what the
     /// save says in another.
+    ///
+    /// It carries BOTH halves, because both mean the same thing to a reader —
+    /// there is no figure here to show. The PRICE half is the save path's own
+    /// refusal, when no net price exists at all. The TAX half is
+    /// `line_taxes::calculate_line_taxes` refusing the arithmetic on a net that
+    /// does exist: a stored price with no upper ceiling plus a stored rate can
+    /// be a pair no arithmetic can carry, and a ladder that published a
+    /// breakdown for it would be publishing a figure a document line would
+    /// refuse to write.
+    ///
+    /// ONE slot, not two. A second field would need a second message key and a
+    /// second branch in the fragment, and a reader would still be asking the
+    /// same question of both.
     pub net_refusal: Option<PriceRefusal>,
     /// True when a form field was not a number, so the ladder reports the last
     /// state the save path accepted instead of a preview of a value that does

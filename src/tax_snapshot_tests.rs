@@ -179,7 +179,8 @@ async fn taxes_linked_to(
 /// the line total is the untouched net amount (never a re-scaled copy of it).
 #[test]
 fn tax_snapshot_calc_zero_taxes_keeps_the_net_total() {
-    let calc = calculate_line_taxes(dec("123.456"), &[]);
+    let calc = calculate_line_taxes(dec("123.456"), &[])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert!(calc.taxes.is_empty());
     assert_eq!(calc.net_subtotal, dec("123.456"));
     assert_eq!(calc.tax_total, dec("0"));
@@ -191,7 +192,8 @@ fn tax_snapshot_calc_zero_taxes_keeps_the_net_total() {
 #[test]
 fn tax_snapshot_calc_single_tax_contribution() {
     let tax = tax_value(1, "IVA", "21");
-    let calc = calculate_line_taxes(dec("100"), &[tax]);
+    let calc = calculate_line_taxes(dec("100"), &[tax])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes.len(), 1);
     assert_eq!(calc.taxes[0].amount, dec("21"));
     assert_eq!(calc.tax_total, dec("21"));
@@ -205,7 +207,8 @@ fn tax_snapshot_calc_multiple_taxes_are_additive_not_compounded() {
     let calc = calculate_line_taxes(
         dec("100"),
         &[tax_value(1, "IVA", "21"), tax_value(2, "IIBB", "10")],
-    );
+    )
+    .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes[0].amount, dec("21"));
     assert_eq!(calc.taxes[1].amount, dec("10"));
     assert_eq!(calc.tax_total, dec("31"));
@@ -216,7 +219,8 @@ fn tax_snapshot_calc_multiple_taxes_are_additive_not_compounded() {
 /// id, code, name and rate as they were resolved, never a live join.
 #[test]
 fn tax_snapshot_calc_returns_the_immutable_tax_facts() {
-    let calc = calculate_line_taxes(dec("50"), &[tax_value(7, "IVA", "21")]);
+    let calc = calculate_line_taxes(dec("50"), &[tax_value(7, "IVA", "21")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     let snapshot = &calc.taxes[0];
     assert_eq!(snapshot.tax_id, 7);
     assert_eq!(snapshot.code, "IVA");
@@ -230,7 +234,8 @@ fn tax_snapshot_calc_returns_the_immutable_tax_facts() {
 /// product-markup derived price uses. A banker's rounding would answer 0.00.
 #[test]
 fn tax_snapshot_calc_rounds_a_contribution_half_up_at_the_midpoint() {
-    let calc = calculate_line_taxes(dec("1"), &[tax_value(1, "T", "0.5")]);
+    let calc = calculate_line_taxes(dec("1"), &[tax_value(1, "T", "0.5")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes[0].amount, dec("0.01"));
     assert_eq!(calc.tax_total, dec("0.01"));
     assert_eq!(calc.total, dec("1.01"));
@@ -240,7 +245,8 @@ fn tax_snapshot_calc_rounds_a_contribution_half_up_at_the_midpoint() {
 /// can carry more than two decimals (a fractional quantity times a price).
 #[test]
 fn tax_snapshot_calc_rounds_the_total_half_up_at_the_midpoint() {
-    let calc = calculate_line_taxes(dec("10.005"), &[tax_value(1, "IVA", "21")]);
+    let calc = calculate_line_taxes(dec("10.005"), &[tax_value(1, "IVA", "21")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes[0].amount, dec("2.10"));
     assert_eq!(calc.tax_total, dec("2.10"));
     assert_eq!(calc.total, dec("12.11"));
@@ -257,7 +263,8 @@ fn tax_snapshot_calc_contributions_reconcile_with_the_tax_total() {
             tax_value(2, "B", "5.5"),
             tax_value(3, "C", "1.1"),
         ],
-    );
+    )
+    .expect("an ordinary amount and rate set is arithmetic this contract carries");
     let summed: Decimal = calc.taxes.iter().map(|t| t.amount).sum();
     assert_eq!(summed, calc.tax_total);
     assert_eq!(calc.tax_total, dec("9.20"));
@@ -268,7 +275,8 @@ fn tax_snapshot_calc_contributions_reconcile_with_the_tax_total() {
 /// snapshot row still exists so the document shows the fact it was linked.
 #[test]
 fn tax_snapshot_calc_zero_rate_tax_contributes_nothing() {
-    let calc = calculate_line_taxes(dec("80"), &[tax_value(1, "EXENTO", "0")]);
+    let calc = calculate_line_taxes(dec("80"), &[tax_value(1, "EXENTO", "0")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes.len(), 1);
     assert_eq!(calc.taxes[0].amount, dec("0"));
     assert_eq!(calc.tax_total, dec("0"));
@@ -289,7 +297,8 @@ fn tax_snapshot_calc_round_to_cents_is_half_up_away_from_zero() {
 /// for field, so what the document stores is exactly what the contract decided.
 #[test]
 fn tax_snapshot_calc_snapshot_converts_to_the_persistence_shape() {
-    let calc = calculate_line_taxes(dec("100"), &[tax_value(7, "IVA", "21")]);
+    let calc = calculate_line_taxes(dec("100"), &[tax_value(7, "IVA", "21")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     let write: NewLineTax = NewLineTax::from(&calc.taxes[0]);
     assert_eq!(write.tax_id, 7);
     assert_eq!(write.code, "IVA");

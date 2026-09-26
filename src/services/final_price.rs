@@ -16,25 +16,22 @@
 //!   refused rather than multiplied. Every arithmetic step that could overflow
 //!   inside the solve is checked, including building the window's own endpoints.
 //!
-//! # This module does NOT make the tax contract total, and does not try
+//! # The tax contract is total NOW; this module's own guards stay anyway
 //!
-//! [`calculate_line_taxes`] is still not total. It multiplies with rust_decimal's
-//! raw `*` operator, which panics on overflow, and it takes a net and a rate
-//! straight from its caller. What this solve does is BOUND ITS OWN INPUT AND
-//! REFUSE rather than overflow — the ceiling above plus the dry run plus checked
-//! arithmetic at every site in the search.
+//! [`calculate_line_taxes`] used to multiply and add with rust_decimal's raw
+//! operators, which PANIC on overflow, and this module was written to keep its
+//! own callers away from it. The contract has since been made total in its own
+//! right: it returns a typed [`PriceRefusal`] and every step in it is checked,
+//! the final add included.
 //!
-//! That is a local guarantee, not a global one, and the difference matters
-//! because the other callers of the contract have no such guard:
-//! `SqliteSaleRepository::write_line_with_taxes` and `rewrite_draft_line_taxes`,
-//! and their `SqlitePurchaseRepository` mirrors, all call
-//! `calculate_line_taxes(qty * unit_price, &taxes)` with no ceiling on either the
-//! line amount or the tax rate, and `TaxService`'s price ladder calls it with a
-//! stored net. A valid tax carrying an extreme rate plus an ordinary draft line
-//! panics on those shipping paths TODAY, independently of anything in this
-//! module. Closing that is a separate defect in the shared contract and a
-//! separate piece of work; it is named here so nobody reads this module's
-//! totality as having covered it.
+//! The two mechanisms above are NOT removed, and the reason is not redundancy.
+//! [`tax_arithmetic_fits`] decides WHICH refusal a caller of this solve sees:
+//! the contract's own `TaxArithmeticTooLarge` names a document line's amount
+//! and a tax total, while `TaxRateTooLargeToPrice` names the RATE against a
+//! final price, which is the only vocabulary a person setting a final price
+//! can act on. Deleting the dry run would silently repoint this solve's own
+//! refusals at the line's vocabulary, and the ceiling would then be the only
+//! thing standing between an operator and an answer the search cannot carry.
 //!
 //! Both mechanisms above are load-bearing and neither is redundant. For an
 //! all-NON-NEGATIVE rate set the price bound alone is enough, because the
@@ -177,20 +174,25 @@ const MARKUP_PRECISION_LADDER: [u32; 8] = [0, 2, 4, 8, 12, 16, 20, 24];
 /// # Why the solve needs a ceiling at all
 ///
 /// [`calculate_line_taxes`] computes each contribution as `net * rate / 100`
-/// with rust_decimal's raw `*` operator, and that operator PANICS on overflow.
-/// This unit must not change that shared primitive — it is the one tax contract
-/// every document line and the ladder already agree on — so the obligation falls
-/// on this solve, which supplies the final price an operator types and therefore
-/// has to decide what to do with a number that does not fit.
-/// `validate_effective_prices` deliberately has no upper price bound (whether a
-/// price is plausible is a product decision, not an arithmetic one), so without a
-/// ceiling a 28-digit final price reaches the multiplication and takes the
-/// request down. A refusal an operator can read is the only acceptable answer to
-/// a number that does not fit.
+/// and used to do it with rust_decimal's raw `*` operator, which PANICS on
+/// overflow. It is total now — it returns a typed refusal — but this solve
+/// keeps its own ceiling, and for two reasons that survive the contract being
+/// fixed.
 ///
-/// This bounds THIS solve's input. It does not make the tax contract total, and
-/// the other callers that pass it a net with no ceiling are a separate defect —
-/// see the module docs, which name them.
+/// The first is the refusal's vocabulary: the contract would answer
+/// `TaxArithmeticTooLarge` ("the line amount is too large to calculate its
+/// taxes"), which names a document line. A person typing a final price needs to
+/// be told the PRICE is out of range, and `FinalPriceTooLarge` is the sentence
+/// that says so.
+///
+/// The second is that the ceiling is this solve's own promise, checked before
+/// any arithmetic touches the number.
+/// `validate_effective_prices` deliberately has no upper price bound (whether a
+/// price is plausible is a product decision, not an arithmetic one), so without
+/// a ceiling a 28-digit final price reaches the multiplication and is reported
+/// as somebody else's problem. A refusal an operator can read, attributed to the
+/// field they typed in, is the only acceptable answer to a number that does not
+/// fit.
 ///
 /// # Why this value
 ///
@@ -366,7 +368,13 @@ pub fn solve_final_price(
 
     // The breakdown is recomputed from the SOLVED net, never carried over from
     // a candidate, so the rows published are the rows that justify the answer.
-    let calculation = calculate_line_taxes(net, taxes);
+    //
+    // `?` rather than a panic: the contract is total and refuses, and a refusal
+    // that reaches this solve is the same fact `tax_arithmetic_fits` states with
+    // the SOLVE's own variant. Carried through unchanged, so the caller still
+    // learns that a rate set cannot carry this price.
+    let calculation =
+        calculate_line_taxes(net, taxes).map_err(|_| PriceRefusal::TaxRateTooLargeToPrice)?;
     Ok(FinalPriceSolve {
         final_price,
         net_price: net,
@@ -474,7 +482,14 @@ fn solve_net(final_price: Decimal, taxes: &[Tax], divisor: Decimal) -> SolveResu
         let candidate = base
             .checked_add(cent() * Decimal::from(offset))
             .ok_or(PriceRefusal::NetPriceTooLarge)?;
-        if calculate_line_taxes(candidate, taxes).total != final_price {
+        // The two endpoints were proved carryable above, so a refusal here is
+        // the same fact stated by the contract itself. It is reported with the
+        // solve's own variant for the same reason the guard reports it that
+        // way: a machine reading a solve's refusal needs the solve's vocabulary.
+        let Ok(calculation) = calculate_line_taxes(candidate, taxes) else {
+            return Err(PriceRefusal::TaxRateTooLargeToPrice);
+        };
+        if calculation.total != final_price {
             continue;
         }
         let distance = (candidate - estimate).abs();
@@ -495,18 +510,18 @@ fn solve_net(final_price: Decimal, taxes: &[Tax], divisor: Decimal) -> SolveResu
 /// overflowing — a faithful dry run of [`calculate_line_taxes`] with every
 /// operation in its checked form.
 ///
-/// This exists because that contract multiplies with the raw `Decimal` operator,
-/// which PANICS on overflow, and this unit must not change it: it is the one
-/// definition of a final price that the document lines and the ladder already
-/// share, and "make the tax contract total" is a different and much wider piece
-/// of work. The obligation not to crash therefore lands on this solve, which
-/// supplies a number an operator typed, and the honest way to meet it is to know
-/// the answer before asking the question.
+/// The contract is total now and would answer `Err` on its own, so the honest
+/// reason this exists is the REFUSAL it chooses, not the crash it prevents. A
+/// caller of this solve must hear `TaxRateTooLargeToPrice` — "a linked rate is
+/// too large to price this final price" — because that is the one field they
+/// can change. Letting the contract's own answer through would name a line
+/// amount and a tax total, which are not what the person typing a final price
+/// typed. A pre-check that reports the same fact in the solve's own vocabulary
+/// is worth four comparisons per window.
 ///
-/// The obligation is LOCAL. This dry run protects the calls made from
-/// [`solve_net`] and nothing else: the repositories and the price ladder call
-/// the same contract with a net and a rate they do not bound, and remain
-/// exposed. The module docs name them.
+/// It is also cheaper, and it is checked BEFORE the window is walked: a rate
+/// set that cannot carry the search must be refused without paying for a
+/// search to discover it.
 ///
 /// # Why the price bound does not make this redundant
 ///
@@ -786,8 +801,15 @@ mod tests {
 
     /// The final price of a net through the ONE tax contract, so no test in
     /// this module can agree with a second, private idea of the equation.
+    ///
+    /// The contract is total, so a refusal here is a real answer and not a
+    /// test artefact: these fixtures are ordinary amounts with non-negative
+    /// rate sets, and a refusal would mean the equation under test cannot be
+    /// carried at all.
     fn final_of(net: &str, rates: &[&str]) -> Decimal {
-        calculate_line_taxes(dec(net), &taxes(rates)).total
+        calculate_line_taxes(dec(net), &taxes(rates))
+            .expect("an ordinary net and a non-negative rate set are carried")
+            .total
     }
 
     /// Every net in `lo..=hi` (in cents) whose final price is exactly `target`,
@@ -1247,12 +1269,16 @@ mod tests {
     // The solve must be TOTAL IN FACT, not only in prose
     // -----------------------------------------------------------------------
 
-    /// THE PANIC. `calculate_line_taxes` computes `net * rate` with the raw
-    /// `Decimal` operator, which panics on overflow, and this unit must not
-    /// change that shared primitive. With a 21% rate linked, a 7e28 final price
-    /// made `7e28 * 21` leave the representable range and took the whole request
-    /// down. `validate_effective_prices` puts no ceiling on a price, so a typed
-    /// 28-digit number reaches the solve.
+    /// THE PANIC, as it was. `calculate_line_taxes` computed `net * rate` with
+    /// the raw `Decimal` operator, which panics on overflow. With a 21% rate
+    /// linked, a 7e28 final price made `7e28 * 21` leave the representable range
+    /// and took the whole request down.
+    ///
+    /// The contract now refuses instead of panicking, so this test passes for a
+    /// NEW reason and that is exactly why it stays: it must keep answering with
+    /// the SOLVE's own variants, so the day someone deletes the dry run or the
+    /// ceiling this fails on the variant rather than on a crash. A green solve
+    /// must not depend on the contract below it happening to be total.
     ///
     /// Both verifier-confirmed inputs are here, and the sibling of the old
     /// largest test — which was safe only because it carried no tax at all.
@@ -1798,11 +1824,15 @@ mod tests {
 
             for cents in 0..=60_000i64 {
                 let net = Decimal::new(cents, MONEY_SCALE);
-                let target = calculate_line_taxes(net, &taxes).total;
+                let target = calculate_line_taxes(net, &taxes)
+                    .expect("a non-negative rate set carries an ordinary net")
+                    .total;
                 let base = round_to_cents(target / divisor);
 
                 let in_window = (-radius..=radius).any(|offset| {
-                    calculate_line_taxes(base + cent() * Decimal::from(offset), &taxes).total
+                    calculate_line_taxes(base + cent() * Decimal::from(offset), &taxes)
+                        .expect("a non-negative rate set carries an ordinary net")
+                        .total
                         == target
                 });
                 assert!(

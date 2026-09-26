@@ -20,7 +20,7 @@ use crate::localization::LocalizationContext;
 use crate::models::{
     DebtSummary, PaymentType, SaleDetail, SaleListFilter, SaleRecord, SaleStatus, UpdateSaleDraft,
 };
-use crate::routes::AppState;
+use crate::routes::{localized_refusal_error, AppState};
 use crate::security::authz::{CustomersCollect, Nav, Require, SalesCancel, SalesCreate, SalesRead};
 use crate::services::sales::DEBT_BANNER_LIMIT;
 
@@ -680,7 +680,14 @@ async fn add_line_impl(
     state
         .sales_service
         .add_line(id, product_id, qty, unit_price)
-        .await?;
+        .await
+        // A line write runs the shared tax contract, which now REFUSES an
+        // amount or a tax arithmetic it cannot carry instead of panicking. The
+        // refusal is carried out as a typed rule, so it answers through the same
+        // renderer the product form and the ladder use, in the operator's own
+        // language. `localized_refusal_error` passes every other error through
+        // untouched, so nothing else on this route changes.
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         return changed_with_picker(&state, id, &localization, true).await;
     }
@@ -700,7 +707,10 @@ async fn web_update_line(
     state
         .sales_service
         .update_line(line_id, qty, unit_price)
-        .await?;
+        .await
+        // Same contract, same renderer, same reason as the add: an inline edit
+        // of a draft line can carry an unrepresentable amount just as an add can.
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         return changed(&state, sale_id, &localization).await;
     }
@@ -967,6 +977,7 @@ mod tests {
     use crate::models::PaymentType;
     use crate::routes::AppState;
     use crate::security::test_support;
+    use rust_decimal::Decimal;
 
     /// A valid acting user for the mechanical call sites: the migration's
     /// sentinel account (the system actor pre-existing rows are attributed to).
@@ -2903,5 +2914,222 @@ mod tests {
             .get_detail(fixture.sale_id)
             .await
             .is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Tax-contract overflow (tax contract overflow T1): a draft line whose
+    // arithmetic leaves the representable range must be REFUSED, in the
+    // operator's language, on a real request.
+    //
+    // There is no `catch_unwind` and no panic-catching layer in this crate, so
+    // a panic inside the handler resolves the per-connection task to a dropped
+    // `JoinHandle`: the HTMX post paints nothing and the operator's typed
+    // values look like they vanished. Every test in this block therefore
+    // asserts a STATUS and a SENTENCE, because "did not panic" is not
+    // observable from the outside.
+    // -----------------------------------------------------------------------
+
+    /// A product of its own, so a line test can address the line it wrote: the
+    /// fixture already holds a line for ITS product, and two lines on one product
+    /// make "the line I added" ambiguous.
+    async fn product_with_sku(state: &AppState, sku: &str) -> i64 {
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor(state).await,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: format!("Overflow {sku}"),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        product.id
+    }
+
+    /// A product with one linked active tax, at the given rate, for a line test
+    /// that needs the tax half of the contract to run.
+    async fn link_one_tax(state: &AppState, product_id: i64, code: &str, rate: &str) {
+        let actor = audit_actor(state).await;
+        let tax = state
+            .tax_service
+            .create_tax(
+                actor,
+                crate::models::NewTax {
+                    code: code.into(),
+                    name: format!("Tax {code}"),
+                    rate: Decimal::from_str(rate).unwrap(),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .tax_service
+            .link_product_tax(actor, product_id, tax.id)
+            .await
+            .unwrap();
+    }
+
+    /// The line amount is `qty * unit_price` and BOTH operands are unbounded, so
+    /// the raw product the repository evaluates BEFORE the tax contract can
+    /// leave the 96-bit range on its own: `1e20 * 1e9` is `1e29`. That is a
+    /// separate panic from the contract's, and it is the one an operator types
+    /// into a quantity box.
+    #[tokio::test]
+    async fn a_sale_line_whose_amount_overflows_is_a_localized_refusal_not_a_panic() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = post_form(
+            app,
+            &format!("/web/sales/{}/lines", fixture.sale_id),
+            &format!(
+                "product_id={}&qty=100000000000000000000&unit_price=1000000000",
+                fixture.product_id
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unrepresentable line amount is a refusal, not a dropped connection: {body}"
+        );
+        let expected =
+            localization.tr(crate::localization::MessageKey::PriceRefusalLineAmountTooLarge);
+        assert!(
+            body.contains(&expected),
+            "the operator must read the refusal in their own language: {body}"
+        );
+        assert!(
+            !body.contains("\"error\":\"validation error\""),
+            "the refusal reaches the operator as the sentence, not as a wrapped error: {body}"
+        );
+        // The refused line wrote nothing: the fixture's own line is the only one.
+        assert_eq!(
+            state
+                .sales_service
+                .get_detail(fixture.sale_id)
+                .await
+                .unwrap()
+                .lines
+                .len(),
+            1
+        );
+    }
+
+    /// PROBE C, and the case a multiply-only fix would still crash on.
+    ///
+    /// `qty = 1` and `unit_price = Decimal::MAX` make the line amount itself
+    /// representable, and a 1% rate makes `net * rate` representable too — the
+    /// contribution is `MAX / 100`, which fits. The running tax total fits. Only
+    /// the final `net + tax_total` leaves the range, because `MAX + MAX/100` is
+    /// `1.5 * MAX`. Every multiply passes, so a fix that checks the multiplies
+    /// and forgets the add panics here on the very next line.
+    #[tokio::test]
+    async fn a_sale_line_whose_tax_total_cannot_be_added_to_its_net_is_a_refusal() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        link_one_tax(&state, fixture.product_id, "ONEPC", "1").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, body) = post_form(
+            app,
+            &format!("/web/sales/{}/lines", fixture.sale_id),
+            &format!(
+                "product_id={}&qty=1&unit_price=79228162514264337593543950335",
+                fixture.product_id
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "every multiply fits here: only the final add leaves the range, and it must still be \
+             a refusal: {body}"
+        );
+        let expected =
+            localization.tr(crate::localization::MessageKey::PriceRefusalTaxArithmeticTooLarge);
+        assert!(
+            body.contains(&expected),
+            "the two refusals are different rules and the operator must be told which one fired: \
+             {body}"
+        );
+        assert_eq!(
+            state
+                .sales_service
+                .get_detail(fixture.sale_id)
+                .await
+                .unwrap()
+                .lines
+                .len(),
+            1,
+            "a refused line writes nothing"
+        );
+    }
+
+    /// THE CONTROL. The bound is a BOUND, not a blanket rejection: an amount
+    /// this large is legal, so the line must be written and its tax computed
+    /// exactly like any other. Without this test a fix that refused everything
+    /// above some arbitrary ceiling would be green.
+    #[tokio::test]
+    async fn a_large_but_representable_sale_line_is_still_computed_exactly() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let product_id = product_with_sku(&state, "SALE-BIG-OK").await;
+        link_one_tax(&state, product_id, "TENC", "10").await;
+        let app = crate::routes::router(state.clone());
+
+        // qty 1e6 * unit_price 1e13 = a net of 1e19: twenty digits, far above
+        // anything a business means by a price, comfortably inside the 29 the
+        // `Decimal` range carries, and a 10% tax whose contribution (1e18) and
+        // final add (1.1e19) both fit with room to spare.
+        let (status, body) = post_form(
+            app,
+            &format!("/web/sales/{}/lines", fixture.sale_id),
+            &format!("product_id={product_id}&qty=1000000&unit_price=10000000000000"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let detail = state
+            .sales_service
+            .get_detail(fixture.sale_id)
+            .await
+            .unwrap();
+        let line = detail
+            .lines
+            .iter()
+            .find(|line| line.product_id == product_id)
+            .expect("the line must be written");
+        let dec = |raw: &str| rust_decimal::Decimal::from_str(raw).unwrap();
+        assert_eq!(line.subtotal(), dec("10000000000000000000"));
+        assert_eq!(
+            line.tax_total,
+            dec("1000000000000000000"),
+            "a representable amount is priced by the same contract as any other, exactly"
+        );
     }
 }

@@ -6028,6 +6028,8 @@ mod tests {
             "sale_price cannot be negative",
             "cost_price cannot be negative",
             "sale_price is required",
+            "qty * price is too large to store on this line",
+            "the line amount is too large to calculate its taxes",
         ];
         let mut checked = 0;
         for path in [
@@ -6073,7 +6075,7 @@ mod tests {
         }
         assert_eq!(
             checked,
-            8 * 7,
+            8 * sentences.len(),
             "the guard must read every file and every sentence, or it proves nothing"
         );
     }
@@ -6152,6 +6154,126 @@ mod tests {
                 sites[0]
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tax-contract overflow (tax contract overflow T1).
+    //
+    // This is the one path where the overflow needs NO crafted request: the
+    // drawer calls the price ladder on the STORED net on an ordinary page load,
+    // and `validate_effective_prices` has no upper ceiling by design. A product
+    // saved with a very large price plus a linked extreme rate therefore
+    // reaches `calculate_line_taxes` on a GET, and before this work the raw `*`
+    // panicked inside the handler.
+    // -----------------------------------------------------------------------
+
+    /// A state whose active locale is Spanish, so a refusal that reaches the
+    /// operator in English is caught here rather than in production.
+    async fn spanish_business(state: &AppState) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO business_locales (locale_code, language_code, display_name, is_enabled) \
+             VALUES ('es-AR', 'es', 'es-AR', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) \
+             VALUES (1, 'Acme', 'es-AR', 'ARS', 'UTC')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// The DRAWER, on an ordinary page load, on a stored net whose tax
+    /// arithmetic cannot be carried. It must answer 200 with the refusal the
+    /// shared mapping renders in the active locale, and publish no tax money
+    /// derived from an arithmetic that does not exist.
+    #[tokio::test]
+    async fn the_product_drawer_refuses_a_stored_net_whose_tax_arithmetic_overflows() {
+        let state = test_state().await;
+        spanish_business(&state).await;
+        let app = crate::routes::router(state.clone());
+        // The largest net the `Decimal` range holds, with an ordinary 21% rate:
+        // `MAX * 21` leaves the range, so this is the CONTRACT's own multiply
+        // that fails, on a price the save path accepted without complaint.
+        let product_id =
+            product_with_taxes(&state, "LADDER-OVF", "79228162514264337593543950335").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected =
+            localization.tr(crate::localization::MessageKey::PriceRefusalTaxArithmeticTooLarge);
+
+        let (status, html) =
+            get_html(app.clone(), &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the drawer must open: a product the save accepted cannot become unreachable \
+             because its tax arithmetic is extreme: {html:.600}"
+        );
+        assert!(
+            html.contains(expected),
+            "the refusal reaches the operator in their own language, through the one shared \
+             mapping the save form uses: {html:.2000}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("79228162514264337593543950335"),
+            "a refusal derives nothing and rewrites nothing"
+        );
+
+        // The preview endpoint is the same contract on the same stored net, and
+        // it answers in the same way — which is what makes this a property of
+        // the ladder rather than of one handler.
+        let (status, html) = preview(app, product_id, "").await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains(&expected),
+            "the ladder states the same refusal the drawer does: {html:.2000}"
+        );
+    }
+
+    /// THE CONTROL on this path: a large stored net whose tax arithmetic FITS
+    /// is priced normally. Without it, a ladder that refused every big net would
+    /// satisfy the test above and be useless.
+    #[tokio::test]
+    async fn the_product_drawer_still_prices_a_large_stored_net_whose_taxes_fit() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        // 1e19 is twenty digits: absurd for a price, well inside the 29 the
+        // range carries, and a 10% rate leaves the contribution (1e18) and the
+        // add (1.1e19) with room to spare.
+        let product_id = product_with_taxes(&state, "LADDER-BIG-OK", "10000000000000000000").await;
+        let iva = link_tax(&state, "IVA10", "IVA 10%", "10").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains(&money(&localization, "1000000000000000000")),
+            "the tax on a large representable net is computed, not refused: {html:.2000}"
+        );
+        assert!(
+            html.contains(&money(&localization, "11000000000000000000")),
+            "so is the tax-inclusive price: {html:.2000}"
+        );
     }
 
     /// Every `.rs` file under `dir`, RECURSIVELY, sorted, so a failure names the

@@ -11,7 +11,7 @@ use crate::models::{
 };
 use crate::repositories::tax_repo::active_taxes_for_product;
 use crate::repositories::tax_snapshot_repo::replace_purchase_line_taxes;
-use crate::services::line_taxes::{calculate_line_taxes, tax_inclusive_total};
+use crate::services::line_taxes::{calculate_line_taxes, line_net_amount, tax_inclusive_total};
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
@@ -310,7 +310,9 @@ impl SqlitePurchaseRepository {
         // the aggregate that summarizes it can never be committed apart.
         // Resolved through this transaction, like the creation path.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_cost, &taxes);
+        let calc = line_net_amount(qty, unit_cost)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // The DRAFT predicate is the statement's own, so a Confirmed purchase
         // cannot gain a line even if a caller skipped the service's guard.
@@ -363,7 +365,9 @@ impl SqlitePurchaseRepository {
 
         // Resolved through this transaction, like the creation path.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_cost, &taxes);
+        let calc = line_net_amount(qty, unit_cost)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // Statement-level DRAFT predicate again: when it matches nothing the
         // call is refused BEFORE any snapshot is deleted or inserted.

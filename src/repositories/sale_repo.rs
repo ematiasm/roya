@@ -11,7 +11,7 @@ use crate::models::{
 };
 use crate::repositories::tax_repo::active_taxes_for_product;
 use crate::repositories::tax_snapshot_repo::replace_sale_line_taxes;
-use crate::services::line_taxes::{calculate_line_taxes, tax_inclusive_total};
+use crate::services::line_taxes::{calculate_line_taxes, line_net_amount, tax_inclusive_total};
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
@@ -340,7 +340,9 @@ impl SqliteSaleRepository {
         // apart. The resolver takes this transaction's connection, so the taxes
         // a line is snapshotted with are the ones its own transaction saw.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_price, &taxes);
+        let calc = line_net_amount(qty, unit_price)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // The DRAFT predicate is the statement's own: a Confirmed sale matches
         // no row and the insert is a no-op, not a line on closed history.
@@ -395,7 +397,9 @@ impl SqliteSaleRepository {
 
         // Resolved through this transaction, like the creation path.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_price, &taxes);
+        let calc = line_net_amount(qty, unit_price)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // The DRAFT predicate is in the UPDATE's own WHERE. If it matches
         // nothing, the line belongs to a closed document and NOTHING below
