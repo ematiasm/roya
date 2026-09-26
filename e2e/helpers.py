@@ -8,12 +8,18 @@ instance, are added through ``POST /api/products/{id}/barcodes``). Nothing here
 touches the development database: the server the client points at runs on a
 throwaway file.
 
-The one deliberate exception is ``expire_session_in_database``: the AC22
-session-expiry case needs the session invalid server-side while the browser
-still holds its cookie, and expiring the row is not an action the interface
-offers (logout revokes, it does not expire). It writes to the throwaway
-database only — the file the spawned server already owns — and never to the
-development database the harness guards.
+The one deliberate exception is a direct write to the throwaway database, and
+only there — never to the development database the harness guards:
+
+- ``expire_session_in_database``: the AC22 session-expiry case needs the session
+  invalid server-side while the browser still holds its cookie, and expiring the
+  row is not an action the interface offers (logout revokes, it does not expire).
+
+It writes to the file the spawned server already owns.
+
+The first-run wizard needed no such helper: ``first_run_server`` in ``conftest``
+is a server whose setup was never completed, so ``/setup`` is reached by asking
+for that server rather than by undoing a completed install.
 """
 
 from __future__ import annotations

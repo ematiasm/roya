@@ -70,6 +70,18 @@ itself always runs headless; nothing in the repository depends on `--headed`.
   is created with it. No test performs a login step of its own; the gate-behaviour
   tests in `tests/test_identity.py` are the deliberate exception and use an
   anonymous context.
+- Holds both first-run states at once, because they are different things to test.
+  `first_run_server` is a spawned server whose setup was **not** completed — no
+  configuration row, no session, no login — which is the only state in which the
+  one-time `/setup` wizard renders at all; `live_server` is that same spawn plus
+  the setup form plus a login, and is what the rest of the suite rides. A test
+  that needs both (the visual baseline captures `/setup` beside every other page)
+  asks for `first_run_server` as well: it is a second spawn, on its own port and
+  its own throwaway database, because a fixture is cached per test and
+  `live_server` is built on the pending-install fixture. `first_run_page` is the
+  matching browser fixture — a context with no session cookie, since on a
+  server that has no administrator yet there is none to carry. Nothing in the
+  setup path writes to a database.
 - Uses the `en-US` browser baseline, with USD and UTC, so dot-decimal form input
   and server-rendered currency-code text remain stable. Locale-specific parsing
   and presentation coverage belongs to the Rust localization tests.
@@ -210,6 +222,14 @@ under `e2e/.artifacts/<test name>/` (git-ignored):
 - `screenshot.png` — the page as the test last saw it.
 - `server.log` — the application's own output, because "the page did not load"
   is usually answered by the server log.
+
+A test that drives a second server writes the same three files behind a
+`first-run-` prefix — `first-run-trace.zip`, `first-run-screenshot.png`,
+`first-run-server.log` — and that prefix is not cosmetic. A test may hold the
+shared session *and* a fresh installation (the visual baseline does), and both
+finalize into the same per-test directory, so the files are named after the
+server that produced them rather than overwriting each other. The log that
+explains a `/setup` failure is the first-run server's own.
 
 A green run leaves no artifacts. It does rewrite the Python caches
 (`__pycache__` and `.pytest_cache`), which are git-ignored.
