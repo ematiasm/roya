@@ -2,6 +2,7 @@ pub mod account;
 pub mod customer_receipts;
 pub mod customers;
 pub mod documents;
+pub mod final_price;
 pub mod finance_methods;
 pub mod identity;
 pub mod inventory;

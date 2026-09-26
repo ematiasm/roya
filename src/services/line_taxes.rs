@@ -95,7 +95,12 @@ pub fn tax_inclusive_total(net_subtotal: Decimal, tax_total: Decimal) -> Decimal
 /// One tax's contribution to a line, together with the values that produced
 /// it. The write shape of this is [`NewLineTax`], which is what gets persisted
 /// on the document line.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` is derived for the consumers that compare two CALCULATIONS rather
+/// than two rows: the final-price solve publishes this breakdown, and proving
+/// the conversion is idempotent means proving the whole answer is unchanged,
+/// breakdown included.
+#[derive(Debug, Clone, PartialEq)]
 pub struct LineTaxSnapshot {
     pub tax_id: i64,
     pub code: String,

@@ -206,6 +206,14 @@ pub(crate) fn price_refusal_key(refusal: &PriceRefusal) -> MessageKey {
         PriceRefusal::SalePriceNegative => MessageKey::PriceRefusalSalePriceNegative,
         PriceRefusal::CostPriceNegative => MessageKey::PriceRefusalCostPriceNegative,
         PriceRefusal::SalePriceRequired => MessageKey::PriceRefusalSalePriceRequired,
+        PriceRefusal::FinalPriceUnreachable => MessageKey::PriceRefusalFinalPriceUnreachable,
+        PriceRefusal::FinalPriceNotInvertible => MessageKey::PriceRefusalFinalPriceNotInvertible,
+        PriceRefusal::FinalPriceMarkupUnreachable => {
+            MessageKey::PriceRefusalFinalPriceMarkupUnreachable
+        }
+        PriceRefusal::FinalPriceTooLarge => MessageKey::PriceRefusalFinalPriceTooLarge,
+        PriceRefusal::TaxRateTooLargeToPrice => MessageKey::PriceRefusalTaxRateTooLargeToPrice,
+        PriceRefusal::NetPriceTooLarge => MessageKey::PriceRefusalNetPriceTooLarge,
     }
 }
 

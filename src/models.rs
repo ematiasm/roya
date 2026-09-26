@@ -247,6 +247,49 @@ pub enum PriceRefusal {
     /// refuses it before the service is reached, and the ladder reports the same
     /// refusal rather than inventing a price.
     SalePriceRequired,
+    /// `final_price::solve_final_price`: the typed tax-inclusive price is not
+    /// the tax-inclusive price of ANY net. The per-contribution rounding leaves
+    /// gaps, so some typed values simply do not exist as a final price.
+    FinalPriceUnreachable,
+    /// `final_price::solve_final_price`: the linked rates add up to -100% or
+    /// less, so a net is not a function of the final price and there is no
+    /// estimate to search around. The rate set itself has to change first.
+    FinalPriceNotInvertible,
+    /// `final_price::solve_final_price`: the solved net could not be reproduced
+    /// from `cost_price` by any markup the arithmetic can REPRESENT — solving
+    /// `markup = net * 100 / cost - 100` leaves the 28-digit `Decimal` range, so
+    /// there is no `markup_pct` value that could ever close the round trip.
+    ///
+    /// This is deliberately NOT "the ladder did not close": when a rung is
+    /// refused by the deriver the solve reports the DERIVER's own refusal, and
+    /// `derive_net_sale_price` refusing every rung is a different fact with a
+    /// different remedy. The solve says which one happened.
+    FinalPriceMarkupUnreachable,
+    /// `final_price::solve_final_price`: the typed final price is above
+    /// `final_price::max_solvable_final_price`. The tax contract multiplies with
+    /// the raw `Decimal` operator, which PANICS on overflow, so a price this
+    /// large has to be refused before any arithmetic touches it — a price that
+    /// crashes the handler is not a price the operator can be shown.
+    FinalPriceTooLarge,
+    /// `final_price::solve_final_price`: a linked rate is so large that
+    /// `net * rate` leaves the representable range for a final price the solve
+    /// otherwise accepts. Refused for the same reason as `FinalPriceTooLarge`,
+    /// and separately named because the remedy differs: this one is the tax, not
+    /// the price.
+    TaxRateTooLargeToPrice,
+    /// `final_price::solve_final_price`: the NET this final price would need is
+    /// above `Decimal::MAX`, so no net price can be stored for it. The typed
+    /// final price is INSIDE the solve's own limit — the linked rates gross it
+    /// down by a factor small enough that dividing lands past the ceiling (100
+    /// taxes at `-0.99999999999` gross a price down by 1e-11).
+    ///
+    /// This is deliberately neither `FinalPriceTooLarge` nor
+    /// `TaxRateTooLargeToPrice`. The price is not over the limit, so the first
+    /// would contradict the limit's own promise; and the individual rates are
+    /// small, so the second would point at the wrong field. A third variant is
+    /// the honest answer because the remedy is a third thing: the rate SET has to
+    /// stop grossing the price down that far.
+    NetPriceTooLarge,
 }
 
 impl PriceRefusal {
@@ -268,6 +311,12 @@ impl PriceRefusal {
         Self::SalePriceNegative,
         Self::CostPriceNegative,
         Self::SalePriceRequired,
+        Self::FinalPriceUnreachable,
+        Self::FinalPriceNotInvertible,
+        Self::FinalPriceMarkupUnreachable,
+        Self::FinalPriceTooLarge,
+        Self::TaxRateTooLargeToPrice,
+        Self::NetPriceTooLarge,
     ];
 
     /// The English text this refusal has always answered with. It is the
@@ -285,6 +334,23 @@ impl PriceRefusal {
             Self::SalePriceNegative => "sale_price cannot be negative",
             Self::CostPriceNegative => "cost_price cannot be negative",
             Self::SalePriceRequired => "sale_price is required",
+            Self::FinalPriceUnreachable => {
+                "no net price produces this final price with the linked taxes"
+            }
+            Self::FinalPriceNotInvertible => {
+                "linked tax rates must add up to more than -100 to solve a final price"
+            }
+            Self::FinalPriceMarkupUnreachable => {
+                "no markup_pct derives this net_price from this cost_price"
+            }
+            Self::FinalPriceTooLarge => "final_price is too large to solve a net_price from",
+            Self::TaxRateTooLargeToPrice => {
+                "a linked tax rate is too large to price this final_price"
+            }
+            Self::NetPriceTooLarge => {
+                "the linked tax rates gross this final_price down to a net_price that is too \
+                 large to store"
+            }
         }
     }
 }
