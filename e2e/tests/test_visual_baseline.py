@@ -31,6 +31,36 @@ create-under-filter server box). Each state has its own name below; T2c
 recorded the gap this closes: with the base rules removed, a pages-only net
 passed while those five buttons lost their background, label colour, weight
 and cursor.
+
+**Two Settings pages were missing for the same reason and are now here.** The
+`tailwind-stylesheet-rebuild` work unit rebuilt fifteen utility rules the
+committed stylesheet lacked, and every one of them lives on `/settings` or
+`/setup` — pages this net did not visit. A rebuild that the net cannot see is
+a rebuild that was never proven, so the two Settings pages are now captured.
+
+**`/setup` cannot be a capture, and saying so is part of the fix.** The
+first-run wizard is one-time: this harness completes it before any test body
+runs, and the server then answers `GET /setup` with a redirect to `/login`, so
+the wizard is unreachable here (measured — see
+`test_setup_wizard_applies_its_utility_classes`, which puts the server back in
+a fresh-install state and asserts the wizard's classes on a real render). That
+test is a computed-style assertion, not a snapshot: it covers the five classes
+`/setup` owns and says nothing about the rest of that page, which stays
+uncovered by this net.
+
+**And a capture is not the same as an assertion — the limit is measured, not
+assumed.** Thirteen of the fifteen rebuilt classes set a property this net
+deliberately does not record (`width`, `max-width`, `min-height`,
+`grid-template-columns`, `justify-content`, `align-self`, `align-items`,
+`white-space`, and the two vertical margins); only `rounded-xl` and `pt-5`
+declare one it does. Their elements are now fingerprinted, so any colour,
+padding, radius, display, gap or opacity on them is covered, but a dropped
+`md:grid-cols-2` would not fail here. The two tests at the end of this module
+close that second gap by asserting the computed value each class is responsible
+for, and every one of the fifteen is asserted by one of the two mechanisms.
+One of them, `w-auto`, is only observable *below* the `md` breakpoint, which is
+why the variant readings in this module exist and why every one of them is
+taken at a second, narrower viewport as well.
 """
 
 from __future__ import annotations
@@ -55,6 +85,7 @@ from helpers import (
     create_purchase_draft,
     create_supplier,
     fund_account,
+    reopen_first_run_setup_in_database,
     seed_harness_data,
     e2e_copy,
 )
@@ -73,6 +104,13 @@ BASELINE = Path(__file__).resolve().parent.parent / "visual-baseline.json"
 # A fixed viewport so widths and heights are reproducible. The suite runs
 # headless at 1280x720 by default; the desktop layout is what this protects.
 VIEWPORT = {"width": 1440, "height": 900}
+
+# Narrower than Tailwind's `sm` (40rem) and `md` (48rem) breakpoints, so a
+# variant rule is provably *off* here. The tests at the end of this module read
+# every class at both widths: a value that is the same either way could be
+# something else's doing, and a variant rule that is not off at 600px is not a
+# variant rule.
+NARROW = {"width": 600, "height": 900}
 
 # What a person actually sees. Layout-affecting properties are included on
 # purpose: a refactor that drops a `gap` or a `padding` changes the screen even
@@ -102,6 +140,21 @@ VIEWPORT = {"width": 1440, "height": 900}
 # The cost is stated rather than hidden: a dropped `w-full`, `w-20` or `mb-4`
 # would no longer be caught here. Everything above still is, and a layout
 # regression that matters is a behavioural test's job.
+#
+# **Measured, not assumed: of the fifteen classes
+# `tailwind-stylesheet-rebuild` added, this property set can only ever see two.**
+# Counting the property each rule declares against the list below:
+# `rounded-xl` declares `border-radius`, which `border-top-left-radius` records,
+# and `pt-5` declares `padding-top`, which is recorded. The other thirteen
+# declare `width`, `max-width`, `min-height`, `grid-template-columns` (four of
+# them), `justify-content`, `align-self`, `align-items`, `white-space` or a
+# vertical margin — none of which is in this list, and the last two of which are
+# excluded on purpose. So visiting a page is necessary for a class to be
+# covered and not sufficient: the class's element has to be fingerprinted *and*
+# its effect has to be one of the properties recorded. Of the two that qualify,
+# only `rounded-xl` is on a page this net visits — `pt-5` lives on `/setup`,
+# which it cannot. The tests at the end of this module cover the other
+# fourteen, and `rounded-xl` too, so all fifteen are asserted.
 STYLE_PROPERTIES = [
     "color",
     "background-color",
@@ -173,6 +226,20 @@ def _pages(data: HarnessData) -> list[tuple[str, str]]:
         # operator; its dismiss button lives only in the failure re-render,
         # captured separately as `password-error` below.
         ("password", "/password"),
+        # The two Settings pages, added when fifteen rebuilt utility rules all
+        # turned out to live on `/settings` and `/setup` — pages this net did
+        # not visit, which left the rebuild unproven on all of its own surface.
+        #
+        # Both tabs are the same page under two URLs, and both are captured:
+        # the business tab owns the identity/presentation form and the locale
+        # profiles, the Taxes tab owns the tax catalogue. The Taxes tab is
+        # captured in its resting state, with no tax defined, because a
+        # definition would also reach the Products drawer (its link-tax select
+        # lists every definition) and so would move an existing capture — the
+        # `whitespace-nowrap` class only renders on a tax *row*, so that one
+        # class is covered by the computed-style test instead.
+        ("settings", "/settings"),
+        ("settings-taxes", "/settings?tab=taxes"),
     ]
 
 
@@ -579,3 +646,263 @@ def test_visual_baseline(
         "  A baseline regenerated to make a red test green is not evidence.\n\n  "
         + "\n  ".join(problems)
     )
+
+
+# ---------------------------------------------------------------------------
+# What the snapshots above cannot say
+# ---------------------------------------------------------------------------
+#
+# Two gaps, one shape: a class the templates use is not *asserted* to be in
+# force. The snapshots fix the first by visiting the page; the tests below fix
+# the second by naming the value the class is responsible for, which is the
+# only form in which a dropped rule is visible.
+#
+# They read the same `getComputedStyle` the snapshots read, and deliberately
+# use the same property names, so "the net records this" and "the net can see
+# this" stay one question with one answer.
+
+_COMPUTED_FOR_CLASS = """
+([className, prop]) => Array.from(
+  document.querySelectorAll("." + CSS.escape(className))
+).map((el) => getComputedStyle(el).getPropertyValue(prop))
+"""
+
+
+def _computed(page: Page, class_name: str, prop: str) -> list[str]:
+    """What `prop` computes to on every element of this page carrying the class.
+
+    `CSS.escape` is what makes `sm:grid-cols-[100px_1fr_120px_auto]` selectable at
+    all; a hand-written selector for a variant or an arbitrary value is a
+    different selector than the one the class names.
+
+    An empty list means the class is on no element of this page, which is a
+    different failure from a wrong value: the assertion below tells them apart
+    instead of letting an absent class pass for a correct one.
+    """
+    return page.evaluate(_COMPUTED_FOR_CLASS, [class_name, prop])
+
+
+def _assert_computes(page: Page, class_name: str, prop: str, expected: str) -> None:
+    values = _computed(page, class_name, prop)
+    assert values, (
+        f"{class_name!r} is on no element of this page, so {prop} would be "
+        "asserted for nothing"
+    )
+    distinct = sorted(set(values))
+    assert distinct == [expected], (
+        f"{class_name!r} computes {prop} as {distinct}, expected only "
+        f"{expected!r} - the rule is not in force on every element that asks "
+        "for it, or something else is winning"
+    )
+
+
+def _assert_grid_tracks(
+    page: Page,
+    class_name: str,
+    expected_tracks: int,
+    fixed_tracks: tuple[tuple[int, str], ...] = (),
+) -> None:
+    """Assert the track list a `grid-cols-*` class lays out.
+
+    A grid class's value is a track list, so the two facts worth pinning are how
+    many tracks exist and the sizes the class names literally. The `fr` and
+    `auto` tracks resolve from the content and the viewport, so their pixel
+    values are deliberately not asserted: a value that follows the content is
+    the class of value this file already refuses to pin.
+    """
+    values = _computed(page, class_name, "grid-template-columns")
+    assert values, f"{class_name!r} is on no element of this page"
+    for value in values:
+        tracks = value.split()
+        assert len(tracks) == expected_tracks, (
+            f"{class_name!r} laid out {len(tracks)} track(s) {tracks}, expected "
+            f"{expected_tracks}"
+        )
+        for index, size in fixed_tracks:
+            assert tracks[index] == size, (
+                f"{class_name!r} track {index} is {tracks[index]!r}, expected "
+                f"{size!r} - the arbitrary value in this class is not in force"
+            )
+
+
+def _assert_above_and_below_breakpoint(
+    page: Page,
+    class_name: str,
+    prop: str,
+    above: str,
+    below: str | None,
+) -> None:
+    """Assert a class at `VIEWPORT` and at `NARROW`, in that order.
+
+    `below=None` means the class is unconditional and must read the same at
+    both widths; a value that only holds at one width would be a breakpoint
+    assumption dressed up as a class assertion.
+
+    Resizing is enough: `getComputedStyle` forces layout, and the only property
+    under test is one a media query re-evaluates on its own. No sleep.
+    """
+    page.set_viewport_size(VIEWPORT)
+    _assert_computes(page, class_name, prop, above)
+    if below is None:
+        return
+    page.set_viewport_size(NARROW)
+    _assert_computes(page, class_name, prop, below)
+
+
+# `w-auto` is why this table reads at two widths at all, and an earlier draft of
+# it got `w-auto` wrong by asserting only at the wide viewport. The rule is
+# *inert at 1440, 900 and 768* and *observable at 767, 600 and 320*, and the
+# cause is the grid it sits in (`templates/settings.html:105-112`): at `md` and
+# above the label is in the `auto` track of `md:grid-cols-[1fr_auto]` and is
+# content-sized, so the flex shrink algorithm lands on the checkbox's intrinsic
+# 13px with or without the rule; below `md` the grid collapses to a single
+# track, so `.field`'s `width:100%` becomes the flex base size and the checkbox
+# fills the row unless `w-auto` stops it. The NARROW reading is therefore the
+# one that carries the evidence, and the wide reading is kept as the control
+# that shows the two agree exactly where the rule is not needed.
+#
+# **Recording `width` here is safe even though the snapshots refuse it.** The
+# snapshots exclude `width` because it resolves from the rendered font and the
+# runner's fonts are not this machine's. 13px is not a text measurement: it is
+# the native checkbox's intrinsic size. Verified by changing the label's font
+# with the layout otherwise untouched - a control text span inside the same
+# label went 63.45px -> 179.78px -> 368.25px -> 613.75px across monospace 40px,
+# serif 72px and a font that does not exist at 120px, while the checkbox held
+# 13px in both its computed `width` and its `offsetWidth` at every one of them.
+_SETTINGS_BUSINESS_TAB = [
+    ("w-auto", "width", "13px", "13px"),
+    # `--radius-xl` is .75rem, and the locale profile card declares no radius of
+    # its own: without the rule this is 0.
+    #
+    # This entry and the baseline snapshot both assert `rounded-xl`, and the
+    # overlap is deliberate rather than something to prune: `rounded-xl` is the
+    # one class of the fifteen whose effect the snapshot asserts on its own,
+    # because `border-top-left-radius` is in `STYLE_PROPERTIES`, and an auditor
+    # reading this table is looking for every class the fifteen are. A note for
+    # that auditor, because getting it wrong is easy and silent: **Tailwind
+    # emits the `border-radius` SHORTHAND** —
+    # `.rounded-xl { border-radius: var(--radius-xl); }` — and
+    # `rule.style.getPropertyValue('border-top-left-radius')` on that rule is
+    # the empty string, so a probe filtering the CSSOM on the longhand reports
+    # **zero** rules and concludes the class is inert. `Array.from(rule.style)`
+    # does list the four expanded longhands, and the *computed* longhand reads
+    # 12px. Match the shorthand and the illusion goes away: deleting the rule
+    # moves `border-top-left-radius` from 12px to 0px at 1440, 900, 600 and 320.
+    ("rounded-xl", "border-top-left-radius", "12px", None),
+    ("justify-end", "justify-content", "flex-end", None),
+    ("md:items-end", "align-items", "flex-end", "normal"),
+    # `mb-2` is .5rem, so the narrow value is the base class showing through.
+    ("md:mb-0", "margin-bottom", "0px", "8px"),
+]
+
+_SETTINGS_TAXES_TAB = [
+    ("self-end", "align-self", "flex-end", None),
+    # `whitespace-nowrap` renders on a tax *row* only, so this needs a tax
+    # defined; the baseline captures the Taxes tab empty, which is why the
+    # class is asserted here rather than in a snapshot.
+    ("whitespace-nowrap", "white-space", "nowrap", None),
+]
+
+# (class, tracks at VIEWPORT, tracks at NARROW, literal track sizes)
+#
+# Split per tab on purpose: a class belongs to the page that asks for it, and
+# reading one on the other tab must fail loudly rather than be skipped. An
+# earlier single list did fail that way, which is why the split exists.
+_SETTINGS_BUSINESS_GRIDS = [
+    ("md:grid-cols-2", 2, 1, ()),
+    ("md:grid-cols-[1fr_auto]", 2, 1, ()),
+]
+
+_SETTINGS_TAXES_GRIDS = [
+    ("sm:grid-cols-[100px_1fr_120px_auto]", 4, 1, ((0, "100px"), (2, "120px"))),
+]
+
+_SETTINGS_TABS = (
+    ("/settings", _SETTINGS_BUSINESS_TAB, _SETTINGS_BUSINESS_GRIDS),
+    ("/settings?tab=taxes", _SETTINGS_TAXES_TAB, _SETTINGS_TAXES_GRIDS),
+)
+
+# `max-w-2xl` consumes `--container-2xl`, 42rem, at the 16px root the base layer
+# sets. `min-h-[70vh]` is read from the viewport height rather than hardcoded,
+# so the assertion still says `70vh` after a viewport change.
+_SETUP_WIZARD = [
+    ("max-w-2xl", "max-width", "672px", None),
+    ("min-h-[70vh]", "min-height", f"{round(VIEWPORT['height'] * 0.7)}px", None),
+    ("mt-8", "margin-top", "32px", None),
+    ("pt-5", "padding-top", "20px", None),
+]
+
+_SETUP_GRIDS = [("sm:grid-cols-2", 2, 1, ())]
+
+
+def test_settings_pages_apply_their_utility_classes(page: Page, api: ApiClient) -> None:
+    """The Settings classes the baseline cannot see are in force on a real render.
+
+    The baseline now captures both tabs, so their elements are fingerprinted -
+    but eight of the ten classes those pages own set a property
+    `STYLE_PROPERTIES` does not record, and `whitespace-nowrap` renders only on
+    a tax row the resting capture does not have. This asserts the computed value
+    each class is responsible for, which is the only thing that fails when a
+    rule is dropped - verified by removing each rule in turn, not assumed, and
+    read at a second narrow viewport because one of them (`w-auto`) is
+    indistinguishable from nothing at the wide one.
+    """
+    page.set_viewport_size(VIEWPORT)
+    # One tax definition, through the same API the catalogue itself uses, so the
+    # row that carries `whitespace-nowrap` exists. Its own rate and name are
+    # fixed, and nothing here is compared against a snapshot.
+    api.post_json(
+        "/api/taxes",
+        {"code": "NET-CLASS", "name": "Net class", "rate": "21.00", "is_active": True},
+    )
+
+    for path, classes, grids in _SETTINGS_TABS:
+        page.goto(f"{api.base_url}{path}")
+        page.wait_for_load_state("networkidle")
+        for class_name, prop, above, below in classes:
+            _assert_above_and_below_breakpoint(page, class_name, prop, above, below)
+        for class_name, wide, narrow, fixed in grids:
+            page.set_viewport_size(VIEWPORT)
+            _assert_grid_tracks(page, class_name, wide, fixed)
+            page.set_viewport_size(NARROW)
+            _assert_grid_tracks(page, class_name, narrow)
+
+
+def test_setup_wizard_applies_its_utility_classes(
+    page: Page, api: ApiClient, live_server
+) -> None:
+    """The five classes the first-run wizard owns, on a real `/setup` render.
+
+    `/setup` is one-time, so the harness - which completes first-run setup
+    before any test body runs - can never reach it: the server answers the
+    request with a redirect to `/login`, and a browser holding the session then
+    lands on the dashboard having seen no wizard at all. That is why the wizard
+    is not a baseline capture, and it is measured rather than assumed.
+
+    So the server is put back in the state a brand-new installation is in, by
+    removing the singleton configuration row from the throwaway database
+    (`reopen_first_run_setup_in_database`). Everything else is real: the real
+    route, the real template, the real committed stylesheet, read by the real
+    browser. The development database is never involved.
+
+    What this covers is exactly the five classes and the property each one is
+    responsible for. The rest of the wizard's rendering is not covered by
+    anything, and the task document says so.
+    """
+    reopen_first_run_setup_in_database(live_server.db_path)
+
+    page.set_viewport_size(VIEWPORT)
+    page.goto(f"{api.base_url}/setup")
+    page.wait_for_load_state("networkidle")
+    # The redirect is the failure this test works around, so it is asserted
+    # rather than assumed: if the wizard ever becomes reachable through the
+    # seeded session, this stops being the only way to see it.
+    expect(page).to_have_url(f"{api.base_url}/setup")
+
+    for class_name, prop, above, below in _SETUP_WIZARD:
+        _assert_above_and_below_breakpoint(page, class_name, prop, above, below)
+    for class_name, wide, narrow, fixed in _SETUP_GRIDS:
+        page.set_viewport_size(VIEWPORT)
+        _assert_grid_tracks(page, class_name, wide, fixed)
+        page.set_viewport_size(NARROW)
+        _assert_grid_tracks(page, class_name, narrow)
