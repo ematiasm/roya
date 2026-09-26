@@ -185,3 +185,15 @@ Independent verification found a real prose defect in U1, and it is worth statin
 2. `products-drawer:hover` and `:hover-skipped` are absent from the visual baseline because the drawer loop calls `_fingerprint` instead of `capture()`. Pre-existing, found in U1, not fixed.
 3. `sqlx 0.9` accepts only `&'static str` query strings, so the column snapshot uses literal statements plus the PRAGMA check rather than `format!`-built SQL.
 4. Money assertions in this area must expect the exact stored scale: a derived price always carries cents while a manual or stored price keeps its stored scale, and `round_dp(2)` does not pad.
+
+## Delivered
+
+Shipped 2026-09-26 as PR [#108](https://github.com/ematiasm/roya/pull/108), merged as `763f8ea` with `size:exception`.
+
+| Work unit | Implementation on `main` | Evidence on `main` | Pre-rebase, local only |
+|-----------|---------------------------|---------------------|-------------------------|
+| U1 | `245007c` | `42ceb24` | `121293d`, `a15077c` |
+| U2 | `cdf635a` | `d0fd608` | `fd9b4e0`, `9115ff2` |
+| U3 | `b36a141` | `b36a141` | `f5cf904` |
+
+This branch was rebased onto `main` after PR #107 merged, because the repository's ruleset allows only a merge commit, and a merge commit does not put a parent's original commits into `main`'s history — so a later stacked PR's diff against `main` stays polluted until it is rebased. The rebase rewrote this slice's commits, so the SHAs cited in the bullets above are the pre-rebase ones and resolve only in a local clone of the deleted feature branch. The mapping was produced by matching commit subjects between the two, not by hand.

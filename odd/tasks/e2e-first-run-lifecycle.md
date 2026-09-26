@@ -91,3 +91,15 @@ One bounded delegated-direct ODD work unit. It touches the fixture decomposition
 - **Two pytest fixtures are not two servers if one is built on the other.** The per-test cache returns the same instance, which silently gave both requests the same server. Independent spawns are required, not merely cleaner.
 - **One SQLite file, two servers, one `business_settings` row.** Splitting ports is not enough; the file has to be distinct too.
 - When two fixtures finalize into the same per-test artifact directory, teardown order decides which evidence survives. The later fixture overwrites the earlier one's files.
+
+## Delivered
+
+Shipped 2026-09-26 as part of PR [#111](https://github.com/ematiasm/roya/pull/111), merged as `be57b39` with `size:exception`.
+
+| Work unit | Implementation on `main` | Evidence on `main` | Pre-rebase, local only |
+|-----------|---------------------------|---------------------|-------------------------|
+| U1 | `407fb17` | `2b0028d` | `a351e76`, `bfdb5e6` |
+
+This branch was rebased onto `main` after PR #110 merged, so the SHAs cited above are the pre-rebase ones and resolve only in a local clone of the deleted feature branch. The mapping was produced by matching commit subjects, not by hand.
+
+This document also cites one pre-rebase identity of a **sibling** slice: `b6e6285` is the pre-rebase evidence commit of `odd/tasks/tailwind-stylesheet-rebuild.md`, delivered as `3c1f73b` in this same PR.

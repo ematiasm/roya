@@ -155,3 +155,16 @@ Two bounded delegated-direct ODD work units, one writer each: the rebuild and it
 - **`{{ … }}` inside a class attribute is a hard failure, not a skip.** There are none today. If one is ever added the guard refuses to pass rather than going blind, which is the safe direction but does mean the failure is a test error until someone extends the extractor.
 - **A file type with no extractor in a scanned path panics.** Deliberate: loud beats silently uncovered.
 - **`width`, `height` and the vertical margins are not in the visual baseline's property set**, by that suite's own documented decision (they resolve from font metrics). A dropped `w-full` would not be caught there. Pre-existing, from `ui-component-tokens`, not introduced here.
+
+## Delivered
+
+Shipped 2026-09-26 as part of PR [#111](https://github.com/ematiasm/roya/pull/111), merged as `be57b39` with `size:exception`.
+
+| Work unit | Implementation on `main` | Evidence on `main` | Pre-rebase, local only |
+|-----------|---------------------------|---------------------|-------------------------|
+| U1 | `a650c93` | `3c1f73b` | `1f62560` |
+| U2 | `aeb1da6` | `3c1f73b` | `ee652ab` |
+
+The evidence commit is shared: one commit records both units' evidence. This branch was rebased onto `main` after PR #110 merged, so the SHAs cited above are the pre-rebase ones and resolve only in a local clone of the deleted feature branch. The mapping was produced by matching commit subjects, not by hand.
+
+This document also cites two pre-rebase identities of **other** slices: `e7839cd` is the pre-rebase evidence commit of `odd/tasks/localized-price-refusals.md`, delivered as `86aa2b1`; and `a351e76`, in the entry closing the `/setup` gap, is the pre-rebase implementation commit of `odd/tasks/e2e-first-run-lifecycle.md` U1, delivered as `407fb17` in this same PR.
