@@ -30,12 +30,13 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    format_purchase_number, MovementReason, MovementType, NewMovement, NewPurchase, PaymentType,
-    Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter, PurchasePayment,
-    PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
+    format_purchase_number, LineTaxView, MovementReason, MovementType, NewMovement, NewPurchase,
+    PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter,
+    PurchasePayment, PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
     PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, StaleLineCostView, Supplier,
     UpdatePurchaseDraft,
 };
+use crate::services::line_taxes::tax_inclusive_total;
 
 /// What `add_or_increment_line` did with the request. The distinction matters
 /// because the web route announces a merge with a visible notice, while an
@@ -54,7 +55,7 @@ pub enum LineAddOutcome {
 }
 
 #[derive(Clone)]
-pub struct PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM>
+pub struct PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS>
 where
     PR: crate::repositories::PurchaseRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -67,6 +68,7 @@ where
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
     PM: crate::repositories::PaymentMethodRepository,
+    TS: crate::repositories::TaxSnapshotRepository,
 {
     pub purchases: PR,
     pub sequences: DR,
@@ -74,9 +76,14 @@ where
     pub inventory: crate::services::InventoryService<C, P, B, S>,
     pub transactions: crate::services::TransactionService<A, T>,
     pub payment_methods: crate::services::PaymentMethodService<PM>,
+    /// Read-only access to the frozen line tax breakdowns the record page shows.
+    /// The purchase repository OWNS the writes; this service only reads them, so
+    /// a document's tax history can be displayed without a write seam existing.
+    pub tax_snapshots: TS,
 }
 
-impl<PR, DR, SR, CR, C, P, B, S, A, T, PM> PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM>
+impl<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS>
+    PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS>
 where
     PR: crate::repositories::PurchaseRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -89,6 +96,7 @@ where
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
     PM: crate::repositories::PaymentMethodRepository,
+    TS: crate::repositories::TaxSnapshotRepository,
 {
     pub fn new(
         purchases: PR,
@@ -97,6 +105,7 @@ where
         inventory: crate::services::InventoryService<C, P, B, S>,
         transactions: crate::services::TransactionService<A, T>,
         payment_methods: crate::services::PaymentMethodService<PM>,
+        tax_snapshots: TS,
     ) -> Self {
         Self {
             purchases,
@@ -105,6 +114,7 @@ where
             inventory,
             transactions,
             payment_methods,
+            tax_snapshots,
         }
     }
 
@@ -163,11 +173,30 @@ where
         Ok(())
     }
 
-    fn totals(lines: &[PurchaseLine], payments: &[PurchasePayment]) -> (Decimal, Decimal, Decimal) {
+    /// The document's money, in three parts: the NET subtotal, the tax the
+    /// lines' frozen snapshots charge, and the tax-inclusive total.
+    ///
+    /// The total is the sum of each line's PINNED line total
+    /// (`round(qty * cost + tax_total)`), not `round(net + tax)` over the whole
+    /// document — the exact mirror of the sales rule, so the two families cannot
+    /// disagree by a cent and the record page reconciles line by line.
+    fn tax_split(lines: &[PurchaseLine]) -> (Decimal, Decimal, Decimal) {
+        let mut net = Decimal::ZERO;
+        let mut tax = Decimal::ZERO;
         let mut total = Decimal::ZERO;
         for l in lines {
-            total += l.subtotal();
+            net += l.subtotal();
+            tax += l.tax_total;
+            total += tax_inclusive_total(l.subtotal(), l.tax_total);
         }
+        (net, tax, total)
+    }
+
+    /// `total` is the tax-inclusive document total, so every payment ceiling,
+    /// overpayment refusal, due balance and payable figure derived here is
+    /// measured against the money actually owed.
+    fn totals(lines: &[PurchaseLine], payments: &[PurchasePayment]) -> (Decimal, Decimal, Decimal) {
+        let (_, _, total) = Self::tax_split(lines);
         let mut paid = Decimal::ZERO;
         for p in payments {
             paid += p.amount;
@@ -179,12 +208,19 @@ where
     async fn detail_for(&self, purchase: Purchase) -> AppResult<PurchaseDetail> {
         let lines = self.purchases.list_lines(purchase.id).await?;
         let payments = self.purchases.list_payments(purchase.id).await?;
-        let (total, paid, due) = Self::totals(&lines, &payments);
+        let (net_subtotal, tax_total, total) = Self::tax_split(&lines);
+        let mut paid = Decimal::ZERO;
+        for p in &payments {
+            paid += p.amount;
+        }
+        let due = total - paid;
         let payment_status = PurchaseDetail::payment_status_for(total, paid);
         Ok(PurchaseDetail {
             purchase,
             lines,
             payments,
+            net_subtotal,
+            tax_total,
             total,
             paid,
             due,
@@ -515,12 +551,9 @@ where
                 AppError::NotFound(format!("purchase {} not found", line.purchase_id))
             })?;
         Self::ensure_draft(&purchase)?;
-        let deleted = self.purchases.delete_line(line_id).await?;
-        if !deleted {
-            return Err(AppError::NotFound(format!(
-                "purchase line {line_id} not found"
-            )));
-        }
+        // Same answers as the guards above, now enforced by the statement too:
+        // `NotFound` for a missing line, `Conflict` for a closed purchase.
+        self.purchases.delete_line(line_id).await?;
         self.purchases.touch_draft(line.purchase_id, actor).await?;
         Ok(())
     }
@@ -609,6 +642,16 @@ where
             if tracks_stock {
                 tracked_units += line.qty;
             }
+            // The FROZEN breakdown, read from the snapshot table: a re-rated,
+            // renamed or deactivated tax cannot change what this shows.
+            let taxes = self
+                .tax_snapshots
+                .list_purchase_line_taxes(line.id)
+                .await?
+                .iter()
+                .map(LineTaxView::from)
+                .collect();
+            let subtotal = line.subtotal();
             lines.push(PurchaseLineView {
                 id: line.id,
                 product_name: product.name,
@@ -616,7 +659,10 @@ where
                 product_id: line.product_id,
                 qty: line.qty,
                 unit_cost: line.unit_cost,
-                subtotal: line.subtotal(),
+                tax_total: line.tax_total,
+                total: tax_inclusive_total(subtotal, line.tax_total),
+                subtotal,
+                taxes,
                 tracks_stock,
                 stale_cost,
             });
@@ -661,6 +707,8 @@ where
             supplier_name,
             lines,
             payments,
+            net_subtotal: detail.net_subtotal,
+            tax_total: detail.tax_total,
             total: detail.total,
             paid: detail.paid,
             due: detail.due,
@@ -1316,12 +1364,12 @@ mod tests {
         ProductKind, PurchaseStatus, TransactionKind, UpdatePurchaseDraft,
     };
     use crate::repositories::{
-        AccountRepository, DocSequenceRepository, PaymentMethodRepository, PurchaseRepository,
-        SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-        SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
-        SqliteProductSupplierCostRepository, SqlitePurchaseRepository,
-        SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTransactionRepository,
-        StockMovementRepository, TransactionRepository,
+        AccountRepository, DocSequenceRepository, PaymentMethodRepository, ProductTaxRepository,
+        PurchaseRepository, SqliteAccountRepository, SqliteBarcodeRepository,
+        SqliteCategoryRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
+        SqliteProductRepository, SqliteProductSupplierCostRepository, SqlitePurchaseRepository,
+        SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxSnapshotRepository,
+        SqliteTransactionRepository, StockMovementRepository, TaxRepository, TransactionRepository,
     };
     use crate::security::test_support;
     use crate::services::{
@@ -1354,6 +1402,7 @@ mod tests {
         SqliteAccountRepository,
         SqliteTransactionRepository,
         SqlitePaymentMethodRepository,
+        SqliteTaxSnapshotRepository,
     >;
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -1395,6 +1444,7 @@ mod tests {
             inventory,
             transactions,
             PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone())),
+            SqliteTaxSnapshotRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -4784,5 +4834,444 @@ mod tests {
         let (s, _pool) = svc().await;
         let err = s.delete_draft(999_999).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // T2: tax-inclusive purchase money.
+    //
+    // The purchase side must mirror the sales side exactly. A shared
+    // calculation contract is not enough on its own: each family has its own
+    // repository, its own payment ceiling and its own debt read, and every one
+    // of them has to consume the frozen `tax_total`.
+    // -----------------------------------------------------------------------
+
+    /// Create a tax and link it to `product_id` through the same repositories the
+    /// product drawer drives. `rate` is a percentage string.
+    async fn link_tax(pool: &sqlx::SqlitePool, code: &str, rate: &str, product_id: i64) -> i64 {
+        let taxes = crate::repositories::SqliteTaxRepository::new(pool.clone());
+        let links = crate::repositories::SqliteProductTaxRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        let tax = taxes
+            .create(
+                actor,
+                &crate::models::NewTax {
+                    code: code.into(),
+                    name: format!("tax {code}"),
+                    rate: dec(rate),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        links.link(actor, product_id, tax.id).await.unwrap();
+        tax.id
+    }
+
+    /// An empty Draft purchase, so a test can link its taxes BEFORE the line
+    /// write that has to resolve them.
+    async fn draft_purchase(
+        s: &Svc,
+        supplier_id: i64,
+        payment: PaymentType,
+    ) -> crate::models::Purchase {
+        s.create_draft(
+            audit_actor(s).await,
+            NewPurchase {
+                supplier_id,
+                payment_type: payment,
+                purchase_date: purchase_date(),
+                due_date: if payment == PaymentType::Credit {
+                    Some(purchase_date())
+                } else {
+                    None
+                },
+                supplier_invoice_no: None,
+                notes: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A tracked product with stock, so a line write is possible and the confirm
+    /// moves real units.
+    async fn stocked_product(s: &Svc, sku: &str, cost: &str) -> crate::models::Product {
+        let product = seed_product(s, sku, cost).await;
+        seed_stock(s, product.id, "100").await;
+        product
+    }
+
+    /// No linked tax leaves every derived purchase money field as it was: a zero
+    /// tax total and a total that is the net rounded to cents.
+    #[tokio::test]
+    async fn tax_totals_without_taxes_keep_the_net_total() {
+        let (s, _pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-NONE", "12.345").await;
+        let supplier = seed_supplier(&s, "No Tax Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Cash).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("2"),
+            Some(dec("12.345")),
+        )
+        .await
+        .unwrap();
+
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.net_subtotal, dec("24.69"));
+        assert_eq!(detail.tax_total, dec("0"));
+        assert_eq!(detail.total, dec("24.69"));
+        assert_eq!(detail.due, dec("24.69"));
+    }
+
+    /// One linked tax: the contribution is a percentage of the NET unit cost,
+    /// exactly as on the sales side.
+    #[tokio::test]
+    async fn tax_totals_with_one_tax_add_the_contribution() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-ONE", "50").await;
+        link_tax(&pool, "IVA21", "21", product.id).await;
+        let supplier = seed_supplier(&s, "One Tax Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Cash).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("2"),
+            Some(dec("50")),
+        )
+        .await
+        .unwrap();
+
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.net_subtotal, dec("100"));
+        assert_eq!(detail.tax_total, dec("21"));
+        assert_eq!(detail.total, dec("121"));
+        assert_eq!(detail.due, dec("121"));
+    }
+
+    /// Purchase parity: two linked taxes are additive, never compounded.
+    #[tokio::test]
+    async fn tax_totals_with_two_taxes_are_additive_not_compounded() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-TWO", "100").await;
+        link_tax(&pool, "IVA21", "21", product.id).await;
+        link_tax(&pool, "IIBB10", "10", product.id).await;
+        let supplier = seed_supplier(&s, "Two Tax Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Cash).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
+
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.net_subtotal, dec("100"));
+        assert_eq!(detail.tax_total, dec("31"));
+        assert_eq!(
+            detail.total,
+            dec("131"),
+            "additive, matching the sales side, not the compounded 132.10"
+        );
+    }
+
+    /// The half-up rule belongs to the line, and the document total is the sum of
+    /// the line totals the record page shows: two 10.005 net lines with 21% are
+    /// 24.22, where rounding the summed parts once would say 24.21.
+    #[tokio::test]
+    async fn tax_totals_round_each_line_half_up_and_sum_the_line_totals() {
+        let (s, pool) = svc().await;
+        let first = stocked_product(&s, "PTAX-ROUND-A", "10.005").await;
+        let second = stocked_product(&s, "PTAX-ROUND-B", "10.005").await;
+        link_tax(&pool, "IVA21", "21", first.id).await;
+        link_tax(&pool, "IVA21B", "21", second.id).await;
+        let supplier = seed_supplier(&s, "Round Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Cash).await;
+        for product in [&first, &second] {
+            s.add_or_increment_line(
+                audit_actor(&s).await,
+                purchase.id,
+                product.id,
+                dec("1"),
+                Some(dec("10.005")),
+            )
+            .await
+            .unwrap();
+        }
+
+        let record = s.get_record(purchase.id).await.unwrap();
+        assert_eq!(record.lines.len(), 2);
+        assert_eq!(record.lines[0].total, dec("12.11"));
+        assert_eq!(record.lines[1].total, dec("12.11"));
+        assert_eq!(record.net_subtotal, dec("20.01"));
+        assert_eq!(record.tax_total, dec("4.20"));
+        assert_eq!(record.total, dec("24.22"));
+        let sum: Decimal = record.lines.iter().map(|l| l.total).sum();
+        assert_eq!(
+            sum, record.total,
+            "the shown lines must add up to the shown total"
+        );
+    }
+
+    /// The payment ceiling is the tax-inclusive total, and the supplier payment
+    /// that allocates against a payable uses the same figure.
+    #[tokio::test]
+    async fn tax_totals_bound_the_payment_at_the_tax_inclusive_total() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-LIMIT", "100").await;
+        link_tax(&pool, "IVA21", "21", product.id).await;
+        let supplier = seed_supplier(&s, "Limit Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Credit).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
+
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.total, dec("121"));
+        assert_eq!(detail.due, dec("121"));
+
+        let account = seed_account(&s, "Purchase tax account").await;
+        let method = method_by_name(&s, "Transfer").await;
+        allow(&s, account.id, method).await;
+
+        s.record_payment(
+            audit_actor(&s).await,
+            purchase.id,
+            method,
+            dec("121"),
+            purchase_date(),
+        )
+        .await
+        .expect("the exact tax-inclusive total is a legal payment");
+
+        let over = s
+            .record_payment(
+                audit_actor(&s).await,
+                purchase.id,
+                method,
+                dec("0.01"),
+                purchase_date(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            over.to_string().contains("exceeds total"),
+            "the ceiling must be the tax-inclusive total, got: {over}"
+        );
+
+        let settled = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(settled.paid, dec("121"));
+        assert_eq!(settled.due, dec("0"));
+    }
+
+    /// Supplier debt is the `due` of the payable, so it inherits the
+    /// tax-inclusive total.
+    #[tokio::test]
+    async fn tax_totals_carry_the_tax_into_the_supplier_payable() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-DEBT", "100").await;
+        link_tax(&pool, "IVA21", "21", product.id).await;
+        let supplier = seed_supplier(&s, "Taxed Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Credit).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
+
+        let payables = s.outstanding_payables().await.unwrap();
+        assert_eq!(payables.len(), 1);
+        assert_eq!(payables[0].total, dec("121"));
+        assert_eq!(payables[0].due, dec("121"), "nothing was paid");
+    }
+
+    /// A CONFIRMED purchase is frozen against a later re-rate, rename and
+    /// deactivation, exactly like a confirmed sale.
+    #[tokio::test]
+    async fn tax_totals_freeze_a_confirmed_purchase_against_later_tax_edits() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-FROZEN", "100").await;
+        let tax_id = link_tax(&pool, "IVA21", "21", product.id).await;
+        let supplier = seed_supplier(&s, "Frozen Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Credit).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None)
+            .await
+            .unwrap();
+        let before = s.get_record(purchase.id).await.unwrap();
+        assert_eq!(before.total, dec("121"));
+        assert_eq!(before.lines[0].taxes[0].code, "IVA21");
+
+        let taxes = crate::repositories::SqliteTaxRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        taxes
+            .update(actor, tax_id, "IVA5", "Renamed IVA", dec("5"), true)
+            .await
+            .unwrap();
+        taxes.deactivate(actor, tax_id).await.unwrap();
+
+        let after = s.get_record(purchase.id).await.unwrap();
+        assert_eq!(after.total, before.total, "a confirmed total is frozen");
+        assert_eq!(after.net_subtotal, before.net_subtotal);
+        assert_eq!(after.tax_total, before.tax_total);
+        assert_eq!(after.due, before.due);
+        assert_eq!(after.lines[0].taxes.len(), 1);
+        assert_eq!(
+            after.lines[0].taxes[0].code, "IVA21",
+            "the snapshot code is frozen"
+        );
+        assert_eq!(
+            after.lines[0].taxes[0].name, "tax IVA21",
+            "the snapshot name is frozen"
+        );
+        assert_eq!(
+            after.lines[0].taxes[0].rate,
+            dec("21"),
+            "the snapshot rate is frozen"
+        );
+        assert_eq!(after.lines[0].taxes[0].amount, dec("21"));
+    }
+
+    /// A DRAFT purchase line recomputes through the same T1 repository contract
+    /// a draft sale line does.
+    #[tokio::test]
+    async fn tax_totals_recompute_a_draft_after_the_tax_is_re_rated() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-REDRAFT", "100").await;
+        let tax_id = link_tax(&pool, "IVA21", "21", product.id).await;
+        let supplier = seed_supplier(&s, "Redraft Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Cash).await;
+        let line = s
+            .add_line(
+                audit_actor(&s).await,
+                purchase.id,
+                product.id,
+                dec("1"),
+                Some(dec("100")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(s.get_detail(purchase.id).await.unwrap().total, dec("121"));
+
+        let taxes = crate::repositories::SqliteTaxRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        taxes
+            .update(actor, tax_id, "IVA21", "tax IVA21", dec("10"), true)
+            .await
+            .unwrap();
+        s.update_line(audit_actor(&s).await, line.id, dec("1"), dec("100"))
+            .await
+            .unwrap();
+
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(
+            detail.tax_total,
+            dec("10"),
+            "the draft re-resolved the new rate"
+        );
+        assert_eq!(detail.total, dec("110"));
+    }
+
+    /// The purchase record page carries the frozen breakdown and the three money
+    /// figures, mirroring the sale record.
+    #[tokio::test]
+    async fn tax_totals_expose_the_breakdown_on_the_purchase_record() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-BREAKDOWN", "100").await;
+        link_tax(&pool, "IVA21", "21", product.id).await;
+        link_tax(&pool, "IIBB10", "10", product.id).await;
+        let supplier = seed_supplier(&s, "Breakdown Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Cash).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
+
+        let record = s.get_record(purchase.id).await.unwrap();
+        assert_eq!(record.net_subtotal, dec("100"));
+        assert_eq!(record.tax_total, dec("31"));
+        assert_eq!(record.total, dec("131"));
+        let line = &record.lines[0];
+        assert_eq!(
+            line.subtotal,
+            dec("100"),
+            "the stored net cost is untouched"
+        );
+        assert_eq!(line.tax_total, dec("31"));
+        assert_eq!(line.total, dec("131"));
+        assert_eq!(line.taxes.len(), 2);
+        assert_eq!(
+            line.taxes[0].code, "IIBB10",
+            "the breakdown is ordered by code, so the two rows are deterministic"
+        );
+        assert_eq!(line.taxes[0].rate, dec("10"));
+        assert_eq!(line.taxes[0].amount, dec("10"));
+        assert_eq!(line.taxes[1].code, "IVA21");
+        assert_eq!(line.taxes[1].rate, dec("21"));
+        assert_eq!(line.taxes[1].amount, dec("21"));
+        let breakdown: Decimal = line.taxes.iter().map(|t| t.amount).sum();
+        assert_eq!(
+            breakdown, line.tax_total,
+            "the shown breakdown must reconcile with the shown tax total"
+        );
+    }
+
+    /// A line with no linked tax shows an empty breakdown, never a fabricated
+    /// zero row.
+    #[tokio::test]
+    async fn tax_totals_show_no_breakdown_for_a_product_without_taxes() {
+        let (s, _pool) = svc().await;
+        let product = stocked_product(&s, "PTAX-NOBREAK", "10").await;
+        let supplier = seed_supplier(&s, "No Breakdown Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Cash).await;
+        s.add_or_increment_line(
+            audit_actor(&s).await,
+            purchase.id,
+            product.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
+
+        let record = s.get_record(purchase.id).await.unwrap();
+        assert!(record.lines[0].taxes.is_empty());
+        assert_eq!(record.lines[0].tax_total, dec("0"));
+        assert_eq!(record.lines[0].total, dec("20"));
     }
 }

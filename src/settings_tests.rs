@@ -1,14 +1,21 @@
+use std::str::FromStr;
+
 use axum::{
     body::Body,
     http::{header, Request, StatusCode},
 };
+use rust_decimal::Decimal;
 use sqlx::{sqlite::SqlitePoolOptions, Row};
 use tower::ServiceExt;
 
 use crate::models::{
-    NewBusinessLocale, NewBusinessSettings, UpdateBusinessLocale, UpdateBusinessSettings,
+    NewBusinessLocale, NewBusinessSettings, NewTax, Tax, UpdateBusinessLocale,
+    UpdateBusinessSettings,
 };
-use crate::repositories::{BusinessLocaleRepository, BusinessSettingsRepository};
+use crate::repositories::{
+    BusinessLocaleRepository, BusinessSettingsRepository, ProductTaxRepository,
+    SqliteProductTaxRepository, SqliteTaxRepository, TaxRepository,
+};
 use crate::routes::{router, AppState};
 use crate::security::test_support;
 use crate::services::settings::UpdateBusinessConfiguration;
@@ -159,16 +166,29 @@ async fn get(app: &axum::Router, uri: &str, cookie: &str) -> axum::response::Res
 }
 
 async fn post_form(app: &axum::Router, cookie: &str, payload: &str) -> axum::response::Response {
+    post_form_to(app, cookie, "/settings", payload, &[]).await
+}
+
+/// A form POST to an ARBITRARY path, optionally carrying HTMX's request marker:
+/// the taxes tab is an HTMX surface, so a test that must prove the fragment
+/// contract asks for it the way the browser does.
+async fn post_form_to(
+    app: &axum::Router,
+    cookie: &str,
+    uri: &str,
+    payload: &str,
+    htmx: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    for (name, value) in htmx {
+        builder = builder.header(*name, *value);
+    }
     app.clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/settings")
-                .header(header::COOKIE, cookie)
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(payload.to_owned()))
-                .unwrap(),
-        )
+        .oneshot(builder.body(Body::from(payload.to_owned())).unwrap())
         .await
         .unwrap()
 }
@@ -799,4 +819,689 @@ async fn existing_single_profile_database_is_backfilled_and_can_switch_to_englis
     .await
     .unwrap();
     assert_eq!(enabled_codes, vec!["en-US".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// T3 — the permission-gated Taxes tab and the hard-delete safeguard
+// ---------------------------------------------------------------------------
+//
+// THE CANONICAL TAX-ADMINISTRATION SURFACE (T3).
+//
+// Settings owns tax administration, so every tax mutation the Settings Taxes
+// tab issues is addressed under `/web/settings/taxes…` and every one of those
+// routes is gated by `settings.manage`. The pre-existing `/web/taxes…` routes
+// are a DIFFERENT surface with a different owner and a different permission:
+// they belong to the Products screen's tax catalogue and stay gated by
+// `inventory.write`. They are not an alias of the settings surface and this
+// unit does not move them — the product drawer keeps its association
+// management, and moving the catalogue out from under it would break both the
+// product page and its tests for no gain. The two surfaces never share a
+// handler: a principal may hold one permission and not the other, and the tab
+// must not be reachable through the inventory gate.
+//
+// WHAT THIS MEANS, precisely, so the boundary is not over-claimed in either
+// direction: `settings.manage` is required for IRREVERSIBLE tax administration
+// — the hard delete exists on no other route — while a principal holding
+// `inventory.write` can still create, rename, re-rate and activate/deactivate
+// taxes from the Products catalogue, exactly as before this feature. The tests
+// below prove the first half. `tax_web_uses_locale_input_and_display_and_
+// refreshes_product_drawer` in `tax_tests.rs` proves the second half still
+// works, and it is why the inventory routes were left alone.
+
+/// One tax created through the real repository, for the fixtures that only need
+/// one to exist before the surface under test is exercised.
+async fn existing_tax(state: &AppState, code: &str, rate: &str) -> Tax {
+    let actor: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'sistema'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    SqliteTaxRepository::new(state.pool.clone())
+        .create(
+            actor,
+            &NewTax {
+                code: code.into(),
+                name: format!("Tax {code}"),
+                rate: Decimal::from_str(rate).unwrap(),
+                is_active: true,
+            },
+        )
+        .await
+        .unwrap()
+}
+
+async fn linked_product(state: &AppState, sku: &str, tax_id: i64) -> i64 {
+    let actor: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'sistema'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    let product_id: i64 = sqlx::query_scalar(
+        "INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+         VALUES (?, ?, 'Product', 'unit', '10', 0, ?) RETURNING id",
+    )
+    .bind(sku)
+    .bind(format!("Product {sku}"))
+    .bind(actor)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    SqliteProductTaxRepository::new(state.pool.clone())
+        .link(actor, product_id, tax_id)
+        .await
+        .unwrap();
+    product_id
+}
+
+fn htmx() -> [(&'static str, &'static str); 1] {
+    [("HX-Request", "true")]
+}
+
+/// The Taxes tab is a view of the SAME single-form page, not a second page:
+/// the business tab keeps its own form untouched, the taxes tab renders the
+/// catalogue instead, and both are reachable from one tab strip.
+#[tokio::test]
+async fn settings_taxes_tab_is_reachable_and_leaves_the_business_tab_untouched() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+
+    let business = get(&app, "/settings", &cookie).await;
+    assert_eq!(business.status(), StatusCode::OK);
+    let business = body(business).await;
+    assert!(
+        business.contains("data-settings-tab=\"business\""),
+        "the resting page must stay the business tab: {business}"
+    );
+    assert!(
+        business.contains("aria-current=\"page\""),
+        "the selected tab must be marked: {business}"
+    );
+    for field in [
+        "name=\"business_name\"",
+        "name=\"default_locale_code\"",
+        "name=\"currency_code\"",
+        "name=\"timezone\"",
+        "name=\"display_name_0\"",
+        "name=\"enabled_0\"",
+    ] {
+        assert!(
+            business.contains(field),
+            "the business tab must keep its own form ({field}): {business}"
+        );
+    }
+    assert!(
+        !business.contains("id=\"settings-tax-list\""),
+        "the taxes catalogue must not render inside the business tab: {business}"
+    );
+
+    let taxes = get(&app, "/settings?tab=taxes", &cookie).await;
+    assert_eq!(taxes.status(), StatusCode::OK);
+    let taxes = body(taxes).await;
+    assert!(
+        taxes.contains("data-settings-tab=\"taxes\""),
+        "the taxes tab must be selectable: {taxes}"
+    );
+    assert!(
+        taxes.contains("id=\"settings-tax-list\""),
+        "the taxes tab must carry the catalogue: {taxes}"
+    );
+    assert!(
+        taxes.contains("name=\"code\""),
+        "the catalogue must offer the tax fields: {taxes}"
+    );
+    assert!(
+        !taxes.contains("name=\"business_name\""),
+        "the taxes tab must not render the business form: {taxes}"
+    );
+
+    let fragment = get(&app, "/web/settings/taxes", &cookie).await;
+    assert_eq!(
+        fragment.status(),
+        StatusCode::OK,
+        "the catalogue list must be addressable as its own fragment"
+    );
+}
+
+/// Reading the Taxes tab is a `settings.manage` read. A principal without the
+/// permission can neither see the tab nor fetch its fragment, and the refusal
+/// page carries no catalogue at all.
+#[tokio::test]
+async fn settings_taxes_tab_is_refused_without_the_settings_manage_permission() {
+    let state = configured_state().await;
+    test_support::seed_session_without_roles(&state.pool)
+        .await
+        .unwrap();
+    let app = router(state.clone());
+
+    let refused = get(&app, "/settings?tab=taxes", test_support::TEST_COOKIE).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let refused = body(refused).await;
+    assert!(refused.contains("settings.manage"), "{refused}");
+    assert!(
+        !refused.contains("id=\"settings-tax-list\""),
+        "a refused principal must not see the catalogue: {refused}"
+    );
+
+    let fragment = get(&app, "/web/settings/taxes", test_support::TEST_COOKIE).await;
+    assert_eq!(fragment.status(), StatusCode::FORBIDDEN);
+}
+
+/// Every mutation is gated by `settings.manage` and not by `inventory.write`:
+/// a principal that holds the inventory gate the PRODUCTS catalogue uses still
+/// cannot touch the settings surface, and nothing is written.
+#[tokio::test]
+async fn settings_tax_administration_is_refused_without_the_settings_manage_permission() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["inventory.write"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+    let tax = existing_tax(&state, "DENIED", "21").await;
+
+    for uri in [
+        "/web/settings/taxes".to_string(),
+        format!("/web/settings/taxes/delete-confirm/{}", tax.id),
+    ] {
+        let response = get(&app, &uri, &cookie).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+    for (uri, payload) in [
+        (
+            "/web/settings/taxes",
+            "code=NEW&name=New&rate=5".to_string(),
+        ),
+        (
+            "/web/settings/taxes/edit",
+            format!("id={}&code=DENIED&name=Denied&rate=9", tax.id),
+        ),
+        ("/web/settings/taxes/activate", format!("id={}", tax.id)),
+        ("/web/settings/taxes/deactivate", format!("id={}", tax.id)),
+        (
+            "/web/settings/taxes/delete",
+            format!("id={}&confirm=on", tax.id),
+        ),
+    ] {
+        let response = post_form_to(&app, &cookie, &uri, &payload, &htmx()).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    let stored = state.tax_service.get_tax(tax.id).await.unwrap();
+    assert_eq!(stored.code, "DENIED", "a refused mutation writes nothing");
+    assert!(stored.is_active, "a refused mutation writes nothing");
+    assert!(
+        SqliteTaxRepository::new(state.pool.clone())
+            .find_by_code("NEW")
+            .await
+            .unwrap()
+            .is_none(),
+        "no tax may be created by a refused mutation"
+    );
+}
+
+/// A rate typed the way the locale writes it (`21,5`) is parsed through the
+/// request context, stored as the canonical decimal (`21.5`) and read back as
+/// the localized percentage — the one decimal rule the rest of the app uses.
+#[tokio::test]
+async fn settings_taxes_tab_creates_a_tax_from_a_localized_rate() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+
+    let response = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes",
+        "code=IVAWEB&name=IVA+Web&rate=21%2C5",
+        &htmx(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body(response).await;
+    assert!(
+        response.contains("21,5 %"),
+        "the catalogue must show the localized percentage: {response}"
+    );
+
+    let stored_rate: String = sqlx::query_scalar("SELECT rate FROM taxes WHERE code = 'IVAWEB'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_rate, "21.5",
+        "a localized rate is parsed to a canonical decimal, never persisted as typed"
+    );
+}
+
+/// Editing re-rates and renames through the same service contract, and a code
+/// another tax already owns is refused as a conflict with the stored row
+/// untouched.
+#[tokio::test]
+async fn settings_taxes_tab_edits_a_tax_and_refuses_a_duplicate_code() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+    let tax = existing_tax(&state, "IVA21", "21").await;
+    let other = existing_tax(&state, "IVA105", "10.5").await;
+
+    let response = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/edit",
+        &format!("id={}&code=IVA21&name=IVA+21+Editado&rate=22%2C25", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body(response).await;
+    assert!(response.contains("IVA 21 Editado"), "{response}");
+    assert!(response.contains("22,25 %"), "{response}");
+
+    let edited = state.tax_service.get_tax(tax.id).await.unwrap();
+    assert_eq!(edited.name, "IVA 21 Editado");
+    assert_eq!(edited.rate, Decimal::from_str("22.25").unwrap());
+
+    let duplicate = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/edit",
+        &format!("id={}&code=IVA105&name=Robado&rate=5", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+    let duplicate = body(duplicate).await;
+    assert!(
+        !duplicate.contains("FOREIGN KEY") && !duplicate.contains("UNIQUE"),
+        "no raw database text may reach the operator: {duplicate}"
+    );
+
+    // The same refusal WITHOUT the HTMX marker is a rendered page carrying the
+    // same sentence, never a JSON body a browser would dump on the operator.
+    let plain = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/edit",
+        &format!("id={}&code=IVA105&name=Robado&rate=5", tax.id),
+        &[],
+    )
+    .await;
+    assert_eq!(plain.status(), StatusCode::CONFLICT);
+    let plain = body(plain).await;
+    assert!(plain.contains("data-notice=\"error\""), "{plain}");
+    assert!(
+        plain.contains("Ya existe un impuesto con este código."),
+        "the rendered page must carry the localized refusal: {plain}"
+    );
+    assert!(!plain.contains("UNIQUE"), "{plain}");
+
+    assert_eq!(
+        state.tax_service.get_tax(tax.id).await.unwrap().code,
+        "IVA21",
+        "a refused edit writes nothing"
+    );
+    assert_eq!(
+        state.tax_service.get_tax(other.id).await.unwrap().name,
+        "Tax IVA105"
+    );
+}
+
+/// Activation is its own action, not a side effect of an edit: a deactivated
+/// tax can be activated again from the tab, and both transitions are audited.
+#[tokio::test]
+async fn settings_taxes_tab_activates_and_deactivates_a_tax() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+    let tax = existing_tax(&state, "IVA21", "21").await;
+    // The actor is the principal whose session the requests ride, and a
+    // lifecycle change that moved a tax without recording WHO moved it (or
+    // WHEN) would be unauditable. The probe principal's id is resolved through
+    // its own session token rather than guessed from a username, so the
+    // assertion names the actor the request really carried.
+    let actor: i64 = sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = ?")
+        .bind(crate::security::session::hash_token(&token))
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+    /// Put the row's `updated_at` in the past so the ordering assertion is a
+    /// real one and not a tie between two writes in the same millisecond.
+    async fn backdate(pool: &sqlx::SqlitePool, id: i64) {
+        sqlx::query("UPDATE taxes SET updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    backdate(&state.pool, tax.id).await;
+    let response = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/deactivate",
+        &format!("id={}", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let inactive = state.tax_service.get_tax(tax.id).await.unwrap();
+    assert!(!inactive.is_active);
+    assert_eq!(
+        inactive.updated_by,
+        Some(actor),
+        "a deactivation must record the actor who performed it"
+    );
+    assert!(
+        inactive.updated_at.to_string().as_str() > "2000-01-01T00:00:00.000Z",
+        "a deactivation must move updated_at forward, got {}",
+        inactive.updated_at
+    );
+
+    backdate(&state.pool, tax.id).await;
+    let response = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/activate",
+        &format!("id={}", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let active = state.tax_service.get_tax(tax.id).await.unwrap();
+    assert!(active.is_active);
+    assert_eq!(
+        active.updated_by,
+        Some(actor),
+        "a reactivation must record the actor who performed it"
+    );
+    assert!(
+        active.updated_at.to_string().as_str() > "2000-01-01T00:00:00.000Z",
+        "a reactivation must move updated_at forward, got {}",
+        active.updated_at
+    );
+    assert_eq!(
+        active.created_by, inactive.created_by,
+        "a lifecycle change must not rewrite who created the tax"
+    );
+}
+
+/// A FAULT is not a refusal an operator can act on, and it must not be dressed
+/// as one.
+///
+/// The catalogue's own refusals (a duplicate code, a referenced tax) are
+/// decisions: they answer 409/400 with a sentence that says what to do. A
+/// broken request is neither, and the app already has one convention for it —
+/// `AppError: IntoResponse` logs a database error and answers 500 with a
+/// generic body. This test drives a REAL fault by removing the table the
+/// handler writes to, so the mapping is proven against the database and not
+/// against a constructed error value.
+#[tokio::test]
+async fn settings_taxes_faults_answer_500_without_database_text() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+    sqlx::query("DROP TABLE taxes")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    for htmx in [htmx().as_slice(), [].as_slice()] {
+        let response = post_form_to(
+            &app,
+            &cookie,
+            "/web/settings/taxes",
+            "code=BROKEN&name=Broken&rate=5",
+            htmx,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a broken request is a 500, never a 400 the operator would act on"
+        );
+        let response = body(response).await;
+        assert_eq!(
+            response, "{\"error\":\"database error\"}",
+            "the body is the app's generic fault shape, from the same mapping \
+             every other route uses"
+        );
+        for leak in ["no such table", "SQLITE", "sqlite", "taxes"] {
+            assert!(
+                !response.contains(leak),
+                "the fault must not leak database text ({leak}): {response}"
+            );
+        }
+    }
+}
+
+/// A hard delete is a two-step action, enforced by the SERVER and not only by
+/// the button: the first request asks for a confirmation naming the tax, and a
+/// delete that does not carry the explicit confirmation writes nothing.
+#[tokio::test]
+async fn settings_taxes_tab_hard_delete_requires_an_explicit_confirmation() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+    let tax = existing_tax(&state, "IVAWEB", "21").await;
+
+    let confirmation = get(
+        &app,
+        &format!("/web/settings/taxes/delete-confirm/{}", tax.id),
+        &cookie,
+    )
+    .await;
+    assert_eq!(confirmation.status(), StatusCode::OK);
+    let confirmation = body(confirmation).await;
+    assert!(
+        confirmation.contains("IVAWEB"),
+        "the confirmation must name the tax it would delete: {confirmation}"
+    );
+    assert!(
+        confirmation.contains("hx-post=\"/web/settings/taxes/delete\""),
+        "the confirmation must post the real delete: {confirmation}"
+    );
+    assert!(
+        confirmation.contains("name=\"confirm\""),
+        "the confirmation must carry the explicit confirmation field: {confirmation}"
+    );
+    // Both counts are the decision the operator is being asked to make, and
+    // they are shown IN THE SESSION'S LANGUAGE, not as bare numbers. This
+    // fixture's business locale is es-AR, so the Spanish sentences are the ones
+    // an operator here actually reads.
+    assert!(
+        confirmation.contains("Productos aún vinculados: 0"),
+        "the confirmation must report the product references: {confirmation}"
+    );
+    assert!(
+        confirmation.contains("Líneas de documento registradas: 0"),
+        "the confirmation must report the document references: {confirmation}"
+    );
+
+    let unconfirmed = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/delete",
+        &format!("id={}", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(
+        unconfirmed.status(),
+        StatusCode::BAD_REQUEST,
+        "an unconfirmed delete is a refused request: {unconfirmed:?}"
+    );
+    let unconfirmed = body(unconfirmed).await;
+    assert!(
+        unconfirmed.contains("Confirmá la eliminación antes de ejecutarla."),
+        "the refusal must say, in the session language, that the delete needs \
+         its confirmation — and say nothing about the tax's own state: \
+         {unconfirmed}"
+    );
+    assert!(
+        state.tax_service.get_tax(tax.id).await.is_ok(),
+        "an unconfirmed delete writes nothing"
+    );
+
+    // The same refusal without the HTMX marker is a rendered page carrying the
+    // same sentence, so neither caller can be handed a different answer.
+    let plain = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/delete",
+        &format!("id={}", tax.id),
+        &[],
+    )
+    .await;
+    assert_eq!(plain.status(), StatusCode::BAD_REQUEST);
+    let plain = body(plain).await;
+    assert!(
+        plain.contains("Confirmá la eliminación antes de ejecutarla."),
+        "{plain}"
+    );
+
+    let confirmed = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/delete",
+        &format!("id={}&confirm=on", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(confirmed.status(), StatusCode::OK);
+    assert!(
+        state.tax_service.get_tax(tax.id).await.is_err(),
+        "a confirmed delete of an unreferenced tax removes it"
+    );
+}
+
+/// A tax still linked to a product is refused with an actionable, localized
+/// message that says what to do — and never with database text.
+#[tokio::test]
+async fn settings_taxes_tab_delete_refusal_names_the_products_to_unlink() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+    let tax = existing_tax(&state, "IVA21", "21").await;
+    linked_product(&state, "TAX-LINKED", tax.id).await;
+
+    let refused = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/delete",
+        &format!("id={}&confirm=on", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    let refused = body(refused).await;
+    for leak in [
+        "FOREIGN KEY",
+        "UNIQUE constraint",
+        "SQLITE",
+        "sqlite",
+        "taxes.tax_id",
+    ] {
+        assert!(
+            !refused.contains(leak),
+            "the refusal must not leak raw database text ({leak}): {refused}"
+        );
+    }
+    assert!(
+        refused.contains("producto") || refused.contains("Producto"),
+        "the refusal must name what blocks it, in the session locale: {refused}"
+    );
+    assert!(
+        state.tax_service.get_tax(tax.id).await.is_ok(),
+        "a refused delete writes nothing"
+    );
+
+    // Unlinking the product is what the message tells the operator to do, and it
+    // is what actually makes the delete possible.
+    let product_id: i64 = sqlx::query_scalar("SELECT id FROM products WHERE sku = 'TAX-LINKED'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .unlink_product_tax(product_id, tax.id)
+        .await
+        .unwrap();
+    let deleted = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes/delete",
+        &format!("id={}&confirm=on", tax.id),
+        &htmx(),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert!(state.tax_service.get_tax(tax.id).await.is_err());
+}
+
+/// The Taxes tab is additive: the business form still submits, still redirects
+/// and still persists, and neither tab's markup leaks into the other.
+#[tokio::test]
+async fn settings_business_settings_submission_is_unchanged_by_the_taxes_tab() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+
+    let submission = post_form(
+        &app,
+        &cookie,
+        "business_name=Roya+Market&default_locale_code=en-US&currency_code=USD&timezone=UTC\
+         &locale_code_0=es-AR&locale_code_1=en-US\
+         &display_name_0=Espa%C3%B1ol+(Argentina)&display_name_1=English+(United+States)\
+         &enabled_1=on",
+    )
+    .await;
+    let status = submission.status();
+    let submission = body(submission).await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "{submission}");
+
+    let (settings, locales) = state.settings_service.load().await.unwrap();
+    assert_eq!(settings.business_name, "Roya Market");
+    assert_eq!(settings.currency_code, "USD");
+    assert_eq!(locales.len(), 2, "both profiles are still round-tripped");
+
+    let business = get(&app, "/settings?saved=true", &cookie).await;
+    assert_eq!(business.status(), StatusCode::OK);
+    let business = body(business).await;
+    assert!(business.contains("Settings saved"), "{business}");
+    assert!(business.contains("name=\"business_name\""), "{business}");
+    assert!(
+        !business.contains("id=\"settings-tax-list\""),
+        "the saved notice belongs to the business tab: {business}"
+    );
+
+    let taxes = get(&app, "/settings?tab=taxes", &cookie).await;
+    let taxes = body(taxes).await;
+    assert!(
+        !taxes.contains("name=\"business_name\""),
+        "the taxes tab must not render the business form: {taxes}"
+    );
 }

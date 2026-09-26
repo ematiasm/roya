@@ -17,6 +17,8 @@ mod smoke_tests;
 #[cfg(test)]
 mod t1_schema_tests;
 #[cfg(test)]
+mod tax_snapshot_tests;
+#[cfg(test)]
 mod tax_tests;
 
 use std::net::SocketAddr;

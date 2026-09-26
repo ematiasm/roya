@@ -123,6 +123,30 @@ pub struct UpdateTax {
     pub is_active: Option<bool>,
 }
 
+/// What currently references one tax, split by the two families that mean
+/// DIFFERENT things to the operator and are therefore never summed into a
+/// single "in use" number.
+///
+/// The split is the whole point of the hard-delete safeguard: a product link is
+/// current catalogue state the operator can undo, while a document snapshot is
+/// frozen history the application will never rewrite. Each count answers a
+/// different question and leads to a different remedy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaxReferenceCounts {
+    /// Rows in `product_taxes`: the tax is still linked to products.
+    pub product_links: i64,
+    /// Rows in `sale_line_taxes` plus `purchase_line_taxes`: a document line
+    /// already froze this tax's code, name, rate and contribution.
+    pub document_snapshots: i64,
+}
+
+impl TaxReferenceCounts {
+    /// Nothing references the tax, so it may be hard-deleted.
+    pub fn is_deletable(&self) -> bool {
+        self.product_links == 0 && self.document_snapshots == 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductTax {
     pub id: i64,
@@ -137,6 +161,91 @@ pub struct ProductTaxView {
     #[serde(flatten)]
     pub link: ProductTax,
     pub tax: Tax,
+}
+
+/// One tax's contribution to the product's tax-inclusive unit price, in the
+/// shape the drawer renders: the code and name an operator recognises, the rate
+/// as a percentage, and the money that rate adds to the net price.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductTaxBreakdownRow {
+    pub code: String,
+    pub name: String,
+    pub rate: Decimal,
+    pub amount: Decimal,
+}
+
+/// Derived, never stored: what ONE UNIT of a product costs with every tax
+/// currently linked to it added.
+///
+/// This is a preview of the CURRENT catalogue, not of a document: it resolves
+/// the ACTIVE linked taxes and runs them through the same calculation contract
+/// a document line write runs, so the number an operator prices against is the
+/// number the line will charge. The stored `sale_price` is untouched by it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProductTaxPreview {
+    /// The product's stored NET sale price, exactly as persisted.
+    pub net_price: Decimal,
+    /// One row per active linked tax, ordered by code then id. Empty when the
+    /// product has no linked tax.
+    pub breakdown: Vec<ProductTaxBreakdownRow>,
+    /// The sum of `breakdown`, at two decimals.
+    pub tax_total: Decimal,
+    /// The tax-inclusive unit price: `round(net_price + tax_total)`.
+    pub total: Decimal,
+}
+
+// ---------------------------------------------------------------------------
+// Line tax snapshots (tax calculation and settings)
+// ---------------------------------------------------------------------------
+
+/// One tax's immutable facts as a document line recorded them, together with
+/// the contribution that tax made to the line's net subtotal.
+///
+/// This is the WRITE shape of a snapshot: it carries no id of its own and no
+/// parent, so the same value is inserted into the sale-line or the
+/// purchase-line snapshot table and the calculation contract can produce it
+/// without knowing which family will consume it. `rate` and `amount` are
+/// canonical decimals stored as TEXT; `tax_code`/`tax_name` are frozen copies,
+/// never a live join to `taxes`. The columns are named `tax_code`/`tax_name`
+/// because inside a line-tax table the qualifier is what makes the row
+/// readable; the Rust fields keep the shorter shape `Tax` already uses.
+#[derive(Debug, Clone)]
+pub struct NewLineTax {
+    pub tax_id: i64,
+    pub code: String,
+    pub name: String,
+    /// The rate the calculation used, as a percentage.
+    pub rate: Decimal,
+    /// The rounded contribution of this tax to the line's net subtotal.
+    pub amount: Decimal,
+}
+
+/// A stored sale-line tax snapshot: [`NewLineTax`] plus the row's identity and
+/// the line it belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleLineTax {
+    pub id: i64,
+    pub sale_line_id: i64,
+    pub tax_id: i64,
+    pub code: String,
+    pub name: String,
+    pub rate: Decimal,
+    pub amount: Decimal,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// A stored purchase-line tax snapshot: [`NewLineTax`] plus the row's identity
+/// and the line it belongs to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurchaseLineTax {
+    pub id: i64,
+    pub purchase_line_id: i64,
+    pub tax_id: i64,
+    pub code: String,
+    pub name: String,
+    pub rate: Decimal,
+    pub amount: Decimal,
+    pub created_at: chrono::NaiveDateTime,
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +794,12 @@ pub struct SaleLine {
     pub qty: Decimal,
     /// Decimal unit_price >= 0, frozen at confirm, stored as TEXT.
     pub unit_price: Decimal,
+    /// Decimal tax total stored as TEXT: the sum of this line's snapshotted
+    /// tax contributions, written when the line's taxes are computed. The net
+    /// subtotal and the tax-inclusive total are NOT stored — they are derived
+    /// from `qty`, `unit_price` and this value, so no line can hold a total
+    /// that disagrees with its own quantity and price.
+    pub tax_total: Decimal,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -799,11 +914,23 @@ pub struct UpdateSaleDraft {
 }
 
 /// Aggregated sale view with derived totals (never stored as truth).
+///
+/// `net_subtotal` and `tax_total` are the two parts of `total`, both derived
+/// from the lines: the net is `qty * unit_price` and the tax is the sum of the
+/// tax totals those lines froze. They are carried separately so a detail view
+/// can show an operator WHY the total is what it is, and so the parts can be
+/// checked against each other. `total` is the tax-inclusive figure, and it is
+/// the one `paid`/`due` and the payment ceilings are measured against.
 #[derive(Debug, Clone, Serialize)]
 pub struct SaleDetail {
     pub sale: Sale,
     pub lines: Vec<SaleLine>,
     pub payments: Vec<SalePayment>,
+    /// `sum(line.subtotal())` — the money before tax.
+    pub net_subtotal: Decimal,
+    /// `sum(line.tax_total)` — the money the lines' frozen snapshots charge.
+    pub tax_total: Decimal,
+    /// The tax-inclusive total: the sum of each line's pinned line total.
     pub total: Decimal,
     pub paid: Decimal,
     pub due: Decimal,
@@ -884,6 +1011,43 @@ pub struct SaleListFilter {
 // read paths, never by SQL in a route.
 // ---------------------------------------------------------------------------
 
+/// One frozen tax row as a document detail shows it: the identity and rate the
+/// line recorded, plus the contribution that rate made. Never re-read from
+/// `taxes`, so an edited or deactivated tax cannot rewrite what a document
+/// shows. Both snapshot tables map into this one shape, so a sale line and a
+/// purchase line render with the same markup.
+#[derive(Debug, Clone, Serialize)]
+pub struct LineTaxView {
+    pub code: String,
+    pub name: String,
+    /// The rate the line was charged, as a percentage.
+    pub rate: Decimal,
+    /// The contribution to this line, already at two decimals.
+    pub amount: Decimal,
+}
+
+impl From<&SaleLineTax> for LineTaxView {
+    fn from(snapshot: &SaleLineTax) -> Self {
+        Self {
+            code: snapshot.code.clone(),
+            name: snapshot.name.clone(),
+            rate: snapshot.rate,
+            amount: snapshot.amount,
+        }
+    }
+}
+
+impl From<&PurchaseLineTax> for LineTaxView {
+    fn from(snapshot: &PurchaseLineTax) -> Self {
+        Self {
+            code: snapshot.code.clone(),
+            name: snapshot.name.clone(),
+            rate: snapshot.rate,
+            amount: snapshot.amount,
+        }
+    }
+}
+
 /// One sale line resolved for `/sales/{id}`.
 #[derive(Debug, Clone, Serialize)]
 pub struct SaleLineView {
@@ -896,7 +1060,16 @@ pub struct SaleLineView {
     pub product_id: i64,
     pub qty: Decimal,
     pub unit_price: Decimal,
+    /// The NET subtotal: `qty * unit_price`, before any tax.
     pub subtotal: Decimal,
+    /// The tax this line froze when it was written. Zero for a product with no
+    /// linked tax.
+    pub tax_total: Decimal,
+    /// The tax-inclusive line total: `round(subtotal + tax_total)`. The
+    /// document total is the sum of these, so the page reconciles.
+    pub total: Decimal,
+    /// The frozen breakdown, empty for a product with no linked tax.
+    pub taxes: Vec<LineTaxView>,
     /// The same predicate `confirm` and `cancel` use to decide whether a line
     /// moves stock (`product.kind == Product && product.track_stock`), filled
     /// from the very product read that resolves the name — so any preview
@@ -921,6 +1094,10 @@ pub struct SaleRecord {
     pub sale: Sale,
     pub lines: Vec<SaleLineView>,
     pub payments: Vec<SalePaymentView>,
+    /// The net money, the tax money and the tax-inclusive total, in that order,
+    /// so the page can show an auditable sum instead of one opaque number.
+    pub net_subtotal: Decimal,
+    pub tax_total: Decimal,
     pub total: Decimal,
     pub paid: Decimal,
     pub due: Decimal,
@@ -1116,6 +1293,9 @@ pub struct PurchaseLine {
     pub qty: Decimal,
     /// Decimal unit_cost >= 0, frozen at confirm, stored as TEXT.
     pub unit_cost: Decimal,
+    /// Decimal tax total stored as TEXT; the purchase-line mirror of
+    /// `SaleLine::tax_total`, with the same derived-total rule.
+    pub tax_total: Decimal,
     pub created_at: chrono::NaiveDateTime,
 }
 
@@ -1172,11 +1352,20 @@ pub struct UpdatePurchaseDraft {
 }
 
 /// Aggregated purchase view with derived totals (never stored as truth).
+///
+/// The tax mirror of [`SaleDetail`]: `net_subtotal` and `tax_total` are the two
+/// parts of the tax-inclusive `total`, and `paid`/`due` and the payment ceilings
+/// are measured against that `total`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseDetail {
     pub purchase: Purchase,
     pub lines: Vec<PurchaseLine>,
     pub payments: Vec<PurchasePayment>,
+    /// `sum(line.subtotal())` — the money before tax.
+    pub net_subtotal: Decimal,
+    /// `sum(line.tax_total)` — the money the lines' frozen snapshots charge.
+    pub tax_total: Decimal,
+    /// The tax-inclusive total: the sum of each line's pinned line total.
     pub total: Decimal,
     pub paid: Decimal,
     pub due: Decimal,
@@ -1228,7 +1417,16 @@ pub struct PurchaseLineView {
     pub product_id: i64,
     pub qty: Decimal,
     pub unit_cost: Decimal,
+    /// The NET subtotal: `qty * unit_cost`, before any tax.
     pub subtotal: Decimal,
+    /// The tax this line froze when it was written. Zero for a product with no
+    /// linked tax.
+    pub tax_total: Decimal,
+    /// The tax-inclusive line total: `round(subtotal + tax_total)`. The
+    /// document total is the sum of these, so the page reconciles.
+    pub total: Decimal,
+    /// The frozen breakdown, empty for a product with no linked tax.
+    pub taxes: Vec<LineTaxView>,
     /// The same predicate `confirm` and `cancel` use to decide whether a line
     /// moves stock (`product.kind == Product && product.track_stock`), filled
     /// from the very product read that resolves the name — so any preview
@@ -1263,6 +1461,10 @@ pub struct PurchaseRecord {
     pub supplier_name: String,
     pub lines: Vec<PurchaseLineView>,
     pub payments: Vec<PurchasePaymentView>,
+    /// The net money, the tax money and the tax-inclusive total, in that order,
+    /// so the page can show an auditable sum instead of one opaque number.
+    pub net_subtotal: Decimal,
+    pub tax_total: Decimal,
     pub total: Decimal,
     pub paid: Decimal,
     pub due: Decimal,

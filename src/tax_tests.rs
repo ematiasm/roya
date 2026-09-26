@@ -11,7 +11,9 @@ use tower::ServiceExt;
 use crate::error::AppError;
 use crate::models::NewTax;
 use crate::repositories::{
-    ProductTaxRepository, SqliteProductTaxRepository, SqliteTaxRepository, TaxRepository,
+    ProductTaxRepository, PurchaseRepository, SaleRepository, SqliteProductTaxRepository,
+    SqlitePurchaseRepository, SqliteSaleRepository, SqliteTaxRepository,
+    SqliteTaxSnapshotRepository, TaxRepository, TaxSnapshotRepository,
 };
 use crate::routes::AppState;
 use crate::security::test_support;
@@ -505,6 +507,127 @@ async fn tax_api_preserves_inventory_permission_boundaries() {
     );
 }
 
+/// The OTHER half of the authorization invariant, and the reason the inventory
+/// catalogue routes were left exactly as they were.
+///
+/// `settings.manage` is required for IRREVERSIBLE tax administration — the hard
+/// delete exists on no other route, and `tax_settings_...` in `settings_tests.rs`
+/// proves that. This test pins the half that is deliberately NOT narrowed: a
+/// principal holding only `inventory.write` still creates, renames, re-rates
+/// and deactivates/activates taxes from the Products catalogue, exactly as
+/// before this feature. T3 moved the destructive operation behind a gate; it did
+/// not take the catalogue's write access away, and this test fails if a future
+/// change quietly does.
+#[tokio::test]
+async fn tax_inventory_catalogue_keeps_its_own_write_access_for_an_inventory_writer() {
+    let state = test_state().await;
+    let app = crate::routes::router(state.clone());
+    let token = test_support::seed_session_with_permissions(&state.pool, &["inventory.write"])
+        .await
+        .unwrap();
+    let cookie = test_support::cookie_for(&token);
+    let form = "application/x-www-form-urlencoded";
+    let htmx = [("HX-Request", "true"), ("HX-Target", "tax-list")];
+
+    let (status, body) = web_request(
+        app.clone(),
+        "POST",
+        "/web/taxes",
+        &cookie,
+        Some(form),
+        &htmx,
+        "code=INVCAT&name=Inventory+catalogue&rate=10".into(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tax_id: i64 = sqlx::query_scalar("SELECT id FROM taxes WHERE code = 'INVCAT'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+    // Rename AND re-rate, from the product catalogue.
+    let (status, body) = web_request(
+        app.clone(),
+        "POST",
+        "/web/taxes/edit",
+        &cookie,
+        Some(form),
+        &htmx,
+        format!("id={tax_id}&code=INVCAT2&name=Renamed+catalogue&rate=12.5"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let edited = state.tax_service.get_tax(tax_id).await.unwrap();
+    assert_eq!(edited.code, "INVCAT2");
+    assert_eq!(edited.name, "Renamed catalogue");
+    assert_eq!(edited.rate, dec("12.5"));
+    // The row's active box is the form's authority, so a save that does not
+    // carry it deactivates — which is exactly why the Settings tab needed its
+    // own explicit activate action instead of relying on this form.
+    assert!(
+        !edited.is_active,
+        "the product catalogue's row form decides is_active from its checkbox"
+    );
+
+    let (status, body) = web_request(
+        app.clone(),
+        "POST",
+        "/web/taxes/deactivate",
+        &cookie,
+        Some(form),
+        &htmx,
+        format!("id={tax_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!state.tax_service.get_tax(tax_id).await.unwrap().is_active);
+
+    // Activation from that catalogue is the edit form's active box, because the
+    // inventory surface has never had a separate activate action.
+    let (status, body) = web_request(
+        app.clone(),
+        "POST",
+        "/web/taxes/edit",
+        &cookie,
+        Some(form),
+        &htmx,
+        format!("id={tax_id}&code=INVCAT2&name=Renamed+catalogue&rate=12.5&is_active=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(state.tax_service.get_tax(tax_id).await.unwrap().is_active);
+
+    // And the destructive half stays out of reach: there is no inventory route
+    // that can remove the tax, so a caller with `inventory.write` alone cannot
+    // reach the hard delete from any address.
+    for uri in [
+        "/web/taxes/delete".to_string(),
+        format!("/web/taxes/{tax_id}/delete"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("cookie", &cookie)
+                    .body(Body::from(format!("id={tax_id}&confirm=on")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "the inventory surface must expose no delete route ({uri})"
+        );
+    }
+    assert!(
+        state.tax_service.get_tax(tax_id).await.is_ok(),
+        "an inventory writer must never be able to remove a tax"
+    );
+}
+
 #[tokio::test]
 async fn tax_web_uses_locale_input_and_display_and_refreshes_product_drawer() {
     let state = test_state().await;
@@ -590,4 +713,412 @@ async fn tax_web_uses_locale_input_and_display_and_refreshes_product_drawer() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("Inactivo"), "{body}");
+}
+
+// ---------------------------------------------------------------------------
+// T3 — the hard-delete safeguard
+// ---------------------------------------------------------------------------
+//
+// Deletion is the ONE tax operation that can destroy meaning rather than edit
+// it, so its contract is stated in full here: a tax may be removed only when
+// nothing references it. Two independent reference families block it, and they
+// say different things to the operator:
+//
+//   * a `product_taxes` link is CURRENT state the operator can undo — the
+//     remedy is to unlink the product;
+//   * a `sale_line_taxes` / `purchase_line_taxes` snapshot is FROZEN history
+//     the application will never rewrite — the remedy is to keep the tax.
+//
+// When BOTH block the tax, the history conflict is the one reported: no amount
+// of unlinking can ever free a tax a document already froze, so sending the
+// operator to unlink products first would be a pointless errand. The count that
+// matters is the one that cannot be acted on.
+
+/// A Draft sale header for the snapshot fixtures below.
+async fn create_sale(pool: &SqlitePool) -> i64 {
+    let actor = sentinel(pool).await;
+    let customer: i64 = sqlx::query_scalar(
+        "INSERT INTO customers (name, created_by) VALUES ('Delete buyer', ?) RETURNING id",
+    )
+    .bind(actor)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date, created_by)
+         VALUES ('Draft', 'Cash', ?, 'Delete buyer', '2024-05-01', ?) RETURNING id",
+    )
+    .bind(customer)
+    .bind(actor)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A Draft purchase header for the snapshot fixtures below.
+async fn create_purchase(pool: &SqlitePool) -> i64 {
+    let actor = sentinel(pool).await;
+    let supplier: i64 = sqlx::query_scalar(
+        "INSERT INTO suppliers (name, created_by) VALUES ('Delete supplier', ?) RETURNING id",
+    )
+    .bind(actor)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query_scalar(
+        "INSERT INTO purchases (supplier_id, status, payment_type, purchase_date, created_by)
+         VALUES (?, 'Draft', 'Cash', '2024-05-01', ?) RETURNING id",
+    )
+    .bind(supplier)
+    .bind(actor)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn dec(value: &str) -> Decimal {
+    Decimal::from_str(value).unwrap()
+}
+
+#[tokio::test]
+async fn tax_hard_delete_removes_an_unreferenced_tax() {
+    let state = test_state().await;
+    let tax = state
+        .tax_service
+        .create_tax(sentinel(&state.pool).await, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+
+    state.tax_service.delete_tax(tax.id).await.unwrap();
+
+    assert!(
+        state.tax_service.get_tax(tax.id).await.is_err(),
+        "an unreferenced tax is removed by the hard delete"
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM taxes WHERE id = ?")
+        .bind(tax.id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "the row is really gone, not just unread");
+}
+
+#[tokio::test]
+async fn tax_hard_delete_of_an_unknown_tax_is_not_found() {
+    let state = test_state().await;
+    let error = state.tax_service.delete_tax(999_999).await.unwrap_err();
+    assert!(matches!(error, AppError::NotFound(_)), "got {error:?}");
+}
+
+/// A deactivated tax is still current catalogue state: as long as a product is
+/// linked to it, deactivation is not a licence to delete it.
+#[tokio::test]
+async fn tax_hard_delete_is_refused_while_a_product_is_linked() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let product_id = create_product(&state.pool, "TAX-DEL-LINK").await;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .link_product_tax(actor, product_id, tax.id)
+        .await
+        .unwrap();
+
+    let error = state.tax_service.delete_tax(tax.id).await.unwrap_err();
+    assert!(matches!(error, AppError::Conflict(_)), "got {error:?}");
+    assert!(
+        state.tax_service.get_tax(tax.id).await.is_ok(),
+        "a refused delete writes nothing"
+    );
+
+    let counts = state.tax_service.tax_references(tax.id).await.unwrap();
+    assert_eq!(counts.product_links, 1);
+    assert_eq!(counts.document_snapshots, 0);
+
+    state
+        .tax_service
+        .unlink_product_tax(product_id, tax.id)
+        .await
+        .unwrap();
+    state.tax_service.delete_tax(tax.id).await.unwrap();
+    assert!(state.tax_service.get_tax(tax.id).await.is_err());
+}
+
+/// The HISTORY refusal is the one sentence an operator must be able to read at
+/// the route, not only at the service: it is the message that tells them the
+/// tax is kept and the remedy is to deactivate it, which is advice the
+/// product-link message cannot give.
+///
+/// The fixture is a real line write through the real repository, so the
+/// snapshot the refusal counts is one the application itself produced, and the
+/// product link is cleared first so the snapshot is the ONLY blocker — the same
+/// "one reason at a time" shape a reviewer has to be able to trust.
+#[tokio::test]
+async fn tax_delete_route_refusal_for_a_recorded_document_names_the_history_rule() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let product_id = create_product(&state.pool, "TAX-HIST-ROUTE").await;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVAHIST", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .link_product_tax(actor, product_id, tax.id)
+        .await
+        .unwrap();
+    let sale = create_sale(&state.pool).await;
+    SqliteSaleRepository::new(state.pool.clone())
+        .create_line(sale, product_id, dec("1"), dec("100"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .unlink_product_tax(product_id, tax.id)
+        .await
+        .unwrap();
+
+    let app = crate::routes::router(state.clone());
+    let (status, response) = web_request(
+        app,
+        "POST",
+        "/web/settings/taxes/delete",
+        test_support::TEST_COOKIE,
+        Some("application/x-www-form-urlencoded"),
+        &[("HX-Request", "true")],
+        format!("id={}&confirm=on", tax.id),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert!(
+        response.contains("already recorded this tax"),
+        "the refusal must state the history rule, not the product one: {response}"
+    );
+    assert!(
+        response.contains("Deactivate it instead"),
+        "the history refusal must carry its only remedy: {response}"
+    );
+    assert!(
+        !response.contains("still linked to products"),
+        "with the product link cleared, the product message would be a lie: \
+         {response}"
+    );
+    for leak in ["FOREIGN KEY", "UNIQUE", "SQLITE", "sqlite", "no such"] {
+        assert!(
+            !response.contains(leak),
+            "the refusal must not leak database text ({leak}): {response}"
+        );
+    }
+    assert!(
+        state.tax_service.get_tax(tax.id).await.is_ok(),
+        "a refused delete writes nothing"
+    );
+}
+
+#[tokio::test]
+async fn tax_hard_delete_is_refused_by_a_sale_line_snapshot() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let product_id = create_product(&state.pool, "TAX-DEL-SALE").await;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .link_product_tax(actor, product_id, tax.id)
+        .await
+        .unwrap();
+    let sale = create_sale(&state.pool).await;
+    SqliteSaleRepository::new(state.pool.clone())
+        .create_line(sale, product_id, dec("1"), dec("100"))
+        .await
+        .unwrap();
+    // The product link is cleared first so the ONLY remaining reference is the
+    // frozen snapshot: this fixture proves the snapshot alone blocks the delete.
+    state
+        .tax_service
+        .unlink_product_tax(product_id, tax.id)
+        .await
+        .unwrap();
+
+    let error = state.tax_service.delete_tax(tax.id).await.unwrap_err();
+    assert!(matches!(error, AppError::Conflict(_)), "got {error:?}");
+    assert!(
+        state.tax_service.get_tax(tax.id).await.is_ok(),
+        "a snapshot reference keeps the tax for history"
+    );
+    let counts = state.tax_service.tax_references(tax.id).await.unwrap();
+    assert_eq!(counts.product_links, 0);
+    assert_eq!(counts.document_snapshots, 1);
+
+    // The snapshot's own copy of the facts survives untouched: deleting the tax
+    // definition is refused, and history is never rewritten.
+    let snapshots = SqliteTaxSnapshotRepository::new(state.pool.clone())
+        .list_sale_line_taxes(
+            sqlx::query_scalar::<_, i64>("SELECT id FROM sale_lines WHERE sale_id = ? ORDER BY id")
+                .bind(sale)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].code, "IVA21");
+    assert_eq!(snapshots[0].rate, dec("21"));
+}
+
+#[tokio::test]
+async fn tax_hard_delete_is_refused_by_a_purchase_line_snapshot() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let product_id = create_product(&state.pool, "TAX-DEL-PUR").await;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .link_product_tax(actor, product_id, tax.id)
+        .await
+        .unwrap();
+    let purchase = create_purchase(&state.pool).await;
+    SqlitePurchaseRepository::new(state.pool.clone())
+        .create_line(purchase, product_id, dec("1"), dec("100"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .unlink_product_tax(product_id, tax.id)
+        .await
+        .unwrap();
+
+    let error = state.tax_service.delete_tax(tax.id).await.unwrap_err();
+    assert!(matches!(error, AppError::Conflict(_)), "got {error:?}");
+    assert!(state.tax_service.get_tax(tax.id).await.is_ok());
+    let counts = state.tax_service.tax_references(tax.id).await.unwrap();
+    assert_eq!(counts.product_links, 0);
+    assert_eq!(counts.document_snapshots, 1);
+}
+
+/// Both reference families present: the HISTORY conflict is the one reported,
+/// because it is the one no operator action can clear.
+#[tokio::test]
+async fn tax_hard_delete_reports_the_history_conflict_first_when_both_reference_the_tax() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let product_id = create_product(&state.pool, "TAX-DEL-BOTH").await;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .link_product_tax(actor, product_id, tax.id)
+        .await
+        .unwrap();
+    let sale = create_sale(&state.pool).await;
+    SqliteSaleRepository::new(state.pool.clone())
+        .create_line(sale, product_id, dec("1"), dec("100"))
+        .await
+        .unwrap();
+
+    let counts = state.tax_service.tax_references(tax.id).await.unwrap();
+    assert_eq!(counts.product_links, 1);
+    assert_eq!(counts.document_snapshots, 1);
+
+    let error = state.tax_service.delete_tax(tax.id).await.unwrap_err();
+    let AppError::Conflict(message) = error else {
+        panic!("expected the history conflict, got {error:?}");
+    };
+    assert_eq!(
+        message,
+        crate::services::taxes::TAX_DELETE_BLOCKED_BY_HISTORY,
+        "with both blockers the permanent one is reported first"
+    );
+    assert!(state.tax_service.get_tax(tax.id).await.is_ok());
+}
+
+/// The database backstop stays a backstop: if a reference appears between the
+/// application's count and its DELETE, the `ON DELETE RESTRICT` refusal is
+/// mapped to the same actionable conflict and never surfaces as a raw 500.
+#[tokio::test]
+async fn tax_hard_delete_maps_the_foreign_key_backstop_to_a_conflict() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let product_id = create_product(&state.pool, "TAX-DEL-RACE").await;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .link_product_tax(actor, product_id, tax.id)
+        .await
+        .unwrap();
+
+    // Straight to the repository, with no application-level count in front of
+    // it: this is exactly the shape a lost race has.
+    let error = SqliteTaxRepository::new(state.pool.clone())
+        .hard_delete(tax.id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Conflict(_)),
+        "the RESTRICT refusal is a conflict, not a database fault: {error:?}"
+    );
+    let message = error.to_string();
+    for leak in ["FOREIGN KEY", "SQLITE", "sqlite", "no such column"] {
+        assert!(
+            !message.contains(leak),
+            "the mapped conflict must not carry database text ({leak}): {message}"
+        );
+    }
+    assert!(state.tax_service.get_tax(tax.id).await.is_ok());
+}
+
+/// The application-level refusal never leaks SQL either, and it says which
+/// reference family blocks the tax.
+#[tokio::test]
+async fn tax_hard_delete_conflicts_never_carry_raw_sqlite_text() {
+    let state = test_state().await;
+    let actor = sentinel(&state.pool).await;
+    let product_id = create_product(&state.pool, "TAX-DEL-LEAK").await;
+    let tax = state
+        .tax_service
+        .create_tax(actor, tax_input("IVA21", "21"))
+        .await
+        .unwrap();
+    state
+        .tax_service
+        .link_product_tax(actor, product_id, tax.id)
+        .await
+        .unwrap();
+
+    let message = state
+        .tax_service
+        .delete_tax(tax.id)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        message,
+        format!(
+            "conflict: {}",
+            crate::services::taxes::TAX_DELETE_BLOCKED_BY_PRODUCTS
+        )
+    );
+    for leak in ["FOREIGN KEY", "SQLITE", "sqlite", "product_taxes", "SELECT"] {
+        assert!(!message.contains(leak), "{leak} leaked: {message}");
+    }
 }

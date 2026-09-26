@@ -21,6 +21,14 @@
 {% macro record_money(record, entry_row_focus, localization) %}
 <div id="purchase-record-money">
   <div class="my-2 text-2xl font-bold">{{ localization.format_currency(record.total.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesPaid) }} {{ localization.format_currency(record.paid.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_currency(record.due.clone()) }}</span></div>
+
+  {# Net, tax and tax-inclusive total, side by side (tax calculation T2), the
+     exact mirror of the sale record, so a purchase is auditable the same way.
+     The tax total comes from the lines' frozen snapshots and therefore cannot
+     change when a tax is later edited, renamed or deactivated. #}
+  <div class="mb-2 text-[13px] text-muted" data-purchase-tax-summary>
+    {{ localization.tr(crate::localization::MessageKey::TaxNetSubtotal) }} <span class="tabular-nums">{{ localization.format_currency(record.net_subtotal.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxTotal) }} <span class="tabular-nums">{{ localization.format_currency(record.tax_total.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxInclusiveTotal) }} <span class="tabular-nums">{{ localization.format_currency(record.total.clone()) }}</span>
+  </div>
   {% if record.purchase.status.to_string() == "Draft" %}{% call effects::effects_preview(record, localization) %}{% endif %}
 
   {# The entry row (S5a): one persistent flex row above the lines — product,
@@ -106,7 +114,9 @@
             <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::SalesProduct) }}</th>
             <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::SalesQuantity) }}</th>
             <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::DocumentsUnitCost) }}</th>
-            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::SalesSubtotal) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxNetSubtotal) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxTotal) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxInclusiveTotal) }}</th>
             {% if record.purchase.status.to_string() == "Draft" %}<th class="py-2"></th>{% endif %}
           </tr>
         </thead>
@@ -116,6 +126,11 @@
             <td class="py-2.5 pr-3">
               <span class="font-semibold">{{ line.product_name }}</span>
               <span class="text-[13px] text-muted"> · {{ line.product_sku }}</span>
+              {# The FROZEN breakdown of this line, exactly as it was recorded:
+                 the code, name and rate the purchase was charged. #}
+              {% for tax in line.taxes %}
+              <div class="text-[13px] text-muted" data-purchase-line-tax>{{ tax.code }} — {{ tax.name }} ({{ localization.format_percentage(tax.rate.clone()) }}) {{ localization.format_currency(tax.amount.clone()) }}</div>
+              {% endfor %}
             </td>
             {% if record.purchase.status.to_string() == "Draft" %}
             <td class="py-2.5 pr-3 text-right">
@@ -150,7 +165,9 @@
              <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_quantity(line.qty.clone()) }}</td>
              <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.unit_cost.clone()) }}</td>
             {% endif %}
-             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">{{ localization.format_currency(line.subtotal.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.subtotal.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.tax_total.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">{{ localization.format_currency(line.total.clone()) }}</td>
             {% if record.purchase.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
               <button class="btn-secondary"
