@@ -7,12 +7,22 @@ database must be unchanged. It never sleeps past a debounce, and a failing test
 leaves a Playwright trace, a screenshot and the captured server log under
 ``e2e/.artifacts/<test name>/``.
 
+There are two server states, and they are two fixtures rather than one fixture
+plus a mid-test fix-up, because the difference between them is the whole first-
+run lifecycle. ``live_server`` is a spawned server whose setup has been completed
+and which the harness has logged in - the state the rest of the suite rides.
+``first_run_server`` is an independently spawned server whose setup has *not* been
+completed: no ``business_settings`` row, no session, no login. The one-time
+``/setup`` wizard exists only in that second state, and it is reached by asking
+for the server that genuinely holds it.
+
 The fixtures live at the suite root so ``tests/`` can stay a flat directory of
 plain modules.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import socket
@@ -161,7 +171,7 @@ def _login_session(server: LiveServer) -> tuple[str, str]:
     return client.login(TEST_ADMIN_USERNAME, TEST_ADMIN_PASSWORD)
 
 # The development database the harness must never open. Its state is captured
-# before each spawn so the live server can be proven not to have written it.
+# before each spawn so the spawned server can be proven not to have written it.
 DEV_DATABASE_PATH = REPO_ROOT / "roya.db"
 
 
@@ -177,7 +187,7 @@ def _database_stat(path: Path) -> tuple[int, int] | None:
 def _assert_throwaway_database(
     server: LiveServer, dev_before: tuple[int, int] | None
 ) -> None:
-    """Prove the live server opened the throwaway file, not another database.
+    """Prove the spawned server opened the throwaway file, not another database.
 
     The strongest signal is the server's own log line: it prints the
     ``database_url`` it hands to the connection pool, so seeing the temporary
@@ -191,7 +201,7 @@ def _assert_throwaway_database(
     log = server.log_text
     if temp_path not in log:
         raise RuntimeError(
-            "the live server did not name the throwaway database in its own log; it "
+            "the spawned server did not name the throwaway database in its own log; it "
             "may have opened another one. "
             f"expected {temp_path!r} in:\n{log}"
         )
@@ -229,12 +239,38 @@ def roya_binary() -> Path:
     return binary
 
 
-@pytest.fixture
-def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
-    """A real server on a free port, against a fresh throwaway database."""
+@contextlib.contextmanager
+def _spawned_server(
+    roya_binary: Path,
+    tmp_path: Path,
+    label: str,
+) -> Iterator[LiveServer]:
+    """Spawn one real server on a free port against its own throwaway database.
+
+    The whole spawn lifecycle, extracted so both server states share one copy: the
+    port, the environment, the throwaway file, the readiness poll, the guard and
+    the teardown that proves the port came back.
+
+    **`label` is the only thing keeping two servers off one SQLite file.** Every
+    spawn resolves inside the same function-scoped `tmp_path`, so a repeated
+    label would hand both processes the same database path, and the second
+    server would be looking at the first one's install - a completed install's
+    `business_settings` row, its sessions, its rows. Nothing else in this
+    function would notice: the free port and the readiness poll are per-process,
+    and the throwaway guard proves *"a throwaway file"*, not *"its own throwaway
+    file"* - it reads the path this call was given, so a shared path is trivially
+    satisfied. A new server state must therefore pass a label of its own, and it
+    must say in its docstring which file is its own.
+
+    The failure mode is loud rather than silent, which is the only reason this is
+    a comment and not a guard: with one shared file, the first-run server finds
+    the completed install's row, `GET /setup` answers `303` to `/login`, and the
+    URL assertion in every first-run test fires with the redirect in its message.
+    """
+
     port = _free_port()
-    db_path = tmp_path / "roya.db"
-    log_path = tmp_path / "server.log"
+    db_path = tmp_path / f"roya-{label}.db"
+    log_path = tmp_path / f"{label}-server.log"
 
     # Explicit env wins over the repo `.env` (dotenvy does not override what is
     # already set), so a test run can never open the development database.
@@ -269,11 +305,6 @@ def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
     try:
         _wait_until_ready(server)
         _assert_throwaway_database(server, dev_before)
-        # Startup no longer creates an administrator. Complete the real first-run
-        # form before logging in, before any test body runs or seed helper can use
-        # the shared session.
-        setup_fresh_server(ApiClient(server.url))
-        server.session_cookie = _login_session(server)
     except Exception:
         process.kill()
         process.wait(timeout=10)
@@ -287,6 +318,63 @@ def live_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
             server.stop()
         finally:
             log_file.close()
+
+
+@pytest.fixture
+def _pending_install_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
+    """A spawned server whose first-run setup has not been completed.
+
+    This is the spawn and nothing else, and that is the point: a server that has
+    applied its migrations and answered is a genuine brand-new installation, with
+    no `business_settings` row, no session and no login. `/setup` is one-time, so
+    this is the only state in which the wizard renders at all - a server whose
+    setup is complete answers `GET /setup` with a redirect to `/login`.
+
+    It is the building block `live_server` is made of. A test that needs a fresh
+    installation *beside* a completed one must not ask for both, because pytest
+    caches a fixture per test: `live_server` is this very object, so the two would
+    be one server with its setup already done. That test asks for
+    `first_run_server`, which is an independent spawn.
+    """
+    with _spawned_server(roya_binary, tmp_path, "pending-install") as server:
+        yield server
+
+
+@pytest.fixture
+def live_server(_pending_install_server: LiveServer) -> LiveServer:
+    """A pending-install server plus the real setup form plus a harness login.
+
+    Startup no longer creates an administrator, so the real first-run form is
+    completed before the login, before any test body runs or seed helper can use
+    the shared session. Those two steps, in that order, on top of the spawn, are
+    the whole behaviour this fixture had when the three lived in one body; the
+    spawn itself is `_pending_install_server`, unchanged.
+    """
+    setup_fresh_server(ApiClient(_pending_install_server.url))
+    _pending_install_server.session_cookie = _login_session(_pending_install_server)
+    return _pending_install_server
+
+
+@pytest.fixture
+def first_run_server(roya_binary: Path, tmp_path: Path) -> Iterator[LiveServer]:
+    """A second, independent server whose first-run setup is not completed.
+
+    The same state the pending-install server has before `live_server` completes
+    it - no `business_settings` row, no session, no login, the real wizard
+    reachable - spawned independently of it, on its own free port and its own
+    throwaway database file, with the same guard around readiness.
+
+    It is a separate fixture rather than the one `live_server` is built from
+    because pytest caches a fixture per test, and the test that needs both states
+    at once is the visual baseline: it captures `/setup` from a fresh
+    installation while every other page comes from the shared session. Composed
+    on one fixture, the two would be a single server with its setup already
+    complete - measured, not assumed: the browser landed on `/login` instead of
+    the wizard, because the "fresh" server had the harness's session cookie and a
+    configured business behind it.
+    """
+    with _spawned_server(roya_binary, tmp_path, "first-run") as server:
+        yield server
 
 
 @pytest.fixture
@@ -321,18 +409,30 @@ def _write_failure_artifacts(
     page: Page,
     context: BrowserContext,
     server: LiveServer,
+    *,
+    prefix: str = "",
 ) -> None:
+    """Write the trace, the screenshot and `server`'s own log for a failed test.
+
+    `prefix` names the files after the server that produced them, and it exists
+    because a test may exercise more than one: a test holding both a completed
+    install and a fresh one has two contexts, both traced, both failing into the
+    *same* per-test directory. Without a prefix the second teardown overwrites the
+    first, and what survives is whichever server happened to be finalized last -
+    the wrong log and the wrong screenshot for whatever actually failed. A test
+    that needs the first-run server's evidence asks for it by name.
+    """
     directory = _artifact_directory(request)
     directory.mkdir(parents=True, exist_ok=True)
 
     try:
-        page.screenshot(path=str(directory / "screenshot.png"), full_page=True)
+        page.screenshot(path=str(directory / f"{prefix}screenshot.png"), full_page=True)
     except Exception:
         # A crashed page must not hide the trace or the server log.
         pass
 
-    context.tracing.stop(path=str(directory / "trace.zip"))
-    (directory / "server.log").write_text(server.log_text, encoding="utf-8")
+    context.tracing.stop(path=str(directory / f"{prefix}trace.zip"))
+    (directory / f"{prefix}server.log").write_text(server.log_text, encoding="utf-8")
 
 
 @pytest.fixture
@@ -346,6 +446,10 @@ def page(
 
     The trace is kept only when the test fails, together with a screenshot and
     the server log; a green run writes nothing.
+
+    These files are `live_server`'s, unprefixed. A test that also drives
+    `first_run_page` gets a second set behind a `first-run-` prefix rather than
+    having these overwritten, so both servers' evidence survives the failure.
     """
     context = browser.new_context(**browser_context_args)
     context.tracing.start(screenshots=True, snapshots=True, sources=True)
@@ -381,6 +485,44 @@ def page(
     finally:
         if _test_failed(request):
             _write_failure_artifacts(request, page, context, live_server)
+        else:
+            context.tracing.stop()
+        context.close()
+
+
+@pytest.fixture
+def first_run_page(
+    browser: Browser,
+    browser_context_args: dict,
+    first_run_server: LiveServer,
+    request: pytest.FixtureRequest,
+) -> Iterator[Page]:
+    """A page on the pending-install server, whose context carries no session.
+
+    The opposite of `page`, and the honest way to see a brand-new installation:
+    `first_run_server` has no administrator to log in as and no session to
+    share, so there is nothing to inject and nothing to strip. It is the context
+    the gate-behaviour tests in tests/test_identity.py build by hand, for the
+    same reason and against a server whose setup is already complete.
+
+    Traced and artifacted exactly like `page`, because a test that cannot show
+    what it saw is worth much less than one that can. The files carry a
+    `first-run-` prefix because a test may hold this context *and* the shared
+    `page` - the visual baseline does - and both finalize into the same per-test
+    directory, so an unprefixed name would be whichever server was torn down
+    last. The log written here is `first_run_server`'s own, which is the one that
+    explains a `/setup` failure.
+    """
+    context = browser.new_context(**browser_context_args)
+    context.tracing.start(screenshots=True, snapshots=True, sources=True)
+    page = context.new_page()
+    try:
+        yield page
+    finally:
+        if _test_failed(request):
+            _write_failure_artifacts(
+                request, page, context, first_run_server, prefix="first-run-"
+            )
         else:
             context.tracing.stop()
         context.close()

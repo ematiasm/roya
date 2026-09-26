@@ -38,29 +38,31 @@ committed stylesheet lacked, and every one of them lives on `/settings` or
 `/setup` — pages this net did not visit. A rebuild that the net cannot see is
 a rebuild that was never proven, so the two Settings pages are now captured.
 
-**`/setup` cannot be a capture, and saying so is part of the fix.** The
-first-run wizard is one-time: this harness completes it before any test body
-runs, and the server then answers `GET /setup` with a redirect to `/login`, so
-the wizard is unreachable here (measured — see
-`test_setup_wizard_applies_its_utility_classes`, which puts the server back in
-a fresh-install state and asserts the wizard's classes on a real render). That
-test is a computed-style assertion, not a snapshot: it covers the five classes
-`/setup` owns and says nothing about the rest of that page, which stays
-uncovered by this net.
+**`/setup` is one-time, so capturing it needed a server that had not completed
+it — and it is now captured, on a genuine fresh installation.** The wizard is
+available exactly once per database: a server whose setup is done answers `GET
+/setup` with a redirect to `/login`, and a browser holding that session lands on
+the dashboard having rendered nothing, so a naive `page.goto("/setup")` would
+have fingerprinted the dashboard and called it a wizard capture. The harness can
+now hold both states at once — `first_run_server` is a spawned server whose setup
+was never completed, with no configuration row, no session and no login — and
+`setup` is captured from it, in a context with no cookie to carry, asserting the
+URL it actually landed on. No database is manipulated to get there.
 
 **And a capture is not the same as an assertion — the limit is measured, not
 assumed.** Thirteen of the fifteen rebuilt classes set a property this net
 deliberately does not record (`width`, `max-width`, `min-height`,
 `grid-template-columns`, `justify-content`, `align-self`, `align-items`,
 `white-space`, and the two vertical margins); only `rounded-xl` and `pt-5`
-declare one it does. Their elements are now fingerprinted, so any colour,
-padding, radius, display, gap or opacity on them is covered, but a dropped
-`md:grid-cols-2` would not fail here. The two tests at the end of this module
-close that second gap by asserting the computed value each class is responsible
-for, and every one of the fifteen is asserted by one of the two mechanisms.
-One of them, `w-auto`, is only observable *below* the `md` breakpoint, which is
-why the variant readings in this module exist and why every one of them is
-taken at a second, narrower viewport as well.
+declare one it does. Visiting a page is therefore necessary but not sufficient:
+the class's element has to be fingerprinted *and* its effect has to be one of
+the properties recorded. Both of those classes are now covered twice — their
+pages are captured — and the two tests at the end of this module still assert
+the computed value each of the fifteen is responsible for, because a dropped
+`md:grid-cols-2` fails there and would not fail in any snapshot. One of them,
+`w-auto`, is only observable *below* the `md` breakpoint, which is why the
+variant readings in this module exist and why every one of them is taken at a
+second, narrower viewport as well.
 """
 
 from __future__ import annotations
@@ -74,7 +76,7 @@ from typing import Any
 
 from playwright.sync_api import Page, expect
 
-from conftest import TEST_ADMIN_USERNAME
+from conftest import TEST_ADMIN_USERNAME, LiveServer
 from helpers import (
     ApiClient,
     HarnessData,
@@ -85,7 +87,6 @@ from helpers import (
     create_purchase_draft,
     create_supplier,
     fund_account,
-    reopen_first_run_setup_in_database,
     seed_harness_data,
     e2e_copy,
 )
@@ -151,10 +152,10 @@ NARROW = {"width": 600, "height": 900}
 # vertical margin — none of which is in this list, and the last two of which are
 # excluded on purpose. So visiting a page is necessary for a class to be
 # covered and not sufficient: the class's element has to be fingerprinted *and*
-# its effect has to be one of the properties recorded. Of the two that qualify,
-# only `rounded-xl` is on a page this net visits — `pt-5` lives on `/setup`,
-# which it cannot. The tests at the end of this module cover the other
-# fourteen, and `rounded-xl` too, so all fifteen are asserted.
+# its effect has to be one of the properties recorded. Both of the two that
+# qualify are now on captured pages — `rounded-xl` on `/settings`, `pt-5` on
+# `/setup` — but only since every one of the fifteen is asserted by a computed
+# value as well, which is what the tests at the end of this module are for.
 STYLE_PROPERTIES = [
     "color",
     "background-color",
@@ -241,6 +242,20 @@ def _pages(data: HarnessData) -> list[tuple[str, str]]:
         ("settings", "/settings"),
         ("settings-taxes", "/settings?tab=taxes"),
     ]
+
+
+# The one-time wizard is declared apart from `_pages` because it cannot be
+# reached from the shared session at all: `/setup` is one-time, so a server
+# whose setup is complete answers `GET /setup` with a redirect to `/login`, and
+# a browser holding that session lands on the dashboard having rendered no
+# wizard. Visiting it honestly needs a server that has *not* completed setup,
+# which is what `first_run_server` is, so the declaration below is captured
+# against that server in an unauthenticated context.
+#
+# A naive `page.goto("/setup")` here would have fingerprinted the dashboard and
+# called it a wizard capture, which is why the capture asserts the URL it
+# actually landed on.
+_FIRST_RUN_PAGES = [("setup", "/setup")]
 
 
 # The states outside the shared session, one distinct name each. All are
@@ -351,6 +366,8 @@ def test_visual_baseline(
     browser,
     browser_context_args: dict,
     live_server,
+    first_run_page: Page,
+    first_run_server: LiveServer,
 ) -> None:
     """Every screen computes the same styles it did before the refactor."""
     data = seed_harness_data(api)
@@ -368,6 +385,24 @@ def test_visual_baseline(
         page.goto(f"{api.base_url}{path}")
         page.wait_for_load_state("networkidle")
         capture(page, name)
+
+    # -- /setup: the first-run wizard, on a server that has not completed it ---
+    # The only page in the application a first-time operator sees, and until the
+    # harness could hold a pending-install server (`first_run_server`) it was the
+    # one page this net could not visit. It is captured from a genuine fresh
+    # installation: the real route, the real template, the committed stylesheet,
+    # an unauthenticated browser, and no database manipulation of any kind.
+    #
+    # `first_run_page` carries no session because there is none to carry - the
+    # server has no administrator yet. That is also why the URL is asserted: a
+    # redirect away from the wizard would be a silent capture of something else,
+    # which is the failure this page's coverage exists to prevent.
+    first_run_page.set_viewport_size(VIEWPORT)
+    for name, path in _FIRST_RUN_PAGES:
+        first_run_page.goto(f"{first_run_server.url}{path}")
+        first_run_page.wait_for_load_state("networkidle")
+        expect(first_run_page).to_have_url(f"{first_run_server.url}{path}")
+        capture(first_run_page, name)
 
     # The drawers are the richest component surfaces in the app and they are
     # fragments, not pages, so they are reached by clicking. Snapshot the open
@@ -602,6 +637,10 @@ def test_visual_baseline(
     problems: list[str] = []
     names = [n for n, _ in _pages(data)] + [
         n + suffix for n, _ in _pages(data) for suffix in (":hover", ":hover-skipped")
+    ] + [
+        name + suffix
+        for name, _ in _FIRST_RUN_PAGES
+        for suffix in ("", ":hover", ":hover-skipped")
     ] + [
         name + suffix
         for name in _STATE_NAMES
@@ -869,40 +908,40 @@ def test_settings_pages_apply_their_utility_classes(page: Page, api: ApiClient) 
 
 
 def test_setup_wizard_applies_its_utility_classes(
-    page: Page, api: ApiClient, live_server
+    first_run_page: Page, first_run_server: LiveServer
 ) -> None:
     """The five classes the first-run wizard owns, on a real `/setup` render.
 
-    `/setup` is one-time, so the harness - which completes first-run setup
-    before any test body runs - can never reach it: the server answers the
-    request with a redirect to `/login`, and a browser holding the session then
-    lands on the dashboard having seen no wizard at all. That is why the wizard
-    is not a baseline capture, and it is measured rather than assumed.
+    `/setup` is one-time: a server whose setup is complete answers the request
+    with a redirect to `/login`, and a browser holding that session lands on the
+    dashboard having rendered no wizard at all. So this rides `first_run_server`,
+    a genuine brand-new installation - no configuration row, no session, no
+    login - and `first_run_page`, a context on it with no cookie to carry. The
+    state under test is reached by asking for the server that genuinely holds it,
+    not by undoing a completed install, and nothing in the setup path writes to
+    any database.
 
-    So the server is put back in the state a brand-new installation is in, by
-    removing the singleton configuration row from the throwaway database
-    (`reopen_first_run_setup_in_database`). Everything else is real: the real
-    route, the real template, the real committed stylesheet, read by the real
-    browser. The development database is never involved.
-
-    What this covers is exactly the five classes and the property each one is
-    responsible for. The rest of the wizard's rendering is not covered by
-    anything, and the task document says so.
+    This stays, and stays exactly as it was, next to the `setup` capture above.
+    They are complementary, not alternatives: the snapshot records the properties
+    in `STYLE_PROPERTIES`, and four of the five classes here declare properties
+    that are not in it (`max-width`, `min-height`, `margin-top`) or are only
+    observable below the `md` breakpoint (`sm:grid-cols-2`). A dropped rule fails
+    here and would not fail there.
     """
-    reopen_first_run_setup_in_database(live_server.db_path)
-
-    page.set_viewport_size(VIEWPORT)
-    page.goto(f"{api.base_url}/setup")
-    page.wait_for_load_state("networkidle")
-    # The redirect is the failure this test works around, so it is asserted
-    # rather than assumed: if the wizard ever becomes reachable through the
-    # seeded session, this stops being the only way to see it.
-    expect(page).to_have_url(f"{api.base_url}/setup")
+    first_run_page.set_viewport_size(VIEWPORT)
+    first_run_page.goto(f"{first_run_server.url}/setup")
+    first_run_page.wait_for_load_state("networkidle")
+    # A server that had completed setup would answer this with a redirect, so the
+    # URL is asserted rather than assumed: a wizard assertion that silently ran
+    # against the login page would pass on the wrong page.
+    expect(first_run_page).to_have_url(f"{first_run_server.url}/setup")
 
     for class_name, prop, above, below in _SETUP_WIZARD:
-        _assert_above_and_below_breakpoint(page, class_name, prop, above, below)
+        _assert_above_and_below_breakpoint(
+            first_run_page, class_name, prop, above, below
+        )
     for class_name, wide, narrow, fixed in _SETUP_GRIDS:
-        page.set_viewport_size(VIEWPORT)
-        _assert_grid_tracks(page, class_name, wide, fixed)
-        page.set_viewport_size(NARROW)
-        _assert_grid_tracks(page, class_name, narrow)
+        first_run_page.set_viewport_size(VIEWPORT)
+        _assert_grid_tracks(first_run_page, class_name, wide, fixed)
+        first_run_page.set_viewport_size(NARROW)
+        _assert_grid_tracks(first_run_page, class_name, narrow)

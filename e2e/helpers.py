@@ -8,19 +8,18 @@ instance, are added through ``POST /api/products/{id}/barcodes``). Nothing here
 touches the development database: the server the client points at runs on a
 throwaway file.
 
-The two deliberate exceptions are direct writes to the throwaway database, and
+The one deliberate exception is a direct write to the throwaway database, and
 only there — never to the development database the harness guards:
 
 - ``expire_session_in_database``: the AC22 session-expiry case needs the session
   invalid server-side while the browser still holds its cookie, and expiring the
   row is not an action the interface offers (logout revokes, it does not expire).
-- ``reopen_first_run_setup_in_database``: the first-run wizard is one-time, so a
-  server that has already completed setup answers ``/setup`` with a redirect.
-  Removing the configuration row returns the throwaway server to the state a
-  brand-new installation is in, which is the only way this suite can render the
-  wizard without a second server lifecycle.
 
-Both write to the file the spawned server already owns.
+It writes to the file the spawned server already owns.
+
+The first-run wizard needed no such helper: ``first_run_server`` in ``conftest``
+is a server whose setup was never completed, so ``/setup`` is reached by asking
+for that server rather than by undoing a completed install.
 """
 
 from __future__ import annotations
@@ -217,41 +216,6 @@ def expire_session_in_database(db_path: Path, token: str) -> None:
             raise SeedError(
                 f"expected to expire exactly one live session row, moved {cursor.rowcount}; "
                 "the token digest did not match a live row"
-            )
-    finally:
-        connection.close()
-
-
-def reopen_first_run_setup_in_database(db_path: Path) -> None:
-    """Remove the singleton business configuration row, so `/setup` renders again.
-
-    The first-run wizard is one-time: once `business_settings` holds its row the
-    server answers `GET /setup` with a redirect to `/login`, so a harness that
-    has already completed setup can never reach the page. Deleting the row puts
-    the throwaway server back in the state a brand-new installation is in, and
-    the wizard renders for real: the same route, the same template, the same
-    committed stylesheet, read by the same browser.
-
-    There is deliberately no fresh-database harness for this. The alternative —
-    a second spawned server that skips `setup_fresh_server` — is a per-capture
-    server lifecycle, and this suite's `live_server` fixture is the one place
-    that knows how to prove a server opened the throwaway file and not
-    `roya.db`. Reusing the fixture's own database keeps that proof intact.
-
-    It writes to the throwaway database only, exactly as
-    `expire_session_in_database` does, and never to the development database
-    the harness guards. Nothing is left behind: the fixture's database is
-    deleted with its temporary directory.
-    """
-    connection = sqlite3.connect(str(db_path), timeout=5.0)
-    try:
-        connection.execute("PRAGMA busy_timeout = 5000")
-        cursor = connection.execute("DELETE FROM business_settings WHERE id = 1")
-        connection.commit()
-        if cursor.rowcount != 1:
-            raise SeedError(
-                "expected to remove exactly one business configuration row, removed "
-                f"{cursor.rowcount}; the throwaway server was not in the seeded state"
             )
     finally:
         connection.close()
