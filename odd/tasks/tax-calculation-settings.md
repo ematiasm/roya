@@ -197,3 +197,16 @@ This is substantial delegated-direct ODD work. Each work unit touches multiple n
 - Delivery accounting: branch `feat/tax-calculation-settings` is 34 files, approximately 7,856 authored changed lines versus `main` (excluding the generated visual baseline). T1 = 2,885, T2 = 2,295, T3 = 2,744. Each cohesive work unit individually exceeds the 400-line advisory budget; the recorded `ask-on-risk` → `stacked-to-main` decision covers the delivery route, and a single-PR route would require maintainer-approved `size:exception`. No push, PR creation, or merge has been performed.
 - Follow-ups outside this feature: add `/settings` and `/settings?tab=taxes` to the visual baseline; refine the delete-confirmation panel placement and dialog semantics; rebuild `static/tailwind.css`, which is stale for 14 pre-existing classes across 11 templates. (The fourth follow-up — whether the Products catalogue's `inventory.write` tax access should eventually narrow to `settings.manage` — is **no longer open**: decided and implemented on 2026-09-25 in `odd/tasks/api-tax-permissions.md`, on the web by U1 and in the JSON API by the three `Require<SettingsManage>` gates. See the dated note in Decisions above.)
 - Next step: delivery is the user's decision. The feature is implemented, verified, and committed on a local feature branch.
+
+## Delivered
+
+Shipped 2026-09-26 as PR [#107](https://github.com/ematiasm/roya/pull/107), merged as `1d8b444` with `size:exception`.
+
+| Work unit | Implementation | Evidence |
+|-----------|----------------|----------|
+| T1 | `88176a9` | `9e72cd2` |
+| T2 | `a8fa64c` | `20ab076` |
+| T3 | `3b9a927` | `a60640d` |
+| T4 | `75aa362` | `75aa362` |
+
+This slice was merged without a rebase, so the SHAs cited earlier in this document are the ones on `main` and resolve for anyone. The later slices were rebased onto `main` as each merge advanced it, so their documents carry a `Delivered` section with both identities.

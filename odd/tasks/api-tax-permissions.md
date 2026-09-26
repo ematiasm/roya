@@ -94,3 +94,15 @@ One bounded delegated-direct ODD work unit, because it touches several non-trivi
 ### Staging note
 
 `odd/tasks/pos-counter-sales.md` is untracked and belongs to a different task. It must NOT be staged by this work unit. Stage the seven modified files and `odd/tasks/api-tax-permissions.md` explicitly.
+
+## Delivered
+
+Shipped 2026-09-26 as PR [#109](https://github.com/ematiasm/roya/pull/109), merged as `6196741` with `size:exception`.
+
+| Work unit | Implementation on `main` | Evidence on `main` | Pre-rebase, local only |
+|-----------|---------------------------|---------------------|-------------------------|
+| U1 | `32da3af` | `193eed2` | `796a6c1`, `f6a5304` |
+
+This branch was rebased onto `main` after PR #108 merged, so the SHAs cited above are the pre-rebase ones and resolve only in a local clone of the deleted feature branch. The mapping was produced by matching commit subjects, not by hand.
+
+This document also cites one pre-rebase identity of the **preceding** slice, in its Problem section: `f5cf904` is the pre-rebase evidence commit of `odd/tasks/product-price-ladder.md` U3, delivered as `b36a141`.
