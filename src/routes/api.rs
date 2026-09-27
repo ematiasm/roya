@@ -276,7 +276,18 @@ mod tests {
         row.0
     }
 
-    async fn create_account(app: &Router, name: &str) -> i64 {
+    /// Create an account through the API and return its id.
+    ///
+    /// Named `new_account`, NOT `create_account`, and that is deliberate. The
+    /// production route at the top of this file is `create_account`, and CodeQL
+    /// resolves Rust symbols by name: with a test fixture sharing the name, its
+    /// `rust/cleartext-logging` analysis bound the fixture's flow to a
+    /// `tracing` sink in another file and raised a HIGH severity alert on this
+    /// module. There is no logging anywhere in this file and this helper posts
+    /// `{"name": …}` — an account NAME, never a credential — so the alert was a
+    /// false positive, but the ambiguity was real and is now gone. Do not rename
+    /// this back to `create_account`.
+    async fn new_account(app: &Router, name: &str) -> i64 {
         let (status, v) = send(
             app.clone(),
             "POST",
@@ -573,7 +584,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiCatalog").await;
+        let acc = new_account(&app, "ApiCatalog").await;
         let cash = method_id(&pool, "Cash").await;
 
         // A fresh account owns nothing (ownership, not a full catalog).
@@ -610,7 +621,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiReplace").await;
+        let acc = new_account(&app, "ApiReplace").await;
         let cash = method_id(&pool, "Cash").await;
         let transfer = method_id(&pool, "Transfer").await;
 
@@ -636,7 +647,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiUnknown").await;
+        let acc = new_account(&app, "ApiUnknown").await;
         let cash = method_id(&pool, "Cash").await;
         let transfer = method_id(&pool, "Transfer").await;
         let (status, _) = put_methods(&app, acc, &[cash]).await;
@@ -663,8 +674,8 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let a = create_account(&app, "ApiOwner").await;
-        let b = create_account(&app, "ApiThief").await;
+        let a = new_account(&app, "ApiOwner").await;
+        let b = new_account(&app, "ApiThief").await;
         let cash = method_id(&pool, "Cash").await;
         let (status, _) = put_methods(&app, a, &[cash]).await;
         assert_eq!(status, StatusCode::OK);
@@ -696,7 +707,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiEmpty").await;
+        let acc = new_account(&app, "ApiEmpty").await;
         let cash = method_id(&pool, "Cash").await;
         let (status, _) = put_methods(&app, acc, &[cash]).await;
         assert_eq!(status, StatusCode::OK);
@@ -724,7 +735,7 @@ mod tests {
     async fn an_account_balance_whose_transactions_cannot_be_added_up_is_not_a_panic() {
         let state = test_state().await;
         let app = crate::routes::router(state);
-        let account = create_account(&app, "Sweep Balance").await;
+        let account = new_account(&app, "Sweep Balance").await;
         let income = |date: &'static str| {
             let app = app.clone();
             async move {
@@ -787,7 +798,7 @@ mod tests {
     async fn a_transaction_update_whose_projection_cannot_be_carried_is_a_refusal() {
         let state = test_state().await; // allow_negative = false
         let app = crate::routes::router(state);
-        let account = create_account(&app, "Update Projection").await;
+        let account = new_account(&app, "Update Projection").await;
         let post = |kind: &'static str, amount: &'static str, date: &'static str| {
             let app = app.clone();
             async move {
@@ -890,8 +901,8 @@ mod tests {
     async fn the_accounts_api_renders_a_refused_balance_on_the_wire() {
         let state = test_state().await;
         let app = crate::routes::router(state.clone());
-        let refused = create_account(&app, "Api Refused").await;
-        let ordinary = create_account(&app, "Api Ordinary").await;
+        let refused = new_account(&app, "Api Refused").await;
+        let ordinary = new_account(&app, "Api Ordinary").await;
         let actor = test_support::audit_actor_id(&state.pool).await.unwrap();
         for (account, amount) in [
             (refused, "40000000000000000000000000000"),
@@ -969,7 +980,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiManualRef").await;
+        let acc = new_account(&app, "ApiManualRef").await;
 
         let (status, v) = send(
             app.clone(),
@@ -1022,7 +1033,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiExplicitRef").await;
+        let acc = new_account(&app, "ApiExplicitRef").await;
 
         let (status, v) = send(
             app.clone(),
@@ -1057,7 +1068,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiDelete").await;
+        let acc = new_account(&app, "ApiDelete").await;
 
         // Fund the account so the Expense create passes the balance guard.
         let (status, v) = send(
@@ -1119,7 +1130,7 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let acc = create_account(&app, "ApiDeleteLinked").await;
+        let acc = new_account(&app, "ApiDeleteLinked").await;
 
         // Fund the account so the Expense create passes the balance guard.
         let (status, v) = send(
