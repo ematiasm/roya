@@ -1523,3 +1523,164 @@ async fn settings_business_settings_submission_is_unchanged_by_the_taxes_tab() {
         "the taxes tab must not render the business form: {taxes}"
     );
 }
+
+/// The rate ceiling reaches the operator as a SENTENCE IN THEIR OWN LANGUAGE,
+/// on the real form, in both configured languages.
+///
+/// This is the whole point of the bound being a form error rather than an
+/// arithmetic refusal three layers down: the operator types `1001` into the
+/// Taxes tab and reads back why it was refused, in the language the rest of the
+/// screen is in. Three things are asserted per language, and each one rules out a
+/// different way of getting this wrong:
+///
+/// 1. the localized sentence is present — the refusal was not swallowed;
+/// 2. the domain's English marker is ABSENT — the operator is never shown the
+///    internal marker, which is the failure mode of a `Validation` payload that
+///    the presentation layer forgot to map (an unmapped marker degrades to the
+///    generic "could not save" sentence, which would satisfy nothing here);
+/// 3. nothing was stored — the sentence is a refusal, not a warning. Read
+///    AFTER both posts, so it covers the HTMX branch too and is not satisfied
+///    by the plain branch's refusal alone.
+///
+/// The two languages are separate deployments of the same screen, so both are
+/// driven: one `configured_state()` whose default locale is `es-AR`, one
+/// `fresh_setup_state_with_default("en-US")`.
+#[tokio::test]
+async fn settings_tax_rate_above_the_ceiling_is_refused_in_the_operator_language() {
+    let marker = crate::services::taxes::TAX_RATE_ABOVE_CEILING;
+    let cases = [
+        ("es-AR", configured_state().await),
+        ("en-US", fresh_setup_state_with_default("en-US").await),
+    ];
+
+    for (locale, state) in cases {
+        let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+            .await
+            .unwrap();
+        let app = router(state.clone());
+        let cookie = test_support::cookie_for(&token);
+
+        // A plain form post: the Taxes tab re-renders itself with the notice,
+        // which is what an operator without HTMX (or with it disabled) sees.
+        let response = post_form_to(
+            &app,
+            &cookie,
+            "/web/settings/taxes",
+            "code=IVA1001&name=IVA+mil&rate=1001",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{locale}: a malformed submission is a 400, not a crash"
+        );
+        let page = body(response).await;
+        assert!(
+            page.contains("data-notice=\"error\""),
+            "{locale}: the refusal must be painted as an error notice: {page}"
+        );
+        let expected = match locale {
+            "es-AR" => "La tasa del impuesto no puede superar el 1000%.",
+            _ => "The tax rate cannot exceed 1000%.",
+        };
+        assert!(
+            page.contains(expected),
+            "{locale}: the operator must read the ceiling in their own language \
+             (expected {expected:?}): {page}"
+        );
+        assert!(
+            !page.contains(marker),
+            "{locale}: the internal marker must never reach an operator: {page}"
+        );
+
+        // The HTMX surface answers with the SAME sentence in the same language,
+        // in the app's own JSON error shape. The taxes tab is an HTMX surface,
+        // so proving only the plain render would leave the path the operator
+        // actually uses unproven.
+        let htmx = post_form_to(
+            &app,
+            &cookie,
+            "/web/settings/taxes",
+            "code=IVA1001&name=IVA+mil&rate=1001",
+            &htmx(),
+        )
+        .await;
+        assert_eq!(htmx.status(), StatusCode::BAD_REQUEST, "{locale}");
+        let fragment = body(htmx).await;
+        assert!(
+            fragment.contains(expected),
+            "{locale}: the HTMX refusal carries the same localized sentence: {fragment}"
+        );
+
+        // NOTHING WAS STORED, and the count is read AFTER both posts on purpose.
+        // Asserting it between them would leave the HTMX branch — the surface an
+        // operator actually uses — with an unasserted no-write property: the
+        // plain post's refusal would be doing the work of proving that neither
+        // wrote, while the HTMX one could in fact have written and still passed.
+        // One count, after both, is the only version of this assertion that
+        // covers what its own message claims.
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM taxes WHERE code = 'IVA1001'")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored, 0,
+            "{locale}: neither the plain post nor the HTMX post may store a \
+             refused rate"
+        );
+    }
+}
+
+/// The ceiling is the UPPER bound, so the pre-existing lower bound is still
+/// reachable from the same form: a negative rate is refused with the negative
+/// sentence and a rate at the ceiling is stored. Both directions on one screen,
+/// so a bound that quietly became a one-sided rejection would be caught here
+/// rather than by an operator with an unusual but legal levy.
+#[tokio::test]
+async fn settings_tax_rate_below_zero_and_exactly_at_the_ceiling_are_both_answered() {
+    let state = configured_state().await;
+    let token = test_support::seed_session_with_permissions(&state.pool, &["settings.manage"])
+        .await
+        .unwrap();
+    let app = router(state.clone());
+    let cookie = test_support::cookie_for(&token);
+
+    let negative = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes",
+        "code=NEG&name=Negativa&rate=-5",
+        &[],
+    )
+    .await;
+    assert_eq!(negative.status(), StatusCode::BAD_REQUEST);
+    let negative = body(negative).await;
+    assert!(
+        negative.contains("La tasa del impuesto no puede ser negativa."),
+        "the lower bound keeps its own sentence: {negative}"
+    );
+    assert!(
+        !negative.contains("no puede superar el 1000%"),
+        "a negative rate is not a ceiling refusal: {negative}"
+    );
+
+    let accepted = post_form_to(
+        &app,
+        &cookie,
+        "/web/settings/taxes",
+        "code=LEVY&name=Levy&rate=1000",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        accepted.status(),
+        StatusCode::SEE_OTHER,
+        "a rate exactly at the ceiling is accepted and the tab redirects on success"
+    );
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM taxes WHERE code = 'LEVY'")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 1, "the accepted edge is really stored");
+}

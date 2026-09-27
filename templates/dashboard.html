@@ -14,7 +14,9 @@
     <!-- Total -->
     <div class="rounded-2xl border border-border bg-card p-5">
       <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardTotalBalance) }}</div>
-      <div class="text-[32px] font-bold" id="total-balance">{{ localization.format_currency(total_balance.clone()) }}</div>
+      {# A refused set total states the rule here, through the same one renderer
+         the account list uses — the two figures are the same sum. #}
+      <div class="text-[32px] font-bold" id="total-balance">{% if total_balance.is_empty() %}<span class="text-[13px] font-bold text-danger" data-account-total-refusal data-document-total-refusal>{{ total_message }}</span>{% else %}{{ total_balance }}{% endif %}</div>
       <div class="text-[13px] text-muted">{% if allow_negative %}{{ localization.tr(crate::localization::MessageKey::DashboardNegativeAllowed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::DashboardNegativeBlocked) }}{% endif %} • {{ localization.tr(crate::localization::MessageKey::DashboardDerivedTransactions) }}</div>
     </div>
 
@@ -92,8 +94,10 @@
         <div>
           <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardAccount) }}</label>
           <select name="account_id" required id="tx-account-select" class="field">
+            {# The account NAME is the value; the balance is context, so a refused
+               one states the rule beside it and never a figure. #}
             {% for acc in accounts %}
-            <option value="{{ acc.id }}">{{ acc.name }} — {{ localization.format_currency(acc.balance.clone()) }}</option>
+            <option value="{{ acc.id }}">{{ acc.name }}{% if !acc.balance.is_empty() %} — {{ acc.balance }}{% else %} — {{ acc.balance_message }}{% endif %}</option>
             {% endfor %}
           </select>
           <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardAccountRequired) }}</div>

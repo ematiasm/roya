@@ -37,8 +37,8 @@ use std::collections::HashMap;
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{
-    Ageing, Customer, CustomerStatement, NewCustomer, PaymentMethodWithAccount, ReceiptDetail,
-    SaleDetail, UpdateCustomer,
+    Ageing, Customer, CustomerStatement, NewCustomer, PaymentMethodWithAccount, PriceRefusal,
+    ReceiptDetail, SaleListRow, SetMoney, UpdateCustomer,
 };
 use crate::routes::AppState;
 use crate::security::authz::{CustomersCollect, CustomersRead, CustomersWrite, Nav, Require};
@@ -55,9 +55,36 @@ use crate::security::authz::{CustomersCollect, CustomersRead, CustomersWrite, Na
 #[derive(Clone)]
 pub struct CustomerRow {
     pub customer: Customer,
-    pub balance: Decimal,
+    /// The customer's receivable, or a refusal when a document in it cannot be
+    /// totaled — never a partial figure.
+    pub balance: SetMoney,
     pub ageing: Ageing,
     pub over_limit: bool,
+}
+
+/// One ledger row of a statement, with each of its two derived figures already
+/// resolved for the template: the amount where the arithmetic carried it, and the
+/// refusal — in the operator's language, through the one shared mapping — where it
+/// did not.
+struct StatementEntryView {
+    entry: crate::models::StatementEntry,
+    /// The sentence for a refused debit. Empty when the debit is a figure.
+    debit_message: String,
+    /// The sentence for a refused running balance. Empty when it is a figure.
+    balance_message: String,
+}
+
+/// One receivable row of the customer drawer: the document, plus the refusal
+/// already in the operator's language.
+///
+/// The sentence is resolved HERE, through the one shared `price_refusal_key`
+/// mapping, so this surface cannot word the rule differently from the record
+/// pages, the sales list or the index.
+struct DebtRowView {
+    sale: crate::models::Sale,
+    money: Option<crate::models::RecordMoney>,
+    /// Empty when the document's money could be carried.
+    total_refusal_message: String,
 }
 
 #[derive(Template)]
@@ -67,9 +94,14 @@ struct CustomersTemplate {
     localization: LocalizationContext,
     customers: Vec<CustomerRow>,
     statement: Option<CustomerStatement>,
+    /// The statement's balance and ageing grid, resolved into the operator's
+    /// language by `statement_figures`.
+    statement_figures: StatementFigures,
+    /// The ledger, one resolved row per entry.
+    entries: Vec<StatementEntryView>,
     selected: Option<Customer>,
     receipts: Vec<ReceiptDetail>,
-    debt_sales: Vec<SaleDetail>,
+    debt_sales: Vec<DebtRowView>,
     method_options: Vec<PaymentMethodWithAccount>,
     today: String,
     warning: Option<String>,
@@ -92,6 +124,26 @@ struct CustomerListPartial {
     localization: LocalizationContext,
 }
 
+/// Every figure the statement partial renders, already resolved into the
+/// operator's language: the amount, or the sentence in the place the figure
+/// would be.
+///
+/// The buckets are resolved HERE and not in the template, so the template has no
+/// way to print a number where a sum was refused — the grid reads seven strings,
+/// and a refused bucket's string IS the sentence. The total travels beside them
+/// because a total can refuse for a reason no single bucket can show: the buckets
+/// are a partition, and their sum is a second set sum (see [`Ageing::total`]).
+#[derive(Clone, Default)]
+pub struct StatementFigures {
+    pub balance: String,
+    pub ageing_total: String,
+    pub ageing_totalled: bool,
+    pub current: String,
+    pub overdue_1_30: String,
+    pub overdue_31_60: String,
+    pub overdue_61_plus: String,
+}
+
 /// The slide-over drawer body: the statement (header, balance, ageing,
 /// documents) plus the collect form and the payment history. The field names
 /// mirror `CustomersTemplate` so `customers.html` can include the same
@@ -101,8 +153,12 @@ struct CustomerListPartial {
 struct CustomerDetailPartial {
     localization: LocalizationContext,
     statement: Option<CustomerStatement>,
+    /// The statement's balance and ageing grid, resolved into the operator's
+    /// language by `statement_figures`.
+    statement_figures: StatementFigures,
+    entries: Vec<StatementEntryView>,
     selected: Option<Customer>,
-    debt_sales: Vec<SaleDetail>,
+    debt_sales: Vec<DebtRowView>,
     receipts: Vec<ReceiptDetail>,
     method_options: Vec<PaymentMethodWithAccount>,
     today: String,
@@ -201,11 +257,86 @@ fn clean_opt(s: &str) -> Option<String> {
 }
 
 /// `credit_limit` is nullable: null means no limit, so the flag can never block.
-fn over_limit(customer: &Customer, balance: Decimal) -> bool {
-    customer
-        .credit_limit
-        .map(|limit| balance > limit)
-        .unwrap_or(false)
+/// The statement's derived figures, resolved for the template: the amount where
+/// the receivable totals, and the refusal — in the operator's language, through
+/// the one shared mapping — where it does not.
+///
+/// Both are strings rather than a model the template branches on, so the page has
+/// exactly one place to render the rule and the route is the only layer that
+/// knows the locale. `ageing_totalled` says which of the two the page shows.
+fn statement_entry_views(
+    statement: &CustomerStatement,
+    localization: &LocalizationContext,
+) -> Vec<StatementEntryView> {
+    statement
+        .entries
+        .iter()
+        .map(|entry| {
+            let message = |refusal: Option<PriceRefusal>| {
+                refusal
+                    .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+                    .unwrap_or_default()
+            };
+            StatementEntryView {
+                debit_message: message(entry.debit.refusal),
+                balance_message: message(entry.balance.refusal),
+                entry: entry.clone(),
+            }
+        })
+        .collect()
+}
+
+fn statement_figures(
+    statement: &CustomerStatement,
+    localization: &LocalizationContext,
+) -> StatementFigures {
+    let sentence =
+        |refusal: PriceRefusal| crate::routes::price_refusal_message(&refusal, localization);
+    let figure = |money: SetMoney| match money.amount {
+        Some(amount) => localization.format_currency(amount),
+        None => money.refusal.map(sentence).unwrap_or_default(),
+    };
+    let total = statement.ageing.total();
+    let [current, overdue_1_30, overdue_31_60, overdue_61_plus] = statement.ageing.buckets();
+    StatementFigures {
+        balance: figure(statement.balance),
+        ageing_total: figure(total),
+        // Whether the TOTAL is a figure. The grid renders either way: a bucket
+        // that carried keeps its own sum, and a bucket that refused says so in
+        // its own cell. Hiding the whole grid would throw away three real sums
+        // because of a fourth.
+        ageing_totalled: total.amount.is_some(),
+        current: figure(current),
+        overdue_1_30: figure(overdue_1_30),
+        overdue_31_60: figure(overdue_31_60),
+        overdue_61_plus: figure(overdue_61_plus),
+    }
+}
+
+fn debt_row_views(rows: Vec<SaleListRow>, localization: &LocalizationContext) -> Vec<DebtRowView> {
+    rows.into_iter()
+        .map(|row| {
+            let total_refusal_message = row
+                .total_refusal
+                .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+                .unwrap_or_default();
+            DebtRowView {
+                sale: row.sale,
+                money: row.money,
+                total_refusal_message,
+            }
+        })
+        .collect()
+}
+
+fn over_limit(customer: &Customer, balance: SetMoney) -> bool {
+    match (customer.credit_limit, balance.amount) {
+        (Some(limit), Some(amount)) => amount > limit,
+        // A refused figure makes no claim either way: the comparison needs a
+        // number that does not exist, and the refusal is stated where the balance
+        // was, so the absence of the flag is explained on the page.
+        _ => false,
+    }
 }
 
 /// Resolve the selected customer's audit display names in this wiring layer
@@ -231,7 +362,7 @@ async fn customer_rows(
     localization: &LocalizationContext,
 ) -> AppResult<Vec<CustomerRow>> {
     let as_of = today(localization)?;
-    let ageings: HashMap<i64, (Decimal, Ageing)> = state
+    let ageings: HashMap<i64, (SetMoney, Ageing)> = state
         .sales_service
         .ageing_all(as_of)
         .await?
@@ -245,7 +376,7 @@ async fn customer_rows(
             let (balance, ageing) = ageings
                 .get(&customer.id)
                 .copied()
-                .unwrap_or((Decimal::ZERO, Ageing::default()));
+                .unwrap_or((SetMoney::amount(Decimal::ZERO), Ageing::default()));
             let over_limit = over_limit(&customer, balance);
             CustomerRow {
                 customer,
@@ -300,6 +431,11 @@ async fn customers_page(
         localization,
         customers,
         statement: None,
+        // No statement on the list page: there is no receivable to state and no
+        // refusal to state with it, so both strings are empty and the template's
+        // `if let Some(st)` guard means neither is read.
+        statement_figures: StatementFigures::default(),
+        entries: vec![],
         selected: None,
         receipts: vec![],
         debt_sales: vec![],
@@ -333,7 +469,12 @@ async fn customer_statement_page(
     let as_of = today(&localization)?;
     let statement = state.sales_service.customer_statement(id, as_of).await?;
     let over_limit = over_limit(&customer, statement.balance);
-    let debt_sales = state.sales_service.customer_debt_sales(id).await?;
+    let statement_figures = statement_figures(&statement, &localization);
+    let entries = statement_entry_views(&statement, &localization);
+    let debt_sales = debt_row_views(
+        state.sales_service.customer_debt_sales(id).await?,
+        &localization,
+    );
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let (created_by_name, updated_by_name) = customer_actor_names(&state, &customer).await?;
@@ -346,6 +487,8 @@ async fn customer_statement_page(
         localization: localization.clone(),
         customers: customer_rows(&state, &localization).await?,
         statement: Some(statement),
+        statement_figures,
+        entries,
         selected: Some(customer),
         receipts,
         debt_sales,
@@ -411,13 +554,20 @@ async fn detail_html(
     let as_of = today(&localization)?;
     let statement = state.sales_service.customer_statement(id, as_of).await?;
     let over_limit = over_limit(&customer, statement.balance);
-    let debt_sales = state.sales_service.customer_debt_sales(id).await?;
+    let statement_figures = statement_figures(&statement, &localization);
+    let entries = statement_entry_views(&statement, &localization);
+    let debt_sales = debt_row_views(
+        state.sales_service.customer_debt_sales(id).await?,
+        &localization,
+    );
     let receipts = state.customer_receipt_service.list_receipts(id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let (created_by_name, updated_by_name) = customer_actor_names(&state, &customer).await?;
     let html = CustomerDetailPartial {
-        localization,
+        localization: localization.clone(),
         statement: Some(statement),
+        statement_figures,
+        entries,
         selected: Some(customer),
         debt_sales,
         receipts,
@@ -943,6 +1093,84 @@ mod tests {
             product: product.id,
             sale: sale.id,
         }
+    }
+
+    /// A confirmed credit sale of `4e28` — one document that TOTALS on its own,
+    /// so every refusal below is a statement about the SET of documents and never
+    /// about a line.
+    async fn huge_credit_sale(
+        state: &AppState,
+        customer_id: i64,
+        product_id: i64,
+        due_date: NaiveDate,
+    ) -> i64 {
+        let sale = state
+            .sales_service
+            .create_draft(
+                audit_actor(state).await,
+                NewSale {
+                    customer_id,
+                    payment_type: PaymentType::Credit,
+                    sale_date: due_date,
+                    due_date: Some(due_date),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .add_line(
+                sale.id,
+                product_id,
+                Decimal::ONE,
+                Some(Decimal::from_str("4e28").unwrap()),
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .confirm(audit_actor(state).await, sale.id, None)
+            .await
+            .unwrap();
+        sale.id
+    }
+
+    /// F1: the ageing buckets are a PARTITION of one receivable, and a bound that
+    /// holds inside each bucket says nothing about the sum ACROSS them. Two
+    /// documents of `4e28` that land in DIFFERENT buckets each fit their own
+    /// bucket, and their sum is `8e28`, which `Decimal` cannot carry: the page
+    /// must state the rule instead of overflowing.
+    #[tokio::test]
+    async fn a_customer_whose_documents_land_in_different_ageing_buckets_states_the_rule() {
+        let state = test_state().await;
+        let fixture = seed_fixture(&state).await;
+        let today = chrono::Local::now().date_naive();
+        // One not yet due (`current`) and one ten days late (`overdue_1_30`): the
+        // two buckets that a fixed `as_of` splits them into.
+        huge_credit_sale(
+            &state,
+            fixture.customer,
+            fixture.product,
+            today + chrono::Days::new(10),
+        )
+        .await;
+        huge_credit_sale(
+            &state,
+            fixture.customer,
+            fixture.product,
+            today - chrono::Days::new(10),
+        )
+        .await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/customers/{}", fixture.customer)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains("data-document-total-refusal"),
+            "the ageing total refuses instead of overflowing: {html:.400}"
+        );
     }
 
     #[tokio::test]

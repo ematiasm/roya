@@ -139,6 +139,7 @@ define_message_keys! {
     ValidationTaxName => "validation.tax_name",
     ValidationTaxRateInvalid => "validation.tax_rate_invalid",
     ValidationTaxRateNegative => "validation.tax_rate_negative",
+    ValidationTaxRateTooHigh => "validation.tax_rate_too_high",
     CommonBackDashboard => "common.back_dashboard",
     CommonRefresh => "common.refresh",
     CommonClear => "common.clear",
@@ -274,6 +275,13 @@ define_message_keys! {
     ProductLadderNetRefused => "product.ladder_net_refused",
     ProductLadderNetDerived => "product.ladder_net_derived",
     ProductLadderNetManual => "product.ladder_net_manual",
+    ProductLadderNoCostMarkup => "product.ladder_no_cost_markup",
+    ProductFinalPrice => "product.final_price",
+    ProductPreviewFinalPrice => "product.preview_final_price",
+    ProductConfirmFinalPrice => "product.confirm_final_price",
+    ProductFinalPriceConfirmHelp => "product.final_price_confirm_help",
+    ProductFinalPriceLabel => "product.final_price_label",
+    ProductFinalPriceHelp => "product.final_price_help",
     // The product price refusals. ONE key per `PriceRefusal` variant, reached
     // only through the one shared mapping in `routes/inventory_web.rs`, so the
     // ladder preview and the product save form can only ever answer the same
@@ -287,6 +295,26 @@ define_message_keys! {
     PriceRefusalSalePriceNegative => "price_refusal.sale_price_negative",
     PriceRefusalCostPriceNegative => "price_refusal.cost_price_negative",
     PriceRefusalSalePriceRequired => "price_refusal.sale_price_required",
+    PriceRefusalFinalPriceUnreachable => "price_refusal.final_price_unreachable",
+    PriceRefusalFinalPriceNotInvertible => "price_refusal.final_price_not_invertible",
+    PriceRefusalFinalPriceMarkupUnreachable => "price_refusal.final_price_markup_unreachable",
+    PriceRefusalFinalPriceTooLarge => "price_refusal.final_price_too_large",
+    PriceRefusalTaxRateTooLargeToPrice => "price_refusal.tax_rate_too_large_to_price",
+    PriceRefusalNetPriceTooLarge => "price_refusal.net_price_too_large",
+    // The tax contract's own two refusals, from `line_taxes::calculate_line_taxes`
+    // and from the raw `qty * price` its document callers evaluate before it.
+    // They are two rules and not one because the remedies are two: an
+    // unrepresentable line amount is fixed by the quantity or the unit price,
+    // an unrepresentable tax total by the amount OR the rate.
+    PriceRefusalLineAmountTooLarge => "price_refusal.line_amount_too_large",
+    PriceRefusalTaxArithmeticTooLarge => "price_refusal.tax_arithmetic_too_large",
+    // The document-level accumulation's own refusal: every line of the document
+    // is representable and the SUM of them is not. A third rule rather than a
+    // reuse of either line rule, because the remedy is a third thing — reduce or
+    // split the document, or correct it at the source — and either line sentence
+    // would send the operator to a number that is already correct.
+    PriceRefusalDocumentTotalTooLarge => "price_refusal.document_total_too_large",
+    PriceRefusalAggregateTooLarge => "price_refusal.aggregate_too_large",
     ProductSave => "product.save",
     ProductSaveHelp => "product.save_help",
     ProductNoTaxesConfigured => "product.no_taxes_configured",
@@ -1014,6 +1042,11 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
         "The tax rate cannot be negative.",
         "The tax rate cannot be negative.",
     ),
+    (
+        MessageKey::ValidationTaxRateTooHigh,
+        "The tax rate cannot exceed 1000%.",
+        "The tax rate cannot exceed 1000%.",
+    ),
     (MessageKey::FieldEnabled, "Enabled", "Enabled"),
     (MessageKey::ActionCancel, "Cancel", "Cancel"),
     (MessageKey::ActionAddLine, "Add line", "Add line"),
@@ -1202,6 +1235,13 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderNetRefused, "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:", "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:"),
     (MessageKey::ProductLadderNetDerived, "Derived from the cost and the markup", "Derived from the cost and the markup"),
     (MessageKey::ProductLadderNetManual, "Manual price", "Manual price"),
+    (MessageKey::ProductLadderNoCostMarkup, "The markup is not derivable without a cost, so this product's net price is a manual one.", "The markup is not derivable without a cost, so this product's net price is a manual one."),
+    (MessageKey::ProductFinalPrice, "Final price", "Final price"),
+    (MessageKey::ProductFinalPriceLabel, "Price the customer pays", "Price the customer pays"),
+    (MessageKey::ProductPreviewFinalPrice, "Preview", "Preview"),
+    (MessageKey::ProductConfirmFinalPrice, "Confirm and save", "Confirm and save"),
+    (MessageKey::ProductFinalPriceHelp, "The price the customer pays, taxes included. Preview solves the net price and the markup from the cost in the form above and saves nothing, so the ladder above shows what would happen. Confirming stores them. A final price replaces both the net price and the markup, so the sale price and the markup in the form above are not read: what you type there is kept for the ordinary save, and a confirmed final price overwrites it. Nothing is stored as a final price: the net price is the stored truth, so changing a tax later still moves the total.", "The price the customer pays, taxes included. Preview solves the net price and the markup from the cost in the form above and saves nothing, so the ladder above shows what would happen. Confirming stores them. A final price replaces both the net price and the markup, so the sale price and the markup in the form above are not read: what you type there is kept for the ordinary save, and a confirmed final price overwrites it. Nothing is stored as a final price: the net price is the stored truth, so changing a tax later still moves the total."),
+    (MessageKey::ProductFinalPriceConfirmHelp, "This stores the net price, the markup the ladder shows, and the cost above. A net price derived from a cost the database does not hold would be a price nobody could re-derive, so the cost is saved with them.", "This stores the net price, the markup the ladder shows, and the cost above. A net price derived from a cost the database does not hold would be a price nobody could re-derive, so the cost is saved with them."),
     // The price refusals, byte-identical to `PriceRefusal::as_str` because this
     // row IS the body the JSON API answers with. The English sentence carries no
     // final period: it is the exact text the refusal has always returned, and the
@@ -1213,6 +1253,16 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalSalePriceNegative, "sale_price cannot be negative", "sale_price cannot be negative"),
     (MessageKey::PriceRefusalCostPriceNegative, "cost_price cannot be negative", "cost_price cannot be negative"),
     (MessageKey::PriceRefusalSalePriceRequired, "sale_price is required", "sale_price is required"),
+    (MessageKey::PriceRefusalFinalPriceUnreachable, "no net price produces this final price with the linked taxes", "no net price produces this final price with the linked taxes"),
+    (MessageKey::PriceRefusalFinalPriceNotInvertible, "linked tax rates must add up to more than -100 to solve a final price", "linked tax rates must add up to more than -100 to solve a final price"),
+    (MessageKey::PriceRefusalFinalPriceMarkupUnreachable, "no markup_pct derives this net_price from this cost_price", "no markup_pct derives this net_price from this cost_price"),
+    (MessageKey::PriceRefusalFinalPriceTooLarge, "final_price is too large to solve a net_price from", "final_price is too large to solve a net_price from"),
+    (MessageKey::PriceRefusalTaxRateTooLargeToPrice, "a linked tax rate is too large to price this final_price", "a linked tax rate is too large to price this final_price"),
+    (MessageKey::PriceRefusalNetPriceTooLarge, "the linked tax rates gross this final_price down to a net_price that is too large to store", "the linked tax rates gross this final_price down to a net_price that is too large to store"),
+    (MessageKey::PriceRefusalLineAmountTooLarge, "qty * price is too large to store on this line", "qty * price is too large to store on this line"),
+    (MessageKey::PriceRefusalTaxArithmeticTooLarge, "the line amount is too large to calculate its taxes", "the line amount is too large to calculate its taxes"),
+    (MessageKey::PriceRefusalDocumentTotalTooLarge, "the document total is too large to compute: reduce or split the document, or correct its amounts at the source", "the document total is too large to compute: reduce or split the document, or correct its amounts at the source"),
+    (MessageKey::PriceRefusalAggregateTooLarge, "the accumulated amount is too large to compute: correct the stored amounts at the source", "the accumulated amount is too large to compute: correct the stored amounts at the source"),
     (MessageKey::ProductSave, "Save product", "Save product"),
     (MessageKey::ProductSaveHelp, "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique.", "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique."),
     (MessageKey::ProductNoTaxesConfigured, "No taxes configured yet.", "No taxes configured yet."),
@@ -1957,6 +2007,11 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
         "La tasa del impuesto no puede ser negativa.",
         "La tasa del impuesto no puede ser negativa.",
     ),
+    (
+        MessageKey::ValidationTaxRateTooHigh,
+        "La tasa del impuesto no puede superar el 1000%.",
+        "La tasa del impuesto no puede superar el 1000%.",
+    ),
     (MessageKey::FieldEnabled, "Habilitado", "Habilitado"),
     (MessageKey::ActionCancel, "Cancelar", "Cancelar"),
     (MessageKey::ActionAddLine, "Agregar línea", "Agregar línea"),
@@ -2149,6 +2204,13 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderNetRefused, "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:", "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:"),
     (MessageKey::ProductLadderNetDerived, "Derivado del costo y del margen", "Derivado del costo y del margen"),
     (MessageKey::ProductLadderNetManual, "Precio manual", "Precio manual"),
+    (MessageKey::ProductLadderNoCostMarkup, "El margen no se puede derivar sin un costo, así que el precio neto de este producto es manual.", "El margen no se puede derivar sin un costo, así que el precio neto de este producto es manual."),
+    (MessageKey::ProductFinalPrice, "Precio final", "Precio final"),
+    (MessageKey::ProductFinalPriceLabel, "Precio que paga el cliente", "Precio que paga el cliente"),
+    (MessageKey::ProductPreviewFinalPrice, "Previsualizar", "Previsualizar"),
+    (MessageKey::ProductConfirmFinalPrice, "Confirmar y guardar", "Confirmar y guardar"),
+    (MessageKey::ProductFinalPriceHelp, "El precio que paga el cliente, impuestos incluidos. Previsualizar resuelve el precio neto y el margen a partir del costo del formulario de arriba y no guarda nada, así que la escalera de arriba muestra lo que ocurriría. Confirmar los guarda. Un precio final reemplaza tanto el precio neto como el margen, así que el precio de venta y el margen del formulario de arriba no se leen: lo que escribas ahí se conserva para el guardado normal, y un precio final confirmado lo sobrescribe. No se almacena ningún precio final: el precio neto es la verdad almacenada, así que cambiar un impuesto después sigue moviendo el total.", "El precio que paga el cliente, impuestos incluidos. Previsualizar resuelve el precio neto y el margen a partir del costo del formulario de arriba y no guarda nada, así que la escalera de arriba muestra lo que ocurriría. Confirmar los guarda. Un precio final reemplaza tanto el precio neto como el margen, así que el precio de venta y el margen del formulario de arriba no se leen: lo que escribas ahí se conserva para el guardado normal, y un precio final confirmado lo sobrescribe. No se almacena ningún precio final: el precio neto es la verdad almacenada, así que cambiar un impuesto después sigue moviendo el total."),
+    (MessageKey::ProductFinalPriceConfirmHelp, "Esto guarda el precio neto, el margen que muestra la escalera y el costo de arriba. Un precio neto derivado de un costo que la base de datos no tiene sería un precio que nadie podría volver a derivar, por eso el costo se guarda junto a ellos.", "Esto guarda el precio neto, el margen que muestra la escalera y el costo de arriba. Un precio neto derivado de un costo que la base de datos no tiene sería un precio que nadie podría volver a derivar, por eso el costo se guarda junto a ellos."),
     // The price refusals, in the operator's own words. These are TRANSLATIONS,
     // not the English rows copied: the English row is the API body the machine
     // reads, and a Spanish operator who has to decode a column name to learn
@@ -2164,6 +2226,16 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalSalePriceNegative, "El precio de venta no puede ser negativo.", "El precio de venta no puede ser negativo."),
     (MessageKey::PriceRefusalCostPriceNegative, "El costo no puede ser negativo.", "El costo no puede ser negativo."),
     (MessageKey::PriceRefusalSalePriceRequired, "El precio de venta es obligatorio.", "El precio de venta es obligatorio."),
+    (MessageKey::PriceRefusalFinalPriceUnreachable, "Ningún precio neto produce este precio final con los impuestos vinculados.", "Ningún precio neto produce este precio final con los impuestos vinculados."),
+    (MessageKey::PriceRefusalFinalPriceNotInvertible, "Las tasas de los impuestos vinculados deben sumar más de -100 para resolver un precio final.", "Las tasas de los impuestos vinculados deben sumar más de -100 para resolver un precio final."),
+    (MessageKey::PriceRefusalFinalPriceMarkupUnreachable, "Ningún margen deriva este precio neto a partir de este costo.", "Ningún margen deriva este precio neto a partir de este costo."),
+    (MessageKey::PriceRefusalFinalPriceTooLarge, "El precio final es demasiado grande para derivar un precio neto a partir de él.", "El precio final es demasiado grande para derivar un precio neto a partir de él."),
+    (MessageKey::PriceRefusalTaxRateTooLargeToPrice, "Una tasa de impuesto vinculada es demasiado grande para calcular este precio final.", "Una tasa de impuesto vinculada es demasiado grande para calcular este precio final."),
+    (MessageKey::PriceRefusalNetPriceTooLarge, "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar.", "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar."),
+    (MessageKey::PriceRefusalLineAmountTooLarge, "La cantidad por el precio es demasiado grande para guardarse en esta línea.", "La cantidad por el precio es demasiado grande para guardarse en esta línea."),
+    (MessageKey::PriceRefusalTaxArithmeticTooLarge, "El importe de la línea es demasiado grande para calcular sus impuestos.", "El importe de la línea es demasiado grande para calcular sus impuestos."),
+    (MessageKey::PriceRefusalDocumentTotalTooLarge, "El total del documento es demasiado grande para calcularlo: reduzca o divida el documento, o corrija sus importes en el origen.", "El total del documento es demasiado grande para calcularlo: reduzca o divida el documento, o corrija sus importes en el origen."),
+    (MessageKey::PriceRefusalAggregateTooLarge, "El monto acumulado es demasiado grande para calcularlo: corrija los importes almacenados en el origen.", "El monto acumulado es demasiado grande para calcularlo: corrija los importes almacenados en el origen."),
     (MessageKey::ProductSave, "Guardar producto", "Guardar producto"),
     (MessageKey::ProductSaveHelp, "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos.", "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos."),
     (MessageKey::ProductNoTaxesConfigured, "Todavía no hay impuestos configurados.", "Todavía no hay impuestos configurados."),

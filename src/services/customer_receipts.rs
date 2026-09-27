@@ -115,7 +115,10 @@ where
             )));
         }
 
-        let debts = self.sales.customer_debt_sales(customer_id).await?;
+        // The STRICT read: a collection allocates real money against each due, so
+        // a document whose due cannot be stated has nothing to allocate against.
+        // The `outstanding` guard above already refused in that case.
+        let debts = self.sales.customer_debt_details(customer_id).await?;
         let plan = Self::plan_allocations(amount, &debts);
         let planned: Decimal = plan.iter().map(|allocation| allocation.amount).sum();
         if planned != amount {
@@ -1187,7 +1190,9 @@ mod tests {
         let product = seed_product(&s, "R-11", "10").await;
         let customer = seed_customer(&s, "Ana").await;
         let debts = three_debts(&s, customer, product).await;
-        let all = s.sales.customer_debt_sales(customer).await.unwrap();
+        // The STRICT read, the one the collection path uses: a plan allocates
+        // real money against each due.
+        let all = s.sales.customer_debt_details(customer).await.unwrap();
 
         let plan = ReceiptSvc::plan_allocations(dec("80"), &all);
         let takes: Vec<(i64, Decimal)> = plan.iter().map(|a| (a.sale_id, a.amount)).collect();

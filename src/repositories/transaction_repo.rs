@@ -74,26 +74,60 @@ fn row_to_tx(row: sqlx::sqlite::SqliteRow) -> Transaction {
     }
 }
 
-async fn balance_for_account_raw(
-    pool: &SqlitePool,
-    account_id: i64,
-) -> Result<Decimal, sqlx::Error> {
-    let rows = sqlx::query(r#"SELECT kind, amount FROM transactions WHERE account_id = ?"#)
-        .bind(account_id)
-        .fetch_all(pool)
-        .await?;
-    let mut total = Decimal::ZERO;
-    for row in rows {
-        let kind: String = row.get("kind");
-        let amt_str: String = row.get("amount");
-        let amt = parse_decimal(&amt_str);
-        if kind == "Income" {
-            total += amt;
-        } else {
-            total -= amt;
-        }
-    }
-    Ok(total)
+async fn balance_for_account_raw(pool: &SqlitePool, account_id: i64) -> AppResult<Decimal> {
+    // `ORDER BY id` is load-bearing, not decoration. The check below is on the
+    // RUNNING sum, so the order it folds in decides which prefixes it sees, and
+    // without an `ORDER BY` that order is a planner decision — the
+    // `idx_transactions_account_date` index on `(account_id, date)` can hand the
+    // rows back in DATE order while the write pre-check in
+    // `TransactionService` folds them in INSERTION order, and the two disagree.
+    //
+    // They can disagree about the ANSWER too, because addition is not
+    // associative over a range that runs out: insert `+0.05e28`, `-0.05e28`,
+    // `+0.05e28` and a date-ordered fold sees `0.05 / 0 / 0.05` where an
+    // id-ordered one sees `0.05 / 0 / 0.05` — but reorder the dates and a
+    // date-ordered fold walks `0.05 / 0.05 → 0.1e28` prefixes an id-ordered fold
+    // never sees, and can refuse a balance the pre-check approved. `id` order IS
+    // the pre-check's order, because every write appends. It is a covering-index
+    // friendly sort on a column the planner already filters and sorts on, so it
+    // costs one sort of the account's own rows and nothing else.
+    let rows =
+        sqlx::query(r#"SELECT kind, amount FROM transactions WHERE account_id = ? ORDER BY id"#)
+            .bind(account_id)
+            .fetch_all(pool)
+            .await?;
+    // Signed, then summed ONCE through the checked fold: an expense contributes
+    // `-amount`, so a set of incomes and expenses is one sum and one bound.
+    // Folding `+=` and `-=` per row was the same arithmetic with two raw
+    // operators and none. `AppError` rather than sqlx's error, so a refused sum
+    // reaches the operator as the same sentence every other refusal answers with.
+    //
+    // THE FOLD IS THE GUARANTEE, not an induction over the write pre-check: the
+    // pre-check in `TransactionService` validates `current + delta` where
+    // `current` is this very fold, so it is a check on the whole sum, not on the
+    // prefixes of the fold's own iteration — what it buys is that the common case
+    // refuses EARLY, with a useful message, instead of waiting for a read to
+    // discover it. The two agree on the total precisely because both are sums of
+    // the same rows, and the row order is now pinned so their prefixes agree too.
+    let signed = signed_amounts(&rows);
+    Ok(crate::repositories::checked_aggregate_sum(&signed).map_err(AppError::PriceRefused)?)
+}
+
+/// The rows of a balance query as SIGNED amounts: an income is `+amount`, an
+/// expense `-amount`. One helper for every copy of this fold in this layer, so
+/// they cannot drift on how a row contributes.
+fn signed_amounts(rows: &[sqlx::sqlite::SqliteRow]) -> Vec<Decimal> {
+    rows.iter()
+        .map(|row| {
+            let kind: String = row.get("kind");
+            let amt = parse_decimal(&row.get::<String, _>("amount"));
+            if kind == "Income" {
+                amt
+            } else {
+                -amt
+            }
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -283,7 +317,7 @@ impl TransactionRepository for SqliteTransactionRepository {
     }
 
     async fn balance_for_account(&self, account_id: i64) -> AppResult<Decimal> {
-        Ok(balance_for_account_raw(&self.pool, account_id).await?)
+        balance_for_account_raw(&self.pool, account_id).await
     }
 
     async fn sync_cached_balance(&self, account_id: i64) -> AppResult<()> {
@@ -294,11 +328,23 @@ impl TransactionRepository for SqliteTransactionRepository {
     }
 }
 
+/// The cached balance of an account, refreshed inside the caller's transaction.
+///
+/// The error channel is sqlx's because this runs mid-transaction, where every
+/// other statement's channel is sqlx's too. A refused sum therefore travels as
+/// `Error::Protocol` carrying the rule's own text — the same bytes
+/// `PriceRefusal::as_str` is, so the sentence an operator reads is the sentence
+/// the catalog holds and not a driver string.
 async fn sync_cached(
     conn: &mut sqlx::SqliteConnection,
     account_id: i64,
 ) -> Result<(), sqlx::Error> {
-    let balance = balance_for_account_raw_pool(conn, account_id).await?;
+    let balance = balance_for_account_raw_pool(conn, account_id)
+        .await
+        .map_err(|error| match error {
+            AppError::PriceRefused(refusal) => sqlx::Error::Protocol(refusal.as_str().to_string()),
+            other => sqlx::Error::Protocol(other.to_string()),
+        })?;
     sqlx::query(r#"UPDATE accounts SET cached_balance = ? WHERE id = ?"#)
         .bind(balance.to_string())
         .bind(account_id)
@@ -310,21 +356,16 @@ async fn sync_cached(
 async fn balance_for_account_raw_pool(
     conn: &mut sqlx::SqliteConnection,
     account_id: i64,
-) -> Result<Decimal, sqlx::Error> {
+) -> AppResult<Decimal> {
     let rows = sqlx::query(r#"SELECT kind, amount FROM transactions WHERE account_id = ?"#)
         .bind(account_id)
         .fetch_all(&mut *conn)
         .await?;
-    let mut total = Decimal::ZERO;
-    for row in rows {
-        let kind: String = row.get("kind");
-        let amt_str: String = row.get("amount");
-        let amt = parse_decimal(&amt_str);
-        if kind == "Income" {
-            total += amt;
-        } else {
-            total -= amt;
-        }
-    }
-    Ok(total)
+    // Signed, then summed ONCE through the checked fold: an expense contributes
+    // `-amount`, so a set of incomes and expenses is one sum and one bound.
+    // Folding `+=` and `-=` per row was the same arithmetic with two raw
+    // operators and none. `AppError` rather than sqlx's error, so a refused sum
+    // reaches the operator as the same sentence every other refusal answers with.
+    let signed = signed_amounts(&rows);
+    Ok(crate::repositories::checked_aggregate_sum(&signed).map_err(AppError::PriceRefused)?)
 }

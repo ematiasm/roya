@@ -1,0 +1,33 @@
+{# The CONFIRM half of the final-price control (final price markup U2).
+
+   This partial is rendered ONLY by `/web/product-final-price` and its confirm
+   route, and it is swapped into `#product-final-price-confirm` out of band. It
+   is deliberately NOT part of the drawer's own markup: a drawer that has never
+   been previewed, and a preview that was refused, both leave the slot empty and
+   neither offers a way to write. "Preview, then confirm" is therefore a
+   property of the markup rather than of a disabled attribute somebody can work
+   around with the keyboard.
+
+   The button is a `type="button"` carrying its own `hx-post`, which is what
+   makes the two steps two steps: it never submits the control's form, and the
+   control's form is the PREVIEW. So a stray Enter, or the Preview button, can
+   only ever preview.
+
+   `hx-include` is a comma-separated selector list — htmx resolves `hx-include`
+   with `querySelectorAll` — and it names BOTH forms: the control's own, for the
+   final price, and the save form, for the product id and the cost the operator
+   has on screen. The confirm is handed VALUES, never a previewed number. #}
+{% if enabled %}
+<div class="mt-2 flex flex-col gap-2" data-product-final-price-confirm>
+  <button type="button" class="btn-primary"
+          hx-post="/web/product-final-price/confirm"
+          hx-include="#product-final-price-form, #product-edit-form"
+          hx-target="#product-price-ladder"
+          hx-swap="outerHTML">{{ localization.tr(crate::localization::MessageKey::ProductConfirmFinalPrice) }}</button>
+  {# What confirming actually commits, said BEFORE the button exists rather than
+     discovered afterwards: the cost on screen is stored with the pair, because a
+     net derived from a cost the database does not hold is a price nobody could
+     re-derive. #}
+  <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductFinalPriceConfirmHelp) }}</div>
+</div>
+{% endif %}

@@ -6,12 +6,13 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    DocumentKind, DocumentQuery, DocumentRow, NewLineTax, NewPurchase, PaymentType, Purchase,
-    PurchaseLine, PurchaseListFilter, PurchasePayment, PurchaseStatus, UpdatePurchaseDraft,
+    DocumentKind, DocumentQuery, DocumentRow, NewLineTax, NewPurchase, PaymentType, PriceRefusal,
+    Purchase, PurchaseLine, PurchaseListFilter, PurchasePayment, PurchaseStatus,
+    UpdatePurchaseDraft,
 };
 use crate::repositories::tax_repo::active_taxes_for_product;
 use crate::repositories::tax_snapshot_repo::replace_purchase_line_taxes;
-use crate::services::line_taxes::{calculate_line_taxes, tax_inclusive_total};
+use crate::services::line_taxes::{calculate_line_taxes, line_net_amount, tax_inclusive_total};
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
@@ -310,7 +311,9 @@ impl SqlitePurchaseRepository {
         // the aggregate that summarizes it can never be committed apart.
         // Resolved through this transaction, like the creation path.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_cost, &taxes);
+        let calc = line_net_amount(qty, unit_cost)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // The DRAFT predicate is the statement's own, so a Confirmed purchase
         // cannot gain a line even if a caller skipped the service's guard.
@@ -363,7 +366,9 @@ impl SqlitePurchaseRepository {
 
         // Resolved through this transaction, like the creation path.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_cost, &taxes);
+        let calc = line_net_amount(qty, unit_cost)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // Statement-level DRAFT predicate again: when it matches nothing the
         // call is refused BEFORE any snapshot is deleted or inserted.
@@ -907,32 +912,56 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         #[cfg(test)]
         self.tick();
 
+        // The per-document fold is CHECKED, and a document it cannot carry is
+        // recorded as a refusal ON ITS ROW rather than as an error for the read.
+        //
+        // That is the difference between this surface and the record page: the
+        // index holds every document in the shop, so one that cannot be added up
+        // must not take the rest of the page down with it. The row keeps its
+        // place, states the rule, and shows no amount — publishing a number the
+        // arithmetic could not produce is the one thing this work unit exists to
+        // prevent. Every other family on this page is untouched.
         let mut totals: std::collections::BTreeMap<i64, Decimal> =
+            std::collections::BTreeMap::new();
+        let mut refused: std::collections::BTreeMap<i64, PriceRefusal> =
             std::collections::BTreeMap::new();
         for row in line_rows {
             let line = row_to_line(row);
-            *totals
-                .entry(line.purchase_id)
-                .or_insert_with(|| Decimal::ZERO) +=
-                tax_inclusive_total(line.subtotal(), line.tax_total);
+            let running = totals.entry(line.purchase_id).or_default();
+            match running.checked_add(tax_inclusive_total(line.subtotal(), line.tax_total)) {
+                Some(sum) => *running = sum,
+                // The document keeps folding — a later line of the same document
+                // cannot make the sum carryable — and the row will show no amount.
+                None => {
+                    refused.insert(line.purchase_id, PriceRefusal::DocumentTotalTooLarge);
+                }
+            }
         }
 
         Ok(purchases
             .into_iter()
-            .map(|(purchase, supplier_name)| DocumentRow {
-                kind: DocumentKind::Purchase,
-                id: purchase.id,
-                owner_id: purchase.id,
-                reference: purchase
-                    .purchase_number
-                    .clone()
-                    .unwrap_or_else(|| format!("Draft #{}", purchase.id)),
-                party: supplier_name,
-                date: purchase.purchase_date,
-                detail: purchase.status.to_string(),
-                amount: Some(totals.remove(&purchase.id).unwrap_or_default()),
-                quantity: None,
-                created_by: purchase.created_by,
+            .map(|(purchase, supplier_name)| {
+                let total_refusal = refused.remove(&purchase.id);
+                DocumentRow {
+                    kind: DocumentKind::Purchase,
+                    id: purchase.id,
+                    owner_id: purchase.id,
+                    reference: purchase
+                        .purchase_number
+                        .clone()
+                        .unwrap_or_else(|| format!("Draft #{}", purchase.id)),
+                    party: supplier_name,
+                    date: purchase.purchase_date,
+                    detail: purchase.status.to_string(),
+                    amount: if total_refusal.is_some() {
+                        None
+                    } else {
+                        Some(totals.remove(&purchase.id).unwrap_or_default())
+                    },
+                    total_refusal,
+                    quantity: None,
+                    created_by: purchase.created_by,
+                }
             })
             .collect())
     }
@@ -1001,6 +1030,10 @@ impl PurchaseRepository for SqlitePurchaseRepository {
                     date: row.get("date"),
                     detail: "Pago".to_string(),
                     amount: Some(parse_decimal(&amount_str)),
+                    // A payment row carries its OWN stored amount, never a sum of
+                    // a document's lines, so there is no document total here to
+                    // refuse.
+                    total_refusal: None,
                     quantity: None,
                     created_by: row.get("created_by"),
                 }

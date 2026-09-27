@@ -1,0 +1,11 @@
+{# The drawer's AUDIT ATTRIBUTION line: who registered the product, and who last
+   changed it (M5 Phase B, final price markup M1).
+
+   A partial, and the reason is the same as every other one in this change: a
+   confirmed conversion is a product update, so it moves `updated_by` and
+   `updated_at`. A line still naming the PREVIOUS editor after the operator has
+   just changed the product is a wrong fact about an audit, which is the last
+   thing this drawer should be wrong about. The names are resolved in the wiring
+   layer, never here, because a department may not read identity tables (AC20)
+   and the view must show a name and never an id. #}
+<div id="product-audit-line" class="text-[13px] text-muted" data-product-audit>{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ name }}{% endif %}</div>

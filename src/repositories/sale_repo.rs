@@ -6,12 +6,12 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    DocumentKind, DocumentQuery, DocumentRow, NewLineTax, NewSale, PaymentType, Sale, SaleLine,
-    SaleListFilter, SalePayment, SaleStatus, UpdateSaleDraft,
+    DocumentKind, DocumentQuery, DocumentRow, NewLineTax, NewSale, PaymentType, PriceRefusal, Sale,
+    SaleLine, SaleListFilter, SalePayment, SaleStatus, UpdateSaleDraft,
 };
 use crate::repositories::tax_repo::active_taxes_for_product;
 use crate::repositories::tax_snapshot_repo::replace_sale_line_taxes;
-use crate::services::line_taxes::{calculate_line_taxes, tax_inclusive_total};
+use crate::services::line_taxes::{calculate_line_taxes, line_net_amount, tax_inclusive_total};
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap_or(Decimal::ZERO)
@@ -340,7 +340,9 @@ impl SqliteSaleRepository {
         // apart. The resolver takes this transaction's connection, so the taxes
         // a line is snapshotted with are the ones its own transaction saw.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_price, &taxes);
+        let calc = line_net_amount(qty, unit_price)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // The DRAFT predicate is the statement's own: a Confirmed sale matches
         // no row and the insert is a no-op, not a line on closed history.
@@ -395,7 +397,9 @@ impl SqliteSaleRepository {
 
         // Resolved through this transaction, like the creation path.
         let taxes = active_taxes_for_product(&mut tx, product_id).await?;
-        let calc = calculate_line_taxes(qty * unit_price, &taxes);
+        let calc = line_net_amount(qty, unit_price)
+            .and_then(|net| calculate_line_taxes(net, &taxes))
+            .map_err(AppError::PriceRefused)?;
 
         // The DRAFT predicate is in the UPDATE's own WHERE. If it matches
         // nothing, the line belongs to a closed document and NOTHING below
@@ -1011,30 +1015,51 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
 
+        // The per-document fold is CHECKED, and a document it cannot carry is
+        // recorded as a refusal ON ITS ROW rather than as an error for the read.
+        // The purchase twin says why at length; this is the same rule on the
+        // sales side of the same index: one document must not take the page down.
         let mut totals: std::collections::BTreeMap<i64, Decimal> =
+            std::collections::BTreeMap::new();
+        let mut refused: std::collections::BTreeMap<i64, PriceRefusal> =
             std::collections::BTreeMap::new();
         for row in line_rows {
             let line = row_to_line(row);
-            *totals.entry(line.sale_id).or_insert_with(|| Decimal::ZERO) +=
-                tax_inclusive_total(line.subtotal(), line.tax_total);
+            let running = totals.entry(line.sale_id).or_default();
+            match running.checked_add(tax_inclusive_total(line.subtotal(), line.tax_total)) {
+                Some(sum) => *running = sum,
+                // The document keeps folding — a later line of the same document
+                // cannot make the sum carryable — and the row will show no amount.
+                None => {
+                    refused.insert(line.sale_id, PriceRefusal::DocumentTotalTooLarge);
+                }
+            }
         }
 
         Ok(sales
             .into_iter()
-            .map(|sale| DocumentRow {
-                kind: DocumentKind::Sale,
-                id: sale.id,
-                owner_id: sale.id,
-                reference: sale
-                    .sale_number
-                    .clone()
-                    .unwrap_or_else(|| format!("Draft #{}", sale.id)),
-                party: sale.customer_name.clone(),
-                date: sale.sale_date,
-                detail: sale.status.to_string(),
-                amount: Some(totals.remove(&sale.id).unwrap_or_default()),
-                quantity: None,
-                created_by: sale.created_by,
+            .map(|sale| {
+                let total_refusal = refused.remove(&sale.id);
+                DocumentRow {
+                    kind: DocumentKind::Sale,
+                    id: sale.id,
+                    owner_id: sale.id,
+                    reference: sale
+                        .sale_number
+                        .clone()
+                        .unwrap_or_else(|| format!("Draft #{}", sale.id)),
+                    party: sale.customer_name.clone(),
+                    date: sale.sale_date,
+                    detail: sale.status.to_string(),
+                    amount: if total_refusal.is_some() {
+                        None
+                    } else {
+                        Some(totals.remove(&sale.id).unwrap_or_default())
+                    },
+                    total_refusal,
+                    quantity: None,
+                    created_by: sale.created_by,
+                }
             })
             .collect())
     }
@@ -1104,6 +1129,10 @@ impl SaleRepository for SqliteSaleRepository {
                     date: row.get("date"),
                     detail: "Pago".to_string(),
                     amount: Some(parse_decimal(&amount_str)),
+                    // A payment row carries its OWN stored amount, never a sum of
+                    // a document's lines, so there is no document total here to
+                    // refuse.
+                    total_refusal: None,
                     quantity: None,
                     created_by: row.get("created_by"),
                 }

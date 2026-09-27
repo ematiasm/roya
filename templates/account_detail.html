@@ -6,7 +6,11 @@
   <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::AccountTitle) }}</div>
   <div class="flex items-center justify-between gap-3">
     <h2 class="m-0 text-2xl font-semibold">{{ account.name }}</h2>
-    <span class="text-[22px] font-bold tabular-nums {% if account.is_negative() %}text-danger{% else %}text-income{% endif %}">{{ localization.format_currency(account.balance.clone()) }}</span>
+    {# A detail page is a list of one, and the rule is the same: the account keeps
+       its name, its id and its history, and the balance states why it cannot be
+       stated. The transaction feed below is untouched — each transaction is its
+       own bounded amount. #}
+    <span class="text-[22px] font-bold tabular-nums {% if account.balance.is_empty() %}text-danger{% else if account.negative %}text-danger{% else %}text-income{% endif %}">{% if account.balance.is_empty() %}<span data-account-balance-refusal data-document-total-refusal>{{ account.balance_message }}</span>{% else %}{{ account.balance }}{% endif %}</span>
   </div>
   <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::AccountDerived) }} • {{ localization.tr(crate::localization::MessageKey::AccountIdLabel) }} {{ account.id }} • {{ localization.tr(crate::localization::MessageKey::CommonDate) }} {{ localization.format_timestamp(account.created_at.clone()) }}</div>
   <div class="mt-1 text-[13px] text-muted">

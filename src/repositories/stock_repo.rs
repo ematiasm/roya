@@ -3,7 +3,7 @@ use rust_decimal::Decimal;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::str::FromStr;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::{
     DocumentKind, DocumentQuery, DocumentRow, MovementReason, MovementType, NewMovement,
     StockMovement,
@@ -172,18 +172,47 @@ impl StockMovementRepository for SqliteStockMovementRepository {
     }
 
     async fn stock_for_product(&self, product_id: i64) -> AppResult<Decimal> {
-        let rows = sqlx::query(r#"SELECT qty, type FROM stock_movements WHERE product_id = ?"#)
-            .bind(product_id)
-            .fetch_all(&self.pool)
-            .await?;
-        let mut total = Decimal::ZERO;
-        for row in rows {
-            let qty_str: String = row.get("qty");
-            let type_str: String = row.get("type");
-            let qty = parse_decimal(&qty_str);
-            total += signed_contribution(type_from_str(&type_str), qty);
-        }
-        Ok(total)
+        // `ORDER BY id` is load-bearing, for the same reason as the account
+        // balance fold: the check below is on the running sum, so the row order
+        // decides which prefixes it sees, and without an `ORDER BY` the
+        // `idx_stock_movements_product_date` index on `(product_id, date)` can
+        // return DATE order while `InventoryService::record_movement` folded the
+        // same rows in INSERTION order. The two can then walk different prefixes
+        // of a range that runs out — `In 7.9e28 (d1)`, `Out 0.05e28 (d2)`,
+        // `In 0.05e28 (d3)` passes the write pre-check in id order
+        // (`7.9 / 7.85 / 7.9`) while a date-ordered fold walks
+        // `0.05 / 7.95 → 7.95e28`, refusing a level the pre-check approved. `id`
+        // order IS the write order, and the sort is over the product's own rows on
+        // a column the planner already filters on.
+        let rows = sqlx::query(
+            r#"SELECT qty, type FROM stock_movements WHERE product_id = ? ORDER BY id"#,
+        )
+        .bind(product_id)
+        .fetch_all(&self.pool)
+        .await?;
+        // A stock level is a SET SUM over the product's movements, and every one of
+        // them was written from a request's quantity: a bounded movement says
+        // nothing about the sum of a set of them, exactly as a bounded line says
+        // nothing about a document total. Two incoming movements of `4e28` each
+        // carry and are `8e28` together, so the fold is checked and the level
+        // refuses rather than panicking on the product drawer, the stock list and
+        // every stock check that reads it.
+        //
+        // THE FOLD IS THE GUARANTEE, not an induction over `record_movement`'s
+        // pre-check: that pre-check validates `current + delta` where `current` is
+        // this very fold, which is a claim about the whole sum and not about the
+        // prefixes of the fold's own iteration. What it buys is that the common
+        // case refuses EARLY, with a useful message, rather than waiting for a
+        // read to find it — and with the `ORDER BY id` above, the two agree on the
+        // prefixes as well as on the total.
+        let signed: Vec<Decimal> = rows
+            .iter()
+            .map(|row| {
+                let qty = parse_decimal(&row.get::<String, _>("qty"));
+                signed_contribution(type_from_str(&row.get::<String, _>("type")), qty)
+            })
+            .collect();
+        Ok(crate::repositories::checked_aggregate_sum(&signed).map_err(AppError::PriceRefused)?)
     }
 
     async fn list_document_rows(&self, query: &DocumentQuery) -> AppResult<Vec<DocumentRow>> {
@@ -268,6 +297,10 @@ impl StockMovementRepository for SqliteStockMovementRepository {
                     // pill reads the stored tokens, e.g. `In · Purchase`.
                     detail: format!("{movement_type} · {reason}"),
                     amount: None,
+                    // The only family with no money, so it has no document total
+                    // to refuse: `amount` is `None` because there is no amount,
+                    // never because one could not be computed.
+                    total_refusal: None,
                     quantity: Some(parse_decimal(&qty_str)),
                     created_by: row.get("created_by"),
                 }

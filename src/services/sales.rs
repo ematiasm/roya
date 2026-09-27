@@ -29,8 +29,9 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     format_sale_number, Ageing, Customer, CustomerAgeing, CustomerStatement, DebtSummary,
     LineTaxView, MovementReason, MovementType, NewMovement, NewSale, PaymentStatus, PaymentType,
-    ProductKind, Sale, SaleDetail, SaleLine, SaleLineView, SaleListFilter, SalePayment,
-    SalePaymentView, SaleRecord, StatementEntry, StatementEntryKind, UpdateSaleDraft,
+    PriceRefusal, ProductKind, RecordMoney, Sale, SaleDetail, SaleLine, SaleLineView,
+    SaleListFilter, SaleListRow, SalePayment, SalePaymentView, SaleRecord, SetMoney,
+    StatementEntry, StatementEntryKind, UpdateSaleDraft,
 };
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, CustomerRepository,
@@ -38,7 +39,7 @@ use crate::repositories::{
     StockMovementRepository, TransactionRepository,
 };
 use crate::services::line_taxes::tax_inclusive_total;
-use crate::services::CustomerService;
+use crate::services::{checked_money_add, checked_money_sum, CustomerService};
 
 /// How many of the oldest unpaid documents the sales page debt banner renders.
 pub const DEBT_BANNER_LIMIT: usize = 5;
@@ -192,58 +193,185 @@ where
     /// document. That is deliberate: the record page shows the line totals, so a
     /// document total that did not equal their sum would be unauditable. The
     /// two differ whenever a line's net part carries a third decimal.
-    fn tax_split(lines: &[SaleLine]) -> (Decimal, Decimal, Decimal) {
+    ///
+    /// # Every accumulation is checked, and the signature is what makes that so
+    ///
+    /// This returns a `Result` rather than a tuple, and every one of the three
+    /// folds inside it is `checked_add`. Per-line carryability — the invariant
+    /// T1 and T2 established — says NOTHING about a sum: two lines of `4e28` are
+    /// each representable, each is stored by the real checked write, and
+    /// `4e28 + 4e28 = 8e28` is above `Decimal::MAX`. rust_decimal's raw `+=`
+    /// panics on that, this crate has no `catch_unwind`, and the panic happens on
+    /// a READ — after the second line's INSERT has already committed, which
+    /// leaves a document that no surface can open.
+    ///
+    /// A `Result` here, rather than a checked helper offered to the callers, is
+    /// the same argument the tax contract itself makes: a comment saying "check
+    /// this add" rots, and a helper still leaves every raw `+` at every call
+    /// site in place. A caller cannot forget the guard here, because the
+    /// signature will not compile until they handle it.
+    ///
+    /// # Why the census could not have caught it, in one sentence
+    ///
+    /// A wider write bound would not survive a direct SQL insert, a per-line
+    /// census cannot see a property of a SET of rows, and the sum is performed
+    /// here, so this is the only layer that can make it total. The refusal is
+    /// therefore its own rule, [`PriceRefusal::DocumentTotalTooLarge`], and not
+    /// either line rule: every line of the document is fine, so a line-amount or
+    /// tax-arithmetic sentence would send the operator to fix a number that is
+    /// already correct.
+    fn tax_split(lines: &[SaleLine]) -> Result<(Decimal, Decimal, Decimal), PriceRefusal> {
         let mut net = Decimal::ZERO;
         let mut tax = Decimal::ZERO;
         let mut total = Decimal::ZERO;
         for l in lines {
-            net += l.subtotal();
-            tax += l.tax_total;
-            total += tax_inclusive_total(l.subtotal(), l.tax_total);
+            net = net
+                .checked_add(l.subtotal())
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+            tax = tax
+                .checked_add(l.tax_total)
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+            total = total
+                .checked_add(tax_inclusive_total(l.subtotal(), l.tax_total))
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
         }
-        (net, tax, total)
+        Ok((net, tax, total))
     }
 
-    /// `total` is the tax-inclusive document total, so every payment ceiling,
-    /// overpayment refusal, due balance and debt figure derived here is measured
-    /// against the money the customer actually owes.
-    fn totals(lines: &[SaleLine], payments: &[SalePayment]) -> (Decimal, Decimal, Decimal) {
-        let (_, _, total) = Self::tax_split(lines);
+    /// What a document has been paid and what is still owed. Checked for the same
+    /// reason [`Self::tax_split`] is: it is a sum of stored amounts, and the
+    /// payment ceiling that keeps `paid <= total` is enforced by the service's
+    /// own write path, not by the column. `total - paid` is checked too, so the
+    /// due balance is a fact the code can state rather than one it assumes.
+    fn paid_and_due(
+        total: Decimal,
+        payments: &[SalePayment],
+    ) -> Result<(Decimal, Decimal), PriceRefusal> {
         let mut paid = Decimal::ZERO;
         for p in payments {
-            paid += p.amount;
+            paid = paid
+                .checked_add(p.amount)
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
         }
-        let due = total - paid;
-        (total, paid, due)
+        let due = total
+            .checked_sub(paid)
+            .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+        Ok((paid, due))
     }
 
-    /// Fold a sale and its children into the `SaleDetail` shape every derived
-    /// read uses, so `total`/`paid`/`due` are computed in exactly one place.
-    fn assemble_detail(sale: Sale, lines: Vec<SaleLine>, payments: Vec<SalePayment>) -> SaleDetail {
-        let (net_subtotal, tax_total, total) = Self::tax_split(&lines);
-        let mut paid = Decimal::ZERO;
-        for p in &payments {
-            paid += p.amount;
-        }
-        let due = total - paid;
-        let payment_status = SaleDetail::payment_status_for(total, paid);
-        SaleDetail {
-            sale,
-            lines,
-            payments,
+    /// The whole document-level money as ONE value, or the rule that refused it.
+    ///
+    /// This is the ONE place a sale's document money is derived: the detail, the
+    /// record view and the payment ceiling all read it, so a figure can never be
+    /// computed two ways. The refusal travels with the figures because they are
+    /// one fact — a document whose lines cannot be added up has no net, no tax
+    /// total, no total, no due and no payment status either, and returning them
+    /// separately would let a caller publish a due balance derived from a total
+    /// that does not exist.
+    fn document_money(
+        lines: &[SaleLine],
+        payments: &[SalePayment],
+    ) -> Result<RecordMoney, PriceRefusal> {
+        let (net_subtotal, tax_total, total) = Self::tax_split(lines)?;
+        let (paid, due) = Self::paid_and_due(total, payments)?;
+        Ok(RecordMoney {
             net_subtotal,
             tax_total,
             total,
             paid,
             due,
-            payment_status,
+            payment_status: SaleDetail::payment_status_for(total, paid),
+        })
+    }
+
+    /// One document as a LIST ROW: identity and non-money facts always, money when
+    /// the arithmetic carried it, and the rule when it did not.
+    ///
+    /// This is what makes a list page total, and it is the tolerant twin of
+    /// [`Self::assemble_detail`]: a page must be able to SHOW a document whose
+    /// lines cannot be added up, with no figure, instead of answering an error and
+    /// taking every other document on the page with it. Both call the same
+    /// checked [`Self::document_money`], so they cannot disagree about which
+    /// documents are refusable.
+    fn row_for(sale: Sale, lines: &[SaleLine], payments: &[SalePayment]) -> SaleListRow {
+        let (money, total_refusal) = match Self::document_money(lines, payments) {
+            Ok(money) => (Some(money), None),
+            Err(refusal) => (None, Some(refusal)),
+        };
+        SaleListRow {
+            sale,
+            money,
+            total_refusal,
         }
+    }
+
+    /// A SET of documents' figures, as one [`SetMoney`].
+    ///
+    /// ONE refused member means the set has no figure at all: the figures that did
+    /// add up are not published, because a sum missing one of its documents is
+    /// indistinguishable from a real one. A sum that overflows on its own refuses
+    /// the same way, which is the whole reason the accumulation is checked.
+    fn set_sum(rows: &[SaleListRow], figure: impl Fn(&RecordMoney) -> Decimal) -> SetMoney {
+        let mut sum = Decimal::ZERO;
+        for row in rows {
+            let Some(money) = row.money else {
+                return SetMoney::refused(
+                    row.total_refusal
+                        .unwrap_or(PriceRefusal::DocumentTotalTooLarge),
+                );
+            };
+            match checked_money_add(sum, figure(&money)) {
+                Ok(next) => sum = next,
+                Err(refusal) => return SetMoney::refused(refusal),
+            }
+        }
+        SetMoney::amount(sum)
+    }
+
+    /// `total` is the tax-inclusive document total, so every payment ceiling,
+    /// overpayment refusal, due balance and debt figure derived here is measured
+    /// against the money the customer actually owes.
+    fn totals(
+        lines: &[SaleLine],
+        payments: &[SalePayment],
+    ) -> Result<(Decimal, Decimal, Decimal), PriceRefusal> {
+        let money = Self::document_money(lines, payments)?;
+        Ok((money.total, money.paid, money.due))
+    }
+
+    /// Fold a sale and its children into the `SaleDetail` shape every derived
+    /// read uses, so `total`/`paid`/`due` are computed in exactly one place.
+    ///
+    /// The refusal PROPAGATES: every consumer of a `SaleDetail` — the record
+    /// page's totals, the list pages, the debt figure, the JSON API — is a
+    /// consumer of this document's money, and a detail that carried a total
+    /// nobody could compute would be a number the rest of the application would
+    /// then do arithmetic with. The record page is the one surface that must not
+    /// answer an error, and it reads through [`Self::record_from_parts`], which
+    /// keeps the document and states the refusal instead of dropping either.
+    fn assemble_detail(
+        sale: Sale,
+        lines: Vec<SaleLine>,
+        payments: Vec<SalePayment>,
+    ) -> AppResult<SaleDetail> {
+        let money = Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        Ok(SaleDetail {
+            sale,
+            lines,
+            payments,
+            net_subtotal: money.net_subtotal,
+            tax_total: money.tax_total,
+            total: money.total,
+            paid: money.paid,
+            due: money.due,
+            payment_status: money.payment_status,
+        })
     }
 
     async fn detail_for(&self, sale: Sale) -> AppResult<SaleDetail> {
         let lines = self.sales.list_lines(sale.id).await?;
         let payments = self.sales.list_payments(sale.id).await?;
-        Ok(Self::assemble_detail(sale, lines, payments))
+        Self::assemble_detail(sale, lines, payments)
     }
 
     fn ensure_draft(sale: &Sale) -> AppResult<()> {
@@ -437,14 +565,49 @@ where
     /// Record-page view for `/sales/{id}`: resolves product, account and method
     /// names through the existing inventory and finance read paths, so the
     /// route never runs SQL of its own and never prints an internal key.
+    ///
+    /// It reads through [`Self::record_from_parts`] and NOT through
+    /// `get_detail`, on purpose. A `SaleDetail` propagates the document-total
+    /// refusal, and this view must not lose the document because of it: a
+    /// refused detail would make the record page an error page, and an operator
+    /// who cannot open a document cannot reduce it.
     pub async fn get_record(&self, sale_id: i64) -> AppResult<SaleRecord> {
-        let detail = self.get_detail(sale_id).await?;
-        self.record_from_detail(detail).await
+        let sale = self
+            .sales
+            .find_sale(sale_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("sale {sale_id} not found")))?;
+        let lines = self.sales.list_lines(sale.id).await?;
+        let payments = self.sales.list_payments(sale.id).await?;
+        self.record_from_parts(sale, lines, payments).await
     }
 
-    async fn record_from_detail(&self, detail: SaleDetail) -> AppResult<SaleRecord> {
-        let mut lines = Vec::with_capacity(detail.lines.len());
-        for line in detail.lines {
+    /// The one read that renders a document whose money cannot be computed.
+    ///
+    /// Every line is resolved and shown with its own net, tax and tax-inclusive
+    /// total, because each of those IS representable — that is the per-line
+    /// invariant this whole work unit leans on. What is missing is the document's
+    /// own arithmetic, and it is missing as an absence: `money` is `None` and
+    /// `total_refusal` names the rule, so the page states the refusal instead of
+    /// publishing a number derived from a sum that could not be made, and the
+    /// operator can see which lines the document carries and remove one.
+    async fn record_from_parts(
+        &self,
+        sale: Sale,
+        stored_lines: Vec<SaleLine>,
+        stored_payments: Vec<SalePayment>,
+    ) -> AppResult<SaleRecord> {
+        // Resolved BEFORE the children are consumed below, and it is the only
+        // thing that can fail: every name, tax snapshot and amount this view
+        // shows is a fact about ONE line, and a line's own money is
+        // representable.
+        let (money, total_refusal) = match Self::document_money(&stored_lines, &stored_payments) {
+            Ok(money) => (Some(money), None),
+            Err(refusal) => (None, Some(refusal)),
+        };
+
+        let mut lines = Vec::with_capacity(stored_lines.len());
+        for line in stored_lines {
             let product = self.inventory.get_product(line.product_id).await?;
             // The same predicate confirm and cancel use to decide whether a
             // line moves stock; resolved from the product this read already
@@ -492,8 +655,7 @@ where
             .map(|method| (method.id, method.name))
             .collect();
 
-        let payments = detail
-            .payments
+        let payments = stored_payments
             .into_iter()
             .map(|payment| SalePaymentView {
                 id: payment.id,
@@ -511,15 +673,11 @@ where
             .collect();
 
         Ok(SaleRecord {
-            sale: detail.sale,
+            sale,
             lines,
             payments,
-            net_subtotal: detail.net_subtotal,
-            tax_total: detail.tax_total,
-            total: detail.total,
-            paid: detail.paid,
-            due: detail.due,
-            payment_status: detail.payment_status,
+            money,
+            total_refusal,
         })
     }
 
@@ -535,24 +693,69 @@ where
         Ok(out)
     }
 
+    /// The same documents as [`Self::list_details`], as LIST ROWS for the pages
+    /// that must render a document whose total cannot be computed. A refused
+    /// document keeps its place in the list; the read never fails because of one.
+    pub async fn list_rows(&self) -> AppResult<Vec<SaleListRow>> {
+        let sales = self.sales.list_sales().await?;
+        let mut out = Vec::with_capacity(sales.len());
+        for sale in sales {
+            out.push(self.row_of(sale).await?);
+        }
+        Ok(out)
+    }
+
+    /// One document's children, read the way [`Self::detail_for`] reads them, and
+    /// the row built from them.
+    async fn row_of(&self, sale: Sale) -> AppResult<SaleListRow> {
+        let lines = self.sales.list_lines(sale.id).await?;
+        let payments = self.sales.list_payments(sale.id).await?;
+        Ok(Self::row_for(sale, &lines, &payments))
+    }
+
     /// The same derived list narrowed by the server-side list filter. The
     /// criteria run inside the repository query, so only matching documents have
     /// their lines and payments loaded; totals stay derived by `detail_for`,
     /// never by a second summation.
+    ///
+    /// The STRICT twin of [`Self::list_rows_filtered`]: the same documents as
+    /// details, so a caller that makes a decision out of a document's money gets
+    /// the refusal instead of a missing figure. Kept for the read-bound test that
+    /// pins this read's query count, and for any future decision-shaped list;
+    /// `allow(dead_code)` because this crate is a binary, where a `pub` method
+    /// only the tests call still warns.
+    #[allow(dead_code)]
     pub async fn list_details_filtered(
         &self,
         filter: &SaleListFilter,
     ) -> AppResult<Vec<SaleDetail>> {
-        let mut repo_filter = filter.clone();
-        if let Some(name) = &filter.customer {
-            repo_filter.customer_ids = Some(self.matching_customer_ids(name).await?);
-        }
-        let sales = self.sales.list_sales_filtered(&repo_filter).await?;
+        let sales = self.filtered_sales(filter).await?;
         let mut out = Vec::with_capacity(sales.len());
         for sale in sales {
             out.push(self.detail_for(sale).await?);
         }
         Ok(out)
+    }
+
+    /// The same documents as [`Self::list_details_filtered`], as LIST ROWS.
+    pub async fn list_rows_filtered(&self, filter: &SaleListFilter) -> AppResult<Vec<SaleListRow>> {
+        let sales = self.filtered_sales(filter).await?;
+        let mut out = Vec::with_capacity(sales.len());
+        for sale in sales {
+            out.push(self.row_of(sale).await?);
+        }
+        Ok(out)
+    }
+
+    /// The list filter resolved to documents, so the strict and the tolerant read
+    /// cannot drift on WHICH documents a page shows — only on what one document's
+    /// money does.
+    async fn filtered_sales(&self, filter: &SaleListFilter) -> AppResult<Vec<Sale>> {
+        let mut repo_filter = filter.clone();
+        if let Some(name) = &filter.customer {
+            repo_filter.customer_ids = Some(self.matching_customer_ids(name).await?);
+        }
+        Ok(self.sales.list_sales_filtered(&repo_filter).await?)
     }
 
     /// Customer ids whose current name matches `needle` after normalization. The
@@ -578,25 +781,53 @@ where
     /// shape `outstanding_debt` returns. Cancelled sales never appear, cash sales
     /// never appear, and every total comes from `assemble_detail`, so the money is
     /// summed in Rust over the TEXT columns and never with SQL `SUM`.
+    ///
+    /// A document whose lines cannot be added up refuses here, and the refusal
+    /// PROPAGATES: this read exists for the callers that make a DECISION out of a
+    /// document's money — the credit-limit projection and a collection's
+    /// allocation — and a decision whose input cannot be stated has no answer to
+    /// give. The DISPLAYING reads use [`Self::customer_credit_rows`], which keeps
+    /// the document in the set and states the refusal in place of its figure.
     async fn customer_credit_details(&self, customer_id: i64) -> AppResult<Vec<SaleDetail>> {
         let rows = self.sales.list_customer_credit_ledger(customer_id).await?;
-        Ok(rows
-            .into_iter()
-            .map(|(sale, lines, payments)| Self::assemble_detail(sale, lines, payments))
-            .collect())
+        let mut details = Vec::with_capacity(rows.len());
+        for (sale, lines, payments) in rows {
+            details.push(Self::assemble_detail(sale, lines, payments)?);
+        }
+        Ok(details)
+    }
+
+    /// Confirmed credit sales of one customer as the DISPLAYING reads need them:
+    /// identity and non-money facts always, money when the arithmetic carried it.
+    ///
+    /// This is the tolerant twin of [`Self::customer_credit_details`], and the
+    /// difference is the whole of the list decision: a document whose lines cannot
+    /// be added up stays IN the set with its place preserved and no figure, so a
+    /// statement renders every invoice instead of hiding the customer's whole
+    /// ledger behind one of them. Both reads run the same checked derivation, so
+    /// they cannot disagree about which documents are refusable.
+    async fn customer_credit_rows(&self, customer_id: i64) -> AppResult<Vec<SaleListRow>> {
+        let rows = self.sales.list_customer_credit_ledger(customer_id).await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (sale, lines, payments) in rows {
+            out.push(Self::row_for(sale, &lines, &payments));
+        }
+        Ok(out)
     }
 
     /// Money owed by one customer: the sum of `due` (`total - paid`) over the
     /// Confirmed credit sales. A cancelled sale contributes nothing to either
     /// side, a fully paid sale contributes zero and a cash sale never contributes.
     /// Drives the credit-limit check and the statement balance.
+    ///
+    /// The sum itself is checked, and it is a DIFFERENT sum from the document
+    /// fold: these are each documents' dues added together, so two documents of
+    /// `4e28` reach a total no single document could. Every document here is
+    /// individually readable, which is exactly why a per-document guard cannot
+    /// cover this and the accumulation has to.
     pub async fn customer_balance(&self, customer_id: i64) -> AppResult<Decimal> {
-        Ok(self
-            .customer_credit_details(customer_id)
-            .await?
-            .iter()
-            .map(|detail| detail.due)
-            .sum())
+        let details = self.customer_credit_details(customer_id).await?;
+        checked_money_sum(details.iter().map(|detail| &detail.due)).map_err(AppError::PriceRefused)
     }
 
     /// The customer's outstanding debt sales, oldest first: `due_date`, then
@@ -605,7 +836,36 @@ where
     /// with `due > 0` appear, which is why a walk-in sale can never be allocated to:
     /// a confirmed credit sale always carries a due date (K2) and never belongs to
     /// the walk-in.
-    pub async fn customer_debt_sales(&self, customer_id: i64) -> AppResult<Vec<SaleDetail>> {
+    ///
+    /// Rows, not details: a document whose total cannot be computed is still one
+    /// of this customer's invoices, and a list that dropped it would understate
+    /// the debt. It is filtered in only when its due is unknown-or-positive, which
+    /// is every document that is not proven fully paid.
+    pub async fn customer_debt_sales(&self, customer_id: i64) -> AppResult<Vec<SaleListRow>> {
+        let mut rows: Vec<SaleListRow> = self
+            .customer_credit_rows(customer_id)
+            .await?
+            .into_iter()
+            .filter(|row| match row.money {
+                Some(money) => money.due > Decimal::ZERO,
+                None => true,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.sale
+                .due_date
+                .cmp(&b.sale.due_date)
+                .then_with(|| a.sale.sale_date.cmp(&b.sale.sale_date))
+                .then_with(|| a.sale.id.cmp(&b.sale.id))
+        });
+        Ok(rows)
+    }
+
+    /// The same debts as [`Self::customer_debt_sales`], as DETAILS, for the one
+    /// caller that makes a DECISION out of them: a collection allocates real money
+    /// against each due, so a document whose due cannot be stated has nothing to
+    /// allocate against and the read propagates the refusal.
+    pub async fn customer_debt_details(&self, customer_id: i64) -> AppResult<Vec<SaleDetail>> {
         let mut details: Vec<SaleDetail> = self
             .customer_credit_details(customer_id)
             .await?
@@ -625,36 +885,75 @@ where
     /// Add one sale's outstanding `due` to the bucket its `due_date` falls into
     /// against `as_of`: due today, not yet due and no due date are current;
     /// 1..=30, 31..=60 and >60 days late fill the other three.
-    fn add_to_ageing(ageing: &mut Ageing, detail: &SaleDetail, as_of: NaiveDate) {
-        if detail.due <= Decimal::ZERO {
+    ///
+    /// A document whose total cannot be computed is not bucketed, and it refuses
+    /// the WHOLE grid: its due is unknown, so any bucket could be the one that
+    /// lost it, and a grid that kept the other three would be publishing sums the
+    /// operator would add up to a total nobody can stand behind.
+    ///
+    /// A bucket that overflows refuses only ITSELF. That is the honest difference
+    /// between the two cases: an unknown `due` could have belonged anywhere, while
+    /// an overflow is a fact about the documents already in that bucket, and every
+    /// other bucket is still the complete sum of its own.
+    fn add_to_ageing(ageing: &mut Ageing, row: &SaleListRow, as_of: NaiveDate) {
+        let Some(money) = row.money else {
+            if let Some(refusal) = row.total_refusal {
+                *ageing = Ageing {
+                    current: SetMoney::refused(refusal),
+                    overdue_1_30: SetMoney::refused(refusal),
+                    overdue_31_60: SetMoney::refused(refusal),
+                    overdue_61_plus: SetMoney::refused(refusal),
+                };
+            }
+            return;
+        };
+        if money.due <= Decimal::ZERO {
             return;
         }
-        match detail
-            .sale
-            .due_date
-            .map(|due_date| (as_of - due_date).num_days())
-        {
-            None => ageing.current += detail.due,
-            Some(days) if days <= 0 => ageing.current += detail.due,
-            Some(days) if days <= 30 => ageing.overdue_1_30 += detail.due,
-            Some(days) if days <= 60 => ageing.overdue_31_60 += detail.due,
-            Some(_) => ageing.overdue_61_plus += detail.due,
+        let due_date = row.sale.due_date;
+        let days = due_date.map(|due_date| (as_of - due_date).num_days());
+        let bucket = match days {
+            None => &mut ageing.current,
+            Some(days) if days <= 0 => &mut ageing.current,
+            Some(days) if days <= 30 => &mut ageing.overdue_1_30,
+            Some(days) if days <= 60 => &mut ageing.overdue_31_60,
+            Some(_) => &mut ageing.overdue_61_plus,
+        };
+        match bucket.amount {
+            // Already refused: a later document cannot make the sum carryable, and
+            // the bucket stays a refusal so nothing can be read out of it.
+            None => {}
+            Some(current) => {
+                *bucket = match checked_money_add(current, money.due) {
+                    Ok(sum) => SetMoney::amount(sum),
+                    Err(refusal) => SetMoney::refused(refusal),
+                }
+            }
         }
     }
 
-    fn ageing_of(details: &[SaleDetail], as_of: NaiveDate) -> Ageing {
+    fn ageing_of(rows: &[SaleListRow], as_of: NaiveDate) -> Ageing {
         let mut ageing = Ageing::default();
-        for detail in details {
-            Self::add_to_ageing(&mut ageing, detail, as_of);
+        for row in rows {
+            Self::add_to_ageing(&mut ageing, row, as_of);
         }
         ageing
     }
 
     /// Ageing of the derived balance against an explicit `as_of`. Only sales with
     /// `due > 0` are bucketed, so `total()` always equals `customer_balance`.
+    ///
+    /// A document that cannot be totaled makes the ageing answer with the rule
+    /// rather than with buckets: this is a DISPLAY, and a report that dropped the
+    /// document would misstate the receivable.
+    ///
+    /// The single-customer form of the same read, for a caller that wants one
+    /// customer's ageing without their ledger. `allow(dead_code)` because this
+    /// crate is a binary and the pages reach the ageing through the statement.
+    #[allow(dead_code)]
     pub async fn customer_ageing(&self, customer_id: i64, as_of: NaiveDate) -> AppResult<Ageing> {
-        let details = self.customer_credit_details(customer_id).await?;
-        Ok(Self::ageing_of(&details, as_of))
+        let rows = self.customer_credit_rows(customer_id).await?;
+        Ok(Self::ageing_of(&rows, as_of))
     }
 
     /// Chronological ledger of the confirmed credit sales: sales as debits,
@@ -666,47 +965,64 @@ where
         customer_id: i64,
         as_of: NaiveDate,
     ) -> AppResult<CustomerStatement> {
-        let details = self.customer_credit_details(customer_id).await?;
-        let balance: Decimal = details.iter().map(|detail| detail.due).sum();
-        let ageing = Self::ageing_of(&details, as_of);
+        // ONE pass over the ledger, producing both the display row and the
+        // ledger entry for each document, so the statement never reads a document
+        // twice and the two can never disagree.
+        let ledger = self.sales.list_customer_credit_ledger(customer_id).await?;
+        let mut document_rows: Vec<SaleListRow> = Vec::with_capacity(ledger.len());
 
         // Intermediate rows kept only long enough to order the ledger before the
         // running balance is applied. Ties on the same date stay deterministic:
         // document number, then debits before credits, then source row id.
+        //
+        // The rows are the READ documents, so a document whose total cannot be
+        // computed still appears: its debit is a refusal, and the running balance
+        // from that entry on is one too, because a balance cannot be stated past a
+        // figure that does not exist.
         struct LedgerRow {
             date: NaiveDate,
             document: Option<String>,
             kind: StatementEntryKind,
             source_id: i64,
             description: &'static str,
-            debit: Decimal,
+            debit: SetMoney,
             credit: Decimal,
         }
 
         let mut rows: Vec<LedgerRow> = Vec::new();
-        for detail in &details {
-            let document = detail.sale.sale_number.clone();
+        for (sale, lines, payments) in &ledger {
+            let row = Self::row_for(sale.clone(), lines, payments);
+            let document = row.sale.sale_number.clone();
+            let debit = match (row.money, row.total_refusal) {
+                (Some(money), _) => SetMoney::amount(money.total),
+                (None, Some(refusal)) => SetMoney::refused(refusal),
+                (None, None) => SetMoney::amount(Decimal::ZERO),
+            };
             rows.push(LedgerRow {
-                date: detail.sale.sale_date,
+                date: row.sale.sale_date,
                 document: document.clone(),
                 kind: StatementEntryKind::Sale,
-                source_id: detail.sale.id,
+                source_id: row.sale.id,
                 description: "Credit sale",
-                debit: detail.total,
+                debit,
                 credit: Decimal::ZERO,
             });
-            for payment in &detail.payments {
+            for payment in payments {
                 rows.push(LedgerRow {
                     date: payment.date,
                     document: document.clone(),
                     kind: StatementEntryKind::Payment,
                     source_id: payment.id,
                     description: "Payment",
-                    debit: Decimal::ZERO,
+                    debit: SetMoney::amount(Decimal::ZERO),
                     credit: payment.amount,
                 });
             }
+            document_rows.push(row);
         }
+        let balance = Self::set_sum(&document_rows, |money| money.due);
+        let ageing = Self::ageing_of(&document_rows, as_of);
+
         rows.sort_by(|a, b| {
             a.date
                 .cmp(&b.date)
@@ -717,22 +1033,23 @@ where
                 .then_with(|| a.source_id.cmp(&b.source_id))
         });
 
-        let mut running = Decimal::ZERO;
-        let entries = rows
-            .into_iter()
-            .map(|row| {
-                running += row.debit - row.credit;
-                StatementEntry {
-                    date: row.date,
-                    kind: row.kind,
-                    document_number: row.document,
-                    description: row.description.to_string(),
-                    debit: row.debit,
-                    credit: row.credit,
-                    balance: running,
-                }
-            })
-            .collect();
+        // The running balance is checked for the same reason `balance` above is:
+        // it walks the same set of documents' figures, and a statement whose
+        // running balance stops being representable has no honest last row.
+        let mut running = SetMoney::amount(Decimal::ZERO);
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            running = Self::running_balance(running, &row.debit, row.credit);
+            entries.push(StatementEntry {
+                date: row.date,
+                kind: row.kind,
+                document_number: row.document,
+                description: row.description.to_string(),
+                debit: row.debit,
+                credit: row.credit,
+                balance: running,
+            });
+        }
 
         Ok(CustomerStatement {
             customer_id,
@@ -743,6 +1060,32 @@ where
         })
     }
 
+    /// One step of a statement's running balance: the figure it already holds,
+    /// this entry's debit — a refusal when the document cannot be totaled — and
+    /// the credit being applied.
+    ///
+    /// A refusal is STICKY: once the balance cannot be stated, no later entry can
+    /// restore it, because the figure that broke it is still missing from the sum.
+    /// A figure that resumed afterwards would be one this application cannot
+    /// stand behind.
+    fn running_balance(current: SetMoney, debit: &SetMoney, credit: Decimal) -> SetMoney {
+        let (Some(balance), Some(debit)) = (current.amount, debit.amount) else {
+            return SetMoney::refused(
+                debit
+                    .refusal
+                    .or(current.refusal)
+                    .unwrap_or(PriceRefusal::DocumentTotalTooLarge),
+            );
+        };
+        let Some(movement) = debit.checked_sub(credit) else {
+            return SetMoney::refused(PriceRefusal::DocumentTotalTooLarge);
+        };
+        match checked_money_add(balance, movement) {
+            Ok(running) => SetMoney::amount(running),
+            Err(refusal) => SetMoney::refused(refusal),
+        }
+    }
+
     fn statement_kind_rank(kind: StatementEntryKind) -> u8 {
         match kind {
             StatementEntryKind::Sale => 0,
@@ -751,28 +1094,41 @@ where
     }
 
     /// Receivables view: every customer with a non-zero derived balance and the
-    /// ageing of that balance as of `as_of`, ordered by customer id. Runs over the
-    /// same `SaleDetail` shape `outstanding_debt` uses.
+    /// ageing of that balance as of `as_of`, ordered by customer id.
+    ///
+    /// Both figures are sums over a SET of documents, so both are [`SetMoney`]s:
+    /// a receivables report that dropped the document it could not total would
+    /// understate what the shop is owed, and one that refused to render would
+    /// take every other customer's row with it.
     pub async fn ageing_all(&self, as_of: NaiveDate) -> AppResult<Vec<CustomerAgeing>> {
-        let mut balances: BTreeMap<i64, Decimal> = BTreeMap::new();
-        let mut ageings: BTreeMap<i64, Ageing> = BTreeMap::new();
-        for detail in self.list_details().await? {
-            if detail.sale.status != crate::models::SaleStatus::Confirmed
-                || detail.sale.payment_type != PaymentType::Credit
-            {
-                continue;
-            }
-            let customer_id = detail.sale.customer_id;
-            *balances.entry(customer_id).or_default() += detail.due;
-            Self::add_to_ageing(ageings.entry(customer_id).or_default(), &detail, as_of);
+        let mut rows: Vec<SaleListRow> = self.list_rows().await?;
+        // Only confirmed credit sales are receivables, and the filter runs on the
+        // rows so a refused document is judged on its status, never on its money.
+        rows.retain(|row| {
+            row.sale.status == crate::models::SaleStatus::Confirmed
+                && row.sale.payment_type == PaymentType::Credit
+        });
+        let mut by_customer: BTreeMap<i64, Vec<SaleListRow>> = BTreeMap::new();
+        for row in rows {
+            by_customer
+                .entry(row.sale.customer_id)
+                .or_default()
+                .push(row);
         }
-        Ok(balances
+        Ok(by_customer
             .into_iter()
-            .filter(|(_, balance)| *balance != Decimal::ZERO)
-            .map(|(customer_id, balance)| CustomerAgeing {
-                customer_id,
-                balance,
-                ageing: ageings.get(&customer_id).copied().unwrap_or_default(),
+            .filter_map(|(customer_id, rows)| {
+                let balance = Self::set_sum(&rows, |money| money.due);
+                let ageing = Self::ageing_of(&rows, as_of);
+                let settled = balance
+                    .amount
+                    .map(|amount| amount != Decimal::ZERO)
+                    .unwrap_or(true);
+                settled.then_some(CustomerAgeing {
+                    customer_id,
+                    balance,
+                    ageing,
+                })
             })
             .collect())
     }
@@ -791,16 +1147,31 @@ where
     /// The debt banner's read: the exact total owed and the number of unpaid
     /// documents, plus the oldest few. Three batched repository reads, so its query
     /// count stays constant as the shop's history grows; only the displayed rows
-    /// are assembled into full details. The totals are decimal sums in Rust, never
-    /// SQL `SUM` over the TEXT columns.
+    /// are read into rows. The totals are decimal sums in Rust, never SQL `SUM`
+    /// over the TEXT columns — and a checked one, because the banner's total is a
+    /// sum over every unpaid document in the shop.
+    ///
+    /// A document that cannot be totaled keeps its place in `oldest` and makes
+    /// `total` a refusal: a banner that quietly omitted it would misstate the
+    /// receivable, and a banner that refused to render would empty the panel for
+    /// the whole shop.
     pub async fn debt_summary(&self, limit: usize) -> AppResult<DebtSummary> {
         let ledger = self.sales.list_confirmed_credit_ledger_all().await?;
-        let mut unpaid: Vec<SaleDetail> = ledger
-            .into_iter()
-            .map(|(sale, lines, payments)| Self::assemble_detail(sale, lines, payments))
-            .filter(|detail| detail.due > Decimal::ZERO)
-            .collect();
-        let total = unpaid.iter().map(|detail| detail.due).sum();
+        let mut unpaid: Vec<SaleListRow> = Vec::with_capacity(ledger.len());
+        for (sale, lines, payments) in ledger {
+            let row = Self::row_for(sale, &lines, &payments);
+            // A document whose due is unknown is not proven paid, so it stays in
+            // the panel: it is one of the shop's unpaid documents as far as anyone
+            // can show.
+            let unpaid_document = match row.money {
+                Some(money) => money.due > Decimal::ZERO,
+                None => true,
+            };
+            if unpaid_document {
+                unpaid.push(row);
+            }
+        }
+        let total = Self::set_sum(&unpaid, |money| money.due);
         let count = unpaid.len();
         unpaid.truncate(limit);
         Ok(DebtSummary {
@@ -861,7 +1232,12 @@ where
             }
         }
 
-        let (total, _, _) = Self::totals(&lines, &self.sales.list_payments(sale_id).await?);
+        // The document's money is resolved BEFORE any write below — the stock
+        // movements, the finance rows, the sequence number. A confirmation that
+        // cannot state what the document costs must refuse with nothing written,
+        // exactly as it refuses an inactive product here.
+        let (total, _, _) = Self::totals(&lines, &self.sales.list_payments(sale_id).await?)
+            .map_err(AppError::PriceRefused)?;
 
         // The cash account is derived from the method, which belongs to exactly
         // one account: an invalid combination is impossible by construction.
@@ -909,7 +1285,12 @@ where
                 if self.enforce_credit_limit {
                     if let Some(limit) = customer.credit_limit {
                         let debt = self.customer_balance(customer.id).await?;
-                        let projected = debt + total;
+                        // Checked: the projected debt is the customer's existing
+                        // balance plus THIS document, two sums of documents'
+                        // figures, and a credit-limit check that cannot state the
+                        // projection has no answer to give.
+                        let projected =
+                            checked_money_add(debt, total).map_err(AppError::PriceRefused)?;
                         if projected > limit {
                             return Err(AppError::Validation(format!(
                                 "credit limit exceeded for {}: projected debt {projected} > limit {limit}",
@@ -924,7 +1305,9 @@ where
         // Pre-check strict stock to avoid sequence gap + partial moves.
         if !self.inventory.allow_negative_stock {
             for (line, _) in &tracked {
-                let current = self.inventory.stock(line.product_id).await?;
+                // The STRICT level: this is a decision, so it may not proceed on
+                // a figure nobody can state.
+                let current = self.inventory.stock_for_decision(line.product_id).await?;
                 if current - line.qty < Decimal::ZERO {
                     return Err(AppError::Validation(format!(
                         "insufficient stock: {current} would become {}",
@@ -1044,8 +1427,15 @@ where
         let account_id = self.resolve_method_account(method_id).await?;
         let lines = self.sales.list_lines(sale_id).await?;
         let payments = self.sales.list_payments(sale_id).await?;
-        let (total, paid, _) = Self::totals(&lines, &payments);
-        if paid + amount > total {
+        // The ceiling is measured against the DUE BALANCE, not against
+        // `paid + amount`. Both say the same thing while `paid <= total`, and
+        // only one of them can be computed at all: `amount` is an operator's
+        // unbounded input and `paid + amount` is a raw add, so an operator
+        // typing a payment of `4e28` against an ordinary sale would overflow
+        // here rather than be refused the overpayment they just typed. The
+        // message is unchanged, and the figures in it are stated, never summed.
+        let (total, paid, due) = Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+        if amount > due {
             return Err(AppError::Validation(format!(
                 "overpay rejected: paid {paid} + {amount} exceeds total {total}"
             )));
@@ -1113,6 +1503,19 @@ where
         if sale.status == crate::models::SaleStatus::Cancelled {
             return Err(AppError::Validation("sale already cancelled".into()));
         }
+
+        // The document's money is resolved BEFORE any write on this path, like
+        // every other expected rejection here. Without it, a discard would flip
+        // the status and only the read at the end would refuse, and an annulment
+        // would return the stock and post the refunds before refusing — a half
+        // applied reversal reported to the operator as a refusal. The refusal is
+        // recoverable instead: the record page is READABLE, so a line can be
+        // removed from it, and `delete_draft` removes a never-confirmed document
+        // outright without ever reading its money.
+        let lines = self.sales.list_lines(sale_id).await?;
+        let payments = self.sales.list_payments(sale_id).await?;
+        Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+
         if sale.status == crate::models::SaleStatus::Draft {
             // Draft -> Cancelled: no-op, no stock/finance.
             let cancelled = self
@@ -1123,8 +1526,6 @@ where
         }
 
         // Confirmed -> Cancelled: re-enter stock + refunds.
-        let lines = self.sales.list_lines(sale_id).await?;
-        let payments = self.sales.list_payments(sale_id).await?;
         let sale_number = sale
             .sale_number
             .clone()
@@ -1672,7 +2073,10 @@ mod tests {
         assert_eq!(detail.due, Decimal::ZERO);
         assert_eq!(detail.payment_status, PaymentStatus::Paid);
         // Stock deducted: 10 - 3 = 7.
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("7"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("7")
+        );
         // 1 Income + 0 other.
         assert_eq!(tx_count(&pool).await, 1);
         let rows = s
@@ -1731,7 +2135,10 @@ mod tests {
         assert_eq!(detail.paid, Decimal::ZERO);
         assert_eq!(detail.due, dec("24"));
         assert_eq!(detail.payment_status, PaymentStatus::Unpaid);
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("8")
+        );
         assert_eq!(tx_count(&pool).await, 0);
     }
 
@@ -1770,10 +2177,11 @@ mod tests {
         assert_eq!(record.payments.len(), 1);
         assert_eq!(record.payments[0].account_name, acc.name);
         assert_eq!(record.payments[0].method_name, "Cash");
-        assert_eq!(record.total, dec("40"));
-        assert_eq!(record.paid, dec("10"));
-        assert_eq!(record.due, dec("30"));
-        assert_eq!(record.payment_status, PaymentStatus::Partial);
+        let money = record.money.expect("an ordinary document totals");
+        assert_eq!(money.total, dec("40"));
+        assert_eq!(money.paid, dec("10"));
+        assert_eq!(money.due, dec("30"));
+        assert_eq!(money.payment_status, PaymentStatus::Partial);
 
         let draft = draft_with_line(
             &s,
@@ -2048,7 +2456,10 @@ mod tests {
             .await
             .unwrap();
         let number = confirmed.sale.sale_number.clone().unwrap();
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("6"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("6")
+        );
         assert_eq!(tx_count(&pool).await, 1);
 
         let cancelled = s
@@ -2057,7 +2468,10 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.sale.status, crate::models::SaleStatus::Cancelled);
         // Stock re-entered: 6 + 4 = 10.
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("10"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("10")
+        );
         // Refund Expense created: Income + Expense = 2 rows, net 0.
         assert_eq!(tx_count(&pool).await, 2);
         let rows = s
@@ -2116,7 +2530,10 @@ mod tests {
         s.confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
             .unwrap();
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("8")
+        );
         // Drain account: Income 20, then Expense 20 => balance 0.
         s.transactions
             .create(
@@ -2136,7 +2553,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         // No stock re-entry, no extra refund.
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("8"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("8")
+        );
         assert_eq!(tx_count(&pool).await, 2); // Income + gasto, no refund
 
         // With allow_negative=true the same cancel succeeds.
@@ -2181,7 +2601,10 @@ mod tests {
         s2.cancel(audit_actor(&s2).await, sale2.id, None)
             .await
             .unwrap();
-        assert_eq!(s2.inventory.stock(prod2.id).await.unwrap(), dec("10"));
+        assert_eq!(
+            s2.inventory.stock_for_decision(prod2.id).await.unwrap(),
+            dec("10")
+        );
     }
 
     // -- Annulment pre-validation: aggregate per account + partial detection ------
@@ -3587,7 +4010,7 @@ mod tests {
             .customer_ageing(CREDIT_CUSTOMER_ID, sale_date())
             .await
             .unwrap();
-        assert_eq!(ageing.total(), Decimal::ZERO);
+        assert_eq!(ageing.total(), SetMoney::amount(Decimal::ZERO));
     }
 
     /// AC9: every bucket boundary is exact — due today, 1, 30, 31, 60 and 61 days
@@ -3651,20 +4074,28 @@ mod tests {
         let ageing = s.customer_ageing(CREDIT_CUSTOMER_ID, as_of).await.unwrap();
         assert_eq!(
             ageing.current,
-            dec("30"),
+            SetMoney::amount(dec("30")),
             "due today, not yet due and no due date"
         );
-        assert_eq!(ageing.overdue_1_30, dec("20"), "exactly 1 and 30 days late");
+        assert_eq!(
+            ageing.overdue_1_30,
+            SetMoney::amount(dec("20")),
+            "exactly 1 and 30 days late"
+        );
         assert_eq!(
             ageing.overdue_31_60,
-            dec("20"),
+            SetMoney::amount(dec("20")),
             "exactly 31 and 60 days late"
         );
-        assert_eq!(ageing.overdue_61_plus, dec("10"), "exactly 61 days late");
-        assert_eq!(ageing.total(), dec("80"));
+        assert_eq!(
+            ageing.overdue_61_plus,
+            SetMoney::amount(dec("10")),
+            "exactly 61 days late"
+        );
+        assert_eq!(ageing.total().amount, Some(dec("80")));
         assert_eq!(
             s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
-            ageing.total()
+            ageing.total().amount.unwrap()
         );
     }
 
@@ -3750,18 +4181,21 @@ mod tests {
         let rows = s.ageing_all(as_of).await.unwrap();
         assert_eq!(rows.len(), 2, "only non-zero balances are listed");
         assert_eq!(rows[0].customer_id, ana.id);
-        assert_eq!(rows[0].balance, dec("60"));
-        assert_eq!(rows[0].ageing.current, dec("30"));
-        assert_eq!(rows[0].ageing.overdue_1_30, dec("30"));
+        assert_eq!(rows[0].balance.amount, Some(dec("60")));
+        assert_eq!(rows[0].ageing.current, SetMoney::amount(dec("30")));
+        assert_eq!(rows[0].ageing.overdue_1_30, SetMoney::amount(dec("30")));
         assert_eq!(rows[0].ageing.total(), rows[0].balance);
         assert_eq!(rows[1].customer_id, bruno.id);
-        assert_eq!(rows[1].balance, dec("40"));
-        assert_eq!(rows[1].ageing.overdue_61_plus, dec("40"));
+        assert_eq!(rows[1].balance.amount, Some(dec("40")));
+        assert_eq!(rows[1].ageing.overdue_61_plus, SetMoney::amount(dec("40")));
         assert!(rows.iter().all(|row| row.customer_id != carla.id));
         assert!(rows.iter().all(|row| row.customer_id != WALKIN_ID));
 
-        let summed: Decimal = rows.iter().map(|row| row.ageing.total()).sum();
-        let balances: Decimal = rows.iter().map(|row| row.balance).sum();
+        let summed: Decimal = rows
+            .iter()
+            .map(|row| row.ageing.total().amount.unwrap())
+            .sum();
+        let balances: Decimal = rows.iter().map(|row| row.balance.amount.unwrap()).sum();
         assert_eq!(summed, dec("100"));
         assert_eq!(summed, balances);
         for row in &rows {
@@ -3873,19 +4307,27 @@ mod tests {
             .unwrap();
         assert_eq!(statement.customer_id, CREDIT_CUSTOMER_ID);
         assert_eq!(statement.as_of, as_of);
-        assert_eq!(statement.balance, dec("50")); // 150 sales - 100 payments
+        // 150 sales - 100 payments. The figures are `SetMoney`s because they are
+        // sums over a SET of documents; on a receivable that totals they are the
+        // amounts, unchanged.
+        assert_eq!(statement.balance.amount, Some(dec("50")));
+        assert_eq!(statement.balance.refusal, None);
         assert_eq!(
             s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
-            statement.balance
+            statement.balance.amount.unwrap()
         );
         assert_eq!(statement.ageing.total(), statement.balance);
 
         assert_eq!(statement.entries.len(), 5, "2 sales + 3 payments");
-        let debits: Decimal = statement.entries.iter().map(|e| e.debit).sum();
+        let debits: Decimal = statement
+            .entries
+            .iter()
+            .map(|entry| entry.debit.amount.unwrap())
+            .sum();
         let credits: Decimal = statement.entries.iter().map(|e| e.credit).sum();
         assert_eq!(debits, dec("150"));
         assert_eq!(credits, dec("100"));
-        assert_eq!(debits - credits, statement.balance);
+        assert_eq!(Some(debits - credits), statement.balance.amount);
         assert_eq!(statement.entries.last().unwrap().balance, statement.balance);
         for pair in statement.entries.windows(2) {
             assert!(pair[0].date <= pair[1].date, "entries are chronological");
@@ -3898,10 +4340,9 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.kind == StatementEntryKind::Payment && e.credit > Decimal::ZERO));
-        assert!(statement
-            .entries
-            .iter()
-            .all(|e| e.credit == Decimal::ZERO || e.debit == Decimal::ZERO));
+        assert!(statement.entries.iter().all(|entry| {
+            entry.credit == Decimal::ZERO || entry.debit.amount == Some(Decimal::ZERO)
+        }));
     }
 
     /// Ties on the same date stay deterministic: document number, then debits
@@ -3981,7 +4422,13 @@ mod tests {
         let lines: Vec<(StatementEntryKind, Option<String>, Decimal)> = statement
             .entries
             .iter()
-            .map(|e| (e.kind, e.document_number.clone(), e.balance))
+            .map(|entry| {
+                (
+                    entry.kind,
+                    entry.document_number.clone(),
+                    entry.balance.amount.unwrap(),
+                )
+            })
             .collect();
         assert_eq!(
             lines,
@@ -4017,8 +4464,8 @@ mod tests {
             .unwrap();
 
         let on_due = s.customer_ageing(CREDIT_CUSTOMER_ID, due).await.unwrap();
-        assert_eq!(on_due.current, dec("10"));
-        assert_eq!(on_due.total(), dec("10"));
+        assert_eq!(on_due.current, SetMoney::amount(dec("10")));
+        assert_eq!(on_due.total().amount, Some(dec("10")));
 
         let at_30 = s
             .customer_ageing(
@@ -4027,7 +4474,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(at_30.overdue_1_30, dec("10"));
+        assert_eq!(at_30.overdue_1_30, SetMoney::amount(dec("10")));
 
         let at_60 = s
             .customer_ageing(
@@ -4036,7 +4483,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(at_60.overdue_31_60, dec("10"));
+        assert_eq!(at_60.overdue_31_60, SetMoney::amount(dec("10")));
 
         let at_61 = s
             .customer_ageing(
@@ -4045,7 +4492,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(at_61.overdue_61_plus, dec("10"));
+        assert_eq!(at_61.overdue_61_plus, SetMoney::amount(dec("10")));
 
         let repeat = s
             .customer_ageing(
@@ -4141,8 +4588,8 @@ mod tests {
         assert_eq!(summary.count, 20);
         assert_eq!(summary.oldest.len(), DEBT_BANNER_LIMIT);
         assert_eq!(
-            summary.total,
-            full.iter().map(|detail| detail.due).sum::<Decimal>()
+            summary.total.amount,
+            Some(full.iter().map(|detail| detail.due).sum::<Decimal>())
         );
         assert!(
             after < before,
@@ -4775,16 +5222,17 @@ mod tests {
         assert_eq!(record.lines.len(), 2);
         assert_eq!(record.lines[0].total, dec("12.11"), "10.005 + 2.10");
         assert_eq!(record.lines[1].total, dec("12.11"));
-        assert_eq!(record.net_subtotal, dec("20.01"));
-        assert_eq!(record.tax_total, dec("4.20"));
+        let money = record.money.expect("an ordinary document totals");
+        assert_eq!(money.net_subtotal, dec("20.01"));
+        assert_eq!(money.tax_total, dec("4.20"));
         assert_eq!(
-            record.total,
+            money.total,
             dec("24.22"),
             "the sum of the two pinned line totals, not round(20.01 + 4.20)"
         );
         let sum: Decimal = record.lines.iter().map(|l| l.total).sum();
         assert_eq!(
-            sum, record.total,
+            sum, money.total,
             "the shown lines must add up to the shown total"
         );
     }
@@ -4860,11 +5308,11 @@ mod tests {
 
         let debts = s.customer_debt_sales(customer.id).await.unwrap();
         assert_eq!(debts.len(), 1);
-        assert_eq!(debts[0].total, dec("121"));
-        assert_eq!(debts[0].due, dec("121"), "nothing was paid");
+        assert_eq!(debts[0].money.unwrap().total, dec("121"));
+        assert_eq!(debts[0].money.unwrap().due, dec("121"), "nothing was paid");
 
         let summary = s.debt_summary(5).await.unwrap();
-        assert_eq!(summary.total, dec("121"));
+        assert_eq!(summary.total.amount, Some(dec("121")));
     }
 
     /// The credit-limit projection is measured against the tax-inclusive total:
@@ -4919,7 +5367,8 @@ mod tests {
             .await
             .unwrap();
         let before = s.get_record(sale.id).await.unwrap();
-        assert_eq!(before.total, dec("121"));
+        let before_money = before.money.expect("an ordinary document totals");
+        assert_eq!(before_money.total, dec("121"));
         assert_eq!(before.lines[0].taxes[0].code, "IVA21");
 
         let taxes = crate::repositories::SqliteTaxRepository::new(pool.clone());
@@ -4931,10 +5380,14 @@ mod tests {
         taxes.deactivate(actor, tax_id).await.unwrap();
 
         let after = s.get_record(sale.id).await.unwrap();
-        assert_eq!(after.total, before.total, "a confirmed total is frozen");
-        assert_eq!(after.net_subtotal, before.net_subtotal);
-        assert_eq!(after.tax_total, before.tax_total);
-        assert_eq!(after.due, before.due);
+        let after_money = after.money.expect("an ordinary document totals");
+        assert_eq!(
+            after_money.total, before_money.total,
+            "a confirmed total is frozen"
+        );
+        assert_eq!(after_money.net_subtotal, before_money.net_subtotal);
+        assert_eq!(after_money.tax_total, before_money.tax_total);
+        assert_eq!(after_money.due, before_money.due);
         assert_eq!(after.lines[0].total, before.lines[0].total);
         assert_eq!(after.lines[0].taxes.len(), 1);
         assert_eq!(
@@ -5004,8 +5457,9 @@ mod tests {
         s.update_line(line.id, dec("1"), dec("100")).await.unwrap();
 
         let record = s.get_record(sale.id).await.unwrap();
-        assert_eq!(record.tax_total, dec("0"));
-        assert_eq!(record.total, dec("100"));
+        let money = record.money.expect("an ordinary document totals");
+        assert_eq!(money.tax_total, dec("0"));
+        assert_eq!(money.total, dec("100"));
         assert!(record.lines[0].taxes.is_empty());
     }
 
@@ -5023,9 +5477,10 @@ mod tests {
             .unwrap();
 
         let record = s.get_record(sale.id).await.unwrap();
-        assert_eq!(record.net_subtotal, dec("100"));
-        assert_eq!(record.tax_total, dec("31"));
-        assert_eq!(record.total, dec("131"));
+        let money = record.money.expect("an ordinary document totals");
+        assert_eq!(money.net_subtotal, dec("100"));
+        assert_eq!(money.tax_total, dec("31"));
+        assert_eq!(money.total, dec("131"));
         let line = &record.lines[0];
         assert_eq!(
             line.subtotal,
@@ -5066,5 +5521,351 @@ mod tests {
         assert!(record.lines[0].taxes.is_empty());
         assert_eq!(record.lines[0].tax_total, dec("0"));
         assert_eq!(record.lines[0].total, dec("20"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Document-level accumulation (tax contract overflow T3), at the service
+    // level. The route tests prove what the operator sees; these prove the
+    // SHAPE of the answer, including the one invariant a type cannot state.
+    // -----------------------------------------------------------------------
+
+    /// `4e28`: an amount an operator can type into a price box, individually
+    /// carryable (`Decimal::MAX ≈ 7.92e28`) and stored by the real checked
+    /// write. Two of them are `8e28`, which the range does not hold.
+    const FOUR_E28: &str = "40000000000000000000000000000";
+
+    /// A document's money and its refusal are ONE fact: the record page renders
+    /// a document whose total cannot be computed, so the two must never disagree
+    /// — a record with a total AND a refusal would publish money and a warning
+    /// about the same figure, and a record with neither would render an empty
+    /// total with no explanation.
+    #[tokio::test]
+    async fn a_record_carries_either_its_money_or_its_refusal_never_both_and_never_neither() {
+        let (s, _pool) = svc().await;
+        let product = stockable_product(&s, "DOC-TOTAL-SHAPE", "10").await;
+        let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
+
+        // One line: the document totals, and says nothing about the rule.
+        s.add_line(sale.id, product.id, dec("1"), Some(dec("10")))
+            .await
+            .unwrap();
+        let readable = s.get_record(sale.id).await.unwrap();
+        assert!(readable.money.is_some());
+        assert!(readable.total_refusal.is_none());
+        assert_eq!(readable.money.unwrap().total, dec("10"));
+
+        // Two more lines that carry the sum out of range: the document is still
+        // returned, with every figure absent and the rule named.
+        for _ in 0..2 {
+            s.add_line(sale.id, product.id, dec("1"), Some(dec(FOUR_E28)))
+                .await
+                .unwrap();
+        }
+        let refused = s.get_record(sale.id).await.unwrap();
+        assert!(
+            refused.money.is_none(),
+            "no figure is published for a sum that does not exist"
+        );
+        assert_eq!(
+            refused.total_refusal,
+            Some(PriceRefusal::DocumentTotalTooLarge)
+        );
+        assert_eq!(
+            refused.lines.len(),
+            3,
+            "and the LINES are all there: each of their own money is representable, and the page \
+             is the operator's only way to reduce the document"
+        );
+        assert_eq!(refused.lines[1].total, dec(FOUR_E28));
+    }
+
+    /// The debt figures are a sum over a SET of documents, which is a level
+    /// neither the per-line write bound nor the per-document fold can see: each
+    /// document here totals exactly, and the customer's balance does not.
+    ///
+    /// `4e28` per confirmed credit sale: each sale's own total is carryable and
+    /// the document is fully readable, and `4e28 + 4e28 = 8e28` is not — so the
+    /// balance, the ageing and the statement refuse the same rule rather than
+    /// reporting a debt the range cannot hold.
+    #[tokio::test]
+    async fn a_customer_balance_whose_documents_cannot_be_added_up_is_a_refusal_not_a_panic() {
+        let (s, _pool) = svc().await;
+        let product = stockable_product(&s, "DEBT-SET", "10").await;
+        let as_of = sale_date();
+
+        // The control, asserted in the same test: ONE such document is an
+        // ordinary receivable, so a refusal above can only come from the SET.
+        let single = draft_sale(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit).await;
+        s.add_line(single.id, product.id, dec("1"), Some(dec(FOUR_E28)))
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, single.id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            dec(FOUR_E28),
+            "one document at 4e28 is a receivable this application can state"
+        );
+
+        let second = draft_sale(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit).await;
+        s.add_line(second.id, product.id, dec("1"), Some(dec(FOUR_E28)))
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, second.id, None)
+            .await
+            .unwrap();
+
+        // Both documents are individually READABLE — that is what makes the sum
+        // the only thing that can break.
+        assert_eq!(s.get_detail(second.id).await.unwrap().total, dec(FOUR_E28));
+        assert!(matches!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await,
+            Err(AppError::PriceRefused(PriceRefusal::DocumentTotalTooLarge))
+        ));
+        // The DISPLAYING reads answer with the refusal instead of an error, and
+        // they answer it as an ABSENCE: no figure at all where the sum was.
+        let ageing = s.customer_ageing(CREDIT_CUSTOMER_ID, as_of).await.unwrap();
+        assert_eq!(ageing.refusal(), Some(PriceRefusal::DocumentTotalTooLarge));
+        assert_eq!(
+            ageing.total(),
+            SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
+            "a refused ageing has no figure at all, so no client can add its buckets back up \
+             into a total this application cannot stand behind"
+        );
+        // The buckets answer INDIVIDUALLY, and the difference is the point: the
+        // bucket that holds both documents refuses (its sum does not carry), and a
+        // bucket that holds none is a real zero. Neither is the old shape, where a
+        // refusal zeroed all four and a client could not tell a refused bucket from
+        // a customer who owes nothing.
+        let refused_buckets = ageing
+            .buckets()
+            .iter()
+            .filter(|bucket| bucket.refusal.is_some())
+            .count();
+        assert_eq!(
+            refused_buckets, 1,
+            "exactly the bucket the overflow happened in: {ageing:?}"
+        );
+        for bucket in ageing.buckets().iter().filter(|b| b.refusal.is_none()) {
+            assert_eq!(
+                bucket.amount,
+                Some(Decimal::ZERO),
+                "and every other bucket is a figure, not a guess: {ageing:?}"
+            );
+        }
+
+        let summary = s.debt_summary(5).await.unwrap();
+        assert_eq!(
+            summary.total,
+            SetMoney::refused(PriceRefusal::DocumentTotalTooLarge)
+        );
+        assert_eq!(
+            summary.count, 2,
+            "both documents are still counted as owed: neither is proven paid"
+        );
+        assert_eq!(
+            summary.oldest.len(),
+            2,
+            "and the panel still lists them, in place"
+        );
+        assert!(
+            summary
+                .oldest
+                .iter()
+                .all(|row| row.money.is_some() && row.total_refusal.is_none()),
+            "and each of them keeps its OWN figure: these documents total individually, and it is \
+             the set of them that does not. A row that lost its own money because a DIFFERENT \
+             document broke the sum would be the partial figure this whole shape exists to avoid"
+        );
+
+        // The receivable list itself is per document, so it still answers: the
+        // operator can see and act on the documents even while the SET refuses.
+        assert_eq!(s.outstanding_debt().await.unwrap().len(), 2);
+
+        // And the statement, which is a third sum over the same set: its balance
+        // and its running balance are refusals, while each document's OWN entry
+        // keeps its place in the ledger.
+        let statement = s
+            .customer_statement(CREDIT_CUSTOMER_ID, as_of)
+            .await
+            .unwrap();
+        assert_eq!(
+            statement.balance,
+            SetMoney::refused(PriceRefusal::DocumentTotalTooLarge)
+        );
+        assert_eq!(statement.entries.len(), 2, "one entry per document");
+        assert!(
+            statement
+                .entries
+                .iter()
+                .all(|entry| entry.debit.amount.is_some()),
+            "each document is individually carryable, so its OWN debit is a real figure"
+        );
+        assert_eq!(
+            statement.entries[0].balance.amount,
+            Some(dec(FOUR_E28)),
+            "and the running balance is real up to the entry that breaks the set"
+        );
+        let last = statement.entries.last().unwrap();
+        assert_eq!(
+            last.balance,
+            SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
+            "the running balance is refused from the entry that breaks the set onward, and never \
+             recovers: a balance that resumed would be a figure this application cannot stand \
+             behind"
+        );
+        // THE CONTROL on the same read, for another customer entirely: an
+        // ordinary receivable states an ordinary balance, so the refusal above can
+        // only be THIS customer's set and never the statement itself.
+        let other = seed_customer(&s, "Statement Control", None, None).await;
+        let control = draft_sale(&s, other.id, PaymentType::Credit).await;
+        s.add_line(control.id, product.id, dec("1"), Some(dec("2468")))
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, control.id, None)
+            .await
+            .unwrap();
+        let control_statement = s.customer_statement(other.id, as_of).await.unwrap();
+        assert_eq!(control_statement.balance.amount, Some(dec("2468")));
+        assert_eq!(control_statement.balance.refusal, None);
+        assert_eq!(control_statement.ageing.refusal(), None);
+        assert!(control_statement
+            .entries
+            .iter()
+            .all(|entry| entry.balance.refusal.is_none()));
+    }
+    /// The other refusal shape on the same read: a document that cannot be totaled
+    /// at all, whose `due` is therefore unknown. It cannot be attributed to a
+    /// bucket — it could have been in any of the four — so the WHOLE grid refuses,
+    /// which is a different answer from an overflow's and for a different reason.
+    ///
+    /// A confirmation refuses an un-totalable document by design, so the second
+    /// line is stored straight through SQL, past the checked write: the state a
+    /// confirmed document can be found in, and the one this branch exists for.
+    #[tokio::test]
+    async fn an_ageing_with_a_document_it_cannot_total_refuses_every_bucket() {
+        let (s, pool) = svc().await;
+        let product = stockable_product(&s, "XUNKNOWN", "10").await;
+        let as_of = sale_date();
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: as_of - chrono::Duration::days(20),
+                    due_date: Some(as_of - chrono::Duration::days(5)),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let line = s
+            .add_line(sale.id, product.id, dec("1"), Some(dec(FOUR_E28)))
+            .await
+            .unwrap();
+        s.update_line(line.id, dec("1"), dec(FOUR_E28))
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price, tax_total) \
+             VALUES (?, ?, ?, ?, 0)",
+        )
+        .bind(sale.id)
+        .bind(product.id)
+        .bind(dec("1").to_string())
+        .bind(FOUR_E28)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ageing = s.customer_ageing(CREDIT_CUSTOMER_ID, as_of).await.unwrap();
+        assert_eq!(ageing.refusal(), Some(PriceRefusal::DocumentTotalTooLarge));
+        for bucket in ageing.buckets() {
+            assert_eq!(
+                bucket,
+                SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
+                "a grid that kept three sums would be a total the operator adds up to a number \
+                 nobody can stand behind: {ageing:?}"
+            );
+        }
+        assert_eq!(
+            ageing.total(),
+            SetMoney::refused(PriceRefusal::DocumentTotalTooLarge)
+        );
+    }
+
+    /// The cross-bucket half of the same argument, and the half the suite missed:
+    /// the ageing's buckets are a PARTITION of one receivable, so a bound that
+    /// holds inside each bucket says nothing about the sum ACROSS them. Two
+    /// documents of `4e28` that land in DIFFERENT buckets each fit their own, and
+    /// `draft_sale` — which gives both the same due date — put them in the SAME
+    /// one, where the per-bucket check caught it. `as_of` is what splits them, so
+    /// the two due dates are the whole construction.
+    #[tokio::test]
+    async fn an_ageing_whose_buckets_each_carry_refuses_their_sum() {
+        let (s, _pool) = svc().await;
+        let product = stockable_product(&s, "XCROSS", "10").await;
+        let as_of = sale_date();
+        for due in [
+            as_of + chrono::Duration::days(10),
+            as_of - chrono::Duration::days(10),
+        ] {
+            let sale = s
+                .create_draft(
+                    audit_actor(&s).await,
+                    NewSale {
+                        customer_id: CREDIT_CUSTOMER_ID,
+                        payment_type: PaymentType::Credit,
+                        sale_date: as_of - chrono::Duration::days(20),
+                        due_date: Some(due),
+                        receipt_no: None,
+                        notes: None,
+                    },
+                )
+                .await
+                .unwrap();
+            let line = s
+                .add_line(sale.id, product.id, dec("1"), Some(dec(FOUR_E28)))
+                .await
+                .unwrap();
+            s.update_line(line.id, dec("1"), dec(FOUR_E28))
+                .await
+                .unwrap();
+            s.confirm(audit_actor(&s).await, sale.id, None)
+                .await
+                .unwrap();
+        }
+
+        let ageing = s.customer_ageing(CREDIT_CUSTOMER_ID, as_of).await.unwrap();
+        // Both buckets carry on their own: `0 + 4e28` fits, twice.
+        assert_eq!(ageing.current, SetMoney::amount(dec(FOUR_E28)));
+        assert_eq!(ageing.overdue_1_30, SetMoney::amount(dec(FOUR_E28)));
+        assert_eq!(
+            ageing.refusal(),
+            None,
+            "no bucket refused, so the AGEING itself is not a refusal: {ageing:?}"
+        );
+        // The sum across the partition is `8e28`, and THAT is what refuses — the
+        // raw `+` this replaces was a panic on the customer's own page.
+        assert_eq!(
+            ageing.total(),
+            SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
+            "a total over buckets that each carry is still a set sum"
+        );
+        assert_eq!(
+            s.customer_statement(CREDIT_CUSTOMER_ID, as_of)
+                .await
+                .unwrap()
+                .ageing
+                .total(),
+            SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
+            "and the statement reads the same ageing the page does"
+        );
     }
 }

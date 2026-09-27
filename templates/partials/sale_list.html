@@ -3,25 +3,30 @@
   {% if sales.is_empty() %}
     <div class="empty">{{ localization.tr(crate::localization::MessageKey::SalesNothing) }}</div>
   {% else %}
-    {% for d in sales %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-{{ d.sale.id }}">
+    {% for v in sales %}
+    {# One document's row. A document whose lines cannot be added up renders in
+       place — identity, status, type, party and number all intact — with the
+       refusal where the money was and NO figure at all: a stale, zero or partial
+       amount would be worse than none, because the operator cannot tell a real
+       zero from a refusal. #}
+    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-{{ v.sale.id }}">
       <div class="flex flex-col">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="chip {% if d.sale.status.to_string() == "Confirmed" %}chip-income{% else if d.sale.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{% if d.sale.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if d.sale.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
-          <span class="chip {% if d.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{% if d.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if d.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>
-          <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{% if d.sale.payment_type.to_string() == "Cash" %}{{ localization.tr(crate::localization::MessageKey::ValueCash) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ValueCredit) }}{% endif %}</span>
-          <span class="font-semibold">{% if d.sale.customer_name.is_empty() %}{{ localization.tr(crate::localization::MessageKey::SalesWalkIn) }}{% else %}{{ d.sale.customer_name }}{% endif %}</span>
-          {% if let Some(n) = d.sale.sale_number %}
+          <span class="chip {% if v.sale.status.to_string() == "Confirmed" %}chip-income{% else if v.sale.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{% if v.sale.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if v.sale.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
+          {% if let Some(money) = v.money %}<span class="chip {% if money.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}" data-sale-row-payment-status>{% if money.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if money.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>{% else %}<span class="chip chip-expense" data-sale-row-payment-status="refused" data-document-total-refusal>{{ v.total_refusal_message }}</span>{% endif %}
+          <span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{% if v.sale.payment_type.to_string() == "Cash" %}{{ localization.tr(crate::localization::MessageKey::ValueCash) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ValueCredit) }}{% endif %}</span>
+          <span class="font-semibold">{% if v.sale.customer_name.is_empty() %}{{ localization.tr(crate::localization::MessageKey::SalesWalkIn) }}{% else %}{{ v.sale.customer_name }}{% endif %}</span>
+          {% if let Some(n) = v.sale.sale_number %}
             <span class="text-xs text-muted">{{ n }}</span>
           {% else %}
-            <span class="text-xs text-muted">{{ localization.tr(crate::localization::MessageKey::StatusDraft) }} #{{ d.sale.id }}</span>
+            <span class="text-xs text-muted">{{ localization.tr(crate::localization::MessageKey::StatusDraft) }} #{{ v.sale.id }}</span>
           {% endif %}
         </div>
-        <span class="text-[13px] text-muted">#{{ d.sale.id }} • {{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due_date) = d.sale.due_date %} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_date(due_date.clone()) }}{% endif %} • {{ localization.format_currency(d.total.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesPaid) }} {{ localization.format_currency(d.paid.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_currency(d.due.clone()) }}</span>
+        <span class="text-[13px] text-muted">#{{ v.sale.id }} • {{ localization.format_date(v.sale.sale_date.clone()) }}{% if let Some(due_date) = v.sale.due_date %} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_date(due_date.clone()) }}{% endif %}{% if let Some(money) = v.money %} • {{ localization.format_currency(money.total.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesPaid) }} {{ localization.format_currency(money.paid.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_currency(money.due.clone()) }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
-        <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_currency(d.total.clone()) }}</span>
-        <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">{{ localization.tr(crate::localization::MessageKey::SalesOpen) }}</a>
+        {% if let Some(money) = v.money %}<span class="font-bold tabular-nums {% if money.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_currency(money.total.clone()) }}</span>{% endif %}
+        <a href="/sales/{{ v.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">{{ localization.tr(crate::localization::MessageKey::SalesOpen) }}</a>
       </div>
     </div>
     {% endfor %}

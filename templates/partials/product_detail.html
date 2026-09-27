@@ -24,7 +24,7 @@
       {% if let Some(sug) = suggested %}
       <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductLow) }} • {{ localization.tr(crate::localization::MessageKey::ProductSuggest) }} {{ localization.format_quantity(sug.clone()) }}</span>
       {% endif %}
-      {% if stock.is_sign_negative() %}
+      {% if stock_negative %}
       <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductNegative) }}</span>
       {% endif %}
     </div>
@@ -32,12 +32,13 @@
        figure in this drawer belongs to the price ladder below, so a price can
        only be read in one place (product price ladder U2). #}
     <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }}</div>
-    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(stock.clone()) }}{% if let Some(min) = product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
-    {# Audit attribution (M5 Phase B): who registered the product and who last
-       changed it, shown as a display name resolved in the wiring layer — the
-       same rows the finance detail shows. The sentinel renders as its own
-       name, which says what happened instead of hiding it. #}
-    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(name) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ name }}{% endif %}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {% if stock.is_empty() %}<span class="text-danger" data-stock-level-refusal data-document-total-refusal>{{ stock_message }}</span>{% else %}{{ stock }}{% endif %}{% if let Some(min) = product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
+    {# Audit attribution (M5 Phase B): a partial, so a confirmed final price can
+       refresh it — a conversion is a product update and moves `updated_by`. The
+       `id` is ON the line rather than on a wrapper around it: this line always
+       renders, so it can be its own out-of-band target and the swap needs no
+       new element in the drawer. #}
+    {% include "partials/product_audit_line.html" %}
 
     {# Lifecycle actions live beside the header like the customers drawer: hidden
        id, POST, list swap, drawer closes only when the request succeeded. The
@@ -68,7 +69,7 @@
        `htmx:afterSwap` open), which the page listener maps to
        `closeProductDrawer()`. A failed save swaps nothing and keeps the drawer
        open. #}
-    <form class="mt-4 flex flex-col gap-2.5"
+    <form id="product-edit-form" class="mt-4 flex flex-col gap-2.5"
           data-action="{{ localization.tr(crate::localization::MessageKey::ProductSave) }}"
           hx-post="/web/products/edit"
           hx-target="#product-drawer-body"
@@ -102,30 +103,21 @@
         </div>
       </div>
       <div class="flex gap-2.5 [&>*]:flex-1">
-        <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductSalePrice) }}</label>
-          {# Courtesy only (product-markup T6): the edit handler is the
-             enforcement — whenever a markup is present the server ignores
-             this field and derives the price from the cost, so the readonly
-             state here only mirrors what the server already does. The ladder
-             below previews that derivation live, while this note explains why
-             the field is locked. #}
-          <input id="edit-product-sale-price" type="text" inputmode="decimal" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ localization.format_decimal(product.sale_price.clone()) }}" class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />
-          {% if product.markup_pct.is_some() %}
-          {# The readonly field shows the stored price from the last save; the
-             derivation from the cost is server-side, so the number only moves
-             when the product is saved. #}
-          <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductMarkupRecalculated) }} {{ localization.format_percentage(product.markup_pct.unwrap()) }}</div>
-          {% endif %}
+        {# THE THREE PRICE FIELDS, each with an id on its own wrapper, and each
+           the inner content of a partial. The ids exist for exactly one reason:
+           a CONFIRMED final price rewrites all three, so it must be able to
+           refresh them without re-rendering the form around them and discarding
+           every field the conversion does not own. Everything else on this form
+           keeps whatever the operator typed. See `final price markup M1`. #}
+        <div id="edit-product-price-field">
+          {% include "partials/product_sale_price_field.html" %}
         </div>
-        <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCostPrice) }}</label>
-          <input type="text" inputmode="decimal" name="cost_price" step="0.01" value="{{ localization.format_decimal(product.cost_price.clone()) }}" class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />
+        <div id="edit-product-cost-field">
+          {% include "partials/product_cost_price_field.html" %}
         </div>
       </div>
-      <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMarkup) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-        <input id="edit-product-markup" type="text" inputmode="decimal" name="markup_pct" step="0.01" min="-99" placeholder="25" {% if let Some(m) = product.markup_pct %}value="{{ localization.format_decimal(m.clone()) }}"{% endif %} class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />
+      <div id="edit-product-markup-field">
+        {% include "partials/product_markup_field.html" %}
       </div>
       <div>
         <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCategory) }}</label>
@@ -165,22 +157,17 @@
     {# Markup courtesy only (product-markup T6): the edit handler is the
        enforcement — whenever a markup is present the server ignores the price
        and derives it from the cost, so the browser disabling the field changes
-       nothing about what is stored. Runs once on load because HTMX swaps this
-       drawer body in. #}
-    <script>
-      (function () {
-        var markup = document.getElementById('edit-product-markup');
-        var price = document.getElementById('edit-product-sale-price');
-        if (!markup || !price) return;
-        function sync() {
-          var derived = markup.value.trim() !== '';
-          price.readOnly = derived;
-          if (derived) { price.removeAttribute('required'); } else { price.setAttribute('required', ''); }
-        }
-        markup.addEventListener('input', sync);
-        sync();
-      })();
-    </script>
+       nothing about what is stored.
+
+       It is a PARTIAL, and the confirm inlines the same file, because the confirm
+       replaces both inputs this binds to (final price markup M1): without a
+       re-run, clearing the markup after a conversion would leave the net price
+       field `readonly` with no way to type into it. One file, two call sites —
+       `include_str!` in the route means the confirm's copy cannot drift from
+       the drawer's. The file holds no Askama syntax, because `include_str!`
+       inlines it byte for byte and an Askama comment would become a JS syntax
+       error. #}
+    {% include "partials/product_markup_sync.html" %}
   </section>
 
   {# The price ladder (product price ladder U2), right under the fields that
@@ -191,7 +178,63 @@
      the browser never multiplies or rounds a cent. #}
   <section class="rounded-2xl border border-border bg-card p-5">
     {% include "partials/product_price_ladder.html" %}
+
+    {# The FINAL PRICE control (final price markup U2): a separate small form
+       in this card, BELOW the ladder island, and NOT another field of the save
+       form above, because it expresses the opposite intent — the price the
+       CUSTOMER pays, from which the net price and the markup are both solved
+       backwards, rather than a cost and a markup that derive a net.
+
+       It is a SIBLING of `#product-price-ladder`, never inside it, and that is
+       load bearing rather than cosmetic: that island is replaced wholesale on
+       every preview and on every refusal, so a control inside it would lose the
+       value the operator typed the moment anything refreshed. Targeting the
+       ladder means a refusal is rendered exactly where a ladder refusal has
+       always been rendered, and the drawer body — the save form, its unsaved
+       values, this control — is never replaced.
+
+       TWO STEPS, and the markup is what makes that structural. The form's own
+       `hx-get` IS the preview, so submitting it — with the button or with a
+       stray Enter — can only ever preview. The CONFIRM is not in this markup at
+       all: the server renders it into the slot below, out of band, and only a
+       successful preview fills it. So there is no way to commit without having
+       seen the consequence, not even from the keyboard.
+
+       The control owns ONE field. The cost it is solved against is the SAVE
+       form's own `cost_price`, pulled in by `hx-include`: the cost is a given,
+       and a cost typed and not saved is exactly the case an operator most needs
+       previewed. The save form's `markup_pct` is NOT read, because a final
+       price DETERMINES the markup. #}
+    {# `mt-4` + a top rule, and no `pt-4`: the committed stylesheet is a
+       scanned, closed vocabulary (`stylesheet_tests` refuses any class with no
+       rule in it), and the ladder's own rows already divide themselves with
+       `border-t border-border` alone. #}
+    <div class="mt-4 border-t border-border" data-product-final-price-control>
+      <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductFinalPrice) }}</div>
+      <form id="product-final-price-form" class="flex items-end gap-2.5"
+            data-action="{{ localization.tr(crate::localization::MessageKey::ProductPreviewFinalPrice) }}"
+            hx-get="/web/product-final-price"
+            hx-include="#product-edit-form"
+            hx-target="#product-price-ladder"
+            hx-swap="outerHTML">
+        <div class="flex-1">
+          {# Its OWN label key, deliberately NOT `TaxInclusivePrice`: that key is
+             the ladder's tax-inclusive TOTAL, and the ladder's standing
+             guarantee is that the word is published only when a net price
+             exists. Reusing it here would put a "price with tax" label on a
+             page that may be refusing to publish any tax money. #}
+          <label class="field-label" for="product-final-price">{{ localization.tr(crate::localization::MessageKey::ProductFinalPriceLabel) }}</label>
+          <input id="product-final-price" type="text" inputmode="decimal" name="final_price" step="0.01" min="0" required placeholder="100.00" class="field" />
+        </div>
+        <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::ProductPreviewFinalPrice) }}</button>
+      </form>
+      {# The confirm slot. Empty in the drawer, filled out of band by a
+         successful preview, emptied again by a refusal. #}
+      <div id="product-final-price-confirm"></div>
+      <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductFinalPriceHelp) }}</div>
+    </div>
   </section>
+
 
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductTaxes) }} ({{ product_taxes.len() }})</div>
@@ -245,18 +288,15 @@
      is only the fallback when this list is empty. #}
   <section class="rounded-2xl border border-border bg-card p-5">
     <div class="mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductSupplierCosts) }} ({{ supplier_costs.len() }})</div>
-    {# Derived stale-cost badge (cost-freshness S1): rendered only when the
-       supplier reference cost genuinely disagrees with the stored cost — the
-       Rust side already filtered the no-rows, zero-cost and equal cases.
-       Both values are shown so the operator sees the gap without arithmetic;
-       the badge reuses the card's own badge styling (the neutral price_alert
-       variant), no new Tailwind classes. #}
-    {% if let Some(stale) = stale_cost %}
-    <div class="mb-3 flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3">
-      <span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductStaleCost) }}</span>
-      <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductReferenceCost) }} {{ localization.format_currency(stale.reference.clone()) }} • {{ localization.tr(crate::localization::MessageKey::ProductStoredCost) }} {{ localization.format_currency(stale.stored.clone()) }}</span>
+    {# Derived stale-cost badge (cost-freshness S1): a partial, so a confirmed
+       final price can refresh it — the conversion writes `cost_price`, and the
+       badge is exactly the disagreement between that column and the supplier's
+       reference cost. The Rust side already filtered the no-rows, zero-cost and
+       equal cases; the badge reuses the card's own badge styling (the neutral
+       price_alert variant), no new Tailwind classes. #}
+    <div id="product-stale-cost">
+      {% include "partials/product_stale_cost.html" %}
     </div>
-    {% endif %}
     {% if supplier_costs.is_empty() %}
       <div class="mb-3 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductNoSupplierCosts) }}</div>
     {% else %}
@@ -369,7 +409,7 @@
       <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductMovementHelp) }}</div>
     </form>
     {% else %}
-    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStockUnavailable) }} {{ localization.format_quantity(stock.clone()) }}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStockUnavailable) }} {% if stock.is_empty() %}<span class="text-danger" data-stock-level-refusal data-document-total-refusal>{{ stock_message }}</span>{% else %}{{ stock }}{% endif %}</div>
     {% endif %}
   </section>
 </div>

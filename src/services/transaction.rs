@@ -2,7 +2,7 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{Transaction, TransactionFilter, TransactionKind};
+use crate::models::{PriceRefusal, Transaction, TransactionFilter, TransactionKind};
 use crate::repositories::{AccountRepository, TransactionRepository};
 
 #[derive(Clone)]
@@ -89,15 +89,30 @@ where
             )));
         }
 
-        // If Expense and negative not allowed, check resulting balance
-        if !self.allow_negative && kind == TransactionKind::Expense {
-            let current = self.transactions.balance_for_account(account_id).await?;
-            let next = current - amount;
-            if next < Decimal::ZERO {
-                return Err(AppError::Validation(format!(
-                    "insufficient funds: balance {current} would become {next}"
-                )));
-            }
+        // The resulting balance is computed BEFORE the write and for BOTH kinds,
+        // which is two bounds in one place and the reason neither is optional.
+        //
+        // The overdraft guard is the one this code always had, and it stays: an
+        // Expense may not overdraw an account that forbids it. The range check is
+        // new, and it is the same argument as a document total, one level out: a
+        // transaction is a bounded single write, and the SUM of a set of them is
+        // not bounded — two incomes of `4e28` each carry and are `8e28` together.
+        // What this pre-check buys is EARLY refusal with a useful message, not
+        // reachability: the repository's fold is the guarantee, and it folds in
+        // `ORDER BY id` — the same order the writes append in, so the two walk the
+        // same prefixes as well as agreeing on the total.
+        let current = self.transactions.balance_for_account(account_id).await?;
+        let signed = match kind {
+            TransactionKind::Income => amount,
+            TransactionKind::Expense => -amount,
+        };
+        let next = current
+            .checked_add(signed)
+            .ok_or(AppError::PriceRefused(PriceRefusal::AggregateTooLarge))?;
+        if !self.allow_negative && kind == TransactionKind::Expense && next < Decimal::ZERO {
+            return Err(AppError::Validation(format!(
+                "insufficient funds: balance {current} would become {next}"
+            )));
         }
 
         let desc = description.unwrap_or_default();
@@ -186,7 +201,16 @@ where
                 TransactionKind::Income => existing.amount,
                 TransactionKind::Expense => -existing.amount,
             };
-            let projected = current_balance - orig_signed + new_signed;
+            // CHECKED, and the same rule the balance fold uses: this projection is
+            // a set sum over the account's transactions with one row swapped, and
+            // reverting a large expense can push it past what `Decimal` carries
+            // (`5.1e28 + 4.9e28`). Two raw operators here were a panic on a route
+            // every `finance.write` caller can reach, including an empty-body
+            // update — which recomputes this on every edit.
+            let projected = current_balance
+                .checked_sub(orig_signed)
+                .and_then(|balance| balance.checked_add(new_signed))
+                .ok_or(AppError::PriceRefused(PriceRefusal::AggregateTooLarge))?;
             if projected < Decimal::ZERO {
                 return Err(AppError::Validation(format!(
                     "update would cause negative balance: projected {projected}"
@@ -205,7 +229,14 @@ where
             .ok_or_else(|| AppError::NotFound(format!("transaction {id} not found")))?;
 
         if !self.allow_negative && tx.kind == TransactionKind::Income {
-            // Removing income could make balance negative
+            // Removing income could make balance negative.
+            //
+            // The subtraction is bounded, and the bound is the `allow_negative`
+            // guard right here: that flag is what keeps every balance in the table
+            // at or above zero, and `amount > 0` is validated on the way in, so
+            // `current - amount` lands in `[-MAX, MAX]` and cannot leave the range.
+            // Unlike the projection above there is no second term here, and no term
+            // that can carry a sign the other one cannot.
             let current = self.transactions.balance_for_account(tx.account_id).await?;
             let projected = current - tx.amount; // Income removal subtracts
             if projected < Decimal::ZERO {

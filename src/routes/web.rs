@@ -7,14 +7,13 @@ use axum::{
     Router,
 };
 use chrono::NaiveDate;
-use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{PaymentMethod, TransactionKind};
 use crate::repositories::AccountRepository;
-use crate::routes::AppState;
+use crate::routes::{price_refusal_message, AppState};
 use crate::security::authz::{
     DashboardRead, FinanceMethodsManage, FinanceRead, FinanceWrite, Nav, Require,
 };
@@ -33,8 +32,13 @@ use crate::security::authz::{
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardTemplate {
-    accounts: Vec<crate::models::AccountWithBalance>,
-    total_balance: Decimal,
+    accounts: Vec<AccountRowView>,
+    total_balance: String,
+    /// The sentence a refused SET total answers with, empty when it carried.
+    /// The dashboard's headline is a sum over the same accounts the list below
+    /// renders, so it refuses with them: a figure there would be the operator
+    /// adding up a page that just told them it cannot be added.
+    total_message: String,
     localization: LocalizationContext,
     allow_negative: bool,
     today: String,
@@ -70,7 +74,7 @@ struct TransactionRow {
 #[derive(Template)]
 #[template(path = "account_detail.html")]
 struct AccountDetailTemplate {
-    account: crate::models::AccountWithBalance,
+    account: AccountRowView,
     transactions: Vec<TransactionRow>,
     localization: LocalizationContext,
     /// Display name of the account's creator ("Registrado por"). Every
@@ -93,8 +97,16 @@ struct AccountDetailTemplate {
 #[derive(Template)]
 #[template(path = "partials/account_list.html")]
 struct AccountListPartial {
-    accounts: Vec<crate::models::AccountWithBalance>,
-    total_balance: Decimal,
+    accounts: Vec<AccountRowView>,
+    /// The set total, resolved: the amount, or an empty string when it refused
+    /// (with the sentence in `total_message`). Two fields rather than one so the
+    /// template cannot print a number where there is none.
+    total_balance: String,
+    /// The sentence a refused SET total answers with, empty when it carried.
+    /// The dashboard's headline is a sum over the same accounts the list below
+    /// renders, so it refuses with them: a figure there would be the operator
+    /// adding up a page that just told them it cannot be added.
+    total_message: String,
     accounts_without_methods: AccountsWithoutMethods,
     localization: LocalizationContext,
 }
@@ -110,8 +122,9 @@ struct TransactionListPartial {
 #[derive(Template)]
 #[template(path = "partials/account_options.html")]
 struct AccountOptionsPartial {
-    accounts: Vec<crate::models::AccountWithBalance>,
-    localization: LocalizationContext,
+    /// The rows already resolved by `account_row_views`, so this partial needs no
+    /// locale of its own: it prints the strings the wiring layer produced.
+    accounts: Vec<AccountRowView>,
 }
 
 /// Accounts whose allowlist is empty. Exposes a template-friendly predicate so
@@ -157,6 +170,77 @@ where
 }
 
 // ---------------------------------------------------------------------------
+/// One account row, with its balance already resolved: the amount where the
+/// arithmetic carried it, and the sentence — in the operator's language, through
+/// the one shared mapping — where it did not.
+///
+/// Resolved HERE, in the wiring layer, because the template must not be able to
+/// print a number where a sum was refused. `balance` is empty for a refused row,
+/// so "no figure" and "here is why" cannot be confused by a template change, and
+/// `negative` is false for one because a refusal states no sign.
+#[derive(Clone)]
+pub struct AccountRowView {
+    pub id: i64,
+    pub name: String,
+    pub created_at: chrono::NaiveDateTime,
+    /// The formatted amount, empty when the balance refused.
+    pub balance: String,
+    /// The localized refusal, empty when the balance carried.
+    pub balance_message: String,
+    pub negative: bool,
+}
+
+fn account_row_views(
+    accounts: Vec<crate::models::AccountWithBalance>,
+    localization: &LocalizationContext,
+) -> Vec<AccountRowView> {
+    accounts
+        .into_iter()
+        .map(|account| {
+            let (balance, balance_message) = match account.balance.amount {
+                Some(amount) => (localization.format_currency(amount), String::new()),
+                None => (
+                    String::new(),
+                    account
+                        .balance
+                        .refusal
+                        .map(|refusal| price_refusal_message(&refusal, localization))
+                        .unwrap_or_default(),
+                ),
+            };
+            AccountRowView {
+                id: account.id,
+                name: account.name,
+                created_at: account.created_at,
+                balance,
+                balance_message,
+                negative: account.balance.amount_is_negative(),
+            }
+        })
+        .collect()
+}
+
+/// The sentence a refused SET total answers with, empty when it carried.
+fn total_message_of(total: crate::models::SetMoney, localization: &LocalizationContext) -> String {
+    total
+        .refusal
+        .map(|refusal| price_refusal_message(&refusal, localization))
+        .unwrap_or_default()
+}
+
+/// A derived figure resolved for a template: the amount, or the sentence in its
+/// place. One helper for the list total and the account detail, so both answer a
+/// refused figure the same way.
+fn money_figure(money: crate::models::SetMoney, localization: &LocalizationContext) -> String {
+    match money.amount {
+        Some(amount) => localization.format_currency(amount),
+        None => money
+            .refusal
+            .map(|refusal| price_refusal_message(&refusal, localization))
+            .unwrap_or_default(),
+    }
+}
+
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -166,14 +250,17 @@ async fn dashboard(
     principal: axum::Extension<crate::security::authz::Principal>,
     Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
-    let accounts = state.account_service.list_with_balances().await?;
-    let total_balance = state.account_service.total_balance().await?;
+    let (accounts, total) = state.account_service.list_with_balances_and_total().await?;
+    let accounts = account_row_views(accounts, &localization);
+    let total_message = total_message_of(total, &localization);
+    let total_balance = money_figure(total, &localization);
     let methods = state.payment_method_service.list().await?;
     let accounts_without_methods = missing_methods(&state).await?;
     let today = localization.today_iso();
     let tmpl = DashboardTemplate {
         accounts,
         total_balance,
+        total_message,
         localization,
         allow_negative: state.allow_negative,
         today,
@@ -226,7 +313,13 @@ async fn account_detail(
     let tmpl = AccountDetailTemplate {
         account_created_by_name: name_for(detail.created_by),
         account_updated_by_name: detail.updated_by.and_then(name_for),
-        account: acc_with_balance,
+        // The header's row view, so a refused balance states the rule here too —
+        // and so the page reads the ONE derived balance it was given rather than
+        // a second fold of the same rows.
+        account: account_row_views(vec![acc_with_balance], &localization)
+            .into_iter()
+            .next()
+            .expect("one account in, one row out"),
         transactions,
         localization,
         allow_negative: state.allow_negative,
@@ -348,22 +441,22 @@ async fn web_create_account(
     }
     // If HTMX, return updated fragments
     if is_htmx(&headers) {
-        let accounts = state.account_service.list_with_balances().await?;
-        let total = state.account_service.total_balance().await?;
+        let (accounts, total) = state.account_service.list_with_balances_and_total().await?;
+        let accounts = account_row_views(accounts, &localization);
+        let total_message = total_message_of(total, &localization);
+        let total = money_figure(total, &localization);
         let list_html = AccountListPartial {
             accounts: accounts.clone(),
             total_balance: total,
+            total_message,
             accounts_without_methods: missing_methods(&state).await?,
             localization: localization.clone(),
         }
         .render()
         .map_err(|e| AppError::Internal(e.to_string()))?;
-        let options_html = AccountOptionsPartial {
-            accounts,
-            localization: localization.clone(),
-        }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        let options_html = AccountOptionsPartial { accounts }
+            .render()
+            .map_err(|e| AppError::Internal(e.to_string()))?;
 
         // Return combined: account list + options via OOB swap
         // HTMX out-of-band swap: element with hx-swap-oob
@@ -423,11 +516,14 @@ async fn web_create_transaction(
 
     if is_htmx(&headers) {
         // Return updated dashboard fragments
-        let accounts = state.account_service.list_with_balances().await?;
-        let total = state.account_service.total_balance().await?;
+        let (accounts, total) = state.account_service.list_with_balances_and_total().await?;
+        let accounts = account_row_views(accounts, &localization);
+        let total_message = total_message_of(total, &localization);
+        let total = money_figure(total, &localization);
         let list_html = AccountListPartial {
             accounts,
             total_balance: total,
+            total_message,
             accounts_without_methods: missing_methods(&state).await?,
             localization: localization.clone(),
         }
@@ -464,11 +560,12 @@ async fn web_account_list(
     _: Require<FinanceRead>,
     Extension(localization): Extension<LocalizationContext>,
 ) -> Result<Html<String>, AppError> {
-    let accounts = state.account_service.list_with_balances().await?;
-    let total = state.account_service.total_balance().await?;
+    let (accounts, total) = state.account_service.list_with_balances_and_total().await?;
+    let total_message = total_message_of(total, &localization);
     let html = AccountListPartial {
-        accounts,
-        total_balance: total,
+        accounts: account_row_views(accounts, &localization),
+        total_balance: money_figure(total, &localization),
+        total_message,
         accounts_without_methods: missing_methods(&state).await?,
         localization,
     }
@@ -516,8 +613,7 @@ async fn web_account_options(
 ) -> Result<Html<String>, AppError> {
     let accounts = state.account_service.list_with_balances().await?;
     let html = AccountOptionsPartial {
-        accounts,
-        localization,
+        accounts: account_row_views(accounts, &localization),
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -1424,6 +1520,224 @@ mod tests {
             !page.contains("No payment methods configured"),
             "configured account must not be flagged: {page}"
         );
+    }
+
+    /// The operator's language, so a refusal is asserted as the sentence the
+    /// operator reads and not as the catalog's English bytes.
+    async fn set_locale(state: &AppState, locale_code: &str, language_code: &str) {
+        sqlx::query("INSERT OR IGNORE INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES (?, ?, ?, 1)")
+            .bind(locale_code)
+            .bind(language_code)
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', ?, 'USD', 'UTC')")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = ? WHERE id = 1")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    async fn get_html(app: axum::Router, uri: &str) -> (StatusCode, String) {
+        let (status, body) = send(app, "GET", uri, None, String::new()).await;
+        (status, body)
+    }
+
+    /// One account's row, sliced out by its id, so an assertion about "the refused
+    /// account" is about THAT row and not about the page. The slice ends at the
+    /// row's own anchor close, which is the last thing the row emits, so a
+    /// comparison between two renders is about the row and not about what follows
+    /// it on the page.
+    fn row_html<'a>(html: &'a str, prefix: &str, id: i64) -> Option<&'a str> {
+        let marker = format!("id=\"{prefix}-{id}\"");
+        let start = html.find(&marker)? + marker.len();
+        let rest = &html[start..];
+        let end = rest.find("</a>").map(|at| at + 4).unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    /// An account whose transactions cannot be added up, with a sibling that can,
+    /// through the real flow: two `Income` transactions of `4e28` on one account.
+    ///
+    /// A single transaction is a bounded write and the write pre-check refuses the
+    /// second one, so the pair is stored the one way nothing in this application
+    /// is supposed to: straight through SQL, past the checked write. That is
+    /// exactly the state an account can be found in — by a migration, an import,
+    /// a bug older than this one — and it is the state every finance list has to
+    /// render rather than refuse.
+    async fn refused_balance_account(state: &AppState, name: &str) -> i64 {
+        let actor = test_support::audit_actor_id(&state.pool).await.unwrap();
+        let account = state.account_service.create(actor, name).await.unwrap().id;
+        for date in ["2024-05-01", "2024-05-02"] {
+            sqlx::query(
+                "INSERT INTO transactions (account_id, kind, amount, description, date, created_by) \
+                 VALUES (?, 'Income', '40000000000000000000000000000', 'sweep', ?, ?)",
+            )
+            .bind(account)
+            .bind(date)
+            .bind(actor)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        account
+    }
+
+    /// An ordinary transaction on `account`, so a refused account has a real
+    /// sibling whose figure the page must carry unchanged.
+    async fn ordinary_income(state: &AppState, name: &str, amount: &str) -> i64 {
+        let actor = test_support::audit_actor_id(&state.pool).await.unwrap();
+        let account = state.account_service.create(actor, name).await.unwrap().id;
+        sqlx::query(
+            "INSERT INTO transactions (account_id, kind, amount, description, date, created_by) \
+             VALUES (?, 'Income', ?, 'ordinary', '2024-05-01', ?)",
+        )
+        .bind(account)
+        .bind(amount)
+        .bind(actor)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        account
+    }
+
+    /// The consistency gap: an account whose balance refuses took the WHOLE page
+    /// down with it, which is the 400 this change removed from `/sales` and
+    /// `/purchases`. The row keeps its place, states the rule, and publishes no
+    /// figure; every other account on the page is byte-identical.
+    #[tokio::test]
+    async fn the_accounts_list_renders_a_refused_balance_in_place_of_the_amount() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let expected = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap()
+            .tr(crate::localization::MessageKey::PriceRefusalAggregateTooLarge)
+            .to_string();
+        let ordinary = ordinary_income(&state, "Ordinary Account", "1250").await;
+        let app = crate::routes::router(state.clone());
+
+        // THE CONTROL, measured BEFORE the refused account exists: the same page
+        // with the same ordinary row, so "the other rows are untouched" is a byte
+        // comparison and not a claim about one render.
+        let (clean_status, clean) = get_html(app.clone(), "/web/accounts").await;
+        assert_eq!(clean_status, StatusCode::OK, "{clean:.400}");
+        assert!(
+            !clean.contains("data-account-balance-refusal"),
+            "an all-ordinary page states nothing about the rule: {clean:.400}"
+        );
+        let clean_row =
+            row_html(&clean, "account", ordinary).expect("the ordinary account renders");
+
+        let refused = refused_balance_account(&state, "Refused Account").await;
+        let (status, html) = get_html(app.clone(), "/web/accounts").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let row = row_html(&html, "account", refused).expect("the refused account is on the page");
+        assert!(
+            row.contains(&expected),
+            "the row states the rule: {row:.600}"
+        );
+        assert!(
+            !row.contains("80000000000000000000000000000") && !row.contains("8E28"),
+            "and publishes no figure for it, not even the cached one: {row:.600}"
+        );
+        let sibling =
+            row_html(&html, "account", ordinary).expect("the ordinary account is on the page");
+        assert!(
+            sibling.contains("1.250") || sibling.contains("1250"),
+            "its sibling keeps its own money: {sibling:.600}"
+        );
+        assert_eq!(
+            sibling, clean_row,
+            "and its sibling is BYTE-IDENTICAL to the render that had no refused member beside \
+             it: a refused row must not change any other row"
+        );
+        // And the SET total refuses too, because it sums this account: a headline
+        // that carried would be the operator adding a figure the page just said it
+        // does not have.
+        assert!(
+            html.contains(&expected),
+            "the set total states the rule: {html:.600}"
+        );
+        assert!(
+            !html.contains("total-balance\"></span> 4") && !html.contains("8E28"),
+            "and no figure stands in for it: {html:.600}"
+        );
+    }
+
+    /// The dashboard is the same list on the same template, and the finance home
+    /// page is the surface an operator opens precisely when money is wrong.
+    #[tokio::test]
+    async fn the_dashboard_renders_a_refused_balance_instead_of_failing() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let expected = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap()
+            .tr(crate::localization::MessageKey::PriceRefusalAggregateTooLarge)
+            .to_string();
+        let refused = refused_balance_account(&state, "Dashboard Refused").await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let row = row_html(&html, "account", refused).expect("the refused account is on the page");
+        assert!(row.contains(&expected), "{row:.600}");
+        assert!(!row.contains("8E28"), "{row:.600}");
+    }
+
+    /// One account is a list of one, and its detail page is where an operator
+    /// goes to find out WHY. It renders, states the rule, and still shows the
+    /// transaction feed — each transaction is its own bounded amount.
+    #[tokio::test]
+    async fn the_account_detail_renders_a_refused_balance_instead_of_failing() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let expected = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap()
+            .tr(crate::localization::MessageKey::PriceRefusalAggregateTooLarge)
+            .to_string();
+        let refused = refused_balance_account(&state, "Detail Refused").await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/accounts/{refused}")).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains(&expected), "{html:.600}");
+        assert!(!html.contains("8E28"), "{html:.600}");
+        assert!(
+            html.contains("sweep"),
+            "and the transaction feed is still there: {html:.600}"
+        );
+    }
+
+    /// The account picker on the collect and payment forms reads the same list,
+    /// and a refused balance there would 400 a form an operator is filling in.
+    #[tokio::test]
+    async fn the_account_options_render_a_refused_balance_instead_of_failing() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let expected = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap()
+            .tr(crate::localization::MessageKey::PriceRefusalAggregateTooLarge)
+            .to_string();
+        let refused = refused_balance_account(&state, "Options Refused").await;
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, "/web/account-options").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let option = html
+            .split("<option")
+            .find(|chunk| chunk.contains(&format!(r#"value="{refused}""#)))
+            .unwrap_or_else(|| panic!("the refused account is an option: {html:.600}"));
+        assert!(option.contains(&expected), "{option:.400}");
     }
 
     #[tokio::test]

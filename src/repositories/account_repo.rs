@@ -3,8 +3,8 @@ use rust_decimal::Decimal;
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
-use crate::error::AppResult;
-use crate::models::{Account, AccountWithBalance};
+use crate::error::{AppError, AppResult};
+use crate::models::{Account, AccountWithBalance, SetMoney};
 
 // ---------------------------------------------------------------------------
 // Trait (portable to Postgres)
@@ -15,9 +15,13 @@ pub trait AccountRepository: Send + Sync {
     async fn create(&self, actor: i64, name: &str) -> AppResult<Account>;
     async fn list(&self) -> AppResult<Vec<Account>>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Account>>;
+    /// Every account with its derived balance, TOLERANT: an account whose
+    /// transactions cannot be added up keeps its place in the list carrying the
+    /// rule, so one unmeasurable account never empties the finance page around it.
     async fn list_with_balances(&self) -> AppResult<Vec<AccountWithBalance>>;
+    /// One account's derived balance, tolerant for the same reason — a detail page
+    /// is a list of one.
     async fn find_with_balance(&self, id: i64) -> AppResult<Option<AccountWithBalance>>;
-    async fn total_balance(&self) -> AppResult<Decimal>;
     async fn exists(&self, id: i64) -> AppResult<bool>;
 }
 
@@ -95,52 +99,16 @@ impl AccountRepository for SqliteAccountRepository {
         let accounts = self.list().await?;
         let mut out = Vec::with_capacity(accounts.len());
         for acc in accounts {
-            let balance = balance_for_account(&self.pool, acc.id).await?;
-            out.push(AccountWithBalance {
-                id: acc.id,
-                name: acc.name,
-                balance,
-                cached_balance: acc.cached_balance,
-                created_by: acc.created_by,
-                updated_by: acc.updated_by,
-                created_at: acc.created_at,
-            });
+            out.push(with_balance(&self.pool, acc).await?);
         }
         Ok(out)
     }
 
     async fn find_with_balance(&self, id: i64) -> AppResult<Option<AccountWithBalance>> {
-        let acc = self.find_by_id(id).await?;
-        let Some(acc) = acc else { return Ok(None) };
-        let balance = balance_for_account(&self.pool, acc.id).await?;
-        Ok(Some(AccountWithBalance {
-            id: acc.id,
-            name: acc.name,
-            balance,
-            cached_balance: acc.cached_balance,
-            created_by: acc.created_by,
-            updated_by: acc.updated_by,
-            created_at: acc.created_at,
-        }))
-    }
-
-    async fn total_balance(&self) -> AppResult<Decimal> {
-        // Sum all transactions in Rust for precision
-        let rows = sqlx::query(r#"SELECT kind, amount FROM transactions"#)
-            .fetch_all(&self.pool)
-            .await?;
-        let mut total = Decimal::ZERO;
-        for row in rows {
-            let kind: String = row.get("kind");
-            let amt_str: String = row.get("amount");
-            let amt = parse_decimal(&amt_str);
-            if kind == "Income" {
-                total += amt;
-            } else {
-                total -= amt;
-            }
+        match self.find_by_id(id).await? {
+            None => Ok(None),
+            Some(acc) => Ok(Some(with_balance(&self.pool, acc).await?)),
         }
-        Ok(total)
     }
 
     async fn exists(&self, id: i64) -> AppResult<bool> {
@@ -152,21 +120,49 @@ impl AccountRepository for SqliteAccountRepository {
     }
 }
 
-async fn balance_for_account(pool: &SqlitePool, account_id: i64) -> Result<Decimal, sqlx::Error> {
+/// One account with its derived balance, TOLERANT.
+///
+/// The fold below is the checked one, and a refusal is not an error here: the
+/// account keeps its place in the list and the row states the rule. The CACHED
+/// balance goes with it only when the derived figure carried — a cache of a sum
+/// that cannot be made is a stale number in the place of the number.
+async fn with_balance(pool: &SqlitePool, acc: Account) -> AppResult<AccountWithBalance> {
+    let balance = match balance_for_account(pool, acc.id).await {
+        Ok(amount) => SetMoney::amount(amount),
+        Err(AppError::PriceRefused(refusal)) => SetMoney::refused(refusal),
+        Err(other) => return Err(other),
+    };
+    let cached_balance = balance.amount.map(|_| acc.cached_balance);
+    Ok(AccountWithBalance {
+        id: acc.id,
+        name: acc.name,
+        balance,
+        cached_balance,
+        created_by: acc.created_by,
+        updated_by: acc.updated_by,
+        created_at: acc.created_at,
+    })
+}
+
+async fn balance_for_account(pool: &SqlitePool, account_id: i64) -> AppResult<Decimal> {
     let rows = sqlx::query(r#"SELECT kind, amount FROM transactions WHERE account_id = ?"#)
         .bind(account_id)
         .fetch_all(pool)
         .await?;
-    let mut total = Decimal::ZERO;
-    for row in rows {
-        let kind: String = row.get("kind");
-        let amt_str: String = row.get("amount");
-        let amt = parse_decimal(&amt_str);
-        if kind == "Income" {
-            total += amt;
-        } else {
-            total -= amt;
-        }
-    }
-    Ok(total)
+    let signed: Vec<Decimal> = rows
+        .iter()
+        .map(|row| {
+            let kind: String = row.get("kind");
+            let amt = parse_decimal(&row.get::<String, _>("amount"));
+            if kind == "Income" {
+                amt
+            } else {
+                -amt
+            }
+        })
+        .collect();
+    // `AppError` rather than sqlx's error, so a refused sum reaches the operator
+    // as the same sentence every other refusal answers with, instead of as a
+    // driver error. `AppError: From<sqlx::Error>` still covers the query.
+    Ok(crate::repositories::checked_aggregate_sum(&signed).map_err(AppError::PriceRefused)?)
 }

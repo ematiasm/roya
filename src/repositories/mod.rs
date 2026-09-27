@@ -17,6 +17,27 @@ pub mod purchase_repo;
 pub mod role_repo;
 pub mod sale_repo;
 pub mod session_repo;
+/// Add a SET of stored amounts, refusing when the running sum leaves the range.
+///
+/// This is the repository layer's copy of the argument the service layer keeps in
+/// `checked_money_sum`, and it exists because the rows these folds read are
+/// written one at a time: a bounded write says nothing about the sum of a set of
+/// them, which is the same reason a document total is checked separately from a
+/// line. `PriceRefusal::AggregateTooLarge` is the rule, and it is not
+/// `DocumentTotalTooLarge` because these sets are an account's transactions and a
+/// product's movements, not one document's lines.
+pub fn checked_aggregate_sum<'a>(
+    amounts: impl IntoIterator<Item = &'a Decimal>,
+) -> Result<Decimal, crate::models::PriceRefusal> {
+    let mut sum = Decimal::ZERO;
+    for amount in amounts {
+        sum = sum
+            .checked_add(*amount)
+            .ok_or(crate::models::PriceRefusal::AggregateTooLarge)?;
+    }
+    Ok(sum)
+}
+
 pub mod setup_repo;
 pub mod stock_repo;
 pub mod supplier_repo;

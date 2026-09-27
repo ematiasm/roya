@@ -233,8 +233,11 @@ pub enum PriceRefusal {
     /// derive from. "No cost" is the column's zero, never a NULL.
     MarkupNeedsPositiveCost,
     /// `derive_net_sale_price`: the operands are user-supplied and unbounded, and
-    /// `Decimal` arithmetic panics on overflow, so an unbounded pair is refused
-    /// instead of crashing the handler.
+    /// rust_decimal's raw arithmetic operators panic on overflow, so an
+    /// unbounded pair is refused instead of crashing the handler. The same
+    /// applies to every other variant here: none of them is a defect report, and
+    /// each one exists so a value that cannot be carried reaches an operator as
+    /// a sentence.
     DerivationOverflow,
     /// `validate_effective_prices`: a product must sell for something.
     SalePriceNotPositiveForProduct,
@@ -247,6 +250,109 @@ pub enum PriceRefusal {
     /// refuses it before the service is reached, and the ladder reports the same
     /// refusal rather than inventing a price.
     SalePriceRequired,
+    /// `final_price::solve_final_price`: the typed tax-inclusive price is not
+    /// the tax-inclusive price of ANY net. The per-contribution rounding leaves
+    /// gaps, so some typed values simply do not exist as a final price.
+    FinalPriceUnreachable,
+    /// `final_price::solve_final_price`: the linked rates add up to -100% or
+    /// less, so a net is not a function of the final price and there is no
+    /// estimate to search around. The rate set itself has to change first.
+    FinalPriceNotInvertible,
+    /// `final_price::solve_final_price`: the solved net could not be reproduced
+    /// from `cost_price` by any markup the arithmetic can REPRESENT — solving
+    /// `markup = net * 100 / cost - 100` leaves the 28-digit `Decimal` range, so
+    /// there is no `markup_pct` value that could ever close the round trip.
+    ///
+    /// This is deliberately NOT "the ladder did not close": when a rung is
+    /// refused by the deriver the solve reports the DERIVER's own refusal, and
+    /// `derive_net_sale_price` refusing every rung is a different fact with a
+    /// different remedy. The solve says which one happened.
+    FinalPriceMarkupUnreachable,
+    /// `final_price::solve_final_price`: the typed final price is above
+    /// `final_price::max_solvable_final_price`.
+    ///
+    /// The ceiling was introduced while the tax contract still multiplied with
+    /// rust_decimal's raw operator and PANICKED on overflow, and it stays: the
+    /// contract is now total and refuses in its own right, but a solve that
+    /// already knows the price is outside what the arithmetic can carry must
+    /// say so with the solve's OWN variant rather than depending on which of its
+    /// two mechanisms notices first.
+    FinalPriceTooLarge,
+    /// `final_price::solve_final_price`: a linked rate is so large that
+    /// `net * rate` leaves the representable range for a final price the solve
+    /// otherwise accepts. Refused for the same reason as `FinalPriceTooLarge`,
+    /// and separately named because the remedy differs: this one is the tax, not
+    /// the price. Distinct from `TaxArithmeticTooLarge`, which the shared
+    /// contract raises on a document line and which names the same arithmetic
+    /// with the line's own vocabulary.
+    TaxRateTooLargeToPrice,
+    /// `final_price::solve_final_price`: the NET this final price would need is
+    /// above `Decimal::MAX`, so no net price can be stored for it. The typed
+    /// final price is INSIDE the solve's own limit — the linked rates gross it
+    /// down by a factor small enough that dividing lands past the ceiling (100
+    /// taxes at `-0.99999999999` gross a price down by 1e-11).
+    ///
+    /// This is deliberately neither `FinalPriceTooLarge` nor
+    /// `TaxRateTooLargeToPrice`. The price is not over the limit, so the first
+    /// would contradict the limit's own promise; and the individual rates are
+    /// small, so the second would point at the wrong field. A third variant is
+    /// the honest answer because the remedy is a third thing: the rate SET has to
+    /// stop grossing the price down that far.
+    NetPriceTooLarge,
+    /// A document line's net amount is `qty * price`, and BOTH operands are
+    /// user-supplied with no ceiling of their own, so the PRODUCT leaves the
+    /// 28-digit `Decimal` range before any tax is even read. The remedy is
+    /// wholly the operator's: the quantity or the unit price has to come down.
+    LineAmountTooLarge,
+    /// The net amount is representable, and so is every individual tax
+    /// contribution, but the PAIR is not: `net + SUM round2(net * rate / 100)`
+    /// is what leaves the range.
+    ///
+    /// This is deliberately NOT `LineAmountTooLarge`, and the probe that found
+    /// the difference is the reason. There are inputs where every individual
+    /// multiply fits, the running tax total fits, and only the FINAL ADD
+    /// overflows — `net` at the top of the range with a single 1% rate is one.
+    /// The governing bound is therefore the pair `net * (1 + SUM rate/100) <=
+    /// MAX`, not the per-multiply `net * rate <= MAX`, and a guard that checked
+    /// only the multiplies would still crash on exactly those inputs.
+    ///
+    /// The remedy differs for the same reason. Lowering the quantity or the unit
+    /// price is what fixes an unrepresentable amount; here either the amount OR
+    /// the rate has to come down, so an operator who only lowers the price of a
+    /// 1%-rate line is refused again for the same arithmetic.
+    TaxArithmeticTooLarge,
+    /// Every line of a document is representable, and every one of them was
+    /// stored by a write that refuses to store an unrepresentable amount — and
+    /// their SUM is not representable. Two lines of `4e28` with no tax are the
+    /// smallest construction: each is individually carryable, and `8e28` is
+    /// above `Decimal::MAX`.
+    ///
+    /// This is a THIRD rule and not a reuse of either line rule, for the reason
+    /// the other two are separate: the remedy is a different operator action
+    /// again. A `LineAmountTooLarge` says "lower this line's quantity or price";
+    /// a `TaxArithmeticTooLarge` says "this line's amount or its rate". Neither
+    /// is true here — every line is fine, and every rate is fine — so reusing
+    /// either would tell the operator to fix a number that is already correct.
+    /// What is wrong is the DOCUMENT: the operator has to reduce it, split it,
+    /// or have the amounts corrected at the source.
+    ///
+    /// It is also the one rule a per-line bound can never reach, which is why it
+    /// exists rather than a wider line rule. Per-line carryability is a
+    /// statement about one row; this is a statement about a SET of rows, and a
+    /// census that reads one row at a time cannot see it. The same identity
+    /// covers the sums built FROM documents — a customer's outstanding balance,
+    /// a debt figure — for the same reason: each document's figure is
+    /// representable and the set of them is not, so the remedy is again on the
+    /// documents rather than on any one line.
+    DocumentTotalTooLarge,
+    /// A sum over stored amounts that is not over ONE document's lines: an
+    /// account's balance (its transactions) and a product's stock level (its
+    /// movements). Every row in those sets is a single bounded write, and the sum
+    /// of bounded rows is not bounded — the same argument as the document total,
+    /// one level out, which is why it is a rule of its own rather than a reuse of
+    /// that sentence: an account balance is not a document, and telling an
+    /// operator to split their bank account would be nonsense.
+    AggregateTooLarge,
 }
 
 impl PriceRefusal {
@@ -268,6 +374,16 @@ impl PriceRefusal {
         Self::SalePriceNegative,
         Self::CostPriceNegative,
         Self::SalePriceRequired,
+        Self::FinalPriceUnreachable,
+        Self::FinalPriceNotInvertible,
+        Self::FinalPriceMarkupUnreachable,
+        Self::FinalPriceTooLarge,
+        Self::TaxRateTooLargeToPrice,
+        Self::NetPriceTooLarge,
+        Self::LineAmountTooLarge,
+        Self::TaxArithmeticTooLarge,
+        Self::DocumentTotalTooLarge,
+        Self::AggregateTooLarge,
     ];
 
     /// The English text this refusal has always answered with. It is the
@@ -285,6 +401,36 @@ impl PriceRefusal {
             Self::SalePriceNegative => "sale_price cannot be negative",
             Self::CostPriceNegative => "cost_price cannot be negative",
             Self::SalePriceRequired => "sale_price is required",
+            Self::FinalPriceUnreachable => {
+                "no net price produces this final price with the linked taxes"
+            }
+            Self::FinalPriceNotInvertible => {
+                "linked tax rates must add up to more than -100 to solve a final price"
+            }
+            Self::FinalPriceMarkupUnreachable => {
+                "no markup_pct derives this net_price from this cost_price"
+            }
+            Self::FinalPriceTooLarge => "final_price is too large to solve a net_price from",
+            Self::TaxRateTooLargeToPrice => {
+                "a linked tax rate is too large to price this final_price"
+            }
+            Self::NetPriceTooLarge => {
+                "the linked tax rates gross this final_price down to a net_price that is too \
+                 large to store"
+            }
+            // No trailing period, like every other row here: this text IS the
+            // body the JSON API answers with, and the closed-catalog test pins
+            // the English row to these bytes.
+            Self::LineAmountTooLarge => "qty * price is too large to store on this line",
+            Self::TaxArithmeticTooLarge => "the line amount is too large to calculate its taxes",
+            Self::DocumentTotalTooLarge => {
+                "the document total is too large to compute: reduce or split the document, or \
+                 correct its amounts at the source"
+            }
+            Self::AggregateTooLarge => {
+                "the accumulated amount is too large to compute: correct the stored amounts at \
+                 the source"
+            }
         }
     }
 }
@@ -369,16 +515,32 @@ pub struct ProductPriceLadder {
     /// The markup the ladder reports, or `None` for a manual-price product.
     pub markup_pct: Option<Decimal>,
     /// The net sale price the taxes are applied to. Meaningless when
-    /// `net_refusal` is `Some`.
+    /// `net_refusal` is `Some` — which includes a tax-arithmetic refusal, where
+    /// the net itself is perfectly storable and is simply not shown beside a
+    /// breakdown that does not exist. The form field above the ladder still
+    /// shows the stored value, so nothing is hidden from the operator.
     pub net_price: Decimal,
     /// True when `net_price` came out of the cost and the markup; false for a
     /// manual price. The ladder states which, because "why is it this number"
     /// is the first question an operator asks of a price.
     pub net_is_derived: bool,
-    /// The save path's own refusal, when no net price can be stated. Typed, not
-    /// a message: the ladder renders it through the same mapping the save form
+    /// The ladder's own refusal, when no money can be stated. Typed, not a
+    /// message: the ladder renders it through the same mapping the save form
     /// renders it through, so the preview cannot say in one language what the
     /// save says in another.
+    ///
+    /// It carries BOTH halves, because both mean the same thing to a reader —
+    /// there is no figure here to show. The PRICE half is the save path's own
+    /// refusal, when no net price exists at all. The TAX half is
+    /// `line_taxes::calculate_line_taxes` refusing the arithmetic on a net that
+    /// does exist: a stored price with no upper ceiling plus a stored rate can
+    /// be a pair no arithmetic can carry, and a ladder that published a
+    /// breakdown for it would be publishing a figure a document line would
+    /// refuse to write.
+    ///
+    /// ONE slot, not two. A second field would need a second message key and a
+    /// second branch in the fragment, and a reader would still be asking the
+    /// same question of both.
     pub net_refusal: Option<PriceRefusal>,
     /// True when a form field was not a number, so the ladder reports the last
     /// state the save path accepted instead of a preview of a value that does
@@ -499,12 +661,6 @@ impl Transaction {
     }
 }
 
-impl AccountWithBalance {
-    pub fn is_negative(&self) -> bool {
-        self.balance.is_sign_negative()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // DTOs / API payloads
 // ---------------------------------------------------------------------------
@@ -548,8 +704,20 @@ pub struct TransactionFilter {
 pub struct AccountWithBalance {
     pub id: i64,
     pub name: String,
-    pub balance: Decimal,
-    pub cached_balance: Decimal,
+    /// The balance derived from this account's transactions, or the rule that
+    /// stopped the sum. A refused balance keeps the row's place in every list
+    /// that renders it, which is the same decision the document lists took: one
+    /// account an operator must fix must not empty the finance page around it.
+    pub balance: SetMoney,
+    /// The cached balance, and `None` exactly when [`Self::balance`] refused.
+    ///
+    /// It is a CACHE of a sum that cannot be made, so publishing it beside a
+    /// refusal would be publishing a stale figure in the place of the figure —
+    /// worse than publishing none, because the operator cannot tell the two apart.
+    /// Omitted from the wire entirely when refused, which keeps an ordinary
+    /// account's JSON byte-identical to what it always was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_balance: Option<Decimal>,
     /// Audit actor (M5 Phase B): who created and who last edited the account.
     pub created_by: i64,
     pub updated_by: Option<i64>,
@@ -560,7 +728,9 @@ pub struct AccountWithBalance {
 pub struct AccountDetail {
     pub id: i64,
     pub name: String,
-    pub balance: Decimal,
+    /// The derived balance, or the rule that stopped the sum — the same shape the
+    /// list row carries, because a detail page is a list of one.
+    pub balance: SetMoney,
     /// Audit actor (M5 Phase B): who created and who last edited the account.
     pub created_by: i64,
     pub updated_by: Option<i64>,
@@ -876,8 +1046,14 @@ pub struct NewMovement {
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductStock {
     pub product: Product,
-    pub stock: Decimal,
-    /// `max_stock - stock` when `stock <= min_stock`, else `None`.
+    /// The level derived from this product's movements, or the rule that stopped
+    /// the sum. A stock level is a set sum like an account balance, so it refuses
+    /// the same way, and a catalogue of products must render the one that cannot
+    /// be measured instead of failing to list.
+    pub stock: SetMoney,
+    /// `max_stock - stock` when `stock <= min_stock`, else `None` — and `None` when
+    /// the level refused, because a suggestion computed from a level that does not
+    /// exist would be a number with nothing behind it.
     pub suggested: Option<Decimal>,
 }
 
@@ -1293,15 +1469,15 @@ pub struct SalePaymentView {
     pub date: NaiveDate,
 }
 
-/// The sale record page payload: the stored document plus every child with its
-/// internal keys replaced by display names. Totals stay derived.
-#[derive(Debug, Clone, Serialize)]
-pub struct SaleRecord {
-    pub sale: Sale,
-    pub lines: Vec<SaleLineView>,
-    pub payments: Vec<SalePaymentView>,
-    /// The net money, the tax money and the tax-inclusive total, in that order,
-    /// so the page can show an auditable sum instead of one opaque number.
+/// A document's derived money, held together because it is ONE fact: a document
+/// whose lines can be added up has a net, a tax total, a tax-inclusive total, a
+/// paid figure, a due balance and a payment status, and a document whose lines
+/// cannot be added up has NONE of them.
+///
+/// The net money, the tax money and the tax-inclusive total, in that order, so
+/// the page can show an auditable sum instead of one opaque number.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct RecordMoney {
     pub net_subtotal: Decimal,
     pub tax_total: Decimal,
     pub total: Decimal,
@@ -1310,15 +1486,170 @@ pub struct SaleRecord {
     pub payment_status: PaymentStatus,
 }
 
+/// A money figure derived from a SET of documents: the amount, or the rule that
+/// stopped the accumulation.
+///
+/// It is its own type because a partial sum must never be published. A figure
+/// that silently omitted the one document whose lines cannot be added up is
+/// indistinguishable from a real balance, and an operator who acts on it acts on
+/// a number this application cannot stand behind. `amount` is `None` exactly
+/// when `refusal` is `Some`, so "no figure" and "here is why" travel together and
+/// a page has one thing to render in place of the figure.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetMoney {
+    pub amount: Option<Decimal>,
+    pub refusal: Option<PriceRefusal>,
+}
+
+impl SetMoney {
+    /// The ordinary case: a figure the accumulation could carry.
+    pub fn amount(amount: Decimal) -> Self {
+        Self {
+            amount: Some(amount),
+            refusal: None,
+        }
+    }
+
+    /// The refused case: no figure at all, and the rule that stopped the sum.
+    pub fn refused(refusal: PriceRefusal) -> Self {
+        Self {
+            amount: None,
+            refusal: Some(refusal),
+        }
+    }
+}
+
+impl SetMoney {
+    /// Whether the figure is positive — the sign a ledger row's chip reads.
+    ///
+    /// A refused figure is positive, because the entry that carries it is a
+    /// document entering the ledger and the chip must not claim the opposite.
+    /// It is a colour, never an amount: there is no figure to be right about.
+    pub fn amount_is_positive(&self) -> bool {
+        self.amount
+            .map(|amount| amount.is_sign_positive())
+            .unwrap_or(true)
+    }
+
+    /// Whether the figure is negative — the sign a money row's colour reads. A
+    /// refused figure is NOT negative: it states no sign, because it states no
+    /// figure.
+    pub fn amount_is_negative(&self) -> bool {
+        self.amount
+            .map(|amount| amount.is_sign_negative())
+            .unwrap_or(false)
+    }
+}
+
+impl Default for SetMoney {
+    /// The default is a figure, not a refusal: an absent aggregate is a set with
+    /// no documents in it, and "0 owed" is a fact. `None` is reserved for the one
+    /// case that is not a fact.
+    fn default() -> Self {
+        SetMoney::amount(Decimal::ZERO)
+    }
+}
+
+impl Serialize for SetMoney {
+    /// The bare amount when there is one, and an OBJECT carrying the rule when the
+    /// accumulation refused.
+    ///
+    /// The JSON API's existing shape for these figures IS the amount, so every
+    /// figure that carries stays byte-identical — a consumer that reads a normal
+    /// ageing, a normal balance or a normal statement total sees exactly the
+    /// bytes it saw before this type existed.
+    ///
+    /// A refused figure was `null` here once, and `null` was a defect: on
+    /// `/api/customers/ageing` it produced four genuine-looking `0.00` cells and
+    /// a `null` balance, which a client cannot tell from "this customer owes
+    /// nothing". The wire now has to be able to say WHICH RULE stopped the sum,
+    /// and it says it with [`PriceRefusal::as_str`] — the same bytes the
+    /// `AppError` body and the English catalog row already carry, so there is no
+    /// second message to keep in step.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match (self.amount, self.refusal) {
+            (Some(amount), _) => serde::Serialize::serialize(&amount, serializer),
+            (None, Some(refusal)) => {
+                use serde::ser::SerializeStruct;
+                let mut out = serializer.serialize_struct("SetMoney", 1)?;
+                out.serialize_field("refused", refusal.as_str())?;
+                out.end()
+            }
+            // Unreachable by construction: `amount` is `None` exactly when
+            // `refusal` is `Some`. Serialized as `null` rather than panicking,
+            // because a serializer that panics is the defect this whole type
+            // exists to remove.
+            (None, None) => serializer.serialize_none(),
+        }
+    }
+}
+
+/// One row of a document LIST: the stored document, its money when the
+/// arithmetic carried it, and the rule when it did not.
+///
+/// This is the shape that makes a list page total. A `SaleDetail` cannot be the
+/// row type, because its money is not optional: a detail is a machine contract
+/// (the JSON API) where a refusal is an error, while a page must still SHOW the
+/// document and say why its figure is missing. Both are built by the same
+/// checked derivation, so they cannot disagree about which documents are
+/// refusable.
+#[derive(Debug, Clone, Serialize)]
+pub struct SaleListRow {
+    pub sale: Sale,
+    /// The document's money, or `None` when its lines cannot be added up.
+    pub money: Option<RecordMoney>,
+    /// The rule that refused [`Self::money`], when it is `None`.
+    pub total_refusal: Option<PriceRefusal>,
+}
+
+/// The purchase twin of [`SaleListRow`], plus the one non-money fact a purchases
+/// row shows that a sale row does not: how many lines the document carries.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchaseListRow {
+    pub purchase: Purchase,
+    pub line_count: usize,
+    /// The document's money, or `None` when its lines cannot be added up.
+    pub money: Option<RecordMoney>,
+    /// The rule that refused [`Self::money`], when it is `None`.
+    pub total_refusal: Option<PriceRefusal>,
+}
+
+/// The sale record page payload: the stored document plus every child with its
+/// internal keys replaced by display names. Totals stay derived.
+///
+/// `money` and `total_refusal` are one fact in two halves, and they are never
+/// both set or both clear: the record page is the ONE surface that renders a
+/// document whose total cannot be carried, because it is also the operator's
+/// only way back into one. Every line is still shown with its own money — each
+/// of those is representable — so the page is where the document can be read and
+/// reduced, rather than a document nothing in the application can open.
+#[derive(Debug, Clone, Serialize)]
+pub struct SaleRecord {
+    pub sale: Sale,
+    pub lines: Vec<SaleLineView>,
+    pub payments: Vec<SalePaymentView>,
+    /// The document's money, or `None` when its lines cannot be added up.
+    pub money: Option<RecordMoney>,
+    /// The rule that refused [`Self::money`], when it is `None`. The page states
+    /// it through the one shared `price_refusal_key` mapping, so this surface
+    /// cannot invent a wording of its own.
+    pub total_refusal: Option<PriceRefusal>,
+}
+
 /// The sales page's debt banner: a summary, not the full receivable. `total` and
 /// `count` are exact (decimal sums in Rust) and `oldest` is the first few unpaid
 /// documents by due date, so the banner renders a bounded number of rows. The full
 /// receivable list stays a filtered read, never an always-rendered panel.
+///
+/// The total is a [`SetMoney`] and the rows are [`SaleListRow`]s because both of
+/// them are sums over a SET of documents: a panel that refused to render, or that
+/// published a total with one document quietly missing from it, would misstate
+/// what the shop is owed.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DebtSummary {
-    pub total: Decimal,
+    pub total: SetMoney,
     pub count: usize,
-    pub oldest: Vec<SaleDetail>,
+    pub oldest: Vec<SaleListRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,6 +1991,11 @@ pub struct PurchasePaymentView {
 /// its internal keys replaced by display names (`products.cost_price` stays the
 /// fallback the service already applies for an empty line cost). Totals stay
 /// derived.
+///
+/// `money` and `total_refusal` are one fact in two halves, exactly as on
+/// [`SaleRecord`] and for the same reason: the purchase record page is the
+/// operator's way into a document whose lines cannot be added up, so it renders
+/// the document and states the refusal instead of answering an error.
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseRecord {
     pub purchase: Purchase,
@@ -1667,19 +2003,28 @@ pub struct PurchaseRecord {
     pub supplier_name: String,
     pub lines: Vec<PurchaseLineView>,
     pub payments: Vec<PurchasePaymentView>,
-    /// The net money, the tax money and the tax-inclusive total, in that order,
-    /// so the page can show an auditable sum instead of one opaque number.
-    pub net_subtotal: Decimal,
-    pub tax_total: Decimal,
-    pub total: Decimal,
-    pub paid: Decimal,
-    pub due: Decimal,
-    pub payment_status: PaymentStatus,
+    /// The document's money, or `None` when its lines cannot be added up.
+    pub money: Option<RecordMoney>,
+    /// The rule that refused [`Self::money`], when it is `None`.
+    pub total_refusal: Option<PriceRefusal>,
     /// Sum of `qty` over the lines whose `tracks_stock` predicate holds — the
     /// units `confirm`/`cancel` will actually move (receiving-desk T2). Built
     /// in Rust from the same per-line flags the record already computes, so
     /// any effects preview rendered from it cannot drift from those flows.
-    pub tracked_units: Decimal,
+    /// The units the stock flows will move, as a SET SUM over the document's
+    /// stock-tracking lines — so it is a [`SetMoney`], not a bare `Decimal`, and
+    /// for the same reason the money figures are.
+    ///
+    /// A QUANTITY is bounded by its own argument, and the argument is the one
+    /// this whole change exists on: a per-line bound never covers a per-document
+    /// fold. `qty` is operator-typed, nothing above it is bounded but
+    /// representability, and a line's AMOUNT says nothing about it — `4e28` units
+    /// at a unit cost of `0` is a line of amount `0` and a document total of `0`,
+    /// which every money bound in this codebase carries without complaint. The
+    /// unit count is the one figure on this record that can still leave the range,
+    /// so it refuses the same way, through the same rule, and the page says so
+    /// instead of printing a number no operator can act on.
+    pub tracked_units: SetMoney,
 }
 
 /// Format `YYYY-PURCH-NNNNNN` with zero-padded 6-digit sequence.
@@ -1909,7 +2254,15 @@ pub struct DocumentRow {
     pub date: NaiveDate,
     /// The status/detail pill.
     pub detail: String,
+    /// `None` for a family with no money (a stock movement), and `None` with a
+    /// `total_refusal` for a document whose lines cannot be added up. The
+    /// second case is NOT the first: the row keeps its place in the index and
+    /// states the rule, because one document that cannot be totaled must not cost
+    /// the operator the rest of the page.
     pub amount: Option<Decimal>,
+    /// The rule that refused `amount` on a family that HAS money. Never set
+    /// without `amount` being `None`, and never set on a family with no money.
+    pub total_refusal: Option<PriceRefusal>,
     pub quantity: Option<Decimal>,
     /// The audit actor the row records.
     pub created_by: i64,
@@ -1923,12 +2276,24 @@ pub const DOCUMENTS_PAGE_LIMIT: usize = 200;
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseSuggestion {
     pub product: Product,
-    pub stock: Decimal,
-    pub suggested_qty: Decimal,
+    /// The product's level, or the rule that stopped the sum. The reorder panel
+    /// is a list of set sums like every other list in this change, so the product
+    /// whose movements cannot be added up keeps its row and states the rule.
+    pub stock: SetMoney,
+    /// The suggested reorder quantity, and `None` for a refused level.
+    ///
+    /// `None`, not `0`: a suggestion needs the level it comes from, and a `0`
+    /// beside a refusal would read as "reorder nothing" — a claim derived from a
+    /// figure nobody can state. `None` is the honest "no suggestion exists", and
+    /// the row states the rule beside it.
+    pub suggested_qty: Option<Decimal>,
     pub supplier_id: i64,
     pub supplier_name: String,
     pub unit_cost: Decimal,
-    pub subtotal: Decimal,
+    /// `suggested_qty * unit_cost`, and `None` with it — the subtotal is a
+    /// multiplication of the suggestion, so it is absent exactly when the
+    /// suggestion is.
+    pub subtotal: Option<Decimal>,
 }
 
 /// Low-stock product with no satellite row: never silently dropped, returned
@@ -1936,8 +2301,11 @@ pub struct PurchaseSuggestion {
 #[derive(Debug, Clone, Serialize)]
 pub struct PurchaseSuggestionWithoutSupplier {
     pub product: Product,
-    pub stock: Decimal,
-    pub suggested_qty: Decimal,
+    /// The level, or the rule — the same shape and the same reason as
+    /// [`PurchaseSuggestion::stock`].
+    pub stock: SetMoney,
+    /// `None` for a refused level, for the same reason as on the costed row.
+    pub suggested_qty: Option<Decimal>,
 }
 
 /// The pedido suggestion: costed low-stock lines plus the unsourced ones.
@@ -2027,22 +2395,69 @@ pub struct CustomerCreateResult {
 
 /// Ageing of a derived receivable against an explicit `as_of` date. Each sale
 /// with `due > 0` falls in exactly one bucket by how many days late it is.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+///
+/// Every bucket is a [`SetMoney`] and not a bare `Decimal`, because a bucket is a
+/// SET SUM like any other: it is a sum over the documents that fall in it, so it
+/// is bounded by a checked accumulation and refuses rather than publishing a
+/// figure. The alternative — a `Decimal` plus a `#[serde(skip)]` flag — put four
+/// genuine-looking zeros on the wire with no reason attached, and a client read
+/// that as "owes nothing". There is now nothing on this type that can be zero
+/// BECAUSE a sum was refused: a refused bucket has no amount at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct Ageing {
     /// Not yet due, due today, or no due date at all.
-    pub current: Decimal,
+    pub current: SetMoney,
     /// 1 to 30 days past the due date.
-    pub overdue_1_30: Decimal,
+    pub overdue_1_30: SetMoney,
     /// 31 to 60 days past the due date.
-    pub overdue_31_60: Decimal,
+    pub overdue_31_60: SetMoney,
     /// More than 60 days past the due date.
-    pub overdue_61_plus: Decimal,
+    pub overdue_61_plus: SetMoney,
 }
 
 impl Ageing {
-    /// Sum of the four buckets: the receivable they were computed from.
-    pub fn total(&self) -> Decimal {
-        self.current + self.overdue_1_30 + self.overdue_31_60 + self.overdue_61_plus
+    /// The four buckets as ONE figure — or the rule that stopped the
+    /// accumulation.
+    ///
+    /// Two bounds live here and both are needed, because the buckets are a
+    /// PARTITION of one receivable and a bound that holds inside a bucket says
+    /// nothing about the sum ACROSS the partition: two documents of `4e28`, one
+    /// not yet due and one ten days late, each fit their own bucket and together
+    /// are `8e28`, which `Decimal` cannot carry. A refused bucket refuses the
+    /// total (a total over a refused part is a refusal), and the cross-bucket sum
+    /// is `checked_add` for the same reason the per-bucket sums are: the raw `+`
+    /// here is a panic, and the operator's page is where it would land.
+    pub fn total(&self) -> SetMoney {
+        if let Some(refusal) = self.refusal() {
+            return SetMoney::refused(refusal);
+        }
+        let mut sum = Decimal::ZERO;
+        for bucket in self.buckets() {
+            // Every bucket carries an amount here: `refusal()` found none.
+            let amount = bucket.amount.unwrap_or(Decimal::ZERO);
+            match sum.checked_add(amount) {
+                Some(next) => sum = next,
+                None => return SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
+            }
+        }
+        SetMoney::amount(sum)
+    }
+
+    /// The rule that stopped this ageing, if any of the buckets carries one.
+    /// Derived, never stored: a flag beside the figures is one more thing that
+    /// can disagree with them.
+    pub fn refusal(&self) -> Option<PriceRefusal> {
+        self.buckets().iter().find_map(|bucket| bucket.refusal)
+    }
+
+    /// The four buckets in grid order.
+    pub fn buckets(&self) -> [SetMoney; 4] {
+        [
+            self.current,
+            self.overdue_1_30,
+            self.overdue_31_60,
+            self.overdue_61_plus,
+        ]
     }
 }
 
@@ -2052,7 +2467,7 @@ impl Ageing {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CustomerAgeing {
     pub customer_id: i64,
-    pub balance: Decimal,
+    pub balance: SetMoney,
     pub ageing: Ageing,
 }
 
@@ -2067,6 +2482,11 @@ pub enum StatementEntryKind {
 
 /// One line of a customer statement. `balance` is the running balance after
 /// applying this entry, so the last entry always lands on the statement total.
+///
+/// `debit` and `balance` are [`SetMoney`]s because both are derived from document
+/// totals: a document whose lines cannot be added up has no debit, and from that
+/// entry on the running balance cannot be stated either. `credit` is not — a
+/// payment row carries its own stored amount, which is always representable.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatementEntry {
     pub date: NaiveDate,
@@ -2075,18 +2495,23 @@ pub struct StatementEntry {
     /// the sale it was applied to, which keeps tied dates orderable.
     pub document_number: Option<String>,
     pub description: String,
-    pub debit: Decimal,
+    pub debit: SetMoney,
     pub credit: Decimal,
-    pub balance: Decimal,
+    pub balance: SetMoney,
 }
 
 /// Derived account statement of one customer: the full confirmed-credit ledger
 /// with its running balance, plus the ageing of the same receivable as of
 /// `as_of`. Cancelled sales contribute nothing to either side.
+///
+/// Every figure here is a sum over a SET of documents, so each one is a
+/// [`SetMoney`]: a statement that dropped the document it could not total would
+/// state a balance the operator cannot audit, and one that refused to render
+/// would hide every OTHER document on the page behind it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CustomerStatement {
     pub customer_id: i64,
-    pub balance: Decimal,
+    pub balance: SetMoney,
     pub as_of: NaiveDate,
     pub ageing: Ageing,
     pub entries: Vec<StatementEntry>,

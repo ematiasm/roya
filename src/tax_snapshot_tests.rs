@@ -179,7 +179,8 @@ async fn taxes_linked_to(
 /// the line total is the untouched net amount (never a re-scaled copy of it).
 #[test]
 fn tax_snapshot_calc_zero_taxes_keeps_the_net_total() {
-    let calc = calculate_line_taxes(dec("123.456"), &[]);
+    let calc = calculate_line_taxes(dec("123.456"), &[])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert!(calc.taxes.is_empty());
     assert_eq!(calc.net_subtotal, dec("123.456"));
     assert_eq!(calc.tax_total, dec("0"));
@@ -191,7 +192,8 @@ fn tax_snapshot_calc_zero_taxes_keeps_the_net_total() {
 #[test]
 fn tax_snapshot_calc_single_tax_contribution() {
     let tax = tax_value(1, "IVA", "21");
-    let calc = calculate_line_taxes(dec("100"), &[tax]);
+    let calc = calculate_line_taxes(dec("100"), &[tax])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes.len(), 1);
     assert_eq!(calc.taxes[0].amount, dec("21"));
     assert_eq!(calc.tax_total, dec("21"));
@@ -205,7 +207,8 @@ fn tax_snapshot_calc_multiple_taxes_are_additive_not_compounded() {
     let calc = calculate_line_taxes(
         dec("100"),
         &[tax_value(1, "IVA", "21"), tax_value(2, "IIBB", "10")],
-    );
+    )
+    .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes[0].amount, dec("21"));
     assert_eq!(calc.taxes[1].amount, dec("10"));
     assert_eq!(calc.tax_total, dec("31"));
@@ -216,7 +219,8 @@ fn tax_snapshot_calc_multiple_taxes_are_additive_not_compounded() {
 /// id, code, name and rate as they were resolved, never a live join.
 #[test]
 fn tax_snapshot_calc_returns_the_immutable_tax_facts() {
-    let calc = calculate_line_taxes(dec("50"), &[tax_value(7, "IVA", "21")]);
+    let calc = calculate_line_taxes(dec("50"), &[tax_value(7, "IVA", "21")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     let snapshot = &calc.taxes[0];
     assert_eq!(snapshot.tax_id, 7);
     assert_eq!(snapshot.code, "IVA");
@@ -230,7 +234,8 @@ fn tax_snapshot_calc_returns_the_immutable_tax_facts() {
 /// product-markup derived price uses. A banker's rounding would answer 0.00.
 #[test]
 fn tax_snapshot_calc_rounds_a_contribution_half_up_at_the_midpoint() {
-    let calc = calculate_line_taxes(dec("1"), &[tax_value(1, "T", "0.5")]);
+    let calc = calculate_line_taxes(dec("1"), &[tax_value(1, "T", "0.5")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes[0].amount, dec("0.01"));
     assert_eq!(calc.tax_total, dec("0.01"));
     assert_eq!(calc.total, dec("1.01"));
@@ -240,7 +245,8 @@ fn tax_snapshot_calc_rounds_a_contribution_half_up_at_the_midpoint() {
 /// can carry more than two decimals (a fractional quantity times a price).
 #[test]
 fn tax_snapshot_calc_rounds_the_total_half_up_at_the_midpoint() {
-    let calc = calculate_line_taxes(dec("10.005"), &[tax_value(1, "IVA", "21")]);
+    let calc = calculate_line_taxes(dec("10.005"), &[tax_value(1, "IVA", "21")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes[0].amount, dec("2.10"));
     assert_eq!(calc.tax_total, dec("2.10"));
     assert_eq!(calc.total, dec("12.11"));
@@ -257,7 +263,8 @@ fn tax_snapshot_calc_contributions_reconcile_with_the_tax_total() {
             tax_value(2, "B", "5.5"),
             tax_value(3, "C", "1.1"),
         ],
-    );
+    )
+    .expect("an ordinary amount and rate set is arithmetic this contract carries");
     let summed: Decimal = calc.taxes.iter().map(|t| t.amount).sum();
     assert_eq!(summed, calc.tax_total);
     assert_eq!(calc.tax_total, dec("9.20"));
@@ -268,7 +275,8 @@ fn tax_snapshot_calc_contributions_reconcile_with_the_tax_total() {
 /// snapshot row still exists so the document shows the fact it was linked.
 #[test]
 fn tax_snapshot_calc_zero_rate_tax_contributes_nothing() {
-    let calc = calculate_line_taxes(dec("80"), &[tax_value(1, "EXENTO", "0")]);
+    let calc = calculate_line_taxes(dec("80"), &[tax_value(1, "EXENTO", "0")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     assert_eq!(calc.taxes.len(), 1);
     assert_eq!(calc.taxes[0].amount, dec("0"));
     assert_eq!(calc.tax_total, dec("0"));
@@ -289,7 +297,8 @@ fn tax_snapshot_calc_round_to_cents_is_half_up_away_from_zero() {
 /// for field, so what the document stores is exactly what the contract decided.
 #[test]
 fn tax_snapshot_calc_snapshot_converts_to_the_persistence_shape() {
-    let calc = calculate_line_taxes(dec("100"), &[tax_value(7, "IVA", "21")]);
+    let calc = calculate_line_taxes(dec("100"), &[tax_value(7, "IVA", "21")])
+        .expect("an ordinary amount and rate set is arithmetic this contract carries");
     let write: NewLineTax = NewLineTax::from(&calc.taxes[0]);
     assert_eq!(write.tax_id, 7);
     assert_eq!(write.code, "IVA");
@@ -1876,6 +1885,426 @@ async fn tax_snapshot_purchase_confirmed_freezes_and_draft_recomputes() {
     assert_eq!(read_back.len(), 1);
     assert_eq!(read_back[0].rate, dec("10"));
     assert_eq!(read_back[0].amount, dec("20"));
+}
+
+// ---------------------------------------------------------------------------
+// The write bound, pinned
+// ---------------------------------------------------------------------------
+
+/// A stored `Decimal` column, read strictly.
+///
+/// `tax_repo.rs:9` parses stored amounts with `unwrap_or(Decimal::ZERO)`, so an
+/// unparseable column silently becomes zero on the production read. That is a
+/// different defect and out of this work unit's scope, but it means the census
+/// below must NOT borrow that fallback: a column the application cannot read at
+/// all is itself a read-path defect, so it is reported rather than smoothed away.
+fn parse_stored(raw: &str) -> Option<Decimal> {
+    Decimal::from_str(raw).ok()
+}
+
+/// Every stored document line whose OWN read-side arithmetic the `Decimal` range
+/// cannot carry, described well enough to find the row by id. Per line, never
+/// per document: see the section on the cross-line accumulation below.
+///
+/// # What it is protecting
+///
+/// `SaleLine::subtotal` (`models.rs:1189`) and `PurchaseLine::subtotal`
+/// (`models.rs:1840`) are RAW multiplies, and `tax_inclusive_total`
+/// (`line_taxes.rs:98`) is a raw `+` fed straight into `round_to_cents`.
+/// rust_decimal's raw operators PANIC on overflow, and this crate contains no
+/// `catch_unwind` anywhere, so a panic in one of those would escape the handler
+/// task, axum would drop the connection, and the operator would get no response
+/// at all — the failure this feature exists to remove.
+///
+/// None of those three functions checks anything, and they are not going to:
+/// they run on every read. This census proves the ONE property that makes those
+/// three raw operators safe, and it is worth being exact about what that
+/// property is. Every line that reached storage passed
+/// `line_net_amount(qty, price)` and then `calculate_line_taxes(net, taxes)`
+/// inside the very transaction that inserted it (`sale_repo.rs:343-344`,
+/// `purchase_repo.rs:314-315`), and that second call proved `net + tax_total` was
+/// representable. So EVERY STORED LINE, taken ON ITS OWN, is carryable by the
+/// raw read multiply and the raw read add. That is per-LINE representability,
+/// and it is the whole of what this census proves — not more.
+///
+/// # What it does NOT cover: the document, and why that is not its job
+///
+/// A document is a SUM of its lines, and per-line representability does NOT
+/// imply a carryable sum. The minimal counter-example needs no tax at all: two
+/// lines of `qty = 1`, `unit_price = 4e28`, no tax linked. Each line is
+/// individually carryable, each one is stored by the real checked write, and
+/// `4e28 + 4e28 = 8e28 > Decimal::MAX` overflows in the FOLD rather than in the
+/// line — so this census reports ZERO violations for that document, now and for
+/// good reason. It could never report one: a statement about a set of rows is
+/// not a statement about a row, and bounding the WRITE at the document level
+/// would not survive a direct SQL insert either.
+///
+/// What the census cannot see, the READ path now refuses. Both `tax_split`
+/// folds (`sales.rs:223`, `purchases.rs:200`) are `checked_add` and answer
+/// `PriceRefusal::DocumentTotalTooLarge`, and both `list_document_rows` folds
+/// (`sale_repo.rs:947`, `purchase_repo.rs:836`) keep folding while recording the
+/// refusal per document, so a list row renders in place with the localized
+/// message and NO amount instead of a partial figure. That is work unit T3 in
+/// `odd/tasks/tax-contract-overflow.md`, and it is enforced by the code that
+/// folds, NOT by this census — which is why the honest division of labour is
+/// what it is: the census guards the LINE, the checked folds guard the document.
+///
+/// The write bound this census leans on is unchanged by that, and still says the
+/// same thing about a single line: with an ordinary 21% tax the checked pair caps
+/// a line's net at `MAX / 21 ≈ 3.77e27`, so a document needs EIGHTEEN such lines
+/// rather than two to break the sum.
+///
+/// # What would break the per-line claim
+///
+/// * a NEW write path — another repository method, a bulk import, an admin
+///   script — that inserts `sale_lines` / `purchase_lines` without running the
+///   checked pair first;
+/// * a MIGRATION that backfills, copies or rescales line amounts, which is
+///   precisely the shape that would put an unrepresentable amount into a live
+///   table with nothing left to refuse it;
+/// * reading the RATE CEILING as this bound. It is not one, and the difference
+///   matters: the read path multiplies stored COLUMNS, and no rate takes part in
+///   `subtotal()` or in `tax_inclusive_total`. The ceiling changes nothing here,
+///   which is exactly why the census is needed rather than optional.
+async fn read_bound_violations(pool: &SqlitePool) -> Vec<String> {
+    // Two literal statements rather than one built from a table name: the census
+    // must not become the place where this crate grows a dynamic query.
+    const CENSUSES: [(&str, &str); 2] = [
+        (
+            "sale_lines",
+            "SELECT id, qty, unit_price, tax_total FROM sale_lines",
+        ),
+        (
+            "purchase_lines",
+            "SELECT id, qty, unit_cost, tax_total FROM purchase_lines",
+        ),
+    ];
+    let mut violations = Vec::new();
+    for (table, statement) in CENSUSES {
+        let rows: Vec<(i64, String, String, String)> =
+            sqlx::query_as(statement).fetch_all(pool).await.unwrap();
+        for (id, qty_raw, price_raw, tax_total_raw) in rows {
+            let (Some(qty), Some(price), Some(tax_total)) = (
+                parse_stored(&qty_raw),
+                parse_stored(&price_raw),
+                parse_stored(&tax_total_raw),
+            ) else {
+                violations.push(format!(
+                    "{table} {id}: a stored amount is not a Decimal \
+                     (qty {qty_raw:?}, price {price_raw:?}, tax_total {tax_total_raw:?})"
+                ));
+                continue;
+            };
+            // `SaleLine::subtotal` / `PurchaseLine::subtotal`.
+            let Some(net) = qty.checked_mul(price) else {
+                violations.push(format!(
+                    "{table} {id}: subtotal {qty} * {price} leaves the Decimal range"
+                ));
+                continue;
+            };
+            // `tax_inclusive_total(subtotal, tax_total)`.
+            if net.checked_add(tax_total).is_none() {
+                violations.push(format!(
+                    "{table} {id}: tax-inclusive total {net} + {tax_total} leaves the Decimal range"
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// The operator-typed pair whose PRODUCT is unrepresentable while each operand
+/// is perfectly ordinary. Reused from the contract's own boundary test so the
+/// census's counter-example and the write bound's refusal are the same fact.
+fn uncarriable_qty_price() -> (Decimal, Decimal) {
+    (dec("100000000000000000000"), dec("1000000000"))
+}
+
+/// THE BOUND, exercised at both edges and then asserted as a census over every
+/// stored line of both families.
+///
+/// What makes this a test of the INVARIANT rather than a test of today's code is
+/// the census at the end: it reads back ALL `sale_lines` and `purchase_lines`
+/// rows, not the ones this test happened to write, and asserts that every one of
+/// them is carryable BY ITSELF, one line at a time, through the raw read
+/// multiply and the raw read add. A new write path or a migration that skipped
+/// the checked pair would leave a row this census rejects, so the test fails and
+/// names the row — instead of the per-line panic waiting for an operator to
+/// open a document.
+///
+/// WHAT THAT DOES NOT PROVE, stated here because the census is easy to over-read:
+/// per-line carryability is NOT document-level carryability. A two-line draft of
+/// `unit_price = 4e28` with no tax linked stores two perfectly carryable lines
+/// and the census reports nothing for it, and it CANNOT report anything: a
+/// statement about a sum is not a statement about a row. That document no longer
+/// panics, because `tax_split` and the two `list_document_rows` folds are
+/// `checked_add` and refuse it with `PriceRefusal::DocumentTotalTooLarge` (work
+/// unit T3) — but the census is still not what stops it, and this test must not
+/// be read as having proved it. The census is proven load-bearing for what it
+/// claims, and it is a guard for the LINE; the document is guarded by the folds,
+/// and by T3's own tests.
+///
+/// The sweep deliberately includes the two largest lines the read path can carry
+/// at all, because a census that only ever sees small amounts proves nothing
+/// about the boundary: the largest carryable net with a 1% tax is the one whose
+/// tax-inclusive total is EXACTLY `Decimal::MAX`, and the largest untaxed net is
+/// `Decimal::MAX` itself. If the write bound ever tightened by one unit, these
+/// two rows would stop being storable and this test would say so.
+#[tokio::test]
+async fn tax_read_bound_every_stored_line_is_carriable_by_the_read_side_multiplies() {
+    let pool = pool().await;
+    let product = create_product(&pool, "BOUND-1").await;
+    // One 1% tax, because the top of the range is only carryable WITH a rate: at
+    // `Decimal::MAX` a 1% contribution is a hundredth of the maximum, and adding
+    // it to the maximum is the step that overflows.
+    let taxed = taxes_linked_to(&pool, product, &[("IVA", "1")]).await;
+    assert_eq!(taxed.len(), 1);
+    let plain = create_product(&pool, "BOUND-2").await;
+
+    let sales = SqliteSaleRepository::new(pool.clone());
+    let sale = create_sale(&pool).await;
+
+    // The largest line the read path can carry with a rate: its tax-inclusive
+    // total is EXACTLY `Decimal::MAX`, and `subtotal()` returns the net.
+    let largest = dec("78443725261647859003508861718");
+    let top = sales
+        .create_line(sale, product, dec("1"), largest)
+        .await
+        .expect("the largest carryable net is carried and stored");
+    assert_eq!(top.subtotal(), largest);
+    assert_eq!(
+        top.tax_total,
+        round_to_cents(largest / dec("100")),
+        "a 1% contribution on the largest net"
+    );
+    assert_eq!(
+        largest.checked_add(top.tax_total),
+        Some(Decimal::MAX),
+        "so this line's tax-inclusive total is the largest money there is"
+    );
+    assert_eq!(
+        crate::services::line_taxes::tax_inclusive_total(top.subtotal(), top.tax_total),
+        Decimal::MAX,
+        "and the read path returns it"
+    );
+
+    // The largest UNTAXED line: the whole type's range, with no rate to pair it
+    // with. This is the top edge a bound must still accept.
+    let untaxed = sales
+        .create_line(sale, plain, dec("1"), Decimal::MAX)
+        .await
+        .expect("an untaxed line at the very top of the range is carried");
+    assert_eq!(untaxed.subtotal(), Decimal::MAX);
+    assert_eq!(untaxed.tax_total, Decimal::ZERO);
+
+    // An ordinary line, so the census is looking at a realistic row too.
+    let ordinary = sales
+        .create_line(sale, plain, dec("3"), dec("10.50"))
+        .await
+        .unwrap();
+    assert_eq!(ordinary.subtotal(), dec("31.50"));
+
+    // The UPDATE path, on both sides of the bound. The refusal must leave the
+    // stored row exactly as it was, or the census would be reading a value the
+    // operator never chose.
+    let updated = sales
+        .update_line(ordinary.id, dec("1"), Decimal::MAX)
+        .await
+        .expect("a re-rate to the very top of the range is still carryable");
+    assert_eq!(updated.subtotal(), Decimal::MAX);
+    let refused = sales
+        .update_line(updated.id, dec("2"), Decimal::MAX)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(refused, crate::error::AppError::PriceRefused(_)),
+        "one step past the top is refused by the write bound, not by the read path: \
+         {refused:?}"
+    );
+    let still_there = sales.find_line(updated.id).await.unwrap().unwrap();
+    assert_eq!(
+        still_there.qty,
+        dec("1"),
+        "a refused update writes nothing, so the row the census reads is the \
+         row the operator last accepted"
+    );
+
+    // The other family, through the mirror write.
+    let purchases = SqlitePurchaseRepository::new(pool.clone());
+    let purchase = create_purchase(&pool).await;
+    let bought = purchases
+        .create_line(purchase, product, dec("1"), largest)
+        .await
+        .expect("purchases carry the same largest net");
+    assert_eq!(bought.subtotal(), largest);
+
+    // The clause the whole census rests on, asserted on BOTH families: the write
+    // that stores a line REFUSES an uncarryable product instead of storing it.
+    // Without this the census would be resting on an unstated premise — "the
+    // write always checks" — and a write path that stopped checking (or a
+    // migration that bypassed it) would have to be caught by the census alone,
+    // which only sees a row that was actually stored.
+    let (bad_qty, bad_price) = uncarriable_qty_price();
+    assert!(
+        bad_qty.checked_mul(bad_price).is_none(),
+        "the counter-example really is uncarriable, or this test proves nothing"
+    );
+    for (family, error) in [
+        (
+            "sale",
+            sales
+                .create_line(sale, plain, bad_qty, bad_price)
+                .await
+                .err(),
+        ),
+        (
+            "purchase",
+            purchases
+                .create_line(purchase, plain, bad_qty, bad_price)
+                .await
+                .err(),
+        ),
+    ] {
+        assert!(
+            matches!(error, Some(crate::error::AppError::PriceRefused(_))),
+            "the {family} write must REFUSE an uncarryable line amount rather than \
+             store it: {error:?}"
+        );
+    }
+
+    // THE ASSERTION. Every stored line, both families, read back from storage.
+    let violations = read_bound_violations(&pool).await;
+    assert!(
+        violations.is_empty(),
+        "every stored line is carryable BY ITSELF only while the write bound holds, \
+         and these are not (this says nothing about a document SUM of carryable \
+         lines — that is T3):\n{}",
+        violations.join("\n")
+    );
+
+    // The census is not vacuous: it really did read rows.
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM sale_lines) + (SELECT COUNT(*) FROM purchase_lines)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        stored >= 4,
+        "a census over no rows would pass no matter what the write path did, so \
+         the fixtures must actually be stored: {stored} rows"
+    );
+}
+
+/// THE COUNTER-EXAMPLE, and the reason the census above is worth anything.
+///
+/// A test that only shows "there is no bug today" is worthless as a guard. This
+/// one performs the exact act the invariant forbids — inserting a document line
+/// whose operands are each a fine `Decimal` and whose PRODUCT is not, straight
+/// through SQL, the way a migration or a repair script would — and asserts that
+/// the census REPORTS it. A census that stayed silent here would be a test that
+/// cannot fail, and this is the assertion that proves it can.
+///
+/// The SALE row is removed afterwards so the census's next assertion starts from
+/// a known state, but the PURCHASE row is NOT: the test leaves one unrepresentable
+/// amount in `purchase_lines` on purpose, and only the fresh `sqlite::memory:`
+/// pool from `pool()` keeps that out of any real database. The point is that the
+/// detector fires, not that the tables are left clean.
+#[tokio::test]
+async fn tax_read_bound_census_reports_a_line_a_migration_inserted_directly() {
+    let pool = pool().await;
+    let product = create_product(&pool, "BOUND-SMuggled").await;
+    let sale = create_sale(&pool).await;
+    let (qty, price) = uncarriable_qty_price();
+
+    // Clean to begin with, so the only violation reported afterwards is the one
+    // this test inserts.
+    assert!(
+        read_bound_violations(&pool).await.is_empty(),
+        "the census starts from a clean table"
+    );
+
+    // Exactly what `line_net_amount` exists to prevent, done the one way nothing
+    // in this application is supposed to do it.
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price, tax_total)
+         VALUES (?, ?, ?, ?, '0') RETURNING id",
+    )
+    .bind(sale)
+    .bind(product)
+    .bind(qty.to_string())
+    .bind(price.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let violations = read_bound_violations(&pool).await;
+    assert_eq!(
+        violations.len(),
+        1,
+        "the census must report the smuggled row and nothing else: {violations:?}"
+    );
+    assert!(
+        violations[0].contains(&format!("sale_lines {id}")) && violations[0].contains("subtotal"),
+        "and it must name the row and the arithmetic that would panic: {}",
+        violations[0]
+    );
+
+    // The purchase family gets the same proof, because `PurchaseLine::subtotal`
+    // is a SEPARATE raw multiply on a separate table: a census that only swept
+    // `sale_lines` would leave half the read path unguarded.
+    let purchase = create_purchase(&pool).await;
+    let purchase_id: i64 = sqlx::query_scalar(
+        "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost, tax_total)
+         VALUES (?, ?, ?, ?, '0') RETURNING id",
+    )
+    .bind(purchase)
+    .bind(product)
+    .bind(qty.to_string())
+    .bind(price.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let violations = read_bound_violations(&pool).await;
+    assert_eq!(violations.len(), 2, "{violations:?}");
+    assert!(
+        violations
+            .iter()
+            .any(|violation| violation.contains(&format!("purchase_lines {purchase_id}"))),
+        "{violations:?}"
+    );
+
+    // And the tax-inclusive ADD is a separate step from the multiply, so a row
+    // whose subtotal is fine but whose `net + tax_total` is not must be reported
+    // too. The shape is the largest carryable net from the contract's own
+    // boundary test with a tax total one unit too large: the multiply
+    // `1 * net` fits, and only the add leaves the range. This is the step a
+    // multiply-only guard misses, so a census that only checked the multiply
+    // would leave half the read path unguarded.
+    sqlx::query("DELETE FROM sale_lines WHERE id = ?")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let largest_carryable_net = "78443725261647859003508861718";
+    let overflowing_add: i64 = sqlx::query_scalar(
+        "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price, tax_total)
+         VALUES (?, ?, '1', ?, '784437252616478590035088618') RETURNING id",
+    )
+    .bind(sale)
+    .bind(product)
+    .bind(largest_carryable_net)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let violations = read_bound_violations(&pool).await;
+    assert!(
+        violations.iter().any(|violation| violation
+            .contains(&format!("sale_lines {overflowing_add}"))
+            && violation.contains("tax-inclusive")),
+        "the raw add in `tax_inclusive_total` is its own step and needs its own \
+         coverage: {violations:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

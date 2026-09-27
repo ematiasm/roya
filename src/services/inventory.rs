@@ -6,7 +6,7 @@ use rust_decimal::Decimal;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     Category, MovementReason, MovementType, NewMovement, NewProduct, PriceRefusal, Product,
-    ProductBarcode, ProductKind, ProductStock, StockMovement, UpdateProduct,
+    ProductBarcode, ProductKind, ProductStock, SetMoney, StockMovement, UpdateProduct,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
@@ -627,8 +627,11 @@ where
     async fn with_stock(&self, products: Vec<Product>) -> AppResult<Vec<ProductStock>> {
         let mut out = Vec::with_capacity(products.len());
         for product in products {
-            let stock = self.movements.stock_for_product(product.id).await?;
-            let suggested = Self::suggestion_for(&product, stock);
+            let stock = self.level_of(product.id).await?;
+            let suggested = match stock.amount {
+                Some(level) => Self::suggestion_for(&product, level),
+                None => None,
+            };
             out.push(ProductStock {
                 product,
                 stock,
@@ -740,15 +743,29 @@ where
             ));
         }
 
+        // The level that results from this movement is computed BEFORE the write,
+        // and it is computed for EVERY movement type, not only the ones that
+        // reduce stock. Two bounds, one expression:
+        //
+        // * the overdraft guard this code always had, which says a product may not
+        //   go below zero where that is the rule;
+        // * the RANGE of the new level, which is new and is the same argument as a
+        //   document total one level out. A movement is a bounded single write
+        //   (`qty > 0`, and representable by being a stored Decimal), and the sum
+        //   of a set of them is not bounded: two incoming movements of `4e28` each
+        //   carry and are `8e28` together. What this pre-check buys is EARLY
+        //   refusal with a useful message: the repository's fold is the guarantee,
+        //   and it folds in `ORDER BY id` — the order the writes append in — so
+        //   the two walk the same prefixes as well as agreeing on the total.
         let delta = Self::signed_delta(input.movement_type, input.qty);
-        if !self.allow_negative_stock && delta < Decimal::ZERO {
-            let current = self.movements.stock_for_product(product.id).await?;
-            if current + delta < Decimal::ZERO {
-                return Err(AppError::Validation(format!(
-                    "insufficient stock: {current} would become {}",
-                    current + delta
-                )));
-            }
+        let current = self.movements.stock_for_product(product.id).await?;
+        let next = current
+            .checked_add(delta)
+            .ok_or(AppError::PriceRefused(PriceRefusal::AggregateTooLarge))?;
+        if !self.allow_negative_stock && next < Decimal::ZERO {
+            return Err(AppError::Validation(format!(
+                "insufficient stock: {current} would become {next}"
+            )));
         }
 
         self.movements.create(actor, &input).await
@@ -756,25 +773,74 @@ where
 
     // -- derived ------------------------------------------------------------
 
+    /// How much to reorder, or `None` when there is nothing to say: the product
+    /// does not track stock, it is above its minimum, or the product carries no
+    /// ceiling to reorder towards.
+    ///
+    /// The subtraction is CHECKED, and `None` is what a quantity that cannot be
+    /// subtracted looks like here. That is the whole design question this answers,
+    /// and the answer is deliberately the smaller one: `None` already means "no
+    /// suggestion" on [`ProductStock::suggested`], on
+    /// `PurchaseSuggestion::suggested_qty` and on its `subtotal`, and every
+    /// surface that reads them already treats an absent suggestion as an absence
+    /// rather than a zero — the row states the rule beside it, and the seed route
+    /// refuses because it needs a real quantity. Carrying a SECOND absence
+    /// (a `Result`, a refusal field, a new key) would be a second convention for
+    /// the same fact, and the level's own refusal is already travelling beside the
+    /// row that needs it.
+    ///
+    /// No ceiling is invented for `max_stock`: `validate_product` bounds it only
+    /// by `max >= min >= 0`, and a ceiling is a product decision this change does
+    /// not get to make. `4e28 - (-7.9e28)` is `1.19e29`, and a checked subtraction
+    /// says so instead of asserting a range nobody chose.
     fn suggestion_for(product: &Product, stock: Decimal) -> Option<Decimal> {
         if !product.track_stock {
             return None;
         }
         match (product.min_stock, product.max_stock) {
-            (Some(min), Some(max)) if stock <= min => Some(max - stock),
+            (Some(min), Some(max)) if stock <= min => max.checked_sub(stock),
             _ => None,
         }
     }
 
-    pub async fn stock(&self, product_id: i64) -> AppResult<Decimal> {
+    /// The tolerant level: the derived level, or the rule that stopped the sum.
+    ///
+    /// Every DISPLAYING read of a level goes through here, for the reason the
+    /// document lists do: a level is a set sum over the product's movements, and
+    /// one product an operator must fix must not empty the catalogue, the drawer
+    /// or the picker search around it. The DECISION reads keep the strict one
+    /// ([`Self::stock_for_decision`]), because a sale's stock check is a decision
+    /// and a decision may not proceed on a figure nobody can state.
+    async fn level_of(&self, product_id: i64) -> AppResult<SetMoney> {
+        match self.movements.stock_for_product(product_id).await {
+            Ok(level) => Ok(SetMoney::amount(level)),
+            Err(AppError::PriceRefused(refusal)) => Ok(SetMoney::refused(refusal)),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// The level for a DECISION — a stock check before a movement. Strict on
+    /// purpose, and the counterpart of [`Self::stock`]: a decision may not proceed
+    /// on a figure nobody can state, so a refused level refuses the movement
+    /// instead of comparing a missing figure against the quantity.
+    ///
+    /// This is the same split the money reads make: `customer_balance` is strict
+    /// because a credit decision needs a figure, while the statement and the
+    /// ageing carry the refusal and render it.
+    pub async fn stock_for_decision(&self, product_id: i64) -> AppResult<Decimal> {
         self.get_product(product_id).await?;
         self.movements.stock_for_product(product_id).await
     }
 
     pub async fn product_stock(&self, product_id: i64) -> AppResult<ProductStock> {
         let product = self.get_product(product_id).await?;
-        let stock = self.movements.stock_for_product(product_id).await?;
-        let suggested = Self::suggestion_for(&product, stock);
+        let stock = self.level_of(product_id).await?;
+        // A suggestion computed from a level that does not exist would be a number
+        // with nothing behind it, so a refused level has none.
+        let suggested = match stock.amount {
+            Some(level) => Self::suggestion_for(&product, level),
+            None => None,
+        };
         Ok(ProductStock {
             product,
             stock,
@@ -782,6 +848,15 @@ where
         })
     }
 
+    /// Active tracked products at or below their minimum — and the products whose
+    /// level could not be measured, which is why the rows are built through
+    /// [`Self::level_of`] and not through the strict read.
+    ///
+    /// A refused level is INCLUDED rather than dropped: this list is where an
+    /// operator looks when stock is wrong, and a product silently missing from it
+    /// is the one product they must fix. It is not claimed to be low — the row
+    /// states the rule instead of a level, and carries no "low" chip, because
+    /// whether it is low is exactly what cannot be stated.
     pub async fn low_stock(&self) -> AppResult<Vec<ProductStock>> {
         let all = self.products.list().await?;
         let mut out = Vec::new();
@@ -792,9 +867,16 @@ where
             let (Some(min), Some(_)) = (p.min_stock, p.max_stock) else {
                 continue;
             };
-            let stock = self.movements.stock_for_product(p.id).await?;
-            if stock <= min {
-                let suggested = Self::suggestion_for(&p, stock);
+            let stock = self.level_of(p.id).await?;
+            let low = match stock.amount {
+                Some(level) => level <= min,
+                None => true,
+            };
+            if low {
+                let suggested = match stock.amount {
+                    Some(level) => Self::suggestion_for(&p, level),
+                    None => None,
+                };
                 out.push(ProductStock {
                     product: p,
                     stock,
@@ -812,9 +894,18 @@ where
             if !p.is_active || !p.track_stock {
                 continue;
             }
-            let stock = self.movements.stock_for_product(p.id).await?;
-            if stock < Decimal::ZERO {
-                let suggested = Self::suggestion_for(&p, stock);
+            // Same reasoning as `low_stock`: a level that cannot be stated is
+            // visible here rather than dropped, and the row says why.
+            let stock = self.level_of(p.id).await?;
+            let negative = match stock.amount {
+                Some(level) => level < Decimal::ZERO,
+                None => true,
+            };
+            if negative {
+                let suggested = match stock.amount {
+                    Some(level) => Self::suggestion_for(&p, level),
+                    None => None,
+                };
                 out.push(ProductStock {
                     product: p,
                     stock,
@@ -1043,7 +1134,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert_eq!(s.stock(p.id).await.unwrap(), dec("5"));
+        assert_eq!(s.stock_for_decision(p.id).await.unwrap(), dec("5"));
     }
 
     #[tokio::test]
@@ -1071,7 +1162,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(s.stock(p.id).await.unwrap(), dec("-5"));
+        assert_eq!(s.stock_for_decision(p.id).await.unwrap(), dec("-5"));
         let neg = s.negative_stock().await.unwrap();
         assert!(neg.iter().any(|ps| ps.product.id == p.id));
     }
@@ -1114,7 +1205,7 @@ mod tests {
         .unwrap();
         // 20 - 8 - 2 = 10
         let ps = s.product_stock(p.id).await.unwrap();
-        assert_eq!(ps.stock, dec("10"));
+        assert_eq!(ps.stock, SetMoney::amount(dec("10")));
         assert!(ps.suggested.is_none());
 
         // Drop to low stock: 10 - 8 = 2 <= min(5) => suggested = max - stock = 48
@@ -1128,7 +1219,7 @@ mod tests {
         .await
         .unwrap();
         let ps = s.product_stock(p.id).await.unwrap();
-        assert_eq!(ps.stock, dec("2"));
+        assert_eq!(ps.stock, SetMoney::amount(dec("2")));
         assert_eq!(ps.suggested.unwrap(), dec("48"));
         let low = s.low_stock().await.unwrap();
         assert!(low.iter().any(|x| x.product.id == p.id));
@@ -1337,7 +1428,11 @@ mod tests {
         let by_name = s.search_products("yerba").await.unwrap();
         assert_eq!(by_name.len(), 1, "name match: {by_name:?}");
         assert_eq!(by_name[0].product.id, yerba.id);
-        assert_eq!(by_name[0].stock, dec("7"), "stock rides along");
+        assert_eq!(
+            by_name[0].stock,
+            SetMoney::amount(dec("7")),
+            "stock rides along"
+        );
 
         let by_sku = s.search_products("yerba-5").await.unwrap();
         assert_eq!(by_sku.len(), 1, "sku match: {by_sku:?}");

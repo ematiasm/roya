@@ -94,6 +94,11 @@ struct DocumentView {
     date: chrono::NaiveDate,
     detail: String,
     amount: Option<Decimal>,
+    /// The document-total refusal in the operator's language, when the row's
+    /// amount could not be computed. `Some` exactly when a family that HAS money
+    /// refused: the row then shows the sentence instead of a figure, and the
+    /// page keeps every other document.
+    total_refusal_message: Option<String>,
     quantity: Option<Decimal>,
     actor_name: Option<String>,
 }
@@ -289,6 +294,9 @@ async fn resolve_views(
             date: row.date,
             detail: row.detail,
             amount: row.amount,
+            total_refusal_message: row
+                .total_refusal
+                .map(|refusal| crate::routes::price_refusal_message(&refusal, localization)),
             quantity: row.quantity,
             actor_name: names.get(&row.created_by).cloned(),
         })
@@ -418,6 +426,93 @@ async fn web_document_list(
 struct DrawerFact {
     label: String,
     value: String,
+}
+
+/// A payment drawer's parent facts: the owning document's total, paid and
+/// balance — or the same single refusal, on the same terms as
+/// [`document_money_facts`]. A payment's own amount is a stored fact and is
+/// always shown; what can be missing is the document it is measured against.
+fn payment_money_facts(
+    money: Option<crate::models::RecordMoney>,
+    total_refusal: Option<crate::models::PriceRefusal>,
+    localization: &LocalizationContext,
+) -> Vec<DrawerFact> {
+    use crate::localization::MessageKey;
+    let Some(money) = money else {
+        let sentence = total_refusal
+            .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+            .unwrap_or_default();
+        return vec![DrawerFact::new(
+            copy(localization, MessageKey::CustomerTotal),
+            sentence,
+        )];
+    };
+    vec![
+        DrawerFact::new(
+            copy(localization, MessageKey::CustomerTotal),
+            localization.format_currency(money.total),
+        ),
+        DrawerFact::new(
+            copy(localization, MessageKey::CustomerPaid),
+            localization.format_currency(money.paid),
+        ),
+        DrawerFact::new(
+            copy(localization, MessageKey::DocumentsBalance),
+            localization.format_currency(money.due),
+        ),
+    ]
+}
+
+/// A document's money as drawer facts, or the ONE refusal that says why the
+/// figures are absent.
+///
+/// `None` money means the document's lines cannot be added up — each of them is
+/// representable, and their sum is not — so the drawer states the refusal
+/// through the one shared `price_refusal_key` mapping and shows no figure at
+/// all. Publishing a placeholder number would be the one thing this work unit
+/// exists to prevent, and repeating the same sentence six times would be noise
+/// where one is a fact.
+fn document_money_facts(
+    money: Option<crate::models::RecordMoney>,
+    total_refusal: Option<crate::models::PriceRefusal>,
+    localization: &LocalizationContext,
+) -> Vec<DrawerFact> {
+    use crate::localization::MessageKey;
+    let Some(money) = money else {
+        let sentence = total_refusal
+            .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+            .unwrap_or_default();
+        return vec![DrawerFact::new(
+            copy(localization, MessageKey::CustomerTotal),
+            sentence,
+        )];
+    };
+    vec![
+        DrawerFact::new(
+            copy(localization, MessageKey::TaxNetSubtotal),
+            localization.format_currency(money.net_subtotal),
+        ),
+        DrawerFact::new(
+            copy(localization, MessageKey::TaxTotal),
+            localization.format_currency(money.tax_total),
+        ),
+        DrawerFact::new(
+            copy(localization, MessageKey::CustomerTotal),
+            localization.format_currency(money.total),
+        ),
+        DrawerFact::new(
+            copy(localization, MessageKey::CustomerPaid),
+            localization.format_currency(money.paid),
+        ),
+        DrawerFact::new(
+            copy(localization, MessageKey::DocumentsBalance),
+            localization.format_currency(money.due),
+        ),
+        DrawerFact::new(
+            copy(localization, MessageKey::DocumentsPaymentStatus),
+            status_copy(localization, &money.payment_status.to_string()),
+        ),
+    ]
 }
 
 impl DrawerFact {
@@ -1228,38 +1323,10 @@ async fn sale_drawer(
     // money is three figures, not one: showing only the total would make it
     // unauditable, and the tax figure comes from the lines' frozen snapshots so
     // it cannot drift when a tax is edited later.
-    facts.push(DrawerFact::new(
-        copy(
-            localization,
-            crate::localization::MessageKey::TaxNetSubtotal,
-        ),
-        localization.format_currency(record.net_subtotal),
-    ));
-    facts.push(DrawerFact::new(
-        copy(localization, crate::localization::MessageKey::TaxTotal),
-        localization.format_currency(record.tax_total),
-    ));
-    facts.push(DrawerFact::new(
-        copy(localization, crate::localization::MessageKey::CustomerTotal),
-        localization.format_currency(record.total),
-    ));
-    facts.push(DrawerFact::new(
-        copy(localization, crate::localization::MessageKey::CustomerPaid),
-        localization.format_currency(record.paid),
-    ));
-    facts.push(DrawerFact::new(
-        copy(
-            localization,
-            crate::localization::MessageKey::DocumentsBalance,
-        ),
-        localization.format_currency(record.due),
-    ));
-    facts.push(DrawerFact::new(
-        copy(
-            localization,
-            crate::localization::MessageKey::DocumentsPaymentStatus,
-        ),
-        status_copy(localization, &record.payment_status.to_string()),
+    facts.extend(document_money_facts(
+        record.money,
+        record.total_refusal,
+        localization,
     ));
     facts.push(created_by);
     facts.extend(updated_by);
@@ -1532,23 +1599,7 @@ async fn sale_payment_drawer(
         label: document_kind_label(&DocumentKind::Sale, localization),
         title: document_title(sale.sale_number.as_deref(), sale.id, localization),
         status_line: status_copy(localization, &sale.status.to_string()),
-        facts: vec![
-            DrawerFact::new(
-                copy(localization, crate::localization::MessageKey::CustomerTotal),
-                localization.format_currency(record.total),
-            ),
-            DrawerFact::new(
-                copy(localization, crate::localization::MessageKey::CustomerPaid),
-                localization.format_currency(record.paid),
-            ),
-            DrawerFact::new(
-                copy(
-                    localization,
-                    crate::localization::MessageKey::DocumentsBalance,
-                ),
-                localization.format_currency(record.due),
-            ),
-        ],
+        facts: payment_money_facts(record.money, record.total_refusal, localization),
         href: format!("/sales/{}", sale.id),
     };
 
@@ -1655,38 +1706,10 @@ async fn purchase_drawer(
     // money is three figures, not one: showing only the total would make it
     // unauditable, and the tax figure comes from the lines' frozen snapshots so
     // it cannot drift when a tax is edited later.
-    facts.push(DrawerFact::new(
-        copy(
-            localization,
-            crate::localization::MessageKey::TaxNetSubtotal,
-        ),
-        localization.format_currency(record.net_subtotal),
-    ));
-    facts.push(DrawerFact::new(
-        copy(localization, crate::localization::MessageKey::TaxTotal),
-        localization.format_currency(record.tax_total),
-    ));
-    facts.push(DrawerFact::new(
-        copy(localization, crate::localization::MessageKey::CustomerTotal),
-        localization.format_currency(record.total),
-    ));
-    facts.push(DrawerFact::new(
-        copy(localization, crate::localization::MessageKey::CustomerPaid),
-        localization.format_currency(record.paid),
-    ));
-    facts.push(DrawerFact::new(
-        copy(
-            localization,
-            crate::localization::MessageKey::DocumentsBalance,
-        ),
-        localization.format_currency(record.due),
-    ));
-    facts.push(DrawerFact::new(
-        copy(
-            localization,
-            crate::localization::MessageKey::DocumentsPaymentStatus,
-        ),
-        status_copy(localization, &record.payment_status.to_string()),
+    facts.extend(document_money_facts(
+        record.money,
+        record.total_refusal,
+        localization,
     ));
     facts.push(created_by);
     facts.extend(updated_by);
@@ -1938,23 +1961,7 @@ async fn purchase_payment_drawer(
             localization,
         ),
         status_line: status_copy(localization, &purchase.status.to_string()),
-        facts: vec![
-            DrawerFact::new(
-                copy(localization, crate::localization::MessageKey::CustomerTotal),
-                localization.format_currency(record.total),
-            ),
-            DrawerFact::new(
-                copy(localization, crate::localization::MessageKey::CustomerPaid),
-                localization.format_currency(record.paid),
-            ),
-            DrawerFact::new(
-                copy(
-                    localization,
-                    crate::localization::MessageKey::DocumentsBalance,
-                ),
-                localization.format_currency(record.due),
-            ),
-        ],
+        facts: payment_money_facts(record.money, record.total_refusal, localization),
         href: format!("/purchases/{}", purchase.id),
     };
 
@@ -2050,9 +2057,20 @@ async fn stock_movement_drawer(
             copy(localization, crate::localization::MessageKey::DocumentsDate),
             localization.format_date(movement.date),
         ),
+        // The product's CURRENT level is a set sum over its movements, so it
+        // states the rule in this fact's place when it refused — through the same
+        // one renderer the drawer uses for every other refusal. The movement's OWN
+        // quantity above is a single bounded write and stays a figure either way.
         DrawerFact::new(
             copy(localization, crate::localization::MessageKey::ProductStock),
-            localization.format_quantity(stock.stock),
+            match stock.stock.amount {
+                Some(level) => localization.format_quantity(level),
+                None => stock
+                    .stock
+                    .refusal
+                    .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+                    .unwrap_or_default(),
+            },
         ),
     ];
     facts.push(created_by);
@@ -2366,6 +2384,153 @@ mod tests {
             .find(|m| m.name == "Cash")
             .expect("the account defaults include Cash");
         (product.id, account.id, method.id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Document-level accumulation (tax contract overflow T3).
+    //
+    // The index is the FOURTH surface, and it is the one with a different
+    // failure shape: `list_document_rows` folds every document's lines into one
+    // amount per document with the same raw `+=`, so one document that cannot be
+    // added up takes the WHOLE PAGE down with it. Every other document in the
+    // shop's history is on this page too, and they have nothing to do with it.
+    //
+    // The document is built the real way — the same checked line write the
+    // operator's form reaches, at `4e28`, twice — so the two lines are each
+    // individually carryable and each is stored, and the sum `8e28` is not.
+    // -----------------------------------------------------------------------
+
+    /// `4e28`: individually carryable (`Decimal::MAX ≈ 7.92e28`), and two of
+    /// them are `8e28`, which the `Decimal` range does not hold.
+    const FOUR_E28: &str = "40000000000000000000000000000";
+
+    /// A draft sale carrying two lines of `4e28` and nothing else.
+    async fn seed_untotalable_sale(state: &AppState) -> i64 {
+        use crate::models::{NewProduct, NewSale};
+        use rust_decimal::Decimal;
+
+        let actor = audit_actor(state).await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "DOC-TOTAL-IDX".into(),
+                    name: "Document total product".into(),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let customer = state
+            .customer_service
+            .list_customers(true)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|customer| customer.is_walkin)
+            .expect("the walk-in is seeded by migrations");
+        let sale = state
+            .sales_service
+            .create_draft(
+                actor,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: crate::models::PaymentType::Cash,
+                    sale_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: None,
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let unit_price = Decimal::from_str(FOUR_E28).unwrap();
+        for _ in 0..2 {
+            state
+                .sales_service
+                .add_line(sale.id, product.id, Decimal::from(1), Some(unit_price))
+                .await
+                .unwrap();
+        }
+        sale.id
+    }
+
+    /// THE INDEX ANSWERS. One document whose lines cannot be added up must not
+    /// cost the operator the rest of the page: the document is listed, the
+    /// refusal is stated on the row, and every other document is still there.
+    #[tokio::test]
+    async fn the_index_lists_a_document_whose_lines_cannot_be_added_up() {
+        let state = test_state().await;
+        let untotalable = seed_untotalable_sale(&state).await;
+        let (product, _, method) = seed_sale_kit(&state).await;
+        let ordinary = seed_sale_typed(
+            &state,
+            product,
+            true,
+            crate::models::PaymentType::Cash,
+            Some(method),
+        )
+        .await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+
+        let (status, html) = get_drawer(app.clone(), "/documents", test_support::TEST_COOKIE).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "one document that cannot be totaled must not take the index down: {html:.800}"
+        );
+        assert!(
+            html.contains(&format!("Draft #{untotalable}")),
+            "the document is listed: an operator who cannot see it cannot act on it: {html:.2000}"
+        );
+        assert!(
+            html.contains("data-document-total-refusal"),
+            "and its row states the refusal: {html:.2000}"
+        );
+        assert!(
+            html.contains(&expected),
+            "in the operator's own language, through the one shared mapping: {html:.2000}"
+        );
+        assert!(
+            html.contains(&format!("{ordinary}")),
+            "and the rest of the page is unaffected: {html:.2000}"
+        );
+
+        // The drawer for that same document answers too: it is the fourth
+        // surface's own detail view, and it states the same sentence.
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/sale/{untotalable}"),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains(&expected),
+            "the drawer states the same refusal instead of publishing a total that does not \
+             exist: {html:.2000}"
+        );
+        assert!(
+            !html.contains("data-document-total-refusal-line"),
+            "and it does not restate the refusal on every line: {html:.2000}"
+        );
     }
 
     async fn seed_sale(state: &AppState, product_id: i64, confirm: bool) -> i64 {

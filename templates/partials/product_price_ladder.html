@@ -109,6 +109,25 @@
   {% if ladder.inputs_unreadable %}
   <div class="mt-2 text-[13px] text-muted" data-product-ladder-unreadable>{{ localization.tr(crate::localization::MessageKey::ProductLadderUnreadable) }}</div>
   {% endif %}
+  {% if markup_not_derivable %}
+  {# WHY the markup row is a dash (final price markup U2): a markup is a
+     percentage OF the cost, and this product has no cost to be a percentage
+     of. It is the same fact the final-price solve states in its own type when
+     it answers `NotDerivableWithoutCost`, printed here so an operator reading
+     a dash is not left to guess. This product is still fully priceable: the
+     net price is manual, and the final-price control below the ladder solves
+     one.
+
+     DELIBERATELY OUTSIDE the `net_refusal` guard above, and this is the decision
+     rather than an oversight. A refused ladder still shows a cost row and a
+     markup row, and on a product with no cost that markup row is a dash the
+     operator is looking at — so the note that explains the dash is exactly as
+     needed on a refusal as on a success. The note is a sentence about a column,
+     NOT a figure: it publishes no money, so the ladder's guarantee that a
+     refusal publishes none is untouched. Pinned by
+     `a_refused_final_price_preview_of_a_no_cost_product_states_both_facts_and_no_money`. #}
+  <div class="mt-2 text-[13px] text-muted" data-product-ladder-no-cost-markup>{{ localization.tr(crate::localization::MessageKey::ProductLadderNoCostMarkup) }}</div>
+  {% endif %}
   <div class="mt-2 text-[13px] text-muted">
     {% if ladder.net_refusal.is_none() %}
     {% if ladder.net_is_derived %}

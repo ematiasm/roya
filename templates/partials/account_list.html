@@ -1,12 +1,15 @@
 <div>
-  <div class="mb-2.5 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardTotalBalance) }}: <span class="font-bold text-text">{{ localization.format_currency(total_balance.clone()) }}</span> • {{ localization.tr_count(crate::localization::MessageKey::AccountCount, accounts.len()) }}</div>
+  {# The set total is a sum over the SAME rows, so it refuses whenever an account
+     does: a headline that carried beside an account stating the rule would be the
+     operator adding a figure the page just told them does not exist. #}
+  <div class="mb-2.5 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardTotalBalance) }}: <span class="font-bold text-text">{% if total_balance.is_empty() %}<span class="text-danger" data-account-total-refusal data-document-total-refusal>{{ total_message }}</span>{% else %}{{ total_balance }}{% endif %}</span> • {{ localization.tr_count(crate::localization::MessageKey::AccountCount, accounts.len()) }}</div>
   {% if accounts.is_empty() %}
     <div class="empty">{{ localization.tr(crate::localization::MessageKey::AccountNoAccounts) }}</div>
   {% else %}
     {% for acc in accounts %}
     {# A row, not a control: the anchor is the row, carrying the flex layout
        and its colour — the row's appearance is the layout rather than a control's. #}
-    <a href="/accounts/{{ acc.id }}" class="block text-inherit">
+    <a href="/accounts/{{ acc.id }}" id="account-{{ acc.id }}" class="block text-inherit">
       <div class="card mb-2.5 flex items-center justify-between bg-surface px-4 py-3.5 transition-colors hover:border-accent2">
         <div>
           <div class="font-semibold">{{ acc.name }}</div>
@@ -15,7 +18,11 @@
           <div class="mt-1.5 inline-block rounded-full border border-danger/40 bg-danger/10 px-2 py-0.5 text-[11px] font-bold tracking-[0.02em] text-danger" data-payment-methods-warning="true">⚠ {{ localization.tr(crate::localization::MessageKey::AccountNoMethods) }}</div>
           {% endif %}
         </div>
-        <div class="font-bold tabular-nums {% if acc.is_negative() %}text-danger{% else %}text-income{% endif %}">{{ localization.format_currency(acc.balance.clone()) }}</div>
+        {# A row whose balance refuses keeps its place, its name, its number and
+           its date, and states the rule where the amount was. No figure at all
+           stands in for it — not a zero, not a partial sum, and not the cached
+           balance, which is why the route drops that with the refusal. #}
+        <div class="font-bold tabular-nums {% if !acc.balance.is_empty() %}{% if acc.negative %}text-danger{% else %}text-income{% endif %}{% else %}text-danger{% endif %}">{% if acc.balance.is_empty() %}<span data-account-balance-refusal data-document-total-refusal>{{ acc.balance_message }}</span>{% else %}{{ acc.balance }}{% endif %}</div>
       </div>
     </a>
     {% endfor %}

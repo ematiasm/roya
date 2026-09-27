@@ -30,6 +30,71 @@ pub const TAX_DELETE_BLOCKED_BY_HISTORY: &str = "tax is referenced by document h
 /// still an actionable conflict, never a raw database fault.
 pub const TAX_DELETE_BLOCKED: &str = "tax is still referenced";
 
+/// The highest tax rate this application will STORE, as a percentage: 1000%.
+///
+/// # Why 1000%, and what this bound is NOT
+///
+/// This is a BUSINESS-PLAUSIBILITY bound, not an arithmetic one, and the
+/// difference is the entire reason it is worth having.
+///
+/// * **It is not what makes the arithmetic safe.** That is the tax contract's
+///   job: `line_net_amount` and `calculate_line_taxes` are total and refuse
+///   (`PriceRefusal::LineAmountTooLarge` / `TaxArithmeticTooLarge`) whatever the
+///   rate happens to be. Do not read this constant as a second, redundant
+///   arithmetic guard — it is not one, and deleting it would not make a single
+///   panic possible.
+/// * **So it cannot cause a false refusal.** With a single tax at the ceiling the
+///   binding bound is the PER-MULTIPLY one, `net * R <= MAX`, because the
+///   contract's first step multiplies by the rate BEFORE it divides by 100
+///   (`line_taxes.rs:207-210`): at `R = 1000` that is `net <= MAX / 1000`, so
+///   the largest net that computes is `≈ 7.92e25` — not the `MAX / 11 ≈ 7.2e27`
+///   the PAIR bound `net * (1 + R/100) <= MAX` would suggest, which is looser by
+///   `1000/11 ≈ 91×` and therefore not the figure to quote. `7.92e25` is still
+///   not a number an operator types into a price box. Read even that as "ONE tax
+///   at the ceiling", not as a global guarantee: the number of taxes linkable to
+///   a product is unbounded, so this constant does not bound their SUM, and a
+///   document SUM of individually carryable lines is not bounded at all (work
+///   unit T3). That is the checked contract's problem, not this one's — and the
+///   reason nothing here may be presented as making the arithmetic safe.
+/// * **Its real job is WHERE the refusal happens.** `Decimal::MAX` is a
+///   perfectly storable rate today: the column is `rate TEXT NOT NULL` with no
+///   CHECK, the JSON API has no attribute, and the Settings input has no `max`.
+///   An admin can store it, and then the price ladder refuses the arithmetic
+///   three layers down — on an ordinary page load, in a sentence about money,
+///   for a defect that was really a number in a tax form. This constant turns
+///   that into a form error, at the field that caused it, in the operator's
+///   language.
+///
+/// 1000% is an order of magnitude above the highest levy any jurisdiction has
+/// ever charged, so the headroom over every plausible business rate is wide and
+/// this will not fire on real data.
+///
+/// # Changing the number
+///
+/// Four places name it: this constant, the [`TAX_RATE_ABOVE_CEILING`] marker,
+/// and the EN and ES rows of `MessageKey::ValidationTaxRateTooHigh`. All four
+/// move together, and
+/// `tax_rate_ceiling_number_is_the_same_in_the_constant_the_marker_and_both_catalogs`
+/// in `tax_tests.rs` is the test that fails if they drift apart.
+pub const MAX_TAX_RATE_PERCENT: Decimal = Decimal::from_parts(1000, 0, 0, false, 0);
+
+/// Canonical reason a rate was refused for being above [`MAX_TAX_RATE_PERCENT`].
+///
+/// The same shape as every other tax-validation marker and the same route to an
+/// operator: an `AppError::Validation` payload, mapped to catalog copy by
+/// `tax_error_message` in `routes/settings_web.rs`, and never shown raw. A rate
+/// is a tax DEFINITION, not a price refusal, so this is deliberately not a
+/// `PriceRefusal`, deliberately absent from `price_refusal_key`, and carries its
+/// own sentence because the remedy differs from the negative-rate one: there the
+/// operator raises the number, here they lower it.
+///
+/// It is worded so that it is NOT a substring of either catalog sentence, which
+/// is what lets a test assert that the marker never reaches an operator: a
+/// marker buried inside the English copy would make "the page does not contain
+/// the marker" pass or fail for a reason that has nothing to do with the
+/// mapping.
+pub const TAX_RATE_ABOVE_CEILING: &str = "tax rate exceeds the 1000% ceiling";
+
 #[derive(Clone)]
 pub struct TaxService<P, T, L>
 where
@@ -129,8 +194,27 @@ where
     /// stopped charging a tax and later needs it back must not have to re-submit
     /// its code, name and rate to bring it back, and the row keeps the same
     /// audit shape as every other lifecycle change here.
+    ///
+    /// It goes through `validate_rate` like every other write of a rate, and the
+    /// reason is worth stating because the rate here is not operator input:
+    /// `activate_tax` cannot INTRODUCE an over-ceiling rate, since it
+    /// re-persists the value already stored. What it can do is carry one
+    /// forward. A legacy row written before the ceiling existed — one this
+    /// document lists as UNVERIFIED, because the database was deliberately never
+    /// read — would otherwise be reactivated with a rate the rest of the
+    /// application refuses to write, so the chokepoint would be a claim rather
+    /// than a fact.
+    ///
+    /// Refusing to reactivate is RECOVERABLE and that is what makes it the
+    /// defensible choice. The row is not locked: `deactivate_tax` and
+    /// `delete_tax` never look at the rate, and `update_tax` accepts any rate at
+    /// or under the ceiling, so an operator's remedy is a form field — bring the
+    /// rate down and activate. The refusal arrives as `AppError::Validation`,
+    /// which `taxes_refusal_response` already answers 400 with the ceiling's own
+    /// localized sentence, so there is nothing new to render and no new status.
     pub async fn activate_tax(&self, actor: i64, id: i64) -> AppResult<Tax> {
         let current = self.get_tax(id).await?;
+        validate_rate(current.rate)?;
         self.taxes
             .update(actor, id, &current.code, &current.name, current.rate, true)
             .await
@@ -238,6 +322,19 @@ where
             .ok_or_else(|| AppError::NotFound(format!("product {product_id} not found")))
     }
 
+    /// The taxes a DOCUMENT LINE and this product's price ladder both resolve:
+    /// linked AND active, ordered by code then id.
+    ///
+    /// Public because `final_price::solve_final_price` must be handed the very
+    /// same set the ladder and a line write are handed, and a second read that
+    /// filtered differently would make the operator's typed final price a
+    /// different question from the one the ladder answers. It is the one
+    /// resolution boundary, exposed once, rather than a rule restated at a
+    /// second call site.
+    pub async fn list_active_for_product(&self, product_id: i64) -> AppResult<Vec<Tax>> {
+        self.product_taxes.list_active_for_product(product_id).await
+    }
+
     /// The product price ladder: cost, markup, net sale price, every active
     /// linked tax with the amount it adds, the tax total and the tax-inclusive
     /// price — in the order an operator can sanity-check a price.
@@ -312,10 +409,7 @@ where
         let stored_kind = product.kind;
         // The same resolution boundary the line write uses: linked AND active,
         // ordered by code then id so the ladder is deterministic.
-        let taxes = self
-            .product_taxes
-            .list_active_for_product(product_id)
-            .await?;
+        let taxes = self.list_active_for_product(product_id).await?;
 
         // First the PRICE half of the ladder, from the form or from the stored
         // row, including the two states in which there is no net price to
@@ -391,22 +485,43 @@ where
         // to: a breakdown computed from a price that does not exist would be
         // exactly the fabrication this ladder exists to avoid.
         if ladder.net_refusal.is_none() {
-            let calc = calculate_line_taxes(ladder.net_price, &taxes);
-            ladder.breakdown = calc
-                .taxes
-                .iter()
-                .map(|row| ProductTaxBreakdownRow {
-                    code: row.code.clone(),
-                    name: row.name.clone(),
-                    rate: row.rate,
-                    amount: row.amount,
-                })
-                .collect();
-            // The net is read back off the calculation, never re-derived here:
-            // one source of truth for the figure the breakdown adds up to.
-            ladder.net_price = calc.net_subtotal;
-            ladder.tax_total = calc.tax_total;
-            ladder.total = calc.total;
+            // The contract REFUSES rather than panicking, and the ladder carries
+            // that refusal in the one typed slot it already has, which the
+            // fragment renders through the one shared mapping. It does NOT
+            // become an error of the caller's, and the reason is the drawer's:
+            // this is an ORDINARY page load on a STORED net. The price rule
+            // (`validate_effective_prices`) has no upper ceiling by design, so
+            // a product saved with a very large price plus a linked extreme rate
+            // is a row the operator still has to be able to OPEN and EDIT.
+            // Failing the whole drawer would replace today's dropped connection
+            // with a refusal that makes the product unreachable.
+            //
+            // A refusal here means the same thing it means everywhere else on
+            // this ladder: no money is published, because there is no arithmetic
+            // to publish it from. `breakdown`, `tax_total` and `total` are
+            // already empty and zero — this ladder is built that way in every
+            // arm above and nothing has written to them yet.
+            match calculate_line_taxes(ladder.net_price, &taxes) {
+                Ok(calc) => {
+                    ladder.breakdown = calc
+                        .taxes
+                        .iter()
+                        .map(|row| ProductTaxBreakdownRow {
+                            code: row.code.clone(),
+                            name: row.name.clone(),
+                            rate: row.rate,
+                            amount: row.amount,
+                        })
+                        .collect();
+                    // The net is read back off the calculation, never
+                    // re-derived here: one source of truth for the figure the
+                    // breakdown adds up to.
+                    ladder.net_price = calc.net_subtotal;
+                    ladder.tax_total = calc.tax_total;
+                    ladder.total = calc.total;
+                }
+                Err(refusal) => ladder.net_refusal = Some(refusal),
+            }
         }
         Ok(ladder)
     }
@@ -452,9 +567,30 @@ fn validate_name(value: &str) -> AppResult<String> {
     Ok(value.to_string())
 }
 
+/// The one rule set a tax DEFINITION must satisfy before it is stored, called by
+/// `create_tax`, `update_tax` and `activate_tax` — the only three callers, and
+/// the only three places in the application that reach `TaxRepository::create` or
+/// `TaxRepository::update` with a rate, so this is the single production
+/// chokepoint for a stored rate.
+///
+/// `activate_tax` is in that list because it WRITES the rate column, even though
+/// the value it writes is the one already stored. A chokepoint that listed only
+/// the two form paths would be a claim about forms, not about storage, and
+/// `activate_tax` reached `TaxRepository::update` directly until this rule was
+/// applied to it. `deactivate_tax` is deliberately NOT a caller: it goes through
+/// `TaxRepository::deactivate`, which never binds `rate`.
+///
+/// Two rules, in this order, and both are `AppError::Validation`: a rate is a
+/// definition an operator types, and the refusal is the same shape a negative
+/// rate has always had. It is deliberately NOT a `PriceRefusal` — a rate above
+/// the ceiling is not money the arithmetic cannot carry, it is a number in a
+/// form that no jurisdiction has ever charged.
 fn validate_rate(rate: Decimal) -> AppResult<()> {
     if rate < Decimal::ZERO {
         return Err(AppError::Validation("tax rate cannot be negative".into()));
+    }
+    if rate > MAX_TAX_RATE_PERCENT {
+        return Err(AppError::Validation(TAX_RATE_ABOVE_CEILING.into()));
     }
     Ok(())
 }

@@ -1,0 +1,15 @@
+{# The drawer's COST field, the cost a final price is solved AGAINST (final price
+   markup M1).
+
+   A partial for the same reason as `product_sale_price_field.html`, and it is
+   swapped out of band on a confirmed conversion because the confirm writes
+   `cost_price` too — it stores the cost the operator has on screen, so the
+   field's own text is already right, and re-rendering it normalises what the
+   operator typed to the stored scale rather than leaving a value the row does
+   not literally hold.
+
+   The ladder `hx-get` is here rather than on the wrapping `<div>` because htmx
+   reads the trigger attribute off the element that changed, and the input is
+   the element that changes. #}
+<label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCostPrice) }}</label>
+<input type="text" inputmode="decimal" name="cost_price" step="0.01" value="{{ localization.format_decimal(product.cost_price.clone()) }}" class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />

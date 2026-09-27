@@ -2170,14 +2170,36 @@ fn locale_aware_decimal_html_controls_are_reachable_text_inputs() {
         "partials/product_detail.html",
         include_str!("../templates/partials/product_detail.html"),
         &[
-            "sale_price",
-            "cost_price",
-            "markup_pct",
             "min_stock",
             "max_stock",
             "cost",
             "qty",
+            // The final-price control's own input (final price markup U2). It
+            // is a money value the operator types, so it is held to the same
+            // rule as every other one.
+            "final_price",
         ],
+    );
+    // The three PRICE fields moved out of `product_detail.html` into their own
+    // partials (final price markup M1), because a confirmed conversion has to
+    // be able to refresh exactly those three without re-rendering the form
+    // around them. The guard follows the controls, not the file they used to sit
+    // in: a locale-aware decimal input that moved files must not be able to
+    // escape the check by moving.
+    assert_decimal_text_controls(
+        "partials/product_sale_price_field.html",
+        include_str!("../templates/partials/product_sale_price_field.html"),
+        &["sale_price"],
+    );
+    assert_decimal_text_controls(
+        "partials/product_cost_price_field.html",
+        include_str!("../templates/partials/product_cost_price_field.html"),
+        &["cost_price"],
+    );
+    assert_decimal_text_controls(
+        "partials/product_markup_field.html",
+        include_str!("../templates/partials/product_markup_field.html"),
+        &["markup_pct"],
     );
     assert_decimal_text_controls(
         "partials/product_search_results.html",

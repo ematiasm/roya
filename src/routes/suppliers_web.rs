@@ -20,8 +20,8 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{
-    NewSupplier, PaymentMethodWithAccount, Product, ProductSupplierCost, PurchaseDetail,
-    PurchaseListFilter, PurchaseStatus, Supplier, UpdateSupplier,
+    NewSupplier, PaymentMethodWithAccount, Product, ProductSupplierCost, PurchaseListFilter,
+    PurchaseStatus, Supplier, UpdateSupplier,
 };
 use crate::repositories::{ProductRepository, ProductSupplierCostRepository};
 use crate::routes::AppState;
@@ -81,8 +81,12 @@ struct SupplierListPartial {
 struct SupplierDetailPartial {
     localization: LocalizationContext,
     supplier: Supplier,
-    balance: Decimal,
-    purchases: Vec<PurchaseDetail>,
+    /// The outstanding balance, already resolved: the amount, or the refusal in
+    /// the operator's language. A sum over the supplier's confirmed documents, so
+    /// never partial.
+    balance: String,
+    /// The supplier's documents, with each one's refusal resolved.
+    purchases: Vec<SupplierPurchaseView>,
     products: Vec<Product>,
     method_options: Vec<PaymentMethodWithAccount>,
     today: String,
@@ -385,6 +389,11 @@ async fn web_supplier_detail(
     supplier_detail_html(&state, id, &localization).await
 }
 
+/// One of a supplier's documents, with the refusal already in the operator's
+/// language — the purchase-list row, reused so the two surfaces cannot word the
+/// rule differently.
+type SupplierPurchaseView = crate::routes::purchases_web::PurchaseView;
+
 /// The drawer body with fresh derived data. Both the detail fragment and the
 /// pay/record-cost actions answer it, so paying or recording refreshes the
 /// drawer in place without the client rebuilding a URL.
@@ -398,15 +407,46 @@ async fn supplier_detail_html(
         supplier_ids: Some(vec![id]),
         ..Default::default()
     };
-    let purchases = state
-        .purchases_service
-        .list_details_filtered(&filter)
-        .await?;
-    let balance: Decimal = purchases
-        .iter()
-        .filter(|d| d.purchase.status == PurchaseStatus::Confirmed)
-        .map(|d| d.due)
-        .sum();
+    // The ROW read, the same reason as every other list: a document whose total
+    // cannot be computed renders in place with no figure, instead of taking the
+    // whole drawer — every purchase of this supplier — down with it.
+    let rows = state.purchases_service.list_rows_filtered(&filter).await?;
+    let today_date: chrono::NaiveDate = localization
+        .today_iso()
+        .parse()
+        .map_err(|_| AppError::Internal("invalid localized date".into()))?;
+    let purchases = crate::routes::purchases_web::purchase_views_from_rows(
+        state,
+        rows.clone(),
+        today_date,
+        localization,
+    )
+    .await?;
+    // The outstanding balance is a sum over the supplier's CONFIRMED documents:
+    // checked, and refused rather than partial, because a figure missing one
+    // purchase is indistinguishable from a real balance.
+    let mut balance = Decimal::ZERO;
+    let mut balance_refusal: Option<crate::models::PriceRefusal> = None;
+    for row in &rows {
+        if row.purchase.status != PurchaseStatus::Confirmed {
+            continue;
+        }
+        let Some(money) = row.money else {
+            balance_refusal = row.total_refusal;
+            break;
+        };
+        match crate::services::checked_money_add(balance, money.due) {
+            Ok(sum) => balance = sum,
+            Err(refusal) => {
+                balance_refusal = Some(refusal);
+                break;
+            }
+        }
+    }
+    let balance = match balance_refusal {
+        Some(refusal) => crate::routes::price_refusal_message(&refusal, &localization),
+        None => localization.format_currency(balance),
+    };
     let products = state.inventory_service.products.list().await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
     let today = localization.today_iso();

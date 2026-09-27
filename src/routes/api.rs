@@ -23,8 +23,11 @@ async fn list_accounts(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let accounts = state.account_service.list_with_balances().await?;
-    let total = state.account_service.total_balance().await?;
+    // Tolerant, like every other list in this change: an account whose balance
+    // refuses travels as a row with the rule in it, and the set total refuses with
+    // it, so the document still lists every OTHER account instead of collapsing
+    // into one error.
+    let (accounts, total) = state.account_service.list_with_balances_and_total().await?;
     Ok(Json(
         serde_json::json!({ "accounts": accounts, "total_balance": total }),
     ))
@@ -199,6 +202,7 @@ mod tests {
     use std::str::FromStr;
     use tower::ServiceExt;
 
+    use crate::models::PriceRefusal;
     use crate::routes::AppState;
     use crate::security::test_support;
 
@@ -710,6 +714,255 @@ mod tests {
     }
 
     // -- transaction reference (money traceability) -----------------------------
+
+    /// The sweep's FOURTH fold, and the money twin of the stock level: an account
+    /// balance is the sum of that account's transactions, every one of them
+    /// written from a request's amount, and `validate_amount` refuses only
+    /// `amount <= 0`. Two incomes of `4e28` carry on their own, are `8e28`
+    /// together, and the accounts list — the finance home page — folds them raw.
+    #[tokio::test]
+    async fn an_account_balance_whose_transactions_cannot_be_added_up_is_not_a_panic() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let account = create_account(&app, "Sweep Balance").await;
+        let income = |date: &'static str| {
+            let app = app.clone();
+            async move {
+                send(
+                    app,
+                    "POST",
+                    "/api/transactions",
+                    Some("application/json"),
+                    serde_json::json!({
+                        "account_id": account,
+                        "type": "Income",
+                        "amount": "40000000000000000000000000000",
+                        "description": "sweep",
+                        "date": date,
+                    })
+                    .to_string(),
+                )
+                .await
+            }
+        };
+
+        let (status, v) = income("2024-05-01").await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        // The second is the sum that does not carry, refused BEFORE the write.
+        let (status, v) = income("2024-05-02").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a balance the addition cannot carry is a refusal, not a panic: {v}"
+        );
+        assert!(
+            v.to_string().contains("too large to compute"),
+            "in the rule's own words: {v}"
+        );
+
+        // The accounts list still answers, with the balance that carried.
+        let (status, v) = send(app.clone(), "GET", "/api/accounts", None, String::new()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let balance = v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"].as_i64() == Some(account))
+            .map(|a| a["balance"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        assert_eq!(balance, "40000000000000000000000000000", "{v}");
+    }
+
+    /// B1: an UPDATE with an empty body still recomputes the projected balance,
+    /// and that projection was a raw `current - orig_signed + new_signed` — two
+    /// operators, no bound, on a route every `finance.write` caller can reach.
+    ///
+    /// The state is built entirely through the application's OWN checked writes
+    /// with `allow_negative = false`, so the test cannot pass on a state the
+    /// application refuses to create: income `5e28`, expense `4.9e28`, income
+    /// `5e28`, where every prefix carries and the balance is `5.1e28`. Reverting
+    /// the expense to income then projects `5.1e28 + 4.9e28 = 1e29`, which no
+    /// `Decimal` carries.
+    #[tokio::test]
+    async fn a_transaction_update_whose_projection_cannot_be_carried_is_a_refusal() {
+        let state = test_state().await; // allow_negative = false
+        let app = crate::routes::router(state);
+        let account = create_account(&app, "Update Projection").await;
+        let post = |kind: &'static str, amount: &'static str, date: &'static str| {
+            let app = app.clone();
+            async move {
+                let (status, v) = send(
+                    app,
+                    "POST",
+                    "/api/transactions",
+                    Some("application/json"),
+                    serde_json::json!({
+                        "account_id": account,
+                        "type": kind,
+                        "amount": amount,
+                        "description": "checked write",
+                        "date": date,
+                    })
+                    .to_string(),
+                )
+                .await;
+                (status, v)
+            }
+        };
+
+        // Three ordinary writes, every one of them accepted by the checked
+        // pre-check — so the state is one the application itself produces.
+        let (status, v) = post("Income", "50000000000000000000000000000", "2024-05-01").await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        let (status, expense) =
+            post("Expense", "49000000000000000000000000000", "2024-05-02").await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        let expense_id = expense["id"].as_i64().unwrap();
+        let (status, v) = post("Income", "50000000000000000000000000000", "2024-05-03").await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+
+        // The empty-body update: nothing about the transaction changes, and the
+        // projection still has to be computed.
+        let (status, v) = send(
+            app.clone(),
+            "PUT",
+            &format!("/api/transactions/{expense_id}"),
+            Some("application/json"),
+            serde_json::json!({ "type": "Income" }).to_string(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a projection that cannot be carried is a refusal, not a panic: {v}"
+        );
+        assert!(
+            v.to_string().contains("too large to compute"),
+            "in the rule's own words: {v}"
+        );
+
+        // And nothing was written: the transaction is still the expense it was,
+        // and the balance is still the one the three writes produced.
+        // The list is the shape the API offers for a single transaction (there is
+        // no per-id read), and it answers either way.
+        let (status, v) = send(
+            app.clone(),
+            "GET",
+            &format!("/api/transactions?account_id={account}"),
+            None,
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let row = v["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"].as_i64() == Some(expense_id))
+            .unwrap_or_else(|| panic!("the expense is still in the list: {v}"));
+        assert_eq!(row["kind"], serde_json::json!("Expense"), "{v}");
+        assert_eq!(
+            row["amount"],
+            serde_json::json!("49000000000000000000000000000"),
+            "with the amount the refused update would have changed: {v}"
+        );
+        let (status, v) = send(app.clone(), "GET", "/api/accounts", None, String::new()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let balance = v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"].as_i64() == Some(account))
+            .map(|a| a["balance"].as_str().unwrap_or_default().to_string())
+            .unwrap_or_default();
+        assert_eq!(balance, "51000000000000000000000000000", "{v}");
+    }
+
+    /// The wire convention F4 established, on the accounts list: an ordinary
+    /// response is byte-identical to before, and a refused member carries the
+    /// rule instead of taking the document down with a 400.
+    ///
+    /// The pair of `4e28` incomes is stored straight through SQL, because the
+    /// transaction write refuses the second one by design — which is exactly the
+    /// state an account can be found in, and the state this endpoint has to
+    /// render.
+    #[tokio::test]
+    async fn the_accounts_api_renders_a_refused_balance_on_the_wire() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let refused = create_account(&app, "Api Refused").await;
+        let ordinary = create_account(&app, "Api Ordinary").await;
+        let actor = test_support::audit_actor_id(&state.pool).await.unwrap();
+        for (account, amount) in [
+            (refused, "40000000000000000000000000000"),
+            (refused, "40000000000000000000000000000"),
+            (ordinary, "1250"),
+        ] {
+            sqlx::query(
+                "INSERT INTO transactions (account_id, kind, amount, description, date, created_by) \
+                 VALUES (?, 'Income', ?, 'sweep', '2024-05-01', ?)",
+            )
+            .bind(account)
+            .bind(amount)
+            .bind(actor)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let (status, v) = send(app.clone(), "GET", "/api/accounts", None, String::new()).await;
+        assert_eq!(status, StatusCode::OK, "the list answers: {v}");
+        let row = |id: i64| {
+            v["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["id"].as_i64() == Some(id))
+                .unwrap_or_else(|| panic!("account {id} missing from the list: {v}"))
+                .clone()
+        };
+        // The refused account: the rule travels with the figure's place.
+        let refused_row = row(refused);
+        assert_eq!(
+            refused_row["balance"]["refused"],
+            serde_json::json!(PriceRefusal::AggregateTooLarge.as_str()),
+            "{v}"
+        );
+        assert!(
+            refused_row.get("cached_balance").is_none(),
+            "and NO stale cached figure stands in for it: {v}"
+        );
+        // The ordinary account: byte-identical to the shape before this change.
+        let ordinary_row = row(ordinary);
+        assert_eq!(ordinary_row["balance"], serde_json::json!("1250"), "{v}");
+        assert!(
+            ordinary_row.get("cached_balance").is_some(),
+            "and the cached field is still there, exactly as before: {v}"
+        );
+        // The SET total sums the refused member, so it refuses — but it refuses as
+        // a figure with a reason, not as an error that emptied the document.
+        assert_eq!(
+            v["total_balance"]["refused"],
+            serde_json::json!(PriceRefusal::AggregateTooLarge.as_str()),
+            "{v}"
+        );
+
+        // The account's own detail is a list of one and renders the same way.
+        let (status, v) = send(
+            app.clone(),
+            "GET",
+            &format!("/api/accounts/{refused}"),
+            None,
+            String::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the detail answers: {v}");
+        assert_eq!(
+            v["balance"]["refused"],
+            serde_json::json!(PriceRefusal::AggregateTooLarge.as_str()),
+            "{v}"
+        );
+    }
 
     #[tokio::test]
     async fn transaction_api_reference_is_null_for_manual_transactions() {
