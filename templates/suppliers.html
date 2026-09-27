@@ -48,7 +48,7 @@
       <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::SuppliersDetail) }}</span>
       <button type="button" class="btn-secondary" data-drawer-close aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
     </div>
-    <div id="supplier-drawer-body" data-drawer-body="supplier-drawer" class="flex-1 overflow-y-auto p-4"></div>
+    <div id="supplier-drawer-body" data-drawer-body="supplier-drawer" class="flex-1 overflow-y-auto p-4">{% include "partials/drawer_empty.html" %}</div>
   </div>
 </div>
 

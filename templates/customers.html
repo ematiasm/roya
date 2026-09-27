@@ -39,7 +39,7 @@
      controller's Escape and `✕` remove. It matters below the split threshold
      only: at and above it the panel is a grid column and is visible either way.
      The body is server-rendered here rather than fetched, so this panel is the
-     exception the shared component absorbs without a shared partial.
+     exception the shared component absorbs.
 
      No `data-drawer-close-on`: a customer edit must not take the panel away —
      the operator is reading the very statement the edit changed. The lifecycle
@@ -58,6 +58,13 @@
     <div id="customer-drawer-body" data-drawer-body="customer-drawer" class="flex-1 overflow-y-auto p-4">
       {% if selected.is_some() %}
       {% include "partials/customer_detail.html" %}
+      {% else %}
+      {# The other four panels have nothing to server-render, so their empty
+         state is unconditional. This one is server-opened, so the empty state
+         belongs to the ELSE and nowhere else: `/customers/{id}` must show the
+         statement, and rendering the sentence above a detail that is already
+         there would put both on screen at once. #}
+      {% include "partials/drawer_empty.html" %}
       {% endif %}
     </div>
   </div>

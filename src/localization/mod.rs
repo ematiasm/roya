@@ -161,6 +161,13 @@ define_message_keys! {
     CommonOptional => "common.optional",
     CommonCloseDetail => "common.close_detail",
     CommonInactiveLabel => "common.inactive_label",
+    // The drawer's own chrome, declared after the `common` run because its wire
+    // name is `drawer.*` and this file groups declarations by namespace.
+    // `CommonCloseDetail` is its conceptual sibling: the other string the shared
+    // panel needs, and neither belongs to a module. ONE key serves all five, so
+    // the sentence must name no module — five per-module keys would put five
+    // translations in the catalog for a component that is defined once.
+    DrawerEmpty => "drawer.empty",
     DashboardNewTransaction => "dashboard.new_transaction",
     DashboardTotalBalance => "dashboard.total_balance",
     DashboardNegativeAllowed => "dashboard.negative_allowed",
@@ -1109,6 +1116,11 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::CommonOptional, "optional", "optional"),
     (MessageKey::CommonCloseDetail, "Close detail", "Close detail"),
     (MessageKey::CommonInactiveLabel, "(inactive)", "(inactive)"),
+    // A sentence with nothing to count, so both forms are the SAME string:
+    // `non_count_catalog_rows_do_not_mix_singular_and_plural_languages` rejects
+    // any non-count row whose two forms differ, and a panel invitation is not a
+    // noun that could take a plural.
+    (MessageKey::DrawerEmpty, "Select a row to see its details.", "Select a row to see its details."),
     (MessageKey::DashboardNewTransaction, "New transaction", "New transaction"),
     (MessageKey::DashboardTotalBalance, "Total balance", "Total balance"),
     (MessageKey::DashboardNegativeAllowed, "Negative balances allowed", "Negative balances allowed"),
@@ -2078,6 +2090,10 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::CommonOptional, "opcional", "opcional"),
     (MessageKey::CommonCloseDetail, "Cerrar detalle", "Cerrar detalle"),
     (MessageKey::CommonInactiveLabel, "(inactivo)", "(inactivo)"),
+    // "Seleccione" and not "Seleccioná": the catalog is a neutral register and
+    // `CustomerHelp` / `SuppliersHelp` already open with "Seleccione un nombre
+    // para ver…", so this is the same voice the operator reads beside it.
+    (MessageKey::DrawerEmpty, "Seleccione una fila para ver sus detalles.", "Seleccione una fila para ver sus detalles."),
     (MessageKey::DashboardNewTransaction, "Nueva transacción", "Nueva transacción"),
     (MessageKey::DashboardTotalBalance, "Saldo total", "Saldo total"),
     (MessageKey::DashboardNegativeAllowed, "Saldos negativos permitidos", "Saldos negativos permitidos"),

@@ -45,6 +45,7 @@ from helpers import (
     create_purchase_draft,
     create_sale_draft,
     create_supplier,
+    e2e_copy,
     fund_account,
 )
 
@@ -124,6 +125,24 @@ def _assert_no_warning(page: Page) -> None:
     """
     expect(page.get_by_text("stale cost", exact=True)).to_have_count(0)
     expect(page.get_by_role("button", name="Apply to product")).to_have_count(0)
+
+
+def _assert_peek_body_is_the_empty_state(page: Page) -> None:
+    """Assert the closed peek's body holds the shared empty state and no detail.
+
+    The claim is NOT "the peek is hidden": `not_to_be_visible()` already says
+    that, and it cannot tell an emptied body from a full one. It is "the purchase
+    is gone and the panel says so", because at and above the drawer's split
+    threshold the panel is a permanent column and a body with nothing in it is
+    what the operator stares at. The child count is what keeps this honest — a
+    leftover fragment carrying the same words would pass on text alone.
+    """
+    assert page.evaluate(
+        "document.querySelectorAll('#purchase-drawer-body > .empty').length"
+    ) == 1, "the closed peek must be back to the empty state, not merely hidden"
+    assert page.evaluate(
+        "document.getElementById('purchase-drawer-body').textContent.trim()"
+    ) == e2e_copy("drawer_empty"), "the closed body must hold no purchase, only the empty state"
 
 
 def test_confirming_a_rising_cost_purchase_warns_and_applying_updates_the_product(
@@ -482,15 +501,13 @@ def test_clicking_a_purchase_row_opens_the_peek_and_escape_closes_it(
     # The URL never moved: the peek is an in-page swap, not a navigation.
     assert urlparse(page.url).path == "/purchases", page.url
 
-    # Escape closes the drawer AND empties the body — the emptied body is the
-    # DOM property the page's close script owns, the same claim the documents
-    # drawer tests make for their sibling.
+    # Escape closes the drawer AND clears the body back to the empty state — the
+    # body's DOM is the property the page's close script owns, the same claim the
+    # documents drawer tests make for their sibling. "Cleared" means the shared
+    # empty state, not nothing: on a wide screen the panel is a permanent column.
     page.keyboard.press("Escape")
     expect(drawer).not_to_be_visible()
-    assert (
-        page.evaluate("document.getElementById('purchase-drawer-body').innerHTML")
-        == ""
-    ), "Escape must empty the peek body, not just hide the drawer"
+    _assert_peek_body_is_the_empty_state(page)
 
 
 # ---------------------------------------------------------------------------

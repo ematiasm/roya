@@ -106,6 +106,25 @@ def _answer_next_dialog(page: Page, *, accept: bool) -> list[str]:
     return seen
 
 
+def _assert_body_is_the_empty_state(page: Page) -> None:
+    """Assert a closed drawer's body holds the shared empty state and no detail.
+
+    The claim is NOT "the panel is hidden": ``not_to_be_visible()`` already says
+    that, and it cannot tell an emptied body from a full one. It is "the
+    document is gone and the panel says so", because at and above the drawer's
+    split threshold the panel is a permanent column and a body with nothing in it
+    is what the operator stares at. So the body is read through the DOM rather
+    than off the panel, and the child count is what keeps this honest — a
+    leftover detail fragment carrying the same words would pass on text alone.
+    """
+    assert page.evaluate(
+        f"document.querySelectorAll('{_DRAWER_BODY} > .empty').length"
+    ) == 1, "the closed drawer must be back to the empty state, not merely hidden"
+    assert page.evaluate(
+        f"document.querySelector('{_DRAWER_BODY}').textContent.trim()"
+    ) == e2e_copy("drawer_empty"), "the closed body must hold no document, only the empty state"
+
+
 # ---------------------------------------------------------------------------
 # Case 6's principal: built through the real screens, the way the identity
 # tests build theirs (a role whose matrix holds exactly one read code, a user
@@ -252,9 +271,7 @@ def test_escape_closes_the_drawer_and_empties_its_body(page: Page, api: ApiClien
     page.keyboard.press("Escape")
 
     expect(page.locator(_DRAWER)).not_to_be_visible()
-    assert page.evaluate(
-        "document.getElementById('document-drawer-body').innerHTML"
-    ) == "", "closing the drawer must empty its body, not just hide it"
+    _assert_body_is_the_empty_state(page)
 
 
 def test_opening_the_drawer_never_navigates_or_reloads(page: Page, api: ApiClient) -> None:
@@ -368,9 +385,7 @@ def test_deleting_a_draft_refreshes_the_feed_and_closes_the_drawer(
     # instead of sleeping.
     expect(listing).not_to_contain_text(f"Draft #{sale_id}")
     expect(page.locator(_DRAWER)).not_to_be_visible()
-    assert page.evaluate(
-        "document.getElementById('document-drawer-body').innerHTML"
-    ) == "", "the closed drawer must be empty, not merely hidden"
+    _assert_body_is_the_empty_state(page)
     assert urlparse(page.url).path == _DOCUMENTS_PAGE, (
         f"the delete navigated away: {page.url}"
     )
@@ -415,9 +430,7 @@ def test_annulling_a_confirmed_sale_refreshes_the_feed_and_closes_the_drawer(
         listing.locator('[data-document-kind="sale"]', has_text=sale_number)
     ).to_contain_text(e2e_copy("cancelled"))
     expect(page.locator(_DRAWER)).not_to_be_visible()
-    assert page.evaluate(
-        "document.getElementById('document-drawer-body').innerHTML"
-    ) == "", "the closed drawer must be empty, not merely hidden"
+    _assert_body_is_the_empty_state(page)
     assert urlparse(page.url).path == _DOCUMENTS_PAGE, (
         f"the annul navigated away: {page.url}"
     )

@@ -102,12 +102,33 @@
       // panel is overlaying. On the rail the panel is a column, so there is
       // nothing to collapse and ✕ clears the selection instead — which is the
       // empty state the rail needs when nothing is selected.
+      //
+      // "Empty" means back to the empty STATE, not to nothing. The slot starts
+      // out holding the server-rendered `.empty` box (see
+      // `templates/partials/drawer_empty.html`), and clearing it to a bare
+      // string left a `bg-card` rectangle with nothing in it — so at and above
+      // the split threshold the rail read one way on load and another after ✕.
+      // Restoring the same box makes both states identical, which is the whole
+      // reason the rail needs no separate "cleared" treatment.
+      //
+      // Built with `el()` and `replaceChildren`, never `innerHTML` and a
+      // concatenated string: the sentence is localized, so a string here is
+      // markup assembled out of a translated value, and `el()` sets
+      // `textContent`, which is why the notice builder below gets to do the same
+      // thing. `el` and `translations` are both declared further down this
+      // IIFE, which is safe — function declarations hoist, `var translations` is
+      // assigned while this IIFE runs, and no close can fire before an event
+      // does.
+      //
+      // The local is `panel`, NOT `el`: `var el = drawerNode(id)` shadows the
+      // `el()` builder for the rest of this function, so `el('div', …)` would
+      // call a DOM node and throw. Two identifiers, one name, one function.
       function closeDrawer(id) {
-        var el = drawerNode(id);
-        if (!el) return;
-        if (!drawerIsRail.matches) el.removeAttribute('data-open');
+        var panel = drawerNode(id);
+        if (!panel) return;
+        if (!drawerIsRail.matches) panel.removeAttribute('data-open');
         var body = document.getElementById(id + '-body');
-        if (body) body.innerHTML = '';
+        if (body) body.replaceChildren(el('div', { class: 'empty' }, translations.drawerEmpty));
       }
 
       // `data-drawer-close` names a panel, or sits inside one and names
@@ -202,7 +223,8 @@
         dismiss: "{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}",
         requestFailed: "{{ localization.tr(crate::localization::MessageKey::NoticeRequestFailed) }}",
         actionFailed: "{{ localization.tr(crate::localization::MessageKey::NoticeActionFailed) }}",
-        actionSaved: "{{ localization.tr(crate::localization::MessageKey::NoticeActionSaved) }}"
+        actionSaved: "{{ localization.tr(crate::localization::MessageKey::NoticeActionSaved) }}",
+        drawerEmpty: "{{ localization.tr(crate::localization::MessageKey::DrawerEmpty) }}"
       };
       // Notice: non-blocking feedback region; replaces the old blocking browser dialog.
       // The server can also render this success box itself for the

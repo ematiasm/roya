@@ -1,0 +1,18 @@
+{# The detail panel's empty state, shared by all five modules. It is a partial
+   because FIVE call sites want byte-identical content — not to carry a
+   per-module exception. If a module ever needs different words, the honest fix
+   is a second key with a real reason, not a branch in here: this file is the
+   only place the sentence exists, and a `{% if module == … %}` would make the
+   shared component's copy depend on the page that opened it.
+
+   It renders on load so the first paint is right, which matters only at and
+   above the drawer's split threshold: there the panel is a permanent grid
+   column, so an empty body would be a bare `bg-card` rectangle for as long as
+   the operator stays on the page. Below the threshold the panel is
+   `display: none` and this is invisible and harmless. The controller in
+   base.html re-inserts the same box after a close, for the same reason.
+
+   `.empty` is the existing shared component, not a new class: it is already
+   defined in `@layer components` and already compiled into `static/tailwind.css`,
+   so this needs no stylesheet rebuild. #}
+<div class="empty">{{ localization.tr(crate::localization::MessageKey::DrawerEmpty) }}</div>

@@ -117,6 +117,11 @@ _E2E_COPY = {
         "products_linked": "Products still linked: {count}",
         "document_lines": "Recorded document lines: {count}",
         "save": "Save",
+        # The detail panel's empty state, shared by all five modules and byte
+        # identical to the application's catalog row: the drawer is one
+        # component, so five per-module sentences would be five translations of a
+        # message that is written once.
+        "drawer_empty": "Select a row to see its details.",
     },
     "es": {
         "username": "Usuario",
@@ -171,6 +176,7 @@ _E2E_COPY = {
         "products_linked": "Productos aún vinculados: {count}",
         "document_lines": "Líneas de documento registradas: {count}",
         "save": "Guardar",
+        "drawer_empty": "Seleccione una fila para ver sus detalles.",
     },
 }
 
@@ -178,7 +184,6 @@ _E2E_COPY = {
 def e2e_copy(key: str) -> str:
     """Return presentation copy for the locale configured by this harness."""
     return _E2E_COPY.get(E2E_LANGUAGE, _E2E_COPY["en"])[key]
-
 
 
 class SeedError(RuntimeError):
