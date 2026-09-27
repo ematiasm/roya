@@ -52,7 +52,7 @@ use crate::security::authz::{
 #[derive(Template)]
 #[template(path = "products.html")]
 struct ProductsTemplate {
-    products: Vec<ProductStock>,
+    products: Vec<ProductRowView>,
     categories: Vec<crate::models::Category>,
     localization: LocalizationContext,
     allow_negative_stock: bool,
@@ -64,10 +64,51 @@ struct ProductsTemplate {
     nav: Nav,
 }
 
+/// One product row, with its level resolved: the formatted quantity, or the
+/// sentence where the quantity was. Same shape as every other refused row in this
+/// change — the row keeps its place, its name, its SKU and its prices, and states
+/// the rule instead of a figure.
+#[derive(Clone)]
+struct ProductRowView {
+    product: Product,
+    suggested: Option<Decimal>,
+    stock: String,
+    stock_message: String,
+    negative: bool,
+}
+
+fn product_row_views(
+    products: Vec<ProductStock>,
+    localization: &LocalizationContext,
+) -> Vec<ProductRowView> {
+    products
+        .into_iter()
+        .map(|ps| {
+            let (stock, stock_message) = match ps.stock.amount {
+                Some(level) => (localization.format_quantity(level), String::new()),
+                None => (
+                    String::new(),
+                    ps.stock
+                        .refusal
+                        .map(|refusal| price_refusal_message(&refusal, localization))
+                        .unwrap_or_default(),
+                ),
+            };
+            ProductRowView {
+                product: ps.product,
+                suggested: ps.suggested,
+                negative: ps.stock.amount_is_negative(),
+                stock,
+                stock_message,
+            }
+        })
+        .collect()
+}
+
 #[derive(Template)]
 #[template(path = "partials/product_list.html")]
 struct ProductListPartial {
-    products: Vec<ProductStock>,
+    products: Vec<ProductRowView>,
     localization: LocalizationContext,
 }
 
@@ -101,7 +142,13 @@ struct StockListPartial {
 /// to display names (M5 Phase B, slice S10): the department returns ids, the
 /// wiring layer resolves them, so the interface shows a name and never an id.
 struct StockRow {
-    ps: ProductStock,
+    product: Product,
+    suggested: Option<Decimal>,
+    /// The level resolved: the formatted quantity, or empty when it refused, with
+    /// the sentence in `stock_message`. A stock list is a list of set sums, so the
+    /// row that cannot be measured renders in place like any other refused row.
+    stock: String,
+    stock_message: String,
     /// Display name of the product's creator ("Registrado por"); `None` only
     /// when the id resolves to nothing (a concurrent deactivation).
     created_by_name: Option<String>,
@@ -201,7 +248,15 @@ fn product_price_ladder_html(
 struct ProductDetailPartial {
     localization: LocalizationContext,
     product: Product,
-    stock: Decimal,
+    /// The level, already resolved: the formatted quantity, or an empty string
+    /// when the level refused (with the sentence in `stock_message`).
+    stock: String,
+    /// The refusal for a level that could not be carried, in the operator's
+    /// language, through the one shared mapping.
+    stock_message: String,
+    /// The sign the drawer's "negative" chip reads. False for a refused level:
+    /// it states no figure, so it states no sign.
+    stock_negative: bool,
     suggested: Option<Decimal>,
     /// Display name of the product's creator ("Registrado por"). Every
     /// product has one (`created_by` is NOT NULL); it renders even when the
@@ -278,7 +333,7 @@ fn render_product_list(
     localization: &LocalizationContext,
 ) -> AppResult<String> {
     ProductListPartial {
-        products: products.to_vec(),
+        products: product_row_views(products.to_vec(), localization),
         localization: localization.clone(),
     }
     .render()
@@ -363,7 +418,7 @@ async fn products_page(
         .await?;
     let categories = state.inventory_service.categories.list().await?;
     let tmpl = ProductsTemplate {
-        products,
+        products: product_row_views(products, &localization),
         categories,
         localization,
         allow_negative_stock: state.allow_negative_stock,
@@ -415,7 +470,7 @@ async fn web_product_list(
         .filter_products(&query, category_id)
         .await?;
     let html = ProductListPartial {
-        products,
+        products: product_row_views(products, &localization),
         localization: localization.clone(),
     }
     .render()
@@ -460,10 +515,25 @@ async fn stock_list_html(
     let name_for = |id: i64| names.get(&id).cloned();
     let rows = items
         .into_iter()
-        .map(|ps| StockRow {
-            created_by_name: name_for(ps.product.created_by),
-            updated_by_name: ps.product.updated_by.and_then(name_for),
-            ps,
+        .map(|ps| {
+            let (stock, stock_message) = match ps.stock.amount {
+                Some(level) => (localization.format_quantity(level), String::new()),
+                None => (
+                    String::new(),
+                    ps.stock
+                        .refusal
+                        .map(|refusal| price_refusal_message(&refusal, &localization))
+                        .unwrap_or_default(),
+                ),
+            };
+            StockRow {
+                created_by_name: name_for(ps.product.created_by),
+                updated_by_name: ps.product.updated_by.and_then(name_for),
+                product: ps.product,
+                suggested: ps.suggested,
+                stock,
+                stock_message,
+            }
         })
         .collect();
     StockListPartial {
@@ -578,7 +648,17 @@ async fn web_product_search_json(
                 sku: ps.product.sku,
                 sale_price,
                 cost_price,
-                stock: localization.format_quantity(ps.stock),
+                // A refused level states the rule in the island's own field: the
+                // island renders this string verbatim, so a search that met a
+                // refused level still answers every OTHER product it matched.
+                stock: match ps.stock.amount {
+                    Some(level) => localization.format_quantity(level),
+                    None => ps
+                        .stock
+                        .refusal
+                        .map(|refusal| price_refusal_message(&refusal, &localization))
+                        .unwrap_or_default(),
+                },
             }
         })
         .collect();
@@ -772,10 +852,26 @@ async fn product_detail_html(
     // shared mapping the product save form also goes through.
     let ladder = state.tax_service.product_price_ladder(id, None).await?;
     let net_refusal_message = ladder_refusal_message(&ladder, localization);
+    // The level resolved for the drawer, the same way the picker row resolves it:
+    // the amount, or the sentence in its place. Two fields, because the template
+    // must not be able to print a number where the sum was refused.
+    let (stock, stock_message) = match ps.stock.amount {
+        Some(level) => (localization.format_quantity(level), String::new()),
+        None => (
+            String::new(),
+            ps.stock
+                .refusal
+                .map(|refusal| price_refusal_message(&refusal, localization))
+                .unwrap_or_default(),
+        ),
+    };
+    let stock_negative = ps.stock.amount_is_negative();
     let html = ProductDetailPartial {
         localization: localization.clone(),
         product: ps.product,
-        stock: ps.stock,
+        stock,
+        stock_message,
+        stock_negative,
         suggested: ps.suggested,
         created_by_name,
         updated_by_name,
@@ -1453,7 +1549,7 @@ async fn web_edit_product(
             .filter_products(&query, category_id)
             .await?;
         let html = ProductListPartial {
-            products,
+            products: product_row_views(products, &localization),
             localization: localization.clone(),
         }
         .render()
@@ -1619,7 +1715,7 @@ async fn product_lifecycle_response(
             .filter_products(&query, category_id)
             .await?;
         let html = ProductListPartial {
-            products,
+            products: product_row_views(products, &localization),
             localization: localization.clone(),
         }
         .render()
@@ -2161,6 +2257,69 @@ mod tests {
         (status, String::from_utf8_lossy(&bytes).to_string())
     }
 
+    /// The sweep's THIRD quantity fold, and the one that made the first two
+    /// reachable: a stock level is the sum of a product's movements, every one of
+    /// them written from a request's quantity, and nothing bounds the SUM. Two
+    /// incoming movements of `4e28` carry on their own and are `8e28` together,
+    /// which is a level no stock page can state.
+    #[tokio::test]
+    async fn a_stock_level_whose_movements_cannot_be_added_up_is_not_a_panic() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product = seed_tracked_product(&state, "LEVEL-HUGE").await.id;
+        let movement = |note: &'static str| {
+            let app = app.clone();
+            async move {
+                let (status, _headers, body) = post_form_full(
+                    app,
+                    "/web/stock-movements",
+                    &format!(
+                        "product_id={product}&qty=40000000000000000000000000000&type=In&\
+                         reason=Initial&date=2024-05-01&\
+                         location=main&notes={note}"
+                    ),
+                    &[],
+                )
+                .await;
+                (status, body)
+            }
+        };
+
+        // The first movement carries on its own.
+        let (status, body) = movement("first").await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        // The second is the sum that does not, and it is refused BEFORE the write.
+        let (status, body) = movement("second").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a level the addition cannot carry is a refusal, not a panic: {body:.400}"
+        );
+        assert!(
+            body.contains("too large to compute"),
+            "in the rule's own words: {body:.400}"
+        );
+
+        // The level that was stored is the one that carried: the refused movement
+        // wrote nothing, so the drawer answers with a real figure.
+        let level = state
+            .inventory_service
+            .stock_for_decision(product)
+            .await
+            .unwrap();
+        assert_eq!(
+            level,
+            Decimal::from_str("40000000000000000000000000000").unwrap()
+        );
+        let (status, html) =
+            get_html(app.clone(), &format!("/web/products/detail/{product}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the drawer still answers: {html:.400}"
+        );
+    }
+
     #[tokio::test]
     async fn web_products_page_renders() {
         let state = test_state().await;
@@ -2178,6 +2337,291 @@ mod tests {
             html.contains(localization.tr(crate::localization::MessageKey::ProductLowStock)),
             "page should have low-stock section"
         );
+    }
+
+    /// The operator's language, so a refusal is asserted as a sentence.
+    async fn set_locale(state: &AppState, locale_code: &str, language_code: &str) {
+        sqlx::query("INSERT OR IGNORE INTO business_locales (locale_code, language_code, display_name, is_enabled) VALUES (?, ?, ?, 1)")
+            .bind(locale_code)
+            .bind(language_code)
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT OR IGNORE INTO business_settings (id, business_name, default_locale_code, currency_code, timezone) VALUES (1, 'Test', ?, 'USD', 'UTC')")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE business_settings SET default_locale_code = ? WHERE id = 1")
+            .bind(locale_code)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+    }
+
+    /// One product's row, sliced out by its id, so an assertion about the refused
+    /// product is about THAT row and not about the page. The slice ends at the
+    /// row's own closing pair, which is the last thing the row emits.
+    fn row_html<'a>(html: &'a str, prefix: &str, id: i64) -> Option<&'a str> {
+        let marker = format!("id=\"{prefix}-{id}\"");
+        let start = html.find(&marker)? + marker.len();
+        let rest = &html[start..];
+        let end = rest
+            .find("</div>\n    </div>")
+            .map(|at| at + "</div>\n    </div>".len())
+            .unwrap_or(rest.len());
+        Some(&rest[..end])
+    }
+
+    /// B2: the reorder SUGGESTION is `max_stock - stock`, and that subtraction
+    /// was raw. A tracked product with `min_stock = 0` and `max_stock = 4e28`
+    /// plus one `Out` movement of `7.9e28` gives a level of `-7.9e28` (which
+    /// carries, and is accepted because negative stock is allowed by default), so
+    /// the suggestion is `4e28 + 7.9e28 = 1.19e29` and every catalogue read
+    /// panicked.
+    ///
+    /// The product is created through the API and the movement through the stock
+    /// form, so the state is one the application itself produces — `max_stock` has
+    /// no ceiling and this is not one.
+    #[tokio::test]
+    async fn a_reorder_suggestion_whose_subtraction_cannot_be_carried_is_not_a_panic() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+
+        // A tracked product whose ceiling is enormous, through the product API.
+        let (status, body) = post_json(
+            crate::routes::router(state.clone()),
+            "/api/products",
+            &serde_json::json!({
+                "sku": "SUGGEST-HUGE", "name": "prod SUGGEST-HUGE", "kind": "Product",
+                "unit": "un", "sale_price": "10", "cost_price": "5",
+                "track_stock": true,
+                "min_stock": "0", "max_stock": "40000000000000000000000000000"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let product = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        // One outgoing movement, through the stock form the operator uses.
+        let (status, _headers, body) = post_form_full(
+            crate::routes::router(state.clone()),
+            "/web/stock-movements",
+            &format!(
+                "product_id={product}&qty=79000000000000000000000000000&type=Out&\
+                 reason=Loss&date=2024-05-01&location=main&notes=sweep"
+            ),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+        // Every read that walks the catalogue, in the order an operator meets
+        // them: the list, the drawer, both stock panels and the picker search.
+        //
+        // What is true here is worth stating precisely, because it is the whole
+        // design question: the LEVEL is carryable (`-7.9e28` is a real figure and
+        // stays on the row), and the SUGGESTION is what cannot be subtracted. So
+        // the row keeps the level and simply has no quantity — no `1.19e29`, and
+        // no zero either, because a zero reads as "reorder nothing".
+        let app = crate::routes::router(state);
+        for uri in [
+            "/web/products",
+            &format!("/web/products/detail/{product}"),
+            "/web/low-stock",
+            "/web/negative-stock",
+            "/web/product-search.json?q=SUGGEST",
+        ] {
+            let (status, html) = get_html(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {html:.400}");
+            assert!(
+                !html.contains("1.19E29") && !html.contains("119000000000000000000000000000"),
+                "{uri} publishes no reorder quantity it could not subtract: {html:.600}"
+            );
+        }
+        let (status, html) = get_html(app.clone(), "/web/products").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains("79.000.000.000.000.000.000.000.000.000"),
+            "the level the arithmetic CAN carry is still the row's own figure: {html:.600}"
+        );
+
+        // The reorder panel: the row survives with no quantity and no subtotal.
+        // The FRAGMENT, which is the same partial the purchases page includes.
+        let (status, html) = get_html(app, "/web/purchases/suggestions").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        // It lands in the "no supplier cost" list — it has no satellite cost row —
+        // which is the same partial and the same row shape.
+        let row = row_html(&html, "suggestion-nosup", product)
+            .unwrap_or_else(|| panic!("the product is in the panel: {html:.2000}"));
+        assert!(
+            !row.contains("×"),
+            "no quantity × cost on the row: {row:.600}"
+        );
+        assert!(
+            !row.contains("119000000000000000000000000000"),
+            "and no subtotal stands in for it: {row:.600}"
+        );
+    }
+
+    /// The control for the suggestion rule above: an ordinary tracked product
+    /// still gets its reorder quantity, so a checked subtraction did not silence
+    /// the panel it was meant to protect.
+    #[tokio::test]
+    async fn an_ordinary_reorder_suggestion_still_carries_its_quantity() {
+        let state = test_state().await;
+        let product = seed_tracked_product(&state, "SUGGEST-ORDINARY").await.id;
+        let app = crate::routes::router(state.clone());
+        let (status, _, body) = post_form_full(
+            app.clone(),
+            "/web/stock-movements",
+            &format!(
+                "product_id={product}&qty=1&type=In&reason=Initial&date=2024-05-01&\
+                 location=main&notes=ordinary"
+            ),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+        let (status, html) = get_html(app, "/web/purchases/suggestions").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let row = row_html(&html, "suggestion-nosup", product)
+            .unwrap_or_else(|| panic!("the product is in the panel: {html:.2000}"));
+        // The label is the template's own, so the assertion is about the value
+        // that FOLLOWS it: an ordinary product still gets a quantity.
+        let label = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap()
+            .tr(crate::localization::MessageKey::PurchasesSuggestions)
+            .to_string();
+        let after = row
+            .split(&label)
+            .nth(1)
+            .unwrap_or_else(|| panic!("the row names the suggestion: {row:.600}"));
+        assert!(
+            after.trim_start().starts_with(|c: char| c.is_ascii_digit()),
+            "an ordinary product keeps its reorder quantity: {row:.600}"
+        );
+    }
+
+    /// The stock level is a set sum like the balance, and the same rule applies
+    /// where a LIST renders many products: one product whose level cannot be
+    /// carried took the whole catalogue, the drawer and the picker search down
+    /// with it.
+    ///
+    /// The two `In` movements of `4e28` are stored straight through SQL, because
+    /// the movement write refuses the second one by design — which is exactly the
+    /// state a product can be found in.
+    async fn refused_level_product(state: &AppState, sku: &str) -> i64 {
+        let product = seed_tracked_product(state, sku).await.id;
+        let actor = audit_actor_id(state).await;
+        for _ in 0..2 {
+            sqlx::query(
+                "INSERT INTO stock_movements (product_id, qty, type, reason, date, created_by) \
+                 VALUES (?, '40000000000000000000000000000', 'In', 'Initial', '2024-05-01', ?)",
+            )
+            .bind(product)
+            .bind(actor)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        product
+    }
+
+    #[tokio::test]
+    async fn the_product_list_renders_a_refused_stock_level_in_place_of_the_number() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let expected = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap()
+            .tr(crate::localization::MessageKey::PriceRefusalAggregateTooLarge)
+            .to_string();
+        let ordinary = seed_tracked_product(&state, "LEVEL-ORDINARY").await.id;
+        let app = crate::routes::router(state.clone());
+
+        // THE CONTROL, measured BEFORE the refused product exists: the same list
+        // with the same ordinary row, so the untouched claim is a byte
+        // comparison.
+        let (clean_status, clean) = get_html(app.clone(), "/web/products").await;
+        assert_eq!(clean_status, StatusCode::OK, "{clean:.400}");
+        assert!(
+            !clean.contains("data-stock-level-refusal"),
+            "an all-ordinary list states nothing about the rule: {clean:.400}"
+        );
+        let clean_row =
+            row_html(&clean, "product", ordinary).expect("the ordinary product renders");
+
+        let refused = refused_level_product(&state, "LEVEL-REFUSED").await;
+        let (status, html) = get_html(app.clone(), "/web/products").await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let row = row_html(&html, "product", refused).expect("the refused product is on the page");
+        assert!(
+            row.contains(&expected),
+            "the row states the rule: {row:.600}"
+        );
+        assert!(
+            !row.contains("80000000000000000000000000000") && !row.contains("8E28"),
+            "and publishes no level for it: {row:.600}"
+        );
+        let sibling =
+            row_html(&html, "product", ordinary).expect("the ordinary product is on the page");
+        assert!(
+            sibling.contains("0"),
+            "its sibling keeps its own level: {sibling:.600}"
+        );
+        assert_eq!(
+            sibling, clean_row,
+            "and its sibling is BYTE-IDENTICAL to the render with no refused member beside it: \
+             a refused row must not change any other row"
+        );
+
+        // The picker search reads the same levels while an operator types, so a
+        // refused one there would break the line editor of every document.
+        let (status, body) = get_html(app.clone(), "/web/product-search.json?q=LEVEL").await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert!(
+            body.contains(&expected),
+            "the search answers with the rule, in the operator's language: {body:.600}"
+        );
+
+        // And the drawer, which is where an operator goes to fix one product.
+        let (status, html) = get_html(app, &format!("/web/products/detail/{refused}")).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains(&expected), "{html:.600}");
+        assert!(!html.contains("8E28"), "{html:.600}");
+    }
+
+    #[tokio::test]
+    async fn the_low_stock_list_renders_a_refused_level_instead_of_failing() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let expected = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap()
+            .tr(crate::localization::MessageKey::PriceRefusalAggregateTooLarge)
+            .to_string();
+        let refused = refused_level_product(&state, "LOW-REFUSED").await;
+        let app = crate::routes::router(state);
+
+        for uri in ["/web/low-stock", "/web/negative-stock"] {
+            let (status, html) = get_html(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {html:.400}");
+            assert!(
+                html.contains(&expected),
+                "{uri} states the rule for the one product it cannot measure: {html:.600}"
+            );
+            assert!(
+                html.contains(&format!("id=\"stock-{refused}\"")),
+                "{uri}: {html:.600}"
+            );
+        }
     }
 
     #[tokio::test]

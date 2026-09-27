@@ -1,3 +1,7 @@
 {% for acc in accounts %}
-<option value="{{ acc.id }}">{{ acc.name }} — {{ localization.format_currency(acc.balance.clone()) }}</option>
+{# The account NAME is the value here; the balance is context, so a refused one
+   states the rule beside it and never a figure. The option stays selectable —
+   refusing to offer an account would leave an operator with no way to pay from
+   it, which is a worse answer than saying why its balance is unknown. #}
+<option value="{{ acc.id }}">{{ acc.name }}{% if !acc.balance.is_empty() %} — {{ acc.balance }}{% else %} — <span data-account-balance-refusal data-document-total-refusal>{{ acc.balance_message }}</span>{% endif %}</option>
 {% endfor %}

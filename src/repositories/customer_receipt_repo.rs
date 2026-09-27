@@ -263,6 +263,13 @@ impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
                     // The project's word for a collection.
                     detail: "Cobro".to_string(),
                     amount: Some(totals.get(&id).copied().unwrap_or(Decimal::ZERO)),
+                    // A receipt's amount is a sum of the payments allocated to
+                    // it, and each payment is bounded by the sale it settles, so
+                    // the same per-document refusal the sale and purchase folds
+                    // carry cannot arise here. Left `None` rather than asserted:
+                    // the index renders no figure for a family without money, and
+                    // a receipt is not one.
+                    total_refusal: None,
                     quantity: None,
                     created_by: row.get("created_by"),
                 }

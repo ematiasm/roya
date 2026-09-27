@@ -31,11 +31,12 @@ use std::collections::{BTreeMap, HashSet};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     format_purchase_number, LineTaxView, MovementReason, MovementType, NewMovement, NewPurchase,
-    PaymentType, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView, PurchaseListFilter,
-    PurchasePayment, PurchasePaymentView, PurchaseRecord, PurchaseStatus, PurchaseSuggestion,
-    PurchaseSuggestionWithoutSupplier, PurchaseSuggestions, StaleLineCostView, Supplier,
-    UpdatePurchaseDraft,
+    PaymentType, PriceRefusal, Purchase, PurchaseDetail, PurchaseLine, PurchaseLineView,
+    PurchaseListFilter, PurchaseListRow, PurchasePayment, PurchasePaymentView, PurchaseRecord,
+    PurchaseStatus, PurchaseSuggestion, PurchaseSuggestionWithoutSupplier, PurchaseSuggestions,
+    RecordMoney, SetMoney, StaleLineCostView, Supplier, UpdatePurchaseDraft,
 };
+use crate::services::checked_money_sum;
 use crate::services::line_taxes::tax_inclusive_total;
 
 /// What `add_or_increment_line` did with the request. The distinction matters
@@ -180,51 +181,129 @@ where
     /// (`round(qty * cost + tax_total)`), not `round(net + tax)` over the whole
     /// document — the exact mirror of the sales rule, so the two families cannot
     /// disagree by a cent and the record page reconciles line by line.
-    fn tax_split(lines: &[PurchaseLine]) -> (Decimal, Decimal, Decimal) {
+    ///
+    /// # Every accumulation is checked, and the signature is what makes that so
+    ///
+    /// The exact twin of `SalesService::tax_split`, deliberately: an operator
+    /// typing a received quantity and a supplier's cost is typing the same
+    /// unbounded operands a sale is, and a fix written for one family only would
+    /// leave this one panicking. Per-line carryability says nothing about a sum
+    /// — two lines of `4e28` are each stored by the real checked write and
+    /// `8e28` is above `Decimal::MAX` — so the folds are `checked_add` and the
+    /// result is a `Result`. A caller cannot forget the guard, because the
+    /// signature will not compile until they handle it.
+    ///
+    /// The refusal is [`PriceRefusal::DocumentTotalTooLarge`], its own rule and
+    /// not either line rule: every line of the document is fine, so a
+    /// line-amount or tax-arithmetic sentence would send the operator to fix a
+    /// number that is already correct.
+    fn tax_split(lines: &[PurchaseLine]) -> Result<(Decimal, Decimal, Decimal), PriceRefusal> {
         let mut net = Decimal::ZERO;
         let mut tax = Decimal::ZERO;
         let mut total = Decimal::ZERO;
         for l in lines {
-            net += l.subtotal();
-            tax += l.tax_total;
-            total += tax_inclusive_total(l.subtotal(), l.tax_total);
+            net = net
+                .checked_add(l.subtotal())
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+            tax = tax
+                .checked_add(l.tax_total)
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+            total = total
+                .checked_add(tax_inclusive_total(l.subtotal(), l.tax_total))
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
         }
-        (net, tax, total)
+        Ok((net, tax, total))
     }
 
-    /// `total` is the tax-inclusive document total, so every payment ceiling,
-    /// overpayment refusal, due balance and payable figure derived here is
-    /// measured against the money actually owed.
-    fn totals(lines: &[PurchaseLine], payments: &[PurchasePayment]) -> (Decimal, Decimal, Decimal) {
-        let (_, _, total) = Self::tax_split(lines);
+    /// What a document has been paid and what is still owed, checked for the
+    /// same reason [`Self::tax_split`] is: it is a sum of stored amounts, and
+    /// `total - paid` is the subtraction every payment ceiling is measured
+    /// against, so it is a fact the code states rather than one it assumes.
+    fn paid_and_due(
+        total: Decimal,
+        payments: &[PurchasePayment],
+    ) -> Result<(Decimal, Decimal), PriceRefusal> {
         let mut paid = Decimal::ZERO;
         for p in payments {
-            paid += p.amount;
+            paid = paid
+                .checked_add(p.amount)
+                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
         }
-        let due = total - paid;
-        (total, paid, due)
+        let due = total
+            .checked_sub(paid)
+            .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+        Ok((paid, due))
     }
 
-    async fn detail_for(&self, purchase: Purchase) -> AppResult<PurchaseDetail> {
-        let lines = self.purchases.list_lines(purchase.id).await?;
-        let payments = self.purchases.list_payments(purchase.id).await?;
-        let (net_subtotal, tax_total, total) = Self::tax_split(&lines);
-        let mut paid = Decimal::ZERO;
-        for p in &payments {
-            paid += p.amount;
-        }
-        let due = total - paid;
-        let payment_status = PurchaseDetail::payment_status_for(total, paid);
-        Ok(PurchaseDetail {
-            purchase,
-            lines,
-            payments,
+    /// The whole document-level money as ONE value, or the rule that refused it.
+    /// The sales twin's reason for asking, deliberately: this is the ONE place a
+    /// purchase's document money is derived, and the figures travel together
+    /// because they are one fact, so no caller can publish a payable figure
+    /// derived from a total that does not exist.
+    fn document_money(
+        lines: &[PurchaseLine],
+        payments: &[PurchasePayment],
+    ) -> Result<RecordMoney, PriceRefusal> {
+        let (net_subtotal, tax_total, total) = Self::tax_split(lines)?;
+        let (paid, due) = Self::paid_and_due(total, payments)?;
+        Ok(RecordMoney {
             net_subtotal,
             tax_total,
             total,
             paid,
             due,
-            payment_status,
+            payment_status: PurchaseDetail::payment_status_for(total, paid),
+        })
+    }
+
+    /// One document as a LIST ROW: identity and non-money facts always, money when
+    /// the arithmetic carried it, and the rule when it did not. The purchase twin
+    /// of `SalesService::row_for`, for the same reason: a list page must be able
+    /// to SHOW a document whose lines cannot be added up instead of answering an
+    /// error and taking every other row with it.
+    ///
+    fn row_for(
+        purchase: Purchase,
+        lines: &[PurchaseLine],
+        payments: &[PurchasePayment],
+    ) -> PurchaseListRow {
+        let (money, total_refusal) = match Self::document_money(lines, payments) {
+            Ok(money) => (Some(money), None),
+            Err(refusal) => (None, Some(refusal)),
+        };
+        PurchaseListRow {
+            purchase,
+            line_count: lines.len(),
+            money,
+            total_refusal,
+        }
+    }
+
+    /// `total` is the tax-inclusive document total, so every payment ceiling,
+    /// overpayment refusal, due balance and payable figure derived here is
+    /// measured against the money actually owed.
+    fn totals(
+        lines: &[PurchaseLine],
+        payments: &[PurchasePayment],
+    ) -> Result<(Decimal, Decimal, Decimal), PriceRefusal> {
+        let money = Self::document_money(lines, payments)?;
+        Ok((money.total, money.paid, money.due))
+    }
+
+    async fn detail_for(&self, purchase: Purchase) -> AppResult<PurchaseDetail> {
+        let lines = self.purchases.list_lines(purchase.id).await?;
+        let payments = self.purchases.list_payments(purchase.id).await?;
+        let money = Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        Ok(PurchaseDetail {
+            purchase,
+            lines,
+            payments,
+            net_subtotal: money.net_subtotal,
+            tax_total: money.tax_total,
+            total: money.total,
+            paid: money.paid,
+            due: money.due,
+            payment_status: money.payment_status,
         })
     }
 
@@ -482,10 +561,20 @@ where
             // Same product at the same price: sum the quantities through the
             // existing update path (which re-runs the draft and validation
             // guards), keeping exactly one line for the product.
+            //
+            // The sum is CHECKED, and it is the second half of the argument the
+            // write bound cannot make: a stored quantity plus a REQUESTED one is a
+            // fold over a set, and nothing bounds it. `4e28` plus `4e28` overflows
+            // in the raw `+` while every amount on the document stays at `0` —
+            // the money bound is about the amount, and says nothing about the
+            // count. The rule is `LineAmountTooLarge` because the line it refuses
+            // IS the line whose resulting amount is too large to carry.
             Some(existing) if existing.unit_cost == cost => {
-                let line = self
-                    .update_line(actor, existing.id, existing.qty + qty, cost)
-                    .await?;
+                let merged = existing
+                    .qty
+                    .checked_add(qty)
+                    .ok_or_else(|| AppError::PriceRefused(PriceRefusal::LineAmountTooLarge))?;
+                let line = self.update_line(actor, existing.id, merged, cost).await?;
                 Ok(LineAddOutcome::Merged {
                     line,
                     product_name: product.name,
@@ -580,28 +669,54 @@ where
     /// Record-page view for `/purchases/{id}`: resolves supplier, product,
     /// account and method names through the existing read paths, so the route
     /// never runs SQL of its own and never prints an internal key.
+    ///
+    /// It reads through [`Self::record_from_parts`] and NOT through
+    /// `get_detail`, on purpose: a `PurchaseDetail` propagates the
+    /// document-total refusal, and this view must not lose the document because
+    /// of it — an operator who cannot open a purchase cannot reduce it.
     pub async fn get_record(&self, purchase_id: i64) -> AppResult<PurchaseRecord> {
-        let detail = self.get_detail(purchase_id).await?;
-        self.record_from_detail(detail).await
+        let purchase = self
+            .purchases
+            .find_purchase(purchase_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("purchase {purchase_id} not found")))?;
+        let lines = self.purchases.list_lines(purchase.id).await?;
+        let payments = self.purchases.list_payments(purchase.id).await?;
+        self.record_from_parts(purchase, lines, payments).await
     }
 
-    async fn record_from_detail(&self, detail: PurchaseDetail) -> AppResult<PurchaseRecord> {
+    /// The one read that renders a document whose money cannot be computed: the
+    /// purchase twin of `SalesService::record_from_parts`, for the same reason.
+    /// Every line is shown with its own money, and the document-level figures
+    /// are absent as an absence — `money` is `None` and `total_refusal` names the
+    /// rule — so the page states the refusal instead of publishing money derived
+    /// from a sum that could not be made.
+    async fn record_from_parts(
+        &self,
+        purchase: Purchase,
+        stored_lines: Vec<PurchaseLine>,
+        stored_payments: Vec<PurchasePayment>,
+    ) -> AppResult<PurchaseRecord> {
+        let (money, total_refusal) = match Self::document_money(&stored_lines, &stored_payments) {
+            Ok(money) => (Some(money), None),
+            Err(refusal) => (None, Some(refusal)),
+        };
         let supplier_name = self
             .suppliers
-            .get_supplier(detail.purchase.supplier_id)
+            .get_supplier(purchase.supplier_id)
             .await?
             .name;
 
-        // The status is read before the loop consumes `detail.lines`: the
-        // purchase itself is moved into the record at the end, so reading it
-        // inside the loop would touch a partially moved value.
-        let status = detail.purchase.status;
-        let mut lines = Vec::with_capacity(detail.lines.len());
+        // The status is read before the loop consumes the lines: the purchase
+        // itself is moved into the record at the end, so reading it inside the
+        // loop would touch a partially moved value.
+        let status = purchase.status;
+        let mut lines = Vec::with_capacity(stored_lines.len());
         // Receiving-desk T2: the units the stock flows will move, summed from
         // the same per-line `tracks_stock` flags below — never recomputed
         // elsewhere (a second predicate could drift from confirm/cancel).
-        let mut tracked_units = Decimal::ZERO;
-        for line in detail.lines {
+        let mut tracked_units = SetMoney::default();
+        for line in stored_lines {
             let product = self.inventory.get_product(line.product_id).await?;
             // The same predicate confirm and cancel use to decide whether a
             // line moves stock; resolved from the product this read already
@@ -640,7 +755,18 @@ where
                 None
             };
             if tracks_stock {
-                tracked_units += line.qty;
+                // The same checked fold as the merge above, one level up: a
+                // per-line bound is not a per-document bound, and this is the
+                // per-document figure. Once it refuses it STAYS refused — a later
+                // line cannot make the sum carryable, and a document that could
+                // not state its unit count must not grow one.
+                tracked_units = match tracked_units.amount {
+                    None => tracked_units,
+                    Some(sum) => match sum.checked_add(line.qty) {
+                        Some(next) => SetMoney::amount(next),
+                        None => SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
+                    },
+                };
             }
             // The FROZEN breakdown, read from the snapshot table: a re-rated,
             // renamed or deactivated tax cannot change what this shows.
@@ -684,8 +810,7 @@ where
             .map(|method| (method.id, method.name))
             .collect();
 
-        let payments = detail
-            .payments
+        let payments = stored_payments
             .into_iter()
             .map(|payment| PurchasePaymentView {
                 id: payment.id,
@@ -703,16 +828,12 @@ where
             .collect();
 
         Ok(PurchaseRecord {
-            purchase: detail.purchase,
+            purchase,
             supplier_name,
             lines,
             payments,
-            net_subtotal: detail.net_subtotal,
-            tax_total: detail.tax_total,
-            total: detail.total,
-            paid: detail.paid,
-            due: detail.due,
-            payment_status: detail.payment_status,
+            money,
+            total_refusal,
             tracked_units,
         })
     }
@@ -727,24 +848,64 @@ where
         Ok(out)
     }
 
+    /// The same documents as [`Self::list_details_filtered`], as LIST ROWS: the
+    /// tolerant twin every list surface reads, so a refused document keeps its
+    /// place in the list and the read never fails because of one.
+    pub async fn list_rows_filtered(
+        &self,
+        filter: &PurchaseListFilter,
+    ) -> AppResult<Vec<PurchaseListRow>> {
+        let purchases = self.filtered_purchases(filter).await?;
+        let mut out = Vec::with_capacity(purchases.len());
+        for purchase in purchases {
+            out.push(self.row_of(purchase).await?);
+        }
+        Ok(out)
+    }
+
+    /// A LIST row, the same documents and the same derived money
+    /// [`Self::detail_for`] computes — payments INCLUDED, because a row's chip is a
+    /// claim about the money: a settled document that still showed its full total as
+    /// due would be a lie the operator could act on.
+    async fn row_of(&self, purchase: Purchase) -> AppResult<PurchaseListRow> {
+        let lines = self.purchases.list_lines(purchase.id).await?;
+        let payments = self.purchases.list_payments(purchase.id).await?;
+        Ok(Self::row_for(purchase, &lines, &payments))
+    }
+
     /// The same derived list narrowed by the server-side list filter. The party
     /// name is resolved against the suppliers table (normalized) into ids, and the
     /// repository narrows the document query by those ids, so only matching
     /// documents have their lines and payments loaded.
+    ///
+    /// The STRICT twin of [`Self::list_rows_filtered`]: the same documents as
+    /// details, so a caller that makes a decision out of a document's money gets
+    /// the refusal instead of a missing figure. Kept for the read-bound test that
+    /// pins this read's query count, and for any future decision-shaped list;
+    /// `allow(dead_code)` because this crate is a binary, where a `pub` method
+    /// only the tests call still warns.
+    #[allow(dead_code)]
     pub async fn list_details_filtered(
         &self,
         filter: &PurchaseListFilter,
     ) -> AppResult<Vec<PurchaseDetail>> {
-        let mut repo_filter = filter.clone();
-        if let Some(name) = &filter.supplier {
-            repo_filter.supplier_ids = Some(self.matching_supplier_ids(name).await?);
-        }
-        let purchases = self.purchases.list_purchases_filtered(&repo_filter).await?;
+        let purchases = self.filtered_purchases(filter).await?;
         let mut out = Vec::with_capacity(purchases.len());
         for purchase in purchases {
             out.push(self.detail_for(purchase).await?);
         }
         Ok(out)
+    }
+
+    /// The list filter resolved to documents, so the strict and the tolerant read
+    /// cannot drift on WHICH documents a page shows — only on what one document's
+    /// money does.
+    async fn filtered_purchases(&self, filter: &PurchaseListFilter) -> AppResult<Vec<Purchase>> {
+        let mut repo_filter = filter.clone();
+        if let Some(name) = &filter.supplier {
+            repo_filter.supplier_ids = Some(self.matching_supplier_ids(name).await?);
+        }
+        Ok(self.purchases.list_purchases_filtered(&repo_filter).await?)
     }
 
     /// Supplier ids whose current name matches `needle` after normalization. The
@@ -859,7 +1020,11 @@ where
             }
         }
 
-        let (total, _, _) = Self::totals(&lines, &self.purchases.list_payments(purchase_id).await?);
+        // The document's money is resolved BEFORE any write below, exactly as on
+        // the sales side: a confirmation that cannot state what the document
+        // costs must refuse with nothing written.
+        let (total, _, _) = Self::totals(&lines, &self.purchases.list_payments(purchase_id).await?)
+            .map_err(AppError::PriceRefused)?;
 
         // The cash account is derived from the method, which belongs to exactly
         // one account: an invalid combination is impossible by construction.
@@ -1021,8 +1186,13 @@ where
         let account_id = self.payment_methods.resolve_account(method_id).await?;
         let lines = self.purchases.list_lines(purchase_id).await?;
         let payments = self.purchases.list_payments(purchase_id).await?;
-        let (total, paid, _) = Self::totals(&lines, &payments);
-        if paid + amount > total {
+        // The ceiling is measured against the DUE BALANCE, not `paid + amount`:
+        // `amount` is an operator's unbounded input and `paid + amount` is a raw
+        // add, so an operator typing `4e28` against an ordinary purchase would
+        // overflow here instead of being refused the overpayment they typed. The
+        // message is unchanged and its figures are stated, never summed.
+        let (total, paid, due) = Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+        if amount > due {
             return Err(AppError::Validation(format!(
                 "overpay rejected: paid {paid} + {amount} exceeds total {total}"
             )));
@@ -1097,7 +1267,12 @@ where
                 .then_with(|| a.purchase.purchase_date.cmp(&b.purchase.purchase_date))
                 .then_with(|| a.purchase.id.cmp(&b.purchase.id))
         });
-        let outstanding: Decimal = debts.iter().map(|detail| detail.due).sum();
+        // Checked, because this is the shape neither the per-line write bound
+        // nor the per-document fold can reach: a sum over a SET of documents.
+        // Each purchase's due is representable — it was refused otherwise when
+        // it was read — and the supplier's total need not be.
+        let outstanding = checked_money_sum(debts.iter().map(|detail| &detail.due))
+            .map_err(AppError::PriceRefused)?;
         if amount > outstanding {
             return Err(AppError::Validation(format!(
                 "amount {amount} exceeds the outstanding debt {outstanding} of supplier {} ({supplier_id})",
@@ -1118,7 +1293,8 @@ where
             plan.push((detail.purchase.id, take));
             remaining -= take;
         }
-        let planned: Decimal = plan.iter().map(|(_, take)| *take).sum();
+        let planned =
+            checked_money_sum(plan.iter().map(|(_, take)| take)).map_err(AppError::PriceRefused)?;
         if planned != amount {
             return Err(AppError::Internal(format!(
                 "payment plan {planned} does not consume the paid amount {amount}"
@@ -1154,6 +1330,22 @@ where
         if purchase.status == PurchaseStatus::Cancelled {
             return Err(AppError::Validation("purchase already cancelled".into()));
         }
+
+        // The document's money is resolved BEFORE any write on this path, like
+        // every other expected rejection here, and for the reason the sale twin
+        // states: without it a discard would flip the status and only the read at
+        // the end would refuse, and an annulment would return the stock and post
+        // the refunds before refusing — a half applied reversal reported to the
+        // operator as a refusal. The purchase twin did not carry this guard, and
+        // it showed: an un-totalable confirmed purchase came back as a 400 with
+        // its stock already returned, its refund already posted and its status
+        // already flipped. Recoverable instead: the record page is READABLE, so a
+        // line can be removed from the draft it still is, and `delete_draft`
+        // removes a never-confirmed document outright without reading its money.
+        let lines = self.purchases.list_lines(purchase_id).await?;
+        let payments = self.purchases.list_payments(purchase_id).await?;
+        Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+
         if purchase.status == PurchaseStatus::Draft {
             // Draft -> Cancelled: discard, no stock/finance/satellite side effect.
             let cancelled = self
@@ -1164,8 +1356,6 @@ where
         }
 
         // Confirmed -> Cancelled: goods back to the supplier + refunds.
-        let lines = self.purchases.list_lines(purchase_id).await?;
-        let payments = self.purchases.list_payments(purchase_id).await?;
         let purchase_number = purchase.purchase_number.clone().ok_or_else(|| {
             AppError::Internal("confirmed purchase missing purchase_number".into())
         })?;
@@ -1308,7 +1498,11 @@ where
         let mut suggestions = Vec::new();
         let mut without_supplier = Vec::new();
         for ps in low {
-            let suggested_qty = ps.suggested.unwrap_or(Decimal::ZERO);
+            // A refused level has NO suggestion, and the absence is the point: a
+            // `0` would read as "reorder nothing", which is a claim derived from a
+            // figure nobody can state. It also keeps the `subtotal` multiplication
+            // below off a level nobody can measure.
+            let suggested_qty = ps.suggested;
             let costs = self.suppliers.list_costs_for_product(ps.product.id).await?;
             if costs.is_empty() {
                 without_supplier.push(PurchaseSuggestionWithoutSupplier {
@@ -1346,7 +1540,7 @@ where
                 supplier_id: supplier.id,
                 supplier_name: supplier.name,
                 unit_cost,
-                subtotal: suggested_qty * unit_cost,
+                subtotal: suggested_qty.map(|qty| qty * unit_cost),
             });
         }
         Ok(PurchaseSuggestions {
@@ -1642,10 +1836,10 @@ mod tests {
     // -- Stale line cost (confirmed freshness flag) ---------------------------
 
     /// The real rendering path: build the record view for a purchase's lines
-    /// through `record_from_detail`, never by hand-constructing the view.
+    /// through `record_from_parts` — the same call `get_record` makes — never by
+    /// hand-constructing the view.
     async fn line_views(s: &Svc, purchase_id: i64) -> Vec<PurchaseLineView> {
-        let detail = s.get_detail(purchase_id).await.unwrap();
-        s.record_from_detail(detail).await.unwrap().lines
+        s.get_record(purchase_id).await.unwrap().lines
     }
 
     #[tokio::test]
@@ -1955,11 +2149,10 @@ mod tests {
         .await
         .unwrap();
 
-        let detail = s.get_detail(purchase.id).await.unwrap();
-        let record = s.record_from_detail(detail).await.unwrap();
+        let record = s.get_record(purchase.id).await.unwrap();
         assert_eq!(
             record.tracked_units,
-            dec("3"),
+            SetMoney::amount(dec("3")),
             "only the stock-tracking line counts toward the projection: {:?}",
             record.tracked_units
         );
@@ -2083,7 +2276,10 @@ mod tests {
         assert_eq!(detail.payment_status, crate::models::PaymentStatus::Paid);
 
         // Stock In reason Purchase, reference = purchase_number.
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("13"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("13")
+        );
         let moves = s
             .inventory
             .movements
@@ -2147,7 +2343,10 @@ mod tests {
         assert_eq!(detail.due, dec("24"));
         assert_eq!(detail.payment_status, crate::models::PaymentStatus::Unpaid);
         assert_eq!(detail.purchase.due_date, Some(d(2024, 6, 1)));
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("12"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("12")
+        );
         assert_eq!(tx_count(&pool).await, 0, "Credit confirm posts no Expense");
         assert!(s
             .purchases
@@ -2664,7 +2863,10 @@ mod tests {
             .await
             .unwrap();
         let number = detail.purchase.purchase_number.clone().unwrap();
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("14"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("14")
+        );
 
         // Drain the account to 0 so a guarded refund would fail.
         s.transactions
@@ -2699,7 +2901,10 @@ mod tests {
         );
 
         // Goods go back: 14 - 4 = 10, Out reason Purchase-return.
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("10"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("10")
+        );
         let moves = s
             .inventory
             .movements
@@ -3479,28 +3684,28 @@ mod tests {
             .iter()
             .find(|x| x.product.id == pref_prod.id)
             .unwrap();
-        assert_eq!(a.suggested_qty, dec("48"));
+        assert_eq!(a.suggested_qty, Some(dec("48")));
         assert_eq!(a.supplier_id, sup_a.id);
         assert_eq!(a.supplier_name, "SUG A");
         assert_eq!(a.unit_cost, dec("9"));
-        assert_eq!(a.subtotal, dec("432"));
+        assert_eq!(a.subtotal, Some(dec("432")));
 
         let b = out
             .suggestions
             .iter()
             .find(|x| x.product.id == cheap_prod.id)
             .unwrap();
-        assert_eq!(b.suggested_qty, dec("19"));
+        assert_eq!(b.suggested_qty, Some(dec("19")));
         assert_eq!(b.supplier_id, sup_b.id);
         assert_eq!(b.unit_cost, dec("6"));
-        assert_eq!(b.subtotal, dec("114"));
+        assert_eq!(b.subtotal, Some(dec("114")));
 
         let c = out
             .without_supplier
             .iter()
             .find(|x| x.product.id == no_sup.id)
             .unwrap();
-        assert_eq!(c.suggested_qty, dec("30"));
+        assert_eq!(c.suggested_qty, Some(dec("30")));
         assert!(!out.suggestions.iter().any(|x| x.product.id == no_sup.id));
         assert!(!out.suggestions.iter().any(|x| x.product.id == fine.id));
         assert!(!out.suggestions.iter().any(|x| x.product.id == svc_prod.id));
@@ -3602,7 +3807,10 @@ mod tests {
         assert_eq!(detail.total, dec("60"));
         // Services are not stock-tracked: no movement at all.
         assert_eq!(movement_count(&pool).await, before);
-        assert_eq!(s.inventory.stock(svc_prod.id).await.unwrap(), dec("0"));
+        assert_eq!(
+            s.inventory.stock_for_decision(svc_prod.id).await.unwrap(),
+            dec("0")
+        );
         assert_eq!(tx_count(&pool).await, 1);
         // Satellite cost still recorded for the service.
         let row = s
@@ -4090,7 +4298,10 @@ mod tests {
         let after = s.get_detail(purchase.id).await.unwrap();
         assert_eq!(after.purchase.status, PurchaseStatus::Draft);
         assert_eq!(after.purchase.purchase_number, None);
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), Decimal::ZERO);
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            Decimal::ZERO
+        );
         assert_eq!(movement_count(&pool).await, 0);
         assert_eq!(tx_count(&pool).await, 0);
         assert!(s
@@ -4137,7 +4348,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(detail.total, dec("12"));
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("3"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("3")
+        );
         let cost = s
             .suppliers
             .find_cost(prod.id, sup.id)
@@ -4172,7 +4386,7 @@ mod tests {
             .iter()
             .find(|x| x.product.id == prod.id)
             .unwrap();
-        assert_eq!(item.suggested_qty, dec("18"));
+        assert_eq!(item.suggested_qty, Some(dec("18")));
         assert_eq!(item.supplier_id, sup.id);
 
         // Draft the pedido from the suggestion and confirm it (Credit).
@@ -4181,7 +4395,8 @@ mod tests {
             audit_actor(&s).await,
             purchase.id,
             item.product.id,
-            item.suggested_qty,
+            item.suggested_qty
+                .expect("an ordinary suggestion carries its quantity"),
             Some(item.unit_cost),
         )
         .await
@@ -4189,7 +4404,10 @@ mod tests {
         s.confirm(audit_actor(&s).await, purchase.id, None)
             .await
             .unwrap();
-        assert_eq!(s.inventory.stock(prod.id).await.unwrap(), dec("20"));
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            dec("20")
+        );
 
         let after = s.suggestions().await.unwrap();
         assert!(!after.suggestions.iter().any(|x| x.product.id == prod.id));
@@ -5009,12 +5227,13 @@ mod tests {
         assert_eq!(record.lines.len(), 2);
         assert_eq!(record.lines[0].total, dec("12.11"));
         assert_eq!(record.lines[1].total, dec("12.11"));
-        assert_eq!(record.net_subtotal, dec("20.01"));
-        assert_eq!(record.tax_total, dec("4.20"));
-        assert_eq!(record.total, dec("24.22"));
+        let money = record.money.expect("an ordinary document totals");
+        assert_eq!(money.net_subtotal, dec("20.01"));
+        assert_eq!(money.tax_total, dec("4.20"));
+        assert_eq!(money.total, dec("24.22"));
         let sum: Decimal = record.lines.iter().map(|l| l.total).sum();
         assert_eq!(
-            sum, record.total,
+            sum, money.total,
             "the shown lines must add up to the shown total"
         );
     }
@@ -5129,7 +5348,8 @@ mod tests {
             .await
             .unwrap();
         let before = s.get_record(purchase.id).await.unwrap();
-        assert_eq!(before.total, dec("121"));
+        let before_money = before.money.expect("an ordinary document totals");
+        assert_eq!(before_money.total, dec("121"));
         assert_eq!(before.lines[0].taxes[0].code, "IVA21");
 
         let taxes = crate::repositories::SqliteTaxRepository::new(pool.clone());
@@ -5141,10 +5361,14 @@ mod tests {
         taxes.deactivate(actor, tax_id).await.unwrap();
 
         let after = s.get_record(purchase.id).await.unwrap();
-        assert_eq!(after.total, before.total, "a confirmed total is frozen");
-        assert_eq!(after.net_subtotal, before.net_subtotal);
-        assert_eq!(after.tax_total, before.tax_total);
-        assert_eq!(after.due, before.due);
+        let after_money = after.money.expect("an ordinary document totals");
+        assert_eq!(
+            after_money.total, before_money.total,
+            "a confirmed total is frozen"
+        );
+        assert_eq!(after_money.net_subtotal, before_money.net_subtotal);
+        assert_eq!(after_money.tax_total, before_money.tax_total);
+        assert_eq!(after_money.due, before_money.due);
         assert_eq!(after.lines[0].taxes.len(), 1);
         assert_eq!(
             after.lines[0].taxes[0].code, "IVA21",
@@ -5223,9 +5447,10 @@ mod tests {
         .unwrap();
 
         let record = s.get_record(purchase.id).await.unwrap();
-        assert_eq!(record.net_subtotal, dec("100"));
-        assert_eq!(record.tax_total, dec("31"));
-        assert_eq!(record.total, dec("131"));
+        let money = record.money.expect("an ordinary document totals");
+        assert_eq!(money.net_subtotal, dec("100"));
+        assert_eq!(money.tax_total, dec("31"));
+        assert_eq!(money.total, dec("131"));
         let line = &record.lines[0];
         assert_eq!(
             line.subtotal,

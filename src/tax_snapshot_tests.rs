@@ -1908,8 +1908,8 @@ fn parse_stored(raw: &str) -> Option<Decimal> {
 ///
 /// # What it is protecting
 ///
-/// `SaleLine::subtotal` (`models.rs:1133`) and `PurchaseLine::subtotal`
-/// (`models.rs:1629`) are RAW multiplies, and `tax_inclusive_total`
+/// `SaleLine::subtotal` (`models.rs:1189`) and `PurchaseLine::subtotal`
+/// (`models.rs:1840`) are RAW multiplies, and `tax_inclusive_total`
 /// (`line_taxes.rs:98`) is a raw `+` fed straight into `round_to_cents`.
 /// rust_decimal's raw operators PANIC on overflow, and this crate contains no
 /// `catch_unwind` anywhere, so a panic in one of those would escape the handler
@@ -1921,40 +1921,38 @@ fn parse_stored(raw: &str) -> Option<Decimal> {
 /// three raw operators safe, and it is worth being exact about what that
 /// property is. Every line that reached storage passed
 /// `line_net_amount(qty, price)` and then `calculate_line_taxes(net, taxes)`
-/// inside the very transaction that inserted it (`sale_repo.rs:343`,
-/// `purchase_repo.rs:313`), and that second call proved `net + tax_total` was
+/// inside the very transaction that inserted it (`sale_repo.rs:343-344`,
+/// `purchase_repo.rs:314-315`), and that second call proved `net + tax_total` was
 /// representable. So EVERY STORED LINE, taken ON ITS OWN, is carryable by the
 /// raw read multiply and the raw read add. That is per-LINE representability,
 /// and it is the whole of what this census proves — not more.
 ///
-/// # What it does NOT cover: the cross-line accumulation
+/// # What it does NOT cover: the document, and why that is not its job
 ///
-/// A document is a SUM of its lines, and that sum is folded by DIFFERENT raw
-/// operators this census never executes: `SalesService::tax_split`
-/// (`sales.rs:200-202`) and `PurchaseService::tax_split` (`purchases.rs:183-191`)
-/// both fold with a raw `+=`, and the two `list_document_rows` folds
-/// (`sale_repo.rs:1023`, `purchase_repo.rs:921`) fold
-/// `*totals.entry(..) += tax_inclusive_total(..)` the same way. Per-line
-/// representability does NOT imply a carryable document total, and the minimal
-/// counter-example needs no tax at all: two lines of `qty = 1`,
-/// `unit_price = 4e28`, no tax linked. Each line is individually carryable and
-/// each one is stored by the real checked write, so this census reports ZERO
-/// violations for exactly the document that panics, because
-/// `4e28 + 4e28 = 8e28 > Decimal::MAX` overflows in the fold rather than in the
-/// line. With an ordinary 21% tax the write bound caps a line's net at
-/// `MAX / 21 ≈ 3.77e27`, so the same overflow needs EIGHTEEN lines instead of
-/// two.
+/// A document is a SUM of its lines, and per-line representability does NOT
+/// imply a carryable sum. The minimal counter-example needs no tax at all: two
+/// lines of `qty = 1`, `unit_price = 4e28`, no tax linked. Each line is
+/// individually carryable, each one is stored by the real checked write, and
+/// `4e28 + 4e28 = 8e28 > Decimal::MAX` overflows in the FOLD rather than in the
+/// line — so this census reports ZERO violations for that document, now and for
+/// good reason. It could never report one: a statement about a set of rows is
+/// not a statement about a row, and bounding the WRITE at the document level
+/// would not survive a direct SQL insert either.
 ///
-/// That is a real panic on `GET /sales/{id}`, on the add-line response itself
-/// (`add_line_impl` -> `record_context` -> `get_record`), on
-/// `GET /purchases/{id}` and on the documents list page, and the worst part is
-/// that the second line's INSERT COMMITS before the response renders — so the
-/// operator is left holding a document that can never be opened again. It is
-/// work unit T3 in `odd/tasks/tax-contract-overflow.md` and it is deliberately
-/// NOT fixed here. No census over single rows can close it, because the
-/// invariant it would need is a statement about a SET of rows; a per-line
-/// census cannot pin a document-level invariant, and bounding the WRITE at the
-/// document level would not survive a direct SQL insert either.
+/// What the census cannot see, the READ path now refuses. Both `tax_split`
+/// folds (`sales.rs:223`, `purchases.rs:200`) are `checked_add` and answer
+/// `PriceRefusal::DocumentTotalTooLarge`, and both `list_document_rows` folds
+/// (`sale_repo.rs:947`, `purchase_repo.rs:836`) keep folding while recording the
+/// refusal per document, so a list row renders in place with the localized
+/// message and NO amount instead of a partial figure. That is work unit T3 in
+/// `odd/tasks/tax-contract-overflow.md`, and it is enforced by the code that
+/// folds, NOT by this census — which is why the honest division of labour is
+/// what it is: the census guards the LINE, the checked folds guard the document.
+///
+/// The write bound this census leans on is unchanged by that, and still says the
+/// same thing about a single line: with an ordinary 21% tax the checked pair caps
+/// a line's net at `MAX / 21 ≈ 3.77e27`, so a document needs EIGHTEEN such lines
+/// rather than two to break the sum.
 ///
 /// # What would break the per-line claim
 ///
@@ -2037,11 +2035,14 @@ fn uncarriable_qty_price() -> (Decimal, Decimal) {
 /// WHAT THAT DOES NOT PROVE, stated here because the census is easy to over-read:
 /// per-line carryability is NOT document-level carryability. A two-line draft of
 /// `unit_price = 4e28` with no tax linked stores two perfectly carryable lines
-/// and then panics in the raw `+=` of `tax_split` when the document is read. The
-/// census reports nothing for it, and it cannot report anything: a statement
-/// about a sum is not a statement about a row. That gap is work unit T3, and
-/// naming it here is the honest scope of this test — the census is proven
-/// load-bearing, and it is a guard for the LINE, not for the document.
+/// and the census reports nothing for it, and it CANNOT report anything: a
+/// statement about a sum is not a statement about a row. That document no longer
+/// panics, because `tax_split` and the two `list_document_rows` folds are
+/// `checked_add` and refuse it with `PriceRefusal::DocumentTotalTooLarge` (work
+/// unit T3) — but the census is still not what stops it, and this test must not
+/// be read as having proved it. The census is proven load-bearing for what it
+/// claims, and it is a guard for the LINE; the document is guarded by the folds,
+/// and by T3's own tests.
 ///
 /// The sweep deliberately includes the two largest lines the read path can carry
 /// at all, because a census that only ever sees small amounts proves nothing

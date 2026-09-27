@@ -18,18 +18,30 @@
    fields are the always-visible inline header form below. #}
 {% import "partials/purchase_effects_preview.html" as effects %}
 {% import "partials/supplier_picker.html" as supplier_picker %}
-{% macro record_money(record, entry_row_focus, localization) %}
+{% macro record_money(record, entry_row_focus, total_refusal_message, tracked_units_message, localization) %}
 <div id="purchase-record-money">
-  <div class="my-2 text-2xl font-bold">{{ localization.format_currency(record.total.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesPaid) }} {{ localization.format_currency(record.paid.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_currency(record.due.clone()) }}</span></div>
+  {% if let Some(money) = record.money %}
+  <div class="my-2 text-2xl font-bold">{{ localization.format_currency(money.total.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchasesPaid) }} {{ localization.format_currency(money.paid.clone()) }} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_currency(money.due.clone()) }}</span></div>
 
   {# Net, tax and tax-inclusive total, side by side (tax calculation T2), the
      exact mirror of the sale record, so a purchase is auditable the same way.
      The tax total comes from the lines' frozen snapshots and therefore cannot
      change when a tax is later edited, renamed or deactivated. #}
   <div class="mb-2 text-[13px] text-muted" data-purchase-tax-summary>
-    {{ localization.tr(crate::localization::MessageKey::TaxNetSubtotal) }} <span class="tabular-nums">{{ localization.format_currency(record.net_subtotal.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxTotal) }} <span class="tabular-nums">{{ localization.format_currency(record.tax_total.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxInclusiveTotal) }} <span class="tabular-nums">{{ localization.format_currency(record.total.clone()) }}</span>
+    {{ localization.tr(crate::localization::MessageKey::TaxNetSubtotal) }} <span class="tabular-nums">{{ localization.format_currency(money.net_subtotal.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxTotal) }} <span class="tabular-nums">{{ localization.format_currency(money.tax_total.clone()) }}</span> • {{ localization.tr(crate::localization::MessageKey::TaxInclusiveTotal) }} <span class="tabular-nums">{{ localization.format_currency(money.total.clone()) }}</span>
   </div>
-  {% if record.purchase.status.to_string() == "Draft" %}{% call effects::effects_preview(record, localization) %}{% endif %}
+  {% if record.purchase.status.to_string() == "Draft" %}{% call effects::effects_preview(money, record.tracked_units, tracked_units_message, localization) %}{% endif %}
+  {% else %}
+  {# The document's lines are each representable and their SUM is not, so this
+     page states the refusal INSTEAD of a total rather than answering an error:
+     the operator still sees every line below, and a draft can still be reduced
+     from here. The sentence comes from the one shared price-refusal mapping, so
+     this surface cannot word it differently from the add-line response or the
+     index — and it is why the confirm-at-effects preview above is not rendered
+     either: it would publish a cash scenario built on a total that does not
+     exist. #}
+  <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-document-total-refusal>{{ total_refusal_message }}</div>
+  {% endif %}
 
   {# The entry row (S5a): one persistent flex row above the lines — product,
      qty, cost and the Add button — so the results appearing below can never
@@ -235,7 +247,7 @@
 <div id="purchase-record-inner" data-purchase-record>
   <div class="mb-3 flex flex-wrap items-center gap-2">
     <span class="chip {% if record.purchase.status.to_string() == "Confirmed" %}chip-income{% else if record.purchase.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{% if record.purchase.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if record.purchase.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
-    <span class="chip {% if record.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}">{% if record.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if record.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>
+    {% if let Some(money) = record.money %}<span class="chip {% if money.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}" data-purchase-payment-status>{% if money.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if money.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>{% else %}<span class="chip chip-expense" data-purchase-payment-status="refused">{{ total_refusal_message }}</span>{% endif %}
     {% if record.purchase.status.to_string() != "Draft" %}<span class="rounded-full px-2 py-0.5 text-[11px] font-bold tracking-[0.04em] uppercase">{% if record.purchase.payment_type.to_string() == "Cash" %}{{ localization.tr(crate::localization::MessageKey::ValueCash) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ValueCredit) }}{% endif %}</span>{% endif %}
     <span class="text-base font-bold">
       {% if let Some(n) = record.purchase.purchase_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::PurchasesDraft) }}{% endif %}
@@ -385,7 +397,7 @@
   {% endif %}
   {% endif %}
 
-   {% call record_money(record, entry_row_focus, localization) %}
+   {% call record_money(record, entry_row_focus, total_refusal_message, tracked_units_message, localization) %}
 
   <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr_count(crate::localization::MessageKey::PurchasesPayments, record.payments.len()) }}</div>
   {% if record.payments.is_empty() %}

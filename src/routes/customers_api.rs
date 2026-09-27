@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
-use crate::models::{Ageing, Customer, NewCustomer, UpdateCustomer};
+use crate::models::{Ageing, Customer, NewCustomer, SetMoney, UpdateCustomer};
 use crate::routes::AppState;
 
 // S6 enforcement (AC10): the entity and its derived receivable are read with
@@ -91,7 +91,14 @@ pub struct UpdateCustomerRequest {
 #[derive(Debug, Serialize)]
 pub struct CustomerBalanceView {
     pub customer: Customer,
-    pub balance: Decimal,
+    /// The customer's receivable, or the RULE that stopped the sum when a document
+    /// in it cannot be totaled — never a partial figure, and never the bare `null`
+    /// this used to emit (see [`SetMoney`]: a client cannot tell `null` from
+    /// "owes nothing", and four `0.00` ageing buckets with no reason were the
+    /// defect that rule exists to fix). On the wire an ordinary balance is the
+    /// decimal string it always was; a refused one is
+    /// `{"refused": "<the rule's own text>"}`.
+    pub balance: SetMoney,
     pub over_limit: bool,
 }
 
@@ -99,17 +106,27 @@ pub struct CustomerBalanceView {
 pub struct CustomerAgeingView {
     pub customer_id: i64,
     pub name: String,
-    pub balance: Decimal,
+    /// The customer's receivable, or the RULE that stopped the sum — the same
+    /// shape and the same wire as [`CustomerBalanceView::balance`].
+    pub balance: SetMoney,
     pub over_limit: bool,
+    /// The ageing's four buckets, each a `SetMoney` for the same reason: a bucket
+    /// is a set sum of its own, and a refused one serializes as
+    /// `{"refused": "..."}` rather than as a `0.00` nobody can act on.
     pub ageing: Ageing,
 }
 
 /// `credit_limit` is nullable: null means no limit, so the flag can never block.
-fn over_limit(customer: &Customer, balance: Decimal) -> bool {
-    customer
-        .credit_limit
-        .map(|limit| balance > limit)
-        .unwrap_or(false)
+///
+/// A refused balance makes NO claim either way: the comparison needs a figure
+/// that does not exist, so the flag is false rather than a guess — and the
+/// refusal travels inside the `balance` it belongs to, so a consumer can see why
+/// the flag is absent.
+fn over_limit(customer: &Customer, balance: SetMoney) -> bool {
+    match (customer.credit_limit, balance.amount) {
+        (Some(limit), Some(amount)) => amount > limit,
+        _ => false,
+    }
 }
 
 fn today(localization: &LocalizationContext) -> AppResult<NaiveDate> {
@@ -128,7 +145,7 @@ async fn customer_views(
     localization: &LocalizationContext,
 ) -> AppResult<Vec<CustomerBalanceView>> {
     let ageing = state.sales_service.ageing_all(today(localization)?).await?;
-    let balances: HashMap<i64, Decimal> = ageing
+    let balances: HashMap<i64, SetMoney> = ageing
         .iter()
         .map(|row| (row.customer_id, row.balance))
         .collect();
@@ -136,7 +153,10 @@ async fn customer_views(
     Ok(customers
         .into_iter()
         .map(|customer| {
-            let balance = balances.get(&customer.id).copied().unwrap_or(Decimal::ZERO);
+            let balance = balances
+                .get(&customer.id)
+                .copied()
+                .unwrap_or_else(|| SetMoney::amount(Decimal::ZERO));
             let over_limit = over_limit(&customer, balance);
             CustomerBalanceView {
                 customer,
@@ -147,8 +167,14 @@ async fn customer_views(
         .collect())
 }
 
+/// One customer, from the DECISION read: the whole figure or a refusal.
+///
+/// This view answers "is this customer over their limit?", and a question whose
+/// input cannot be stated has no answer — which is why it takes the strict
+/// `customer_balance` rather than the tolerant list read. `SetMoney` is the same
+/// field type as the list view's, so the two serialize identically.
 async fn customer_view(state: &AppState, customer: Customer) -> AppResult<CustomerBalanceView> {
-    let balance = state.sales_service.customer_balance(customer.id).await?;
+    let balance = SetMoney::amount(state.sales_service.customer_balance(customer.id).await?);
     let over_limit = over_limit(&customer, balance);
     Ok(CustomerBalanceView {
         customer,
@@ -410,6 +436,7 @@ mod tests {
     use std::str::FromStr;
     use tower::ServiceExt;
 
+    use crate::models::PriceRefusal;
     use crate::routes::AppState;
     use crate::security::test_support;
 
@@ -813,6 +840,82 @@ mod tests {
     }
 
     // -- Collect: receipt total, allocations and reads --------------------------
+
+    /// A product whose OWN price is `4e28`, so a line of qty 1 totals to a
+    /// figure no set of two can add up. Created through the API like any other:
+    /// the point of the test is that this is reachable, not that it is awkward.
+    async fn product_at(app: &axum::Router, sku: &str, sale_price: &str) -> i64 {
+        let (st, v) = post(
+            app,
+            "/api/products",
+            json!({
+                "sku": sku, "name": format!("prod {sku}"), "kind": "Product",
+                "unit": "un", "sale_price": sale_price, "cost_price": "0",
+                "track_stock": true, "min_stock": "0", "max_stock": "50"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "seed product {sku}: {v}");
+        v["id"].as_i64().unwrap()
+    }
+
+    /// F4: a bucket that cannot carry its share of the receivable must say so ON
+    /// THE WIRE. Four bare `0.00` cells and no reason is the one shape this
+    /// endpoint must never emit: a client reading it would conclude the customer
+    /// owes nothing, which is the exact opposite of the truth.
+    #[tokio::test]
+    async fn a_refused_ageing_carries_the_rule_on_the_wire_instead_of_bare_zeros() {
+        let state = test_state(false).await;
+        let app = crate::routes::router(state);
+        let product = product_at(&app, "AGE-REFUSE-P", "4e28").await;
+        seed_stock(&app, product).await;
+        let customer = seed_customer(&app, "Refused Ageing", None, None).await;
+        // Both documents are more than 60 days late as of the query date, so they
+        // share ONE bucket and the bucket is the sum that cannot be carried.
+        credit_sale(&app, customer, product, "1", "2024-05-10").await;
+        credit_sale(&app, customer, product, "1", "2024-05-11").await;
+        // The control: an ordinary customer on the same page, whose JSON must stay
+        // exactly what it was — four decimal strings and nothing else.
+        let control_product = seed_product(&app, "AGE-OK-P").await;
+        seed_stock(&app, control_product).await;
+        let control = seed_customer(&app, "Ordinary Ageing", None, None).await;
+        credit_sale(&app, control, control_product, "3", "2024-05-10").await;
+
+        let (st, v) = get(&app, "/api/customers/ageing?as_of=2024-08-01").await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let rows = v["ageing"].as_array().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r["customer_id"].as_i64() == Some(customer))
+            .unwrap_or_else(|| panic!("customer {customer} missing from ageing: {v}"));
+        assert_eq!(
+            row["ageing"]["overdue_61_plus"]["refused"],
+            json!(PriceRefusal::DocumentTotalTooLarge.as_str()),
+            "the bucket states the rule it could not carry: {v}"
+        );
+        assert!(
+            row["balance"]["refused"].is_string(),
+            "and so does the balance, which is the same sum read once: {v}"
+        );
+        for bucket in ["current", "overdue_1_30", "overdue_31_60"] {
+            assert!(
+                row["ageing"][bucket].is_string(),
+                "a bucket that DID carry stays a bare figure — a refusal never rewrites its \
+                 neighbours: {bucket} in {v}"
+            );
+        }
+
+        let control_row = rows
+            .iter()
+            .find(|r| r["customer_id"].as_i64() == Some(control))
+            .unwrap_or_else(|| panic!("control customer {control} missing from ageing: {v}"));
+        assert_eq!(
+            dec(&control_row["ageing"]["overdue_61_plus"]),
+            dec(&json!("30")),
+            "an ordinary ageing serializes exactly as it did before: {v}"
+        );
+        assert!(control_row["ageing"]["current"].is_string(), "{v}");
+    }
 
     #[tokio::test]
     async fn rest_collect_creates_a_receipt_with_derived_total_and_allocations() {

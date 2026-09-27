@@ -24,7 +24,7 @@
       {% if let Some(sug) = suggested %}
       <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductLow) }} • {{ localization.tr(crate::localization::MessageKey::ProductSuggest) }} {{ localization.format_quantity(sug.clone()) }}</span>
       {% endif %}
-      {% if stock.is_sign_negative() %}
+      {% if stock_negative %}
       <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductNegative) }}</span>
       {% endif %}
     </div>
@@ -32,7 +32,7 @@
        figure in this drawer belongs to the price ladder below, so a price can
        only be read in one place (product price ladder U2). #}
     <div class="text-[13px] text-muted">{{ product.sku }} • {{ product.unit }}</div>
-    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(stock.clone()) }}{% if let Some(min) = product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {% if stock.is_empty() %}<span class="text-danger" data-stock-level-refusal data-document-total-refusal>{{ stock_message }}</span>{% else %}{{ stock }}{% endif %}{% if let Some(min) = product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</div>
     {# Audit attribution (M5 Phase B): who registered the product and who last
        changed it, shown as a display name resolved in the wiring layer — the
        same rows the finance detail shows. The sentinel renders as its own
@@ -369,7 +369,7 @@
       <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductMovementHelp) }}</div>
     </form>
     {% else %}
-    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStockUnavailable) }} {{ localization.format_quantity(stock.clone()) }}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStockUnavailable) }} {% if stock.is_empty() %}<span class="text-danger" data-stock-level-refusal data-document-total-refusal>{{ stock_message }}</span>{% else %}{{ stock }}{% endif %}</div>
     {% endif %}
   </section>
 </div>

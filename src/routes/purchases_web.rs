@@ -19,7 +19,7 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{
-    NewPurchase, PaymentType, PurchaseDetail, PurchaseListFilter, PurchaseRecord, PurchaseStatus,
+    NewPurchase, PaymentType, PurchaseListFilter, PurchaseRecord, PurchaseStatus,
     PurchaseSuggestions, UpdateProduct,
 };
 use crate::routes::{localized_refusal_error, AppState};
@@ -51,9 +51,23 @@ const HEADER_SIBLING_INCLUDE: &str = "#record-purchase-date, #record-invoice-no,
 /// line names what was paid only then — settled rows say it once in the chip).
 #[derive(Clone)]
 pub struct PurchaseView {
-    pub detail: PurchaseDetail,
+    /// The document's own fields, flattened, plus the refusal already in the
+    /// operator's language.
+    ///
+    /// `money` is `None` exactly when `total_refusal_message` is not empty, so the
+    /// template has one thing to render in place of the figures — and no figure at
+    /// all to mistake for a real zero.
+    pub purchase: crate::models::Purchase,
+    pub line_count: usize,
+    pub money: Option<crate::models::RecordMoney>,
+    pub total_refusal_message: String,
     pub supplier_name: String,
+    /// The payment state, from the document's money. It is a money claim, so it
+    /// carries no value for a refused document: the template shows the refusal in
+    /// its place and never reads this.
     pub payment_state: PurchasePaymentState,
+    /// Whether money was received against the document, from its money. Same
+    /// rule: read only when `money` is `Some`.
     pub partially_paid: bool,
 }
 
@@ -85,13 +99,111 @@ impl std::fmt::Display for PurchasePaymentState {
 /// — is Due. Derived in the view layer, never in the template. Zero must
 /// compare numerically, not by sign: `Decimal::ZERO.is_sign_positive()` is
 /// `true`, and a settled purchase (due exactly 0) is Paid, never Due.
-fn purchase_payment_state(detail: &PurchaseDetail, today: NaiveDate) -> PurchasePaymentState {
-    if detail.due <= Decimal::ZERO {
+/// The one word a row's money resolves to. The document and its money are passed
+/// separately because a LIST row carries them separately — the document is
+/// always there and the money is there when the arithmetic carried it.
+fn purchase_payment_state_of(
+    purchase: &crate::models::Purchase,
+    money: crate::models::RecordMoney,
+    today: NaiveDate,
+) -> PurchasePaymentState {
+    if money.due <= Decimal::ZERO {
         PurchasePaymentState::Paid
-    } else if detail.purchase.due_date.map(|d| d < today) == Some(true) {
+    } else if purchase.due_date.map(|d| d < today) == Some(true) {
         PurchasePaymentState::Overdue
     } else {
         PurchasePaymentState::Due
+    }
+}
+
+/// One reorder row with its level resolved: the quantity, or the sentence in its
+/// place. The reorder panel is a list of set sums — a level per product — so the
+/// product whose movements cannot be added up keeps its row, its name, its SKU
+/// and its seed action, and states the rule where the quantity was.
+#[derive(Clone)]
+pub struct SuggestionView {
+    pub product: crate::models::Product,
+    /// The suggestion and its subtotal, already formatted — and EMPTY for a
+    /// refused level, which has no suggestion to format. A `0` there would read
+    /// as "reorder nothing".
+    pub suggested_qty: String,
+    pub subtotal: String,
+    pub supplier_name: String,
+    pub unit_cost: String,
+    pub stock: String,
+    pub stock_message: String,
+}
+
+/// A reorder row with no supplier cost yet: the same resolved level, and it keeps
+/// its own place in the "without a cost" list rather than being dropped.
+#[derive(Clone)]
+pub struct SuggestionWithoutSupplierView {
+    pub product: crate::models::Product,
+    pub suggested_qty: String,
+    pub stock: String,
+    pub stock_message: String,
+}
+
+/// The panel's rows, resolved. `has_suggestions` is the caller's: it is about
+/// whether there is anything to show, and the count is unchanged by a refusal.
+pub struct SuggestionFigures {
+    pub suggestions: Vec<SuggestionView>,
+    pub without_supplier: Vec<SuggestionWithoutSupplierView>,
+}
+
+fn suggestion_figures(
+    suggestions: PurchaseSuggestions,
+    localization: &LocalizationContext,
+) -> SuggestionFigures {
+    let level = |stock: crate::models::SetMoney| match stock.amount {
+        Some(level) => (localization.format_quantity(level), String::new()),
+        None => (
+            String::new(),
+            stock
+                .refusal
+                .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+                .unwrap_or_default(),
+        ),
+    };
+    SuggestionFigures {
+        suggestions: suggestions
+            .suggestions
+            .into_iter()
+            .map(|s| {
+                let (stock, stock_message) = level(s.stock);
+                SuggestionView {
+                    product: s.product,
+                    suggested_qty: s
+                        .suggested_qty
+                        .map(|qty| localization.format_quantity(qty))
+                        .unwrap_or_default(),
+                    subtotal: s
+                        .subtotal
+                        .map(|total| localization.format_currency(total))
+                        .unwrap_or_default(),
+                    supplier_name: s.supplier_name,
+                    unit_cost: localization.format_currency(s.unit_cost),
+                    stock,
+                    stock_message,
+                }
+            })
+            .collect(),
+        without_supplier: suggestions
+            .without_supplier
+            .into_iter()
+            .map(|w| {
+                let (stock, stock_message) = level(w.stock);
+                SuggestionWithoutSupplierView {
+                    product: w.product,
+                    suggested_qty: w
+                        .suggested_qty
+                        .map(|qty| localization.format_quantity(qty))
+                        .unwrap_or_default(),
+                    stock,
+                    stock_message,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -101,7 +213,7 @@ struct PurchasesTemplate {
     title: String,
     localization: LocalizationContext,
     purchases: Vec<PurchaseView>,
-    suggestions: PurchaseSuggestions,
+    suggestions: SuggestionFigures,
     has_suggestions: bool,
     /// Live: the included `partials/suggestion_list.html` renders `{{ today }}`
     /// in its seed-options date input, so this is not the deleted creation
@@ -187,6 +299,11 @@ struct PurchasePageTemplate {
     /// header form — see `PurchaseDetailPartial` for the contract.
     header_action: String,
     header_include: &'static str,
+    /// The document-total refusal in the operator's language, empty when the
+    /// document totals exactly. The page includes the same record partial the
+    /// action responses render, so the sentence travels with it.
+    total_refusal_message: String,
+    tracked_units_message: String,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -237,6 +354,12 @@ struct PurchaseDetailPartial {
     /// wiring layer resolved (never the ids).
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
+    /// The document-total refusal, already in the operator's language, or empty
+    /// when the document totals exactly. Resolved HERE, through the one shared
+    /// `price_refusal_key` mapping, so the purchase record page cannot word the
+    /// rule differently from the sale record page or the index.
+    total_refusal_message: String,
+    tracked_units_message: String,
     /// T4: the draft's inline header posts the existing header route, and
     /// the picker's `include` names the three sibling field ids so every
     /// post (Enter, Save, a clicked result) carries the same field set —
@@ -252,7 +375,7 @@ struct PurchaseDetailPartial {
 #[template(path = "partials/suggestion_list.html")]
 struct SuggestionListPartial {
     localization: LocalizationContext,
-    suggestions: PurchaseSuggestions,
+    suggestions: SuggestionFigures,
     has_suggestions: bool,
     today: String,
 }
@@ -334,25 +457,58 @@ fn clean_opt(s: &str) -> Option<String> {
     }
 }
 
+/// The rows of a purchases list, with each document's refusal resolved.
+///
+/// The ROW read, not the detail read: a list must render a document whose total
+/// cannot be computed instead of answering an error and taking every other row on
+/// the page with it. The refusal is resolved here, through the one shared
+/// `price_refusal_key` mapping, so this surface cannot word the rule differently
+/// from the record page, the sales list or the index.
 async fn purchase_views(
     state: &AppState,
     filter: &PurchaseListFilter,
     today: NaiveDate,
+    localization: &LocalizationContext,
 ) -> AppResult<Vec<PurchaseView>> {
-    let details = state
-        .purchases_service
-        .list_details_filtered(filter)
-        .await?;
-    let mut out = Vec::with_capacity(details.len());
-    for detail in details {
+    let rows = state.purchases_service.list_rows_filtered(filter).await?;
+    purchase_views_from_rows(state, rows, today, localization).await
+}
+
+/// [`purchase_views`] over rows the caller has already read, so a surface that
+/// needs the documents AND something derived from them reads once. The supplier
+/// drawer is that surface: it renders the rows and sums their dues.
+pub(crate) async fn purchase_views_from_rows(
+    state: &AppState,
+    rows: Vec<crate::models::PurchaseListRow>,
+    today: NaiveDate,
+    localization: &LocalizationContext,
+) -> AppResult<Vec<PurchaseView>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
         let supplier = state
             .supplier_service
-            .get_supplier(detail.purchase.supplier_id)
+            .get_supplier(row.purchase.supplier_id)
             .await?;
+        let (payment_state, partially_paid) = match row.money {
+            // A refused document gets the state a DRAFT gets, which the template
+            // never reaches: the status gate runs first and the money zone is
+            // replaced by the refusal. It is a value, never a claim.
+            Some(money) => (
+                purchase_payment_state_of(&row.purchase, money, today),
+                money.paid > Decimal::ZERO && money.due > Decimal::ZERO,
+            ),
+            None => (PurchasePaymentState::Paid, false),
+        };
         out.push(PurchaseView {
-            payment_state: purchase_payment_state(&detail, today),
-            partially_paid: detail.paid > Decimal::ZERO && detail.due > Decimal::ZERO,
-            detail,
+            total_refusal_message: row
+                .total_refusal
+                .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+                .unwrap_or_default(),
+            purchase: row.purchase,
+            line_count: row.line_count,
+            money: row.money,
+            payment_state,
+            partially_paid,
             supplier_name: supplier.name,
         });
     }
@@ -388,6 +544,16 @@ struct PurchaseRecordContext {
     /// in the wiring layer (AC20: the service never reads identity).
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
+    /// The document-total refusal in the operator's language, empty when the
+    /// document totals exactly. The page states it instead of answering an
+    /// error, so an operator can still open a purchase and reduce it.
+    total_refusal_message: String,
+    /// The refusal for the document's UNIT count, in the same language and
+    /// through the same one mapping. It is a separate figure from the money: a
+    /// purchase of `4e28` units at no cost has a perfectly ordinary total of `0`
+    /// and a unit count that leaves the range, and the effects preview has to say
+    /// so rather than print a movement it cannot state.
+    tracked_units_message: String,
 }
 
 async fn record_context(
@@ -413,6 +579,13 @@ async fn record_context(
     let name_for = |id: i64| names.get(&id).cloned();
     let created_by_name = name_for(record.purchase.created_by);
     let updated_by_name = record.purchase.updated_by.and_then(name_for);
+    let message = |refusal: Option<crate::models::PriceRefusal>| {
+        refusal
+            .map(|refusal| crate::routes::price_refusal_message(&refusal, &localization))
+            .unwrap_or_default()
+    };
+    let total_refusal_message = message(record.total_refusal);
+    let tracked_units_message = message(record.tracked_units.refusal);
     Ok(PurchaseRecordContext {
         record,
         confirm_due_date,
@@ -421,6 +594,8 @@ async fn record_context(
         localization,
         created_by_name,
         updated_by_name,
+        total_refusal_message,
+        tracked_units_message,
     })
 }
 
@@ -442,6 +617,8 @@ fn render_record(
         updated_by_name: context.updated_by_name,
         header_action,
         header_include: HEADER_SIBLING_INCLUDE,
+        total_refusal_message: context.total_refusal_message,
+        tracked_units_message: context.tracked_units_message,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -508,7 +685,12 @@ async fn purchases_page(
         .today_iso()
         .parse()
         .map_err(|_| AppError::Internal("invalid localized date".into()))?;
-    let purchases = purchase_views(&state, &query.to_filter(), today).await?;
+    // A list of documents can carry one whose total cannot be computed, and
+    // this page is where the operator goes to FIND it. It refuses the whole
+    // page rather than dropping that document silently — a list that quietly
+    // omits a stored sale is a lie about the shop's history — and it refuses
+    // in the operator's language, through the one shared mapping.
+    let purchases = purchase_views(&state, &query.to_filter(), today, &localization).await?;
     // The suggestion block renders only when the principal may refresh it:
     // the fragment (`/web/purchases/suggestions`) and the API twin are gated
     // `inventory.read` because the suggestion is stock-derived data, so the
@@ -519,9 +701,15 @@ async fn purchases_page(
     let (suggestions, has_suggestions) = if show_suggestions {
         let suggestions = state.purchases_service.suggestions().await?;
         let has = !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
-        (suggestions, has)
+        (suggestion_figures(suggestions, &localization), has)
     } else {
-        (PurchaseSuggestions::default(), false)
+        (
+            SuggestionFigures {
+                suggestions: vec![],
+                without_supplier: vec![],
+            },
+            false,
+        )
     };
     // The header's primary action opens the creation dialog (T3), so it is
     // offered only when the principal can create (AC21/AC7, the same rule
@@ -694,6 +882,8 @@ async fn purchase_record_page(
         updated_by_name: context.updated_by_name,
         header_action: format!("/web/purchases/{}/header", id),
         header_include: HEADER_SIBLING_INCLUDE,
+        total_refusal_message: context.total_refusal_message,
+        tracked_units_message: context.tracked_units_message,
         nav_key: "purchases",
         nav: Nav::for_principal(&principal),
     };
@@ -713,7 +903,12 @@ async fn web_purchase_list(
         .today_iso()
         .parse()
         .map_err(|_| AppError::Internal("invalid localized date".into()))?;
-    let view = purchase_views(&state, &query.to_filter(), today).await?;
+    // A list of documents can carry one whose total cannot be computed, and
+    // this page is where the operator goes to FIND it. It refuses the whole
+    // page rather than dropping that document silently — a list that quietly
+    // omits a stored sale is a lie about the shop's history — and it refuses
+    // in the operator's language, through the one shared mapping.
+    let view = purchase_views(&state, &query.to_filter(), today, &localization).await?;
     let title = localization
         .tr(crate::localization::MessageKey::PurchasesAll)
         .to_string();
@@ -766,8 +961,8 @@ async fn web_purchase_suggestions(
         !suggestions.suggestions.is_empty() || !suggestions.without_supplier.is_empty();
     let today = localization.today_iso();
     let html = SuggestionListPartial {
+        suggestions: suggestion_figures(suggestions, &localization),
         localization,
-        suggestions,
         has_suggestions,
         today,
     }
@@ -1322,10 +1517,14 @@ async fn web_cancel_purchase_impl(
     id: i64,
     form: CancelPurchaseForm,
 ) -> AppResult<Response> {
+    // The annulment measures refunds against the document's payments, so it can
+    // answer the document-total refusal too — in the operator's language, the
+    // same way every other refusal on this surface answers.
     state
         .purchases_service
         .cancel(actor, id, clean_opt(&form.reason))
-        .await?;
+        .await
+        .map_err(|error| localized_refusal_error(error, localization))?;
     if is_htmx(&headers) {
         return changed(&state, id, &localization).await;
     }
@@ -1431,11 +1630,14 @@ async fn web_seed_from_suggestion(
                 form.product_id
             ))
         })?;
-    if item.suggested_qty <= Decimal::ZERO {
+    // A DECISION read: seeding a line needs a real quantity, so a suggestion with
+    // none — which is what a refused level produces — refuses here instead of
+    // writing a line of zero.
+    let Some(suggested_qty) = item.suggested_qty.filter(|qty| *qty > Decimal::ZERO) else {
         return Err(AppError::Validation(
             "suggested qty must be > 0 to seed a draft".into(),
         ));
-    }
+    };
     let purchase = state
         .purchases_service
         .create_draft(
@@ -1456,7 +1658,7 @@ async fn web_seed_from_suggestion(
             principal.user_id,
             purchase.id,
             item.product.id,
-            item.suggested_qty,
+            suggested_qty,
             Some(item.unit_cost),
         )
         .await?;
@@ -4019,6 +4221,8 @@ mod tests {
             .get_record(cash.id)
             .await
             .unwrap()
+            .money
+            .expect("an ordinary document totals")
             .total
             .to_string();
         assert!(
@@ -4072,6 +4276,8 @@ mod tests {
             .get_record(credit.id)
             .await
             .unwrap()
+            .money
+            .expect("an ordinary document totals")
             .total
             .to_string();
         assert!(
@@ -6370,5 +6576,582 @@ mod tests {
                 .any(|line| line.product_id == product_id),
             "a refused line writes nothing"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Document-level accumulation (tax contract overflow T3).
+    //
+    // The purchase twin of the sale construction, and the reason the fix cannot
+    // be written for one family: `PurchaseService::tax_split` folds the same
+    // three accumulations with the same raw operators, and the operator typing
+    // a received quantity and a supplier's cost is typing the same unbounded
+    // operands.
+    //
+    // TWO products, not two posts of one: `add_or_increment_line` merges a
+    // repeat product at the same price into the existing line, so a second post
+    // of the same product would be a `qty + qty` merge and never a second term
+    // in the document's sum.
+    // -----------------------------------------------------------------------
+
+    /// `4e28`: individually carryable (`Decimal::MAX ≈ 7.92e28`), accepted by
+    /// the checked line write, and two of them are `8e28`, which is not.
+    const FOUR_E28: &str = "40000000000000000000000000000";
+
+    #[tokio::test]
+    async fn a_draft_purchase_whose_lines_cannot_be_added_up_is_still_readable() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let first = product_with_sku(&state, "DOC-TOTAL-PUR-1").await;
+        let second = product_with_sku(&state, "DOC-TOTAL-PUR-2").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+
+        for product_id in [first, second] {
+            let (status, _, body) = post_form_response(
+                app.clone(),
+                &format!("/web/purchases/{}/lines", fixture.purchase_id),
+                &format!("product_id={product_id}&qty=1&unit_cost={FOUR_E28}"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a line of 4e28 is carryable on its own: {body:.400}"
+            );
+        }
+
+        // The fixture's own line is a third, ordinary term, so this document
+        // carries the same defect as the sale twin: its lines cannot be added up.
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the purchase is READABLE: an operator who cannot open a stored document cannot fix \
+             it: {html:.600}"
+        );
+        assert!(
+            html.contains(&expected),
+            "and it states the SAME refusal the sale record page states, in the operator's own \
+             language, through the one shared mapping: {html:.2000}"
+        );
+        assert_eq!(
+            html.matches("data-document-total-refusal").count(),
+            1,
+            "in the place the total would be: {html:.2000}"
+        );
+        assert!(
+            html.contains("data-purchase-payment-status=\"refused\""),
+            "and no payment status is published for a total that does not exist: {html:.2000}"
+        );
+        assert_eq!(
+            html.matches("id=\"purchase-line-").count(),
+            3,
+            "every line is still shown, because each of them is representable: {html:.2000}"
+        );
+
+        // The service agrees, through its own typed result.
+        match state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+        {
+            Err(crate::error::AppError::PriceRefused(refusal)) => {
+                assert_eq!(refusal, crate::models::PriceRefusal::DocumentTotalTooLarge)
+            }
+            other => panic!("the purchase total cannot be computed: {other:?}"),
+        }
+    }
+
+    /// THE LIST PAGE ANSWERS, the sales twin's decision applied to the purchases
+    /// family: a purchase whose lines cannot be added up renders IN PLACE, with
+    /// no figure and the refusal where the figure was, and every other purchase
+    /// on the page renders exactly as it does today.
+    /// A product that TRACKS STOCK, which is the only kind whose quantity reaches
+    /// the document's `tracked_units` figure. `product_with_sku` deliberately does
+    /// not, so the two are separate helpers rather than a flag.
+    async fn stock_tracking_product(state: &AppState, sku: &str) -> i64 {
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor(state).await,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: format!("Tracked {sku}"),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: true,
+                    min_stock: Some(Decimal::ZERO),
+                    max_stock: Some(Decimal::from(1_000_000)),
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        product.id
+    }
+
+    /// A CONFIRMED purchase whose lines cannot be added up, plus the counts a test
+    /// needs to prove the annulment wrote NOTHING.
+    ///
+    /// A confirmation refuses an un-totalable document by design, so the second
+    /// line is stored the one way nothing in this application is supposed to:
+    /// straight through SQL, past the checked write. That is exactly the state a
+    /// confirmed purchase can be found in — by a migration, by an import, by a
+    /// bug older than this one — and it is the state the reversal has to refuse
+    /// BEFORE it touches anything.
+    async fn confirmed_untotalable_purchase(
+        state: &AppState,
+        account: i64,
+    ) -> (i64, i64, ReversalCounts) {
+        let actor = audit_actor(state).await;
+        let supplier = seed_supplier(state, "Untotalable Supplier").await;
+        let product = stock_tracking_product(state, "UNTOUCHABLE").await;
+        let purchase = state
+            .purchases_service
+            .create_draft(
+                actor,
+                crate::models::NewPurchase {
+                    supplier_id: supplier.id,
+                    // Credit, so the confirmation needs no payment method: the
+                    // point of the fixture is the REVERSAL, and a payment is added
+                    // afterwards so the refund leg is exercised too.
+                    payment_type: crate::models::PaymentType::Credit,
+                    purchase_date: chrono::NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(chrono::NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        // One line of 4e28 totals exactly, so the real flow confirms it.
+        state
+            .purchases_service
+            .add_line(
+                actor,
+                purchase.id,
+                product,
+                Decimal::ONE,
+                Some(Decimal::from_str(FOUR_E28).unwrap()),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(actor, purchase.id, None)
+            .await
+            .expect("one line of 4e28 is carryable, so the confirm is an ordinary one");
+        // A payment against it, so the reversal has a refund to post: a stock
+        // return alone would prove only half of what "wrote nothing" means.
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(actor, account, "Caja")
+            .await
+            .unwrap();
+        let method = state
+            .payment_method_service
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash" && m.account_id == Some(account))
+            .expect("Cash is assigned to the account")
+            .id;
+        state
+            .purchases_service
+            .record_payment(
+                actor,
+                purchase.id,
+                method,
+                Decimal::from(100),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 3).unwrap(),
+            )
+            .await
+            .expect("100 against a 4e28 due is an ordinary payment");
+        // The second line, stored directly.
+        sqlx::query(
+            "INSERT INTO purchase_lines (purchase_id, product_id, qty, unit_cost, tax_total) \
+             VALUES (?, ?, ?, ?, 0)",
+        )
+        .bind(purchase.id)
+        .bind(product)
+        .bind(Decimal::ONE.to_string())
+        .bind(FOUR_E28)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (purchase.id, product, ReversalCounts::read(state).await)
+    }
+
+    /// What an annulment of a purchase would write. Read as COUNTS so the test
+    /// asserts the absence of every write, not the presence of one absence.
+    #[derive(Debug, Clone, PartialEq)]
+    struct ReversalCounts {
+        status_cancelled: i64,
+        return_movements: i64,
+        income_transactions: i64,
+        movements: i64,
+    }
+
+    impl ReversalCounts {
+        async fn read(state: &AppState) -> Self {
+            let status_cancelled: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM purchases WHERE status = 'Cancelled'")
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            let return_movements: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM stock_movements WHERE reason = 'Purchase-return'",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+            let income_transactions: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE kind = 'Income'")
+                    .fetch_one(&state.pool)
+                    .await
+                    .unwrap();
+            let movements: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stock_movements")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+            Self {
+                status_cancelled,
+                return_movements,
+                income_transactions,
+                movements,
+            }
+        }
+    }
+
+    /// F2, first fold: the record's `tracked_units` is a SET SUM over the
+    /// document's stock-tracking lines, and a bound that holds per line says
+    /// nothing about their sum. Two lines of `4e28` units at no cost each: the
+    /// document's money totals to a clean zero, and its unit count is `8e28`.
+    #[tokio::test]
+    async fn a_purchase_whose_units_cannot_be_added_up_is_still_readable() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+
+        // Two products, because `add_or_increment_line` merges a repeat product
+        // at the same price — and that merge is the SECOND fold this test
+        // reaches, so the two lines are deliberately different products.
+        let first = stock_tracking_product(&state, "UNITS-A").await;
+        let second = stock_tracking_product(&state, "UNITS-B").await;
+        let purchase =
+            draft_purchase(&state, seed_supplier(&state, "Units Supplier").await.id).await;
+        for product in [first, second] {
+            let (status, _, body) = post_form_response(
+                app.clone(),
+                &format!("/web/purchases/{}/lines", purchase.id),
+                &format!("product_id={product}&qty={FOUR_E28}&unit_cost=0"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body:.400}");
+        }
+
+        // The document's MONEY is a real figure — zero — because zero is what two
+        // free lines at an enormous quantity add up to.
+        let (status, html) = get_html(app.clone(), &format!("/purchases/{}", purchase.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            html.contains(&expected),
+            "the record states the rule for the figure it cannot carry: {html:.600}"
+        );
+        let (status, html) = get_html(app, &format!("/purchases/{}", purchase.id)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !html.contains("8E28") && !html.contains("80000000000000000000000000000"),
+            "and publishes no unit figure for the document: {html:.600}"
+        );
+    }
+
+    /// F2, second fold: a repeat product at the same price MERGES, and the merge
+    /// is `existing.qty + qty` — a sum of a stored quantity and a REQUESTED one,
+    /// with nothing between them but the write bound on the resulting amount.
+    #[tokio::test]
+    async fn a_repeat_line_whose_merged_quantity_cannot_be_carried_is_a_refusal() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let product = product_with_sku(&state, "MERGE-HUGE").await;
+        let supplier = seed_supplier(&state, "Merge Supplier").await;
+        let purchase = draft_purchase(&state, supplier.id).await;
+        let post = |qty: &'static str| {
+            let app = app.clone();
+            async move {
+                let (status, _, body) = post_form_response(
+                    app,
+                    &format!("/web/purchases/{}/lines", purchase.id),
+                    &format!("product_id={product}&qty={qty}&unit_cost=0"),
+                )
+                .await;
+                (status, body)
+            }
+        };
+
+        let (status, _) = post(FOUR_E28).await;
+        assert_eq!(status, StatusCode::OK);
+        // The second add of the SAME product at the same price is the merge.
+        let (status, body) = post(FOUR_E28).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a quantity the merge cannot carry is a localized refusal: {body:.400}"
+        );
+        assert!(
+            body.contains(
+                localization.tr(crate::localization::MessageKey::PriceRefusalLineAmountTooLarge)
+            ),
+            "in the operator's language, through the one shared mapping: {body:.400}"
+        );
+
+        // And the STORED line is untouched: the refusal preceded the write, so the
+        // line still carries exactly the quantity the first add accepted. The
+        // record states no document refusal, because there is none to state — one
+        // line of `4e28` units at no cost has an amount of `0` and a unit count
+        // that carries; it is only the SUM with a second one that would not.
+        let record = state
+            .purchases_service
+            .get_record(purchase.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            record.lines[0].qty,
+            Decimal::from_str(FOUR_E28).unwrap(),
+            "the refused add wrote nothing"
+        );
+        assert_eq!(record.total_refusal, None, "and the document still totals");
+        let (status, html) = get_html(app, &format!("/purchases/{}", purchase.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("data-document-total-refusal"),
+            "so the record states no refusal: {html:.600}"
+        );
+    }
+
+    /// F3: the purchase annulment resolves the document's money BEFORE any write,
+    /// exactly as the sale annulment does. Without that, a confirmed purchase
+    /// whose lines cannot be added up returns the stock, posts the refunds, flips
+    /// the status — and only then refuses at the read, which is a half applied
+    /// reversal reported to the operator as a refusal.
+    #[tokio::test]
+    async fn a_purchase_annulment_that_cannot_carry_the_money_writes_nothing_at_all() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+        // A purchase payment leaves the account, so the reversal has something to
+        // refund only if the account holds something to pay with.
+        let account = state
+            .account_service
+            .create(audit_actor(&state).await, "Caja")
+            .await
+            .unwrap();
+        state
+            .transaction_service
+            .create(
+                audit_actor(&state).await,
+                account.id,
+                crate::models::TransactionKind::Income,
+                Decimal::from(1000),
+                Some("opening".into()),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (purchase, _product, before) = confirmed_untotalable_purchase(&state, account.id).await;
+
+        let (status, _, body) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{purchase}/cancel"),
+            "reason=operator+mistake",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the annulment refuses instead of half applying: {body:.400}"
+        );
+
+        let after = ReversalCounts::read(&state).await;
+        assert_eq!(after, before, "the refusal preceded every write: {after:?}");
+        assert!(
+            body.contains(&expected),
+            "and it reaches the operator in their language: {body:.400}"
+        );
+
+        // And the document is untouched and still READABLE, so the operator can
+        // reach the lines that have to be fixed.
+        let (status, html) = get_html(app, &format!("/purchases/{purchase}")).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(html.contains(&expected), "{html:.600}");
+        assert!(
+            !html.contains("Purchase-return") && !html.contains("Anulado"),
+            "and the record is still a confirmed purchase, not a cancelled one: {html:.600}"
+        );
+    }
+
+    /// F1 (purchases twin): a list renders the document whose total cannot be
+    /// computed, in place, with the rule and no figure.
+    #[tokio::test]
+    async fn the_purchases_list_renders_a_document_whose_total_cannot_be_computed() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+        let big = localization.format_currency(Decimal::from_str(FOUR_E28).unwrap());
+
+        // Two ordinary purchases, then the un-totalable one: two products, because
+        // `add_or_increment_line` merges a repeat product at the same price.
+        let supplier = seed_supplier(&state, "List Supplier").await;
+        let mut ordinary = Vec::new();
+        for n in 0..2 {
+            let product = product_with_sku(&state, &format!("PLIST-ORD-{n}")).await;
+            let purchase = draft_purchase(&state, supplier.id).await;
+            let (status, _, body) = post_form_response(
+                app.clone(),
+                &format!("/web/purchases/{}/lines", purchase.id),
+                &format!("product_id={product}&qty=2&unit_cost={ORDINARY_COST}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body:.400}");
+            ordinary.push(purchase.id);
+        }
+        let untotalable = draft_purchase(&state, supplier.id).await;
+        for n in 0..2 {
+            let product = product_with_sku(&state, &format!("PLIST-BAD-{n}")).await;
+            let (status, _, body) = post_form_response(
+                app.clone(),
+                &format!("/web/purchases/{}/lines", untotalable.id),
+                &format!("product_id={product}&qty=1&unit_cost={FOUR_E28}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body:.400}");
+        }
+
+        let (status, html) = get_html(app, "/purchases").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "one purchase that cannot be totaled must not take the page down: {html:.800}"
+        );
+
+        let row = row_html(&html, "purchase-", untotalable.id);
+        assert!(
+            row.contains(&expected),
+            "the refused row states the rule in the operator's language: {row:.1200}"
+        );
+        assert!(
+            row.contains(&supplier.name),
+            "and keeps its identity: {row:.1200}"
+        );
+        assert!(!row.contains(&big), "and shows NO amount: {row:.1200}");
+        assert!(
+            !row.contains("0.00"),
+            "and no zero placeholder: {row:.1200}"
+        );
+
+        let ordinary_amount = localization.format_currency(Decimal::from_str("2468").unwrap());
+        for id in ordinary {
+            let row = row_html(&html, "purchase-", id);
+            assert!(
+                row.contains(&ordinary_amount),
+                "an ordinary purchase still shows its own total: {row:.1200}"
+            );
+        }
+    }
+
+    /// The ordinary line's money: `qty 2` at `1234`. A whole number on purpose:
+    /// these tests run under `es-AR`, whose form parser takes `,` as the decimal
+    /// separator.
+    const ORDINARY_COST: &str = "1234";
+
+    /// A supplier of its own, so the list test's rows all name the same supplier
+    /// and the identity assertions are about the row, not about the fixture.
+    async fn seed_supplier(state: &AppState, name: &str) -> crate::models::Supplier {
+        use crate::models::NewSupplier;
+
+        state
+            .supplier_service
+            .create_supplier(
+                audit_actor(state).await,
+                NewSupplier {
+                    name: name.into(),
+                    phone: None,
+                    notes: None,
+                    due_days: None,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// One draft purchase from a supplier, with no lines: the fixture every list
+    /// test adds its own lines to.
+    async fn draft_purchase(state: &AppState, supplier_id: i64) -> crate::models::Purchase {
+        use crate::models::NewPurchase;
+        use chrono::NaiveDate;
+
+        state
+            .purchases_service
+            .create_draft(
+                audit_actor(state).await,
+                NewPurchase {
+                    supplier_id,
+                    payment_type: PaymentType::Cash,
+                    purchase_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// One row of a rendered list, sliced out by its row id.
+    fn row_html<'a>(html: &'a str, id_prefix: &str, id: i64) -> &'a str {
+        let marker = format!("id=\"{id_prefix}{id}\"");
+        let start = html
+            .find(&marker)
+            .unwrap_or_else(|| panic!("row {id_prefix}{id} is missing from the page"))
+            + marker.len();
+        let rest = &html[start..];
+        let end = rest
+            .find(&format!("id=\"{id_prefix}"))
+            .unwrap_or(rest.len());
+        &rest[..end]
     }
 }

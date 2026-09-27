@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{
-    DebtSummary, PaymentType, SaleDetail, SaleListFilter, SaleRecord, SaleStatus, UpdateSaleDraft,
+    DebtSummary, PaymentType, SaleListFilter, SaleRecord, SaleStatus, UpdateSaleDraft,
 };
 use crate::routes::{localized_refusal_error, AppState};
 use crate::security::authz::{CustomersCollect, Nav, Require, SalesCancel, SalesCreate, SalesRead};
@@ -39,8 +39,18 @@ use crate::services::sales::DEBT_BANNER_LIMIT;
 struct SalesTemplate {
     title: String,
     localization: LocalizationContext,
-    sales: Vec<SaleDetail>,
-    debt: DebtSummary,
+    /// The documents, each with its refusal already resolved: a row whose
+    /// arithmetic could not be carried renders in place with no figure.
+    sales: Vec<SaleRowView>,
+    /// How many documents are unpaid — a fact even when the total is a refusal.
+    debt_count: usize,
+    /// The banner's headline: the amount, or the refusal in the operator's
+    /// language. A sum over every unpaid document, so never partial.
+    debt_total: String,
+    /// True when `debt_total` is a real figure, so the panel shows it as one.
+    debt_totalled: bool,
+    /// The banner's documents, with their own refusals resolved.
+    debt_oldest: Vec<SaleRowView>,
     customers: Vec<crate::models::Customer>,
     today: String,
     nav_key: &'static str,
@@ -76,9 +86,43 @@ struct SalePageTemplate {
     /// last editor, resolved in this wiring layer.
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
+    /// The document-total refusal in the operator's language, empty when the
+    /// document totals exactly. The page includes the same record partial the
+    /// action responses render, so the sentence travels with it.
+    total_refusal_message: String,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
+}
+
+/// One row of a document list, as a page needs it: the document's own fields,
+/// flattened, plus the refusal already in the operator's language.
+///
+/// The sentence is resolved HERE, through the one shared `price_refusal_key`
+/// mapping, so no surface can word the rule differently from the record pages,
+/// the customer drawer or the index. `money` is `None` exactly when the message
+/// is not empty: the two travel together so the template has one thing to render
+/// in place of the figure.
+struct SaleRowView {
+    sale: crate::models::Sale,
+    money: Option<crate::models::RecordMoney>,
+    total_refusal_message: String,
+}
+
+fn sale_row_views(
+    rows: Vec<crate::models::SaleListRow>,
+    localization: &LocalizationContext,
+) -> Vec<SaleRowView> {
+    rows.into_iter()
+        .map(|row| SaleRowView {
+            sale: row.sale,
+            money: row.money,
+            total_refusal_message: row
+                .total_refusal
+                .map(|refusal| crate::routes::price_refusal_message(&refusal, localization))
+                .unwrap_or_default(),
+        })
+        .collect()
 }
 
 #[derive(Template)]
@@ -86,7 +130,7 @@ struct SalePageTemplate {
 struct SaleListPartial {
     title: String,
     localization: LocalizationContext,
-    sales: Vec<SaleDetail>,
+    sales: Vec<SaleRowView>,
 }
 
 /// The debt banner: total owed, unpaid count and the oldest few. A summary, so
@@ -95,7 +139,18 @@ struct SaleListPartial {
 #[template(path = "partials/sale_debt.html")]
 struct SaleDebtPartial {
     localization: LocalizationContext,
-    debt: DebtSummary,
+    /// How many documents are unpaid. The panel is a summary, so the COUNT is a
+    /// fact even when the total is a refusal: the operator still needs to know how
+    /// many documents are behind.
+    debt_count: usize,
+    /// The banner's headline, already resolved: the amount, or the refusal in the
+    /// operator's language. A sum over every unpaid document in the shop, so it
+    /// is refused rather than partial.
+    debt_total: String,
+    /// True when `debt_total` is a real figure, so the panel shows it as one.
+    debt_totalled: bool,
+    /// The banner's documents, with their own refusals resolved.
+    debt_oldest: Vec<SaleRowView>,
 }
 
 /// The record body, shared by the page and by every action response that swaps
@@ -111,6 +166,11 @@ struct SaleDetailPartial {
     /// Audit display names: who created the sale, and who last edited it.
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
+    /// The document-total refusal, already in the operator's language, or empty
+    /// when the document totals exactly. Resolved HERE, through the one shared
+    /// `price_refusal_key` mapping, so the record page cannot word the rule
+    /// differently from the add-line response or the index.
+    total_refusal_message: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +244,7 @@ fn parse_date_or_today(s: &str, localization: &LocalizationContext) -> AppResult
 }
 
 fn render_list(
-    sales: Vec<SaleDetail>,
+    sales: Vec<SaleRowView>,
     title: &str,
     localization: LocalizationContext,
 ) -> AppResult<Html<String>> {
@@ -199,9 +259,27 @@ fn render_list(
 }
 
 fn render_debt(debt: DebtSummary, localization: LocalizationContext) -> AppResult<Html<String>> {
-    let html = SaleDebtPartial { localization, debt }
-        .render()
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let (debt_total, debt_totalled) = match debt.total.amount {
+        Some(amount) => (localization.format_currency(amount), true),
+        None => (
+            debt.total
+                .refusal
+                .map(|refusal| crate::routes::price_refusal_message(&refusal, &localization))
+                .unwrap_or_default(),
+            false,
+        ),
+    };
+    let debt_count = debt.count;
+    let debt_oldest = sale_row_views(debt.oldest, &localization);
+    let html = SaleDebtPartial {
+        localization,
+        debt_count,
+        debt_total,
+        debt_totalled,
+        debt_oldest,
+    }
+    .render()
+    .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Html(html))
 }
 
@@ -217,6 +295,10 @@ struct SaleRecordContext {
     /// here in the wiring layer (AC20: the service never reads identity).
     created_by_name: Option<String>,
     updated_by_name: Option<String>,
+    /// The document-total refusal in the operator's language, empty when the
+    /// document totals exactly. See [`SaleRecordContext::record`] for why the
+    /// page states it instead of answering an error.
+    total_refusal_message: String,
 }
 
 async fn record_context(
@@ -233,6 +315,10 @@ async fn record_context(
     let name_for = |id: i64| names.get(&id).cloned();
     let created_by_name = name_for(record.sale.created_by);
     let updated_by_name = record.sale.updated_by.and_then(name_for);
+    let total_refusal_message = record
+        .total_refusal
+        .map(|refusal| crate::routes::price_refusal_message(&refusal, &localization))
+        .unwrap_or_default();
     Ok(SaleRecordContext {
         record,
         localization,
@@ -240,6 +326,7 @@ async fn record_context(
         today,
         created_by_name,
         updated_by_name,
+        total_refusal_message,
     })
 }
 
@@ -252,6 +339,7 @@ fn render_record(context: SaleRecordContext, oob_picker: bool) -> AppResult<Html
         today: context.today,
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
+        total_refusal_message: context.total_refusal_message,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -298,21 +386,47 @@ async fn sales_page(
     principal: axum::Extension<crate::security::authz::Principal>,
     Query(query): Query<SaleListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let sales = state
-        .sales_service
-        .list_details_filtered(&query.to_filter())
-        .await?;
+    // A list of documents can carry one whose total cannot be computed, and
+    // this page is where the operator goes to FIND it. It refuses the whole
+    // page rather than dropping that document silently — a list that quietly
+    // omits a stored sale is a lie about the shop's history — and it refuses
+    // in the operator's language, through the one shared mapping.
+    // The ROW read, not the detail read: a list must render a document whose
+    // total cannot be computed instead of answering an error and taking every
+    // other document on the page with it.
+    let sales = sale_row_views(
+        state
+            .sales_service
+            .list_rows_filtered(&query.to_filter())
+            .await?,
+        &localization,
+    );
     let debt = state.sales_service.debt_summary(DEBT_BANNER_LIMIT).await?;
     let customers = state.customer_service.list_customers(true).await?;
     let today = localization.today_iso();
     let title = localization
         .tr(crate::localization::MessageKey::SalesAll)
         .to_string();
+    let (debt_total, debt_totalled) = match debt.total.amount {
+        Some(amount) => (localization.format_currency(amount), true),
+        None => (
+            debt.total
+                .refusal
+                .map(|refusal| crate::routes::price_refusal_message(&refusal, &localization))
+                .unwrap_or_default(),
+            false,
+        ),
+    };
+    let debt_count = debt.count;
+    let debt_oldest = sale_row_views(debt.oldest, &localization);
     let tmpl = SalesTemplate {
         title,
         localization,
         sales,
-        debt,
+        debt_count,
+        debt_total,
+        debt_totalled,
+        debt_oldest,
         customers,
         today,
         nav_key: "sales",
@@ -391,10 +505,14 @@ async fn web_sale_list(
     Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<SaleListQuery>,
 ) -> Result<Html<String>, AppError> {
-    let sales = state
-        .sales_service
-        .list_details_filtered(&query.to_filter())
-        .await?;
+    // The ROW read, the same reason and the same mapping as the page above.
+    let sales = sale_row_views(
+        state
+            .sales_service
+            .list_rows_filtered(&query.to_filter())
+            .await?,
+        &localization,
+    );
     let title = localization
         .tr(crate::localization::MessageKey::SalesAll)
         .to_string();
@@ -464,6 +582,7 @@ async fn sale_record_page(
         today: context.today,
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
+        total_refusal_message: context.total_refusal_message,
         nav_key: "sales",
         nav: Nav::for_principal(&principal),
     };
@@ -748,7 +867,15 @@ async fn confirm_sale_impl(
     form: ConfirmSaleForm,
 ) -> Result<axum::response::Response, AppError> {
     let method_id = parse_opt_i64(&form.method_id, "method_id")?;
-    state.sales_service.confirm(actor, id, method_id).await?;
+    // A refusal reaches the operator in their language: a confirmation can be
+    // refused by the document-total rule, and a raw `PriceRefused` would answer
+    // with the English wire text instead of the sentence this screen is written
+    // in. Every other error travels untouched.
+    state
+        .sales_service
+        .confirm(actor, id, method_id)
+        .await
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         return changed(&state, id, &localization).await;
     }
@@ -780,10 +907,13 @@ async fn record_payment_impl(
 ) -> Result<axum::response::Response, AppError> {
     let amount = parse_required_decimal(&form.amount, "amount", &localization)?;
     let date = parse_date_or_today(&form.date, &localization)?;
+    // The payment ceiling is measured against the document total, so this path
+    // can answer the document-total refusal too — in the operator's language.
     state
         .sales_service
         .record_payment(actor, id, form.method_id, amount, date)
-        .await?;
+        .await
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         return changed(&state, id, &localization).await;
     }
@@ -815,7 +945,13 @@ async fn cancel_sale_impl(
     } else {
         Some(form.reason.trim().to_string())
     };
-    state.sales_service.cancel(actor, id, reason).await?;
+    // The annulment measures refunds against the document's payments, so it can
+    // answer the document-total refusal too — in the operator's language.
+    state
+        .sales_service
+        .cancel(actor, id, reason)
+        .await
+        .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
         return changed(&state, id, &localization).await;
     }
@@ -3131,5 +3267,739 @@ mod tests {
             dec("1000000000000000000"),
             "a representable amount is priced by the same contract as any other, exactly"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Document-level accumulation (tax contract overflow T3).
+    //
+    // Every test above is PER LINE. This block is the DOCUMENT: a sum of lines
+    // that each pass the per-line write bound and still cannot be added up.
+    // Per-line carryability — the invariant T1 and T2 established — says nothing
+    // about a sum, so no per-line rule can refuse this construction: both lines
+    // are stored by the real checked write.
+    //
+    // The tests are the operator's, not the arithmetic's: they drive the real
+    // router with the real session cookie and assert a STATUS and a SENTENCE.
+    // "Did not panic" is not observable from outside the process — a panic
+    // escapes the handler, the connection is dropped and the operator is left
+    // with nothing at all — so a test that only proved "no panic" would be
+    // satisfied by a page that renders an empty document.
+    // -----------------------------------------------------------------------
+
+    /// `4e28`: an amount an operator can type into a price box, individually
+    /// carryable (`Decimal::MAX ≈ 7.92e28`), accepted by the checked line write
+    /// and computable by the tax contract. Two of them are the SMALLEST
+    /// construction that cannot be added up: `4e28 + 4e28 = 8e28 > MAX`.
+    const FOUR_E28: &str = "40000000000000000000000000000";
+
+    /// A draft sale with NO lines, plus a product of its own, so the document is
+    /// exactly the lines the test adds. `seed_record_fixture` seeds a line of its
+    /// own, which would be a third term in a total this test is about.
+    async fn empty_draft_sale(state: &AppState, sku: &str) -> (i64, i64) {
+        use crate::models::{NewProduct, NewSale, ProductKind};
+        use chrono::NaiveDate;
+
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor(state).await,
+                NewProduct {
+                    sku: sku.into(),
+                    name: format!("Document total {sku}"),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let customer = seed_customer(state, "Document Total Buyer").await;
+        let sale = state
+            .sales_service
+            .create_draft(
+                audit_actor(state).await,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Cash,
+                    sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: None,
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        (sale.id, product.id)
+    }
+
+    /// THE CONSTRUCTION. Two lines, each individually carryable, whose SUM is
+    /// not. The second line's INSERT COMMITS before the response renders, so
+    /// from that moment the document exists and every surface that reads it must
+    /// answer: an unreadable document is stranded data, not a rejected request.
+    #[tokio::test]
+    async fn a_draft_sale_whose_lines_cannot_be_added_up_is_still_readable() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let (sale_id, product_id) = empty_draft_sale(&state, "DOC-TOTAL-2LINE").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        // The refusal in the operator's own language, through the ONE shared
+        // mapping every price refusal uses — the same sentence the add-line
+        // response, the record page and the index must all show.
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+        assert!(
+            !expected.is_empty()
+                && expected != crate::models::PriceRefusal::DocumentTotalTooLarge.as_str(),
+            "the Spanish catalog carries a sentence of its own for this rule"
+        );
+
+        // One line of 4e28: the document totals exactly, so the record renders
+        // and this response is a plain 200 with no refusal anywhere on it.
+        let (status, body) = post_form(
+            app.clone(),
+            &format!("/web/sales/{sale_id}/lines"),
+            &format!("product_id={product_id}&qty=1&unit_price={FOUR_E28}"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "one line of 4e28 is carryable on its own, and the per-line write bound is a BOUND \
+             rather than a blanket rejection: {body}"
+        );
+        assert!(
+            !body.contains("data-document-total-refusal"),
+            "a document that totals says nothing about the rule: {body:.800}"
+        );
+
+        // The second line is the one that commits before the fold runs.
+        let (status, body) = post_form(
+            app.clone(),
+            &format!("/web/sales/{sale_id}/lines"),
+            &format!("product_id={product_id}&qty=1&unit_price={FOUR_E28}"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the add-line response itself is one of the four surfaces, and a document whose total \
+             cannot be carried is still a document: {body}"
+        );
+        assert!(
+            body.contains(&expected),
+            "the add-line response states the refusal in the operator's language: {body:.2000}"
+        );
+        assert_eq!(
+            body.matches("id=\"sale-line-").count(),
+            2,
+            "and it still shows BOTH lines, because each of them is representable: {body:.2000}"
+        );
+
+        // And the record page, which is the operator's way back into it.
+        let (status, html) = get_html(app.clone(), &format!("/sales/{sale_id}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the document is READABLE: an operator who cannot open a stored document cannot fix \
+             it: {html:.600}"
+        );
+        assert!(
+            html.contains(&expected),
+            "the record page states the refusal: {html:.2000}"
+        );
+        assert_eq!(
+            html.matches("id=\"sale-line-").count(),
+            2,
+            "the operator can see WHICH lines the document carries: {html:.2000}"
+        );
+        assert!(
+            html.contains("data-sale-payment-status=\"refused\""),
+            "and that no payment status is published for a total that does not exist: {html:.2000}"
+        );
+
+        // AND THE DOCUMENT IS NOT STRANDED: it is still a working draft. Removing
+        // one line brings the sum back inside the range, and the page says so by
+        // rendering the total again. This is the whole difference between a
+        // document that is unreadable and one that is too large.
+        let line_id: i64 =
+            sqlx::query_scalar("SELECT id FROM sale_lines WHERE sale_id = ? ORDER BY id LIMIT 1")
+                .bind(sale_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let (status, body, _) = send_delete(
+            app.clone(),
+            &format!("/web/sales/{sale_id}/lines/{line_id}"),
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.600}");
+        assert!(
+            !body.contains(&expected),
+            "one line less and the document totals again: the refusal was about the document, not \
+             about the line that was removed: {body:.2000}"
+        );
+
+        // The stored document is the ordinary one the tests around it expect.
+        let detail = state.sales_service.get_detail(sale_id).await.unwrap();
+        assert_eq!(detail.lines.len(), 1);
+        assert_eq!(detail.total, Decimal::from_str(FOUR_E28).unwrap());
+    }
+
+    /// THE CASE A NET-ONLY GUARD MISSES.
+    ///
+    /// With an ordinary 21% tax the per-multiply bound caps a line's net at
+    /// `MAX / 21 ≈ 3.77e27`, so the two-line construction is out of reach: the
+    /// write refuses a line that big. Eighteen lines of `3.7e27` get there
+    /// instead, and they bind on a DIFFERENT accumulation than the two-line
+    /// case does — the net sums to `6.66e28` and the tax to `1.3986e28`, both
+    /// inside the range, and only the sum of the lines' tax-inclusive totals
+    /// (`18 × 4.477e27 = 8.0586e28`) leaves it.
+    ///
+    /// The claim is asserted here in CHECKED form rather than assumed, so the
+    /// test says which accumulation overflows and stops claiming the case exists
+    /// if `Decimal`'s limits ever move.
+    #[tokio::test]
+    async fn a_draft_sale_whose_tax_inclusive_total_cannot_be_added_up_is_still_readable() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let (sale_id, product_id) = empty_draft_sale(&state, "DOC-TOTAL-18LINE").await;
+        link_one_tax(&state, product_id, "IVA21D", "21").await;
+        let app = crate::routes::router(state.clone());
+
+        // The eighteen lines' own arithmetic, in checked form: every line is
+        // written, and only the DOCUMENT's tax-inclusive total is out of range.
+        let net = Decimal::from_str("3700000000000000000000000000").unwrap();
+        let tax = Decimal::from_str("777000000000000000000000000").unwrap();
+        let line_total = Decimal::from_str("4477000000000000000000000000").unwrap();
+        assert_eq!(tax, net * Decimal::from(21) / Decimal::from(100));
+        assert_eq!(line_total, net + tax);
+        assert!(
+            net.checked_mul(Decimal::from(18)).is_some(),
+            "the NET must fit, or this is not the case it claims to be"
+        );
+        assert!(
+            tax.checked_mul(Decimal::from(18)).is_some(),
+            "the TAX must fit, or this is not the case it claims to be"
+        );
+        assert!(
+            line_total.checked_mul(Decimal::from(18)).is_none(),
+            "the tax-inclusive line totals must be the accumulation that leaves the range"
+        );
+
+        for line in 0..18 {
+            let (status, body) = post_form(
+                app.clone(),
+                &format!("/web/sales/{sale_id}/lines"),
+                &format!("product_id={product_id}&qty=1&unit_price={}", dec_str(net)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "line {} of 18 is individually carryable: the write bound is per LINE, and a \
+                 document that reaches 18 lines was accepted 17 times over: {body}",
+                line + 1
+            );
+        }
+
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+        let (status, html) = get_html(app, &format!("/sales/{sale_id}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the document is READABLE: {html:.600}"
+        );
+        assert!(
+            html.contains(&expected),
+            "the tax-inclusive total is the accumulation that leaves the range, and the operator \
+             reads the same refusal for it: {html:.2000}"
+        );
+        assert_eq!(
+            html.matches("id=\"sale-line-").count(),
+            18,
+            "every line is still shown, and each line's own taxed total is intact: {html:.2000}"
+        );
+        // The service agrees about WHICH accumulation refused, and says so
+        // through its own typed result rather than through the page.
+        match state.sales_service.get_detail(sale_id).await {
+            Err(crate::error::AppError::PriceRefused(refusal)) => assert_eq!(
+                refusal,
+                crate::models::PriceRefusal::DocumentTotalTooLarge,
+                "the tax-inclusive accumulation is the one that refuses, and it is its own rule"
+            ),
+            other => panic!("the document total cannot be computed: {other:?}"),
+        }
+    }
+
+    /// THE ACTION PATHS. A document whose total cannot be computed cannot be
+    /// confirmed, paid or discarded: each of those measures money against the
+    /// tax-inclusive total, and each must refuse BEFORE it writes. The assertions
+    /// that matter are the ones after the request — a refusal that leaves a
+    /// numbered document, a stock movement or a finance row behind is a refusal
+    /// the operator cannot trust, and an annulment that refunds half of a
+    /// document and then refuses is worse than a refusal.
+    ///
+    /// The refusal is RECOVERABLE, and this test proves the two ways out rather
+    /// than asserting the word "recoverable": the record page is readable (the
+    /// test above), so a line can be removed from it, and a never-confirmed
+    /// draft can be deleted outright from the documents drawer.
+    #[tokio::test]
+    async fn a_sale_whose_total_cannot_be_computed_refuses_every_action_with_no_side_effect() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let (sale_id, product_id) = empty_draft_sale(&state, "DOC-TOTAL-ACTIONS").await;
+        let app = crate::routes::router(state.clone());
+        for _ in 0..2 {
+            post_form(
+                app.clone(),
+                &format!("/web/sales/{sale_id}/lines"),
+                &format!("product_id={product_id}&qty=1&unit_price={FOUR_E28}"),
+            )
+            .await;
+        }
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+
+        let (status, body) = post_form(
+            app.clone(),
+            &format!("/web/sales/{sale_id}/confirm"),
+            "method_id=",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "confirm measures the cash scenario against the document total: {body}"
+        );
+        assert!(
+            body.contains(&expected),
+            "in the operator's language: {body}"
+        );
+
+        let sale: (String, Option<String>) =
+            sqlx::query_as("SELECT status, sale_number FROM sales WHERE id = ?")
+                .bind(sale_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            sale,
+            ("Draft".to_string(), None),
+            "a refused confirm writes NOTHING: no number, no status change"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM transactions")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0,
+            "and no finance row"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM stock_movements")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0,
+            "and no stock movement"
+        );
+
+        // The discard refuses the same way, and writes nothing either.
+        let (status, body) = post_form(
+            app.clone(),
+            &format!("/web/sales/{sale_id}/cancel"),
+            "reason=x",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a discard measures the same total: {body}"
+        );
+        assert!(body.contains(&expected), "in their language: {body}");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM sales WHERE id = ?")
+                .bind(sale_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            "Draft",
+            "and a refused discard changes no status: a half-applied annulment is worse than a \
+             refusal"
+        );
+
+        // The way out that needs no total at all: a never-confirmed draft is
+        // deletable, and the delete never reads the document's money.
+        state.sales_service.delete_draft(sale_id).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sales WHERE id = ?")
+                .bind(sale_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap(),
+            0,
+            "so the operator is never stuck holding a document they cannot act on"
+        );
+    }
+
+    /// THE CONTROL, and the reason a bound that refuses everything large is not
+    /// a fix. Twenty ordinary taxed lines are added up exactly as before: the
+    /// checked path is a different IMPLEMENTATION of the same sum, never a
+    /// different rule about when a document may be totalled.
+    #[tokio::test]
+    async fn many_ordinary_lines_still_total_exactly() {
+        let state = test_state().await;
+        let (sale_id, product_id) = empty_draft_sale(&state, "DOC-TOTAL-CONTROL").await;
+        link_one_tax(&state, product_id, "IVA21C", "21").await;
+        let app = crate::routes::router(state.clone());
+
+        for _ in 0..20 {
+            let (status, body) = post_form(
+                app.clone(),
+                &format!("/web/sales/{sale_id}/lines"),
+                &format!("product_id={product_id}&qty=3&unit_price=12.34"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        // 20 x (3 x 12.34 = 37.02 net, 21% = 7.77 tax, 44.79 tax-inclusive).
+        let (status, html) = get_html(app, &format!("/sales/{sale_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        let detail = state.sales_service.get_detail(sale_id).await.unwrap();
+        assert_eq!(detail.net_subtotal, Decimal::from_str("740.40").unwrap());
+        assert_eq!(detail.tax_total, Decimal::from_str("155.40").unwrap());
+        assert_eq!(detail.total, Decimal::from_str("895.80").unwrap());
+        assert_eq!(detail.lines.len(), 20);
+    }
+
+    /// A `Decimal` as the form field carries it, for a test that computes the
+    /// price it types instead of repeating the digits.
+    fn dec_str(value: Decimal) -> String {
+        value.normalize().to_string()
+    }
+
+    // -----------------------------------------------------------------------
+    // List surfaces (tax contract overflow T3, F1).
+    //
+    // A list is the one surface where a refusal must NOT be the answer: the page
+    // holds many documents, and one document that cannot be totaled must render
+    // IN PLACE — with its identity, with no figure, and with the refusal where
+    // the figure was — while every other row renders exactly as it does today.
+    // Refusing the page would hide 49 documents behind 1.
+    //
+    // The document under test here is an ordinary DRAFT: the real add-line form
+    // stores it, so nothing here needs a hand-written row. The debt banner's
+    // test below needs a CONFIRMED one, and that one does smuggle a line in
+    // through SQL — because a confirmation refuses an un-totalable document by
+    // design, so no application path can produce it.
+    // -----------------------------------------------------------------------
+
+    /// One ordinary line, added to a draft through the real form. Returns the
+    /// draft's id.
+    ///
+    /// The price is a whole number on purpose: these tests run under `es-AR`,
+    /// whose form parser takes `,` as the decimal separator, so a `12.34` field
+    /// is a form error there and the fixture would fail before reaching the
+    /// behaviour under test.
+    async fn ordinary_draft(state: &AppState, sku: &str) -> i64 {
+        let (sale_id, product_id) = empty_draft_sale(state, sku).await;
+        let (status, body) = post_form(
+            crate::routes::router(state.clone()),
+            &format!("/web/sales/{sale_id}/lines"),
+            &format!(
+                "product_id={product_id}&qty=2&unit_price={}",
+                ORDINARY_PRICE
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        sale_id
+    }
+
+    /// The ordinary line's money: `qty 2` at `1234`, and the amount the page is
+    /// expected to render for it in whatever locale the test set.
+    const ORDINARY_PRICE: &str = "1234";
+
+    /// One row of a rendered list, sliced out by its row id — so an assertion
+    /// about "the refused row" is about THAT row and not about the page.
+    ///
+    /// The slice ends at the row's own "Open" link, which is the last element of
+    /// a row's trailing zone. Cutting there keeps a comparison between two renders
+    /// about the ROW and not about whatever follows it on the page, which is
+    /// exactly what differs when one render carries an extra document.
+    fn row_html<'a>(html: &'a str, id_prefix: &str, id: i64) -> &'a str {
+        let marker = format!("id=\"{id_prefix}{id}\"");
+        let start = html
+            .find(&marker)
+            .unwrap_or_else(|| panic!("row {id_prefix}{id} is missing from the page"))
+            + marker.len();
+        let rest = &html[start..];
+        let end = rest.find("</a>").map(|at| at + 4).unwrap_or(0);
+        &rest[..end]
+    }
+
+    /// A draft sale carrying two lines of `4e28`, stored by the real form.
+    async fn untotalable_draft(state: &AppState, sku: &str) -> i64 {
+        let (sale_id, product_id) = empty_draft_sale(state, sku).await;
+        for _ in 0..2 {
+            let (status, body) = post_form(
+                crate::routes::router(state.clone()),
+                &format!("/web/sales/{sale_id}/lines"),
+                &format!("product_id={product_id}&qty=1&unit_price={FOUR_E28}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        sale_id
+    }
+
+    /// THE LIST PAGE ANSWERS. One un-totalable draft among ordinary ones: the
+    /// page renders, the bad document renders in place with the refusal and
+    /// without a figure, and the ordinary documents are untouched.
+    #[tokio::test]
+    async fn the_sales_list_renders_a_document_whose_total_cannot_be_computed() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let first = ordinary_draft(&state, "LIST-ORD-1").await;
+        let second = ordinary_draft(&state, "LIST-ORD-2").await;
+        let third = ordinary_draft(&state, "LIST-ORD-3").await;
+        let untotalable = untotalable_draft(&state, "LIST-BAD").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+        let big = localization.format_currency(Decimal::from_str(FOUR_E28).unwrap());
+
+        let (status, html) = get_html(app, "/sales").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "one document that cannot be totaled must not take the page down: {html:.800}"
+        );
+
+        // THE REFUSED ROW: in place, identified, and carrying the sentence.
+        let row = row_html(&html, "sale-", untotalable);
+        assert!(
+            row.contains(&expected),
+            "the refused row states the rule in the operator's language: {row:.1200}"
+        );
+        assert!(
+            // The list row's identity is the PARTY, not the product: a document
+            // row is what the operator scans, and the products are one click away
+            // on the document itself.
+            row.contains("Document Total Buyer"),
+            "and keeps its identity: {row:.1200}"
+        );
+        assert!(
+            row.contains(localization.tr(crate::localization::MessageKey::StatusDraft)),
+            "including its status, in the operator's language: {row:.1200}"
+        );
+        assert!(
+            !row.contains(&big),
+            "and shows NO amount: a stale, partial or zero figure is worse than none, because the \
+             operator cannot tell a real zero from a refusal. row: {row:.1200}"
+        );
+        assert!(
+            !row.contains("0.00"),
+            "and in particular no zero placeholder: {row:.1200}"
+        );
+
+        // THE ORDINARY ROWS: every one is still there, with its own money.
+        let ordinary_amount = localization.format_currency(Decimal::from_str("2468").unwrap());
+        for id in [first, second, third] {
+            let row = row_html(&html, "sale-", id);
+            assert!(
+                row.contains(&ordinary_amount),
+                "an ordinary document still shows its own total: {row:.1200}"
+            );
+        }
+    }
+
+    /// THE CONTROL, and the only honest form of "exactly as today": the SAME
+    /// ordinary documents, rendered by the SAME code, with and without the
+    /// un-totalable one on the page. Their rows must be byte-identical, so the
+    /// refusal path cannot have changed a single character of a normal row.
+    #[tokio::test]
+    async fn an_ordinary_sales_list_is_unchanged_by_the_presence_of_a_refused_row() {
+        let with_bad = test_state().await;
+        set_locale(&with_bad, "es-AR", "es").await;
+        let a1 = ordinary_draft(&with_bad, "CTRL-ORD-1").await;
+        let a2 = ordinary_draft(&with_bad, "CTRL-ORD-2").await;
+        untotalable_draft(&with_bad, "CTRL-BAD").await;
+
+        let without_bad = test_state().await;
+        set_locale(&without_bad, "es-AR", "es").await;
+        let b1 = ordinary_draft(&without_bad, "CTRL-ORD-1").await;
+        let b2 = ordinary_draft(&without_bad, "CTRL-ORD-2").await;
+        assert_eq!((a1, a2), (b1, b2), "the control seeds the same rows");
+
+        let (status, dirty) = get_html(crate::routes::router(with_bad), "/sales").await;
+        assert_eq!(status, StatusCode::OK, "{dirty:.400}");
+        let (status, clean) = get_html(crate::routes::router(without_bad), "/sales").await;
+        assert_eq!(status, StatusCode::OK, "{clean:.400}");
+
+        for id in [a1, a2] {
+            assert_eq!(
+                row_html(&dirty, "sale-", id),
+                row_html(&clean, "sale-", id),
+                "an ordinary row is byte-identical with and without a refused document on the page"
+            );
+        }
+        assert!(
+            !clean.contains("data-document-total-refusal"),
+            "and an all-ordinary page states nothing about the rule: {clean:.2000}"
+        );
+    }
+
+    /// A CONFIRMED credit sale whose lines cannot be added up, for the surfaces
+    /// that only read confirmed documents. A confirmation refuses an un-totalable
+    /// document by design, so the second line is inserted the one way nothing in
+    /// this application is supposed to: straight through SQL, past the checked
+    /// write. That is precisely the case the checked accumulation exists for.
+    async fn confirmed_untotalable_credit_sale(state: &AppState, sku: &str) -> (i64, i64) {
+        use crate::models::{NewSale, PaymentType as Pay};
+        use chrono::NaiveDate;
+        use rust_decimal::Decimal as Dec;
+
+        let actor = audit_actor(state).await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: format!("Debt {sku}"),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Dec::from(25),
+                    cost_price: Dec::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let customer = seed_customer(state, "Debt Buyer").await;
+        let sale = state
+            .sales_service
+            .create_draft(
+                actor,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: Pay::Credit,
+                    sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 2).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        // One line of 4e28 totals exactly, so the real flow confirms it.
+        state
+            .sales_service
+            .add_line(
+                sale.id,
+                product.id,
+                Dec::from(1),
+                Some(Dec::from_str(FOUR_E28).unwrap()),
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .confirm(actor, sale.id, None)
+            .await
+            .expect("one line of 4e28 is carryable, so the confirm is an ordinary one");
+        // The second line: stored directly, which is the only way a CONFIRMED
+        // document can carry two lines the document fold cannot add up.
+        sqlx::query(
+            "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price, tax_total) \
+             VALUES (?, ?, ?, ?, 0)",
+        )
+        .bind(sale.id)
+        .bind(product.id)
+        .bind(Dec::from(1).to_string())
+        .bind(FOUR_E28)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        (sale.id, customer.id)
+    }
+
+    /// THE DEBT BANNER, which is a DIFFERENT aggregation from a plain list: its
+    /// headline is a sum over every unpaid document in the shop, and its rows
+    /// are documents. The page must render both — the sentence where the total
+    /// was, the document rows in place — because a receivable that silently
+    /// omitted one invoice would misstate what the shop is owed.
+    #[tokio::test]
+    async fn the_debt_banner_renders_a_document_whose_total_cannot_be_computed() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let (untotalable, _) = confirmed_untotalable_credit_sale(&state, "DEBT-BAD").await;
+        let ordinary = ordinary_draft(&state, "DEBT-ORD").await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let expected = localization
+            .tr(crate::localization::MessageKey::PriceRefusalDocumentTotalTooLarge)
+            .to_string();
+        let big = localization.format_currency(Decimal::from_str(FOUR_E28).unwrap());
+
+        let (status, html) = get_html(app, "/web/sales/debt").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the banner is a sum over documents, and one un-totalable document must not empty the \
+             panel: {html:.800}"
+        );
+        assert!(
+            html.contains(&expected),
+            "the headline states the refusal instead of a partial total: {html:.1200}"
+        );
+        assert!(
+            !html.contains(&big),
+            "and publishes no figure for the set: {html:.1200}"
+        );
+        // The document itself is still listed in the banner, in place.
+        let row = row_html(&html, "sale-debt-", untotalable);
+        assert!(
+            row.contains(&expected),
+            "the document's own row states the rule too: {row:.1200}"
+        );
+        assert!(!row.contains(&big), "and no figure: {row:.1200}");
+        let _ = ordinary;
     }
 }

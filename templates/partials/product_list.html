@@ -19,7 +19,10 @@
           {% if !ps.product.track_stock %}
             <span class="text-xs text-muted">{{ localization.tr(crate::localization::MessageKey::ProductUntracked) }}</span>
           {% else %}
-            {% if ps.stock.is_sign_negative() %}
+            {# A refused level states no sign, so it gets no "negative" chip
+               either: whether the level is negative is exactly what cannot be
+               stated. #}
+            {% if ps.negative %}
               <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductNegative) }}</span>
             {% endif %}
           {% endif %}
@@ -27,10 +30,10 @@
             <span class="chip chip-expense">{{ localization.tr(crate::localization::MessageKey::ProductLow) }} • {{ localization.tr(crate::localization::MessageKey::ProductSuggest) }} {{ localization.format_quantity(sug.clone()) }}</span>
           {% endif %}
         </div>
-        <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {{ localization.format_quantity(ps.stock.clone()) }}{% if let Some(min) = ps.product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</span>
+        <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductStock) }} {% if ps.stock.is_empty() %}<span class="text-danger" data-stock-level-refusal data-document-total-refusal>{{ ps.stock_message }}</span>{% else %}{{ ps.stock }}{% endif %}{% if let Some(min) = ps.product.min_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMinimum) }} {{ localization.format_quantity(min.clone()) }}{% endif %}{% if let Some(max) = ps.product.max_stock %} • {{ localization.tr(crate::localization::MessageKey::ProductMaximum) }} {{ localization.format_quantity(max.clone()) }}{% endif %}</span>
       </div>
       <div class="flex items-center gap-3">
-        <span class="font-bold tabular-nums {% if ps.stock.is_sign_negative() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_quantity(ps.stock.clone()) }}</span>
+        <span class="font-bold tabular-nums {% if ps.stock.is_empty() %}text-danger{% else if ps.negative %}text-expense{% else %}text-income{% endif %}">{% if ps.stock.is_empty() %}<span data-stock-level-refusal data-document-total-refusal>{{ ps.stock_message }}</span>{% else %}{{ ps.stock }}{% endif %}</span>
       </div>
     </div>
     {% endfor %}

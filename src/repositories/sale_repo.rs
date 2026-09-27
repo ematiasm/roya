@@ -6,8 +6,8 @@ use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    DocumentKind, DocumentQuery, DocumentRow, NewLineTax, NewSale, PaymentType, Sale, SaleLine,
-    SaleListFilter, SalePayment, SaleStatus, UpdateSaleDraft,
+    DocumentKind, DocumentQuery, DocumentRow, NewLineTax, NewSale, PaymentType, PriceRefusal, Sale,
+    SaleLine, SaleListFilter, SalePayment, SaleStatus, UpdateSaleDraft,
 };
 use crate::repositories::tax_repo::active_taxes_for_product;
 use crate::repositories::tax_snapshot_repo::replace_sale_line_taxes;
@@ -1015,30 +1015,51 @@ impl SaleRepository for SqliteSaleRepository {
         #[cfg(test)]
         self.tick();
 
+        // The per-document fold is CHECKED, and a document it cannot carry is
+        // recorded as a refusal ON ITS ROW rather than as an error for the read.
+        // The purchase twin says why at length; this is the same rule on the
+        // sales side of the same index: one document must not take the page down.
         let mut totals: std::collections::BTreeMap<i64, Decimal> =
+            std::collections::BTreeMap::new();
+        let mut refused: std::collections::BTreeMap<i64, PriceRefusal> =
             std::collections::BTreeMap::new();
         for row in line_rows {
             let line = row_to_line(row);
-            *totals.entry(line.sale_id).or_insert_with(|| Decimal::ZERO) +=
-                tax_inclusive_total(line.subtotal(), line.tax_total);
+            let running = totals.entry(line.sale_id).or_default();
+            match running.checked_add(tax_inclusive_total(line.subtotal(), line.tax_total)) {
+                Some(sum) => *running = sum,
+                // The document keeps folding — a later line of the same document
+                // cannot make the sum carryable — and the row will show no amount.
+                None => {
+                    refused.insert(line.sale_id, PriceRefusal::DocumentTotalTooLarge);
+                }
+            }
         }
 
         Ok(sales
             .into_iter()
-            .map(|sale| DocumentRow {
-                kind: DocumentKind::Sale,
-                id: sale.id,
-                owner_id: sale.id,
-                reference: sale
-                    .sale_number
-                    .clone()
-                    .unwrap_or_else(|| format!("Draft #{}", sale.id)),
-                party: sale.customer_name.clone(),
-                date: sale.sale_date,
-                detail: sale.status.to_string(),
-                amount: Some(totals.remove(&sale.id).unwrap_or_default()),
-                quantity: None,
-                created_by: sale.created_by,
+            .map(|sale| {
+                let total_refusal = refused.remove(&sale.id);
+                DocumentRow {
+                    kind: DocumentKind::Sale,
+                    id: sale.id,
+                    owner_id: sale.id,
+                    reference: sale
+                        .sale_number
+                        .clone()
+                        .unwrap_or_else(|| format!("Draft #{}", sale.id)),
+                    party: sale.customer_name.clone(),
+                    date: sale.sale_date,
+                    detail: sale.status.to_string(),
+                    amount: if total_refusal.is_some() {
+                        None
+                    } else {
+                        Some(totals.remove(&sale.id).unwrap_or_default())
+                    },
+                    total_refusal,
+                    quantity: None,
+                    created_by: sale.created_by,
+                }
             })
             .collect())
     }
@@ -1108,6 +1129,10 @@ impl SaleRepository for SqliteSaleRepository {
                     date: row.get("date"),
                     detail: "Pago".to_string(),
                     amount: Some(parse_decimal(&amount_str)),
+                    // A payment row carries its OWN stored amount, never a sum of
+                    // a document's lines, so there is no document total here to
+                    // refuse.
+                    total_refusal: None,
                     quantity: None,
                     created_by: row.get("created_by"),
                 }

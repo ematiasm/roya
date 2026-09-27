@@ -14,7 +14,7 @@
     <div class="text-[13px] text-muted">{{ notes }}</div>
     {% endif %}
     <div class="text-[13px] text-muted" data-supplier-actor>{{ localization.tr(crate::localization::MessageKey::SuppliersRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ editor }}{% endif %}</div>
-    <div class="my-2 text-2xl font-bold">{{ localization.format_currency(balance.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersOutstanding) }}</span></div>
+    <div class="my-2 text-2xl font-bold">{{ balance }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersOutstanding) }}</span></div>
     <div class="mt-4 flex items-center gap-2">
       {% if supplier.is_active %}
       <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
@@ -99,9 +99,11 @@
             <span class="chip chip-muted">{% if d.purchase.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if d.purchase.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
             <span class="font-semibold">{% if let Some(n) = d.purchase.purchase_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::DocumentsPurchase) }} #{{ d.purchase.id }}{% endif %}</span>
           </div>
-          <span class="text-[13px] text-muted">{{ localization.format_date(d.purchase.purchase_date.clone()) }} • {{ localization.format_currency(d.total.clone()) }} • {{ localization.tr(crate::localization::MessageKey::PurchasesPaid) }} {{ localization.format_currency(d.paid.clone()) }}</span>
+          {# A document whose lines cannot be added up renders in place with the
+             refusal where the money was, and no figure at all. #}
+          <span class="text-[13px] text-muted">{{ localization.format_date(d.purchase.purchase_date.clone()) }}{% if let Some(money) = d.money %} • {{ localization.format_currency(money.total.clone()) }} • {{ localization.tr(crate::localization::MessageKey::PurchasesPaid) }} {{ localization.format_currency(money.paid.clone()) }}{% else %} • <span class="text-danger" data-document-total-refusal>{{ d.total_refusal_message }}</span>{% endif %}</span>
         </div>
-        <span class="font-bold tabular-nums {% if d.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_currency(d.due.clone()) }}</span>
+        {% if let Some(money) = d.money %}<span class="font-bold tabular-nums {% if money.due.is_sign_positive() %}text-expense{% else %}text-income{% endif %}">{{ localization.format_currency(money.due.clone()) }}</span>{% endif %}
       </a>
       {% endfor %}
     {% endif %}

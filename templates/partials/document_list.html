@@ -15,6 +15,11 @@
       </div>
       <div class="flex items-center gap-3">
         {% if let Some(amount) = v.amount %}<span class="font-bold tabular-nums">{{ localization.format_currency(amount.clone()) }}</span>{% endif %}
+        {# A document whose lines cannot be added up keeps its row and states the
+           rule through the one shared price-refusal mapping, instead of showing
+           a figure the arithmetic could not produce. The page never fails
+           because of one document: every other row is unaffected. #}
+        {% if let Some(refusal) = v.total_refusal_message %}<span class="text-[13px] text-danger" data-document-total-refusal>{{ refusal }}</span>{% endif %}
         {% if let Some(quantity) = v.quantity %}<span class="font-bold tabular-nums">{{ localization.format_quantity(quantity.clone()) }}</span>{% endif %}
         <a href="{{ v.href }}" class="btn-secondary bg-card font-normal hover:opacity-100">{{ localization.tr(crate::localization::MessageKey::DocumentsOpen) }}</a>
       </div>

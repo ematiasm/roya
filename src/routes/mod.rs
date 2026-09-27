@@ -216,6 +216,8 @@ pub(crate) fn price_refusal_key(refusal: &PriceRefusal) -> MessageKey {
         PriceRefusal::NetPriceTooLarge => MessageKey::PriceRefusalNetPriceTooLarge,
         PriceRefusal::LineAmountTooLarge => MessageKey::PriceRefusalLineAmountTooLarge,
         PriceRefusal::TaxArithmeticTooLarge => MessageKey::PriceRefusalTaxArithmeticTooLarge,
+        PriceRefusal::DocumentTotalTooLarge => MessageKey::PriceRefusalDocumentTotalTooLarge,
+        PriceRefusal::AggregateTooLarge => MessageKey::PriceRefusalAggregateTooLarge,
     }
 }
 

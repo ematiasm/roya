@@ -1,7 +1,9 @@
 use rust_decimal::Decimal;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{Account, AccountDetail, AccountWithBalance, Transaction};
+use crate::models::{
+    Account, AccountDetail, AccountWithBalance, PriceRefusal, SetMoney, Transaction,
+};
 use crate::repositories::{AccountRepository, TransactionRepository};
 
 #[derive(Clone)]
@@ -53,6 +55,36 @@ where
         self.accounts.list_with_balances().await
     }
 
+    /// The accounts with their balances, plus the balance of ALL of them.
+    ///
+    /// The total is a SET sum over the same rows, so it is refused whenever any
+    /// account is: a headline that carried while one of its accounts states the
+    /// rule would be the operator adding a figure the page just told them does not
+    /// exist. It is also the same figure as before for an ordinary set — a sum of
+    /// per-account balances IS the sum of every transaction, and it now costs one
+    /// read instead of one per account plus one for the total.
+    pub async fn list_with_balances_and_total(
+        &self,
+    ) -> AppResult<(Vec<AccountWithBalance>, SetMoney)> {
+        let accounts = self.accounts.list_with_balances().await?;
+        let mut sum = Decimal::ZERO;
+        let mut refusal: Option<PriceRefusal> = None;
+        for account in &accounts {
+            match account.balance.amount {
+                Some(amount) => {
+                    sum = sum
+                        .checked_add(amount)
+                        .ok_or(AppError::PriceRefused(PriceRefusal::AggregateTooLarge))?
+                }
+                None => refusal = account.balance.refusal,
+            }
+        }
+        Ok((
+            accounts,
+            refusal.map_or_else(|| SetMoney::amount(sum), SetMoney::refused),
+        ))
+    }
+
     pub async fn list(&self) -> AppResult<Vec<Account>> {
         self.accounts.list().await
     }
@@ -75,10 +107,6 @@ where
             created_at: acc.created_at,
             transactions: txs,
         })
-    }
-
-    pub async fn total_balance(&self) -> AppResult<Decimal> {
-        self.accounts.total_balance().await
     }
 }
 

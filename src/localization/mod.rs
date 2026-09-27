@@ -301,6 +301,13 @@ define_message_keys! {
     // an unrepresentable tax total by the amount OR the rate.
     PriceRefusalLineAmountTooLarge => "price_refusal.line_amount_too_large",
     PriceRefusalTaxArithmeticTooLarge => "price_refusal.tax_arithmetic_too_large",
+    // The document-level accumulation's own refusal: every line of the document
+    // is representable and the SUM of them is not. A third rule rather than a
+    // reuse of either line rule, because the remedy is a third thing — reduce or
+    // split the document, or correct it at the source — and either line sentence
+    // would send the operator to a number that is already correct.
+    PriceRefusalDocumentTotalTooLarge => "price_refusal.document_total_too_large",
+    PriceRefusalAggregateTooLarge => "price_refusal.aggregate_too_large",
     ProductSave => "product.save",
     ProductSaveHelp => "product.save_help",
     ProductNoTaxesConfigured => "product.no_taxes_configured",
@@ -1240,6 +1247,8 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalNetPriceTooLarge, "the linked tax rates gross this final_price down to a net_price that is too large to store", "the linked tax rates gross this final_price down to a net_price that is too large to store"),
     (MessageKey::PriceRefusalLineAmountTooLarge, "qty * price is too large to store on this line", "qty * price is too large to store on this line"),
     (MessageKey::PriceRefusalTaxArithmeticTooLarge, "the line amount is too large to calculate its taxes", "the line amount is too large to calculate its taxes"),
+    (MessageKey::PriceRefusalDocumentTotalTooLarge, "the document total is too large to compute: reduce or split the document, or correct its amounts at the source", "the document total is too large to compute: reduce or split the document, or correct its amounts at the source"),
+    (MessageKey::PriceRefusalAggregateTooLarge, "the accumulated amount is too large to compute: correct the stored amounts at the source", "the accumulated amount is too large to compute: correct the stored amounts at the source"),
     (MessageKey::ProductSave, "Save product", "Save product"),
     (MessageKey::ProductSaveHelp, "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique.", "Creation rules also apply: services cannot track stock, tracked products require minimum and maximum values, and SKUs must be unique."),
     (MessageKey::ProductNoTaxesConfigured, "No taxes configured yet.", "No taxes configured yet."),
@@ -2204,6 +2213,8 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalNetPriceTooLarge, "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar.", "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar."),
     (MessageKey::PriceRefusalLineAmountTooLarge, "La cantidad por el precio es demasiado grande para guardarse en esta línea.", "La cantidad por el precio es demasiado grande para guardarse en esta línea."),
     (MessageKey::PriceRefusalTaxArithmeticTooLarge, "El importe de la línea es demasiado grande para calcular sus impuestos.", "El importe de la línea es demasiado grande para calcular sus impuestos."),
+    (MessageKey::PriceRefusalDocumentTotalTooLarge, "El total del documento es demasiado grande para calcularlo: reduzca o divida el documento, o corrija sus importes en el origen.", "El total del documento es demasiado grande para calcularlo: reduzca o divida el documento, o corrija sus importes en el origen."),
+    (MessageKey::PriceRefusalAggregateTooLarge, "El monto acumulado es demasiado grande para calcularlo: corrija los importes almacenados en el origen.", "El monto acumulado es demasiado grande para calcularlo: corrija los importes almacenados en el origen."),
     (MessageKey::ProductSave, "Guardar producto", "Guardar producto"),
     (MessageKey::ProductSaveHelp, "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos.", "También se aplican las reglas de creación: los servicios no pueden controlar stock, los productos con control requieren mínimos y máximos, y los SKU deben ser únicos."),
     (MessageKey::ProductNoTaxesConfigured, "Todavía no hay impuestos configurados.", "Todavía no hay impuestos configurados."),

@@ -30,25 +30,35 @@
   {% endif %}
 
   {% if let Some(st) = statement %}
-   <div class="my-2 text-2xl font-bold">{{ localization.format_currency(st.balance.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerBalanceAsOf) }} {{ localization.format_date(st.as_of.clone()) }}</span></div>
+   {# The balance is a sum over every receivable of this customer, the four
+      ageing buckets are four MORE sums over the same documents, and the ageing
+      TOTAL is a fifth — a bucket is a partition, so the sum across it is a set
+      sum of its own and can refuse where every bucket carries. All seven figures
+      are resolved by the route, so there is no branch here that could print a
+      number where a sum was refused: a refused figure IS the sentence, in the
+      cell it belongs to. #}
+   <div class="my-2 text-2xl font-bold" data-customer-statement-balance>{{ statement_figures.balance }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerBalanceAsOf) }} {{ localization.format_date(st.as_of.clone()) }}</span></div>
 
   <div class="mt-3 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerAgeing) }}</div>
+  {% if !statement_figures.ageing_totalled %}
+  <div class="rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-document-total-refusal>{{ statement_figures.ageing_total }}</div>
+  {% endif %}
   <div class="flex flex-wrap gap-2 [&>*]:flex-1">
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerCurrent) }}</div>
-       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.current.clone()) }}</div>
+       <div class="font-bold tabular-nums" data-ageing-bucket="current">{{ statement_figures.current }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerOverdue1To30) }}</div>
-       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_1_30.clone()) }}</div>
+       <div class="font-bold tabular-nums" data-ageing-bucket="overdue_1_30">{{ statement_figures.overdue_1_30 }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerOverdue31To60) }}</div>
-       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_31_60.clone()) }}</div>
+       <div class="font-bold tabular-nums" data-ageing-bucket="overdue_31_60">{{ statement_figures.overdue_31_60 }}</div>
     </div>
     <div class="rounded-[10px] border border-border bg-surface px-3 py-2">
       <div class="text-[11px] font-bold tracking-[0.04em] uppercase text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerOverdue61Plus) }}</div>
-       <div class="font-bold tabular-nums">{{ localization.format_currency(st.ageing.overdue_61_plus.clone()) }}</div>
+       <div class="font-bold tabular-nums" data-ageing-bucket="overdue_61_plus">{{ statement_figures.overdue_61_plus }}</div>
     </div>
   </div>
 

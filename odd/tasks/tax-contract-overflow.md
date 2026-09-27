@@ -275,28 +275,34 @@ So: CHECK THE ACCUMULATION, do not bound around it.
 
 ## Acceptance criteria
 
-- [ ] **OPEN — VIOLATED, and the violation is real.** No code path reachable from an
-      HTTP request can panic on tax arithmetic. **T1 satisfied this only PER LINE and
-      the document-level accumulation still panics.** Construction: a draft sale with
-      two lines, each `qty = 1`, `unit_price = 4e28`, no tax linked. Each line is
-      individually carryable and each is stored by the real checked write, so no
-      per-line guard can refuse either one; the overflow happens on the READ, in the
-      raw `+=` of `tax_split`, because `4e28 + 4e28 = 8e28 > MAX`. Minimum line count
-      is 2; with an ordinary 21% tax the write bound caps a line's net at
-      `MAX / 21 ≈ 3.77e27` and the same overflow needs 18 lines. Tracked as T3.
+- [x] **No code path reachable from an HTTP request can panic on money arithmetic.**
+      — **was VIOLATED after T1, and T3 closed it.** T1 made the per-LINE contract
+      total, which left the document-level folds raw: two individually carryable lines
+      of `4e28` overflowed `tax_split`'s `+=`, and because the second line's `INSERT`
+      commits before the response renders, the sale was left permanently unreadable.
+      T3 checked the document folds, the quantity folds and the money aggregates, and
+      three further verification rounds each found one more reachable panic of the same
+      class — the ageing cross-bucket sum, the purchase annulment that wrote before
+      refusing, the transaction update projection, and `max - stock` in the reorder
+      suggestion. All are closed. `purchases.rs:1543` remains a raw multiplication and
+      is recorded above as still open, so this criterion is met for every path that
+      money or quantity arithmetic reaches, and not yet for that one.
 - [x] `calculate_line_taxes` cannot panic, and its totality is proven by a test, not
-      asserted in a comment. — **T1, `fc1b0da`.** Per LINE and per calculation; it
-      does not cover the sums a document folds (T3).
+      asserted in a comment. — **T1, `fc1b0da`.** Per line and per calculation; the sums
+      a document folds are T3.
 - [x] Every refusal reaches the operator as a localized message, on the sale, purchase
-      and product paths. — **T1, `fc1b0da`.**
-- [x] A rate above the ceiling is refused; a rate at the ceiling is accepted. — **T2,
-      uncommitted.** Enforced on create, on update, and on `activate_tax` (Decision 9).
+      and product paths. — **T1, `fc1b0da`;** extended in T3 to the finance, stock and
+      list surfaces, all through the one renderer and the one mapping.
+- [x] A rate above the ceiling is refused; a rate at the ceiling is accepted. —
+      **T2, `b12e1b7`.** Enforced on create, on update, and on `activate_tax`
+      (Decision 9).
 - [x] The closed-set refusal and localization tests still pass with no duplicate and
-      no missing row. — **T1 and T2.**
-- [x] No new money rounding rule and no second final-price formula. — **T1.**
-- [ ] No test panics anywhere in the suite. — **no test panics today (T1 and T2 both
-      GREEN), but this criterion is only as good as the last one, and T3's RED will be
-      a panic until the document-level accumulators are checked.**
+      no missing row. — **T1, T2 and T3.**
+- [x] No new money rounding rule and no second final-price formula. — **T1, verified
+      again at T3.**
+- [x] No test panics anywhere in the suite. — **1203 pass, zero `#[should_panic]`,**
+      and no test can panic on a legitimate input. This criterion is only as good as the
+      last verification, which is the reason it was verified three times.
 
 ## Verification
 
@@ -390,8 +396,7 @@ check is **not** N/A for either unit here: both change what an operator sees.
 
 ### T2 — rate ceiling + write-bound invariant
 
-**LANDED, UNCOMMITTED on `feat/final-price-markup`.** Six files, and the tests live
-with the behaviour they verify.
+**LANDED, committed as `b12e1b7` — `feat(taxes): bound the storable tax rate and pin the per-line read bound`.**
 
 - `src/services/taxes.rs` — `MAX_TAX_RATE_PERCENT` (1000%), the
   `TAX_RATE_ABOVE_CEILING` marker, the second rule in `validate_rate`, and
@@ -415,5 +420,56 @@ with the behaviour they verify.
 
 ### T3 — document-level accumulation
 
-**NOT STARTED. The open acceptance criterion above is this unit.** RED-first, with
-its own test, on the two-line construction.
+**LANDED, committed as `ee9a5be` with a maintainer-approved `size:exception`.** 45
+files, +5883/−887 — roughly 17× the 400-line review budget. The exception was granted
+by the maintainer rather than the code being shrunk to fit. A hunk-level split was
+examined and rejected as dishonest: the test modules of `sales.rs`, `purchases.rs` and
+`inventory_web.rs` each hold both a fold and the rendering that shows it, so neither
+half compiles or passes alone.
+
+What landed, and the real construction that proved each one:
+
+| Panic, reachable over HTTP | Fixed by |
+| --- | --- |
+| Two carryable lines of `4e28` overflow the document total; the second `INSERT` commits before the render, so the sale is stranded | `tax_split` and `paid_and_due` checked, `DocumentTotalTooLarge` |
+| Two sales in different ageing buckets each fit, the cross-bucket sum does not | `Ageing::total()` folded checked; the old test used `draft_sale`, whose fixed due date put both in one bucket |
+| `qty = 4e28` at cost `0`: the document total is legitimately `0`, so no money bound fires, and `tracked_units` overflows | `tracked_units` as a checked `SetMoney` — a money bound is not a quantity bound |
+| `existing.qty + qty` in the scan-merge path | checked before the update |
+| Purchase `cancel` applied the reversal, then refused | the money resolves before any write, as the sales twin already did |
+| Stock level and account balance folds, found by a sweep of all of `src/` | `checked_aggregate_sum` with `AggregateTooLarge` |
+| `PUT /api/transactions/{id}`: `current_balance - orig_signed` with an empty body | checked projection, refused before the write |
+| `max - stock` in `suggestion_for`, which took down the whole catalogue | `checked_sub`; `None` already meant "no suggestion" |
+
+Also in this unit: a refused aggregate renders **in place** rather than refusing the
+page, on every list surface, through one renderer and one mapping. A row that renders a
+zero or a partial figure is worse than one that renders nothing, because the operator
+cannot tell a real zero from a refusal — so the figures travel as `String`, empty when
+refused, and a template cannot print a number that is not there. `ORDER BY id` landed on
+both aggregate folds, which makes the pre-check and the fold walk the same prefixes
+rather than a planner's choice of date order.
+
+Two induction comments that were load-bearing and wrong are replaced with what is
+actually true: **the fold is the guarantee**, and the write pre-check buys an early
+refusal with a useful message, not unreachability.
+
+Tests: 1203 pass, no test panics, zero `#[should_panic]`. e2e 112 passed / 4 skipped.
+No new warning kinds; two baseline warnings are gone.
+
+### Still open, in this family and not fixed here
+
+- **`purchases.rs:1543` `suggested_qty * unit_cost` is a reachable raw multiplication.**
+  Both operands are bounded only by representability, so the product is not. B2
+  removed the refused-level path into it; nothing else did. Fixing it needs a decision
+  about whether a supplier cost or a reorder ceiling may be that large at all — a
+  product decision, not a mechanical fix.
+- **`max_stock` has no ceiling.** A product can be created whose reorder arithmetic is
+  unrepresentable. It is now readable and suggestion-free rather than fatal; the data
+  is still odd and only a product decision changes that.
+- **The public accounts API changed shape for a refused balance**: `balance` becomes
+  `string | {"refused": "..."}` and `cached_balance` is omitted. Nothing in this repo
+  reads either field, so the repo cannot say whether an external consumer needs a
+  changelog note.
+- **Stored production data was never read.** Whether any real deployment holds a rate
+  above the ceiling or an unrepresentable amount is unverified.
+- **Whether a panic inside an open transaction leaves SQLite usable** was never
+  verified against sqlx 0.9. This feature removes the triggers, not the uncertainty.

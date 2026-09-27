@@ -3,23 +3,27 @@
    full list stays behind the API (`GET /api/sales/debt`), not this always-rendered
    panel. #}
 <div id="sale-debt-summary">
-  {% if debt.count == 0 %}
+  {% if debt_count == 0 %}
     <div class="empty">{{ localization.tr(crate::localization::MessageKey::SalesNoDebt) }}</div>
   {% else %}
+    {# The headline is a sum over every unpaid document in the shop. It is
+       rendered as the amount or as the refusal — never as a sum missing the one
+       document that could not be totaled — and the rows below keep their own
+       refusals, so one un-totalable document never empties this panel. #}
     <div class="mb-2 flex flex-wrap items-baseline gap-2">
-      <span class="text-2xl font-bold tabular-nums text-expense">{{ localization.format_currency(debt.total.clone()) }}</span>
-      <span class="text-[13px] text-muted">{{ debt.count }} {{ localization.tr(crate::localization::MessageKey::SalesOwedDocuments) }}</span>
+      {% if debt_totalled %}<span class="text-2xl font-bold tabular-nums text-expense" data-sale-debt-total>{{ debt_total }}</span>{% else %}<span class="text-2xl font-bold text-danger" data-sale-debt-total="refused" data-document-total-refusal>{{ debt_total }}</span>{% endif %}
+      <span class="text-[13px] text-muted">{{ debt_count }} {{ localization.tr(crate::localization::MessageKey::SalesOwedDocuments) }}</span>
     </div>
-    {% if debt.oldest.len() < debt.count %}
-    <div class="mb-1.5 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesOldest) }} {{ debt.oldest.len() }}:</div>
+    {% if debt_oldest.len() < debt_count %}
+    <div class="mb-1.5 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SalesOldest) }} {{ debt_oldest.len() }}:</div>
     {% endif %}
-    {% for d in debt.oldest %}
-    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-debt-{{ d.sale.id }}">
+    {% for v in debt_oldest %}
+    <div class="mb-2 flex items-center justify-between rounded-[10px] border border-border bg-surface px-3.5 py-3" id="sale-debt-{{ v.sale.id }}">
       <div class="flex flex-col">
-        <span class="font-semibold">{% if let Some(n) = d.sale.sale_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::SalesDraft) }}{% endif %}</span>
-        <span class="text-[13px] text-muted">{% if d.sale.customer_name.is_empty() %}{{ localization.tr(crate::localization::MessageKey::SalesWalkIn) }}{% else %}{{ d.sale.customer_name }}{% endif %} • {{ localization.format_date(d.sale.sale_date.clone()) }}{% if let Some(due) = d.sale.due_date %} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_date(due.clone()) }}{% endif %} • {{ localization.tr(crate::localization::MessageKey::SalesOwedDocuments) }} {{ localization.format_currency(d.due.clone()) }}</span>
+        <span class="font-semibold">{% if let Some(n) = v.sale.sale_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::SalesDraft) }}{% endif %}</span>
+        <span class="text-[13px] text-muted">{% if v.sale.customer_name.is_empty() %}{{ localization.tr(crate::localization::MessageKey::SalesWalkIn) }}{% else %}{{ v.sale.customer_name }}{% endif %} • {{ localization.format_date(v.sale.sale_date.clone()) }}{% if let Some(due) = v.sale.due_date %} • {{ localization.tr(crate::localization::MessageKey::SalesDue) }} {{ localization.format_date(due.clone()) }}{% endif %}{% if let Some(money) = v.money %} • {{ localization.tr(crate::localization::MessageKey::SalesOwedDocuments) }} {{ localization.format_currency(money.due.clone()) }}{% else %} • <span class="text-danger" data-document-total-refusal>{{ v.total_refusal_message }}</span>{% endif %}</span>
       </div>
-      <a href="/sales/{{ d.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">{{ localization.tr(crate::localization::MessageKey::SalesOpen) }}</a>
+      <a href="/sales/{{ v.sale.id }}" class="btn-secondary bg-card font-normal hover:opacity-100">{{ localization.tr(crate::localization::MessageKey::SalesOpen) }}</a>
     </div>
     {% endfor %}
   {% endif %}
