@@ -2,64 +2,38 @@
 
 ## Status
 
-**Planning complete. BLOCKED on a merge. No implementation yet.**
+**Planning complete. UNBLOCKED — the dependency has landed.**
 
-## ⛔ Hard dependency: `feat/final-price-markup` must land first
+## ✅ Dependency resolved: `final-price-markup` and the drawer are on `main`
 
-This feature **cannot start on `main`**, and the reason is not organizational —
-it is that the code T1 has to extract is not there.
+This feature could not start while `main` lacked the code T1 extracts. Both
+prerequisites have since merged, and the evidence is in `main` today:
 
-| symbol | `main` | `feat/final-price-markup` |
+| symbol | was on `main` | is on `main` now |
 | --- | --- | --- |
-| `ProductPriceLadder`, `net_refusal` | present | present |
 | `solve_final_price`, `max_solvable_final_price` | **absent** | present |
 | `final_price.rs` (`gross_divisor`, `solve_net`) | **absent** | present |
 | `line_net_amount` (the overflow guard) | **absent** | present |
+| `ProductPriceLadder`, `net_refusal` | present | present |
 
-`src/repositories/purchase_repo.rs:313` on `main` reads:
+`src/repositories/purchase_repo.rs:313` on `main` now reads:
 
 ```rust
-let calc = calculate_line_taxes(qty * unit_cost, &taxes);
+let calc = line_net_amount(qty, unit_cost)
+    .and_then(|net| calculate_line_taxes(net, &taxes))
+    .map_err(AppError::PriceRefused)?;
 ```
 
-— a raw multiply. On `feat/final-price-markup` the same line is
-`line_net_amount(qty, unit_cost).and_then(|net| calculate_line_taxes(net, &taxes))`,
-which returns a `SolveResult` and **refuses instead of panicking**. So `main`
-still carries a reachable money-overflow defect that the unmerged branch already
-fixes, and **T4 edits exactly that line**. Writing T4 on `main` would mean
-editing an expression that is itself the bug.
+— the raw `qty * unit_cost` multiply that made T4 unsafe to write is gone, and
+with it the reachable money-overflow defect `main` carried.
 
-**Task-level consequence:**
+**All seven tasks are now executable on `main`.** T1 extracts an inverse that
+exists; T4 edits a line that is now correct rather than being the bug.
 
-| task | blocked? | why |
-| --- | --- | --- |
-| T2, T5, T6, T7 — the **figure** | **no** | `calculate_line_taxes` is public at `line_taxes.rs:139` and the ladder already resolves the tax set at `taxes.rs:317`. The whole visible payoff is executable on `main` today. |
-| T1 — extract the inverse | **yes** | the code does not exist on `main` |
-| T3 — the basis column | **yes** | executable, but it has no consumer until T4 |
-| T4 — convert at the boundary | **yes** | needs the inverse, and touches a line `main` computes unsafely |
-
-**The decision taken: wait for the merge.** The sequence stays linear and nothing
-overlaps. The visible half was available early; that is the price of a clean
-sequence, and it is the right trade for a data-model change that must be
-reviewable on its own.
-
-### The merge order is forced by the topology
-
-```
-main                              23f548d
-└─ feat/final-price-markup        696f66c   7 commits    65 files, +13323 −1007
-   └─ feat/drawer-split-component f8b1722  11 commits    23 files,  +1937  −264
-      └─ feat/cost-with-taxes     (rebase onto main after the two above)
-```
-
-`feat/drawer-split-component` **descends from** `feat/final-price-markup`, so the
-second merge is 11 commits and does not re-carry the first seven.
-`feat/cost-with-taxes` was cut from `main` and shares no work with either, so it
-rebases cleanly once both are in.
-
-The two feature branches are unpushed; push, PR and merge are the maintainer's
-call. Nothing here was pushed, and the two `odd/tasks/` documents that must never
-be staged were never staged.
+Delivered as PR [#113](https://github.com/ematiasm/roya/pull/113) (the
+final-price solve and the overflow refusals, merge `2e91b1d`) and PR
+[#114](https://github.com/ematiasm/roya/pull/114) (the drawer component and the
+split, merge `8b970e9f`).
 
 
 ## Objective
@@ -269,12 +243,13 @@ case is not the one `net_refusal` was built for.
 
 ## Branch and delivery
 
-New branch from `main`, **not** from `feat/final-price-markup` or
-`feat/drawer-split-component`. This feature is a data-model change and must be
-reviewable on its own; the other two branches are unpushed and each already
-carries a second concern. Cutting from `main` avoids inheriting either.
+`feat/cost-with-taxes` is cut from `main` and rebased onto it after both merges.
+It shares no work with either delivered branch, so it stands alone — which is the
+point: this is a data-model change and must be reviewable on its own.
 
-Size is a real risk here: the cost-feature history in this repo is
+Size is a real risk here. The cost-feature history in this repo is
 `odd/tasks/cost-price-freshness.md` at 40K, so expect this to exceed the ~400
-line heuristic and plan the PR structure deliberately rather than discovering it
-at the end.
+line heuristic. **Plan the PR structure deliberately rather than discovering it at
+the end** — the delivered precedent is `feat/tax-calculation-0*`, which split one
+feature into five chained PRs. T1 in particular is a behaviour-preserving
+extraction and would merge cleanly on its own, before anything depends on it.
