@@ -29,6 +29,7 @@ states for a human to look at; it is skipped unless
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from urllib.parse import urlparse
 
 import pytest
@@ -1393,6 +1394,310 @@ def test_switching_the_kind_in_the_drawer_moves_the_ladder_threshold(
     stored = api.get_json(f"/api/products/{product_id}")
     assert stored["kind"] == "Service", stored
     assert stored["sale_price"] == "0.00", stored
+
+
+# ---------------------------------------------------------------------------
+# Setting a FINAL, tax-inclusive price (final price markup U2)
+# ---------------------------------------------------------------------------
+
+_FINAL_PRICE_PATH = "/web/product-final-price"
+_CONFIRM_FINAL_PRICE_PATH = "/web/product-final-price/confirm"
+
+
+def _final_price_control(page: Page):
+    """The control that asks for the price the customer pays.
+
+    Addressed by its own endpoint, the way the ladder is addressed by its own: a
+    locator that finds the input by placeholder would still pass against a
+    control wired to nothing.
+    """
+    return page.locator(f'#product-final-price-form[hx-get="{_FINAL_PRICE_PATH}"]')
+
+
+def _confirm_final_price(page: Page):
+    """The CONFIRM control, which the server renders only after a preview.
+
+    Its absence from the drawer before a preview is the point of the design, so
+    this locator is expected to match nothing until the preview has answered.
+    """
+    return page.locator(f'#product-final-price-confirm button[hx-post="{_CONFIRM_FINAL_PRICE_PATH}"]')
+
+
+def _final_price_product(api: ApiClient, sku: str, name: str) -> int:
+    """A manual-price product with a cost of 10 and ONE 10% tax linked to it.
+
+    10% is chosen because it makes the ladder's arithmetic readable by hand: a
+    final price of 100.00 is 90.91 net plus 9.09 of tax, and 90.91 is the ONLY
+    net that lands exactly on 100.00. A 21% rate would make the expected figures
+    a matter of trust in the solver rather than of arithmetic.
+    """
+    product = create_product(
+        api,
+        sku=sku,
+        name=name,
+        sale_price="20.00",
+        cost_price="10.00",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    tax = api.post_json(
+        "/api/taxes",
+        {"code": "IVA10", "name": "IVA 10%", "rate": "10", "is_active": True},
+    )
+    api.post_json(f"/api/products/{product_id}/taxes", {"tax_id": int(tax["id"])})
+    return product_id
+
+
+def test_a_final_price_is_previewed_before_it_is_confirmed_and_only_the_confirm_stores_it(
+    page: Page, api: ApiClient
+) -> None:
+    """The whole two-step operator flow, in a real browser.
+
+    What only a browser can prove is that the CONFIRM does not exist until a
+    preview has run, and that the save form's own price fields are repopulated
+    from the database afterwards. A Rust test can assert the stored row; it
+    cannot assert that a control the operator can press was absent a moment
+    earlier, nor that a form on a different fragment from the one that was
+    submitted now shows the same thing the row holds.
+
+    So the flow is walked in order:
+
+    * the drawer opens with the stored ladder and NO way to confirm;
+    * typing a final price and submitting runs a GET that changes nothing;
+    * the preview shows the whole solved chain, chipped "Unsaved";
+    * the confirm appears, and only now is there a way to write;
+    * confirming stores the net and the markup, the save form's fields move to
+      the stored figures, and re-opening the drawer shows the same thing.
+    """
+    product_id = _final_price_product(api, "FINAL-SKU-40", "Final Price Widget")
+    _open_products_list(page, api, name="Final Price Widget")
+    _open_product_drawer(page, product_id)
+
+    # As stored: a manual net of 20.00 with a cost of 10.00, and 2.00 of tax
+    # on top of it.
+    before = _ladder_amounts(page)
+    assert before["Cost price"] == "10.00 USD", before
+    assert before["Net price"] == "20.00 USD", before
+    assert before["Price with tax"] == "22.00 USD", before
+
+    # Nothing to confirm yet. This is the assertion a Rust test cannot make.
+    expect(_confirm_final_price(page)).to_have_count(0)
+
+    # M3: the control says up front what it does NOT read, because an operator
+    # who typed a sale price and then a final price would otherwise lose the
+    # first one with no warning.
+    expect(page.locator("[data-product-final-price-control]")).to_contain_text(
+        "the sale price and the markup in the form above are not read"
+    )
+
+    # Unsaved work in fields the conversion does not own. A confirm that
+    # re-rendered the drawer body would throw all of this away silently.
+    form = _edit_form(page)
+    form.locator('input[name="location"]').fill("aisle-9")
+    form.locator('input[name="notes"]').fill("typed note")
+    form.locator('input[name="min_stock"]').fill("3.50")
+
+    # --- STEP ONE: preview, which writes nothing -----------------------------
+    _final_price_control(page).locator('input[name="final_price"]').fill("100.00")
+    with page.expect_response(_response_for(_FINAL_PRICE_PATH, "GET")):
+        _final_price_control(page).get_by_role("button", name="Preview").click()
+
+    # 100.00 with 10% tax is 90.91 net plus 9.09, and it re-derives to exactly
+    # 100.00 rather than to 99.99 or 100.01.
+    previewed = _ladder_amounts(page)
+    assert previewed["Cost price"] == "10.00 USD", previewed
+    assert previewed["Net price"] == "90.91 USD", previewed
+    assert previewed["IVA10 — IVA 10%"] == "9.09 USD", previewed
+    assert previewed["Tax total"] == "9.09 USD", previewed
+    assert previewed["Price with tax"] == "100.00 USD", previewed
+    # Every row is chipped unsaved, because a preview by definition stores
+    # nothing.
+    expect(page.locator("#product-price-ladder")).to_contain_text("Unsaved")
+
+    # And the row is untouched, read back through the API rather than trusted.
+    stored = api.get_json(f"/api/products/{product_id}")
+    assert stored["sale_price"] == "20.00", stored
+    assert stored["markup_pct"] is None, stored
+
+    # The confirm now exists, which is what makes "preview, then confirm" true
+    # in the page and not merely in the server.
+    expect(_confirm_final_price(page)).to_be_visible()
+    # And it says what it is about to commit, before it is pressed.
+    expect(page.locator("[data-product-final-price-confirm]")).to_contain_text(
+        "This stores the net price, the markup the ladder shows, and the cost above"
+    )
+
+    # --- STEP TWO: confirm, which writes ------------------------------------
+    with page.expect_response(_response_for(_CONFIRM_FINAL_PRICE_PATH, "POST")):
+        _confirm_final_price(page).click()
+
+    after = _ladder_amounts(page)
+    assert after["Net price"] == "90.91 USD", after
+    assert after["Price with tax"] == "100.00 USD", after
+
+    # M1: the three fields the confirm wrote now show the stored figures, and
+    # everything else the operator typed is STILL THERE and still editable. The
+    # second half is the assertion a stored-row test cannot make and the whole
+    # reason the confirm no longer re-renders the drawer body.
+    form = _edit_form(page)
+    expect(form.locator('input[name="sale_price"]')).to_have_value("90.91")
+    expect(form.locator('input[name="markup_pct"]')).to_have_value("809.10")
+    expect(form.locator('input[name="cost_price"]')).to_have_value("10.00")
+    for field, typed in (
+        ("location", "aisle-9"),
+        ("notes", "typed note"),
+        ("min_stock", "3.50"),
+    ):
+        expect(form.locator(f'input[name="{field}"]')).to_have_value(typed)
+        expect(form.locator(f'input[name="{field}"]')).to_be_editable()
+
+    # The markup-binding script survived the swap: clearing the markup re-enables
+    # the net price field, which it would not do if the confirm had left the old,
+    # listener-less inputs in place.
+    form.locator('input[name="markup_pct"]').fill("")
+    expect(form.locator('input[name="sale_price"]')).to_be_editable()
+    form.locator('input[name="markup_pct"]').fill("809.10")
+
+    # A markup-managed product: the net is derived, and the drawer says so.
+    expect(page.locator("#product-price-ladder")).to_contain_text(
+        "Derived from the cost and the markup"
+    )
+    # The confirm is gone with the drawer re-render: there is nothing left to
+    # commit, so the control that commits is not offered again.
+    expect(_confirm_final_price(page)).to_have_count(0)
+
+    # And the row holds both, so the two are not two free numbers.
+    stored = api.get_json(f"/api/products/{product_id}")
+    assert stored["sale_price"] == "90.91", stored
+    assert Decimal(stored["markup_pct"]) == Decimal("809.10"), stored
+
+    # Re-opening the drawer reads the stored row, so it must show the same
+    # figures: nothing about the answer lives only in the browser.
+    page.get_by_role("button", name="Close detail").click()
+    _open_product_drawer(page, product_id)
+    reopened = _ladder_amounts(page)
+    assert reopened["Net price"] == "90.91 USD", reopened
+    assert reopened["Price with tax"] == "100.00 USD", reopened
+    expect(_edit_form(page).locator('input[name="sale_price"]')).to_have_value("90.91")
+
+
+def test_a_refused_final_price_preview_offers_no_confirm_and_keeps_the_drawer_editable(
+    page: Page, api: ApiClient
+) -> None:
+    """A refused preview must not cost the operator their work, and must not
+    leave a way to write.
+
+    With a single 10% tax the tax-inclusive price is a staircase: 0.04 prices at
+    0.04 and 0.05 prices at 0.06, so 0.05 is a price no net can produce. The
+    preview must say so in the ladder, in place, WITHOUT replacing the drawer
+    body — replacing it would throw away every unsaved value in the save form on
+    a product that is perfectly storable — and it must offer no confirm, because
+    there is nothing to confirm.
+
+    So the sharp assertions are the absences: the edit form is still in the
+    page, its unsaved value is still in it, and the refusal named the reason
+    rather than inventing a nearby price.
+    """
+    product_id = _final_price_product(api, "FINAL-SKU-41", "Refused Final Widget")
+    _open_products_list(page, api, name="Refused Final Widget")
+    _open_product_drawer(page, product_id)
+
+    # Something unsaved in the save form, which a body-swapping answer would
+    # discard: this is the work the refusal has to leave alone.
+    _edit_form(page).locator('input[name="cost_price"]').fill("11.11")
+    _edit_form(page).locator('input[name="location"]').fill("aisle-9")
+    _edit_form(page).locator('input[name="notes"]').fill("typed note")
+
+    _final_price_control(page).locator('input[name="final_price"]').fill("0.05")
+    with page.expect_response(_response_for(_FINAL_PRICE_PATH, "GET")):
+        _final_price_control(page).get_by_role("button", name="Preview").click()
+
+    ladder = _ladder(page)
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_be_visible()
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_contain_text(
+        "no net price produces this final price with the linked taxes"
+    )
+    # The ladder's standing guarantee survives: a refusal publishes no tax money.
+    expect(ladder).not_to_contain_text("Price with tax")
+    expect(ladder).not_to_contain_text("Tax total")
+    # Nothing to commit, so no way to commit.
+    expect(_confirm_final_price(page)).to_have_count(0)
+
+    # The drawer is still open, still editable, and EVERY unsaved value is still
+    # in it — not only the cost, which is the one the conversion reads.
+    expect(page.locator("#product-drawer")).to_be_visible()
+    for field, typed in (
+        ("cost_price", "11.11"),
+        ("location", "aisle-9"),
+        ("notes", "typed note"),
+    ):
+        expect(_edit_form(page).locator(f'input[name="{field}"]')).to_have_value(typed)
+        expect(_edit_form(page).locator(f'input[name="{field}"]')).to_be_editable()
+    # And the control is there to correct the price rather than re-typed from
+    # scratch.
+    expect(_final_price_control(page).locator('input[name="final_price"]')).to_have_value(
+        "0.05"
+    )
+
+    # Nothing was stored: the ladder is publishing no net at all rather than the
+    # row's old one beside a refusal, and the row is unchanged.
+    assert _ladder_amounts(page)["Net price"] == "—"
+    stored = api.get_json(f"/api/products/{product_id}")
+    assert stored["sale_price"] == "20.00", stored
+    assert stored["markup_pct"] is None, stored
+    assert stored["cost_price"] == "10.00", stored
+
+
+def test_editing_a_price_field_in_the_drawer_retires_the_final_price_confirm(
+    page: Page, api: ApiClient
+) -> None:
+    """The confirm must not outlive the preview it belongs to.
+
+    Preview a final price, the confirm appears, then edit the cost. That edit is
+    wired to the ladder endpoint, which previews the SAVE FORM — so the figures
+    under the confirm are no longer the ones the operator previewed, and a live
+    confirm would be promising a conversion they never saw. The stored row would
+    still come out right, because the confirm re-solves; what would be wrong is
+    the promise on screen, and a promise an operator acts on.
+
+    This is the browser half of the Rust test of the same name: the assertion is
+    that the confirm is GONE and cannot be pressed, and that previewing again
+    brings it back.
+    """
+    product_id = _final_price_product(api, "FINAL-SKU-42", "Retired Confirm Widget")
+    _open_products_list(page, api, name="Retired Confirm Widget")
+    _open_product_drawer(page, product_id)
+
+    _final_price_control(page).locator('input[name="final_price"]').fill("100.00")
+    with page.expect_response(_response_for(_FINAL_PRICE_PATH, "GET")):
+        _final_price_control(page).get_by_role("button", name="Preview").click()
+    expect(_confirm_final_price(page)).to_be_visible()
+
+    # The operator edits the cost, which is the ladder endpoint's trigger. The
+    # `fill` + `blur` pair is the suite's own shape for a ladder refresh: `fill`
+    # alone does not fire the `change` the inputs listen for.
+    cost_field = _edit_form(page).locator('input[name="cost_price"]')
+    cost_field.fill("12.00")
+    with page.expect_response(_response_for(_LADDER_PATH)):
+        cost_field.blur()
+
+    # The ladder is now the save form's own preview, and the confirm is gone.
+    amounts = _ladder_amounts(page)
+    assert amounts["Cost price"] == "12.00 USD", amounts
+    expect(_confirm_final_price(page)).to_have_count(0)
+    # And there is no way to reach the write from the page at all.
+    expect(page.locator(f'[hx-post="{_CONFIRM_FINAL_PRICE_PATH}"]')).to_have_count(0)
+
+    # Previewing again restores it, so the control is retired and not disabled.
+    with page.expect_response(_response_for(_FINAL_PRICE_PATH, "GET")):
+        _final_price_control(page).get_by_role("button", name="Preview").click()
+    expect(_confirm_final_price(page)).to_be_visible()
+
+    # And nothing was stored by any of it.
+    stored = api.get_json(f"/api/products/{product_id}")
+    assert stored["sale_price"] == "20.00", stored
+    assert stored["cost_price"] == "10.00", stored
 
 
 # ---------------------------------------------------------------------------

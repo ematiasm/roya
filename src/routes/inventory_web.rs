@@ -25,6 +25,7 @@ use crate::security::authz::{
     InventoryRead, InventoryStockWrite, InventoryWrite, Nav, PurchasesCostsRead,
     PurchasesCostsWrite, Require,
 };
+use crate::services::final_price::{solve_final_price, SolvedMarkup};
 
 // S5 enforcement mapping (products screen). The screen mixes capabilities, so
 // every handler declares its own extractor — reads `inventory.read`, product
@@ -207,6 +208,15 @@ struct ProductPriceLadderPartial {
     /// HERE, by the one shared mapping, so the fragment never renders a refusal
     /// in a language of its own.
     net_refusal_message: Option<String>,
+    /// True when this product has no positive cost AND no markup, so its net
+    /// price is manual and there is nothing for a markup to be a percentage OF.
+    ///
+    /// Computed HERE rather than in the template because a `Decimal` comparison
+    /// is a fact about the answer, not about the markup — and because the
+    /// fragment then states WHY the markup row is a dash instead of leaving an
+    /// operator to work it out. A product that can take a final price is exactly
+    /// this one: the net is solved and honoured, and no markup is invented.
+    markup_not_derivable: bool,
 }
 
 /// The refusal a ladder publishes, as the active locale words it — or `None`,
@@ -229,12 +239,101 @@ fn product_price_ladder_html(
     let net_refusal_message = ladder_refusal_message(&ladder, localization);
     ProductPriceLadderPartial {
         localization: localization.clone(),
+        markup_not_derivable: markup_not_derivable(&ladder),
         ladder,
         net_refusal_message,
     }
     .render()
     .map(Html)
     .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+/// Whether this ladder's product has no positive cost AND no markup, so its net
+/// price is manual and there is nothing for a markup to be a percentage OF.
+///
+/// One function because the drawer's embedded fragment and the standalone
+/// preview endpoint answer about the SAME product and would otherwise be free to
+/// disagree about whether a markup is derivable — a disagreement no test that
+/// only visits one of them could see.
+fn markup_not_derivable(ladder: &ProductPriceLadder) -> bool {
+    ladder.markup_pct.is_none() && ladder.cost_price <= Decimal::ZERO
+}
+
+/// The CONFIRM control, rendered out of band by the final-price routes and never
+/// part of the drawer's own markup. See
+/// `templates/partials/product_final_price_confirm.html` for why it arrives
+/// only after a preview, and only after a successful one.
+#[derive(Template)]
+#[template(path = "partials/product_final_price_confirm.html")]
+struct ProductFinalPriceConfirmPartial {
+    localization: LocalizationContext,
+    /// False renders NOTHING, which is how the out-of-band swap empties the
+    /// slot: a refused preview and a refused confirm both leave the drawer with
+    /// no way to write.
+    enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// The regions a CONFIRMED final price re-renders out of band (M1)
+//
+// A confirm writes `cost_price`, `sale_price` and `markup_pct`, and it must not
+// re-render the drawer body, because the body carries every OTHER field the
+// operator may have typed and the row does not hold. So each region below is one
+// thing that is a FUNCTION of what the confirm wrote, with the SAME partial the
+// drawer itself includes — one definition, two call sites, so a confirm can
+// never drift from the drawer it is refreshing.
+//
+// | region | why a confirm moves it |
+// |---|---|
+// | the three price fields | it wrote all three |
+// | the markup-binding script | it replaced the two inputs the script binds to |
+// | the stale-cost badge | the verdict is `cost_price` vs the supplier's truth |
+// | the audit line | a conversion is an update, so `updated_by` moved |
+//
+// Everything else on the form is left exactly as typed, which is the whole
+// point: a refusal never discarded it, and neither may a success.
+// ---------------------------------------------------------------------------
+
+/// The three price fields, as three partials the drawer includes and a confirm
+/// swaps. `Product` by reference because the confirm re-reads the row after the
+/// write, and the drawer already holds the same one.
+#[derive(Template)]
+#[template(path = "partials/product_sale_price_field.html")]
+struct ProductSalePriceFieldPartial<'a> {
+    localization: &'a LocalizationContext,
+    product: &'a Product,
+}
+
+#[derive(Template)]
+#[template(path = "partials/product_cost_price_field.html")]
+struct ProductCostPriceFieldPartial<'a> {
+    localization: &'a LocalizationContext,
+    product: &'a Product,
+}
+
+#[derive(Template)]
+#[template(path = "partials/product_markup_field.html")]
+struct ProductMarkupFieldPartial<'a> {
+    localization: &'a LocalizationContext,
+    product: &'a Product,
+}
+
+/// The stale-cost badge, an `Option` because "no disagreement" is a state this
+/// partial has to be able to state — a conversion can bring the stored cost back
+/// into agreement and the badge has to go.
+#[derive(Template)]
+#[template(path = "partials/product_stale_cost.html")]
+struct ProductStaleCostPartial<'a> {
+    localization: &'a LocalizationContext,
+    stale_cost: Option<&'a StaleCostView>,
+}
+
+#[derive(Template)]
+#[template(path = "partials/product_audit_line.html")]
+struct ProductAuditLinePartial<'a> {
+    localization: &'a LocalizationContext,
+    created_by_name: Option<&'a str>,
+    updated_by_name: Option<&'a str>,
 }
 
 /// The product slide-over drawer body: the header with derived stock and the
@@ -277,6 +376,10 @@ struct ProductDetailPartial {
     /// that fragment, so the sentence it states is resolved by the same shared
     /// mapping rather than by a rendering rule of its own.
     net_refusal_message: Option<String>,
+    /// The same field again, for the same reason: the embedded fragment reads
+    /// it, so the drawer's first render and the preview endpoint cannot disagree
+    /// about whether a markup is derivable from a cost.
+    markup_not_derivable: bool,
     supplier_costs: Vec<ProductCostView>,
     suppliers: Vec<crate::models::Supplier>,
     stale_cost: Option<StaleCostView>,
@@ -783,15 +886,569 @@ async fn web_product_price_ladder(
         .tax_service
         .product_price_ladder(query.id, input)
         .await?;
-    product_price_ladder_html(&localization, ladder)
+    // THE CONFIRM IS RETIRED HERE, and this is the whole answer to "how do the
+    // two callers of this island tell themselves apart": they do not share an
+    // endpoint, so there is no flag to get wrong. This endpoint is the SAVE
+    // FORM's preview — the cost, the markup, the net price and the kind each
+    // trigger it — and the final-price preview has its own. So every answer from
+    // here invalidates any conversion preview on offer, because a conversion
+    // preview is a statement about exactly the form this endpoint is re-reading.
+    //
+    // The failure this prevents: preview a final price, then edit the cost. The
+    // ladder is now the save form's own preview, and a confirm left standing
+    // under it would promise a conversion the operator never saw. The stored row
+    // would still come out right — the confirm re-solves — but the VISIBLE
+    // promise would be a lie, and a lie the operator acts on.
+    //
+    // Unconditional, on purpose, and that includes a bare read: any answer from
+    // this path is a statement about the form, so the confirm's premise is gone
+    // either way. The only other way to obtain a confirm is to run a final-price
+    // preview, which fills the slot again.
+    let body = format!(
+        "{}\n{confirm_slot}",
+        product_price_ladder_html(&localization, ladder)?.0,
+        confirm_slot = out_of_band(CONFIRM_SLOT, ""),
+    );
+    Ok(Html(body))
 }
 
-/// The drawer body with fresh derived data. The detail read and every mutating
-/// drawer action answer it, so saving/costs/movements refresh the drawer in
-/// place without the client rebuilding a URL. The audit actors are resolved
-/// HERE, in the wiring layer, because a department may not read identity
-/// tables (AC20) and the view must show a name, never an id — the same way
-/// the finance detail does it.
+/// The values the final-price control reads, in ONE struct, because the preview
+/// and the confirm must be handed the same shape and neither may read a field
+/// the other ignores.
+///
+/// # Why the cost is an input and the markup is not
+///
+/// The cost is a GIVEN — what this costs me — so a cost typed and not saved is
+/// exactly the case an operator most needs answered before committing, and it
+/// is why the control READS the save form's own `cost_price` rather than
+/// keeping a second copy of a field it does not own.
+///
+/// The markup is an OUTPUT — what I make on it. A final price DETERMINES the
+/// markup, so the save form's `markup_pct` is not an input to this control at
+/// all: reading it would let a typed markup override the one the solve verified,
+/// and the stored net would stop being the price the operator typed. The solve
+/// is still HANDED the product's STORED markup, for one purpose only — its
+/// contradiction rule, which refuses a row carrying a markup with no positive
+/// cost.
+#[derive(Debug, Deserialize)]
+struct FinalPriceValues {
+    /// The drawer's own key, the same one the ladder preview reads it under.
+    id: i64,
+    final_price: String,
+    /// Read from the SAVE form, which `hx-include` pulls in. An absent key
+    /// means "this request carries no save form", which is the same distinction
+    /// the ladder preview draws between a bare read and an emptied field.
+    #[serde(default)]
+    cost_price: Option<String>,
+}
+
+/// The control's values, read once and gated once, for both steps.
+///
+/// An EMPTY cost is the column's own "no cost recorded yet" zero, exactly as
+/// the save path reads it. An UNREADABLE one is a typo, and it is a 400 in both
+/// steps rather than a guess: the ladder's documented precedence is to name the
+/// field the operator is typing into instead of reading it as a zero.
+struct FinalPriceInput {
+    product_id: i64,
+    final_price: Decimal,
+    cost_price: Decimal,
+}
+
+fn final_price_input(
+    values: &FinalPriceValues,
+    localization: &LocalizationContext,
+) -> AppResult<FinalPriceInput> {
+    let final_price = match read_price_field(&values.final_price, localization) {
+        PriceField::Value(value) => value,
+        // EMPTY and UNREADABLE are the same thing to this control — there is no
+        // price to solve from — and NEITHER is a price RULE, so neither becomes
+        // a `PriceRefusal`. A refusal is a sentence in the catalog, and a
+        // catalog sentence no rule can produce is a lie an operator would have
+        // to read. This is a form error, and 400 is the answer the ladder's own
+        // `Unreadable` state and `web_record_product_cost` already give.
+        PriceField::Empty | PriceField::Unreadable => {
+            return Err(AppError::Validation("invalid final_price".into()))
+        }
+    };
+    let cost_price = match read_price_field(
+        values.cost_price.as_deref().unwrap_or_default(),
+        localization,
+    ) {
+        PriceField::Value(value) => value,
+        PriceField::Empty => Decimal::ZERO,
+        PriceField::Unreadable => return Err(AppError::Validation("invalid cost_price".into())),
+    };
+    Ok(FinalPriceInput {
+        product_id: values.id,
+        final_price,
+        cost_price,
+    })
+}
+
+/// The solve, run from the values on screen. Shared by both steps so they cannot
+/// drift: the preview's answer and the confirm's write come out of this ONE
+/// call, and the confirm never sees a number the preview produced.
+async fn solve_final_price_from_screen(
+    state: &AppState,
+    input: &FinalPriceInput,
+) -> AppResult<(
+    crate::models::Product,
+    crate::services::final_price::FinalPriceSolve,
+)> {
+    let product = state
+        .inventory_service
+        .get_product(input.product_id)
+        .await?;
+    let taxes = state
+        .tax_service
+        .list_active_for_product(input.product_id)
+        .await?;
+    let solve = solve_final_price(
+        input.final_price,
+        product.kind,
+        input.cost_price,
+        product.markup_pct,
+        &taxes,
+    )
+    .map_err(AppError::PriceRefused)?;
+    Ok((product, solve))
+}
+
+/// The markup a solved answer may store, or the typed statement that none exists.
+fn storable_markup(solve: &crate::services::final_price::FinalPriceSolve) -> Option<Decimal> {
+    match &solve.markup {
+        SolvedMarkup::Verified { markup_pct, .. } => Some(*markup_pct),
+        // A product with no positive cost has nothing for a markup to be a
+        // percentage OF, so none is written. The solve's first rule already
+        // refused any product that ARRIVED with a markup in this state, so this
+        // is not a silent overwrite: it is the write saying "no markup" out
+        // loud rather than inheriting whatever was there.
+        SolvedMarkup::NotDerivableWithoutCost => None,
+    }
+}
+
+/// The ladder a SOLVED answer would publish, with the figure the confirm would
+/// store in the ladder's own shape.
+///
+/// This is the whole rendering strategy, and it is why the preview needs no
+/// renderer of its own: the solved net and the solved markup are handed to
+/// `LadderInput::Form`, which is the input the SAVE FORM's own preview already
+/// uses. The ladder then re-derives the net from that cost and that markup
+/// through `derive_net_sale_price` and re-totals it through
+/// `calculate_line_taxes` — so a preview re-verifies the round trip the solve
+/// claims, and its published total is the typed figure or the preview is wrong
+/// about something the ladder would show. `from_form` comes out true, so every
+/// row is chipped "Unsaved", which is exactly what a preview is.
+fn solved_ladder_input(
+    input: &FinalPriceInput,
+    solve: &crate::services::final_price::FinalPriceSolve,
+) -> LadderInput {
+    LadderInput::Form {
+        // The control does not own the kind, so it names none and the ladder
+        // falls back to the product's stored kind — the ladder's own documented
+        // behaviour for a request that names no readable kind.
+        kind: None,
+        sale_price: solve.net_price,
+        cost_price: input.cost_price,
+        markup_pct: storable_markup(solve),
+    }
+}
+
+/// The out-of-band block that carries the CONFIRM control into the drawer, or
+/// empties the slot when there is nothing to confirm.
+///
+/// The confirm control is NOT in the drawer's own markup. It is rendered here
+/// and only here, so "preview, then confirm" is a property of the markup rather
+/// than of a disabled attribute somebody can work around with the keyboard: a
+/// refused preview, and a drawer that has never been previewed, both leave the
+/// slot empty and neither offers a way to write.
+fn confirm_slot_html(localization: &LocalizationContext, enabled: bool) -> AppResult<String> {
+    ProductFinalPriceConfirmPartial {
+        localization: localization.clone(),
+        enabled,
+    }
+    .render()
+    .map_err(|error| AppError::Internal(error.to_string()))
+}
+
+/// `GET /web/product-final-price`: the final-price PREVIEW. The operator types
+/// what the customer pays; the server solves it and publishes what WOULD happen,
+/// writing nothing.
+///
+/// # WHY A GET, which is the load-bearing part
+///
+/// "It persists nothing" has to be structural rather than promised, and the
+/// repository already has the argument: the ladder preview is a GET behind
+/// `inventory.read` precisely so that no write verb exists on the path, and a
+/// POST to it is answered 405. This is the same rule for the same reason — a
+/// preview that wrote would be a conversion nobody confirmed. So the preview is
+/// a GET behind `inventory.read`, and the only verb that can write anything is
+/// the confirm's own POST behind `inventory.write`.
+///
+/// # What it publishes, and what it never publishes
+///
+/// On a solve it publishes the ladder built from the SOLVED net, the SOLVED
+/// markup and the cost ON SCREEN — so the operator reads the consequence as a
+/// coherent cost → markup → net → tax → total chain rather than as one number.
+/// On a refusal it publishes the ladder's own refusal, through the one renderer
+/// and the one `price_refusal_key` mapping, in the operator's language.
+///
+/// Either way the answer is the ladder fragment plus the out-of-band confirm
+/// slot, and NEVER the drawer body: the control targets `#product-price-ladder`,
+/// so the save form, its unsaved values and the control itself all survive, and
+/// the product stays editable. A refusal in a preview is the normal answer to an
+/// impossible target, not an error state.
+async fn web_preview_product_final_price(
+    State(state): State<AppState>,
+    _: Require<InventoryRead>,
+    Extension(localization): Extension<LocalizationContext>,
+    Query(values): Query<FinalPriceValues>,
+) -> AppResult<Html<String>> {
+    let input = final_price_input(&values, &localization)?;
+    let (ladder_input, confirmable) = match solve_final_price_from_screen(&state, &input).await {
+        Ok((_product, solve)) => (solved_ladder_input(&input, &solve), true),
+        Err(AppError::PriceRefused(refusal)) => (
+            refused_final_price_ladder_input(refusal, input.cost_price),
+            // Nothing to commit when nothing can be stored, so the slot is
+            // emptied and the drawer is left with no way to write.
+            false,
+        ),
+        Err(error) => return Err(error),
+    };
+    let ladder = state
+        .tax_service
+        .product_price_ladder(input.product_id, Some(ladder_input))
+        .await?;
+    Ok(Html(final_price_answer_html(
+        &localization,
+        ladder,
+        confirmable,
+    )?))
+}
+
+/// `POST /web/product-final-price/confirm`: the final-price WRITE. The operator
+/// has seen the preview and is committing the values on screen.
+///
+/// # THE RULE THAT MAKES THE TWO STEPS SAFE
+///
+/// **The confirm RE-SOLVES from the values it is given, through
+/// [`solve_final_price_from_screen`] — the very call the preview made — and it
+/// never stores a number the preview displayed.** The preview is advisory; it is
+/// not a proposal the server holds, it is not a token, and there is no path by
+/// which its output reaches this write. That is what makes a STALE preview
+/// harmless: it can mislead an operator's expectation, which is a UI defect they
+/// can see, but it cannot reach the row, because the row is computed from the
+/// values this request carries.
+///
+/// The alternative — storing what the preview showed — is the direction that
+/// corrupts. A stored net with a stored markup that does not reproduce it is a
+/// self-contradicting row, and the next ordinary save would silently undo the
+/// conversion. `the stale-preview test` pins the resolution: the confirm's
+/// values win, always.
+///
+/// # What one statement writes
+///
+/// `cost_price`, `sale_price` and `markup_pct`, in ONE `update_product` call,
+/// which is ONE `UPDATE`. The cost travels WITH the pair deliberately: a net
+/// derived from a cost the database does not hold is a price nobody can
+/// re-derive, and the operator is told exactly that in the confirm control's own
+/// help line before the button exists.
+///
+/// `net_price` stays the canonical stored truth — there is no final-price column
+/// and no migration — and `validate_product` re-derives the net from the cost
+/// and the markup the solve verified, so the stored net cannot silently become a
+/// different one.
+///
+/// # WHY THE ANSWER NEVER RE-RENDERS THE DRAWER BODY
+///
+/// A whole-body re-render is the obvious way to "refresh the form from the row",
+/// and it is the one thing this route must not do. The body carries every OTHER
+/// field the operator may have typed — the SKU, the name, the kind, the
+/// category, the unit, the stock bounds, the location, the notes — and none of
+/// them is in the row, because none of them was saved. Replacing the body puts
+/// the OLD values back and the typed ones are gone, with no refusal to explain
+/// it and nothing on screen to suggest they ever existed.
+///
+/// The refusal path already refused to do that, and the feature document says a
+/// refusal must never discard unsaved work. A SUCCESS discarding exactly the
+/// same work would be the same defect wearing a better outcome, so the rule here
+/// is one sentence and it is enforced by an assertion rather than by this
+/// comment: **the answer re-renders exactly the regions that are FUNCTIONS of the
+/// three fields this request wrote, and nothing else.** Those regions are the
+/// three price fields, the script that binds two of them, the stale-cost badge
+/// (whose verdict is the stored cost against the supplier's truth) and the audit
+/// line (a conversion is an update, so `updated_by` moved). Each renders from the
+/// SAME partial the drawer includes, so the confirm cannot drift from the drawer
+/// it is refreshing.
+///
+/// The `sku`/`name`/`kind`/`category_id`/`unit`/`track_stock`/`min_stock`/
+/// `max_stock`/`location`/`notes` inputs are not in that list, which is the
+/// point: they keep exactly what the operator typed, and they stay editable.
+async fn web_confirm_product_final_price(
+    State(state): State<AppState>,
+    _: Require<InventoryWrite>,
+    principal: axum::Extension<crate::security::authz::Principal>,
+    Extension(localization): Extension<LocalizationContext>,
+    headers: HeaderMap,
+    Form(values): Form<FinalPriceValues>,
+) -> Result<axum::response::Response, AppError> {
+    let input = final_price_input(&values, &localization)?;
+    let solve = match solve_final_price_from_screen(&state, &input).await {
+        Ok((_product, solve)) => solve,
+        Err(error) => {
+            // A refusal here is the SAME refusal the preview would have shown
+            // for these values — which is the point: the confirm cannot fail in
+            // a way the preview did not describe, because it asks the same
+            // question. Nothing is written, and the answer is the ladder's own
+            // refusal with the confirm slot EMPTIED, so there is nothing left to
+            // press.
+            let refusal = match error {
+                AppError::PriceRefused(refusal) => refusal,
+                other => return Err(other),
+            };
+            let ladder = state
+                .tax_service
+                .product_price_ladder(
+                    input.product_id,
+                    Some(refused_final_price_ladder_input(refusal, input.cost_price)),
+                )
+                .await?;
+            // `false`: the slot is emptied, so a refused confirm leaves no way to
+            // press confirm again on a row that has not moved.
+            return Ok(Html(final_price_answer_html(&localization, ladder, false)?).into_response());
+        }
+    };
+    state
+        .inventory_service
+        .update_product(
+            principal.user_id,
+            input.product_id,
+            UpdateProduct {
+                // The cost ON SCREEN, committed with the pair. See the route doc.
+                cost_price: Some(input.cost_price),
+                sale_price: Some(solve.net_price),
+                // The double option, exactly as the save form sends it: the outer
+                // `Some` says "this conversion speaks for the markup", and the
+                // inner `None` is the explicit "no markup".
+                markup_pct: Some(storable_markup(&solve)),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| localized_refusal_error(error, &localization))?;
+
+    if !is_htmx(&headers) {
+        // The control only exists inside the HTMX drawer, so a plain browser
+        // post is not a real caller; it gets the module's usual answer for one.
+        // Checked HERE, after the write and before any rendering, because a
+        // redirect has nothing to render.
+        return Ok(Redirect::to("/products").into_response());
+    }
+    // The row the write just landed on, re-read: every figure the answer shows
+    // is read back from the DATABASE rather than from the solve, so the drawer
+    // and the row cannot disagree about what was stored.
+    let product = state
+        .inventory_service
+        .get_product(input.product_id)
+        .await?;
+    let (created_by_name, updated_by_name) = product_audit_names(&state, &product).await?;
+    let stale_cost = product_stale_cost(&state, &product).await?;
+    let ladder_html = product_price_ladder_html(
+        &localization,
+        state
+            .tax_service
+            .product_price_ladder(input.product_id, None)
+            .await?,
+    )?
+    .0;
+    let body = format!(
+        "{ladder_html}\n{confirm_slot}\n{price_field}\n{cost_field}\n{markup_field}\n{stale_cost}\n{audit_line}\n{markup_script}",
+        confirm_slot = out_of_band(
+            CONFIRM_SLOT,
+            &confirm_slot_html(&localization, false)?,
+        ),
+        price_field = out_of_band(
+            PRICE_FIELD,
+            &ProductSalePriceFieldPartial {
+                localization: &localization,
+                product: &product,
+            }
+            .render()
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+        ),
+        cost_field = out_of_band(
+            COST_FIELD,
+            &ProductCostPriceFieldPartial {
+                localization: &localization,
+                product: &product,
+            }
+            .render()
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+        ),
+        markup_field = out_of_band(
+            MARKUP_FIELD,
+            &ProductMarkupFieldPartial {
+                localization: &localization,
+                product: &product,
+            }
+            .render()
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+        ),
+        stale_cost = out_of_band(
+            STALE_COST_SLOT,
+            &ProductStaleCostPartial {
+                localization: &localization,
+                stale_cost: stale_cost.as_ref(),
+            }
+            .render()
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+        ),
+        audit_line = out_of_band_swapping(
+            "outerHTML",
+            AUDIT_SLOT,
+            &ProductAuditLinePartial {
+                localization: &localization,
+                created_by_name: created_by_name.as_deref(),
+                updated_by_name: updated_by_name.as_deref(),
+            }
+            .render()
+            .map_err(|error| AppError::Internal(error.to_string()))?,
+        ),
+        // LAST, and the order is load-bearing: htmx runs the scripts it swaps in,
+        // and this one binds to the two inputs the blocks above just replaced.
+        // Without the re-run, clearing the markup after a conversion would leave
+        // the net price field `readonly` with no way to type into it.
+        markup_script = out_of_band(
+            MARKUP_SYNC,
+            include_str!("../../templates/partials/product_markup_sync.html"),
+        ),
+    );
+    // NO `product-saved` fires, so the drawer stays open on the figures the
+    // operator just committed — a price they want to check, not a form they are
+    // finished with.
+    Ok(triggered(body, "product-changed"))
+}
+
+// ---------------------------------------------------------------------------
+// The out-of-band targets a final-price answer may swap, and nothing else (M1)
+//
+// Each is a REGION of the drawer that is a function of what the conversion
+// wrote. Naming them in one block is the point: the confirm's answer is
+// assembled from this list and from nothing else, so a field the operator may
+// have typed cannot end up in it by accident.
+// ---------------------------------------------------------------------------
+
+/// The final-price control's confirm slot. Filled by a successful preview,
+/// emptied by a refusal, and emptied again by a save-form ladder refresh (M2).
+pub(crate) const CONFIRM_SLOT: &str = "#product-final-price-confirm";
+/// The net price field's wrapper: the confirm wrote `sale_price`.
+const PRICE_FIELD: &str = "#edit-product-price-field";
+/// The cost field's wrapper: the confirm wrote `cost_price`.
+const COST_FIELD: &str = "#edit-product-cost-field";
+/// The markup field's wrapper: the confirm rewrote `markup_pct`.
+const MARKUP_FIELD: &str = "#edit-product-markup-field";
+/// The stale-cost badge: its verdict is the stored cost against the supplier's.
+const STALE_COST_SLOT: &str = "#product-stale-cost";
+/// The audit attribution line: a conversion is an update, so `updated_by` moved.
+const AUDIT_SLOT: &str = "#product-audit-line";
+/// The markup-binding script, which binds to the two inputs above.
+const MARKUP_SYNC: &str = "#product-markup-sync";
+
+/// The answer BOTH steps give when neither writes: the ladder island as the main
+/// swap, plus the confirm slot out of band.
+///
+/// One function, because the two steps must not be able to drift in how they
+/// report a refusal. A preview that answered differently from a confirm of the
+/// same values would mean one of them is describing something the other does not
+/// do, and the whole safety argument of this design is that they ask the same
+/// question and answer it the same way. `confirmable` is the only difference and
+/// it is the whole difference: there is nothing to commit unless the solve
+/// succeeded.
+fn final_price_answer_html(
+    localization: &LocalizationContext,
+    ladder: ProductPriceLadder,
+    confirmable: bool,
+) -> AppResult<String> {
+    Ok(format!(
+        "{}\n{confirm_slot}",
+        product_price_ladder_html(localization, ladder)?.0,
+        confirm_slot = out_of_band(CONFIRM_SLOT, &confirm_slot_html(localization, confirmable)?),
+    ))
+}
+
+/// The ladder a refusal gets, through the one already-audited input the ladder
+/// itself uses for a refusal the save path would also answer. It keeps the cost
+/// the operator has on screen, and the ladder's tax half is skipped because a
+/// refusal is set — so no money is ever published beside a figure that does not
+/// exist.
+fn refused_final_price_ladder_input(refusal: PriceRefusal, cost_price: Decimal) -> LadderInput {
+    LadderInput::Refused {
+        refusal,
+        cost_price,
+    }
+}
+
+/// The audit attribution, resolved in the WIRING layer because a department may
+/// not read identity tables (AC20) and the view must show a name, never an id.
+async fn product_audit_names(
+    state: &AppState,
+    product: &Product,
+) -> AppResult<(Option<String>, Option<String>)> {
+    let mut actor_ids = vec![product.created_by];
+    actor_ids.extend(product.updated_by);
+    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
+    let name_for = |id: i64| names.get(&id).cloned();
+    Ok((
+        name_for(product.created_by),
+        product.updated_by.and_then(name_for),
+    ))
+}
+
+/// The stale-cost disagreement (cost-freshness S1), derived and never stored: the
+/// supplier reference cost disagrees with the stored cost only when there IS a
+/// supplier truth to compare against (no rows ⇒ the product column IS the truth),
+/// the stored cost was ever recorded (0 is the NOT NULL DEFAULT, "no cost yet",
+/// not a cost), and the two genuinely differ (equal ⇒ fresh).
+async fn product_stale_cost(
+    state: &AppState,
+    product: &Product,
+) -> AppResult<Option<StaleCostView>> {
+    Ok(
+        match (
+            state.supplier_service.reference_cost(product.id).await?,
+            product.cost_price != Decimal::ZERO,
+        ) {
+            (Some(reference), true) if reference != product.cost_price => Some(StaleCostView {
+                reference,
+                stored: product.cost_price,
+            }),
+            _ => None,
+        },
+    )
+}
+
+/// Wrap one region of the drawer in the out-of-band attribute htmx swaps, so a
+/// confirm can refresh that region and nothing else.
+///
+/// The wrapper's own id is irrelevant — the attribute's selector is the target —
+/// which is why it carries none, the same as `base.html`'s notice wrapper. The
+/// ORDER of these blocks is load-bearing wherever one of them is a `<script>`:
+/// htmx processes out-of-band elements in response order, and the markup-binding
+/// script must run after the fields it binds to exist.
+fn out_of_band(selector: &str, content: &str) -> String {
+    out_of_band_swapping("innerHTML", selector, content)
+}
+
+/// The same, with the swap style stated. Two styles are in use and both are
+/// load-bearing: a partial that renders the INNER content of an element the
+/// drawer already had is swapped in with `innerHTML`, so that element keeps its
+/// own id and classes and is never rebuilt; a partial that renders a whole
+/// element — because that element is the target itself — is swapped with
+/// `outerHTML`.
+fn out_of_band_swapping(style: &str, selector: &str, content: &str) -> String {
+    format!("<div hx-swap-oob=\"{style}:{selector}\">{content}</div>")
+}
+
 async fn product_detail_html(
     state: &AppState,
     id: i64,
@@ -823,28 +1480,9 @@ async fn product_detail_html(
             }
         })
         .collect();
-    let mut actor_ids = vec![ps.product.created_by];
-    actor_ids.extend(ps.product.updated_by);
-    let names = crate::routes::audit_actor_names(&state.pool, &actor_ids).await?;
-    let name_for = |id: i64| names.get(&id).cloned();
-    let created_by_name = name_for(ps.product.created_by);
-    let updated_by_name = ps.product.updated_by.and_then(name_for);
+    let (created_by_name, updated_by_name) = product_audit_names(state, &ps.product).await?;
     let today = localization.today_iso();
-    // Derived, never stored (cost-freshness S1): the supplier reference cost
-    // disagrees with the stored cost only when there IS a supplier truth to
-    // compare against (no rows ⇒ the product column IS the truth), the stored
-    // cost was ever recorded (0 is the NOT NULL DEFAULT, "no cost yet", not a
-    // cost), and the two genuinely differ (equal ⇒ fresh).
-    let stale_cost = match (
-        state.supplier_service.reference_cost(id).await?,
-        ps.product.cost_price != Decimal::ZERO,
-    ) {
-        (Some(r), true) if r != ps.product.cost_price => Some(StaleCostView {
-            reference: r,
-            stored: ps.product.cost_price,
-        }),
-        _ => None,
-    };
+    let stale_cost = product_stale_cost(state, &ps.product).await?;
     // The drawer has no form values on its first render, so the ladder reports
     // the stored state — the very figures the form is prefilled with, so the
     // two cannot disagree on arrival. Read ONCE: the refusal sentence the
@@ -852,6 +1490,7 @@ async fn product_detail_html(
     // shared mapping the product save form also goes through.
     let ladder = state.tax_service.product_price_ladder(id, None).await?;
     let net_refusal_message = ladder_refusal_message(&ladder, localization);
+    let markup_not_derivable = markup_not_derivable(&ladder);
     // The level resolved for the drawer, the same way the picker row resolves it:
     // the amount, or the sentence in its place. Two fields, because the template
     // must not be able to print a number where the sum was refused.
@@ -884,6 +1523,7 @@ async fn product_detail_html(
         ladder,
         // The embedded ladder fragment reads this.
         net_refusal_message,
+        markup_not_derivable,
         supplier_costs,
         suppliers,
         stale_cost,
@@ -1740,6 +2380,14 @@ pub fn router() -> Router<AppState> {
         .route("/web/product-search.json", get(web_product_search_json))
         .route("/web/products/detail/{id}", get(web_product_detail))
         .route("/web/product-price-ladder", get(web_product_price_ladder))
+        .route(
+            "/web/product-final-price",
+            get(web_preview_product_final_price),
+        )
+        .route(
+            "/web/product-final-price/confirm",
+            post(web_confirm_product_final_price),
+        )
         .route("/web/products/edit", post(web_edit_product))
         .route("/web/products/activate", post(web_activate_product))
         .route("/web/products/deactivate", post(web_deactivate_product))
@@ -2994,6 +3642,15 @@ mod tests {
             localization.tr(crate::localization::MessageKey::ProductLinkTax),
             localization.tr(crate::localization::MessageKey::ProductRecordCost),
             localization.tr(crate::localization::MessageKey::ProductRecordMovement),
+            // The final-price control (final price markup U2) is a FIFTH
+            // labelled action in the drawer, and it is listed here rather than
+            // folded into the total below: the point of this pin is that every
+            // label is named, so a new toast silently appearing is a diff in
+            // the list above, not a number that happens to have grown. Its
+            // label is the PREVIEW's, because the preview is the control's own
+            // form — and the CONFIRM is not in the drawer's markup at all, so
+            // it can never contribute a sixth.
+            localization.tr(crate::localization::MessageKey::ProductPreviewFinalPrice),
         ] {
             let attr = format!("data-action=\"{label}\"");
             assert_eq!(
@@ -3004,7 +3661,7 @@ mod tests {
         }
         assert_eq!(
             html.matches("data-action=").count(),
-            4,
+            5,
             "no other data-action labels may appear in the drawer fragment: {html:.900}"
         );
 
@@ -6717,6 +7374,1424 @@ mod tests {
         assert!(
             html.contains(&money(&localization, "11000000000000000000")),
             "so is the tax-inclusive price: {html:.2000}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Setting a FINAL, tax-inclusive price (final price markup U2).
+    //
+    // TWO STEPS, because the operator must see the consequence before it is
+    // committed: a GET preview that solves and writes nothing, then an explicit
+    // POST confirm that RE-SOLVES from the values it is given and writes the net,
+    // the markup and the cost in one statement.
+    //
+    // Every test here goes through `preview_final_price` or
+    // `confirm_final_price`, each sending the body the drawer actually sends, so
+    // a field-name or verb mismatch fails here rather than in a browser nobody
+    // runs.
+    // -----------------------------------------------------------------------
+
+    const FINAL_PRICE_PATH: &str = "/web/product-final-price";
+    const CONFIRM_FINAL_PRICE_PATH: &str = "/web/product-final-price/confirm";
+
+    /// The browser's own request shape, byte for byte: the control's form
+    /// contributes `final_price` and the SAVE form is pulled in by
+    /// `hx-include="#product-edit-form"` for the product id and the cost the
+    /// operator has on screen. `cost` is therefore an input, and it is the
+    /// save form's OWN field — one owner, many readers, never a second editor.
+    fn final_price_query(product_id: i64, final_price: &str, cost: &str) -> String {
+        // One literal on one line: `cargo fmt` rewraps a `\` continuation and
+        // the spaces it leaves behind are not valid URI characters.
+        format!("id={product_id}&sku=FINAL-BODY&name=Final+body&kind=Product&category_id=&unit=un&sale_price=&cost_price={cost}&markup_pct=&track_stock=&min_stock=&max_stock=&location=&notes=&final_price={final_price}")
+    }
+
+    /// The PREVIEW, sent as a GET the way htmx sends it. A GET is not a
+    /// stylistic choice: it is what makes "it persists nothing" structural
+    /// rather than promised, because there is no write verb on this path.
+    async fn preview_final_price(
+        app: axum::Router,
+        product_id: i64,
+        final_price: &str,
+        cost: &str,
+    ) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "{FINAL_PRICE_PATH}?{}",
+                final_price_query(product_id, final_price, cost)
+            ))
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The CONFIRM, sent as the POST the control's confirm button makes. It
+    /// sends the SAME values the preview did, which is the whole point: the
+    /// confirm is not handed a preview token or a previewed number, it is handed
+    /// the values on screen and asked to solve them again.
+    async fn confirm_final_price(
+        app: axum::Router,
+        product_id: i64,
+        final_price: &str,
+        cost: &str,
+    ) -> (StatusCode, String) {
+        let (status, _headers, body) = post_form_full(
+            app,
+            CONFIRM_FINAL_PRICE_PATH,
+            &final_price_query(product_id, final_price, cost),
+            &[("HX-Target", "product-drawer-body")],
+        )
+        .await;
+        (status, body)
+    }
+
+    /// A POST to an explicit body, addressed as the drawer's confirm button
+    /// addresses its request, for the tests whose point is WHICH FIELDS the body
+    /// carries rather than what a canonical body carries.
+    async fn post_drawer_form(app: axum::Router, uri: &str, body: &str) -> (StatusCode, String) {
+        let (status, _headers, response) =
+            post_form_full(app, uri, body, &[("HX-Target", "product-drawer-body")]).await;
+        (status, response)
+    }
+
+    /// The product's ENTIRE row, as the TEXT the database holds, so "a preview
+    /// wrote nothing" can be asserted byte-identically instead of field by field
+    /// — including `updated_at`, which any write at all would move.
+    async fn stored_row_text(state: &AppState, product_id: i64) -> String {
+        use sqlx::{Column as _, Row as _};
+        let row = sqlx::query("SELECT * FROM products WHERE id = ?")
+            .bind(product_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        // Read every column the table has, by name, so a column added later is
+        // covered the day this test runs rather than the day someone notices.
+        let mut out = String::new();
+        for column in row.columns().iter().map(|column| column.name()) {
+            let raw: Option<String> = row.try_get(column).ok();
+            out.push_str(column);
+            out.push('=');
+            out.push_str(raw.as_deref().unwrap_or("NULL"));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The stored pricing triple, read straight from the row: the net, the cost
+    /// and the markup (the TEXT scale is the repository's business, so the
+    /// numbers are compared as `Decimal`).
+    async fn stored_prices(
+        state: &AppState,
+        product_id: i64,
+    ) -> (Decimal, Decimal, Option<Decimal>) {
+        let row: (String, String, Option<String>) =
+            sqlx::query_as("SELECT sale_price, cost_price, markup_pct FROM products WHERE id = ?")
+                .bind(product_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        (
+            Decimal::from_str(&row.0).unwrap(),
+            Decimal::from_str(&row.1).unwrap(),
+            row.2.map(|raw| Decimal::from_str(&raw).unwrap()),
+        )
+    }
+
+    /// A product in the state the ladder suite uses: manual net price, a cost,
+    /// and ONE ACTIVE linked tax at `rate`. `markup: Some(..)` goes through the
+    /// real service, so a markup product's stored net is its derived one.
+    async fn product_for_final_price(
+        state: &AppState,
+        sku: &str,
+        price: &str,
+        cost: &str,
+        markup: Option<&str>,
+        rate: &str,
+    ) -> i64 {
+        let product_id = product_with_markup(state, sku, price, cost, markup).await;
+        let tax = link_tax(state, &format!("{sku}-TAX"), &format!("Tax {rate}%"), rate).await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(state).await, product_id, tax)
+            .await
+            .unwrap();
+        product_id
+    }
+
+    /// The final price of a net through the ONE tax contract, so no test in this
+    /// block can agree with a second, private idea of what the operator typed.
+    /// The rate is read from the row the fixture linked, so a test cannot assert
+    /// against a rate the product does not actually carry.
+    async fn final_price_of(state: &AppState, product_id: i64, net: &str) -> Decimal {
+        let rate: String = sqlx::query_scalar(
+            "SELECT taxes.rate FROM taxes
+             JOIN product_taxes ON product_taxes.tax_id = taxes.id
+             WHERE product_taxes.product_id = ?
+             ORDER BY taxes.code, taxes.id
+             LIMIT 1",
+        )
+        .bind(product_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let tax = crate::models::Tax {
+            id: 0,
+            code: "T".into(),
+            name: "T".into(),
+            rate: Decimal::from_str(&rate).unwrap(),
+            is_active: true,
+            created_by: 0,
+            updated_by: None,
+            created_at: Default::default(),
+            updated_at: Default::default(),
+        };
+        crate::services::line_taxes::calculate_line_taxes(Decimal::from_str(net).unwrap(), &[tax])
+            .expect("an ordinary net and one ordinary rate are carried")
+            .total
+    }
+
+    /// A solve + a check that it actually solved to the typed value, written
+    /// once because the preview/confirm tests all need the same two facts: what
+    /// the solve produces, and that the SOLVED net prices back to the TYPED
+    /// figure through the real tax contract. A number that cannot be produced
+    /// is a panic, not a wrong answer — it would mean this block's fixtures had
+    /// drifted away from the arithmetic they claim to exercise.
+    fn assert_solves_to(net: &str, markup: Option<&str>, cost: &str) {
+        let cost = dec(cost);
+        let markup = markup.map(dec);
+        let derived =
+            crate::services::inventory::derive_net_sale_price(cost, markup, Decimal::ZERO).unwrap();
+        assert_eq!(
+            derived,
+            dec(net),
+            "the fixture's expected net is not what its own markup derives"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The two steps exist at all
+    // -----------------------------------------------------------------------
+
+    /// The shape the maintainer chose: a PREVIEW that writes nothing, then a
+    /// CONFIRM. This test exists to say the two are separate endpoints, because
+    /// a single-submit control would satisfy every other test in this block.
+    ///
+    /// The structural half is the verb: the preview is a GET, so there is no
+    /// write verb on that path at all and "it persists nothing" is a property
+    /// of the route rather than a promise in its comment. The behavioural half
+    /// is that a POST to the preview path is refused, exactly as the ladder
+    /// preview's is.
+    #[tokio::test]
+    async fn the_final_price_preview_is_a_get_and_the_confirm_is_a_separate_post() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-TWO-STEP", "20.00", "10.00", None, "10").await;
+
+        let (status, html) = preview_final_price(app.clone(), product_id, "100.00", "10.00").await;
+        assert_eq!(status, StatusCode::OK, "{html:.2000}");
+
+        // A POST on the preview path is not a second way in: 405, so there is
+        // exactly one verb that can reach the solve-without-writing.
+        let (status, _headers, _body) = post_form_full(
+            app.clone(),
+            FINAL_PRICE_PATH,
+            &final_price_query(product_id, "100.00", "10.00"),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "the preview path must not accept a write verb"
+        );
+
+        // And a GET on the confirm path is equally refused, so the write is
+        // reachable by exactly one verb too.
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "{CONFIRM_FINAL_PRICE_PATH}?{}",
+                final_price_query(product_id, "100.00", "10.00")
+            ))
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "the confirm path must not answer a read verb"
+        );
+    }
+
+    /// RED 1 — a PREVIEW writes nothing. Not "the route returned 200": the row.
+    /// `stored_row_text` covers every column including `updated_at`, so a write
+    /// that touched nothing an assertion happened to name would still fail here.
+    #[tokio::test]
+    async fn a_final_price_preview_writes_nothing_at_all() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_for_final_price(
+            &state,
+            "FINAL-PREVIEW-NOWRITE",
+            "20.00",
+            "10.00",
+            None,
+            "10",
+        )
+        .await;
+        let before = stored_row_text(&state, product_id).await;
+
+        // Three previews, including one of an impossible target and one of a
+        // cost the product does not hold, because "a preview writes nothing"
+        // has to be true of every answer, not only the happy one.
+        for (typed, cost) in [("100.00", "10.00"), ("0.05", "10.00"), ("250.00", "37.50")] {
+            let (status, html) = preview_final_price(app.clone(), product_id, typed, cost).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "previewing {typed} at cost {cost}: {html:.600}"
+            );
+            assert_eq!(
+                stored_row_text(&state, product_id).await,
+                before,
+                "a preview of {typed} at cost {cost} changed the row"
+            );
+        }
+    }
+
+    /// RED 2 — the test that keeps this design honest. The SAME inputs, previewed
+    /// and then confirmed, must produce the same pair, and the stored pair must
+    /// be the pair the ladder SHOWED.
+    ///
+    /// If the preview and the confirm could ever disagree, one of two things is
+    /// true: the preview is lying about what confirming will do, or the confirm
+    /// is doing something the preview never described. Neither is acceptable,
+    /// and neither is detectable by any other test here.
+    #[tokio::test]
+    async fn a_final_price_preview_and_its_confirm_agree_on_the_stored_pair() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-AGREE", "20.00", "10.00", None, "10").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, preview) =
+            preview_final_price(app.clone(), product_id, "100.00", "10.00").await;
+        assert_eq!(status, StatusCode::OK, "{preview:.2000}");
+
+        // Read the PREVIEWED figures out of the rendered money, in the active
+        // locale, rather than out of a `Decimal` this test computed for itself:
+        // what the operator saw is the thing that has to match what is stored.
+        assert!(
+            preview.contains(&money(&localization, "90.91")),
+            "the preview must publish the net it would store: {preview:.4000}"
+        );
+        assert!(
+            preview.contains(&money(&localization, "100.00")),
+            "and the tax-inclusive price the operator typed: {preview:.4000}"
+        );
+        assert!(
+            preview.contains(&super::html_escape(
+                &localization.format_percentage(dec("809.10"))
+            )),
+            "and the markup it would rewrite the product with: {preview:.4000}"
+        );
+        assert!(
+            preview
+                .contains(&localization.tr(crate::localization::MessageKey::ProductLadderUnsaved)),
+            "a preview is by definition unsaved, and the ladder must say so: {preview:.4000}"
+        );
+        // Nothing stored yet — this is what makes the next assertion a real one.
+        assert_eq!(
+            stored_prices(&state, product_id).await,
+            (dec("20.00"), dec("10.00"), None)
+        );
+
+        // Confirm the SAME values.
+        let (status, _body) = confirm_final_price(app, product_id, "100.00", "10.00").await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The stored pair is the previewed pair.
+        let (net, cost, markup) = stored_prices(&state, product_id).await;
+        assert_eq!(
+            net,
+            dec("90.91"),
+            "the stored net is the one the ladder published"
+        );
+        assert_eq!(
+            cost,
+            dec("10.00"),
+            "and the cost on screen was stored with it"
+        );
+        assert_eq!(
+            markup,
+            Some(dec("809.10")),
+            "the stored markup is the one the ladder published"
+        );
+        assert_solves_to("90.91", Some("809.10"), "10.00");
+        assert_eq!(
+            final_price_of(&state, product_id, &net.to_string()).await,
+            dec("100.00"),
+            "and the TYPED value re-derives from what is stored"
+        );
+    }
+
+    /// RED 3 — a stale preview cannot be confirmed into the stored numbers. This
+    /// is the test that says WHICH WAY the design resolves a stale preview, and
+    /// the direction is the safe one:
+    ///
+    /// The operator previews a final price against a cost of 10, then changes
+    /// the cost to 20 and confirms WITHOUT previewing again. The confirm
+    /// re-solves from the values it was GIVEN, so what is stored is derived from
+    /// cost 20 — and the stored markup is NOT the one the preview showed.
+    ///
+    /// Why that direction and not the other: storing the previewed pair would
+    /// leave a row whose stored markup does not reproduce its own stored net
+    /// under the cost now on file. That is a self-contradicting row, and the
+    /// very next save would silently undo the conversion. A stale preview is a
+    /// UI defect the operator can see and correct; a stale WRITE is data
+    /// corruption they cannot. The preview is advisory and is never the source
+    /// of the truth.
+    #[tokio::test]
+    async fn a_stale_final_price_preview_is_never_what_gets_stored() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-STALE", "20.00", "10.00", None, "10").await;
+
+        // Previewed against the cost on screen at that moment: 10.
+        let (status, preview) =
+            preview_final_price(app.clone(), product_id, "100.00", "10.00").await;
+        assert_eq!(status, StatusCode::OK, "{preview:.2000}");
+        assert!(
+            preview.contains(&money(
+                &crate::localization::load_context(&state.pool)
+                    .await
+                    .unwrap(),
+                "90.91"
+            )),
+            "the preview solved the typed price: {preview:.600}"
+        );
+
+        // The operator changes the cost and confirms straight away, with no
+        // second preview. The final price is unchanged; the cost is not.
+        let (status, _body) = confirm_final_price(app, product_id, "100.00", "20.00").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (net, cost, markup) = stored_prices(&state, product_id).await;
+        assert_eq!(
+            cost,
+            dec("20.00"),
+            "the confirm stored the cost it was GIVEN"
+        );
+        assert_eq!(
+            net,
+            dec("90.91"),
+            "the net is a function of the typed final price and the taxes alone, so it is \
+             the same figure the preview showed — and that is exactly why the markup is not"
+        );
+        assert_eq!(
+            markup,
+            Some(dec("354.55")),
+            "the stored markup is the one cost 20 derives, NOT the 809.10 the stale preview \
+             showed: storing that would leave a row whose markup does not reproduce its own net"
+        );
+        assert_ne!(
+            markup,
+            Some(dec("809.10")),
+            "the stale figure must not be stored"
+        );
+        assert_solves_to("90.91", Some("354.55"), "20.00");
+        assert_eq!(
+            crate::services::inventory::derive_net_sale_price(
+                dec("20.00"),
+                Some(dec("809.10")),
+                Decimal::ZERO
+            )
+            .unwrap(),
+            dec("181.82"),
+            "which is the arithmetic that makes the stale pair unusable: 809.10% of a cost of \
+             20 derives 181.82, twice the solved net, so storing the previewed markup beside \
+             the solved net would store a price nobody can re-derive"
+        );
+    }
+
+    /// RED 4 — a refusal in the PREVIEW is the normal answer to an impossible
+    /// target, not an error state. It writes nothing, it publishes no tax money,
+    /// and it leaves the drawer open and the product editable.
+    ///
+    /// `0.05` under a single 10% tax is genuinely unreachable: `0.04` prices at
+    /// `0.04` and `0.05` prices at `0.06`.
+    #[tokio::test]
+    async fn a_refused_final_price_preview_writes_nothing_and_leaves_the_drawer_editable() {
+        for (locale_code, language_code, typed, cost, expected) in [
+            (
+                "en-US",
+                "en",
+                "0.05",
+                "10.00",
+                "no net price produces this final price with the linked taxes",
+            ),
+            (
+                "es-AR",
+                "es",
+                // A browser sends both numbers the way that locale's operator
+                // writes them, and `parse_decimal` reads them back that way.
+                "0,05",
+                "10,00",
+                "Ningún precio neto produce este precio final con los impuestos vinculados.",
+            ),
+        ] {
+            let state = test_state().await;
+            let app = crate::routes::router(state.clone());
+            let product_id = product_for_final_price(
+                &state,
+                "FINAL-REFUSED-PREVIEW",
+                "20.00",
+                "10.00",
+                None,
+                "10",
+            )
+            .await;
+            set_locale(&state, locale_code, language_code).await;
+            let localization = crate::localization::load_context(&state.pool)
+                .await
+                .unwrap();
+            let before = stored_row_text(&state, product_id).await;
+
+            let (status, html) = preview_final_price(app.clone(), product_id, typed, cost).await;
+
+            assert_eq!(status, StatusCode::OK, "{html:.2000}");
+            assert!(
+                html.contains("data-product-ladder-net-refused"),
+                "the refusal must be rendered by the ladder's own renderer: {html:.2000}"
+            );
+            assert!(
+                html.contains(&super::html_escape(expected)),
+                "the save path's OWN sentence, in the active language ({expected}): {html:.2000}"
+            );
+            assert_publishes_no_tax_money(&localization, &html);
+            assert_eq!(
+                stored_row_text(&state, product_id).await,
+                before,
+                "a refused preview must not touch the row at all"
+            );
+
+            // THE SAME REFUSAL, IN THE SAME LANGUAGE, FROM THE CONFIRM. The
+            // bilingual claim is only true if both steps are exercised in both
+            // languages, and the confirm is a separate handler that could drift
+            // to an untranslated path on its own.
+            let (status, confirmed) =
+                confirm_final_price(app.clone(), product_id, typed, cost).await;
+            assert_eq!(status, StatusCode::OK, "{confirmed:.2000}");
+            assert!(
+                confirmed.contains("data-product-ladder-net-refused"),
+                "the confirm must refuse the same target: {confirmed:.2000}"
+            );
+            assert!(
+                confirmed.contains(&super::html_escape(expected)),
+                "in the same active language ({expected}): {confirmed:.2000}"
+            );
+            assert_publishes_no_tax_money(&localization, &confirmed);
+            assert_eq!(
+                stored_row_text(&state, product_id).await,
+                before,
+                "a refused confirm must not touch the row either"
+            );
+            assert!(
+                !confirmed.contains(CONFIRM_FINAL_PRICE_PATH),
+                "and it must not leave a confirm on offer for a target that cannot be \
+                 stored: {confirmed:.2000}"
+            );
+
+            // THE DRAWER SURVIVES IT. The answer is the ladder island and nothing
+            // that could replace the body, so the save form, its unsaved values
+            // and the control are all still there.
+            assert!(
+                !html.contains("/web/products/edit"),
+                "the answer must NOT carry the edit form: replacing the drawer body on a \
+                 refusal would discard the operator's unsaved values: {html:.2000}"
+            );
+            let (status, drawer) =
+                get_html(app, &format!("/web/products/detail/{product_id}")).await;
+            assert_eq!(status, StatusCode::OK, "{drawer:.2000}");
+            let price_at = drawer.find("name=\"sale_price\"").unwrap_or_else(|| {
+                panic!("the net price field must still be there: {drawer:.4000}")
+            });
+            let form_at = drawer.find("/web/products/edit").unwrap();
+            assert!(
+                !drawer[form_at..price_at].contains("readonly"),
+                "the net price field must still be editable: nothing was saved"
+            );
+        }
+    }
+
+    /// RED 5 — a CONFIRM of a value that became impossible writes nothing.
+    ///
+    /// The operator previews 100.00, sees the consequence, then edits the final
+    /// price to 0.05 — which no net can produce — and confirms without
+    /// previewing the new value. This is the reachable shape of the stale-value
+    /// hazard and it is why the confirm RE-SOLVES: a confirm that trusted the
+    /// preview would store the 90.91 the operator saw for a price they have
+    /// since changed their mind about.
+    #[tokio::test]
+    async fn a_final_price_confirm_on_a_value_that_became_impossible_writes_nothing() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-CHANGED-MIND", "20.00", "10.00", None, "10")
+                .await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // Previewed: 100.00 is reachable and the net is 90.91.
+        let (status, preview) =
+            preview_final_price(app.clone(), product_id, "100.00", "10.00").await;
+        assert_eq!(status, StatusCode::OK, "{preview:.600}");
+        assert!(
+            !preview.contains("data-product-ladder-net-refused"),
+            "100.00 is reachable under a 10% tax: {preview:.600}"
+        );
+        assert!(
+            preview.contains(CONFIRM_FINAL_PRICE_PATH),
+            "so the confirm is on offer: {preview:.600}"
+        );
+
+        // The operator changes their mind to a value no net can produce, and
+        // confirms straight away. 0.05 under a 10% tax: 0.04 prices at 0.04
+        // and 0.05 prices at 0.06.
+        let before = stored_row_text(&state, product_id).await;
+        let (status, html) = confirm_final_price(app, product_id, "0.05", "10.00").await;
+
+        assert_eq!(status, StatusCode::OK, "{html:.2000}");
+        assert!(
+            html.contains("data-product-ladder-net-refused"),
+            "the confirm must re-solve and refuse, never store what the preview showed: {html:.2000}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(
+            stored_row_text(&state, product_id).await,
+            before,
+            "a refused confirm must not touch the row at all"
+        );
+        // The handler empties the confirm slot on this path, and an unasserted
+        // comment is a lie waiting for a refactor: nothing may be on offer for a
+        // target that cannot be stored.
+        assert!(
+            !html.contains(CONFIRM_FINAL_PRICE_PATH),
+            "a refused confirm must not leave a confirm on offer: {html:.2000}"
+        );
+    }
+
+    /// A no-cost product, in both steps. The net is solved and honoured and NO
+    /// markup is invented: a 0% markup on a 0 cost is a different product, and a
+    /// cost of zero is the column's "no cost recorded yet", never a NULL.
+    #[tokio::test]
+    async fn a_final_price_for_a_product_with_no_cost_solves_the_net_and_invents_no_markup() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-NOCOST", "20.00", "0", None, "10").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // PREVIEW: the net is stated, and the ladder says a markup cannot come
+        // out of it.
+        let (status, preview) = preview_final_price(app.clone(), product_id, "100.00", "0").await;
+        assert_eq!(status, StatusCode::OK, "{preview:.2000}");
+        assert!(
+            preview.contains(&money(&localization, "90.91")),
+            "the preview states the net it would store: {preview:.4000}"
+        );
+        assert!(
+            preview.contains("markup is not derivable without a cost"),
+            "and says a markup cannot be derived from a product with no cost: {preview:.4000}"
+        );
+        assert_eq!(
+            stored_prices(&state, product_id).await,
+            (dec("20.00"), dec("0"), None),
+            "the preview wrote nothing"
+        );
+
+        // CONFIRM: the net is stored and the markup stays absent.
+        let (status, _body) = confirm_final_price(app.clone(), product_id, "100.00", "0").await;
+        assert_eq!(status, StatusCode::OK);
+        let (net, cost, markup) = stored_prices(&state, product_id).await;
+        assert_eq!(
+            net,
+            dec("90.91"),
+            "the final price is honoured with no cost at all"
+        );
+        assert_eq!(cost, dec("0"), "and the cost stays zero");
+        assert_eq!(
+            markup, None,
+            "nothing may be invented where there is no cost to be a percentage OF"
+        );
+        assert_eq!(
+            final_price_of(&state, product_id, &net.to_string()).await,
+            dec("100.00")
+        );
+
+        // And the drawer states it, on the stored row.
+        let (status, drawer) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{drawer:.2000}");
+        assert!(
+            drawer.contains("markup is not derivable without a cost"),
+            "the ladder must STATE that the markup is not derivable without a cost, \
+             rather than printing a dash: {drawer:.4000}"
+        );
+    }
+
+    /// A stored markup with no positive cost. `validate_product` refuses to
+    /// CREATE this row, so the fixture writes it directly: it is exactly the
+    /// contradicting state the solve's first rule defends against, and a row
+    /// like it is what a cost corrected to zero elsewhere would leave behind.
+    /// Storing a new net beside that markup would make the row disagree with
+    /// itself, and the next save would silently undo the change.
+    #[tokio::test]
+    async fn a_final_price_on_a_stored_markup_with_no_positive_cost_is_refused_at_preview() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-CONTRADICT", "20.00", "10.00", None, "10").await;
+        sqlx::query("UPDATE products SET cost_price = '0', markup_pct = '50' WHERE id = ?")
+            .bind(product_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let before = stored_row_text(&state, product_id).await;
+
+        let (status, html) = preview_final_price(app.clone(), product_id, "100.00", "0").await;
+
+        assert_eq!(status, StatusCode::OK, "{html:.2000}");
+        assert!(
+            html.contains(&super::html_escape(&localization.tr(
+                crate::localization::MessageKey::PriceRefusalMarkupNeedsPositiveCost
+            ))),
+            "the save path's own refusal, through the one mapping: {html:.2000}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(
+            stored_row_text(&state, product_id).await,
+            before,
+            "a refused preview must leave the contradicting row exactly as it was"
+        );
+
+        // And the confirm is refused the same way, for the same reason.
+        let (status, html) = confirm_final_price(app, product_id, "100.00", "0").await;
+        assert_eq!(status, StatusCode::OK, "{html:.2000}");
+        assert!(
+            html.contains("data-product-ladder-net-refused"),
+            "the confirm must refuse too: {html:.2000}"
+        );
+        assert_eq!(
+            stored_row_text(&state, product_id).await,
+            before,
+            "a refused confirm must leave the row exactly as it was"
+        );
+    }
+
+    /// The write is ATOMIC, and this proves it by trying to break it rather than
+    /// by asserting that a transaction was used.
+    ///
+    /// The claim is that `cost_price`, `sale_price` and `markup_pct` land
+    /// together or not at all. The three are mutually dependent — the stored
+    /// markup must reproduce the stored net from the stored cost — so a
+    /// half-written row is detectable, and the four facts below are the proof:
+    ///
+    /// 1. the fixture's PRE-state fails the check, so the check is not vacuous;
+    /// 2. the real confirm leaves a row no half-write can produce;
+    /// 3. the row still prices to the TYPED final price, so a coherent pair is
+    ///    not merely self-consistent but correct;
+    /// 4. each half-state, written by hand exactly as a split implementation
+    ///    would leave it, IS caught — so a split implementation is a red test,
+    ///    not an undetected defect.
+    #[tokio::test]
+    async fn the_final_price_confirm_writes_cost_net_and_markup_in_one_atomic_step() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-ATOMIC", "20.00", "10.00", None, "10").await;
+
+        /// The invariant a half-written row violates: the stored markup must
+        /// reproduce the stored net FROM THE STORED COST, and the stored net
+        /// must price to the typed final price. Read through the two REAL
+        /// contracts, never a copy.
+        async fn is_coherent(
+            state: &AppState,
+            product_id: i64,
+            typed_final: &str,
+        ) -> Result<(), String> {
+            let (net, cost, markup) = stored_prices(state, product_id).await;
+            let Some(markup) = markup else {
+                return Err("no markup is stored, so there is no triple to check".into());
+            };
+            let derived = crate::services::inventory::derive_net_sale_price(
+                cost,
+                Some(markup),
+                Decimal::ZERO,
+            )
+            .map_err(|error| format!("the stored markup does not derive: {error:?}"))?;
+            if derived != net {
+                return Err(format!(
+                    "cost {cost} with markup {markup} derives {derived}, not the stored net {net}"
+                ));
+            }
+            let priced = final_price_of(state, product_id, &net.to_string()).await;
+            if priced != dec(typed_final) {
+                return Err(format!(
+                    "the stored net {net} prices to {priced}, not the typed {typed_final}"
+                ));
+            }
+            Ok(())
+        }
+
+        // (1) FIRST, so the teeth are shown before the row is repaired: the
+        // fixture as seeded cannot satisfy the invariant.
+        assert!(
+            is_coherent(&state, product_id, "100.00").await.is_err(),
+            "the pre-state must FAIL the invariant, or the assertions below prove nothing: \
+             a manual price with no markup is not a triple at all"
+        );
+
+        // (2) and (3) The real confirm.
+        let (status, _body) = confirm_final_price(app, product_id, "100.00", "10.00").await;
+        assert_eq!(status, StatusCode::OK);
+        is_coherent(&state, product_id, "100.00")
+            .await
+            .expect("a confirmed conversion stores a coherent triple");
+
+        // (4) Each half, written the way a split implementation would leave it:
+        // only the NET moved, and then only the COST.
+        sqlx::query("UPDATE products SET markup_pct = '999' WHERE id = ?")
+            .bind(product_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(
+            is_coherent(&state, product_id, "100.00").await.is_err(),
+            "a row whose markup moved without its net must be caught"
+        );
+        sqlx::query("UPDATE products SET markup_pct = '809.10', cost_price = '20' WHERE id = ?")
+            .bind(product_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(
+            is_coherent(&state, product_id, "100.00").await.is_err(),
+            "a row whose cost moved without its markup must be caught"
+        );
+        sqlx::query("UPDATE products SET cost_price = '10', sale_price = '20.00' WHERE id = ?")
+            .bind(product_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert!(
+            is_coherent(&state, product_id, "100.00").await.is_err(),
+            "a row whose net moved without its markup must be caught"
+        );
+    }
+
+    /// The control CANNOT confirm before it has previewed. The confirm button is
+    /// not in the drawer's markup at all: the server renders it into a slot, and
+    /// only a successful preview fills that slot. So "preview, then confirm" is
+    /// a property of the markup rather than of a disabled attribute somebody can
+    /// work around with the keyboard.
+    #[tokio::test]
+    async fn the_final_price_control_cannot_be_confirmed_before_it_is_previewed() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_markup(&state, "FINAL-GATE-UI", "20.00", "10.00", None).await;
+
+        let (status, drawer) =
+            get_html(app.clone(), &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{drawer:.2000}");
+        assert!(
+            !drawer.contains(CONFIRM_FINAL_PRICE_PATH),
+            "the drawer must carry no way to confirm before a preview has run: {drawer:.4000}"
+        );
+        assert!(
+            drawer.contains(&format!("hx-get=\"{FINAL_PRICE_PATH}\"")),
+            "the control's own submit IS the preview, so a stray Enter can only preview: \
+             {drawer:.4000}"
+        );
+
+        // A PREVIEW that refuses leaves nothing to confirm either. 0.05 under a
+        // 10% tax is unreachable; on an UNTAXED product the same number would
+        // solve (the net IS the final price), so the tax is what makes this a
+        // refusal rather than a very small sale.
+        let taxed =
+            product_for_final_price(&state, "FINAL-GATE-UI-TAX", "20.00", "10.00", None, "10")
+                .await;
+        let (_status, refused) = preview_final_price(app.clone(), taxed, "0.05", "10.00").await;
+        assert!(
+            refused.contains("data-product-ladder-net-refused"),
+            "0.05 is unreachable under a 10% tax: {refused:.600}"
+        );
+        assert!(
+            !refused.contains(CONFIRM_FINAL_PRICE_PATH),
+            "a refused preview must offer no confirm: {refused:.2000}"
+        );
+
+        // A successful one does.
+        let (_status, preview) = preview_final_price(app, product_id, "100.00", "10.00").await;
+        assert!(
+            preview.contains(CONFIRM_FINAL_PRICE_PATH),
+            "and a successful preview must offer the confirm: {preview:.2000}"
+        );
+    }
+
+    /// The control is a SEPARATE form beside the ladder, not another field in
+    /// the save form. The two reasons are behavioural, and this is what proves
+    /// them: the control carries only the final price, and it READS the save
+    /// form's cost rather than owning a second copy of it.
+    #[tokio::test]
+    async fn the_final_price_control_is_separate_from_the_save_form() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_with_markup(&state, "FINAL-SEPARATE", "20.00", "10.00", None).await;
+
+        let (status, drawer) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{drawer:.2000}");
+
+        let control_at = drawer
+            .find(&format!("hx-get=\"{FINAL_PRICE_PATH}\""))
+            .unwrap_or_else(|| panic!("the drawer must carry the control: {drawer:.4000}"));
+        let form_start = drawer[..control_at].rfind("<form").unwrap_or(0);
+        let control_form = &drawer[form_start..];
+        let control_form = &control_form[..control_form.find("</form>").unwrap() + 7];
+        assert!(
+            control_form.contains("name=\"final_price\""),
+            "the control's own field: {control_form}"
+        );
+        for field in [
+            "name=\"sale_price\"",
+            "name=\"cost_price\"",
+            "name=\"markup_pct\"",
+        ] {
+            assert!(
+                !control_form.contains(field),
+                "the control must not own {field}: it is a conversion, not a second save \
+                 form, and two editors of one field is a race with the save form: {control_form}"
+            );
+        }
+        assert!(
+            control_form.contains("product-edit-form"),
+            "and it must READ the save form's cost rather than keep its own copy: {control_form}"
+        );
+
+        // And the save form kept all three of its own price fields.
+        let save_at = drawer
+            .find("/web/products/edit")
+            .unwrap_or_else(|| panic!("the save form must still be there: {drawer:.4000}"));
+        let save_form = &drawer[save_at..];
+        let save_form = &save_form[..save_form.find("</form>").unwrap() + 7];
+        for field in [
+            "name=\"sale_price\"",
+            "name=\"cost_price\"",
+            "name=\"markup_pct\"",
+        ] {
+            assert!(
+                save_form.contains(field),
+                "the save form keeps {field}, alongside the control and never instead of it: \
+                 {save_form}"
+            );
+        }
+    }
+
+    /// The two steps have DIFFERENT gates, and the difference is the whole point
+    /// of the first one. A principal holding only `inventory.read` may preview —
+    /// a preview writes nothing, so it is a read — and is refused the confirm,
+    /// which writes.
+    #[tokio::test]
+    async fn an_inventory_read_only_principal_may_preview_but_is_refused_the_confirm() {
+        let state = test_state().await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["inventory.read"])
+            .await
+            .unwrap();
+        let product_id = product_with_markup(&state, "FINAL-GATE", "20.00", "10.00", None).await;
+        let app = crate::routes::router(state.clone());
+        let cookie = test_support::cookie_for(&probe);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "{FINAL_PRICE_PATH}?{}",
+                final_price_query(product_id, "100.00", "10.00")
+            ))
+            .header("HX-Request", "true")
+            .header("cookie", cookie.clone())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a preview persists nothing, so it is a read: {}",
+            String::from_utf8_lossy(&to_bytes(resp.into_body(), 1024 * 1024).await.unwrap())
+        );
+
+        let (status, body) = post_form_with_cookie(
+            app,
+            CONFIRM_FINAL_PRICE_PATH,
+            &final_price_query(product_id, "100.00", "10.00"),
+            &[("HX-Request", "true")],
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:.600}");
+        assert_eq!(
+            stored_prices(&state, product_id).await,
+            (dec("20.00"), dec("10.00"), None),
+            "a refused caller must change nothing"
+        );
+    }
+
+    /// A number that is not a number is NOT a price refusal — it is a typo, and
+    /// the ladder's own precedent is to answer 400 rather than invent a price
+    /// from it. Neither step may turn a parse failure into a `PriceRefusal`,
+    /// which would put a sentence in the catalog that no rule can ever produce.
+    #[tokio::test]
+    async fn a_final_price_that_is_not_a_number_is_a_form_error_in_both_steps() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_markup(&state, "FINAL-TYPO", "20.00", "10.00", None).await;
+        let before = stored_row_text(&state, product_id).await;
+
+        for typed in ["", "abc", "12,3,4"] {
+            let (status, body) = preview_final_price(app.clone(), product_id, typed, "10.00").await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "the preview of {typed:?} is a typo, not a price: {body:.600}"
+            );
+            let (status, body) = confirm_final_price(app.clone(), product_id, typed, "10.00").await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "the confirm of {typed:?} is a typo, not a price: {body:.600}"
+            );
+            assert_eq!(
+                stored_row_text(&state, product_id).await,
+                before,
+                "{typed:?} must write nothing, in either step"
+            );
+        }
+
+        // The same for the cost the control READS from the save form: an
+        // unreadable cost is a typo in the operator's own field, and the ladder's
+        // documented precedence is to name the field rather than guess at it.
+        let (status, body) = preview_final_price(app, product_id, "100.00", "abc").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:.600}");
+    }
+
+    /// The documented DESIGN DECISION, pinned where a maintainer reads it: the
+    /// conversion is solved against the cost ON SCREEN, and confirming persists
+    /// that cost together with the net and the markup.
+    ///
+    /// The cost is a GIVEN — what this costs me — so a cost typed and not saved is
+    /// exactly the case an operator most needs previewed. The markup is an
+    /// OUTPUT — what I make on it — so the control does not read the save form's
+    /// markup at all: a final price DETERMINES the markup, and the confirm
+    /// stores the solved one. Persisting a cost the database does not hold would
+    /// leave a net nobody can re-derive, so the cost travels in the same single
+    /// statement as the net and the markup.
+    #[tokio::test]
+    async fn the_final_price_is_solved_against_the_cost_on_screen_and_stores_it() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-ONSCREEN", "20.00", "10.00", None, "10").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // The stored cost is 10. The operator has 20 on screen.
+        let (status, preview) =
+            preview_final_price(app.clone(), product_id, "100.00", "20.00").await;
+        assert_eq!(status, StatusCode::OK, "{preview:.2000}");
+        assert!(
+            preview.contains(&money(&localization, "20.00")),
+            "the preview prices against the cost ON SCREEN, not the stored one: {preview:.4000}"
+        );
+        assert!(
+            preview.contains(&super::html_escape(
+                &localization.format_percentage(dec("354.55"))
+            )),
+            "and the markup is the one cost 20 derives: {preview:.4000}"
+        );
+        assert!(
+            !preview.contains(&super::html_escape(
+                &localization.format_percentage(dec("809.10"))
+            )),
+            "never the one the STORED cost of 10 would derive: {preview:.4000}"
+        );
+
+        let (status, body) = confirm_final_price(app, product_id, "100.00", "20.00").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (net, cost, markup) = stored_prices(&state, product_id).await;
+        assert_eq!(cost, dec("20.00"), "confirming stores the cost on screen");
+        assert_eq!(net, dec("90.91"));
+        assert_eq!(
+            markup,
+            Some(dec("354.55")),
+            "and the markup that cost derives — the cost travels WITH the net so the \
+             stored pair is re-derivable from the row itself"
+        );
+        assert_solves_to("90.91", Some("354.55"), "20.00");
+        // And the answer refreshed the drawer from the row, so the form the
+        // operator is looking at shows what IS stored.
+        assert!(
+            body.contains("hx-swap-oob"),
+            "a confirmed conversion must out-of-band refresh the drawer body, or the form \
+             would keep showing pre-conversion values: {body:.2000}"
+        );
+        assert!(
+            body.contains(&format!(
+                "value=\"{}\"",
+                localization.format_decimal(dec("90.91"))
+            )),
+            "the refreshed form carries the stored net: {body:.2000}"
+        );
+    }
+
+    /// The ladder's standing guarantee has to survive a conversion PREVIEW too:
+    /// a target the solve refuses for being out of range must publish no tax
+    /// money at all, because there is no net to apply a tax to.
+    ///
+    /// The bound is the solve's own ceiling, `max_solvable_final_price` at 1e18,
+    /// so this is reachable by a request rather than by a crafted fixture: 1e19
+    /// is a number a `Decimal` carries and a tax-inclusive price an operator
+    /// could type, and it is a quintillion times the ceiling.
+    #[tokio::test]
+    async fn a_final_price_preview_of_an_out_of_range_price_publishes_no_tax_money() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-OVF-PREVIEW", "20.00", "10.00", None, "10")
+                .await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let before = stored_row_text(&state, product_id).await;
+
+        let (status, html) =
+            preview_final_price(app.clone(), product_id, "10000000000000000000", "10.00").await;
+
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains("data-product-ladder-net-refused"),
+            "a price out of range is a refusal, not a number to work with: {html:.600}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(
+            stored_row_text(&state, product_id).await,
+            before,
+            "and the row is untouched"
+        );
+
+        // The confirm refuses the same way, and also writes nothing.
+        let (status, html) =
+            confirm_final_price(app, product_id, "10000000000000000000", "10.00").await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert_publishes_no_tax_money(&localization, &html);
+        assert_eq!(stored_row_text(&state, product_id).await, before);
+    }
+
+    // -----------------------------------------------------------------------
+    // What a confirm must NOT destroy (M1), and what it must retire (M2).
+    // -----------------------------------------------------------------------
+
+    /// The drawer's out-of-band target that replaces the WHOLE body. A confirm
+    /// that emitted this would throw away every unsaved value on the save form,
+    /// so no final-price answer may contain it — asserted rather than promised.
+    const DRAWER_BODY_OOB: &str = "hx-swap-oob=\"innerHTML:#product-drawer-body\"";
+
+    /// The drawer's editable fields a confirm does NOT own, as the operator
+    /// would type them. Every one of these is a field the conversion never
+    /// writes, so every one must survive both steps untouched.
+    const UNSAVED_FIELDS: [(&str, &str); 6] = [
+        ("sku", "TYPED-SKU"),
+        ("name", "Typed+Name"),
+        ("unit", "box"),
+        ("location", "aisle-9"),
+        ("notes", "typed+note"),
+        ("min_stock", "7.25"),
+    ];
+
+    /// A save form carrying an operator's unsaved work, as the browser sends it:
+    /// the conversion's own fields PLUS every field the conversion does not own,
+    /// each holding something the database does not hold.
+    fn confirm_with_unsaved_work(product_id: i64, final_price: &str, cost: &str) -> String {
+        let mut body = format!(
+            "id={product_id}&kind=Product&category_id=&track_stock=&max_stock=&\
+             sale_price=&markup_pct=&cost_price={cost}&final_price={final_price}"
+        );
+        for (name, value) in UNSAVED_FIELDS {
+            body.push_str(&format!("&{name}={value}"));
+        }
+        // Every one of them must really be on the wire, or the test would be
+        // asserting the confirm's restraint about fields it never sent.
+        for (name, value) in UNSAVED_FIELDS {
+            assert!(
+                body.contains(&format!("{name}={value}")),
+                "{name} must be sent"
+            );
+        }
+        body
+    }
+
+    /// M1's RED, on the SUCCESS path. The operator has typed into fields the
+    /// conversion does not own, previews, and confirms. A confirm that
+    /// re-renders `#product-drawer-body` replaces every one of those inputs with
+    /// the stored row's value — the typed name becomes the old name, the typed
+    /// location becomes NULL — and the operator's work is gone with no warning
+    /// and no refusal to explain it.
+    ///
+    /// The assertion is on the ANSWER, because the answer is what the browser
+    /// applies: it must not carry the whole-body swap, and it must carry the
+    /// three price fields the confirm actually wrote. The browser-side half —
+    /// that a typed value is still on screen and still editable — is the e2e
+    /// test's, because a stored-row test cannot see an input's contents.
+    #[tokio::test]
+    async fn a_confirmed_final_price_does_not_re_render_the_save_form_it_did_not_write() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-KEEPS-WORK", "20.00", "10.00", None, "10").await;
+
+        let (status, body) = post_drawer_form(
+            app,
+            CONFIRM_FINAL_PRICE_PATH,
+            &confirm_with_unsaved_work(product_id, "100.00", "10.00"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.600}");
+
+        // THE DEFECT. Replacing the body is what silently discarded the typed
+        // values: they are not in the row, so a body re-render puts back the
+        // old ones and the operator never sees them again.
+        assert!(
+            !body.contains(DRAWER_BODY_OOB),
+            "a confirm must not replace the whole drawer body: every unsaved value on the \
+             save form would be discarded with it. Answer: {body:.2000}"
+        );
+
+        // And it must refresh exactly what it wrote, or the form would go on
+        // showing a net price and a markup the row no longer holds.
+        for target in [
+            "#edit-product-price-field",
+            "#edit-product-cost-field",
+            "#edit-product-markup-field",
+        ] {
+            assert!(
+                body.contains(&format!("hx-swap-oob=\"innerHTML:{target}\"")),
+                "a confirmed conversion must refresh {target} from the row: {body:.2000}"
+            );
+        }
+        assert!(
+            !body.contains("TYPED-SKU") && !body.contains("aisle-9"),
+            "and the answer must not echo the operator's unsaved values back at all: \
+             {body:.2000}"
+        );
+
+        // The row kept the OLD values for every field the conversion does not
+        // own, which is exactly why a body re-render loses the typed ones.
+        let row: (String, String, String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT sku, name, unit, location, notes FROM products WHERE id = ?")
+                .bind(product_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "FINAL-KEEPS-WORK", "the SKU is still the stored one");
+        assert_eq!(row.1, "Product FINAL-KEEPS-WORK", "and so is the name");
+        assert_eq!(row.2, "un", "and the unit");
+        assert_eq!(row.3, None, "and the location is still unset");
+        assert_eq!(row.4, None, "and the notes are still unset");
+    }
+
+    /// M1's other half, on the REFUSAL path, pinned so the two paths cannot
+    /// diverge. A refusal is the case the feature document names: it must never
+    /// discard unsaved work, and now the success path is held to the same rule.
+    #[tokio::test]
+    async fn a_refused_final_price_confirm_keeps_every_unsaved_field_too() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-REFUSE-KEEPS", "20.00", "10.00", None, "10")
+                .await;
+        let before = stored_row_text(&state, product_id).await;
+
+        // 0.05 under a 10% tax is unreachable, so this is the refusal path.
+        let (status, body) = post_drawer_form(
+            app,
+            CONFIRM_FINAL_PRICE_PATH,
+            &confirm_with_unsaved_work(product_id, "0.05", "10.00"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.600}");
+        assert!(
+            body.contains("data-product-ladder-net-refused"),
+            "0.05 is unreachable under a 10% tax: {body:.600}"
+        );
+        assert!(
+            !body.contains(DRAWER_BODY_OOB),
+            "a refused confirm must not replace the drawer body either — discarding \
+             unsaved work is not a penalty for being refused: {body:.2000}"
+        );
+        assert!(
+            !body.contains("TYPED-SKU") && !body.contains("aisle-9"),
+            "and must not echo the operator's unsaved values: {body:.2000}"
+        );
+        assert_eq!(stored_row_text(&state, product_id).await, before);
+    }
+
+    /// M2's RED. The save form's own four ladder inputs all refresh
+    /// `#product-price-ladder` from `/web/product-price-ladder`, and that
+    /// endpoint used to answer the ladder and nothing else — so the confirm
+    /// control, a sibling of the ladder, survived every one of those refreshes.
+    ///
+    /// The operator's sequence: preview a final price, the confirm appears, then
+    /// edit the cost. The ladder now shows the SAVE FORM's own preview, and an
+    /// enabled confirm still sits under it promising a conversion that was
+    /// previewed against a different cost. The stored row stays correct — the
+    /// confirm re-solves — but the visible promise is a lie, and a lie the
+    /// operator acts on.
+    #[tokio::test]
+    async fn a_save_form_ladder_refresh_retires_a_final_price_confirm_it_invalidated() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-RETIRE", "20.00", "10.00", None, "10").await;
+
+        // Previewed, so the confirm is on offer.
+        let (status, preview) =
+            preview_final_price(app.clone(), product_id, "100.00", "10.00").await;
+        assert_eq!(status, StatusCode::OK, "{preview:.600}");
+        assert!(
+            preview.contains(CONFIRM_FINAL_PRICE_PATH),
+            "a solved preview offers the confirm: {preview:.600}"
+        );
+
+        // The operator edits the cost in the save form, which is wired to the
+        // ladder endpoint. That is the save form's own preview, and it has
+        // invalidated the conversion preview the confirm was about.
+        let (status, refreshed) = get_html(
+            app.clone(),
+            &format!(
+                "{LADDER_PATH}?id={product_id}&sku=LADDER-BODY&name=Ladder+body&kind=Product&\
+                 category_id=&unit=un&sale_price=&cost_price=11&markup_pct=&track_stock=&\
+                 min_stock=&max_stock=&location=&notes="
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{refreshed:.600}");
+        assert!(
+            !refreshed.contains(CONFIRM_FINAL_PRICE_PATH),
+            "a save-form ladder refresh must not re-offer a confirm: {refreshed:.2000}"
+        );
+        assert!(
+            refreshed.contains("hx-swap-oob=\"innerHTML:#product-final-price-confirm\""),
+            "and must retire the one on offer: the ladder is now previewing the save \
+             form, so a confirm for a conversion the operator never saw is a lie. \
+             Answer: {refreshed:.2000}"
+        );
+
+        // The FINAL PRICE preview is the other caller of that same island and it
+        // must leave the confirm standing — the two are distinguished by which
+        // endpoint answered, not by a flag, and this is what pins that.
+        let (_status, preview_again) = preview_final_price(app, product_id, "100.00", "11").await;
+        assert!(
+            preview_again.contains(CONFIRM_FINAL_PRICE_PATH),
+            "a final-price preview installs the confirm: {preview_again:.600}"
+        );
+    }
+
+    /// M3's RED, and it is a test of the CODE rather than of the copy: the
+    /// request body carries a `sale_price`, and the confirm must ignore it. The
+    /// help text claims the typed sale price is not read, so the claim is pinned
+    /// here — a `FinalPriceValues` that grew a `sale_price` field would store
+    /// 999.99 here and fail this.
+    #[tokio::test]
+    async fn a_final_price_confirm_ignores_a_sale_price_in_the_request_body() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id =
+            product_for_final_price(&state, "FINAL-IGNORES-PRICE", "20.00", "10.00", None, "10")
+                .await;
+        let before = stored_row_text(&state, product_id).await;
+
+        // The body carries the save form's own `sale_price` field TWICE: empty,
+        // as the drawer sends it, and then a typed 999.99 on top. Neither is read.
+        let mut body = confirm_with_unsaved_work(product_id, "100.00", "10.00");
+        body.push_str("&sale_price=999.99");
+        let (status, _html) = post_drawer_form(app, CONFIRM_FINAL_PRICE_PATH, &body).await;
+        assert_eq!(status, StatusCode::OK, "{_html:.600}");
+
+        let (net, _, markup) = stored_prices(&state, product_id).await;
+        assert_eq!(
+            net,
+            dec("90.91"),
+            "the typed sale price is not an input to this control, so the solved net is \
+             what is stored"
+        );
+        assert_eq!(markup, Some(dec("809.10")));
+        assert_ne!(
+            before,
+            stored_row_text(&state, product_id).await,
+            "and it did write"
+        );
+    }
+
+    /// D1(d): the no-cost note sits OUTSIDE the `net_refusal` guard on purpose,
+    /// and this is the case that decides it. A no-cost product whose final price
+    /// is refused publishes the refusal AND the note that explains the markup
+    /// dash, and still no money at all: the note is not a figure, so the ladder's
+    /// guarantee is untouched.
+    #[tokio::test]
+    async fn a_refused_final_price_preview_of_a_no_cost_product_states_both_facts_and_no_money() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        // No cost, and a target the 10% tax cannot produce.
+        let product_id =
+            product_for_final_price(&state, "FINAL-NOCOST-REFUSED", "20.00", "0", None, "10").await;
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = preview_final_price(app, product_id, "0.05", "0").await;
+
+        assert_eq!(status, StatusCode::OK, "{html:.2000}");
+        assert!(
+            html.contains("data-product-ladder-net-refused"),
+            "the refusal is stated: {html:.2000}"
+        );
+        assert!(
+            html.contains("markup is not derivable without a cost"),
+            "and so is the reason the markup row is a dash, because the operator is \
+             looking at a dash and needs to know why: {html:.2000}"
+        );
+        assert_publishes_no_tax_money(&localization, &html);
+        assert!(
+            html.contains("data-product-ladder-no-cost-markup"),
+            "the note is marked, so a test can address it: {html:.2000}"
         );
     }
 

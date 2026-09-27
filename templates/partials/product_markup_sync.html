@@ -1,0 +1,14 @@
+<script id="product-markup-sync">
+  (function () {
+    var markup = document.getElementById('edit-product-markup');
+    var price = document.getElementById('edit-product-sale-price');
+    if (!markup || !price) return;
+    function sync() {
+      var derived = markup.value.trim() !== '';
+      price.readOnly = derived;
+      if (derived) { price.removeAttribute('required'); } else { price.setAttribute('required', ''); }
+    }
+    markup.addEventListener('input', sync);
+    sync();
+  })();
+</script>

@@ -322,6 +322,19 @@ where
             .ok_or_else(|| AppError::NotFound(format!("product {product_id} not found")))
     }
 
+    /// The taxes a DOCUMENT LINE and this product's price ladder both resolve:
+    /// linked AND active, ordered by code then id.
+    ///
+    /// Public because `final_price::solve_final_price` must be handed the very
+    /// same set the ladder and a line write are handed, and a second read that
+    /// filtered differently would make the operator's typed final price a
+    /// different question from the one the ladder answers. It is the one
+    /// resolution boundary, exposed once, rather than a rule restated at a
+    /// second call site.
+    pub async fn list_active_for_product(&self, product_id: i64) -> AppResult<Vec<Tax>> {
+        self.product_taxes.list_active_for_product(product_id).await
+    }
+
     /// The product price ladder: cost, markup, net sale price, every active
     /// linked tax with the amount it adds, the tax total and the tax-inclusive
     /// price — in the order an operator can sanity-check a price.
@@ -396,10 +409,7 @@ where
         let stored_kind = product.kind;
         // The same resolution boundary the line write uses: linked AND active,
         // ordered by code then id so the ladder is deterministic.
-        let taxes = self
-            .product_taxes
-            .list_active_for_product(product_id)
-            .await?;
+        let taxes = self.list_active_for_product(product_id).await?;
 
         // First the PRICE half of the ladder, from the form or from the stored
         // row, including the two states in which there is no net price to

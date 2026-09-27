@@ -1,0 +1,31 @@
+{# The drawer's NET PRICE field, and the note that explains it when the price is
+   derived (final price markup M1).
+
+   A partial, and a partial that renders ONLY the inner content of the field's
+   own `<div>`, for two reasons that are the same reason:
+
+   * the drawer includes it on its first render, and
+   * a CONFIRMED final price swaps it out of band, because the confirm wrote
+     `sale_price` and the field must show what the row now holds.
+
+   One definition and two call sites is the point: a confirm that re-rendered
+   these few lines by hand would be free to drift from the drawer, and the drift
+   would be invisible until an operator saw a price field that disagreed with
+   the ladder beside it. The out-of-band target is the wrapping `<div>`'s id
+   with `innerHTML`, so the `<div>`'s own classes and id are never rebuilt.
+
+   The `readonly`/`required` pair and the recalculated note are inside this
+   partial on purpose: both are FUNCTIONS of `markup_pct`, which the confirm
+   writes, so both have to move with it. #}
+<label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductSalePrice) }}</label>
+{# Courtesy only (product-markup T6): the edit handler is the enforcement — whenever
+   a markup is present the server ignores this field and derives the price from the
+   cost, so the readonly state here only mirrors what the server already does. The
+   ladder below previews that derivation live, while this note explains why the
+   field is locked. #}
+<input id="edit-product-sale-price" type="text" inputmode="decimal" name="sale_price" step="0.01" {% if product.markup_pct.is_some() %}readonly {% endif %}{% if !product.markup_pct.is_some() %}required {% endif %}value="{{ localization.format_decimal(product.sale_price.clone()) }}" class="field" hx-get="/web/product-price-ladder" hx-trigger="change" hx-target="#product-price-ladder" hx-swap="outerHTML" hx-include="closest form" />
+{% if product.markup_pct.is_some() %}
+{# The readonly field shows the stored price from the last save; the derivation from
+   the cost is server-side, so the number only moves when the product is saved. #}
+<div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductMarkupRecalculated) }} {{ localization.format_percentage(product.markup_pct.unwrap()) }}</div>
+{% endif %}

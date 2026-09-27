@@ -1,0 +1,17 @@
+{# The drawer's STALE-COST badge, the derived disagreement between the supplier
+   reference cost and the product's stored `cost_price` (cost-freshness S1,
+   final price markup M1).
+
+   Rendered only when they genuinely disagree, and it is a PARTIAL because a
+   confirmed conversion writes `cost_price` and can therefore flip the verdict
+   either way: a badge that survived a conversion which brought the stored cost
+   back into agreement would be a lie, and one that never appeared for a
+   conversion which broke agreement would be a silence. It is swapped out of
+   band with the price fields, and it is a `Option` so "no disagreement" is a
+   state this partial can state. #}
+{% if let Some(stale) = stale_cost %}
+<div class="mb-3 flex items-center gap-2 rounded-[10px] border border-border bg-surface px-3.5 py-3" data-product-stale-cost>
+  <span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductStaleCost) }}</span>
+  <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductReferenceCost) }} {{ localization.format_currency(stale.reference.clone()) }} • {{ localization.tr(crate::localization::MessageKey::ProductStoredCost) }} {{ localization.format_currency(stale.stored.clone()) }}</span>
+</div>
+{% endif %}

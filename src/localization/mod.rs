@@ -275,6 +275,13 @@ define_message_keys! {
     ProductLadderNetRefused => "product.ladder_net_refused",
     ProductLadderNetDerived => "product.ladder_net_derived",
     ProductLadderNetManual => "product.ladder_net_manual",
+    ProductLadderNoCostMarkup => "product.ladder_no_cost_markup",
+    ProductFinalPrice => "product.final_price",
+    ProductPreviewFinalPrice => "product.preview_final_price",
+    ProductConfirmFinalPrice => "product.confirm_final_price",
+    ProductFinalPriceConfirmHelp => "product.final_price_confirm_help",
+    ProductFinalPriceLabel => "product.final_price_label",
+    ProductFinalPriceHelp => "product.final_price_help",
     // The product price refusals. ONE key per `PriceRefusal` variant, reached
     // only through the one shared mapping in `routes/inventory_web.rs`, so the
     // ladder preview and the product save form can only ever answer the same
@@ -1228,6 +1235,13 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderNetRefused, "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:", "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:"),
     (MessageKey::ProductLadderNetDerived, "Derived from the cost and the markup", "Derived from the cost and the markup"),
     (MessageKey::ProductLadderNetManual, "Manual price", "Manual price"),
+    (MessageKey::ProductLadderNoCostMarkup, "The markup is not derivable without a cost, so this product's net price is a manual one.", "The markup is not derivable without a cost, so this product's net price is a manual one."),
+    (MessageKey::ProductFinalPrice, "Final price", "Final price"),
+    (MessageKey::ProductFinalPriceLabel, "Price the customer pays", "Price the customer pays"),
+    (MessageKey::ProductPreviewFinalPrice, "Preview", "Preview"),
+    (MessageKey::ProductConfirmFinalPrice, "Confirm and save", "Confirm and save"),
+    (MessageKey::ProductFinalPriceHelp, "The price the customer pays, taxes included. Preview solves the net price and the markup from the cost in the form above and saves nothing, so the ladder above shows what would happen. Confirming stores them. A final price replaces both the net price and the markup, so the sale price and the markup in the form above are not read: what you type there is kept for the ordinary save, and a confirmed final price overwrites it. Nothing is stored as a final price: the net price is the stored truth, so changing a tax later still moves the total.", "The price the customer pays, taxes included. Preview solves the net price and the markup from the cost in the form above and saves nothing, so the ladder above shows what would happen. Confirming stores them. A final price replaces both the net price and the markup, so the sale price and the markup in the form above are not read: what you type there is kept for the ordinary save, and a confirmed final price overwrites it. Nothing is stored as a final price: the net price is the stored truth, so changing a tax later still moves the total."),
+    (MessageKey::ProductFinalPriceConfirmHelp, "This stores the net price, the markup the ladder shows, and the cost above. A net price derived from a cost the database does not hold would be a price nobody could re-derive, so the cost is saved with them.", "This stores the net price, the markup the ladder shows, and the cost above. A net price derived from a cost the database does not hold would be a price nobody could re-derive, so the cost is saved with them."),
     // The price refusals, byte-identical to `PriceRefusal::as_str` because this
     // row IS the body the JSON API answers with. The English sentence carries no
     // final period: it is the exact text the refusal has always returned, and the
@@ -2190,6 +2204,13 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderNetRefused, "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:", "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:"),
     (MessageKey::ProductLadderNetDerived, "Derivado del costo y del margen", "Derivado del costo y del margen"),
     (MessageKey::ProductLadderNetManual, "Precio manual", "Precio manual"),
+    (MessageKey::ProductLadderNoCostMarkup, "El margen no se puede derivar sin un costo, así que el precio neto de este producto es manual.", "El margen no se puede derivar sin un costo, así que el precio neto de este producto es manual."),
+    (MessageKey::ProductFinalPrice, "Precio final", "Precio final"),
+    (MessageKey::ProductFinalPriceLabel, "Precio que paga el cliente", "Precio que paga el cliente"),
+    (MessageKey::ProductPreviewFinalPrice, "Previsualizar", "Previsualizar"),
+    (MessageKey::ProductConfirmFinalPrice, "Confirmar y guardar", "Confirmar y guardar"),
+    (MessageKey::ProductFinalPriceHelp, "El precio que paga el cliente, impuestos incluidos. Previsualizar resuelve el precio neto y el margen a partir del costo del formulario de arriba y no guarda nada, así que la escalera de arriba muestra lo que ocurriría. Confirmar los guarda. Un precio final reemplaza tanto el precio neto como el margen, así que el precio de venta y el margen del formulario de arriba no se leen: lo que escribas ahí se conserva para el guardado normal, y un precio final confirmado lo sobrescribe. No se almacena ningún precio final: el precio neto es la verdad almacenada, así que cambiar un impuesto después sigue moviendo el total.", "El precio que paga el cliente, impuestos incluidos. Previsualizar resuelve el precio neto y el margen a partir del costo del formulario de arriba y no guarda nada, así que la escalera de arriba muestra lo que ocurriría. Confirmar los guarda. Un precio final reemplaza tanto el precio neto como el margen, así que el precio de venta y el margen del formulario de arriba no se leen: lo que escribas ahí se conserva para el guardado normal, y un precio final confirmado lo sobrescribe. No se almacena ningún precio final: el precio neto es la verdad almacenada, así que cambiar un impuesto después sigue moviendo el total."),
+    (MessageKey::ProductFinalPriceConfirmHelp, "Esto guarda el precio neto, el margen que muestra la escalera y el costo de arriba. Un precio neto derivado de un costo que la base de datos no tiene sería un precio que nadie podría volver a derivar, por eso el costo se guarda junto a ellos.", "Esto guarda el precio neto, el margen que muestra la escalera y el costo de arriba. Un precio neto derivado de un costo que la base de datos no tiene sería un precio que nadie podría volver a derivar, por eso el costo se guarda junto a ellos."),
     // The price refusals, in the operator's own words. These are TRANSLATIONS,
     // not the English rows copied: the English row is the API body the machine
     // reads, and a Spanish operator who has to decode a column name to learn
