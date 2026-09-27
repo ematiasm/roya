@@ -225,10 +225,65 @@ rail — the rail is permanent, the selection is what ✕ clears.
   names the detail panel everywhere else in the file, and one word cannot mean
   two components.
 
-- [ ] **T3 — migrate the five modules.** `products.html:193`, `purchases.html:86`,
+- [x] **T3 — migrate the five modules.** `products.html:193`, `purchases.html:86`,
   `customers.html:76`, `documents.html:39`, `suppliers.html:57` onto
   `.drawer` + `.drawer-split`; delete the ten functions; keep every refresh
   listener; preserve the customers server-open and the purchases anchor.
+  **Delivered `e890813`.** `cargo test` 1223 passed; the four drawer e2e specs
+  62 passed 2 skipped, and those specs open the modals.
+
+  Opt-in attributes as landed:
+
+  | module | `data-drawer-close-on` | `data-drawer-guard` |
+  | --- | --- | --- |
+  | products | `product-saved drawer:close` | `#new-category-dialog,#new-product-dialog` |
+  | purchases | `purchase-changed` | `#new-purchase-dialog` |
+  | customers | `drawer:close` | `#new-customer-dialog,#customer-edit-dialog` |
+  | documents | `sale-changed purchase-changed` | *(none — it has no dialog)* |
+  | suppliers | `drawer:close` | `#new-supplier-dialog,#supplier-edit-dialog` |
+
+  ### Three things the plan did not know
+
+  **1. Nine call sites lived outside the five shells, and the plan missed them.**
+  `partials/product_detail.html:53,58,63`, `customer_detail.html:13,18,24` and
+  `supplier_detail.html:20,22,24` called the deleted functions as
+  `hx-on::after-request` handlers. Deleting the functions verbatim turned all nine
+  into `ReferenceError` **and** dropped close-on-deactivate, which is pinned by
+  `e2e/tests/test_products.py:903-904`. Binding the server event was not
+  available: a deactivate fires the *same* `product-changed` as an ordinary
+  in-panel save, so it would dismiss the panel on every edit. `data-drawer-close`
+  is a click contract, so on a form it would collapse the panel on submit and
+  take the operator's detail with them when the request then failed. The landed
+  answer is a client-side `drawer:close` event dispatched on the enclosing panel
+  under `event.detail.successful`, which `data-drawer-close-on` already binds —
+  zero per-module functions and zero new controller code. `hx-on::after-request`
+  was already the dominant idiom here (25 files), so this is not a new
+  dependency.
+
+  **2. Eight `<dialog>` modals were trapped inside the split frame.** The
+  migration wrapped each page's content, and the modals sat between the list
+  column and the panel, so the frame ended up with four children. A closed
+  `<dialog>` is `display: none` and never becomes a grid item, which is exactly
+  why all 62 e2e specs passed with the defect in place. It is still a real
+  coupling: a non-modal `dialog.open = true` **is** displayed, would take
+  column 1 and push the panel onto a second row. They are now siblings of
+  `.drawer-split` again, direct children of `main`.
+
+  **3. Two of the plan's own claims were wrong, and the writer corrected both
+  with measurements rather than assertions.**
+  - `documents.html` has **no dialog at all**. The plan listed "dialog L54" from
+    a grep that had matched a backticked `` `<dialog>` `` inside the Jinja
+    comment explaining that the page owns no dialog. Acting on it would have
+    meant editing a phantom.
+  - The plan predicted that un-trapping the modals would shrink the baseline
+    diff. **It does not**: the difference set is **2418 both before and after**
+    the fix, 646 of them on dialog paths. The baseline keys elements by a
+    *global* sibling index (`test_visual_baseline.py:314-326`), so adding the
+    wrapper renumbers `main`'s children no matter where the dialogs sit. The
+    churn is caused by the split wrapper existing, not by the dialogs' position.
+    The genuine signal is **10 style changes on 5 elements** — the wrapper
+    computing `display` and `gap` — which is the real consequence of T3.
+
 - [ ] **T4 — raise the cap and fix the one unwrapped table.** `base.html:39`
   `max-w-[1080px]` → `max-w-7xl`. Add `overflow-x-auto` to
   `document_detail.html:32`, the only `<table>` in the repo without a wrapper —
@@ -240,14 +295,31 @@ rail — the rail is permanent, the selection is what ✕ clears.
   Add: overlay behaviour pinned at 1280 (the default, already there) AND an
   explicit narrow viewport so the overlay path stops being effectively untested;
   split behaviour pinned at 1440; and the ✕-clears-to-empty state at 1440.
-- [ ] **T7 — visual baseline.** Regenerate deliberately and audit capture by
-  capture. `max-width`, `width`, `height`, `margin-*` and
-  `grid-template-columns` are **excluded** from `STYLE_PROPERTIES`
-  (`test_visual_baseline.py:159-183`), so the cap change produces literally zero
-  diff. The real failure mode is not a style diff — it is the DOM path: `_WALK`
-  keys by tag+child index, so moving the shell inside `main` behind a new grid
-  wrapper shifts every descendant path and yields hundreds of appeared/gone lines
-  truncated at 40. Read that as "the tree moved", not "a colour changed".
+- [ ] **T7 — visual baseline. NOW BLOCKING — the suite is red until this lands.**
+  Regenerate deliberately and audit capture by capture. `max-width`, `width`,
+  `height`, `margin-*` and `grid-template-columns` are **excluded** from
+  `STYLE_PROPERTIES` (`test_visual_baseline.py:159-183`), so the cap change
+  produces literally zero diff. The real failure mode is not a style diff — it
+  is the DOM path: `_WALK` keys by a **global** sibling index
+  (`Array.from(parent.children).indexOf(node)`, `:314-326`), so introducing the
+  `.drawer-split` wrapper renumbers `main`'s children and every descendant path
+  under them shifts. Measured at **2418 differences**, of which 646 sit on
+  dialog paths and only **10 are real style changes on 5 elements** (the wrapper
+  computing `display` and `gap` on customers, products,
+  products-create-under-filter, products-drawer, suppliers). Read a huge report
+  as "the tree moved"; audit the 10.
+
+  **Known fragility, recorded not fixed:** `VIEWPORT = 1440×900`
+  (`test_visual_baseline.py:107`) sits **exactly** on the `90rem` split
+  threshold, and `min-width: 90rem` matches at exactly 1440. So every module
+  capture in the baseline is taken in **rail** mode while the functional specs
+  run at the 1280 default in **overlay** mode. That split is a fortunate
+  accident worth keeping — it is the only place the rail is fingerprinted at
+  all — but the capture sits on a knife edge: any change to the threshold, or
+  one pixel of rounding, flips the whole baseline. T5's empty state must land
+  with it, or the rail is captured with a bare `bg-card` panel and an empty
+  body.
+
   `products-drawer:hover` and `:hover-skipped` are in the compared-names list
   (`:648-649`) but never captured (`:417` bypasses `capture()`) — both sides are
   `{}`. Dead weight; the drawer hover state is genuinely unpinned.
