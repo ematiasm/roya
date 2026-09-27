@@ -7,6 +7,13 @@
 {% let page_action_href = "" %}
 {% let page_action_label = "" %}
 {% let page_action_dialog = "" %}
+{# The list column and the detail panel, in one frame. `.drawer-split` is one
+   column until the stylesheet's split threshold and a grid above it, and
+   `min-w-0` is load bearing: the track is `minmax(0, 1fr)`, so without it the
+   column keeps a grid item's intrinsic `min-width: auto` and a wide row drags
+   the panel off the right edge instead of scrolling. #}
+<div class="drawer-split">
+  <div class="min-w-0">
 {% include "partials/page_header.html" %}
 <div class="rounded-2xl border border-border bg-card p-5">
   <div class="mb-3 flex items-center justify-between">
@@ -36,47 +43,37 @@
   </div>
 </div>
 
-<div id="document-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
-  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-    <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::DocumentsDetail) }}</span>
-    <div class="flex items-center gap-2">
-      <a class="btn-secondary font-normal hover:opacity-100" href="/documents">{{ localization.tr(crate::localization::MessageKey::DocumentsAllLink) }}</a>
-      <button type="button" class="btn-secondary" onclick="closeDocumentDrawer()" aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
-    </div>
   </div>
-  <div id="document-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
+
+  {# The document detail panel: the `.drawer` component, not a hand-written panel,
+     so its chrome and its width ladder live in one place. The list rows swap the
+     detail fragment into `#document-drawer-body` and the shared controller in
+     base.html opens the panel on that swap. BOTH mutations that invalidate a
+     document dismiss it — a confirmed sale rewrites one, a purchase write another
+     — hence two names in `data-drawer-close-on`. No dialog guard: this page owns
+     no `<dialog>`, and the confirm is htmx's `hx-confirm`, which is a browser
+     dialog the page never sees. #}
+  <div id="document-drawer" class="drawer" data-drawer="document-drawer"
+       data-drawer-close-on="sale-changed purchase-changed">
+    <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+      <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::DocumentsDetail) }}</span>
+      <div class="flex items-center gap-2">
+        <a class="btn-secondary font-normal hover:opacity-100" href="/documents">{{ localization.tr(crate::localization::MessageKey::DocumentsAllLink) }}</a>
+        <button type="button" class="btn-secondary" data-drawer-close aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
+      </div>
+    </div>
+    <div id="document-drawer-body" data-drawer-body="document-drawer" class="flex-1 overflow-y-auto p-4"></div>
+  </div>
 </div>
 
 <script>
-  function openDocumentDrawer() {
-    var drawer = document.getElementById('document-drawer');
-    if (drawer) {
-      drawer.classList.remove('hidden');
-      drawer.classList.add('flex');
-    }
-  }
-  function closeDocumentDrawer() {
-    var drawer = document.getElementById('document-drawer');
-    if (drawer) {
-      drawer.classList.add('hidden');
-      drawer.classList.remove('flex');
-    }
-    var body = document.getElementById('document-drawer-body');
-    if (body) body.innerHTML = '';
-  }
-  document.addEventListener('keydown', function (evt) {
-    if (evt.key !== 'Escape') return;
-    closeDocumentDrawer();
-  });
-  document.body.addEventListener('htmx:afterSwap', function (evt) {
-    if (evt.detail.target && evt.detail.target.id === 'document-drawer-body') openDocumentDrawer();
-  });
+  // The list refreshes are a LIST concern with targets of their own, so they stay
+  // here; the panel's close rides its `data-drawer-close-on` and nothing on this
+  // page opens or closes a panel.
   document.body.addEventListener('sale-changed', function () {
-    closeDocumentDrawer();
     htmx.trigger('#document-list', 'refresh');
   });
   document.body.addEventListener('purchase-changed', function () {
-    closeDocumentDrawer();
     htmx.trigger('#document-list', 'refresh');
   });
 </script>

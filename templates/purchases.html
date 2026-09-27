@@ -5,6 +5,13 @@
 {% let page_title = localization.tr(crate::localization::MessageKey::NavigationPurchases) %}
 {% let page_breadcrumb_label = "" %}
 {% let page_breadcrumb_href = "" %}
+{# The list column and the detail panel, in one frame. `.drawer-split` is one
+   column until the stylesheet's split threshold and a grid above it, and
+   `min-w-0` is load bearing: the track is `minmax(0, 1fr)`, so without it the
+   column keeps a grid item's intrinsic `min-width: auto` and a wide row drags
+   the panel off the right edge instead of scrolling. #}
+<div class="drawer-split">
+  <div class="min-w-0">
 {% include "partials/page_header.html" %}
 <div class="flex flex-col gap-6">
     <div class="rounded-2xl border border-border bg-card p-5">
@@ -63,6 +70,26 @@
     {% endif %}
 </div>
 
+  </div>
+
+  {# The purchase peek: the `.drawer` component, not a hand-written panel, so its
+     chrome and its width ladder live in one place. The list rows swap the detail
+     fragment into `#purchase-drawer-body` and the shared controller in base.html
+     opens the panel on that swap — the row keeps its `href`, which is still the
+     no-JavaScript way to read the same thing. A mutation inside the peek makes it
+     stale, so `purchase-changed` closes it; the guard hands Escape to the create
+     dialog, which used to lose its panel. #}
+  <div id="purchase-drawer" class="drawer" data-drawer="purchase-drawer"
+       data-drawer-close-on="purchase-changed"
+       data-drawer-guard="#new-purchase-dialog">
+    <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+      <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::DocumentsPurchase) }}</span>
+      <button type="button" class="btn-secondary" data-drawer-close aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
+    </div>
+    <div id="purchase-drawer-body" data-drawer-body="purchase-drawer" class="flex-1 overflow-y-auto p-4"></div>
+  </div>
+</div>
+
 {# The creation dialog: the primary action opens it, and choosing the supplier
    creates the draft. The supplier picker posts the existing web route and the
    successful create navigates to the new draft. #}
@@ -81,42 +108,10 @@
 </dialog>
 {% endif %}
 
-{# The purchase peek shell: a fixed right panel whose body the list rows swap
-   the detail fragment into. #}
-<div id="purchase-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl hidden">
-  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-    <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::DocumentsPurchase) }}</span>
-    <button type="button" class="btn-secondary" onclick="closePurchaseDrawer()" aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
-  </div>
-  <div id="purchase-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
-</div>
-
 <script>
-  function openPurchaseDrawer() {
-    var drawer = document.getElementById('purchase-drawer');
-    if (drawer) {
-      drawer.classList.remove('hidden');
-      drawer.classList.add('flex');
-    }
-  }
-  function closePurchaseDrawer() {
-    var drawer = document.getElementById('purchase-drawer');
-    if (drawer) {
-      drawer.classList.add('hidden');
-      drawer.classList.remove('flex');
-    }
-    var body = document.getElementById('purchase-drawer-body');
-    if (body) body.innerHTML = '';
-  }
-  document.addEventListener('keydown', function (evt) {
-    if (evt.key !== 'Escape') return;
-    closePurchaseDrawer();
-  });
-  document.body.addEventListener('htmx:afterSwap', function (evt) {
-    if (evt.detail.target && evt.detail.target.id === 'purchase-drawer-body') openPurchaseDrawer();
-  });
-  // A mutation inside the peek re-reads the list, so the peek is stale: the
-  // `purchase-changed` family closes it and refreshes the feed.
-  document.body.addEventListener('purchase-changed', function(){ closePurchaseDrawer(); htmx.trigger('#purchase-list','refresh'); });
+  // The list refresh is a LIST concern with a target of its own, so it stays
+  // here; the peek's close rides the panel's `data-drawer-close-on` and nothing
+  // on this page opens or closes a panel.
+  document.body.addEventListener('purchase-changed', function(){ htmx.trigger('#purchase-list','refresh'); });
 </script>
 {% endblock %}

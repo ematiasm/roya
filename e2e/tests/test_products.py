@@ -518,7 +518,8 @@ def test_editing_a_product_in_the_drawer_updates_drawer_and_list(
 
     # The drawer read the swapped fragment before closing: the new values were in
     # it (proven by the list below rendering them), and the drawer itself is now
-    # hidden with its body emptied by closeProductDrawer().
+    # hidden with its body emptied by the shared controller, bound to this panel
+    # through `data-drawer-close-on="product-saved"`.
     expect(page.locator("#product-drawer")).not_to_be_visible()
     expect(page.locator("#product-drawer-body")).to_have_text("")
 

@@ -6,6 +6,13 @@
    parties-style header instead: back link + context pill, then a title row whose
    right side carries the two New buttons (the list's Refresh control lives in
    the shared filter bar below). #}
+{# The list column and the detail panel, in one frame. `.drawer-split` is one
+   column until the stylesheet's split threshold and a grid above it, and
+   `min-w-0` is load bearing: the track is `minmax(0, 1fr)`, so without it the
+   column keeps a grid item's intrinsic `min-width: auto` and a wide row drags
+   the panel off the right edge instead of scrolling. #}
+<div class="drawer-split">
+  <div class="min-w-0">
 <div class="mb-4 flex items-center gap-2">
   <a href="/" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CommonBackDashboard) }}</a>
   <span class="rounded-full border border-border bg-card px-2.5 py-1 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductTitle) }} • {{ localization.tr(crate::localization::MessageKey::ProductInventory) }} • {% if allow_negative_stock %}{{ localization.tr(crate::localization::MessageKey::ProductNegativeAllowed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::ProductNegativeBlocked) }}{% endif %}</span>
@@ -69,6 +76,30 @@
      so the same form is no longer reachable from two screens under two
      permissions. What stays on this screen is the ASSOCIATION — the product
      drawer links and unlinks a tax from an existing definition. #}
+</div>
+
+  </div>
+
+  {# The product slide-over: the `.drawer` component, not a hand-written panel, so
+     its chrome and its width ladder live in one place. Empty on load — the row
+     buttons fetch the detail fragment into `#product-drawer-body` and the shared
+     controller in base.html opens the panel on that swap. `product-saved` arrives
+     after settle and closes it; `product-changed` does not, because the same
+     event rides every in-drawer mutation and the operator must keep the panel
+     while the fragment refreshes underneath. The guard hands Escape to an open
+     create dialog, which is the only thing on this page that can have one. #}
+  <div id="product-drawer" class="drawer" data-drawer="product-drawer"
+       data-drawer-close-on="product-saved drawer:close"
+       data-drawer-guard="#new-category-dialog,#new-product-dialog">
+    <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+      <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::ProductDetail) }}</span>
+      <div class="flex items-center gap-2">
+        <a class="btn-secondary font-normal hover:opacity-100" href="/products">{{ localization.tr(crate::localization::MessageKey::ProductAllProducts) }}</a>
+        <button type="button" class="btn-secondary" data-drawer-close aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
+      </div>
+    </div>
+    <div id="product-drawer-body" data-drawer-body="product-drawer" class="flex-1 overflow-y-auto p-4"></div>
+  </div>
 </div>
 
 {# New category modal. On success the form resets, the list refreshes and BOTH
@@ -187,56 +218,20 @@
   </form>
 </dialog>
 
-{# The product slide-over. Empty on load: the row buttons fetch the detail
-   fragment into `#product-drawer-body` and `htmx:afterSwap` opens the drawer; the
-   save form's close rides the `product-saved` after-settle trigger. #}
-<div id="product-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md hidden flex-col border-l border-border bg-card shadow-xl">
-  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-    <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::ProductDetail) }}</span>
-    <div class="flex items-center gap-2">
-      <a class="btn-secondary font-normal hover:opacity-100" href="/products">{{ localization.tr(crate::localization::MessageKey::ProductAllProducts) }}</a>
-      <button type="button" class="btn-secondary" onclick="closeProductDrawer()" aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
-    </div>
-  </div>
-  <div id="product-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
-</div>
-
 <script>
-  function openProductDrawer() {
-    var drawer = document.getElementById('product-drawer');
-    if (drawer) {
-      drawer.classList.remove('hidden');
-      drawer.classList.add('flex');
-    }
-  }
-  function closeProductDrawer() {
-    var drawer = document.getElementById('product-drawer');
-    if (drawer) {
-      drawer.classList.add('hidden');
-      drawer.classList.remove('flex');
-    }
-    var body = document.getElementById('product-drawer-body');
-    if (body) body.innerHTML = '';
-  }
-  document.addEventListener('keydown', function (evt) {
-    if (evt.key !== 'Escape') return;
-    // An open dialog owns Escape; only close the drawer when both are closed.
-    var catDlg = document.getElementById('new-category-dialog');
-    if (catDlg && catDlg.open) return;
-    var prodDlg = document.getElementById('new-product-dialog');
-    if (prodDlg && prodDlg.open) return;
-    closeProductDrawer();
-  });
-  document.body.addEventListener('htmx:afterSwap', function (evt) {
-    if (evt.detail.target && evt.detail.target.id === 'product-drawer-body') openProductDrawer();
-  });
-  // A successful drawer save answers the POST with the fresh detail fragment
-  // plus two trigger events: `product-changed` (pre-swap) refreshes the lists,
-  // and `product-saved` — delivered after the swap settles, because the plain
-  // header fires before it and the `htmx:afterSwap` open below would reopen
-  // the panel — is what closes the drawer here. A failed save swaps nothing
-  // and fires no trigger, so the drawer stays open with the operator's values.
-  document.body.addEventListener('product-saved', closeProductDrawer);
+  // List refreshes only. The panel's open and close belong to the controller in
+  // base.html, so nothing on this page knows what a drawer is — the drawer asks
+  // for itself by swapping into its own body slot, and `data-drawer-close-on`
+  // says which event dismisses it.
+  //
+  // A successful drawer save answers the POST with the fresh detail fragment plus
+  // two trigger events: `product-changed` (pre-swap) refreshes the lists, and
+  // `product-saved` — delivered after the swap settles, because the plain header
+  // fires before it and the controller's `htmx:afterSwap` open would reopen the
+  // panel — is what closes it. The split matters: `product-changed` also rides
+  // every in-drawer mutation, so a panel that closed on it would vanish under
+  // the operator mid-edit. A failed save swaps nothing and fires no trigger, so
+  // the panel stays open with the values they typed.
   document.body.addEventListener('product-created', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
   document.body.addEventListener('product-changed', function(){ htmx.trigger('#product-list','refresh'); htmx.trigger('#low-stock-list','refresh'); });
   document.body.addEventListener('category-created', function(){ htmx.trigger('#product-list','refresh'); });

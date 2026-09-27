@@ -9,9 +9,12 @@
    (issue #37): today their drawer answer is the detail fragment, but their
    endpoints also answer list fragments, so the body always carries the filter
    the operator is looking at. The save form stays without it: its `category_id`
-   is the product's own, not the filter's. Lifecycle actions swap
-   `#product-list` themselves and close the drawer on success via
-   `closeProductDrawer()`. #}
+   is    the product's own, not the filter's. Lifecycle actions swap
+   `#product-list` themselves and close the drawer on success by asking for it:
+   the panel is gone from under the operator once the record behind it is gone,
+   and `data-drawer-close` is a click contract, so a request that FAILED would
+   take the detail away with it. They dispatch `drawer:close` on the enclosing
+   panel instead, and the panel — not this partial — owns what closing means. #}
 <div id="product-detail-inner" class="flex flex-col gap-4">
   {# Card A: header, derived stock and the in-place edit form. Every field is
      prefilled from the stored row; optional numbers/text render empty values,
@@ -47,17 +50,17 @@
        must render the list the operator is looking at (issue #33). #}
     <div class="mt-4 flex items-center gap-2">
       {% if product.is_active %}
-      <form hx-post="/web/products/deactivate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+      <form hx-post="/web/products/deactivate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger(this.closest('[data-drawer]'),'drawer:close')">
         <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
         <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
       </form>
       {% else %}
-      <form hx-post="/web/products/activate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+      <form hx-post="/web/products/activate" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger(this.closest('[data-drawer]'),'drawer:close')">
         <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
         <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}</button>
       </form>
       {% endif %}
-      <form hx-post="/web/products/delete" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeProductDrawer()">
+      <form hx-post="/web/products/delete" hx-include="#product-filters" hx-target="#product-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger(this.closest('[data-drawer]'),'drawer:close')">
         <input type="hidden" name="product_id" value="{{ product.id }}" class="field" />
         <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
       </form>
@@ -66,9 +69,9 @@
     {# Closure is trigger-driven: htmx removes this form's listeners when the
        swap detaches it, so the form cannot own its own close; the save answer
        instead carries `product-saved` (after-settle, so it lands after the
-       `htmx:afterSwap` open), which the page listener maps to
-       `closeProductDrawer()`. A failed save swaps nothing and keeps the drawer
-       open. #}
+       controller's `htmx:afterSwap` open), which the panel's
+       `data-drawer-close-on` binds. A failed save swaps nothing and keeps the
+       drawer open. #}
     <form id="product-edit-form" class="mt-4 flex flex-col gap-2.5"
           data-action="{{ localization.tr(crate::localization::MessageKey::ProductSave) }}"
           hx-post="/web/products/edit"

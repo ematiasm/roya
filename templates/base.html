@@ -134,6 +134,14 @@
       // `purchase-changed`, and customers and suppliers on nothing at all. The
       // list-refresh listeners that sit beside them are a LIST concern with
       // per-module targets, so they stay in the modules.
+      //
+      // `drawer:close` is the one name no server sends: a detail fragment that
+      // DESTROYS the record the panel is showing dispatches it on the enclosing
+      // panel, because a deactivate or a delete leaves a panel full of a record
+      // that no longer exists. It is dispatched, not bound, on purpose — the
+      // alternative is a click contract (`data-drawer-close`) on a form, which
+      // would collapse the panel on submit and lose the operator's detail when
+      // the request then failed.
       Array.prototype.forEach.call(
         document.querySelectorAll('[data-drawer-close-on]'),
         function (panel) {

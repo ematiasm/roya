@@ -297,6 +297,14 @@
      The panel is `width: 100%` of its track and the track is declared HERE,
      once. The panel does not read the width token, so the two cannot disagree.
 
+     `max-height: 100vh` is not decoration. Below the threshold `inset-y-0`
+     bounds the panel to exactly the viewport and its body scrolls inside it. In
+     flow there is no such bound, so without it the panel is as tall as its
+     content — a 1500px-tall detail makes the PAGE scroll instead of the panel,
+     and the split buys back nothing. The bound restores the behaviour the
+     overlay already had, so the two sides of the threshold differ in position
+     and in nothing else.
+
      `minmax(0, 1fr)` and not `1fr`: the list column must be able to shrink
      below its content's intrinsic width, or a wide table inside it pushes the
      track and the panel off the right edge instead of scrolling.
@@ -316,6 +324,7 @@
     .drawer {
       position: static;
       width: 100%;
+      max-height: 100vh;
       box-shadow: none;
       /* Unconditional, and after the `data-open` rule on purpose: on a wide
          screen the panel is a column, not an overlay, so there is nothing to
