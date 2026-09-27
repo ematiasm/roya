@@ -2,7 +2,27 @@
 
 ## Status
 
-Planning complete. No implementation yet.
+**Delivered.** All seven tasks landed; the full suite is green
+(`128 passed, 4 skipped`, and `cargo test` 1223).
+
+| task | commit |
+| --- | --- |
+| T1 tokens + `.drawer` component | `38f1860` |
+| T2 the shared controller | `50cb4bf` |
+| T3 migrate the five modules | `e890813` |
+| T4 the cap and the one unwrapped table | `9adad56` |
+| T5 the rail empty state | `65e8fc8` |
+| T6 the layout spec, mutation-proven | `00d2b21` |
+| T7 regenerate and audit the baseline | `e4ae700` |
+
+Three defects were found by measuring rather than by reading, and all three
+would have shipped: a `@media` condition using `var()` that parsed, built with
+exit 0, and never matched anything; a `max-w-7xl` that is 1280px and not the
+1536px the plan claimed; and a `var el` shadowing the IIFE's own DOM builder.
+One piece of code was also found to be unobservable — the controller's rail
+guard, which the stylesheet already guarantees — and the comment that credited
+it was corrected instead of the branch being deleted.
+
 
 ## Objective
 
@@ -367,39 +387,102 @@ rail — the rail is permanent, the selection is what ✕ clears.
   detail; the close button brings the box back with the panel still visible.
   `/customers` shows it, `/customers/{id}` does not.
 
-- [ ] **T6 — tests.** The two Rust assertions on the function *source strings*
+- [x] **T6 — tests.** The two Rust assertions on the function *source strings*
   (`smoke_tests.rs:3937-3940`, `purchases_web.rs:5824-5827`) break on rename.
   Add: overlay behaviour pinned at 1280 (the default, already there) AND an
   explicit narrow viewport so the overlay path stops being effectively untested;
   split behaviour pinned at 1440; and the ✕-clears-to-empty state at 1440.
-- [ ] **T7 — visual baseline. NOW BLOCKING — the suite is red until this lands.**
-  Regenerate deliberately and audit capture by capture. `max-width`, `width`,
-  `height`, `margin-*` and `grid-template-columns` are **excluded** from
-  `STYLE_PROPERTIES` (`test_visual_baseline.py:159-183`), so the cap change
-  produces literally zero diff. The real failure mode is not a style diff — it
-  is the DOM path: `_WALK` keys by a **global** sibling index
-  (`Array.from(parent.children).indexOf(node)`, `:314-326`), so introducing the
-  `.drawer-split` wrapper renumbers `main`'s children and every descendant path
-  under them shifts. Measured at **2418 differences**, of which 646 sit on
-  dialog paths and only **10 are real style changes on 5 elements** (the wrapper
-  computing `display` and `gap` on customers, products,
-  products-create-under-filter, products-drawer, suppliers). Read a huge report
-  as "the tree moved"; audit the 10.
+  **Delivered `00d2b21`.** The Rust half was already done in T3. The new work is
+  `e2e/tests/test_drawer_layout.py` — **13 tests, no production change.**
 
-  **Known fragility, recorded not fixed:** `VIEWPORT = 1440×900`
-  (`test_visual_baseline.py:107`) sits **exactly** on the `90rem` split
-  threshold, and `min-width: 90rem` matches at exactly 1440. So every module
-  capture in the baseline is taken in **rail** mode while the functional specs
-  run at the 1280 default in **overlay** mode. That split is a fortunate
-  accident worth keeping — it is the only place the rail is fingerprinted at
-  all — but the capture sits on a knife edge: any change to the threshold, or
-  one pixel of rounding, flips the whole baseline. T5's empty state must land
-  with it, or the rail is captured with a bare `bg-card` panel and an empty
-  body.
+  It lives outside every module's spec because it tests the SHARED component, and
+  it covers **all five modules** because covering one would not prove the reuse
+  this feature claims. The default viewport is deliberately left at 1280: moving
+  it above the threshold would silently invert many existing drawer assertions.
 
-  `products-drawer:hover` and `:hover-skipped` are in the compared-names list
-  (`:648-649`) but never captured (`:417` bypasses `capture()`) — both sides are
-  `{}`. Dead weight; the drawer hover state is genuinely unpinned.
+  | test | viewport | claim |
+  | --- | --- | --- |
+  | the split threshold is a boundary | 1439 → 1440 | overlay at 1439, rail at 1440, **failing in both directions** |
+  | the rail is there with no click ×5 | 1440×900 | visible, not `fixed`, one `.empty` child |
+  | the overlay opens on a row and Escape closes it ×5 | 1280×720 | hidden, then the record's own text with **zero** `.empty`, then closed + empty state |
+  | the overlay is full bleed | 360×740 | rendered width == available width, and `available < 400` so it cannot pass by coincidence |
+  | the rail survives its own ✕ | 1440×900 | body empties **and** the panel stays visible — either half alone is vacuous |
+
+  The threshold test holds one page at 1439 and then changes only the viewport,
+  so the single variable is the width. Raising the threshold to `999rem` breaks
+  the 1440 half; lowering it to `70rem` breaks the 1439 half. That pins the
+  value **from both sides** instead of trusting the comment.
+
+  ### The finding: one mutant killed nothing
+
+  Every test was proven non-vacuous. The split mutation (`90rem` → `999rem`, and
+  separately deleting the in-flow `.drawer` rule) fails 7 of 13. Removing the
+  `min(100%, …)` bound fails exactly 1 — the full-bleed test, reporting
+  `measured 400px against 360px available`. Stopping `closeDrawer` from
+  re-inserting the empty state fails 6.
+
+  **Dropping `closeDrawer`'s `if (!drawerIsRail.matches)` guard leaves all 13
+  green.** The rail's permanence is the **stylesheet's** guarantee: inside
+  `@media (width >= 90rem)`, `.drawer { display: flex }` is unconditional, at the
+  same specificity as the base `display: none` and later in source order, so a
+  rail is a column whether or not `data-open` is set. No DOM state can observe
+  the controller's branch. Not a behaviour defect — the outcome is correct and
+  doubly guaranteed — but `base.html`'s comment credited the controller, so it
+  now states what actually provides the guarantee and warns against deleting the
+  branch without re-running the mutation.
+
+  **A test that survives the mutation it was written for is decorative coverage.**
+  The writer also caught two of its own docstrings claiming discriminations the
+  mutations disproved, and corrected them rather than shipping them.
+
+  Two more things the work pinned down:
+  - **Purchases needed two different markers, not one.** The list row shows the
+    *supplier*; the body shows the line's *product*, because they are separate
+    swaps by separate endpoints. A single string would have proved neither.
+  - `--tb=line` is unreliable in this suite — it reported line 456 when the real
+    failing assertion was 441. Every mutation was re-verified with `--tb=short`.
+
+  Verified: the new spec 13 passed; the full suite **1 failed, 127 passed,
+  4 skipped**, whose sole failure is T7's known `test_visual_baseline[chromium]`;
+  `cargo test` 1223 passed; no stylesheet or baseline file in the diff.
+- [x] **T7 — visual baseline. Delivered `e4ae700`. NOW GREEN.**
+  Regenerated deliberately and audited by comparing the two JSONs directly,
+  **not** by reading the test's own report — that report stops after 40
+  problems and would have shown a fraction of the real diff.
+
+  The verdict:
+
+  - **Only `display` and `gap` ever changed** on any element that kept its DOM
+    path, across all 86 captures. Not one colour, font-size, border, padding or
+    radius moved. No pre-existing element was silently restyled, which is the
+    rule this baseline exists to enforce.
+  - Those two are the `.drawer-split` frame computing `display: grid` and
+    `gap: 24px` at 1440, at five paths where a **different** element used to
+    sit. The recorded old value is `flex`, not `block` — that is the tell: a
+    path collision, not a restyle.
+  - The remaining ~1170 differences are path renumbering. Paired by
+    fingerprint, every moved element carries **identical** computed styles,
+    which is what proves the tree moved rather than the appearance changing.
+  - The nine `:hover-skipped` captures changed for two reasons: the dialog paths
+    renumbered, and the panel's header anchor and ✕ **stopped being skipped** —
+    because at 1440 the panel is a visible grid column, so the hover walk now
+    visits it. That is the split becoming observable.
+  - **The rail's empty state is now fingerprinted.** Fifteen captures contain a
+    dashed `.empty`, up from twelve: `customers`, `documents` and `suppliers`
+    went 0 → 1, and the product and purchase captures 1 → 2.
+    `border-top-style` is in `STYLE_PROPERTIES`, so it is a real assertion
+    rather than a hole in the net.
+  - Capture count 86 before and after, as a layout-only change requires. Key
+    count 5453 → 5486.
+
+  ⚠️ **My first classification method was wrong and I corrected it.** I paired
+  removals with additions on identical fingerprints and reported "1173 shifted,
+  9 gone, 55 new". That pairing is unreliable here — dozens of sibling `div`s
+  share identical computed styles, so it mispairs and invents phantom
+  additions. The reliable signals are the style-property scan and reading the
+  path prefixes directly, which show every "new" path is the same element one
+  level deeper.
+
 
 ## Review record
 
