@@ -284,10 +284,48 @@ rail — the rail is permanent, the selection is what ✕ clears.
     The genuine signal is **10 style changes on 5 elements** — the wrapper
     computing `display` and `gap` — which is the real consequence of T3.
 
-- [ ] **T4 — raise the cap and fix the one unwrapped table.** `base.html:39`
-  `max-w-[1080px]` → `max-w-7xl`. Add `overflow-x-auto` to
+- [x] **T4 — raise the cap and fix the one unwrapped table.** `base.html:39`
+  `max-w-[1080px]` → `max-w-[1536px]`. Add `overflow-x-auto` to
   `document_detail.html:32`, the only `<table>` in the repo without a wrapper —
-  it renders inside the panel and 448 → 360/560 would squeeze it.
+  it renders inside the panel and 448 → 360/560 would squeeze it. **Delivered
+  `9adad56`.** `cargo test` 1223 passed; the four drawer e2e specs 62 passed
+  2 skipped; the stylesheet rebuilds with zero warnings; `document_detail.html`
+  parses with zero unclosed and zero mismatched tags by a depth-tracking parser.
+
+  **The plan named the wrong utility, and measuring caught it.** The plan said
+  `max-w-7xl` "equals the `2xl` breakpoint" at 1536px. Measured in Chromium at
+  1920px against the built stylesheet: **`max-w-7xl` is 1280px**, and
+  `max-w-8xl` — the container that would be 1536px — is **not a utility this
+  stylesheet generates at all**. Shipping the plan as written would have put the
+  1920px list at **632px instead of 888px** and silently undone the entire point
+  of the task. The cap is an arbitrary literal now, and the reason is recorded in
+  `base.html` where a reader finds it *before* changing it back to 1080px.
+
+  Measured geometry against the built stylesheet at the real class strings:
+
+  | viewport | mode | main | list | panel | dead gutter |
+  | --- | --- | --- | --- | --- | --- |
+  | 1280 | overlay | 1024 | 960 | 538 | 0 |
+  | 1440 | rail | 1184 | **648** | 448 | 0 |
+  | 1600 | rail | 1344 | 808 | 448 | 0 |
+  | 1920 | rail | 1536 | **888** | **560** | 64 |
+  | 2560 | rail | 1536 | 888 | 560 | 384 |
+
+  The list and the panel are **both** wider than the 448px overlay they replace,
+  and 1440 holds exactly the 648px floor the threshold arithmetic was chosen for.
+
+  **The cap is provably invisible to the visual baseline, and that was checked
+  rather than assumed:** the post-change report contains **zero** width-related
+  differences and is still truncated at 40 with the same first entries
+  (`main[1]/dialog[2]`, T3's DOM-path shift). A class VALUE cannot change the DOM
+  structure and `max-width` is excluded from `STYLE_PROPERTIES`, so T4 added
+  nothing to the 2418 differences T3 caused.
+
+  ⚠️ **My first geometry probe measured the wrong thing.** It rendered `main`
+  without the cap class and so reported `main 1664 / list 1016` at 1920 —
+  better-looking numbers that were not the product. The corrected probe uses the
+  real `base.html` class string. A geometry probe that omits the property under
+  test will confidently report the wrong answer.
 - [ ] **T5 — rail empty state.** New `MessageKey` (EN + ES) and the template
   fragment for the always-visible panel.
 - [ ] **T6 — tests.** The two Rust assertions on the function *source strings*
