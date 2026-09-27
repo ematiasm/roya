@@ -326,8 +326,47 @@ rail — the rail is permanent, the selection is what ✕ clears.
   better-looking numbers that were not the product. The corrected probe uses the
   real `base.html` class string. A geometry probe that omits the property under
   test will confidently report the wrong answer.
-- [ ] **T5 — rail empty state.** New `MessageKey` (EN + ES) and the template
-  fragment for the always-visible panel.
+- [x] **T5 — rail empty state.** New `MessageKey` (EN + ES) and the template
+  fragment for the always-visible panel. **Delivered `65e8fc8`.** `cargo test`
+  1223 passed including the catalog-parity and non-count-form guards; the
+  stylesheet presence guard 10 passed; the four drawer e2e specs 62 passed
+  2 skipped.
+
+  **One shared key, not five.** The sentence is module-NEUTRAL because the same
+  key serves products, purchases, customers, documents and suppliers. EN
+  `"Select a row to see its details."` / ES `"Seleccione una fila para ver sus
+  detalles."` (neutral usted register, matching the catalog). Five per-module
+  keys would be ten catalog rows for a transient state. Wire name is
+  **`drawer.empty`**, not a dot-less name, because **698 of 698** existing keys
+  are `namespace.name` — one exception in 699 is an inconsistency someone
+  "fixes" later.
+
+  The markup is a partial (`partials/drawer_empty.html`, five identical call
+  sites — the real reason a partial exists) and it **reuses the existing `.empty`
+  component**, so the stylesheet needed **no rebuild**: `.empty` was already
+  compiled in. Customers is the one server-rendered body, so its include sits in
+  the `{% else %}` — `/customers` shows the empty state, `/customers/{id}` shows
+  the statement.
+
+  **The controller shadowing bug this surfaced.** `closeDrawer` had
+  `var el = drawerNode(id)`, and the same IIFE owns an `el(tag, attrs, text)`
+  DOM builder. `el('div', …)` inside that function would have called a DOM node
+  and thrown. The local is now `panel`, and the comment names the trap.
+
+  **Seven e2e assertions pinned the old empty body, and they were RED before
+  this work** — the failure was literally a diff of the new
+  `<div class="empty">` against an expected `''`. They encoded the defect T5
+  fixes, not a behaviour worth keeping. Each was rewritten to a named helper
+  asserting **exactly one `> .empty` child**, which is *stronger* than the
+  `to_have_text("")` it replaces: `not_to_be_visible()` cannot tell an emptied
+  body from a full one, and a leftover detail fragment carrying the same words
+  would pass on the text alone.
+
+  Verified in a real browser at 1920: the rail renders 560px wide with **no
+  `data-open`** and shows the sentence; clicking a row removes the box and shows
+  detail; the close button brings the box back with the panel still visible.
+  `/customers` shows it, `/customers/{id}` does not.
+
 - [ ] **T6 — tests.** The two Rust assertions on the function *source strings*
   (`smoke_tests.rs:3937-3940`, `purchases_web.rs:5824-5827`) break on rename.
   Add: overlay behaviour pinned at 1280 (the default, already there) AND an

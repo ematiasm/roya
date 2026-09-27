@@ -123,6 +123,19 @@
       // The local is `panel`, NOT `el`: `var el = drawerNode(id)` shadows the
       // `el()` builder for the rest of this function, so `el('div', …)` would
       // call a DOM node and throw. Two identifiers, one name, one function.
+      //
+      // The rail guard below is REDUNDANT, and that is worth knowing rather than
+      // assuming. It was written believing this function decides whether a rail
+      // collapses; it does not. Inside `@media (width >= 90rem)` the stylesheet
+      // sets `.drawer { display: flex }` unconditionally, at the same
+      // specificity as the base `.drawer { display: none }` and later in source
+      // order, so a rail is a column whether or not `data-open` is set. Dropping
+      // this guard entirely was tried as a mutation against the whole drawer
+      // layout spec and all 13 tests passed — no DOM state can observe it.
+      //
+      // The stylesheet owns geometry; this is belt-and-braces, kept because the
+      // intent is worth stating in code and because the CSS rule could one day be
+      // reordered. Do not "simplify" it away without re-running that mutation.
       function closeDrawer(id) {
         var panel = drawerNode(id);
         if (!panel) return;
