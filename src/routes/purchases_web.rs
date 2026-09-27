@@ -5822,8 +5822,22 @@ mod tests {
             "the shell must render the swap target: {html:.600}"
         );
         assert!(
-            html.contains("closePurchaseDrawer()"),
-            "the shell's close button must be wired: {html:.600}"
+            html.contains("data-drawer=\"purchase-drawer\""),
+            "the peek must opt into the shared drawer controller: {html:.600}"
+        );
+        // The close button opts into the controller's close instead of calling a
+        // per-module function, and it keeps its `aria-label`: the accessible name
+        // and the wiring are two separate contracts on the same element.
+        assert!(
+            html.contains("data-drawer-close aria-label="),
+            "the shell's close button must be wired to the shared controller: {html:.600}"
+        );
+        // A mutation inside the peek makes it stale, so the peek closes on it.
+        // This one is the module's actual behaviour and the reason the opt-in
+        // exists: five hand-written close pairs collapse into this attribute.
+        assert!(
+            html.contains("data-drawer-close-on=\"purchase-changed\""),
+            "the peek must close when the purchase changes: {html:.600}"
         );
     }
 

@@ -36,7 +36,19 @@
         <a href="/" class="text-lg font-bold tracking-[-0.02em] text-text">roya <span class="text-accent">◆</span></a>
       </header>
 
-      <main class="mx-auto w-full max-w-[1080px] flex-1 px-4 py-6 lg:px-8">
+      {# The content cap is load bearing for the drawer split, not a readability
+         preference. At 1920px this yields a 1472px content box, and with the
+         split's 24px gap and a 560px panel the list keeps 888px — a list and a
+         panel that are both wider than the 448px overlay this replaced. At the
+         old 1080px the list fell to 632px, which is the whole reason the cap
+         moved.
+
+         1536px is arbitrary on purpose. `max-w-7xl` LOOKS like the right name
+         and is 1280px — measured, not assumed — which would put the 1920px list
+         back at 632px. `max-w-8xl`, the container that would be 1536px, is not
+         a utility this stylesheet generates. Keep this a literal and change it
+         with the split arithmetic in mind. #}
+      <main class="mx-auto w-full max-w-[1536px] flex-1 px-4 py-6 lg:px-8">
         <div id="notice" data-notice-region aria-live="polite"></div>
         {% block content %}{% endblock %}
       </main>
@@ -45,17 +57,174 @@
 
   <script>
     (function () {
-      // Drawer: the sidebar is off-canvas below md; the toggle and Escape close it.
+      // Sidebar: off-canvas below md; the toggle and Escape close it. Renamed
+      // from `drawer` because "drawer" now means the detail panel everywhere
+      // else in this file, and one word cannot mean two components.
       var sidebar = document.getElementById('sidebar');
       var toggle = document.getElementById('drawer-toggle');
-      function drawer(open) {
+      function toggleSidebar(open) {
         if (!sidebar || !toggle) return;
         sidebar.classList.toggle('-translate-x-full', !open);
         toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
       }
-      if (toggle) toggle.addEventListener('click', function () { drawer(sidebar.classList.contains('-translate-x-full')); });
-      document.addEventListener('keydown', function (evt) { if (evt.key === 'Escape') drawer(false); });
-      if (sidebar) sidebar.addEventListener('click', function (evt) { if (evt.target.closest && evt.target.closest('a')) drawer(false); });
+      if (toggle) toggle.addEventListener('click', function () { toggleSidebar(sidebar.classList.contains('-translate-x-full')); });
+      document.addEventListener('keydown', function (evt) { if (evt.key === 'Escape') toggleSidebar(false); });
+      if (sidebar) sidebar.addEventListener('click', function (evt) { if (evt.target.closest && evt.target.closest('a')) toggleSidebar(false); });
+
+      // ---- The detail drawer: one controller for every module. ----
+      //
+      // A panel opts in with `data-drawer="<id>"` on the shell and
+      // `data-drawer-body="<id>"` on its slot, so no module writes an open or a
+      // close. Five modules used to carry five hand-written open/close pairs
+      // that were character-for-character identical apart from two id strings,
+      // and five copies of the Escape binding; purchases and documents had no
+      // dialog guard at all and closed the panel out from under an open dialog.
+      //
+      // WIDTH IS NEVER MEASURED HERE. The split is the stylesheet's job, in a
+      // media query, because the available width is the only fact a layout can
+      // honestly depend on. This asks one question of matchMedia — "is the
+      // panel a track right now?" — and changes nothing else.
+      var drawerIsRail = window.matchMedia('(min-width: 90rem)');
+
+      function drawerNode(id) { return id ? document.getElementById(id) : null; }
+
+      function drawerOpen(id) {
+        var el = drawerNode(id);
+        return !!(el && el.hasAttribute('data-open'));
+      }
+
+      function openDrawer(id) {
+        var el = drawerNode(id);
+        if (el) el.setAttribute('data-open', '');
+      }
+
+      // Closing always empties the slot; it only collapses the panel while the
+      // panel is overlaying. On the rail the panel is a column, so there is
+      // nothing to collapse and ✕ clears the selection instead — which is the
+      // empty state the rail needs when nothing is selected.
+      //
+      // "Empty" means back to the empty STATE, not to nothing. The slot starts
+      // out holding the server-rendered `.empty` box (see
+      // `templates/partials/drawer_empty.html`), and clearing it to a bare
+      // string left a `bg-card` rectangle with nothing in it — so at and above
+      // the split threshold the rail read one way on load and another after ✕.
+      // Restoring the same box makes both states identical, which is the whole
+      // reason the rail needs no separate "cleared" treatment.
+      //
+      // Built with `el()` and `replaceChildren`, never `innerHTML` and a
+      // concatenated string: the sentence is localized, so a string here is
+      // markup assembled out of a translated value, and `el()` sets
+      // `textContent`, which is why the notice builder below gets to do the same
+      // thing. `el` and `translations` are both declared further down this
+      // IIFE, which is safe — function declarations hoist, `var translations` is
+      // assigned while this IIFE runs, and no close can fire before an event
+      // does.
+      //
+      // The local is `panel`, NOT `el`: `var el = drawerNode(id)` shadows the
+      // `el()` builder for the rest of this function, so `el('div', …)` would
+      // call a DOM node and throw. Two identifiers, one name, one function.
+      //
+      // The rail guard below is REDUNDANT, and that is worth knowing rather than
+      // assuming. It was written believing this function decides whether a rail
+      // collapses; it does not. Inside `@media (width >= 90rem)` the stylesheet
+      // sets `.drawer { display: flex }` unconditionally, at the same
+      // specificity as the base `.drawer { display: none }` and later in source
+      // order, so a rail is a column whether or not `data-open` is set. Dropping
+      // this guard entirely was tried as a mutation against the whole drawer
+      // layout spec and all 13 tests passed — no DOM state can observe it.
+      //
+      // The stylesheet owns geometry; this is belt-and-braces, kept because the
+      // intent is worth stating in code and because the CSS rule could one day be
+      // reordered. Do not "simplify" it away without re-running that mutation.
+      function closeDrawer(id) {
+        var panel = drawerNode(id);
+        if (!panel) return;
+        if (!drawerIsRail.matches) panel.removeAttribute('data-open');
+        var body = document.getElementById(id + '-body');
+        if (body) body.replaceChildren(el('div', { class: 'empty' }, translations.drawerEmpty));
+      }
+
+      // `data-drawer-close` names a panel, or sits inside one and names
+      // nothing: the ✕ buttons are the common case and repeating the id in
+      // every module is the kind of copy this controller exists to remove.
+      document.addEventListener('click', function (evt) {
+        var t = evt.target;
+        if (!t || !t.closest) return;
+        var opener = t.closest('[data-drawer-open]');
+        if (opener) { openDrawer(opener.getAttribute('data-drawer-open')); return; }
+        var closer = t.closest('[data-drawer-close]');
+        if (!closer) return;
+        var id = closer.getAttribute('data-drawer-close');
+        if (!id) {
+          var host = closer.closest('[data-drawer]');
+          id = host ? host.id : null;
+        }
+        if (id) closeDrawer(id);
+      });
+
+      // A swap into a `data-drawer-body` slot IS the signal that a module
+      // opened a panel. This replaces five listeners that each compared one
+      // hardcoded id.
+      document.body.addEventListener('htmx:afterSwap', function (evt) {
+        var t = evt.detail && evt.detail.target;
+        if (t && t.getAttribute) {
+          var id = t.getAttribute('data-drawer-body');
+          if (id) openDrawer(id);
+        }
+      });
+
+      // `data-drawer-close-on="<event> [<event>]"` on the panel binds the htmx
+      // events that dismiss it. This is where the five modules genuinely
+      // differed: products closed on `product-saved`, purchases on
+      // `purchase-changed`, documents on BOTH `sale-changed` and
+      // `purchase-changed`, and customers and suppliers on nothing at all. The
+      // list-refresh listeners that sit beside them are a LIST concern with
+      // per-module targets, so they stay in the modules.
+      //
+      // `drawer:close` is the one name no server sends: a detail fragment that
+      // DESTROYS the record the panel is showing dispatches it on the enclosing
+      // panel, because a deactivate or a delete leaves a panel full of a record
+      // that no longer exists. It is dispatched, not bound, on purpose — the
+      // alternative is a click contract (`data-drawer-close`) on a form, which
+      // would collapse the panel on submit and lose the operator's detail when
+      // the request then failed.
+      Array.prototype.forEach.call(
+        document.querySelectorAll('[data-drawer-close-on]'),
+        function (panel) {
+          var id = panel.id;
+          (panel.getAttribute('data-drawer-close-on') || '').split(/\s+/).forEach(function (name) {
+            if (!name) return;
+            document.body.addEventListener(name, function () { closeDrawer(id); });
+          });
+        }
+      );
+
+      // `data-drawer-guard="#dlg-a,#dlg-b"` names the dialogs that own Escape
+      // while they are open. The test is the element's `open` property, NOT its
+      // presence: a <dialog> is always in the DOM, so a presence test would
+      // guard the drawer forever and Escape would never close it.
+      function drawerIsGuarded(panel) {
+        var ids = (panel.getAttribute('data-drawer-guard') || '').split(/[\s,]+/);
+        for (var i = 0; i < ids.length; i++) {
+          if (!ids[i]) continue;
+          var el = document.getElementById(ids[i]);
+          if (el && el.open) return true;
+        }
+        return false;
+      }
+
+      // One Escape handler for every panel. It stays silent unless a panel is
+      // actually overlaying, and it never calls preventDefault on a bare
+      // Escape, because the product picker's handler below depends on receiving
+      // it. Six document-level Escape listeners already exist on a split page;
+      // this replaces the module's, it does not add to them.
+      document.addEventListener('keydown', function (evt) {
+        if (evt.key !== 'Escape') return;
+        if (drawerIsRail.matches) return;
+        var open = document.querySelector('[data-drawer][data-open]');
+        if (!open || drawerIsGuarded(open)) return;
+        closeDrawer(open.id);
+      });
 
       function el(tag, attrs, text) {
         var node = document.createElement(tag);
@@ -67,7 +236,8 @@
         dismiss: "{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}",
         requestFailed: "{{ localization.tr(crate::localization::MessageKey::NoticeRequestFailed) }}",
         actionFailed: "{{ localization.tr(crate::localization::MessageKey::NoticeActionFailed) }}",
-        actionSaved: "{{ localization.tr(crate::localization::MessageKey::NoticeActionSaved) }}"
+        actionSaved: "{{ localization.tr(crate::localization::MessageKey::NoticeActionSaved) }}",
+        drawerEmpty: "{{ localization.tr(crate::localization::MessageKey::DrawerEmpty) }}"
       };
       // Notice: non-blocking feedback region; replaces the old blocking browser dialog.
       // The server can also render this success box itself for the

@@ -17,11 +17,11 @@
     <div class="my-2 text-2xl font-bold">{{ balance }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersOutstanding) }}</span></div>
     <div class="mt-4 flex items-center gap-2">
       {% if supplier.is_active %}
-      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
+      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/deactivate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger(this.closest('[data-drawer]'),'drawer:close')">{{ localization.tr(crate::localization::MessageKey::CommonDeactivate) }}</button>
       {% else %}
-      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/activate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}</button>
+      <button type="button" class="btn-secondary" hx-post="/web/suppliers/{{ supplier.id }}/activate" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger(this.closest('[data-drawer]'),'drawer:close')">{{ localization.tr(crate::localization::MessageKey::CommonActivate) }}</button>
       {% endif %}
-      <button type="button" class="btn-secondary" hx-delete="/web/suppliers/{{ supplier.id }}" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) closeSupplierDrawer()">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
+      <button type="button" class="btn-secondary" hx-delete="/web/suppliers/{{ supplier.id }}" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) htmx.trigger(this.closest('[data-drawer]'),'drawer:close')">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
     </div>
   </section>
 

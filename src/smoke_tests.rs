@@ -3934,9 +3934,23 @@ async fn products_page_uses_modals_drawer_and_clickable_rows() {
         products.contains("id=\"product-drawer-body\""),
         "the product drawer body must be rendered"
     );
+    // The shell is the shared component now, not a hand-written panel: `drawer`
+    // is the only class it carries, and the eleven utilities it used to restate
+    // live in one definition. The controller finds the panel by `data-drawer`
+    // and the ✕ opts into its close, which is what replaced the page's own
+    // `closeProductDrawer` — the attribute is pinned WITH its `aria-label`
+    // because the close control must keep both.
     assert!(
-        products.contains("function closeProductDrawer()"),
-        "the page must define closeProductDrawer"
+        products.contains("class=\"drawer\""),
+        "the product drawer must be the shared component, not a hand-written panel"
+    );
+    assert!(
+        products.contains("data-drawer=\"product-drawer\""),
+        "the product drawer must opt into the shared controller"
+    );
+    assert!(
+        products.contains("data-drawer-close aria-label="),
+        "the product drawer's close button must be wired to the shared controller"
     );
 
     // The permanent New Product card is gone. `id="new-product"` with the

@@ -1,6 +1,13 @@
 {% extends "base.html" %}
 {% block title %}{{ title }}{% endblock %}
 {% block content %}
+{# The list column and the detail panel, in one frame. `.drawer-split` is one
+   column until the stylesheet's split threshold and a grid above it, and
+   `min-w-0` is load bearing: the track is `minmax(0, 1fr)`, so without it the
+   column keeps a grid item's intrinsic `min-width: auto` and a wide row drags
+   the panel off the right edge instead of scrolling. #}
+<div class="drawer-split">
+  <div class="min-w-0">
 <div class="mb-4 flex items-center gap-2">
   <a href="/" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CommonBackDashboard) }}</a>
   <a href="/sales" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::NavigationSales) }}</a>
@@ -20,6 +27,48 @@
   {% include "partials/customer_list.html" %}
 </div>
 <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerHelp) }}</div>
+
+  </div>
+
+  {# The customer detail panel: the `.drawer` component, not a hand-written panel,
+     so its chrome and its width ladder live in one place.
+
+     This is the ONE panel the server opens. `GET /customers/{id}` renders the
+     statement with the detail already in the body, so `drawer_open` becomes
+     `data-open` — the attribute the component shows the panel on, and the one the
+     controller's Escape and `✕` remove. It matters below the split threshold
+     only: at and above it the panel is a grid column and is visible either way.
+     The body is server-rendered here rather than fetched, so this panel is the
+     exception the shared component absorbs.
+
+     No `data-drawer-close-on`: a customer edit must not take the panel away —
+     the operator is reading the very statement the edit changed. The lifecycle
+     actions inside the detail ask for the close themselves, once the record they
+     are about is really gone. The guard hands Escape to an open dialog. #}
+  <div id="customer-drawer" class="drawer" data-drawer="customer-drawer"
+       data-drawer-close-on="drawer:close"
+       data-drawer-guard="#new-customer-dialog,#customer-edit-dialog"{% if drawer_open %} data-open{% endif %}>
+    <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+      <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerDetail) }}</span>
+      <div class="flex items-center gap-2">
+        <a class="btn-secondary font-normal hover:opacity-100" href="/customers">{{ localization.tr(crate::localization::MessageKey::CustomerAllCustomers) }}</a>
+        <button type="button" class="btn-secondary" data-drawer-close aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
+      </div>
+    </div>
+    <div id="customer-drawer-body" data-drawer-body="customer-drawer" class="flex-1 overflow-y-auto p-4">
+      {% if selected.is_some() %}
+      {% include "partials/customer_detail.html" %}
+      {% else %}
+      {# The other four panels have nothing to server-render, so their empty
+         state is unconditional. This one is server-opened, so the empty state
+         belongs to the ELSE and nowhere else: `/customers/{id}` must show the
+         statement, and rendering the sentence above a detail that is already
+         there would put both on screen at once. #}
+      {% include "partials/drawer_empty.html" %}
+      {% endif %}
+    </div>
+  </div>
+</div>
 
 <dialog id="new-customer-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
   <div class="mb-3 flex items-center justify-between gap-6">
@@ -73,49 +122,10 @@
   <div id="customer-edit-dialog-body"></div>
 </dialog>
 
-<div id="customer-drawer" class="fixed inset-y-0 right-0 z-40 w-full max-w-md flex-col border-l border-border bg-card shadow-xl {% if drawer_open %}flex{% else %}hidden{% endif %}">
-  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-    <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerDetail) }}</span>
-    <div class="flex items-center gap-2">
-      <a class="btn-secondary font-normal hover:opacity-100" href="/customers">{{ localization.tr(crate::localization::MessageKey::CustomerAllCustomers) }}</a>
-      <button type="button" class="btn-secondary" onclick="closeCustomerDrawer()" aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
-    </div>
-  </div>
-  <div id="customer-drawer-body" class="flex-1 overflow-y-auto p-4">
-    {% if selected.is_some() %}
-    {% include "partials/customer_detail.html" %}
-    {% endif %}
-  </div>
-</div>
-
 <script>
-  function openCustomerDrawer() {
-    var drawer = document.getElementById('customer-drawer');
-    if (drawer) {
-      drawer.classList.remove('hidden');
-      drawer.classList.add('flex');
-    }
-  }
-  function closeCustomerDrawer() {
-    var drawer = document.getElementById('customer-drawer');
-    if (drawer) {
-      drawer.classList.add('hidden');
-      drawer.classList.remove('flex');
-    }
-    var body = document.getElementById('customer-drawer-body');
-    if (body) body.innerHTML = '';
-  }
-  document.addEventListener('keydown', function (evt) {
-    if (evt.key !== 'Escape') return;
-    var dlg = document.getElementById('new-customer-dialog');
-    if (dlg && dlg.open) return;
-    var editDlg = document.getElementById('customer-edit-dialog');
-    if (editDlg && editDlg.open) return;
-    closeCustomerDrawer();
-  });
-  document.body.addEventListener('htmx:afterSwap', function (evt) {
-    if (evt.detail.target && evt.detail.target.id === 'customer-drawer-body') openCustomerDrawer();
-  });
+  // List refreshes only; the panel's open and close belong to the controller in
+  // base.html. `customer-changed` deliberately does NOT dismiss the panel — the
+  // statement on screen is the record the edit just changed.
   document.body.addEventListener('customer-created', function () {
     htmx.trigger('#customer-list', 'refresh');
     var dlg = document.getElementById('new-customer-dialog');

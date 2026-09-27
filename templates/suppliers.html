@@ -1,6 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Roya — {{ localization.tr(crate::localization::MessageKey::SuppliersTitle) }}{% endblock %}
 {% block content %}
+{# The list column and the detail panel, in one frame. `.drawer-split` is one
+   column until the stylesheet's split threshold and a grid above it, and
+   `min-w-0` is load bearing: the track is `minmax(0, 1fr)`, so without it the
+   column keeps a grid item's intrinsic `min-width: auto` and a wide row drags
+   the panel off the right edge instead of scrolling. #}
+<div class="drawer-split">
+  <div class="min-w-0">
 <div class="mb-4 flex items-center gap-2">
   <a href="/" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CommonBackDashboard) }}</a>
   <a href="/purchases" class="link text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::NavigationPurchases) }}</a>
@@ -21,6 +28,28 @@
     {% include "partials/supplier_list.html" %}
   </div>
   <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersHelp) }}</div>
+</div>
+
+  </div>
+
+  {# The supplier detail panel: the `.drawer` component, not a hand-written panel,
+     so its chrome and its width ladder live in one place. The list rows swap the
+     detail fragment into `#supplier-drawer-body` and the shared controller in
+     base.html opens the panel on that swap. No `data-drawer-close-on` for the
+     `supplier-*` family: paying a supplier, recording a cost and editing one are
+     all in-panel mutations, and a panel that vanished under each of them would
+     make the detail unusable. The lifecycle actions ask for the close themselves,
+     once the record they are about is really gone, and the guard hands Escape to
+     an open dialog. #}
+  <div id="supplier-drawer" class="drawer" data-drawer="supplier-drawer"
+       data-drawer-close-on="drawer:close"
+       data-drawer-guard="#new-supplier-dialog,#supplier-edit-dialog">
+    <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
+      <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::SuppliersDetail) }}</span>
+      <button type="button" class="btn-secondary" data-drawer-close aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
+    </div>
+    <div id="supplier-drawer-body" data-drawer-body="supplier-drawer" class="flex-1 overflow-y-auto p-4">{% include "partials/drawer_empty.html" %}</div>
+  </div>
 </div>
 
 <dialog id="new-supplier-dialog" class="rounded-2xl border border-border bg-card p-5 text-text">
@@ -54,42 +83,9 @@
   <div id="supplier-edit-dialog-body"></div>
 </dialog>
 
-<div id="supplier-drawer" class="fixed inset-y-0 right-0 z-40 hidden w-full max-w-md flex-col border-l border-border bg-card shadow-xl">
-  <div class="flex items-center justify-between gap-2 border-b border-border px-4 py-3">
-    <span class="text-sm font-semibold">{{ localization.tr(crate::localization::MessageKey::SuppliersDetail) }}</span>
-    <button type="button" class="btn-secondary" onclick="closeSupplierDrawer()" aria-label="{{ localization.tr(crate::localization::MessageKey::CommonCloseDetail) }}">✕</button>
-  </div>
-  <div id="supplier-drawer-body" class="flex-1 overflow-y-auto p-4"></div>
-</div>
-
 <script>
-  function openSupplierDrawer() {
-    var drawer = document.getElementById('supplier-drawer');
-    if (drawer) {
-      drawer.classList.remove('hidden');
-      drawer.classList.add('flex');
-    }
-  }
-  function closeSupplierDrawer() {
-    var drawer = document.getElementById('supplier-drawer');
-    if (drawer) {
-      drawer.classList.add('hidden');
-      drawer.classList.remove('flex');
-    }
-    var body = document.getElementById('supplier-drawer-body');
-    if (body) body.innerHTML = '';
-  }
-  document.addEventListener('keydown', function (evt) {
-    if (evt.key !== 'Escape') return;
-    var dlg = document.getElementById('new-supplier-dialog');
-    if (dlg && dlg.open) return;
-    var editDlg = document.getElementById('supplier-edit-dialog');
-    if (editDlg && editDlg.open) return;
-    closeSupplierDrawer();
-  });
-  document.body.addEventListener('htmx:afterSwap', function (evt) {
-    if (evt.detail.target && evt.detail.target.id === 'supplier-drawer-body') openSupplierDrawer();
-  });
+  // List refreshes only; the panel's open and close belong to the controller in
+  // base.html, and none of these events dismiss it.
   document.body.addEventListener('supplier-created', function () {
     htmx.trigger('#supplier-list', 'refresh');
     var dlg = document.getElementById('new-supplier-dialog');

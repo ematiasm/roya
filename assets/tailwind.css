@@ -36,6 +36,40 @@
      encoded by painting the total red. Red keeps its two existing meanings
      (money out, error); amber is the only new colour the interface gains. */
   --color-warning: #fbbf24;
+
+  /* Drawer geometry: four numbers, one decision each. Only .drawer and
+     .drawer-split read them, so a module cannot restate a width — restating is
+     exactly how the five hand-copied shells drifted apart in the first place.
+     The `drawer` prefix is not a Tailwind namespace, so these emit as plain
+     custom properties and generate no unused utilities. */
+  /* The SPLIT THRESHOLD is deliberately NOT a token, and this is the reason.
+     A custom property is not available in a media query condition — the CSS
+     cascade resolves `var()` against an element, and a media query has no
+     element — so `@media (width >= var(--drawer-split-at))` parses, is emitted
+     verbatim, and then never matches anything in any browser. It is a SILENT
+     failure: no console error, no build error, and a component that simply
+     never changes mode. Measured in Chromium at 1920px: a rule behind
+     `@media (width >= var(--x))` stayed unapplied while the identical rule
+     behind `@media (width >= 90rem)` applied. The threshold is therefore a
+     literal at both of its two sites below; if it ever changes, BOTH change.
+
+     90rem (1440px) is where the arithmetic closes: 1440 - 256 (sidebar)
+     - 64 (padding) - 24 (gap) - 448 (panel) = 648 of list, the floor at which
+     the list is still usable. 1280 leaves 536, which is tight; 1024 leaves
+     320, which is not a list. It is also above the 1280px default Playwright
+     viewport, which is what keeps the e2e suite's drawer assertions meaning
+     what they mean today. */
+  /* The side panel's width once it is a track: 448px, widening to 560px on the
+     widest screens. At 1920px that yields an 888px list — a 560px panel is
+     wider than the 448px overlay it replaces, and the list keeps ~888px, so
+     both grow. */
+  --drawer-rail: 28rem;
+  --drawer-rail-lg: 35rem;
+  /* The overlay's ladder: full-bleed below the floor, then a clamp that tracks
+     the viewport. 42vw, not a device check — a half-screen window on a 13"
+     laptop has less width than an iPad in landscape. */
+  --drawer-overlay-min: 25rem;
+  --drawer-overlay-max: 40rem;
 }
 
 /* Element defaults that keep the original visual language. */
@@ -207,5 +241,104 @@
   .htmx-request .htmx-indicator,
   .htmx-request.htmx-indicator {
     display: block;
+  }
+
+  /* ---------------------------------------------------------------------
+     The drawer: the slide-over every module opens a row into.
+
+     One definition for the panel's position, chrome, width ladder and split
+     behaviour. Before this, five templates each hand-copied the same eleven
+     utilities — and they had already drifted, in utility order, in three of
+     the five. A panel whose width is restated at the call site is a panel that
+     will be wrong in one module and not the others.
+
+     Width adapts to the AVAILABLE WIDTH, never to a device. There is no
+     userAgent check and no JavaScript in this file: a half-screen window on a
+     13" laptop has less width than an iPad in landscape, and OS scaling moves
+     CSS pixels without moving the device, so a device test is a test of the
+     wrong fact. A media query IS the width test. */
+  .drawer {
+    @apply fixed inset-y-0 right-0 z-40 flex-col border-l border-border bg-card shadow-xl;
+    /* `min(100%, …)` rather than a bare clamp, so the ladder is CONTINUOUS.
+       Below the 25rem floor the clamp would answer 400px on a 360px screen, so
+       the floor has to be bounded by the viewport: a panel never exceeds the
+       space it overlays, and on a phone the detail IS the screen. */
+    width: min(
+      100%,
+      clamp(var(--drawer-overlay-min), 42vw, var(--drawer-overlay-max))
+    );
+    display: none;
+  }
+
+  /* Open state is `data-open`, not Tailwind's `hidden`. `hidden` is a utility,
+     and @layer utilities is emitted AFTER @layer components, so a `hidden` on
+     the element would beat this component's own `display` no matter how it was
+     written — the split below could never force the panel open. `data-open`
+   keeps the cascade unambiguous and still reads as display:none to both a
+     browser and the existing `not_to_be_visible()` e2e idiom. */
+  .drawer[data-open] {
+    display: flex;
+  }
+
+  /* The two-column frame. Below the split it is ordinary flow and the panel
+     overlays it, because the panel is `fixed` and out of flow — which is why
+     the list needs no extra wrapper below the threshold and why wrapping the
+     two together changes nothing there. */
+  .drawer-split {
+    display: block;
+  }
+
+  /* At and above the threshold the panel stops overlaying: it becomes a grid
+     track. This is the whole point of the split — an overlay and the list
+     compete for the same width, so one of them can only win, while a track and
+     a column do not. `position: static` and the dropped shadow are what turn a
+     fixed overlay into a column.
+
+     The panel is `width: 100%` of its track and the track is declared HERE,
+     once. The panel does not read the width token, so the two cannot disagree.
+
+     `max-height: 100vh` is not decoration. Below the threshold `inset-y-0`
+     bounds the panel to exactly the viewport and its body scrolls inside it. In
+     flow there is no such bound, so without it the panel is as tall as its
+     content — a 1500px-tall detail makes the PAGE scroll instead of the panel,
+     and the split buys back nothing. The bound restores the behaviour the
+     overlay already had, so the two sides of the threshold differ in position
+     and in nothing else.
+
+     `minmax(0, 1fr)` and not `1fr`: the list column must be able to shrink
+     below its content's intrinsic width, or a wide table inside it pushes the
+     track and the panel off the right edge instead of scrolling.
+
+     The threshold is a LITERAL, not var(--drawer-split-at): a custom property
+     cannot be read in a media query condition, so the token form parses, builds
+     and never matches. See the note in @theme for the measurement. It appears
+     literally at exactly two sites — here and the 120rem one below. */
+  @media (width >= 90rem) {
+    .drawer-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) var(--drawer-rail);
+      gap: 1.5rem;
+      align-items: start;
+    }
+
+    .drawer {
+      position: static;
+      width: 100%;
+      max-height: 100vh;
+      box-shadow: none;
+      /* Unconditional, and after the `data-open` rule on purpose: on a wide
+         screen the panel is a column, not an overlay, so there is nothing to
+         open or close. Equal specificity, later in source order, so it wins. */
+      display: flex;
+    }
+  }
+
+  /* The widest screens get a wider panel. Re-declaring the token on the frame
+     rather than restating the track is deliberate: the one declaration still
+     owns the width, and the panel inherits it by being 100% of the track. */
+  @media (width >= 120rem) {
+    .drawer-split {
+      --drawer-rail: var(--drawer-rail-lg);
+    }
   }
 }

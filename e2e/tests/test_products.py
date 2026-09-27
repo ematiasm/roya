@@ -36,7 +36,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from conftest import ARTIFACTS_ROOT
-from helpers import ApiClient, create_product, create_supplier, record_supplier_cost
+from helpers import ApiClient, create_product, create_supplier, e2e_copy, record_supplier_cost
 
 # The env gate for the design-screenshot probe, the same one-shot shape as the
 # parties probe: opt-in, skipped by default, no effect on a normal run.
@@ -99,6 +99,28 @@ def _open_product_drawer(page: Page, product_id: int) -> None:
         _drawer_trigger(page, product_id).click()
 
 
+def _assert_drawer_body_is_the_empty_state(page: Page) -> None:
+    """Assert the drawer's body holds the shared empty state and no detail.
+
+    Covers both producers of that state: the server on first paint, and the
+    shared controller after a close. The claim under test is NOT "the panel is
+    hidden" — ``not_to_be_visible()`` already says that, and it cannot tell an
+    emptied body from a full one. It is "the detail is gone and the panel says
+    so", because at and above the drawer's split threshold the panel is a
+    permanent column and a body with nothing in it is what the operator stares
+    at.
+
+    The child count is what keeps this honest: a leftover detail fragment that
+    happened to carry the same words would otherwise pass on the text alone.
+    """
+    assert page.evaluate(
+        "document.querySelectorAll('#product-drawer-body > .empty').length"
+    ) == 1, "the drawer's body must hold the shared empty state and nothing else"
+    assert page.evaluate(
+        "document.getElementById('product-drawer-body').textContent.trim()"
+    ) == e2e_copy("drawer_empty"), "the drawer's body must hold no detail, only the empty state"
+
+
 # ---------------------------------------------------------------------------
 # Page structure
 # ---------------------------------------------------------------------------
@@ -144,10 +166,12 @@ def test_products_page_keeps_the_list_and_drops_the_old_cards(
         expect(page.locator(dialog_id)).to_have_count(1)
         expect(page.locator(dialog_id)).not_to_be_visible()
 
-    # The drawer shell is present, closed, and holds nothing yet.
+    # The drawer shell is present, closed, and holds the shared empty state
+    # rather than nothing: the panel is a permanent column on a wide screen, so
+    # an empty body would be a bare card. No product detail is pre-rendered.
     expect(page.locator("#product-drawer")).to_have_count(1)
     expect(page.locator("#product-drawer")).not_to_be_visible()
-    expect(page.locator("#product-drawer-body")).to_have_text("")
+    _assert_drawer_body_is_the_empty_state(page)
 
     # The list and the Low Stock card remain, and the seeded row's name is the
     # drawer trigger the drawer tests click.
@@ -518,9 +542,11 @@ def test_editing_a_product_in_the_drawer_updates_drawer_and_list(
 
     # The drawer read the swapped fragment before closing: the new values were in
     # it (proven by the list below rendering them), and the drawer itself is now
-    # hidden with its body emptied by closeProductDrawer().
+    # hidden with its body cleared by the shared controller, bound to this panel
+    # through `data-drawer-close-on="product-saved"`. Cleared means back to the
+    # empty state, not back to nothing.
     expect(page.locator("#product-drawer")).not_to_be_visible()
-    expect(page.locator("#product-drawer-body")).to_have_text("")
+    _assert_drawer_body_is_the_empty_state(page)
 
     # The list row behind the drawer was refreshed by the trigger too, still bound
     # to the same product id.
@@ -901,7 +927,7 @@ def test_drawer_deactivate_under_a_category_filter_keeps_the_filtered_list(
     ), f"swapped answer must not hold the other category's row: {swapped:.400}"
 
     expect(page.locator("#product-drawer")).not_to_be_visible()
-    expect(page.locator("#product-drawer-body")).to_have_text("")
+    _assert_drawer_body_is_the_empty_state(page)
 
     # The filtered list must still hold exactly the (now inactive) row.
     expect(page.locator(f"#{_PRODUCTS_INNER}")).to_contain_text("Deactivate Widget")
