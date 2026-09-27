@@ -29,26 +29,32 @@
     {% for table in tables %}
     <div class="mt-4">
       <div class="mb-1.5 font-bold text-[13px] text-muted">{{ table.title }} ({{ table.rows.len() }})</div>
-      <table class="w-full text-[13px]">
-        <thead>
-          <tr class="text-left text-muted">
-            {% for header in table.headers %}<th class="px-2 py-1 font-medium">{{ header }}</th>{% endfor %}
-          </tr>
-        </thead>
-        <tbody>
-          {% for row in table.rows %}
-          <tr class="border-t border-border">
-            {% for cell in row.cells %}
-            {% if loop.first && row.href.is_some() %}
-            <td class="px-2 py-1.5"><a href="{{ row.href.as_ref().unwrap() }}" class="link underline underline-offset-2">{{ cell }}</a></td>
-            {% else %}
-            <td class="px-2 py-1.5 tabular-nums">{{ cell }}</td>
-            {% endif %}
+      {# The only table in the app that renders inside a detail panel and had no
+         scroll wrapper. A panel is a column, not a full page, so a table that
+         fits at desktop width can still overrun a 448px panel — and the rail
+         narrows it further. The other five tables already wrap. #}
+      <div class="overflow-x-auto">
+        <table class="w-full text-[13px]">
+          <thead>
+            <tr class="text-left text-muted">
+              {% for header in table.headers %}<th class="px-2 py-1 font-medium">{{ header }}</th>{% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in table.rows %}
+            <tr class="border-t border-border">
+              {% for cell in row.cells %}
+              {% if loop.first && row.href.is_some() %}
+              <td class="px-2 py-1.5"><a href="{{ row.href.as_ref().unwrap() }}" class="link underline underline-offset-2">{{ cell }}</a></td>
+              {% else %}
+              <td class="px-2 py-1.5 tabular-nums">{{ cell }}</td>
+              {% endif %}
+              {% endfor %}
+            </tr>
             {% endfor %}
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+          </tbody>
+        </table>
+      </div>
     </div>
     {% endfor %}
   </section>
