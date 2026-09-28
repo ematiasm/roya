@@ -566,11 +566,49 @@ pub enum LadderInput {
 /// the ladder's job is to tell the operator what a save would do BEFORE they
 /// save it: `Some` means there is no net price to show and no tax money may be
 /// derived from one.
+///
+/// It also carries ONE figure and ONE refusal about the COST — `cost_total` and
+/// `cost_refusal` — which are the cost's own answer and are NOT the same fact as
+/// the net's. The four figures an operator reads are the cost, the cost with
+/// taxes, the net sale price and the sale price with taxes, and the second one
+/// used to be missing from a ladder whose whole job is to show all four.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductPriceLadder {
     /// The cost the ladder reports: the form's value, or the stored cost when
     /// the form could not be read at all.
     pub cost_price: Decimal,
+    /// The cost's tax-inclusive figure: `calculate_line_taxes(cost_price,
+    /// &taxes).total`, computed by the SAME contract the net's figure is, over
+    /// the SAME product-scoped tax set, so the two halves of this ladder can
+    /// never disagree about which taxes apply or be a cent apart on one rate.
+    ///
+    /// A `String`, and that is the one asymmetry in this struct — `net_price`
+    /// below is a `Decimal`. A refused figure publishes NO amount, so the amount
+    /// has to be able to be absent, and a `Decimal` cannot be: its absence is
+    /// spelled `ZERO`, which is a number a template WILL print. An empty `String`
+    /// prints nothing even by accident, which is the whole reason for the type.
+    /// Do not "fix" this into a `Decimal` to match `net_price`.
+    ///
+    /// Canonical decimal text, ungrouped and unlocalized: the money formatting
+    /// belongs to the presentation layer, exactly as it does for every other
+    /// figure on this ladder.
+    pub cost_total: String,
+    /// The COST half's own refusal — a DIFFERENT FACT from `net_refusal`, in its
+    /// own slot precisely because the two fail independently.
+    ///
+    /// `validate_effective_prices` never compares `cost_price` to the sale price,
+    /// so a manual-price product may legitimately cost more than it sells for and
+    /// the save accepts it. The cost is then the LARGER of the two bases, so it
+    /// is the cost's arithmetic that can refuse while the net's succeeds. And a
+    /// markup that fails derivation leaves a product with no net price and a
+    /// perfectly storable cost. One shared slot would mean either the cost's
+    /// figure is suppressed by a refusal about a different number, or the net's
+    /// is, and both would be lies. Both may be `Some` at the same time.
+    ///
+    /// Typed, never a message, for the reason `net_refusal` is: the ladder
+    /// renders refusals through the one shared mapping the save form uses, so a
+    /// preview cannot say in one language what the save says in another.
+    pub cost_refusal: Option<PriceRefusal>,
     /// The markup the ladder reports, or `None` for a manual-price product.
     pub markup_pct: Option<Decimal>,
     /// The net sale price the taxes are applied to. Meaningless when
