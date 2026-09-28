@@ -23,6 +23,7 @@ use crate::models::{
     PurchaseSuggestions, UpdateProduct,
 };
 use crate::routes::{localized_refusal_error, AppState};
+use crate::services::purchase_cost::{self, CostBasis};
 use crate::services::purchases::LineAddOutcome;
 
 // S7 enforcement: every registered handler declares the permission its action
@@ -462,6 +463,124 @@ fn clean_opt(s: &str) -> Option<String> {
         None
     } else {
         Some(t.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The two sides of one cost, and which one is the input
+// ---------------------------------------------------------------------------
+
+/// The two typed figures, already read and validated, and the basis that says
+/// which of them the operator typed into last.
+struct TypedCost {
+    basis: Option<CostBasis>,
+    net: Option<Decimal>,
+    gross: Option<Decimal>,
+}
+
+impl TypedCost {
+    /// Read a form's pair. The net is read as OPTIONAL on both paths, because
+    /// "is a net required here?" is not this struct's question — it is the
+    /// caller's, and the two callers answer it differently on purpose.
+    ///
+    /// An unparseable figure is a 400 naming the field, and the field is named
+    /// as the operator knows it, not as the form does: `unit_cost` is "costo"
+    /// on screen and `unit_cost_gross` is the field beside it.
+    fn read(
+        net: &str,
+        gross: &str,
+        basis: &str,
+        localization: &LocalizationContext,
+    ) -> AppResult<TypedCost> {
+        Ok(TypedCost {
+            basis: CostBasis::parse(basis),
+            net: parse_opt_decimal(net, "unit_cost", localization)?,
+            gross: parse_opt_decimal(gross, "unit_cost_gross", localization)?,
+        })
+    }
+}
+
+/// THE DIRECTION RULE, applied once for every surface that writes a purchase
+/// line cost: the entry row's add, the inline edit, and the entry row's
+/// preview all call this, so they cannot disagree about which side of the pair
+/// the operator typed into.
+///
+/// The tax set is read ONLY when the gross is the input, and that is the whole
+/// reason this is a function rather than a pair of inline matches: a net that
+/// is already on the form costs no read at all, so the common path cannot be
+/// slowed down or made failable by the other field's arithmetic.
+///
+/// # The read skew, accepted on purpose
+///
+/// The tax set comes from `list_active_for_product` at ROUTE time, while the
+/// write resolves it again INSIDE its own transaction
+/// (`purchase_repo::active_taxes_for_product`). A tax linked or deactivated
+/// between those two moments is a real, narrow hazard, and it is NOT fixed by
+/// freezing a `Vec<Tax>` into the write: the in-transaction resolution is what
+/// stops a document being written against a rate set that moved under it, and
+/// changing that is a different decision about a different feature. The
+/// post-write re-render is the truth the operator actually sees, and it is read
+/// back from the database rather than from this solve.
+async fn typed_line_cost(
+    state: &AppState,
+    product_id: i64,
+    typed: TypedCost,
+) -> AppResult<Option<Decimal>> {
+    match purchase_cost::cost_ask(typed.basis, typed.net, typed.gross) {
+        // No read, no solve, no refusal: the net the operator typed is the
+        // stored truth, and a gross sitting in the other field can never make it
+        // invalid.
+        purchase_cost::CostAsk::Net(net) => Ok(Some(net)),
+        purchase_cost::CostAsk::Gross(gross) => {
+            let taxes = state
+                .tax_service
+                .list_active_for_product(product_id)
+                .await?;
+            purchase_cost::solve_net_cost_from_gross(gross, &taxes)
+                .map(Some)
+                .map_err(AppError::PriceRefused)
+        }
+        // Nothing was typed. Create keeps its own fallback; the edit path turns
+        // this into its required-field refusal, which is the asymmetry between
+        // the two paths and not an accident of where the branch sits.
+        purchase_cost::CostAsk::Unstated => Ok(None),
+    }
+}
+
+/// The counterpart figure the entry row's preview shows beside the field the
+/// operator typed into: the net's gross, or the gross's net, through the same
+/// two service calls the write uses. `None` when the pair states no basis, and
+/// `Err` with a refusal when the side the operator typed cannot be priced.
+async fn typed_counterpart(
+    state: &AppState,
+    product_id: i64,
+    typed: &TypedCost,
+) -> AppResult<(CostBasis, Option<Decimal>)> {
+    match purchase_cost::cost_ask(typed.basis, typed.net, typed.gross) {
+        purchase_cost::CostAsk::Net(net) => {
+            let taxes = state
+                .tax_service
+                .list_active_for_product(product_id)
+                .await?;
+            purchase_cost::gross_cost_from_net(net, &taxes)
+                .map(|gross| (CostBasis::Gross, Some(gross)))
+                .map_err(AppError::PriceRefused)
+        }
+        purchase_cost::CostAsk::Gross(gross) => {
+            let taxes = state
+                .tax_service
+                .list_active_for_product(product_id)
+                .await?;
+            purchase_cost::solve_net_cost_from_gross(gross, &taxes)
+                .map(|net| (CostBasis::Net, Some(net)))
+                .map_err(AppError::PriceRefused)
+        }
+        purchase_cost::CostAsk::Unstated => {
+            // Nothing to preview. Not a refusal and not an error: the operator
+            // has not typed a cost, and the entry row's placeholder is the
+            // honest state of the other field.
+            Ok((CostBasis::Net, None))
+        }
     }
 }
 
@@ -1019,16 +1138,38 @@ pub struct AddLineForm {
     pub product: String,
     #[serde(default)]
     pub qty: String,
+    /// The net cost. Optional here, as it has always been: an empty cost falls
+    /// back to the supplier's satellite and then to the product column.
     #[serde(default)]
     pub unit_cost: String,
+    /// The supplier's tax-inclusive cost — the SECOND way in to the same figure.
+    /// Empty means the operator did not type one, and the net decides on its
+    /// own; the pair is resolved by [`typed_line_cost`], never here.
+    #[serde(default)]
+    pub unit_cost_gross: String,
+    /// Which of the two the operator typed into last, as the fixed wire tokens
+    /// `net` and `gross`. Absent whenever the page did not say — a browser with
+    /// no JavaScript, a REST client — and then the net wins.
+    #[serde(default)]
+    pub cost_basis: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct UpdateLineForm {
     #[serde(default)]
     pub qty: String,
+    /// The net cost. Required on this path, exactly as it has always been: an
+    /// edit that states no cost at all is still refused, because there is no
+    /// supplier satellite to fall back to on a line that already exists.
     #[serde(default)]
     pub unit_cost: String,
+    /// The tax-inclusive cost, which may stand in for the net when the page says
+    /// the operator typed it — see [`AddLineForm::unit_cost_gross`].
+    #[serde(default)]
+    pub unit_cost_gross: String,
+    /// See [`AddLineForm::cost_basis`].
+    #[serde(default)]
+    pub cost_basis: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1184,9 +1325,11 @@ async fn web_add_line_impl(
     form: AddLineForm,
 ) -> AppResult<Response> {
     let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
-    let unit_cost = parse_opt_decimal(&form.unit_cost, "unit_cost", &localization)?;
     // An explicit product id (a clicked result) wins over the typed text; a scan
-    // or an Enter carries only the value and resolves through inventory.
+    // or an Enter carries only the value and resolves through inventory. It is
+    // resolved BEFORE the cost because the cost's tax set belongs to the
+    // product, and the qty parse stays first so an invalid quantity is still
+    // the sentence the operator sees before anything else is read.
     let product_id = match form.product_id.filter(|id| *id > 0) {
         Some(id) => id,
         None => {
@@ -1197,6 +1340,28 @@ async fn web_add_line_impl(
                 .id
         }
     };
+    // Which side of the pair the operator typed into. The RESULT is what goes
+    // to `add_or_increment_line`, and it is the same `Option<Decimal>` a typed
+    // net has always produced — so the supplier-satellite fallback, the
+    // negative-cost guard and the merge comparison are all reached on exactly
+    // the terms they were written for, whichever field the figure came from.
+    let unit_cost = typed_line_cost(
+        &state,
+        product_id,
+        TypedCost::read(
+            &form.unit_cost,
+            &form.unit_cost_gross,
+            &form.cost_basis,
+            &localization,
+        )?,
+    )
+    .await
+    // The CONVERSION refuses in its own vocabulary, and `PriceRefused`
+    // serializes as the model's English sentence — which is exactly what a
+    // non-localized body would carry. So the solve's refusal is rendered here
+    // too, through the same one mapping, or the operator reads English on a
+    // Spanish page for the one refusal this feature introduces.
+    .map_err(|error| localized_refusal_error(error, &localization))?;
     // The web route takes the merging method (S5b): a repeat product at the
     // same resolved cost increments the existing line, with a visible notice;
     // a different cost still answers the same 400. The JSON API keeps the
@@ -1210,8 +1375,9 @@ async fn web_add_line_impl(
         .add_or_increment_line(actor, id, product_id, qty, unit_cost)
         .await
         // A line write runs the shared tax contract, which REFUSES an amount or
-        // a tax arithmetic it cannot carry instead of panicking. The refusal
-        // answers through the one shared renderer, in the operator's own
+        // a tax arithmetic it cannot carry instead of panicking, and the cost's
+        // own conversion refuses a gross that is the gross of no net. Both
+        // answer through the one shared renderer, in the operator's own
         // language; every other error passes through untouched.
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
@@ -1270,7 +1436,40 @@ async fn web_update_line(
     Form(form): Form<UpdateLineForm>,
 ) -> AppResult<Response> {
     let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
-    let unit_cost = parse_required_decimal(&form.unit_cost, "unit_cost", &localization)?;
+    // The SAME direction rule the add applies, on the same terms: the net is
+    // read first so an unreadable one is still the sentence the operator sees,
+    // and a stated gross is solved through the same service call the entry row's
+    // preview uses. What is NOT the same is the required-ness, and that is this
+    // path's own asymmetry rather than a difference in the rule: an inline edit
+    // that states no cost at all is refused here, exactly as it always was,
+    // because there is no satellite to fall back to on a line that exists.
+    let typed = TypedCost::read(
+        &form.unit_cost,
+        &form.unit_cost_gross,
+        &form.cost_basis,
+        &localization,
+    )?;
+    // The line's product, and only when the gross is the input: the tax set
+    // belongs to a product and this is the one moment an edit has to know which.
+    let solved = match purchase_cost::cost_ask(typed.basis, typed.net, typed.gross) {
+        purchase_cost::CostAsk::Net(_) | purchase_cost::CostAsk::Unstated => {
+            typed_line_cost(&state, 0, typed).await
+        }
+        purchase_cost::CostAsk::Gross(_) => {
+            let product_id = state
+                .purchases_service
+                .line_product_id(line_id)
+                .await?;
+            typed_line_cost(&state, product_id, typed).await
+        }
+    }
+    // Same renderer, same reason as the add: a refused conversion is a sentence
+    // in the operator's language or it is a bug.
+    .map_err(|error| localized_refusal_error(error, &localization))?;
+    // The required net, stated as the same sentence this path has always
+    // answered with — the refusal an operator sees for an empty cost has not
+    // changed, only the set of inputs that can satisfy it has grown.
+    let unit_cost = solved.ok_or_else(|| AppError::Validation("invalid unit_cost".into()))?;
     state
         .purchases_service
         .update_line(principal.user_id, line_id, qty, unit_cost)
@@ -7165,6 +7364,794 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Bidirectional cost entry (cost-with-taxes T-C)
+    //
+    // The form carries two figures for one cost: the net and the supplier's
+    // tax-inclusive gross. Whichever the operator typed into is the input and
+    // the other is solved — on create, on the inline edit, and in the entry
+    // row's preview. The arithmetic is `purchase_cost`'s, which delegates to
+    // the shared inverse and to the one tax contract; nothing here computes
+    // money.
+    //
+    // Every form value below is written with a `.` decimal point, which is what
+    // `parse_decimal` reads under this suite's default locale. The one test that
+    // switches to a comma-decimal locale says so where it does it.
+    // -----------------------------------------------------------------------
+
+    /// A draft with ONE product, a 21% tax linked to it and a supplier, and
+    /// nothing on the document yet: the exact state the entry row starts from.
+    /// `line_id` is a second line on a SECOND product for the edit tests, so a
+    /// create and an edit never compete for the same row.
+    struct CostEntry {
+        purchase_id: i64,
+        product_id: i64,
+        edit_product_id: i64,
+        edit_line_id: i64,
+        supplier_id: i64,
+        tax_id: i64,
+    }
+
+    /// The 21% rate every figure below is derived against. A whole percentage
+    /// on purpose: the staircase gap the refusal test needs is a real one at
+    /// this rate, not an artefact of a long decimal.
+    const IVA21: &str = "21";
+
+    async fn cost_entry(state: &AppState) -> CostEntry {
+        use crate::models::{NewProduct, ProductKind};
+        use chrono::NaiveDate;
+
+        let actor = audit_actor(state).await;
+        let supplier = seed_supplier(state, "Cost Entry Supplier").await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "COST-ENTRY-A".into(),
+                    name: "Cost entry alpha".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec_web("25"),
+                    cost_price: dec_web("10"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let edit_product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "COST-ENTRY-B".into(),
+                    name: "Cost entry beta".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec_web("25"),
+                    cost_price: dec_web("10"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let tax = state
+            .tax_service
+            .create_tax(
+                actor,
+                crate::models::NewTax {
+                    code: format!("IVA{IVA21}"),
+                    name: "IVA 21".into(),
+                    rate: dec_web(IVA21),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        for product_id in [product.id, edit_product.id] {
+            state
+                .tax_service
+                .link_product_tax(actor, product_id, tax.id)
+                .await
+                .unwrap();
+        }
+        let purchase = draft_purchase(state, supplier.id).await;
+        let line = state
+            .purchases_service
+            .add_line(actor, purchase.id, edit_product.id, dec_web("2"), Some(dec_web("5")))
+            .await
+            .unwrap();
+        CostEntry {
+            purchase_id: purchase.id,
+            product_id: product.id,
+            edit_product_id: edit_product.id,
+            edit_line_id: line.id,
+            supplier_id: supplier.id,
+            tax_id: tax.id,
+        }
+    }
+
+    /// The stored unit cost of the purchase's only line for `product_id`.
+    async fn stored_unit_cost(state: &AppState, purchase_id: i64, product_id: i64) -> Decimal {
+        state
+            .purchases_service
+            .get_detail(purchase_id)
+            .await
+            .unwrap()
+            .lines
+            .into_iter()
+            .find(|line| line.product_id == product_id)
+            .map(|line| line.unit_cost)
+            .unwrap_or_else(|| panic!("no line for product {product_id}"))
+    }
+
+    /// The entry-row add, through the real route. `body` carries the form
+    /// fields verbatim so a test can post a net, a gross, both or neither.
+    async fn add_cost_line(
+        app: axum::Router,
+        purchase_id: i64,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/web/purchases/{purchase_id}/lines"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    async fn edit_cost_line(
+        app: axum::Router,
+        purchase_id: i64,
+        line_id: i64,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/web/purchases/{purchase_id}/lines/{line_id}"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("HX-Request", "true")
+            .header("cookie", test_support::TEST_COOKIE)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// The sentence a refusal body carries, read out of the JSON rather than
+    /// matched inside it: `{"error": "…"}` is the whole body, so the value IS
+    /// the message the notice box will paint.
+    fn refusal_sentence(body: &str) -> String {
+        let json: serde_json::Value = serde_json::from_str(body)
+            .unwrap_or_else(|error| panic!("a refusal answers JSON, got {body} ({error})"));
+        json["error"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the refusal body has no error message: {body}"))
+            .to_string()
+    }
+
+    /// A product of its own, for a rate set that only one refusal test links.
+    /// A separate product per case because the tax set belongs to the product —
+    /// sharing one would make the four cases interfere.
+    async fn refusal_product(state: &AppState, sku: &str) -> i64 {
+        state
+            .inventory_service
+            .create_product(
+                audit_actor(state).await,
+                crate::models::NewProduct {
+                    sku: sku.into(),
+                    name: sku.into(),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec_web("25"),
+                    cost_price: dec_web("10"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// A GROSS typed into the entry row stores the EXACT net whose gross is that
+    /// figure, and the stored line is priced by the same tax contract.
+    ///
+    /// 6,05 under 21% solves to 5,00, and 5,00 grosses back to 6,05 with no
+    /// drift: the second half of the assertion is the one that matters, because
+    /// a net that is a cent out would still BE a plausible-looking number.
+    #[tokio::test]
+    async fn a_gross_typed_into_the_entry_row_stores_the_exact_net_it_solves_to() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = add_cost_line(
+            app,
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=2&unit_cost=&unit_cost_gross=6.05&cost_basis=gross",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+        let net = stored_unit_cost(&state, entry.purchase_id, entry.product_id).await;
+        assert_eq!(
+            net,
+            dec_web("5.00"),
+            "6,05 at 21% is the gross of exactly 5,00"
+        );
+        let taxes = state
+            .tax_service
+            .list_active_for_product(entry.product_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::services::line_taxes::calculate_line_taxes(net, &taxes)
+                .unwrap()
+                .total,
+            dec_web("6.05"),
+            "and the stored net grosses back to the typed figure, so nothing was approximated"
+        );
+    }
+
+    /// The same net typed directly is stored as typed, with no solve in the way:
+    /// the gross field is a second way in, never a filter on the first.
+    #[tokio::test]
+    async fn a_net_typed_into_the_entry_row_is_stored_as_typed() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = add_cost_line(
+            app,
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost=5.00&unit_cost_gross=&cost_basis=net",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.product_id).await,
+            dec_web("5.00")
+        );
+    }
+
+    /// THE STAIRCASE GAP. 0,03 at 21% is the gross of no net at all: 0,01 and
+    /// 0,02 both gross to themselves and 0,03 is skipped by the per-contribution
+    /// rounding. The write refuses and stores NOTHING — not a rounded net, not a
+    /// line at the product's cost, not a line at the satellite.
+    #[tokio::test]
+    async fn a_gross_that_is_the_gross_of_no_net_refuses_and_stores_nothing() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        state
+            .supplier_service
+            .record_cost(
+                audit_actor(&state).await,
+                entry.product_id,
+                entry.supplier_id,
+                dec_web("9.50"),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = add_cost_line(
+            app,
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost=&unit_cost_gross=0.03&cost_basis=gross",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:.400}");
+        assert_eq!(
+            refusal_sentence(&body),
+            crate::models::PriceRefusal::CostUnreachable.as_str(),
+            "the refusal is the shared sentence for a staircase gap, through the one mapping; \
+             `a_cost_refusal_renders_in_the_active_locale` proves the same body in another \
+             language"
+        );
+        let detail = state
+            .purchases_service
+            .get_detail(entry.purchase_id)
+            .await
+            .unwrap();
+        assert!(
+            !detail
+                .lines
+                .iter()
+                .any(|line| line.product_id == entry.product_id),
+            "a refused gross must store no line at all, and above all not the satellite: {detail:?}"
+        );
+    }
+
+    /// The four cost refusals are all reachable from a real form post, and each
+    /// one renders through the ONE shared mapping in the operator's language.
+    ///
+    /// The rate sets two of them need cannot be created through
+    /// `TaxService::create_tax`, which is the point of that rule: an operator
+    /// cannot link a rate of -100. They are seeded through the REPOSITORY the
+    /// write itself reads, so the route is exercised over HTTP with the same
+    /// data the service test pins — and the sentences below are then the real
+    /// 400 bodies, not a rendering asserted beside the arithmetic.
+    #[tokio::test]
+    async fn every_cost_refusal_answers_the_shared_sentence_on_the_write() {
+        use crate::models::NewTax;
+        use crate::repositories::{SqliteTaxRepository, TaxRepository};
+
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let actor = audit_actor(&state).await;
+        let repository = SqliteTaxRepository::new(state.pool.clone());
+
+        // A set that grosses a net away: the divisor is not positive, so there
+        // is no estimate to search around.
+        let un_invertible = repository
+            .create(
+                actor,
+                &NewTax {
+                    code: "IVA-NEG100".into(),
+                    name: "IVA -100".into(),
+                    rate: dec_web("-100"),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        // One linked rate enormous enough that pricing any net overflows.
+        let huge = repository
+            .create(
+                actor,
+                &NewTax {
+                    code: "IVA-HUGE".into(),
+                    name: "IVA huge".into(),
+                    rate: dec_web("100000000000000000000"),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        // 100 taxes at -0,99999999999 gross a figure down by exactly 1e-11, so
+        // this gross divides back to `Decimal::MAX` and the window's endpoint
+        // leaves the range. `parse_decimal` refuses scientific notation, so the
+        // figure is written out in full — the same constraint an operator has.
+        let mut crushing: Vec<crate::models::Tax> = Vec::with_capacity(100);
+        for n in 0..100 {
+            let tax = repository
+                .create(
+                    actor,
+                    &NewTax {
+                        code: format!("IVA-CRUSH-{n}"),
+                        name: format!("IVA crush {n}"),
+                        rate: dec_web("-0.99999999999"),
+                        is_active: true,
+                    },
+                )
+                .await
+                .unwrap();
+            crushing.push(tax);
+        }
+
+        // Four products, four rate sets, four typed gross figures.
+        let mut cases: Vec<(i64, i64, &str, crate::models::PriceRefusal)> = Vec::new();
+        let gap = entry.product_id; // 21% already linked: 0.03 is the staircase gap
+        cases.push((gap, entry.purchase_id, "0.03", crate::models::PriceRefusal::CostUnreachable));
+
+        let negative_product = refusal_product(&state, "COST-REFUSE-NEG").await;
+        state
+            .tax_service
+            .link_product_tax(actor, negative_product, un_invertible.id)
+            .await
+            .unwrap();
+        cases.push((
+            negative_product,
+            entry.purchase_id,
+            "10.00",
+            crate::models::PriceRefusal::CostNotInvertible,
+        ));
+
+        let huge_product = refusal_product(&state, "COST-REFUSE-HUGE").await;
+        // A second rate cancelling it exactly, so the divisor stays positive and
+        // the search is REACHED: the overflow is hidden in the sum, not in one
+        // product, which is the only shape that reaches this refusal.
+        let cancel = repository
+            .create(
+                actor,
+                &NewTax {
+                    code: "IVA-HUGE-NEG".into(),
+                    name: "IVA huge negative".into(),
+                    rate: dec_web("-100000000000000000000"),
+                    is_active: true,
+                },
+            )
+            .await
+            .unwrap();
+        for tax_id in [huge.id, cancel.id] {
+            state
+                .tax_service
+                .link_product_tax(actor, huge_product, tax_id)
+                .await
+                .unwrap();
+        }
+        cases.push((
+            huge_product,
+            entry.purchase_id,
+            "10000000000",
+            crate::models::PriceRefusal::TaxRateTooLargeToCost,
+        ));
+
+        let ceiling_product = refusal_product(&state, "COST-REFUSE-CEIL").await;
+        for tax in &crushing {
+            state
+                .tax_service
+                .link_product_tax(actor, ceiling_product, tax.id)
+                .await
+                .unwrap();
+        }
+        cases.push((
+            ceiling_product,
+            entry.purchase_id,
+            "792281625142643375.93543950335",
+            crate::models::PriceRefusal::CostNetTooLarge,
+        ));
+
+        let app = crate::routes::router(state.clone());
+        for (product_id, purchase_id, gross, expected) in cases {
+            let (status, body) = add_cost_line(
+                app.clone(),
+                purchase_id,
+                &format!(
+                    "product_id={product_id}&qty=1&unit_cost=&unit_cost_gross={gross}&cost_basis=gross"
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{gross}: {body:.400}");
+            assert_eq!(
+                refusal_sentence(&body),
+                crate::routes::price_refusal_message(&expected, &crate::localization::LocalizationContext::fallback()),
+                "{gross} must answer the shared sentence for {expected:?}"
+            );
+            assert!(
+                !state
+                    .purchases_service
+                    .get_detail(purchase_id)
+                    .await
+                    .unwrap()
+                    .lines
+                    .iter()
+                    .any(|line| line.product_id == product_id),
+                "{gross} stored a line for a refused cost"
+            );
+        }
+    }
+
+    /// The same sentence in the operator's OWN language, and byte-identical to
+    /// the model's English row under the English default.
+    ///
+    /// Both halves are the requirement: a refusal that renders through a
+    /// surface-local wording is a second sentence about one rule, and a
+    /// refusal whose English row drifts from `as_str` is an API body that
+    /// changed under a client. The switch to `es-AR` is what makes the first
+    /// half observable — under the English default both would be the same
+    /// string and the test would prove nothing about localization.
+    #[tokio::test]
+    async fn a_cost_refusal_renders_in_the_active_locale() {
+        use crate::models::PriceRefusal;
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = add_cost_line(
+            app.clone(),
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost=&unit_cost_gross=0.03&cost_basis=gross",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:.400}");
+        assert_eq!(
+            refusal_sentence(&body),
+            PriceRefusal::CostUnreachable.as_str(),
+            "the English body is the model's own sentence, byte for byte"
+        );
+
+        // The locale switch moves the DECIMAL SEPARATOR with it, so the same
+        // figure is now written `0,03` — the same constraint an operator in that
+        // locale has, and the reason the form parser is locale-aware at all.
+        set_locale(&state, "es-AR", "es").await;
+        let (status, body) = add_cost_line(
+            app,
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost=&unit_cost_gross=0%2C03&cost_basis=gross",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:.400}");
+        assert_eq!(
+            refusal_sentence(&body),
+            "Ningún costo neto lleva a este costo con los impuestos vinculados.",
+            "the same refusal in the operator's language, and a different string from the English \
+             one — a surface-local wording could not produce this"
+        );
+    }
+
+    /// A GROSS on create still goes through `resolve_line_cost`, so the satellite
+    /// it would otherwise have used is never reached, and the solved net is
+    /// stored instead.
+    ///
+    /// The fixture is a supplier whose satellite cost is 9,50 — a real, different
+    /// figure. A gross path that bypassed the resolution would either store
+    /// 9,50 (the fallback) or skip the negative guard; this test can only pass if
+    /// the solved net is handed to the SAME resolution the typed net is.
+    #[tokio::test]
+    async fn a_gross_typed_on_create_reaches_the_same_cost_resolution_a_net_does() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        state
+            .supplier_service
+            .record_cost(
+                audit_actor(&state).await,
+                entry.product_id,
+                entry.supplier_id,
+                dec_web("9.50"),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // Neither field typed: the satellite, exactly as before this pair existed.
+        let (status, body) = add_cost_line(
+            app.clone(),
+            entry.purchase_id,
+            &format!("product_id={}&qty=1&unit_cost=&unit_cost_gross=", entry.product_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.product_id).await,
+            dec_web("9.50"),
+            "an empty pair keeps the supplier satellite"
+        );
+
+        // And the gross on a second product, with the same satellite, must NOT
+        // reach it: the solved net is the figure, and it goes through the same
+        // resolution.
+        let other = state
+            .inventory_service
+            .create_product(
+                audit_actor(&state).await,
+                crate::models::NewProduct {
+                    sku: "COST-ENTRY-C".into(),
+                    name: "Cost entry gamma".into(),
+                    kind: crate::models::ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: dec_web("25"),
+                    cost_price: dec_web("10"),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .tax_service
+            .link_product_tax(audit_actor(&state).await, other.id, entry.tax_id)
+            .await
+            .unwrap();
+        state
+            .supplier_service
+            .record_cost(
+                audit_actor(&state).await,
+                other.id,
+                entry.supplier_id,
+                dec_web("9.50"),
+                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, body) = add_cost_line(
+            app,
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost=&unit_cost_gross=6.05&cost_basis=gross",
+                other.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, other.id).await,
+            dec_web("5.00"),
+            "the solved net, not the satellite: a gross path that bypassed resolve_line_cost \
+             would have stored 9.50"
+        );
+    }
+
+    /// THE MERGE PROOF. The same product, added twice — once by gross and once
+    /// by net — must land on ONE line, because the two figures describe the same
+    /// cost and the merge path compares the SOLVED decimals.
+    ///
+    /// This is the test that pins the exactness of the inverse where it actually
+    /// has an observable consequence. `add_or_increment_line` compares
+    /// `existing.unit_cost == cost`; a gross-typed 6,05 and a net-typed 5,00
+    /// under 21% are only the same number if the inverse is exact. An inexact
+    /// one would answer the duplicate-product 400 instead, and the operator
+    /// would be told to use the update endpoint for two identical prices.
+    #[tokio::test]
+    async fn the_same_product_added_by_gross_and_by_net_merges_into_one_line() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+        let (status, body) = add_cost_line(
+            app.clone(),
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost=&unit_cost_gross=6.05&cost_basis=gross",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+        let (status, body) = add_cost_line(
+            app,
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost=5.00&unit_cost_gross=&cost_basis=net",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+
+        let lines: Vec<_> = state
+            .purchases_service
+            .get_detail(entry.purchase_id)
+            .await
+            .unwrap()
+            .lines
+            .into_iter()
+            .filter(|line| line.product_id == entry.product_id)
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the two descriptions of one cost must merge, not collide: {lines:?}"
+        );
+        assert_eq!(lines[0].unit_cost, dec_web("5.00"));
+        assert_eq!(lines[0].qty, dec_web("2"), "and the quantities are summed");
+    }
+
+    /// A GROSS typed into the inline edit stores the solved net, and the answer
+    /// re-renders BOTH inputs from storage: the server is this path's mirror, so
+    /// the operator sees the stored pair rather than a value the page guessed.
+    #[tokio::test]
+    async fn a_gross_typed_into_an_inline_edit_stores_the_solved_net() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = edit_cost_line(
+            app,
+            entry.purchase_id,
+            entry.edit_line_id,
+            "qty=3&unit_cost=&unit_cost_gross=6.05&cost_basis=gross",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.edit_product_id).await,
+            dec_web("5.00")
+        );
+        assert!(
+            body.contains(&format!("id=\"line-cost-{}\"", entry.edit_line_id)),
+            "the answer re-renders the row's net field: {body:.600}"
+        );
+    }
+
+    /// The inline edit's own asymmetry, unchanged: with NEITHER figure the edit
+    /// is still refused, because the net is required on this path. The gross
+    /// only takes over when it can be solved, and "cannot" includes "not typed".
+    #[tokio::test]
+    async fn an_inline_edit_with_neither_cost_is_still_refused() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = edit_cost_line(
+            app,
+            entry.purchase_id,
+            entry.edit_line_id,
+            "qty=3&unit_cost=&unit_cost_gross=&cost_basis=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:.400}");
+        assert_eq!(refusal_sentence(&body), "invalid unit_cost");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.edit_product_id).await,
+            dec_web("5.00"),
+            "a refused edit stores nothing"
+        );
+    }
+
+    /// A refused GROSS edit stores nothing, and the body is the localized
+    /// sentence — the same one the preview paints — so the operator is told the
+    /// same thing whichever side of the pair they were on.
+    #[tokio::test]
+    async fn a_refused_gross_edit_stores_nothing_and_answers_the_shared_sentence() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, body) = edit_cost_line(
+            app,
+            entry.purchase_id,
+            entry.edit_line_id,
+            "qty=3&unit_cost=&unit_cost_gross=0.03&cost_basis=gross",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:.400}");
+        assert_eq!(
+            refusal_sentence(&body),
+            crate::models::PriceRefusal::CostUnreachable.as_str()
+        );
+        let detail = state
+            .purchases_service
+            .get_detail(entry.purchase_id)
+            .await
+            .unwrap();
+        let line = detail
+            .lines
+            .iter()
+            .find(|line| line.id == entry.edit_line_id)
+            .unwrap();
+        assert_eq!(line.unit_cost, dec_web("5.00"), "the stored cost is untouched");
+        assert_eq!(line.qty, dec_web("2"), "and so is the quantity");
     }
 
     /// One row of a rendered list, sliced out by its row id.

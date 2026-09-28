@@ -591,14 +591,34 @@ where
         }
     }
 
+    /// The product a stored line belongs to.
+    ///
+    /// One narrow read, and it exists for the cost's tax set: a line's cost may
+    /// be entered tax-inclusive, and the linked rate set belongs to a PRODUCT,
+    /// so a caller that has to price the line needs to know which one before it
+    /// can ask anything. `update_line` resolves the same product internally, but
+    /// it does so AFTER it has been handed a figure — too late for a caller
+    /// whose figure is not yet a figure. `get_detail` would answer, at the cost
+    /// of loading the whole document to learn one id, and it would read the
+    /// lines the caller is trying to change.
+    ///
+    /// `NotFound` for an unknown line, and nothing else: this is a read, and a
+    /// read adds no rules of its own.
+    pub async fn line_product_id(&self, line_id: i64) -> AppResult<i64> {
+        self.purchases
+            .find_line(line_id)
+            .await?
+            .map(|line| line.product_id)
+            .ok_or_else(|| AppError::NotFound(format!("purchase line {line_id} not found")))
+    }
+
     pub async fn update_line(
         &self,
         actor: i64,
         line_id: i64,
         qty: Decimal,
         unit_cost: Decimal,
-    ) -> AppResult<PurchaseLine> {
-        let line = self
+    ) -> AppResult<PurchaseLine> {        let line = self
             .purchases
             .find_line(line_id)
             .await?
