@@ -582,17 +582,10 @@ pub struct ProductPriceLadder {
     /// the SAME product-scoped tax set, so the two halves of this ladder can
     /// never disagree about which taxes apply or be a cent apart on one rate.
     ///
-    /// A `String`, and that is the one asymmetry in this struct — `net_price`
-    /// below is a `Decimal`. A refused figure publishes NO amount, so the amount
-    /// has to be able to be absent, and a `Decimal` cannot be: its absence is
-    /// spelled `ZERO`, which is a number a template WILL print. An empty `String`
-    /// prints nothing even by accident, which is the whole reason for the type.
-    /// Do not "fix" this into a `Decimal` to match `net_price`.
-    ///
     /// Canonical decimal text, ungrouped and unlocalized: the money formatting
     /// belongs to the presentation layer, exactly as it does for every other
     /// figure on this ladder.
-    pub cost_total: String,
+    pub cost_total: Decimal,
     /// The COST half's own refusal — a DIFFERENT FACT from `net_refusal`, in its
     /// own slot precisely because the two fail independently.
     ///

@@ -450,7 +450,7 @@ where
                     net_price,
                     net_is_derived: net_refusal.is_none() && markup_pct.is_some(),
                     net_refusal,
-                    cost_total: String::new(),
+                    cost_total: Decimal::ZERO,
                     cost_refusal: None,
                     inputs_unreadable: false,
                     from_form: true,
@@ -470,7 +470,7 @@ where
                 net_price: Decimal::ZERO,
                 net_is_derived: false,
                 net_refusal: Some(refusal),
-                cost_total: String::new(),
+                cost_total: Decimal::ZERO,
                 cost_refusal: None,
                 inputs_unreadable: false,
                 from_form: true,
@@ -556,7 +556,7 @@ where
         // zero beside a refusal is a number a template can print, and the ladder
         // promises that a refused figure is never one.
         match calculate_line_taxes(ladder.cost_price, &taxes) {
-            Ok(calc) => ladder.cost_total = calc.total.to_string(),
+            Ok(calc) => ladder.cost_total = calc.total,
             Err(refusal) => ladder.cost_refusal = Some(refusal),
         }
 
@@ -574,7 +574,7 @@ fn stored_ladder(product: &crate::models::Product, unreadable: bool) -> ProductP
         net_price: product.sale_price,
         net_is_derived: product.markup_pct.is_some(),
         net_refusal: None,
-        cost_total: String::new(),
+        cost_total: Decimal::ZERO,
         cost_refusal: None,
         inputs_unreadable: unreadable,
         from_form: false,
@@ -1108,10 +1108,10 @@ mod tests {
         let taxes = s.list_active_for_product(product_id).await.unwrap();
         let expected = calculate_line_taxes(dec("5"), &taxes).unwrap().total;
         assert_eq!(expected, dec("6.05"), "5 plus 21% of 5");
-        assert_eq!(ladder.cost_total, expected.to_string());
+        assert_eq!(ladder.cost_total, expected);
         assert_ne!(
             ladder.cost_total,
-            dec("5").to_string(),
+            dec("5"),
             "the figure is the GROSS of the cost, not the net the ladder already published"
         );
         assert!(ladder.cost_refusal.is_none());
@@ -1131,7 +1131,7 @@ mod tests {
             "the product has no tax, so the ladder must not invent one"
         );
         assert_eq!(
-            Decimal::from_str(&ladder.cost_total).unwrap(),
+            ladder.cost_total,
             dec("5"),
             "an untaxed cost publishes the cost itself, to the cent"
         );
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(ladder.total, dec("12.10"));
         // 50 plus 21% of 50, over the same tax set: the LARGER base is the one
         // that has to be published, not the smaller one.
-        assert_eq!(ladder.cost_total, dec("60.50").to_string());
+        assert_eq!(ladder.cost_total, dec("60.50"));
         assert!(ladder.cost_refusal.is_none());
     }
 
@@ -1209,7 +1209,10 @@ mod tests {
             Some(PriceRefusal::TaxArithmeticTooLarge),
             "the cost's own arithmetic, on the product's own tax set"
         );
-        assert_eq!(ladder.cost_total, "");
+        // The amount beside a refusal is `Decimal::ZERO` — the same value a cost
+        // that really is zero produces, which is precisely why it is the REFUSAL
+        // and never the amount that answers "was there a cost figure here".
+        assert_eq!(ladder.cost_total, Decimal::ZERO);
         // And the net is untouched: same net, same breakdown, same total.
         assert!(ladder.net_refusal.is_none(), "{ladder:?}");
         assert_eq!(ladder.net_price, dec("10"));
@@ -1247,24 +1250,26 @@ mod tests {
         assert_eq!(ladder.tax_total, Decimal::ZERO);
         assert_eq!(ladder.total, Decimal::ZERO);
         // The cost side is not, and says so with a figure.
-        assert_eq!(ladder.cost_total, dec("6.05").to_string());
+        assert_eq!(ladder.cost_total, dec("6.05"));
         assert!(ladder.cost_refusal.is_none());
     }
 
-    /// A REFUSED FIGURE PUBLISHES NO AMOUNT, and here the TYPE is what makes
-    /// that enforceable rather than merely intended. `cost_total` is a `String`,
-    /// so a refusal is `""`: a template that prints the field prints nothing, and
-    /// there is no value it could mistake for a real one. This is deliberately
-    /// NOT the net's `Decimal` + `Option<PriceRefusal>` shape, and the asymmetry
-    /// is the point — a zero beside a refusal is a number a careless template
-    /// WILL print — so do not "fix" it into one.
+    /// A REFUSED FIGURE is the refusal plus a `Decimal::ZERO` beside it, and the
+    /// test below proves the pair is the whole answer: the amount on a refusal is
+    /// the SAME value a cost that genuinely is zero produces, so the amount
+    /// cannot answer the question on its own and only the refusal can. That is
+    /// the net's `Decimal` + `Option<PriceRefusal>` shape, deliberately, and the
+    /// presentation layer guards on the refusal exactly as it already does for
+    /// the net — a zero beside a refusal is a number a careless template WILL
+    /// print, and the guard is what stops it.
     #[tokio::test]
-    async fn a_refused_cost_figure_publishes_an_empty_string_and_never_a_zero() {
+    async fn a_refused_cost_figure_carries_its_refusal_beside_a_zero_amount() {
         let (s, _pool, product_id) = svc_with_product("100").await;
         let huge = link(&s, "IVA1000", "1000").await;
         s.link_product_tax(1, product_id, huge).await.unwrap();
 
-        let ladder = s
+        // The refused cost: the arithmetic leaves the range, so there is no amount.
+        let refused = s
             .product_price_ladder(
                 product_id,
                 Some(LadderInput::Form {
@@ -1276,17 +1281,36 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(ladder.cost_refusal.is_some());
-        assert_eq!(ladder.cost_total, "");
-        for zero in ["0", "0.0", "0.00", "0.000"] {
-            assert_ne!(
-                ladder.cost_total, zero,
-                "a refusal is not a zero spelled differently: {zero:?}"
-            );
-        }
-        assert!(
-            Decimal::from_str(&ladder.cost_total).is_err(),
-            "an empty string is not a number, so no renderer can turn it into one"
+        assert_eq!(
+            refused.cost_refusal,
+            Some(PriceRefusal::TaxArithmeticTooLarge),
+            "the refusal is what says there is no figure, and it is the cost's own"
+        );
+        assert_eq!(refused.cost_total, Decimal::ZERO);
+
+        // A cost that REALLY is zero, over the same tax set, succeeds. Its amount
+        // is the same `Decimal::ZERO` — which is the point: the old `""` assertion
+        // could tell a refusal from a real zero only because the two had different
+        // SHAPES, and that is a weaker guarantee than being able to read the
+        // difference off the refusal itself.
+        let zero_cost = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("10"),
+                    cost_price: dec("0"),
+                    markup_pct: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(zero_cost.cost_refusal, None, "a zero cost is not a refusal");
+        assert_eq!(zero_cost.cost_total, Decimal::ZERO);
+        assert_eq!(
+            refused.cost_total, zero_cost.cost_total,
+            "the two amounts are indistinguishable, which is exactly why the refusal \
+             is the answer and never the amount"
         );
     }
 
