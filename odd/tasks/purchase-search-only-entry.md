@@ -2,8 +2,10 @@
 
 ## Status
 
-**Design closed. Four decisions taken; four tasks to build.** Cut from `main`
-at `181f64e`, after `cost-with-taxes` merged as #120, #121, #122 and #123.
+**Built. Four decisions taken, four tasks delivered.** Cut from `main` at
+`181f64e`, after `cost-with-taxes` merged as #120, #121, #122 and #123.
+Delivered on `feat/purchase-search-only-entry` as `f477caa` (T1), `3cb82c9` (T2),
+`a8af310` (T3), `63d3a9c` (T4). See **Outcome** at the end.
 
 ## Objective
 
@@ -169,21 +171,21 @@ the sale partial.
 
 ## Tasks
 
-- [ ] **T1 — the default, and the RED that proves it is needed.** A test that
+- [x] **T1 — the default, and the RED that proves it is needed.** A test that
   posts the add form with **no** `qty` field at all and asserts the line is
   created with quantity 1. RED against `main` with a 400. This is the task the
   whole feature stands on; do not start the template work before it is green.
-- [ ] **T2 — the entry row loses its money fields.** Remove `line-qty`,
+- [x] **T2 — the entry row loses its money fields.** Remove `line-qty`,
   `line-unit-cost`, `line-unit-cost-gross`, `line-cost-basis` and
   `line-cost-refusal` from `#line-add-form`, keeping the search, the hidden
   `product_id` and the submit. Then rewrite the three tests that assert those
   fields exist, and the three e2e tests that drive them. Keep the field the
   picker owns.
-- [ ] **T3 — delete what the fields owned.** The preview endpoint and its
+- [x] **T3 — delete what the fields owned.** The preview endpoint and its
   collection twin, the mirror JS and `data-last-edited` in `templates/purchase.html`,
   the refusal slot, and the ten tests listed above. Confirm each is unreachable
   before removing it — `grep` the route path and the `data-cost-refusal` hook.
-- [ ] **T4 — prove the flow the operator asked for.** One browser test that finds
+- [x] **T4 — prove the flow the operator asked for.** One browser test that finds
   a product, accepts it, and asserts the line arrives with the **product's
   existing cost already in the net input**; one that scans a barcode with no
   further input and asserts the same; one that edits qty and gross on that line
@@ -216,3 +218,105 @@ the sale partial.
 `cargo test`, `bash scripts/e2e.sh`, `cargo fmt --check`, `cargo clippy
 --all-targets`. The purchase e2e suites and `test_picker.py` are the ones that
 observe this feature; a green Rust suite is not evidence for a DOM contract.
+
+## Outcome
+
+The entry row is a search. `#line-add-form` renders the product field, the
+island's hidden `product_id` and the submit — nothing else — and a bare scan or a
+bare accept adds the product as a line at quantity 1 and the cost the product
+already carried. Both figures are edited on the line, where the product is
+visible and the money is a second pass.
+
+**The blocker was real and it is now the spine of the feature.** `value="1"` was
+markup only. `AddLineForm.qty` is `Option<String>` and `web_add_line_impl`
+resolves `None` to `Decimal::ONE`; `add_or_increment_line` keeps `qty: Decimal`
+and its `qty > 0` guard untouched, and `a_scan_with_no_quantity_field_at_all_adds_one_unit`
+pins the invariant from the web side by asserting a stated `qty=0` is still a
+400. Its red was the real one, not a manufactured one:
+
+```
+an absent quantity is one unit, not a 400: {"error":"invalid qty"}
+  left: 400   right: 200
+```
+
+**Three corrections to what this document predicted, all measured rather than
+assumed:**
+
+1. **The `smoke_tests.rs` helper is misnamed here.** The `#line-qty` loop this
+   document points at (`smoke_tests.rs:4850`) is in
+   `assert_purchase_entry_row_is_empty_and_ready` (4805-4856), not in
+   `assert_oob_picker_is_empty_and_focused` (4562-4599). The latter is the SALE
+   helper and has no such loop; its callers (4726, 4737) are the sale test. The
+   purchase helper is what changed, which is what "do not touch the sale page"
+   requires either way.
+2. **The list of three tests to rewrite was short by two.** Both
+   `n4_purchase_record_offers_the_picker_instead_of_the_catalogue_select` and
+   `purchase_line_picker_adds_lines_without_a_click` asserted
+   `name="qty"` and `value="1"` on the entry row, exactly like the three named.
+   All five now pin the fields' ABSENCE, which is the feature.
+3. **The mirror IIFE could not be deleted whole.** `data-last-edited` and the
+   `htmx:afterRequest` writer are dead and are gone, but the same IIFE also wrote
+   each line row's hidden `cost_basis`, and that is load-bearing: an inline row
+   arrives with a net already on it, so with no basis marker the net wins every
+   time and a typed gross is silently dropped. Deleting the IIFE was run, not
+   reasoned about, and both line-row browser tests failed
+   (`test_a_gross_typed_into_an_inline_edit_stores_the_solved_net` and
+   `test_a_refused_gross_edit_reverts_both_fields_and_stores_nothing`). The
+   marker survived as a four-line IIFE with its own comment saying what it is
+   for; the loop guard did not.
+
+**Deleted**, each proved unreachable by grep over `src/`, `templates/`, `static/`
+and `e2e/tests/` before removal: the preview endpoint and its collection twin
+(the only remaining mention of `lines/cost` is the test asserting it is gone),
+the `data-cost-refusal` slot and its reader (the only remaining mentions are two
+assertions that it is absent), and `data-last-edited` (the only remaining
+mention is the comment recording why it went). The entry row's `data-cost-pair`
+wrapper went with them; the LINE row's stays, because the surviving basis marker
+is what reads it.
+
+**Kept, and proved load-bearing.** The wire contract: `AddLineForm` and
+`UpdateLineForm` still accept `unit_cost`, `unit_cost_gross` and `cost_basis`.
+Dropping `unit_cost` from `AddLineForm` was run as a mutation and turns
+`the_same_product_added_by_gross_and_by_net_merges_into_one_line` into a 400
+(`left: 400, right: 200`) — the merge comparison never matches, which is the
+failure mode the spec predicted. The five wire-contract tests are unmodified and
+pass. `gross_cost_from_net` is now unused by the web route and stays in
+`purchase_cost.rs` with its own tests: it is money arithmetic and this feature
+moves none.
+
+**Refusals did not get weaker.** A gross that is the gross of no net is still
+refused, with the same shared sentence, on the LINE
+(`a_refused_gross_edit_stores_nothing_and_answers_the_shared_sentence` in Rust,
+`test_a_refused_gross_edit_reverts_both_fields_and_stores_nothing` in the
+browser) and on the CREATE path through the wire
+(`a_cost_refusal_renders_in_the_active_locale`,
+`every_cost_refusal_answers_the_shared_sentence_on_the_write`). What the entry
+row's tests took with them was the PREVIEW's way of saying it, and there is no
+browser-reachable path left to a refused add-time cost because the entry row
+takes no cost.
+
+**Four mutations, all caught.** The `Decimal::ONE` default removed → 400, caught.
+The default moved into the service → a stated `qty=0` is accepted, caught. The
+preview route left registered → 200 with a solved figure, caught. A repeat scan
+adding a second line → `expected to have Value '2'`, caught in Rust, in smoke,
+and in the browser. Plus, for T4: the product's cost not resolved onto the line
+→ the net input reads `0` instead of `7.35`; the exact-barcode step skipped →
+the scan adds no line; the line's gross rendered from a derived figure → the
+gross input reads `6.05` where storage says empty; the basis marker not written
+→ the solved net never reaches storage and the re-rendered net reads `5.00`.
+
+**One thing regenerated on purpose.** The visual baseline, because the purchase
+record's positional DOM fingerprint loses exactly the twelve nodes the entry row
+gave up and no other page moved. It was regenerated deliberately, and the diff
+was read to confirm that before committing.
+
+**Verification:** `cargo test` 1262 passed (1268 before, +1 T1, +1 route-is-gone,
+−8 preview and entry-row cost tests, +3 T1's own); `cargo test purchases_web` 86;
+`cargo test smoke` 116; `bash scripts/e2e.sh` 134 passed, 4 skipped (135/4
+before: −4 entry-row e2e tests, +3 T4); `bash scripts/e2e.sh -k "picker or
+purchase or receiving"` 38 passed; `cargo fmt --check` clean; `cargo clippy
+--all-targets` exit 0.
+
+**Not done here, and not in scope:** the `qty` input is gone from the purchase
+entry row and remains on the SALE entry row, where nothing in this feature asked
+for it to move.
