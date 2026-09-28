@@ -27,6 +27,7 @@ not on a shrug.
 
 from __future__ import annotations
 
+import time
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from urllib.parse import urlparse
@@ -1439,14 +1440,21 @@ def test_a_gross_the_operators_own_figure_keeps_what_they_typed(
 
     The trap is a slow answer, not a fast one. The operator types a net, walks
     away to the gross field and starts THEIR figure, and the first answer lands
-    in between — carrying the counterpart of the net they typed, which belongs in
-    the gross field, which is now full of something else. The `data-last-edited`
-    marker is the only thing that knows they have moved on.
+    in between — carrying the counterpart of the net they typed, which belongs
+    in the gross field, which is now full of something else. The
+    `data-last-edited` marker is the only thing that knows they have moved on.
 
     The first response is HELD so the ordering is the one the guard exists for
-    rather than a race the debounce usually hides.
+    rather than a race the debounce usually hides — and the test then WAITS for
+    both answers to have landed. Without that wait the whole first half passes
+    vacuously: nothing arriving is indistinguishable from an answer arriving and
+    being correctly discarded, so a page that never mirrored anything would pass
+    it too. The clean interaction afterwards is the other half of that: it proves
+    the writer is alive.
     """
-    _product_id, purchase_id = _cost_entry_page(api, sku="COSTIN-C", name="Cost entry gamma")
+    _product_id, purchase_id = _cost_entry_page(
+        api, sku="COSTIN-C", name="Cost entry gamma"
+    )
     page.goto(f"{api.base_url}/purchases/{purchase_id}")
 
     net = page.locator("#line-unit-cost")
@@ -1470,26 +1478,46 @@ def test_a_gross_the_operators_own_figure_keeps_what_they_typed(
 
     page.route(f"**{_PREVIEW_PATH_SUFFIX}*", _hold)
 
+    # Count what actually reached the page, so "the late answer arrived and was
+    # discarded" is a fact this test establishes rather than an assumption.
+    answers: list[str] = []
+    page.on(
+        "response",
+        lambda response: answers.append(response.text())
+        if _PREVIEW_PATH_SUFFIX in urlparse(response.url).path
+        else None,
+    )
+
     net.fill("5.00")
     net.press("Tab")
-    # The request is in flight and unanswered: the operator moves on.
     page.wait_for_timeout(600)
+    # The operator moves on before the first answer is allowed to land.
     gross.fill("7.00")
     release[0] = True
 
-    # Both of their figures survive, and the net they never retyped is still
-    # theirs: the late answer was for the gross field, and the gross field is
-    # where they now are.
+    # The operator is still IN the gross field — no blur, so no second question
+    # and no second answer. The one answer that lands is the counterpart of the
+    # net they typed earlier, and it names the field they are now standing in.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not answers:
+        page.wait_for_timeout(25)
+    assert held[0] >= 1, "no preview was ever held, so the ordering was never tested"
+    assert answers, (
+        "the held answer must actually LAND for this test to say anything: an answer that "
+        f"never arrives leaves 'the operator's figure survived' true of a page that never "
+        f"mirrors at all"
+    )
+
+    # Both of their figures survive. The late answer named the gross field — 6.05,
+    # the counterpart of the 5.00 they typed first — and the gross field is where
+    # they are now, mid-figure, so the answer is dropped and the net keeps what
+    # they typed.
     expect(gross).to_have_value("7.00")
     expect(net).to_have_value("5.00")
 
-    # The writer is demonstrably ALIVE, so the assertion above is about the guard
-    # and not about a page that never mirrors anything: a clean interaction now
-    # fills the other field exactly as the first interaction did.
-    assert held[0] >= 1, "no preview was ever held, so the ordering was never tested"
-    # Let every held answer land before the interception comes off, so the next
-    # interaction is a plain one and this test says one thing at a time.
-    page.wait_for_timeout(600)
+    # The writer is demonstrably ALIVE, so the assertions above are about the
+    # guard and not about a page that never mirrors anything: a clean interaction
+    # now fills the other field exactly as the first interaction did.
     page.unroute(f"**{_PREVIEW_PATH_SUFFIX}*")
     gross.fill("3.63")
     gross.press("Tab")

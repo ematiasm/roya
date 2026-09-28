@@ -8535,6 +8535,71 @@ mod tests {
         );
     }
 
+    /// THE BASIS, where it actually decides: BOTH figures on the form.
+    ///
+    /// This is the inline row's real shape. The net field is prefilled from
+    /// storage and the gross field beside it is where the supplier's figure
+    /// goes, so an edit to the gross arrives with a net already there — and a
+    /// rule that ignored the basis would store the untouched net every time, so
+    /// typing a gross would silently do nothing.
+    ///
+    /// It is also the property the no-JavaScript fallback rests on from the other
+    /// side: with no basis stated, the SAME pair stores the net. One rule, two
+    /// answers, and the only thing that decides between them is a field the page
+    /// sets.
+    #[tokio::test]
+    async fn the_stated_basis_decides_when_both_figures_are_on_the_form() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        // The gross is what the operator typed last: the net solves to 5.00 and
+        // the typed 4.00 is ignored.
+        let (status, body) = edit_cost_line(
+            app.clone(),
+            entry.purchase_id,
+            entry.edit_line_id,
+            "qty=2&unit_cost=4.00&unit_cost_gross=6.05&cost_basis=gross",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.edit_product_id).await,
+            dec_web("5.00"),
+            "the stated basis is the gross, so 6.05 at 21% decides the stored net"
+        );
+
+        // The same pair with the net stated: the net is the input, and the gross
+        // beside it cannot refuse it.
+        let (status, body) = edit_cost_line(
+            app.clone(),
+            entry.purchase_id,
+            entry.edit_line_id,
+            "qty=2&unit_cost=4.00&unit_cost_gross=6.05&cost_basis=net",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.edit_product_id).await,
+            dec_web("4.00")
+        );
+
+        // And with NO basis — a post from a browser with no JavaScript — the net
+        // wins, which is what this form did before the pair existed.
+        let (status, body) = edit_cost_line(
+            app,
+            entry.purchase_id,
+            entry.edit_line_id,
+            "qty=2&unit_cost=4.00&unit_cost_gross=6.05&cost_basis=",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.edit_product_id).await,
+            dec_web("4.00")
+        );
+    }
+
     /// A refused GROSS edit stores nothing, and the body is the localized
     /// sentence — the same one the preview paints — so the operator is told the
     /// same thing whichever side of the pair they were on.

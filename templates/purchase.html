@@ -101,7 +101,14 @@
     // place that knows it. The hidden field is what the post and the PUT carry;
     // with no JavaScript it stays empty, the server reads that as "no basis
     // stated", and the net wins — the form this pair replaced.
-    document.addEventListener('change', function (evt) {
+    //
+    // `input` AND `change`, and `input` is the load-bearing one: an operator
+    // part-way through retyping the gross has not blurred it, so no `change` has
+    // fired and a marker that only followed `change` would still name the field
+    // they left. `change` stays for a value that arrives without keystrokes —
+    // an autofill, a restored form — and both write the same value, so the
+    // order they arrive in cannot matter.
+    function markEdited(evt) {
       var target = evt.target;
       if (!target || !target.matches || !target.matches('[data-cost-field]')) return;
       var pair = costPair(target);
@@ -110,7 +117,9 @@
       pair.dataset.lastEdited = field;
       var basis = pair.querySelector('[data-cost-basis]');
       if (basis) basis.value = field;
-    });
+    }
+    document.addEventListener('input', markEdited);
+    document.addEventListener('change', markEdited);
     document.addEventListener('htmx:afterRequest', function (evt) {
       var detail = evt.detail || {};
       if (!detail.successful || !detail.xhr) return;
