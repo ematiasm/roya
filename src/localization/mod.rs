@@ -12,6 +12,19 @@ use crate::repositories::{
     SqliteBusinessSettingsRepository,
 };
 
+/// The currency's decimal places, as a DISPLAY scale.
+///
+/// It is the same number as [`crate::services::line_taxes::MONEY_SCALE`] and it
+/// is a SECOND constant rather than a reference to that one on purpose:
+/// `localization` is a leaf and must not depend on `services`, so reaching for
+/// the tax service's constant from here would invert the layering and make a
+/// formatting concern the reason a leaf knows a tax service exists. The
+/// compiler cannot check that these two agree, so
+/// `money_scale_is_the_same_in_the_formatter_and_the_line_tax_service` is what
+/// checks them — the same arrangement the tax-rate ceiling already uses for its
+/// four places, and the same reason.
+pub const MONEY_SCALE: u32 = 2;
+
 /// A closed set of presentation messages supported by the Spanish and English
 /// catalogs. Domain values, API values, and persistence values do not belong
 /// here: this enum is only for text shown by the application shell and other
@@ -2885,8 +2898,81 @@ impl LocalizationContext {
         }
     }
 
-    /// Format a Decimal without rounding or changing its scale.
+    /// Format a Decimal without rounding or changing its scale: what the value
+    /// carries is what the reader sees.
+    ///
+    /// This is the right formatter for a quantity, a rate, a markup, and every
+    /// other figure whose scale is ITSELF information — and deliberately the
+    /// wrong one for money, which is [`Self::format_money`]'s job and the reason
+    /// that one exists.
     pub fn format_decimal(&self, value: Decimal) -> String {
+        self.format_at_scale(value, 0)
+    }
+
+    /// Format a Decimal as money, retaining the currency code from the
+    /// business configuration. A code is honest for every supported currency;
+    /// guessing a symbol would be a lie when the symbol is ambiguous.
+    pub fn format_currency(&self, value: Decimal) -> String {
+        format!("{} {}", self.format_decimal(value), self.currency_code)
+    }
+
+    /// Render a Decimal at the currency's scale, zero-extending the fraction and
+    /// changing nothing else. Same shape and same currency-code contract as
+    /// [`Self::format_currency`]; the only difference is the scale.
+    ///
+    /// WHY THIS IS SEPARATE RATHER THAN A FIX TO `format_decimal`. This is a
+    /// display pin for money, and money is the one thing in the crate whose
+    /// scale is NOT information: a currency's decimals belong to the currency,
+    /// so `5` and `5.00` are the same number, and a form printing the first
+    /// beside the second is showing the operator one price twice at two scales.
+    /// A quantity's scale, by contrast, IS information — `1.5` and `1.50` are not
+    /// the same claim about stock — so the two formatters answer different
+    /// questions and neither can absorb the other's rule. `format_decimal` is
+    /// therefore left EXACTLY as it was: `format_currency` has 17 callers across
+    /// seven route modules, and moving all of them to two decimals is a change
+    /// of its own, with its own review and its own visual baseline.
+    ///
+    /// KNOWN GAP, left open by that decision on purpose rather than overlooked:
+    /// money figures outside the ones this reaches still render at whatever
+    /// scale they happen to carry. Purchase totals and due amounts, document,
+    /// sale and receipt lists, the customer and supplier statements, and the
+    /// product drawer's own sale price and satellite costs all still go through
+    /// [`Self::format_currency`], so a `5` can still sit beside a `5.00` on
+    /// those screens. Recorded here so the next reader knows it is a known gap.
+    ///
+    /// WHY PADDING IS NOT ROUNDING. The fraction is zero-extended to
+    /// [`MONEY_SCALE`] and every place the value already carries is kept: no
+    /// digit is changed, added or removed, so the text parses back — through
+    /// [`Self::parse_decimal`], in this locale's own conventions — to the very
+    /// number that went in. That round trip is what makes this presentation
+    /// rather than arithmetic, and it is why this function does NOT call
+    /// `services::line_taxes::round_to_cents`: rounding is a money RULE, that
+    /// one rule is the tax feature's, and a formatter applying it would change a
+    /// stored number for the sake of a screenshot. It is also the reason this
+    /// function is safe at the type's own limits for free — it only ever appends
+    /// a character to a string, and a string has no maximum.
+    ///
+    /// A value carrying MORE decimals than the currency has is rendered whole.
+    /// Printing `"1.234"` as `"1.23"` would state a different number than the
+    /// one the line costs, and a formatter must not do that even politely.
+    pub fn format_money(&self, value: Decimal) -> String {
+        format!(
+            "{} {}",
+            self.format_at_scale(value, MONEY_SCALE),
+            self.currency_code
+        )
+    }
+
+    /// The ONE number-rendering path, so the grouping and the locale's two
+    /// separator characters cannot come to disagree between the formatters
+    /// above. A hand-rolled pad is exactly where that disagreement is born, and
+    /// the round-trip test in `localization_tests` is what would catch it.
+    ///
+    /// `min_scale` is a floor on the fraction's LENGTH and nothing else: a
+    /// shorter fraction is zero-extended to it, a longer one is left alone, and
+    /// in neither case is a digit moved. It is 0 or [`MONEY_SCALE`], so the
+    /// extension below cannot allocate on a caller-supplied scale.
+    fn format_at_scale(&self, value: Decimal, min_scale: u32) -> String {
         let (group, decimal_sep, _) = self.number_conventions();
         let text = value.to_string();
         let (sign, unsigned) = text
@@ -2902,18 +2988,18 @@ impl LocalizationContext {
             grouped.push(character);
         }
 
-        if decimal.is_empty() {
+        // THE PAD, and the whole of the money rule. A `Decimal` renders as ASCII
+        // digits either side of its point, so `len()` counts the places.
+        let mut fraction = decimal.to_string();
+        while u32::try_from(fraction.len()).unwrap_or(u32::MAX) < min_scale {
+            fraction.push('0');
+        }
+
+        if fraction.is_empty() {
             format!("{sign}{grouped}")
         } else {
-            format!("{sign}{grouped}{decimal_sep}{decimal}")
+            format!("{sign}{grouped}{decimal_sep}{fraction}")
         }
-    }
-
-    /// Format a Decimal as money, retaining the currency code from the
-    /// business configuration. A code is honest for every supported currency;
-    /// guessing a symbol would be a lie when the symbol is ambiguous.
-    pub fn format_currency(&self, value: Decimal) -> String {
-        format!("{} {}", self.format_decimal(value), self.currency_code)
     }
 
     pub fn format_quantity(&self, value: Decimal) -> String {

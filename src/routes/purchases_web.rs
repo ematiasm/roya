@@ -179,10 +179,18 @@ fn suggestion_figures(
                         .unwrap_or_default(),
                     subtotal: s
                         .subtotal
-                        .map(|total| localization.format_currency(total))
+                        .map(|total| localization.format_money(total))
                         .unwrap_or_default(),
                     supplier_name: s.supplier_name,
-                    unit_cost: localization.format_currency(s.unit_cost),
+                    // `format_money`, not `format_currency`: the unit cost and
+                    // the subtotal above it are `unit_cost` and
+                    // `suggested_qty * unit_cost` — a product of what the
+                    // operator typed and what the reorder solve produced, at
+                    // whatever scale each of those arrived at. Neither is
+                    // rounded on the way here, so the panel is where a scale-0
+                    // and a scale-2 reading of the SAME cost sit side by side.
+                    // Money scale, no arithmetic: see `format_money`.
+                    unit_cost: localization.format_money(s.unit_cost),
                     stock,
                     stock_message,
                 }
@@ -3652,7 +3660,11 @@ mod tests {
         );
         let row = row_with_id(&body, &format!("purchase-line-{}", fixture.line_id));
         assert!(
-            row.contains("12 USD"),
+            // Money scale, so the applied cost of a whole number reads as the
+            // price it is: `12` and `12.00` are one number, and this cell used
+            // to render whichever the storage happened to carry. The applied
+            // cost is unchanged — only the places it is SHOWN at.
+            row.contains("12.00 USD"),
             "the refreshed fragment still shows the line at its applied cost: {row}"
         );
     }

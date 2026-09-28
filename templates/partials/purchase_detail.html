@@ -175,11 +175,35 @@
             </td>
             {% else %}
              <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_quantity(line.qty.clone()) }}</td>
-             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.unit_cost.clone()) }}</td>
+              {# `format_money` on ALL FOUR money cells of a line, and the
+                 reason is not taste. `unit_cost` is what the operator typed or
+                 what `solve_net_from_gross` solved back from a typed gross, and
+                 `subtotal` is `qty * unit_cost` — neither is rounded, so each
+                 carries whatever scale it arrived at and a line can show `5`
+                 beside a hand-typed `5.00`.
+
+                 The tax and total cells are here because `round_to_cents` is a
+                 VALUE rule and not a SCALE rule: it never adds a decimal place,
+                 so `round_to_cents(24)` is `24` at scale 0 and
+                 `round_to_cents(24.4)` is `24.4` at scale 1. An untaxed line's
+                 `tax_total` is `Decimal::ZERO` and its `total` is a whole
+                 number, so both reached this row at scale 0 — which is why a row
+                 reads `12.00 USD | 24.00 USD | 0 USD | 24 USD` if only the cost
+                 cells are pinned. The tax SERVICE's scale promise is about the
+                 VALUES it derives; the scale an operator READS is this template's
+                 job, and it is the one place that can deliver it.
+
+                 The form input above keeps `format_decimal` on purpose. A value
+                 inside an input is not a figure an operator READS, it is one
+                 they POST BACK, and `format_decimal` echoes back exactly the
+                 scale that was stored — rendering the field at money scale would
+                 silently rescale a stored unit cost the moment the operator
+                 edited an unrelated field on the same row. #}
+              <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_money(line.unit_cost.clone()) }}</td>
             {% endif %}
-             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.subtotal.clone()) }}</td>
-             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_currency(line.tax_total.clone()) }}</td>
-             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">{{ localization.format_currency(line.total.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_money(line.subtotal.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right tabular-nums">{{ localization.format_money(line.tax_total.clone()) }}</td>
+             <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">{{ localization.format_money(line.total.clone()) }}</td>
             {% if record.purchase.status.to_string() == "Draft" %}
             <td class="py-2.5 text-right">
               <button class="btn-secondary"
