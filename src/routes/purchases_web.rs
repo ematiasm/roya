@@ -2392,12 +2392,29 @@ mod tests {
             !input_tag.contains("value="),
             "the entry row must come back empty: {input_tag}"
         );
-        for id in ["id=\"line-qty\"", "id=\"line-unit-cost\""] {
+        for id in [
+            "id=\"line-qty\"",
+            "id=\"line-unit-cost\"",
+            "id=\"line-unit-cost-gross\"",
+            "id=\"line-cost-basis\"",
+            "id=\"line-cost-refusal\"",
+        ] {
             assert!(
-                row.contains(id),
-                "the entry row carries the qty and the cost field: {id}: {row:.600}"
+                !row.contains(id),
+                "the entry row is search-only: it must not carry {id}. An operator is asked for a \
+                 quantity and a cost on the LINE, after they have decided they want the product: \
+                 {row:.600}"
             );
         }
+        // What the entry row keeps is the picker island's own contract: the
+        // search, the hidden `product_id` the island writes, and the submit that
+        // carries a chosen result in one step.
+        assert!(
+            row.contains("id=\"product-picker\"")
+                && row.contains("name=\"product_id\"")
+                && row.contains("type=\"submit\""),
+            "the search, the island's hidden product id and the submit all stay: {row:.600}"
+        );
     }
 
     /// Everything a record-page test needs to address the seeded document.
@@ -4281,14 +4298,17 @@ mod tests {
             !html.contains("id=\"add-line\""),
             "the bar carries no drawer button and the page no drawer anchor: {html:.400}"
         );
-        // The entry row is persistent: product, qty, cost and the Add action
-        // render without any click, inside the money region adds swap.
+        // The entry row is persistent and search-only: the product field, the
+        // island's hidden id and the Add action render without any click, inside
+        // the money region adds swap. Quantity and money are asked on the LINE,
+        // where the product is already a line the operator can see.
         assert!(
             html.contains("id=\"line-picker\"")
                 && html.contains("id=\"product-picker\"")
-                && html.contains("id=\"line-qty\"")
-                && html.contains("id=\"line-unit-cost\""),
-            "the entry row renders its fields persistent: {html:.600}"
+                && !html.contains("id=\"line-qty\"")
+                && !html.contains("id=\"line-unit-cost\""),
+            "the entry row renders its search persistent, and asks for no quantity and no cost: \
+             {html:.600}"
         );
         for dialog in ["confirm-purchase", "discard-purchase"] {
             assert!(
@@ -5513,8 +5533,9 @@ mod tests {
             "the form carries the island-owned hidden product id: {picker}"
         );
         assert!(
-            picker.contains("name=\"qty\"") && picker.contains("value=\"1\""),
-            "a scan and a click must both carry the default quantity: {picker}"
+            !picker.contains("name=\"qty\""),
+            "the entry row asks for no quantity: a scan and a click both add ONE, resolved by the \
+             server, and the operator corrects it on the line: {picker}"
         );
 
         // The field carries no declarative search transport: the island owns

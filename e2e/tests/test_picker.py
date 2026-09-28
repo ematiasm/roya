@@ -339,18 +339,25 @@ def test_the_picker_island_owns_the_purchase_search(page: Page, api: ApiClient) 
     expect(results).to_contain_text("Harness Spare")
     expect(results).to_contain_text("Cost 2.00 USD")
 
-    # Clicking the match adds the line with the island's selected id and the
-    # quantity the operator typed. The field held "Harness" — no exact match
-    # for either seeded product — so only the island-selected id can have
+    # Accepting the match adds the line. The field held "Harness" — no exact
+    # match for either seeded product — so only the island-selected id can have
     # produced this line; a stale hidden id cannot smuggle one in.
-    page.locator("#line-qty").fill("3")
     page.locator("#product-search-results button", has_text="Harness Spare").click()
 
     row = _purchase_line_row(page, "Harness Spare")
     expect(row).to_have_count(1)
-    expect(row.locator("input[name='qty']")).to_have_value("3")
+    # An accept that states no quantity arrives at ONE. The quantity is a
+    # question the entry row no longer asks, and the line is where the operator
+    # answers it — so asserting "1" is asserting the shape of the workflow, not
+    # a default the page happens to render.
+    expect(row.locator("input[name='qty']")).to_have_value("1")
+    # And the cost is the one the product ALREADY had, looked up and shown: the
+    # same "Cost 2.00 USD" the result row quoted a moment earlier. This is the
+    # operator's second ask — the product's own cost, already on the line.
+    expect(row.locator("input[name='unit_cost']")).to_have_value("2.00")
     line = _purchase_line_for(api, data.purchase_id, spare_id)
-    assert Decimal(str(line["qty"])) == Decimal("3"), line
+    assert Decimal(str(line["qty"])) == Decimal("1"), line
+    assert Decimal(str(line["unit_cost"])) == Decimal("2.00"), line
 
     # The entry row is persistent inside the swapped money region, not out of
     # band: the add response re-renders it empty and focused, ready for the
@@ -387,7 +394,6 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     # travelled through the purchase host's parameters.
     expect(results).to_contain_text("Cost 2.00 USD")
 
-    page.locator("#line-qty").fill("4")
     page.locator("#product-search-results button", has_text="Harness Spare").click()
 
     row = _purchase_line_row(page, "Harness Spare")
@@ -395,16 +401,20 @@ def test_choosing_a_result_on_the_purchase_page_renders_and_adds(
     expect(row).to_contain_text("HARNESS-SPARE")
     # Qty and unit cost are inline-edit inputs now (T7): their content is the
     # value attribute, not cell text, so the row shape is asserted through the
-    # inputs while the derived subtotal stays plain text.
-    expect(row.locator("input[name='qty']")).to_have_value("4")
+    # inputs while the derived subtotal stays plain text. Both arrive on their
+    # own — one unit at the product's existing cost, because the entry row
+    # asked for neither.
+    expect(row.locator("input[name='qty']")).to_have_value("1")
     expect(row.locator("input[name='unit_cost']")).to_have_value("2.00")
-    expect(row).to_contain_text("8.00 USD")
+    expect(row).to_contain_text("2.00 USD")
 
     detail = api.get_json(f"/api/purchases/{data.purchase_id}")
     line = next(
         line for line in detail["lines"] if int(line["product_id"]) == spare_id
     )
-    assert Decimal(str(line["qty"])) == Decimal("4"), line
+    assert Decimal(str(line["qty"])) == Decimal("1"), line
+    assert Decimal(str(line["unit_cost"])) == Decimal("2.00"), line
+    assert Decimal(str(line["tax_total"])) == Decimal("0"), line
 
 
 def test_a_repeat_scan_on_a_draft_purchase_merges_into_one_line(
@@ -417,6 +427,11 @@ def test_a_repeat_scan_on_a_draft_purchase_merges_into_one_line(
     the case a receiving desk actually hits) the second scan increments the
     line and the answer says so in the notice region. One row, quantity 2, a
     visible merge notice: nothing happens silently.
+
+    The entry row asks for the product and nothing else, so neither scan states
+    a quantity — which is exactly the case this test now pins: a bare scan means
+    "one more", and the merge must be what turns two of them into two units on
+    ONE row rather than a second line.
     """
     data = seed_harness_data(api)
     # A draft of our own: the seeded purchase already carries a line for this
@@ -427,16 +442,15 @@ def test_a_repeat_scan_on_a_draft_purchase_merges_into_one_line(
     picker = page.locator("#product-picker")
 
     # Scan 1: an empty cost resolves to the supplier's satellite cost, so the
-    # line is created at it.
-    page.locator("#line-qty").fill("1")
+    # line is created at it, at one unit.
     picker.fill(data.barcode)
     picker.press("Enter")
     row = _purchase_line_row(page, data.product_name)
     expect(row).to_have_count(1)
     expect(row.locator("input[name='qty']")).to_have_value("1")
+    expect(row.locator("input[name='unit_cost']")).to_have_value("9.50")
 
     # Scan 2: the same barcode, the same resolved cost — the line increments.
-    page.locator("#line-qty").fill("1")
     picker.fill(data.barcode)
     picker.press("Enter")
     rows = _purchase_line_row(page, data.product_name)
@@ -455,3 +469,4 @@ def test_a_repeat_scan_on_a_draft_purchase_merges_into_one_line(
     line = detail["lines"][0]
     assert int(line["product_id"]) == data.product_id
     assert Decimal(str(line["qty"])) == Decimal("2"), line
+    assert Decimal(str(line["unit_cost"])) == Decimal("9.50"), line

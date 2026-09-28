@@ -4806,7 +4806,8 @@ async fn line_picker_loads_a_sale_without_a_click() {
 /// money region, empty and ready for the next scan. The sale record keeps the
 /// out-of-band picker, so purchases get their own contract here: the entry
 /// row renders once, its tag carries NO `hx-swap-oob`, the product field is
-/// empty and `autofocus`, and the qty and cost fields travel with it.
+/// empty and `autofocus`, and it carries the search and nothing else —
+/// quantity and money are asked on the line.
 fn assert_purchase_entry_row_is_empty_and_ready(html: &str) {
     assert_eq!(
         html.matches("id=\"line-picker\"").count(),
@@ -4847,12 +4848,25 @@ fn assert_purchase_entry_row_is_empty_and_ready(html: &str) {
         !input_tag.contains("value="),
         "the entry row must come back empty: {input_tag}"
     );
-    for id in ["id=\"line-qty\"", "id=\"line-unit-cost\""] {
+    for id in [
+        "id=\"line-qty\"",
+        "id=\"line-unit-cost\"",
+        "id=\"line-unit-cost-gross\"",
+        "id=\"line-cost-basis\"",
+        "id=\"line-cost-refusal\"",
+    ] {
         assert!(
-            row.contains(id),
-            "the entry row carries the qty and the cost field: {id}: {row:.600}"
+            !row.contains(id),
+            "the entry row is search-only: it must not carry {id}. Quantity and money are edited on \
+             the line, once the product is one: {row:.600}"
         );
     }
+    // What stays is the island's own contract: the search, the hidden product id
+    // it writes, and the submit that carries a chosen result in one step.
+    assert!(
+        row.contains("name=\"product_id\"") && row.contains("type=\"submit\""),
+        "the island's hidden product id and the submit all stay: {row:.600}"
+    );
 }
 
 #[tokio::test]
@@ -4946,7 +4960,9 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     }
 
     // The single add-line form keeps the server's contract: the post, the
-    // hidden island-owned product id and the default quantity.
+    // hidden island-owned product id, and NOTHING that asks the operator for a
+    // quantity. The "1" is the server's answer to a request nobody makes, and
+    // the line is where a wrong one is corrected.
     let form_pos = page[..input_pos]
         .rfind("<form")
         .expect("the field sits in the add-line form");
@@ -4958,8 +4974,9 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     );
     assert!(form.contains("name=\"product_id\""), "{form:.600}");
     assert!(
-        form.contains("name=\"qty\"") && form.contains("value=\"1\""),
-        "a scan and a click must both carry the default quantity: {form:.600}"
+        !form.contains("name=\"qty\""),
+        "a scan and a click both add ONE without being asked: the entry row is search-only. \
+         {form:.600}"
     );
 
     // The results container is a sibling of the form, never inside it.
@@ -4981,9 +4998,9 @@ async fn purchase_line_picker_adds_lines_without_a_click() {
     assert!(page.contains("id=\"purchase-record-money\""), "{page:.600}");
 
     // Scan 1: the reader types the barcode and presses Enter. The form carries the
-    // field and the quantity, never a product id. The fixture's supplier has no
-    // satellite row for the product, so the empty cost uses the product cost price
-    // (10).
+    // field, never a product id and never a quantity. The fixture's supplier has
+    // no satellite row for the product, so the empty cost uses the product cost
+    // price (10).
     let (status, added) = post_form(
         &app,
         &format!("{base}/lines"),
