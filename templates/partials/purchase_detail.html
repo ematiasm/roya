@@ -89,14 +89,10 @@
        data-picker-match-count-many="{{ localization.tr_count(crate::localization::MessageKey::PickerMatchCount, 2) }}"
        data-picker-cost-label="{{ localization.tr(crate::localization::MessageKey::PickerCostLabel) }}"
        data-picker-stock-label="{{ localization.tr(crate::localization::MessageKey::PickerStockLabel) }}">
-  {# THE PAIR, as a container rather than as the form: the page shell finds both
-     cost fields and the refusal slot through this ancestor, and a slot OUTSIDE
-     the form is not inside it. #}
-  <div data-cost-pair>
-    <form id="line-add-form" class="flex flex-wrap items-end gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesAddLine) }}"
-          hx-post="/web/purchases/{{ record.purchase.id }}/lines"
-          hx-disinherit="hx-select hx-target hx-swap"
-          hx-target="#purchase-record-money" hx-swap="outerHTML" hx-select="#purchase-record-money">
+  <form id="line-add-form" class="flex flex-wrap items-end gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesAddLine) }}"
+        hx-post="/web/purchases/{{ record.purchase.id }}/lines"
+        hx-disinherit="hx-select hx-target hx-swap"
+        hx-target="#purchase-record-money" hx-swap="outerHTML" hx-select="#purchase-record-money">
       {# Island-owned: set from state.selectedProductId on a click, disabled
          while nothing is selected so the typed-name Enter path never competes
          with a stale id. #}
@@ -110,8 +106,7 @@
                {% if entry_row_focus %}autofocus{% endif %} class="field" />
       </div>
       <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesAddLine) }}</button>
-    </form>
-  </div>
+  </form>
   {# Same busy cue and live region the shared picker macro renders. The
      island owns both now: it toggles the busy cue's `htmx-request` class
      from its own status while its search fetch is in flight, and the polite

@@ -27,7 +27,6 @@ not on a shrug.
 
 from __future__ import annotations
 
-import time
 from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from urllib.parse import urlparse
@@ -1312,14 +1311,20 @@ def test_a_refused_inline_line_edit_reverts_and_stores_nothing(
 # Bidirectional cost entry (cost-with-taxes T-C)
 #
 # Two fields for one figure, and whichever the operator types into is the input.
-# The server computes every number here — the entry row's preview asks it to
-# solve the other side, and the inline edit's PUT answers with the record body
-# re-read from storage — so what these tests assert is that the page asks, and
-# that what comes back is the exact figure rather than a rounded neighbour.
+# The server computes every number here: the inline edit's PUT asks it to solve
+# the other side, and its answer is the record body re-read from storage, so what
+# these tests assert is that the page asks, and that what comes back is the exact
+# figure rather than a rounded neighbour.
+#
+# THE ENTRY ROW'S HALF IS GONE (purchase-search-only-entry T3). The entry row
+# asked for the pair before the product was accepted, and its live preview is
+# what made that bearable; both are gone with the fields, so the tests that drove
+# them went too. The refused case they covered is not lost with them: a gross of
+# no net is still refused on the line, and
+# `test_a_refused_gross_edit_reverts_both_fields_and_stores_nothing` below says
+# so through the same shared sentence. There is no browser-reachable path left to
+# a refused gross at ADD time, because the entry row no longer takes a cost.
 # ---------------------------------------------------------------------------
-
-_PREVIEW_PATH_SUFFIX = "/lines/cost"
-
 
 def _cost_entry_page(api: ApiClient, *, sku: str, name: str, cost: str = "5.00"):
     """A draft with one product carrying a 21% tax, and nothing on the line yet.
@@ -1348,219 +1353,6 @@ def _cost_entry_page(api: ApiClient, *, sku: str, name: str, cost: str = "5.00")
     supplier_id = create_supplier(api, f"Cost Supplier {sku}")
     purchase_id = create_purchase_draft(api, supplier_id, payment_type="Cash")
     return product_id, purchase_id
-
-
-def test_a_gross_typed_into_the_entry_row_fills_the_net_and_stores_it(
-    page: Page, api: ApiClient
-) -> None:
-    """Type the supplier's figure; the net appears, and the line is stored at it.
-
-    This is the whole promise of the feature in one interaction, and the reason
-    the net is asserted to the CENT rather than to "something near 5": 6.05 at
-    21% is the gross of exactly 5.00, and a page that computed the net itself
-    would land on 5.00 too — so the stored line, not the visible field, is what
-    proves the server did the work.
-    """
-    product_id, purchase_id = _cost_entry_page(
-        api, sku="COSTIN-A", name="Cost entry alpha"
-    )
-    page.goto(f"{api.base_url}/purchases/{purchase_id}")
-
-    net = page.locator("#line-unit-cost")
-    gross = page.locator("#line-unit-cost-gross")
-    expect(net).to_have_value("")
-    expect(gross).to_have_value("")
-
-    # The product is chosen the way a receiving desk does it — the text goes in
-    # and Enter carries it — and the cost is typed beside it.
-    page.locator("#product-picker").fill("COSTIN-A")
-
-    # ONE preview request, and the net fills from its answer. The count is
-    # asserted because a pair that answers each other is the failure this shape
-    # is built to prevent, and "the net is right" alone would not notice it.
-    previews: list[str] = []
-    page.on(
-        "request",
-        lambda request: previews.append(request.url)
-        if _PREVIEW_PATH_SUFFIX in urlparse(request.url).path
-        else None,
-    )
-    gross.fill("6.05")
-    gross.press("Tab")
-    # "5" and not "5.00": `Decimal` carries no trailing zeros, so a SOLVED figure
-    # renders at the scale it happens to hold while a TYPED one renders at the
-    # scale the operator typed. Both parse and store as the same number — the
-    # read-back below is what proves that — and the app renders every derived
-    # figure this way, the ladder's included.
-    expect(net).to_have_value("5")
-    assert len(previews) == 1, f"one answer per field, not a loop: {previews}"
-
-    # And the gross the operator typed is still theirs: the answer goes into the
-    # OTHER field.
-    expect(gross).to_have_value("6.05")
-
-    # Adding the line stores the solved net, exactly.
-    page.locator("#product-picker").press("Enter")
-    row = page.locator(f"#purchase-line-{product_id}")
-    expect(row).to_have_count(1)
-    stored = api.get_json(f"/api/purchases/{purchase_id}")
-    line = next(line for line in stored["lines"] if int(line["product_id"]) == product_id)
-    assert Decimal(str(line["unit_cost"])) == Decimal("5.00"), line
-    # 21% of the line's own net subtotal (1 x 5.00 = 5.00) — the tax the WRITE
-    # froze, which is what the gross was derived against.
-    assert Decimal(str(line["tax_total"])) == Decimal("1.05"), line
-
-
-def test_a_net_typed_into_the_entry_row_fills_the_gross(page: Page, api: ApiClient) -> None:
-    """The mirror runs the other way too, and on the same contract.
-
-    5,00 at 21% grosses to 6,05 — which is the ladder's `cost_total` arithmetic
-    and the same `calculate_line_taxes` a line write will run. Asserting the
-    gross here is what keeps the two directions honest about each other: a
-    "mirror" that only ever solved gross to net would pass the first test.
-    """
-    _product_id, purchase_id = _cost_entry_page(api, sku="COSTIN-B", name="Cost entry beta")
-    page.goto(f"{api.base_url}/purchases/{purchase_id}")
-
-    net = page.locator("#line-unit-cost")
-    gross = page.locator("#line-unit-cost-gross")
-
-    page.locator("#product-picker").fill("COSTIN-B")
-    net.fill("5.00")
-    net.press("Tab")
-
-    expect(gross).to_have_value("6.05")
-    expect(net).to_have_value("5.00")
-
-
-def test_a_gross_the_operators_own_figure_keeps_what_they_typed(
-    page: Page, api: ApiClient
-) -> None:
-    """The loop guard: an answer must never overwrite the field being typed in.
-
-    The trap is a slow answer, not a fast one. The operator types a net, walks
-    away to the gross field and starts THEIR figure, and the first answer lands
-    in between — carrying the counterpart of the net they typed, which belongs
-    in the gross field, which is now full of something else. The
-    `data-last-edited` marker is the only thing that knows they have moved on.
-
-    The first response is HELD so the ordering is the one the guard exists for
-    rather than a race the debounce usually hides — and the test then WAITS for
-    both answers to have landed. Without that wait the whole first half passes
-    vacuously: nothing arriving is indistinguishable from an answer arriving and
-    being correctly discarded, so a page that never mirrored anything would pass
-    it too. The clean interaction afterwards is the other half of that: it proves
-    the writer is alive.
-    """
-    _product_id, purchase_id = _cost_entry_page(
-        api, sku="COSTIN-C", name="Cost entry gamma"
-    )
-    page.goto(f"{api.base_url}/purchases/{purchase_id}")
-
-    net = page.locator("#line-unit-cost")
-    gross = page.locator("#line-unit-cost-gross")
-    page.locator("#product-picker").fill("COSTIN-C")
-
-    # Hold the FIRST preview until released and pass every later one straight
-    # through. Holding all of them would also hold the clean interaction at the
-    # end, which is not what is under test.
-    release: list[bool] = [False]
-    held: list[int] = [0]
-
-    def _hold(route) -> None:
-        held[0] += 1
-        if held[0] > 1:
-            route.continue_()
-            return
-        while not release[0]:
-            page.wait_for_timeout(20)
-        route.continue_()
-
-    page.route(f"**{_PREVIEW_PATH_SUFFIX}*", _hold)
-
-    # Count what actually reached the page, so "the late answer arrived and was
-    # discarded" is a fact this test establishes rather than an assumption.
-    answers: list[str] = []
-    page.on(
-        "response",
-        lambda response: answers.append(response.text())
-        if _PREVIEW_PATH_SUFFIX in urlparse(response.url).path
-        else None,
-    )
-
-    net.fill("5.00")
-    net.press("Tab")
-    page.wait_for_timeout(600)
-    # The operator moves on before the first answer is allowed to land.
-    gross.fill("7.00")
-    release[0] = True
-
-    # The operator is still IN the gross field — no blur, so no second question
-    # and no second answer. The one answer that lands is the counterpart of the
-    # net they typed earlier, and it names the field they are now standing in.
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and not answers:
-        page.wait_for_timeout(25)
-    assert held[0] >= 1, "no preview was ever held, so the ordering was never tested"
-    assert answers, (
-        "the held answer must actually LAND for this test to say anything: an answer that "
-        f"never arrives leaves 'the operator's figure survived' true of a page that never "
-        f"mirrors at all"
-    )
-
-    # Both of their figures survive. The late answer named the gross field — 6.05,
-    # the counterpart of the 5.00 they typed first — and the gross field is where
-    # they are now, mid-figure, so the answer is dropped and the net keeps what
-    # they typed.
-    expect(gross).to_have_value("7.00")
-    expect(net).to_have_value("5.00")
-
-    # The writer is demonstrably ALIVE, so the assertions above are about the
-    # guard and not about a page that never mirrors anything: a clean interaction
-    # now fills the other field exactly as the first interaction did.
-    page.unroute(f"**{_PREVIEW_PATH_SUFFIX}*")
-    gross.fill("3.63")
-    gross.press("Tab")
-    expect(net).to_have_value("3")
-
-
-def test_a_gross_that_is_the_gross_of_no_net_says_so_and_stores_nothing(
-    page: Page, api: ApiClient
-) -> None:
-    """0,03 at 21% is the gross of no net. The page says so, and adds nothing.
-
-    A rounded approximation would be the wrong kind of success: it would store a
-    net whose gross is not the figure on the invoice, and the operator would
-    have no way to see the difference. So the refusal is the assertion, and the
-    document must be untouched afterwards.
-    """
-    product_id, purchase_id = _cost_entry_page(
-        api, sku="COSTIN-D", name="Cost entry delta"
-    )
-    page.goto(f"{api.base_url}/purchases/{purchase_id}")
-
-    net = page.locator("#line-unit-cost")
-    gross = page.locator("#line-unit-cost-gross")
-    page.locator("#product-picker").fill("COSTIN-D")
-    gross.fill("0.03")
-    gross.press("Tab")
-
-    refusal = page.locator("[data-cost-refusal]")
-    expect(refusal).to_be_visible()
-    expect(refusal).to_contain_text("no net cost grosses to this cost")
-    # The net the operator had (none) is not invented, and the gross they typed
-    # is still theirs to correct.
-    expect(gross).to_have_value("0.03")
-    expect(net).to_have_value("")
-
-    # And the write refuses the same figure rather than rounding it.
-    page.locator("#product-picker").press("Enter")
-    page.wait_for_timeout(800)
-    stored = api.get_json(f"/api/purchases/{purchase_id}")
-    assert stored["lines"] == [], stored["lines"]
-    assert int(product_id) not in {
-        int(line["product_id"]) for line in stored["lines"]
-    }
 
 
 def test_a_gross_typed_into_an_inline_edit_stores_the_solved_net(
