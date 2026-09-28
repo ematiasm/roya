@@ -312,6 +312,74 @@ mod tests {
         Decimal::from_str(raw).unwrap()
     }
 
+    /// A rate SET: several linked taxes on one line, each with its own `id`,
+    /// because the breakdown's one-entry-per-tax shape is part of what the
+    /// document-total invariant pins.
+    fn taxes(rates: &[&str]) -> Vec<Tax> {
+        rates
+            .iter()
+            .enumerate()
+            .map(|(index, rate)| Tax {
+                id: index as i64 + 1,
+                ..tax(rate)
+            })
+            .collect()
+    }
+
+    /// ONE contribution, written the way [`calculate_line_taxes`] writes it.
+    /// Restating the definition is the point: the expected money below is built
+    /// from the rule rather than typed in, so each literal beside it checks the
+    /// rule's result instead of being a copy of it.
+    fn contribution(net: Decimal, rate: Decimal) -> Decimal {
+        round_to_cents(net * rate / percent())
+    }
+
+    /// The figure a PER-UNIT implementation would produce for the same line:
+    /// the unit's tax rounded, added to the unit, and only then multiplied by
+    /// the quantity.
+    ///
+    /// Decision 3 is a claim about WHERE the one `round_to_cents` happens, and a
+    /// claim about a location is only checkable once the alternative is written
+    /// down as arithmetic. This is built from the same `round_to_cents` the
+    /// contract uses, so the two differ in exactly one respect — the quantity
+    /// the rounding is applied to — and every counter-example below is about
+    /// that one difference rather than about two rival rounding rules.
+    fn per_unit_line_total(unit: Decimal, qty: Decimal, taxes: &[Tax]) -> Decimal {
+        let unit_tax_total = taxes
+            .iter()
+            .fold(Decimal::ZERO, |sum, tax| sum + contribution(unit, tax.rate));
+        round_to_cents(unit + unit_tax_total) * qty
+    }
+
+    /// The figure the cent is MEANT to be nearest: `net * (1 + SUM rate_i/100)`
+    /// with nothing rounded anywhere.
+    ///
+    /// It is the yardstick both error statements below are measured against,
+    /// and it is not a restatement of the contract — the contract rounds, this
+    /// does not — which is what keeps the bound from being circular.
+    fn exact_line_total(net: Decimal, taxes: &[Tax]) -> Decimal {
+        let factor = taxes
+            .iter()
+            .fold(Decimal::ONE, |factor, tax| factor + tax.rate / percent());
+        net * factor
+    }
+
+    /// The error bound, as a VALUE.
+    ///
+    /// [`round_to_cents`] moves its input by at most half a cent, and nothing
+    /// in the contract rounds anything else, so `n` linked taxes bound the
+    /// total at `n` half-cents. `extra_pins` pays for the OTHER pins the answer
+    /// may pass through. It is zero whenever the net is already at
+    /// [`MONEY_SCALE`] — every whole quantity of a two-decimal price — because
+    /// a sum of values that are already at `MONEY_SCALE` is exact and the
+    /// line's own pin is then a no-op. A net carrying MORE decimals (a
+    /// fractional quantity, a three-decimal unit cost) goes through one real
+    /// extra pin, and the bound pays for it rather than the test quietly
+    /// excluding the case.
+    fn error_bound(taxes: &[Tax], extra_pins: usize) -> Decimal {
+        Decimal::from(taxes.len() + extra_pins) * cent() / Decimal::TWO
+    }
+
     /// THE PROBE. Every individual multiply fits, the running tax total fits,
     /// and only the FINAL ADD leaves the range — so a guard that checked the
     /// multiplies and forgot the add would still crash on this input.
@@ -464,5 +532,270 @@ mod tests {
         assert_eq!(calc.taxes[1].amount, dec("10"));
         assert_eq!(calc.tax_total, dec("31"));
         assert_eq!(calc.total, dec("131"));
+    }
+
+    /// DECISION 3, on the plan's own worked example, with BOTH answers asserted.
+    ///
+    /// Cost `0,03` at 21% in a quantity of 7 is the figure the decision was
+    /// taken on, and it is here with the two numbers SEPARATED rather than
+    /// described: the contract's answer, `0.25`, and the answer a per-unit
+    /// implementation gives for the identical line, `0.28`, against an exact
+    /// figure of `0.2541` that neither of them lands on. The two are asserted
+    /// as numbers and asserted to DIFFER, which is what makes this a
+    /// counter-example rather than a claim in a comment: an implementation that
+    /// moved the rounding to the unit would answer `0.28` here and fail on the
+    /// literal.
+    ///
+    /// The three fixtures are not chosen because they are awkward. The first is
+    /// the plan's, the second reaches the same line net by a different route
+    /// (so the line-level figure is fixed by the line, not by the unit, which is
+    /// the whole claim), and the third multiplies the quantity by fourteen and
+    /// leaves the line-level answer alone while the per-unit answer walks off by
+    /// 37 cents — a hundred times the quantity would.
+    #[test]
+    fn the_line_rounds_once_at_the_line_and_not_at_the_unit() {
+        for (raw_unit, rates, raw_qty, line, per_unit, exact) in [
+            ("0.03", ["21"].as_slice(), "7", "0.25", "0.28", "0.2541"),
+            ("0.07", ["21"].as_slice(), "3", "0.25", "0.24", "0.2541"),
+            ("0.03", ["21"].as_slice(), "100", "3.63", "4.00", "3.63"),
+        ] {
+            let linked = taxes(rates);
+            let (unit, qty) = (dec(raw_unit), dec(raw_qty));
+            let label = format!("{raw_unit} at {rates:?} in {raw_qty}");
+
+            // The line's net, from the contract's own definition of one.
+            let net =
+                line_net_amount(qty, unit).expect("a fixture amount is arithmetic this carries");
+            let calc = calculate_line_taxes(net, &linked)
+                .expect("an ordinary amount and rate set is arithmetic this contract carries");
+
+            // The arithmetic that produces the literal, so the literal cannot
+            // drift from the rule silently: one pinned contribution per tax,
+            // their sum, and the net plus that sum.
+            let built: Vec<Decimal> = linked.iter().map(|t| contribution(net, t.rate)).collect();
+            assert_eq!(
+                calc.taxes.iter().map(|s| s.amount).collect::<Vec<_>>(),
+                built,
+                "{label}: the breakdown is the pinned contributions"
+            );
+            assert_eq!(calc.tax_total, built.iter().sum::<Decimal>(), "{label}");
+            assert_eq!(calc.total, dec(line), "{label}: the line-level figure");
+
+            // The unrounded figure, so the two errors below are measured
+            // against a yardstick rather than against each other.
+            assert_eq!(exact_line_total(net, &linked), dec(exact), "{label}: exact");
+
+            // The counter-example, as a number: the alternative's arithmetic is
+            // run here and its result asserted, so a reader can check that the
+            // two really are computed by the rules named and not by hand.
+            let alternative = per_unit_line_total(unit, qty, &linked);
+            assert_eq!(alternative, dec(per_unit), "{label}: the per-unit figure");
+            assert_ne!(
+                alternative, calc.total,
+                "{label}: the per-unit figure {alternative} must differ from the line-level one \
+                 {}, or the counter-example proves nothing",
+                calc.total
+            );
+        }
+    }
+
+    /// THE PROPERTY, and it is a bound over a range rather than three fixtures.
+    ///
+    /// Decision 3's claim is that the line-level answer stays within half a cent
+    /// of the exact figure REGARDLESS OF QUANTITY. Stated as arithmetic: a
+    /// `round_to_cents` call moves its input by at most `cent() / 2`, the
+    /// contract applies it once per linked tax and nowhere else, and a sum of
+    /// values already at `MONEY_SCALE` is exact — so for `n` linked taxes on a
+    /// two-decimal net the total is at most `n` half-cents from
+    /// `net * (1 + SUM rate_i/100)`, and NO quantity appears in that bound at
+    /// all. The per-unit alternative's error is `qty * delta` for a `delta`
+    /// fixed by the unit cost and the rates alone, so it grows without limit as
+    /// the quantity grows while this one cannot. That is the difference, and it
+    /// is why the decision is not a preference.
+    ///
+    /// The second arm is the fractional quantity, and it is here because the
+    /// bound above is FALSE without it rather than merely untested: a net with
+    /// more than two decimals goes through one real extra pin — the line's own
+    /// total — and pays one more half-cent. A test that swept only whole
+    /// quantities of two-decimal prices would be claiming a bound the contract
+    /// does not hold, and a mutation that moved the line's pin onto the
+    /// contributions would slip past it.
+    #[test]
+    fn the_line_level_error_stays_within_half_a_cent_per_tax_at_every_quantity() {
+        let units = [
+            "0.01", "0.03", "0.07", "0.11", "0.13", "0.29", "1.37", "2.50", "99.99",
+        ];
+        let rate_sets: [&[&str]; 5] = [
+            &["21"],
+            &["10.5"],
+            &["27"],
+            &["21", "10.5"],
+            &["21", "10.5", "3"],
+        ];
+        // Quantities an operator actually types, and a few past the end of the
+        // range a purchase form offers, because the claim is REGARDLESS of
+        // quantity and a bound nobody has pushed on is a guess.
+        let quantities: [Decimal; 10] =
+            ["1", "2", "3", "7", "12", "25", "50", "99", "100", "1000"].map(dec);
+
+        for rates in rate_sets {
+            let linked = taxes(rates);
+            for raw_unit in units {
+                let unit = dec(raw_unit);
+                for qty in quantities {
+                    let net = line_net_amount(qty, unit).expect("a fixture amount is carried");
+
+                    let calc = calculate_line_taxes(net, &linked)
+                        .expect("an ordinary amount and rate set is carried");
+                    let error = (calc.total - exact_line_total(net, &linked)).abs();
+
+                    // A whole quantity of a two-decimal price: the net is
+                    // already at `MONEY_SCALE`, so the line's own pin has
+                    // nothing to move and `n` half-cents is the whole bound.
+                    assert!(
+                        error <= error_bound(&linked, 0),
+                        "{rates:?} on {raw_unit} x {qty}: the line total is {error} from exact, \
+                         past the {} half-cent bound the single line-level rounding gives it",
+                        linked.len()
+                    );
+
+                    // The same bound restated on the quarter that has to be
+                    // there: a quarter of a cent is unreachable with any number
+                    // of taxes, and its loss is what a move of the rounding to
+                    // the unit costs. Reported as a counter-example rather than
+                    // a claim, so the difference survives the mutation that
+                    // makes it true.
+                    let per_unit_error = (per_unit_line_total(unit, qty, &linked)
+                        - exact_line_total(net, &linked))
+                    .abs();
+                    if per_unit_error > error_bound(&linked, 0) {
+                        let per_unit_tax_total: Decimal = linked
+                            .iter()
+                            .fold(Decimal::ZERO, |sum, t| sum + contribution(unit, t.rate));
+                        let delta = per_unit_tax_total
+                            - linked
+                                .iter()
+                                .fold(Decimal::ZERO, |sum, t| sum + unit * t.rate / percent());
+                        assert_eq!(
+                            per_unit_error,
+                            delta.abs() * qty,
+                            "{rates:?} on {raw_unit} x {qty}: rounding the UNIT is a signed error \
+                             of {delta} carried by all {qty} of them, and {delta} * {qty} is not \
+                             the line-level answer"
+                        );
+                    }
+                }
+            }
+        }
+
+        // THE FRACTIONAL ARM. A net carrying more decimals than the currency
+        // pays one more half-cent, for the line's own pin.
+        for rates in rate_sets {
+            let linked = taxes(rates);
+            let bound = error_bound(&linked, 1);
+            for raw_unit in ["0.005", "0.015", "0.333"] {
+                let unit = dec(raw_unit);
+                for raw_qty in ["0.5", "1.5", "2.25", "3.75"] {
+                    let qty = dec(raw_qty);
+                    let net = line_net_amount(qty, unit).expect("a fixture amount is carried");
+                    let calc = calculate_line_taxes(net, &linked)
+                        .expect("an ordinary amount and rate set is carried");
+                    let error = (calc.total - exact_line_total(net, &linked)).abs();
+                    assert!(
+                        error <= bound,
+                        "{rates:?} on {raw_unit} x {raw_qty}: the line total is {error} from exact, \
+                         past the {bound} the single line-level rounding plus the line's own pin \
+                         give it"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE DOCUMENT-TOTAL INVARIANT, and it is a format requirement rather than a
+    /// choice: the Libro de IVA Digital rejects a document whose total differs
+    /// from the sum of its components, and every amount it carries is thirteen
+    /// integers and two decimals. There is no adjustment line to park a
+    /// difference on, so the only way the format is satisfiable at all is if the
+    /// stored breakdown already reconciles with the stored total.
+    ///
+    /// This is therefore also the test that kills a "round the document" design:
+    /// accumulate the contributions at full precision, round the tax total once
+    /// at the end and derive the total from THAT, and every fixture below lands
+    /// on money that looks right and is unreportable. Each tax stays pinned here
+    /// because the stored tax total is the operator's and the accountant's only
+    /// view of how the gross was reached.
+    ///
+    /// The sweep spans one, two and three linked taxes — additive, never
+    /// compounding, every tax on the same net — plus the untaxed line, and both
+    /// an ordinary two-decimal net and a fractional one that the line's own pin
+    /// has to close.
+    #[test]
+    fn the_line_total_is_the_net_plus_its_pinned_contributions_with_nothing_between() {
+        let rate_sets: [&[&str]; 7] = [
+            &[],
+            &["0"],
+            &["21"],
+            &["0.5"],
+            &["21", "10.5"],
+            &["21", "10.5", "3"],
+            &["10.5", "3", "27", "0.5"],
+        ];
+        for rates in rate_sets {
+            let linked = taxes(rates);
+            for raw_net in [
+                "0.00", "0.01", "0.03", "0.07", "0.10", "0.21", "0.15", "0.005", "0.105", "1.37",
+                "2.50", "99.99", "123.456",
+            ] {
+                let net = dec(raw_net);
+                let calc = calculate_line_taxes(net, &linked)
+                    .expect("an ordinary amount and rate set is carried");
+
+                assert_eq!(
+                    calc.net_subtotal, net,
+                    "{rates:?} on {raw_net}: the net is the net"
+                );
+                assert_eq!(
+                    calc.taxes.len(),
+                    linked.len(),
+                    "{rates:?} on {raw_net}: one entry per linked tax, and none invented"
+                );
+
+                // The components, rebuilt from the contract's own definition.
+                let components: Vec<Decimal> =
+                    linked.iter().map(|t| contribution(net, t.rate)).collect();
+                assert_eq!(
+                    calc.taxes.iter().map(|s| s.amount).collect::<Vec<_>>(),
+                    components,
+                    "{rates:?} on {raw_net}: each entry is its own pinned contribution"
+                );
+                assert_eq!(
+                    calc.taxes.iter().map(|s| s.rate).collect::<Vec<_>>(),
+                    linked.iter().map(|t| t.rate).collect::<Vec<_>>(),
+                    "{rates:?} on {raw_net}: the rate beside the amount is the one applied"
+                );
+
+                // THE INVARIANT. Three ways of saying the same identity, because
+                // each one is what a document-level round breaks in a different
+                // place: the tax total is the sum of the entries, the total is
+                // the net plus that sum, and the read side recomputes the same
+                // figure from the same two stored numbers.
+                let components_total = components.iter().sum::<Decimal>();
+                assert_eq!(
+                    calc.tax_total, components_total,
+                    "{rates:?} on {raw_net}: the tax total is the sum of the breakdown"
+                );
+                assert_eq!(
+                    calc.total,
+                    round_to_cents(net + components_total),
+                    "{rates:?} on {raw_net}: the total is the net plus the sum of the breakdown"
+                );
+                assert_eq!(
+                    calc.total,
+                    tax_inclusive_total(net, components_total),
+                    "{rates:?} on {raw_net}: the write and the read side name the same figure"
+                );
+            }
+        }
     }
 }
