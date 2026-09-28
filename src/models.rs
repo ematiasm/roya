@@ -299,6 +299,52 @@ pub enum PriceRefusal {
     /// the honest answer because the remedy is a third thing: the rate SET has to
     /// stop grossing the price down that far.
     NetPriceTooLarge,
+    /// The purchase boundary — the place a tax-inclusive cost is converted, where
+    /// a supplier's gross cost becomes a net one: the cost the operator typed is
+    /// not the gross of ANY net cost. The per-contribution rounding leaves gaps
+    /// for a cost exactly as it does for a final price, so some typed costs do
+    /// not exist as the cost of a net.
+    ///
+    /// This is deliberately NOT `FinalPriceUnreachable`. The staircase gap is one
+    /// fact and the arithmetic is the same, but a refusal names the figure that
+    /// is actually wrong: reusing the sale sentence would tell an operator who
+    /// typed a cost that their FINAL PRICE is wrong, and send them to correct a
+    /// number the sale solve never read.
+    CostUnreachable,
+    /// The purchase boundary: the linked rates add up to -100% or less, so a net
+    /// cost is not a function of the cost the operator typed and there is no
+    /// estimate to search around.
+    ///
+    /// This is deliberately NOT `FinalPriceNotInvertible`, and the RATE SET is the
+    /// reason: the rates are the thing that has to change, before anything else
+    /// about this cost can be judged. The sale sentence would still have to be
+    /// read past a final price to reach that, and it names the wrong figure on the
+    /// way.
+    CostNotInvertible,
+    /// The purchase boundary: the NET cost this cost would need is above
+    /// `Decimal::MAX`, so no net cost can be stored for it. The typed cost is
+    /// INSIDE the conversion's own ceiling — the linked rates gross it down by a
+    /// factor small enough that dividing lands past the ceiling — and every
+    /// individual rate is small.
+    ///
+    /// This is deliberately NOT "the cost is too large", for the reason the sale
+    /// twin carries: the cost is not over the limit, so a cost-too-large sentence
+    /// would contradict the limit's own promise. It is deliberately not
+    /// `TaxRateTooLargeToCost` either, because the individual rates are small and
+    /// that sentence would point at the wrong field. The remedy is a third thing
+    /// — the rate SET has to stop grossing this cost down that far — so a third
+    /// sentence is the honest answer.
+    CostNetTooLarge,
+    /// The purchase boundary: ONE linked rate is so large that pricing this cost
+    /// leaves the representable range where the conversion would otherwise
+    /// accept it.
+    ///
+    /// This is deliberately NOT `TaxRateTooLargeToPrice`, which names a final
+    /// price this refusal must not, and NOT `CostNetTooLarge`, which is a
+    /// statement about the rate SET. The remedy here is a single rate — the tax,
+    /// not the cost — so the two sentences send the operator to two different
+    /// fields.
+    TaxRateTooLargeToCost,
     /// A document line's net amount is `qty * price`, and BOTH operands are
     /// user-supplied with no ceiling of their own, so the PRODUCT leaves the
     /// 28-digit `Decimal` range before any tax is even read. The remedy is
@@ -380,6 +426,10 @@ impl PriceRefusal {
         Self::FinalPriceTooLarge,
         Self::TaxRateTooLargeToPrice,
         Self::NetPriceTooLarge,
+        Self::CostUnreachable,
+        Self::CostNotInvertible,
+        Self::CostNetTooLarge,
+        Self::TaxRateTooLargeToCost,
         Self::LineAmountTooLarge,
         Self::TaxArithmeticTooLarge,
         Self::DocumentTotalTooLarge,
@@ -418,6 +468,15 @@ impl PriceRefusal {
                 "the linked tax rates gross this final_price down to a net_price that is too \
                  large to store"
             }
+            Self::CostUnreachable => "no net cost grosses to this cost with the linked taxes",
+            Self::CostNotInvertible => {
+                "linked tax rates must add up to more than -100 to solve a cost"
+            }
+            Self::CostNetTooLarge => {
+                "the linked tax rates gross this cost down to a net_cost that is too large to \
+                 store"
+            }
+            Self::TaxRateTooLargeToCost => "a linked tax rate is too large to price this cost",
             // No trailing period, like every other row here: this text IS the
             // body the JSON API answers with, and the closed-catalog test pins
             // the English row to these bytes.

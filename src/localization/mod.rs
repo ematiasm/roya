@@ -308,6 +308,14 @@ define_message_keys! {
     PriceRefusalFinalPriceTooLarge => "price_refusal.final_price_too_large",
     PriceRefusalTaxRateTooLargeToPrice => "price_refusal.tax_rate_too_large_to_price",
     PriceRefusalNetPriceTooLarge => "price_refusal.net_price_too_large",
+    // The COST-side counterparts of the four final-price refusals above, for the
+    // purchase boundary — the place a tax-inclusive cost is converted. Separate
+    // keys, never a reuse: a refusal names the figure that is actually wrong, so
+    // a cost cannot be answered with a sentence about a final price.
+    PriceRefusalCostUnreachable => "price_refusal.cost_unreachable",
+    PriceRefusalCostNotInvertible => "price_refusal.cost_not_invertible",
+    PriceRefusalCostNetTooLarge => "price_refusal.cost_net_too_large",
+    PriceRefusalTaxRateTooLargeToCost => "price_refusal.tax_rate_too_large_to_cost",
     // The tax contract's own two refusals, from `line_taxes::calculate_line_taxes`
     // and from the raw `qty * price` its document callers evaluate before it.
     // They are two rules and not one because the remedies are two: an
@@ -1271,6 +1279,10 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalFinalPriceTooLarge, "final_price is too large to solve a net_price from", "final_price is too large to solve a net_price from"),
     (MessageKey::PriceRefusalTaxRateTooLargeToPrice, "a linked tax rate is too large to price this final_price", "a linked tax rate is too large to price this final_price"),
     (MessageKey::PriceRefusalNetPriceTooLarge, "the linked tax rates gross this final_price down to a net_price that is too large to store", "the linked tax rates gross this final_price down to a net_price that is too large to store"),
+    (MessageKey::PriceRefusalCostUnreachable, "no net cost grosses to this cost with the linked taxes", "no net cost grosses to this cost with the linked taxes"),
+    (MessageKey::PriceRefusalCostNotInvertible, "linked tax rates must add up to more than -100 to solve a cost", "linked tax rates must add up to more than -100 to solve a cost"),
+    (MessageKey::PriceRefusalCostNetTooLarge, "the linked tax rates gross this cost down to a net_cost that is too large to store", "the linked tax rates gross this cost down to a net_cost that is too large to store"),
+    (MessageKey::PriceRefusalTaxRateTooLargeToCost, "a linked tax rate is too large to price this cost", "a linked tax rate is too large to price this cost"),
     (MessageKey::PriceRefusalLineAmountTooLarge, "qty * price is too large to store on this line", "qty * price is too large to store on this line"),
     (MessageKey::PriceRefusalTaxArithmeticTooLarge, "the line amount is too large to calculate its taxes", "the line amount is too large to calculate its taxes"),
     (MessageKey::PriceRefusalDocumentTotalTooLarge, "the document total is too large to compute: reduce or split the document, or correct its amounts at the source", "the document total is too large to compute: reduce or split the document, or correct its amounts at the source"),
@@ -2248,6 +2260,10 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PriceRefusalFinalPriceTooLarge, "El precio final es demasiado grande para derivar un precio neto a partir de él.", "El precio final es demasiado grande para derivar un precio neto a partir de él."),
     (MessageKey::PriceRefusalTaxRateTooLargeToPrice, "Una tasa de impuesto vinculada es demasiado grande para calcular este precio final.", "Una tasa de impuesto vinculada es demasiado grande para calcular este precio final."),
     (MessageKey::PriceRefusalNetPriceTooLarge, "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar.", "Las tasas de impuestos vinculadas reducen este precio final a un precio neto demasiado grande para almacenar."),
+    (MessageKey::PriceRefusalCostUnreachable, "Ningún costo neto lleva a este costo con los impuestos vinculados.", "Ningún costo neto lleva a este costo con los impuestos vinculados."),
+    (MessageKey::PriceRefusalCostNotInvertible, "Las tasas de los impuestos vinculados deben sumar más de -100 para resolver un costo.", "Las tasas de los impuestos vinculados deben sumar más de -100 para resolver un costo."),
+    (MessageKey::PriceRefusalCostNetTooLarge, "Las tasas de impuestos vinculadas reducen este costo a un costo neto demasiado grande para almacenar.", "Las tasas de impuestos vinculadas reducen este costo a un costo neto demasiado grande para almacenar."),
+    (MessageKey::PriceRefusalTaxRateTooLargeToCost, "Una tasa de impuesto vinculada es demasiado grande para calcular este costo.", "Una tasa de impuesto vinculada es demasiado grande para calcular este costo."),
     (MessageKey::PriceRefusalLineAmountTooLarge, "La cantidad por el precio es demasiado grande para guardarse en esta línea.", "La cantidad por el precio es demasiado grande para guardarse en esta línea."),
     (MessageKey::PriceRefusalTaxArithmeticTooLarge, "El importe de la línea es demasiado grande para calcular sus impuestos.", "El importe de la línea es demasiado grande para calcular sus impuestos."),
     (MessageKey::PriceRefusalDocumentTotalTooLarge, "El total del documento es demasiado grande para calcularlo: reduzca o divida el documento, o corrija sus importes en el origen.", "El total del documento es demasiado grande para calcularlo: reduzca o divida el documento, o corrija sus importes en el origen."),
