@@ -96,14 +96,9 @@
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::models::{PriceRefusal, ProductKind, Tax};
-use crate::services::gross_inverse::{gross_divisor, solve_net_from_gross, PERCENT};
+use crate::services::gross_inverse::{gross_divisor, solve_net_from_gross, SolveResult, PERCENT};
 use crate::services::inventory::{derive_net_sale_price, validate_effective_prices};
 use crate::services::line_taxes::{calculate_line_taxes, LineTaxSnapshot};
-
-/// What a solve can fail with. There is no other failure mode: this module
-/// returns a typed [`PriceRefusal`] or an answer, never a partial one and never
-/// a silently different price.
-pub type SolveResult<T> = Result<T, PriceRefusal>;
 
 /// The decimal places tried for the markup, coarsest first.
 ///

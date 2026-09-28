@@ -85,8 +85,21 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::models::{PriceRefusal, Tax};
-use crate::services::final_price::SolveResult;
 use crate::services::line_taxes::{calculate_line_taxes, round_to_cents, MONEY_SCALE};
+
+/// What a solve can fail with. There is no other failure mode: this module
+/// returns a typed [`PriceRefusal`] or an answer, never a partial one and never
+/// a silently different price.
+///
+/// It lives HERE, beside the search, and not in the sale solve that first
+/// needed it. Defined there it made this module import
+/// `final_price::SolveResult` while `final_price` imported this module, so the
+/// extraction carried a module cycle across the boundary it existed to cut —
+/// and the purchase-cost caller coming next would have inherited final-price
+/// failure vocabulary through the type of its own answer. The search is the
+/// shared half, so the shared half owns the shape of its own failure. Move this
+/// alias back into a caller and the cycle returns with it.
+pub type SolveResult<T> = Result<T, PriceRefusal>;
 
 /// One hundred, the divisor that turns a percentage rate into a factor.
 pub const PERCENT: Decimal = Decimal::ONE_HUNDRED;
