@@ -618,7 +618,8 @@ where
         line_id: i64,
         qty: Decimal,
         unit_cost: Decimal,
-    ) -> AppResult<PurchaseLine> {        let line = self
+    ) -> AppResult<PurchaseLine> {
+        let line = self
             .purchases
             .find_line(line_id)
             .await?

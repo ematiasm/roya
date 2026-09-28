@@ -9,9 +9,8 @@ use axum::{
     extract::{Extension, Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    Json,
     routing::{get, post, put},
-    Router,
+    Json, Router,
 };
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -517,7 +516,10 @@ async fn web_preview_line_cost(
         Err(AppError::PriceRefused(refusal)) => Ok(Json(CostPreview {
             field: None,
             value: None,
-            refusal: Some(crate::routes::price_refusal_message(&refusal, &localization)),
+            refusal: Some(crate::routes::price_refusal_message(
+                &refusal,
+                &localization,
+            )),
         })),
         Err(other) => Err(other),
     }
@@ -1603,10 +1605,7 @@ async fn web_update_line(
             typed_line_cost(&state, 0, typed).await
         }
         purchase_cost::CostAsk::Gross(_) => {
-            let product_id = state
-                .purchases_service
-                .line_product_id(line_id)
-                .await?;
+            let product_id = state.purchases_service.line_product_id(line_id).await?;
             typed_line_cost(&state, product_id, typed).await
         }
     }
@@ -7624,7 +7623,13 @@ mod tests {
         let purchase = draft_purchase(state, supplier.id).await;
         let line = state
             .purchases_service
-            .add_line(actor, purchase.id, edit_product.id, dec_web("2"), Some(dec_web("5")))
+            .add_line(
+                actor,
+                purchase.id,
+                edit_product.id,
+                dec_web("2"),
+                Some(dec_web("5")),
+            )
             .await
             .unwrap();
         CostEntry {
@@ -7829,12 +7834,17 @@ mod tests {
             // A product name that resolves to nothing.
             format!("{base}?product=not-a-product&unit_cost_gross=6.05&cost_basis=gross"),
             // No cost typed.
-            format!("{base}?product_id={}&unit_cost=&unit_cost_gross=", entry.product_id),
+            format!(
+                "{base}?product_id={}&unit_cost=&unit_cost_gross=",
+                entry.product_id
+            ),
             // A half-typed cost: the operator is still typing it.
-            format!("{base}?product_id={}&unit_cost=&unit_cost_gross=6.&cost_basis=gross", entry.product_id),
+            format!(
+                "{base}?product_id={}&unit_cost=&unit_cost_gross=6.&cost_basis=gross",
+                entry.product_id
+            ),
         ] {
-            let (status, json) =
-                preview_cost(app.clone(), &query, test_support::TEST_COOKIE).await;
+            let (status, json) = preview_cost(app.clone(), &query, test_support::TEST_COOKIE).await;
             assert_eq!(status, StatusCode::OK, "{query}: {json}");
             assert_eq!(json["value"], serde_json::Value::Null, "{query}: {json}");
             assert_eq!(
@@ -7871,7 +7881,9 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("{json}"))
             .to_string();
-        let locale = crate::localization::load_context(&state.pool).await.unwrap();
+        let locale = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
         assert_eq!(
             shown,
             locale.format_decimal(
@@ -8163,7 +8175,12 @@ mod tests {
         // Four products, four rate sets, four typed gross figures.
         let mut cases: Vec<(i64, i64, &str, crate::models::PriceRefusal)> = Vec::new();
         let gap = entry.product_id; // 21% already linked: 0.03 is the staircase gap
-        cases.push((gap, entry.purchase_id, "0.03", crate::models::PriceRefusal::CostUnreachable));
+        cases.push((
+            gap,
+            entry.purchase_id,
+            "0.03",
+            crate::models::PriceRefusal::CostUnreachable,
+        ));
 
         let negative_product = refusal_product(&state, "COST-REFUSE-NEG").await;
         state
@@ -8236,7 +8253,10 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{gross}: {body:.400}");
             assert_eq!(
                 refusal_sentence(&body),
-                crate::routes::price_refusal_message(&expected, &crate::localization::LocalizationContext::fallback()),
+                crate::routes::price_refusal_message(
+                    &expected,
+                    &crate::localization::LocalizationContext::fallback()
+                ),
                 "{gross} must answer the shared sentence for {expected:?}"
             );
             assert!(
@@ -8336,7 +8356,10 @@ mod tests {
         let (status, body) = add_cost_line(
             app.clone(),
             entry.purchase_id,
-            &format!("product_id={}&qty=1&unit_cost=&unit_cost_gross=", entry.product_id),
+            &format!(
+                "product_id={}&qty=1&unit_cost=&unit_cost_gross=",
+                entry.product_id
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body:.400}");
@@ -8543,7 +8566,11 @@ mod tests {
             .iter()
             .find(|line| line.id == entry.edit_line_id)
             .unwrap();
-        assert_eq!(line.unit_cost, dec_web("5.00"), "the stored cost is untouched");
+        assert_eq!(
+            line.unit_cost,
+            dec_web("5.00"),
+            "the stored cost is untouched"
+        );
         assert_eq!(line.qty, dec_web("2"), "and so is the quantity");
     }
 

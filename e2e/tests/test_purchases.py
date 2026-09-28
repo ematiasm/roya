@@ -931,11 +931,22 @@ def test_editing_a_line_inline_keeps_every_id_on_the_page_unique(
     `#purchase-record-money`, and so on.
 
     Duplicate ids are not cosmetic. They make every id-based lookup ambiguous:
-    `hx-include="#line-qty-{id}, #line-cost-{id}"` matches two elements,
-    `hx-target` resolves to whichever comes first, and the picker island's
-    `mount()` would mount the duplicated `[data-picker]`. The page is corrupt
-    until it is reloaded. This is the same family as the hidden-id defect the
-    picker work retired: an id lookup silently resolving to the wrong element.
+    the row's `hx-include` — `"#line-qty-{id}, #line-cost-{id},
+    #line-cost-gross-{id}, #line-cost-basis-{id}"` — would match each of its four
+    selectors twice, `hx-target` resolves to whichever comes first, and the
+    picker island's `mount()` would mount the duplicated `[data-picker]`. The page
+    is corrupt until it is reloaded. This is the same family as the hidden-id
+    defect the picker work retired: an id lookup silently resolving to the wrong
+    element.
+
+    The selector list is FOUR entries since the cost pair (cost-with-taxes T-C)
+    joined the row: the quantity, the net, the supplier's tax-inclusive gross and
+    the hidden `cost_basis` that says which of the two costs the operator typed.
+    All three inputs share the one PUT and all three must carry the whole set —
+    a request that reached the write missing the gross could not be answered,
+    and a request that reached it missing the basis would silently prefer the
+    net. That is why the row's fields are asserted here as a set, not as an
+    attribute that happens to be present.
 
     The assertion is on the counts rather than on the attributes, because the
     attribute can be present while the behaviour is still wrong; the counts
@@ -967,6 +978,10 @@ def test_editing_a_line_inline_keeps_every_id_on_the_page_unique(
         "#purchase-header-form",
         "#purchase-record-money",
         "#line-picker",
+        f"#line-qty-{line_id}",
+        f"#line-cost-{line_id}",
+        f"#line-cost-gross-{line_id}",
+        f"#line-cost-basis-{line_id}",
     ]
     before = {sel: page.locator(sel).count() for sel in unique_ids}
     assert all(count == 1 for count in before.values()), (
@@ -1290,3 +1305,332 @@ def test_a_refused_inline_line_edit_reverts_and_stores_nothing(
     # And nothing was written.
     stored = api.get_json(f"/api/purchases/{purchase_id}")
     assert Decimal(str(stored["lines"][0]["qty"])) == Decimal("2"), stored
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional cost entry (cost-with-taxes T-C)
+#
+# Two fields for one figure, and whichever the operator types into is the input.
+# The server computes every number here — the entry row's preview asks it to
+# solve the other side, and the inline edit's PUT answers with the record body
+# re-read from storage — so what these tests assert is that the page asks, and
+# that what comes back is the exact figure rather than a rounded neighbour.
+# ---------------------------------------------------------------------------
+
+_PREVIEW_PATH_SUFFIX = "/lines/cost"
+
+
+def _cost_entry_page(api: ApiClient, *, sku: str, name: str, cost: str = "5.00"):
+    """A draft with one product carrying a 21% tax, and nothing on the line yet.
+
+    21% is the whole arithmetic: 5,00 nets to 6,05 gross and back with no drift,
+    and 0,03 is a figure NO net grosses to at that rate — the per-contribution
+    rounding leaves a flat step there. Both numbers come from that one rate, so
+    the reachable and the refused case are the same fixture.
+    """
+    product = create_product(
+        api,
+        sku=sku,
+        name=name,
+        sale_price="25.00",
+        cost_price=cost,
+        stock="10",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    tax = api.post_json(
+        "/api/taxes",
+        {"code": f"IVA21-{sku}", "name": "IVA 21%", "rate": "21", "is_active": True},
+    )
+    api.post_json(f"/api/products/{product_id}/taxes", {"tax_id": int(tax["id"])})
+    supplier_id = create_supplier(api, f"Cost Supplier {sku}")
+    purchase_id = create_purchase_draft(api, supplier_id, payment_type="Cash")
+    return product_id, purchase_id
+
+
+def test_a_gross_typed_into_the_entry_row_fills_the_net_and_stores_it(
+    page: Page, api: ApiClient
+) -> None:
+    """Type the supplier's figure; the net appears, and the line is stored at it.
+
+    This is the whole promise of the feature in one interaction, and the reason
+    the net is asserted to the CENT rather than to "something near 5": 6.05 at
+    21% is the gross of exactly 5.00, and a page that computed the net itself
+    would land on 5.00 too — so the stored line, not the visible field, is what
+    proves the server did the work.
+    """
+    product_id, purchase_id = _cost_entry_page(
+        api, sku="COSTIN-A", name="Cost entry alpha"
+    )
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    net = page.locator("#line-unit-cost")
+    gross = page.locator("#line-unit-cost-gross")
+    expect(net).to_have_value("")
+    expect(gross).to_have_value("")
+
+    # The product is chosen the way a receiving desk does it — the text goes in
+    # and Enter carries it — and the cost is typed beside it.
+    page.locator("#product-picker").fill("COSTIN-A")
+
+    # ONE preview request, and the net fills from its answer. The count is
+    # asserted because a pair that answers each other is the failure this shape
+    # is built to prevent, and "the net is right" alone would not notice it.
+    previews: list[str] = []
+    page.on(
+        "request",
+        lambda request: previews.append(request.url)
+        if _PREVIEW_PATH_SUFFIX in urlparse(request.url).path
+        else None,
+    )
+    gross.fill("6.05")
+    gross.press("Tab")
+    # "5" and not "5.00": `Decimal` carries no trailing zeros, so a SOLVED figure
+    # renders at the scale it happens to hold while a TYPED one renders at the
+    # scale the operator typed. Both parse and store as the same number — the
+    # read-back below is what proves that — and the app renders every derived
+    # figure this way, the ladder's included.
+    expect(net).to_have_value("5")
+    assert len(previews) == 1, f"one answer per field, not a loop: {previews}"
+
+    # And the gross the operator typed is still theirs: the answer goes into the
+    # OTHER field.
+    expect(gross).to_have_value("6.05")
+
+    # Adding the line stores the solved net, exactly.
+    page.locator("#product-picker").press("Enter")
+    row = page.locator(f"#purchase-line-{product_id}")
+    expect(row).to_have_count(1)
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    line = next(line for line in stored["lines"] if int(line["product_id"]) == product_id)
+    assert Decimal(str(line["unit_cost"])) == Decimal("5.00"), line
+    # 21% of the line's own net subtotal (1 x 5.00 = 5.00) — the tax the WRITE
+    # froze, which is what the gross was derived against.
+    assert Decimal(str(line["tax_total"])) == Decimal("1.05"), line
+
+
+def test_a_net_typed_into_the_entry_row_fills_the_gross(page: Page, api: ApiClient) -> None:
+    """The mirror runs the other way too, and on the same contract.
+
+    5,00 at 21% grosses to 6,05 — which is the ladder's `cost_total` arithmetic
+    and the same `calculate_line_taxes` a line write will run. Asserting the
+    gross here is what keeps the two directions honest about each other: a
+    "mirror" that only ever solved gross to net would pass the first test.
+    """
+    _product_id, purchase_id = _cost_entry_page(api, sku="COSTIN-B", name="Cost entry beta")
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    net = page.locator("#line-unit-cost")
+    gross = page.locator("#line-unit-cost-gross")
+
+    page.locator("#product-picker").fill("COSTIN-B")
+    net.fill("5.00")
+    net.press("Tab")
+
+    expect(gross).to_have_value("6.05")
+    expect(net).to_have_value("5.00")
+
+
+def test_a_gross_the_operators_own_figure_keeps_what_they_typed(
+    page: Page, api: ApiClient
+) -> None:
+    """The loop guard: an answer must never overwrite the field being typed in.
+
+    The trap is a slow answer, not a fast one. The operator types a net, walks
+    away to the gross field and starts THEIR figure, and the first answer lands
+    in between — carrying the counterpart of the net they typed, which belongs in
+    the gross field, which is now full of something else. The `data-last-edited`
+    marker is the only thing that knows they have moved on.
+
+    The first response is HELD so the ordering is the one the guard exists for
+    rather than a race the debounce usually hides.
+    """
+    _product_id, purchase_id = _cost_entry_page(api, sku="COSTIN-C", name="Cost entry gamma")
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    net = page.locator("#line-unit-cost")
+    gross = page.locator("#line-unit-cost-gross")
+    page.locator("#product-picker").fill("COSTIN-C")
+
+    # Hold the FIRST preview until released and pass every later one straight
+    # through. Holding all of them would also hold the clean interaction at the
+    # end, which is not what is under test.
+    release: list[bool] = [False]
+    held: list[int] = [0]
+
+    def _hold(route) -> None:
+        held[0] += 1
+        if held[0] > 1:
+            route.continue_()
+            return
+        while not release[0]:
+            page.wait_for_timeout(20)
+        route.continue_()
+
+    page.route(f"**{_PREVIEW_PATH_SUFFIX}*", _hold)
+
+    net.fill("5.00")
+    net.press("Tab")
+    # The request is in flight and unanswered: the operator moves on.
+    page.wait_for_timeout(600)
+    gross.fill("7.00")
+    release[0] = True
+
+    # Both of their figures survive, and the net they never retyped is still
+    # theirs: the late answer was for the gross field, and the gross field is
+    # where they now are.
+    expect(gross).to_have_value("7.00")
+    expect(net).to_have_value("5.00")
+
+    # The writer is demonstrably ALIVE, so the assertion above is about the guard
+    # and not about a page that never mirrors anything: a clean interaction now
+    # fills the other field exactly as the first interaction did.
+    assert held[0] >= 1, "no preview was ever held, so the ordering was never tested"
+    # Let every held answer land before the interception comes off, so the next
+    # interaction is a plain one and this test says one thing at a time.
+    page.wait_for_timeout(600)
+    page.unroute(f"**{_PREVIEW_PATH_SUFFIX}*")
+    gross.fill("3.63")
+    gross.press("Tab")
+    expect(net).to_have_value("3")
+
+
+def test_a_gross_that_is_the_gross_of_no_net_says_so_and_stores_nothing(
+    page: Page, api: ApiClient
+) -> None:
+    """0,03 at 21% is the gross of no net. The page says so, and adds nothing.
+
+    A rounded approximation would be the wrong kind of success: it would store a
+    net whose gross is not the figure on the invoice, and the operator would
+    have no way to see the difference. So the refusal is the assertion, and the
+    document must be untouched afterwards.
+    """
+    product_id, purchase_id = _cost_entry_page(
+        api, sku="COSTIN-D", name="Cost entry delta"
+    )
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    net = page.locator("#line-unit-cost")
+    gross = page.locator("#line-unit-cost-gross")
+    page.locator("#product-picker").fill("COSTIN-D")
+    gross.fill("0.03")
+    gross.press("Tab")
+
+    refusal = page.locator("[data-cost-refusal]")
+    expect(refusal).to_be_visible()
+    expect(refusal).to_contain_text("no net cost grosses to this cost")
+    # The net the operator had (none) is not invented, and the gross they typed
+    # is still theirs to correct.
+    expect(gross).to_have_value("0.03")
+    expect(net).to_have_value("")
+
+    # And the write refuses the same figure rather than rounding it.
+    page.locator("#product-picker").press("Enter")
+    page.wait_for_timeout(800)
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    assert stored["lines"] == [], stored["lines"]
+    assert int(product_id) not in {
+        int(line["product_id"]) for line in stored["lines"]
+    }
+
+
+def test_a_gross_typed_into_an_inline_edit_stores_the_solved_net(
+    page: Page, api: ApiClient
+) -> None:
+    """The same two figures, one row down, with no preview at all.
+
+    The inline row is not mirrored in the browser: the PUT's answer IS the record
+    body, re-rendered from storage, so the server is that row's mirror. The test
+    therefore asserts the re-rendered PAIR and the stored line — a client that
+    filled the net field optimistically and never posted the gross would leave
+    the stored cost at the old figure, and that is what the read-back catches.
+    """
+    product_id, purchase_id = _cost_entry_page(
+        api, sku="COSTIN-E", name="Cost entry epsilon"
+    )
+    add_purchase_line(api, purchase_id, product_id, qty="2", unit_cost="5.00")
+    line_id = int(api.get_json(f"/api/purchases/{purchase_id}")["lines"][0]["id"])
+
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    net = page.locator(f"#line-cost-{line_id}")
+    gross = page.locator(f"#line-cost-gross-{line_id}")
+    expect(net).to_have_value("5.00")
+    expect(gross).to_have_value("")
+
+    put = _response_for(f"/web/purchases/{purchase_id}/lines/{line_id}", "PUT")
+    with page.expect_response(put):
+        gross.fill("6.05")
+        gross.press("Tab")
+
+    # The re-rendered pair comes from STORAGE, so the net is the solved figure
+    # the write just stored, and the gross is back to its stored rendering.
+    page.wait_for_timeout(500)
+    expect(net).to_have_value("5")
+    expect(gross).to_have_value("")
+
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    line = next(line for line in stored["lines"] if int(line["id"]) == line_id)
+    assert Decimal(str(line["unit_cost"])) == Decimal("5.00"), line
+
+    # And the other direction on the same row: edit the net, and it is the net
+    # that is stored. A stale basis marker would make the write solve from the
+    # gross again and store 5.00 a second time.
+    with page.expect_response(put):
+        net.fill("4.00")
+        net.press("Tab")
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    line = next(line for line in stored["lines"] if int(line["id"]) == line_id)
+    assert Decimal(str(line["unit_cost"])) == Decimal("4.00"), line
+
+
+def test_a_refused_gross_edit_reverts_both_fields_and_stores_nothing(
+    page: Page, api: ApiClient
+) -> None:
+    """The rollback covers the gross field too, and the net never moved.
+
+    `purchase.html` reverts a refused inline edit with `elt.value =
+    elt.defaultValue`. The gross input is a full participant in that PUT, so the
+    refused figure is cleared back to the field's stored rendering and the stored
+    line keeps the cost it had — which is the same guarantee the quantity-only
+    case has always had, now that a second figure can be the one refused.
+    """
+    product_id, purchase_id = _cost_entry_page(
+        api, sku="COSTIN-F", name="Cost entry zeta"
+    )
+    add_purchase_line(api, purchase_id, product_id, qty="2", unit_cost="5.00")
+    line_id = int(api.get_json(f"/api/purchases/{purchase_id}")["lines"][0]["id"])
+
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+
+    puts: list[str] = []
+    page.on(
+        "request",
+        lambda request: puts.append(f"{request.method} {request.url}")
+        if request.method == "PUT"
+        else None,
+    )
+
+    net = page.locator(f"#line-cost-{line_id}")
+    gross = page.locator(f"#line-cost-gross-{line_id}")
+    # The 400 is the answer, so the response is waited for rather than slept
+    # through: a listener armed after the action races the debounce and times out.
+    with page.expect_response(
+        _response_for(f"/web/purchases/{purchase_id}/lines/{line_id}", "PUT")
+    ):
+        gross.fill("0.03")
+        net.click()  # the blur is what fires `change delay:400ms`
+    page.wait_for_timeout(300)
+
+    assert puts, "htmx issued no PUT, so the rollback path was never reached"
+    expect(page.locator("#notice [data-notice='error']")).to_contain_text(
+        "no net cost grosses to this cost"
+    )
+    expect(gross).to_have_value("")
+    expect(net).to_have_value("5.00")
+
+    stored = api.get_json(f"/api/purchases/{purchase_id}")
+    line = next(line for line in stored["lines"] if int(line["id"]) == line_id)
+    assert Decimal(str(line["unit_cost"])) == Decimal("5.00"), line
+    assert Decimal(str(line["qty"])) == Decimal("2"), line

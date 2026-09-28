@@ -57,11 +57,98 @@
   // the `value` attribute the last render wrote; typing only changes the
   // property, so this is exactly "revert". Only line inputs PUT; every other
   // failure path is left to the base handler.
+  //
+  // A refused GROSS edit lands here too, and it is the whole reason the gross
+  // field is a full participant in the same PUT rather than a preview-only
+  // input: the rollback clears it back to its stored rendering, and the net
+  // beside it never moved, so both inputs are showing what the document holds.
   document.addEventListener('htmx:responseError', function (evt) {
     var elt = evt.detail && evt.detail.requestConfig && evt.detail.requestConfig.elt;
     if (!elt || !elt.matches || !elt.matches('#purchase-record input[hx-put]')) return;
     elt.value = elt.defaultValue;
   });
+
+  {# Bidirectional cost entry (cost-with-taxes T-C).
+
+     ONE piece of client state for the whole pair: `data-last-edited` on the
+     pair, which is the field the operator typed into. The input handler below
+     sets it, the writer reads it, and the writer only ever writes into the
+     OTHER field — so the two can never drive each other in a loop, in whatever
+     order the answers happen to land.
+
+     NOTHING HERE COMPUTES MONEY. The writer reads the figure the server sent
+     and assigns it; the arithmetic is `services::purchase_cost`, the tax
+     contract and the shared inverse's, and there is no division, no rate and
+     no rounding in this file. The server also names WHICH field the figure
+     belongs in, so the client is never inferring a direction it cannot know.
+
+     Delegated on `document`, like every other handler in this shell, because
+     the money region is destroyed and recreated by every action response: a
+     binding made at load time would be gone after the first swap. The `change`
+     handler runs AFTER htmx's own element-level listener, so the debounced
+     request is already scheduled when the marker is written — and the marker is
+     only read when an answer comes back, which is a network round trip later.
+
+     The inline rows are NOT mirrored here. Their PUT answers with the record
+     body re-rendered from storage, so the server is that row's mirror and the
+     operator sees the stored pair rather than a value this file guessed. #}
+  (function () {
+    function costPair(elt) {
+      return elt && elt.closest ? elt.closest('[data-cost-pair]') : null;
+    }
+    // WHICH FIELD WAS TYPED LAST. Set on the pair (for the writer below) and on
+    // the pair's hidden `cost_basis` (for the write, server-side) from the one
+    // place that knows it. The hidden field is what the post and the PUT carry;
+    // with no JavaScript it stays empty, the server reads that as "no basis
+    // stated", and the net wins — the form this pair replaced.
+    document.addEventListener('change', function (evt) {
+      var target = evt.target;
+      if (!target || !target.matches || !target.matches('[data-cost-field]')) return;
+      var pair = costPair(target);
+      if (!pair) return;
+      var field = target.dataset.costField;
+      pair.dataset.lastEdited = field;
+      var basis = pair.querySelector('[data-cost-basis]');
+      if (basis) basis.value = field;
+    });
+    document.addEventListener('htmx:afterRequest', function (evt) {
+      var detail = evt.detail || {};
+      if (!detail.successful || !detail.xhr) return;
+      var elt = (detail.requestConfig && detail.requestConfig.elt) || detail.elt;
+      if (!elt || !elt.matches || !elt.matches('[data-cost-field][hx-get]')) return;
+      var answer;
+      try { answer = JSON.parse(detail.xhr.responseText); } catch (e) { return; }
+      if (!answer) return;
+      var pair = costPair(elt);
+      if (!pair) return;
+      var refusal = pair.querySelector('[data-cost-refusal]');
+      // A REFUSAL paints beside the number and changes nothing else. The net the
+      // operator already has stays exactly as it was: a gross that is the gross
+      // of no net is not evidence that their net is wrong, and blanking it would
+      // be the page making a statement the server did not make.
+      if (answer.refusal) {
+        if (refusal) { refusal.textContent = answer.refusal; refusal.hidden = false; }
+        return;
+      }
+      if (refusal) { refusal.textContent = ''; refusal.hidden = true; }
+      // Nothing to write: the operator has not chosen a product, or the cost is
+      // half-typed. Silence is the honest state of the other field.
+      if (!answer.field || answer.value === null || answer.value === undefined) return;
+      // THE LOOP GUARD. The answer goes into the field the operator is NOT in.
+      // An answer that lands after they have moved on would otherwise overwrite
+      // the figure they are part-way through typing — the one case the
+      // `data-last-edited` marker exists for, and the reason the server's own
+      // choice of field is not enough on its own.
+      if (pair.dataset.lastEdited === answer.field) return;
+      var target = pair.querySelector('[data-cost-field="' + answer.field + '"]');
+      if (!target) return;
+      // No event is dispatched. A synthetic `change` here would ask the server to
+      // solve the pair again, and the pair would answer each other until the
+      // values stopped moving — a loop, not a mirror.
+      target.value = answer.value;
+    });
+  })();
+  
   {# Receiving-desk T2: the identity fields save themselves on blur. The
      response swaps nothing (hx-swap="none" keeps focus alive), so the only
      success feedback is this subtle indicator: a successful header save says

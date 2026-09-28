@@ -62,9 +62,7 @@
 use rust_decimal::Decimal;
 
 use crate::models::{PriceRefusal, Tax};
-use crate::services::gross_inverse::{
-    gross_divisor, solve_net_from_gross, SolveResult,
-};
+use crate::services::gross_inverse::{gross_divisor, solve_net_from_gross, SolveResult};
 use crate::services::line_taxes::calculate_line_taxes;
 
 /// Which side of the pair the operator typed into last.
@@ -128,11 +126,7 @@ pub enum CostAsk {
 ///    happens to be sitting in the other field can never refuse it.
 /// 3. Otherwise a present gross wins, because it is the only figure on offer.
 /// 4. Otherwise nothing was typed.
-pub fn cost_ask(
-    basis: Option<CostBasis>,
-    net: Option<Decimal>,
-    gross: Option<Decimal>,
-) -> CostAsk {
+pub fn cost_ask(basis: Option<CostBasis>, net: Option<Decimal>, gross: Option<Decimal>) -> CostAsk {
     let stated = |want: CostBasis, value: &Option<Decimal>| -> Option<Decimal> {
         if basis == Some(want) {
             *value
@@ -401,7 +395,14 @@ mod tests {
             vec!["100000000000000000000", "-100000000000000000000"],
         ];
         let targets = [
-            "0.00", "0.01", "0.02", "0.03", "1.00", "6.05", "121.00", "10000000000.00",
+            "0.00",
+            "0.01",
+            "0.02",
+            "0.03",
+            "1.00",
+            "6.05",
+            "121.00",
+            "10000000000.00",
         ];
         for rates in &rate_sets {
             let set = taxes(rates);
@@ -434,10 +435,7 @@ mod tests {
             dec("6.05")
         );
         // A rate set with no linked tax grosses to the net itself.
-        assert_eq!(
-            gross_cost_from_net(dec("5.00"), &[]).unwrap(),
-            dec("5.00")
-        );
+        assert_eq!(gross_cost_from_net(dec("5.00"), &[]).unwrap(), dec("5.00"));
     }
 
     #[test]
