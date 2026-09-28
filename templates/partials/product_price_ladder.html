@@ -43,6 +43,49 @@
           <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
           <td class="py-2 pr-3 text-right tabular-nums">{{ localization.format_currency(ladder.cost_price.clone()) }}</td>
         </tr>
+        <tr class="border-b border-border/60">
+          {# The cost's tax-inclusive figure: the second of the ladder's four
+             prices, and the one that used to be missing from a ladder whose
+             whole job is to let an operator sanity-check a price. Placed
+             directly under the cost, because it is the cost's OWN gross — and
+             a markup is a percentage OF the cost, so it reads after the cost's
+             two figures or the reader is reading a percentage of something
+             they have not been shown yet.
+
+             THE GUARD IS THE POINT. `cost_total` is a `Decimal`, and on a
+             refusal it carries `Decimal::ZERO` — byte-identical to a genuinely
+             zero cost, so the amount alone cannot answer whether there is a
+             figure here. Only `cost_refusal` can, and a dash is published in
+             its place: never the zero, never a partial, never a stale figure.
+             The same shape the net price row above already uses for
+             `net_refusal`, and for the same reason. #}
+          <td class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductCostWithTax) }}</td>
+          {# Derived, never stored: `cost_total` is recomputed from the cost and
+             the linked taxes on every render, exactly like the breakdown rows
+             and the tfoot, so a "stored" chip beside it would be a claim the
+             schema does not support. The row therefore carries NO
+             `data-product-ladder-source` either, which is the marker that
+             distinguishes a stored-or-unsaved PRODUCT value from a derived
+             one: the cost row holds neither, and claiming one would put it in
+             the same class as the three rows that do hold the product's own
+             numbers. #}
+          <td class="py-2 pr-3"><span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderDerived) }}</span></td>
+          <td class="py-2 pr-3 text-right text-muted tabular-nums">—</td>
+          <td class="py-2 pr-3 text-right tabular-nums">{% if ladder.cost_refusal.is_some() %}<span class="font-medium text-muted">—</span>{% else %}{{ localization.format_currency(ladder.cost_total.clone()) }}{% endif %}</td>
+        </tr>
+        {% if let Some(refusal_message) = cost_refusal_message.clone() %}
+        <tr>
+          {# The COST's own refusal, in the shared mapping's words, beside a
+             cell that spans the table — so the browser's `_ladder_amounts`
+             helper skips it and the cost row keeps its own four cells. It is
+             NOT a claim that a save would be refused: the cost is still
+             storable, and it is the cost's own arithmetic that has no figure
+             to publish. Its own attribute, beside `data-product-ladder-net-
+             refused`, so an operator reading both refusals is looking at two
+             different numbers. #}
+          <td colspan="4" class="py-2 pr-3 text-[13px] text-muted" data-product-ladder-cost-refused>{{ localization.tr(crate::localization::MessageKey::ProductLadderCostRefused) }} <span class="font-semibold">{{ refusal_message }}</span></td>
+        </tr>
+        {% endif %}
         <tr class="border-b border-border/60" data-product-ladder-source="{% if ladder.from_form %}unsaved{% else %}stored{% endif %}">
           <td class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::ProductMarkup) }}</td>
           <td class="py-2 pr-3">{% if ladder.from_form %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderUnsaved) }}</span>{% else %}<span class="chip chip-muted">{{ localization.tr(crate::localization::MessageKey::ProductLadderStored) }}</span>{% endif %}</td>
