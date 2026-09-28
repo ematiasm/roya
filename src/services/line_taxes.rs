@@ -64,6 +64,28 @@ pub fn round_to_cents(amount: Decimal) -> Decimal {
     amount.round_dp_with_strategy(MONEY_SCALE, RoundingStrategy::MidpointAwayFromZero)
 }
 
+/// The money scale AS A VALUE: one hundredth of a unit, the smallest step the
+/// rounding rule above is allowed to move.
+///
+/// It exists because [`MONEY_SCALE`] is a SCALE — a count of decimal places, a
+/// rule to hand to a rounding call — while a caller that has to BUILD money at
+/// that scale needs the amount itself: stepping a candidate by a hundredth, or
+/// naming the smallest difference two prices are allowed to have. Those are not
+/// rounding operations, so [`round_to_cents`] cannot answer them, and every
+/// caller writing `Decimal::new(1, MONEY_SCALE)` for itself would be
+/// re-deriving the step size of the currency in a second place.
+///
+/// It lives here, beside the constant it is built from, because this module
+/// owns the money rules: [`MONEY_SCALE`] says how many places money has and
+/// this says what one of those places is worth. Everything that moves money in
+/// single-cent steps — this contract, and the gross-to-net search in
+/// [`gross_inverse`](crate::services::gross_inverse) — takes this value rather
+/// than reconstructing it, so the step size of the currency has exactly one
+/// definition in the crate.
+pub fn cent() -> Decimal {
+    Decimal::new(1, MONEY_SCALE)
+}
+
 /// A line's tax calculation: the immutable per-tax facts to snapshot, plus the
 /// money they add up to.
 #[derive(Debug, Clone)]
