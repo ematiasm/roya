@@ -1243,8 +1243,9 @@ def test_typing_a_cost_in_the_drawer_moves_the_server_computed_ladder(
 
     So the assertions are about what the browser got back:
 
-    * typing a new cost must move the derived net price AND the tax-inclusive
-      price, because both are computed from the net;
+    * typing a new cost must move the cost with tax, the derived net price AND
+      the tax-inclusive price, because all three are computed from values the
+      form just changed;
     * the tax amounts must move with it, since a tax is a share of the net;
     * nothing may be saved: the product's stored net price, read back through
       the API, is still the price the drawer was opened with.
@@ -1274,9 +1275,11 @@ def test_typing_a_cost_in_the_drawer_moves_the_server_computed_ladder(
     expect(_ladder(page)).to_be_visible()
 
     # The drawer arrives showing the stored state: cost 10 with a 100% markup
-    # derives 20.00, and 21% of that is 4.20, so 24.20 with tax.
+    # derives 20.00, and 21% of that is 4.20, so 24.20 with tax. The cost's own
+    # gross is a separate figure over the separate base: 10 * 1.21 = 12.10.
     before = _ladder_amounts(page)
     assert before["Cost price"] == "10.00 USD", before
+    assert before["Cost with tax"] == "12.10 USD", before
     assert before["Net price"] == "20.00 USD", before
     assert before["Price with tax"] == "24.20 USD", before
 
@@ -1287,9 +1290,11 @@ def test_typing_a_cost_in_the_drawer_moves_the_server_computed_ladder(
     with page.expect_response(_response_for(_LADDER_PATH)):
         form.locator('input[name="cost_price"]').blur()
 
-    # 25 * (1 + 100/100) = 50.00 net; 21% of 50.00 is 10.50; 60.50 with tax.
+    # 25 * (1 + 100/100) = 50.00 net; 21% of 50.00 is 10.50; 60.50 with tax. The
+    # cost's gross moves on its own base: 25 * 1.21 = 30.25.
     after = _ladder_amounts(page)
     assert after["Cost price"] == "25.00 USD", after
+    assert after["Cost with tax"] == "30.25 USD", after
     assert after["Net price"] == "50.00 USD", after
     assert after["IVA21 — IVA 21%"] == "10.50 USD", after
     assert after["Tax total"] == "10.50 USD", after
@@ -1300,6 +1305,78 @@ def test_typing_a_cost_in_the_drawer_moves_the_server_computed_ladder(
     stored = api.get_json(f"/api/products/{product_id}")
     assert stored["sale_price"] == "20.00", stored
     assert stored["cost_price"] == "10.00", stored
+
+
+def test_a_refused_cost_publishes_no_money_in_a_real_browser(
+    page: Page, api: ApiClient
+) -> None:
+    """The cost's tax-inclusive figure is guarded on the COST's refusal.
+
+    The refusal half of this row has no browser coverage anywhere else, and the
+    guard is invisible to the figure test above: a ladder that printed the field
+    unguarded would still show every figure the other test reads, because the
+    refusal is a state those fixtures never reach.
+
+    The fixture is the business case the cost's own slot exists for. The save
+    path never compares the cost to the sale price, so a manual-price product may
+    legitimately cost more than it sells for — and then the cost is the LARGER of
+    the two bases, so it is the cost's arithmetic that runs out of range while
+    the net's succeeds. A 1000% rate and a 27-digit cost do it: ``cost * rate``
+    leaves the range, ``42 * rate`` is nowhere near it.
+
+    What this proves that a Rust test cannot: the ladder arrives through a REAL
+    form post, so the 27 digits survive the browser's own input handling and the
+    whole ``hx-include`` body, and the two refusals stay independent in the
+    markup rather than only in the service.
+    """
+    product = create_product(
+        api,
+        sku="LADDER-SKU-23",
+        name="Refused Cost Widget",
+        sale_price="42.00",
+        cost_price="10.00",
+        min_stock="1",
+        max_stock="100",
+    )
+    product_id = int(product["id"])
+    tax = api.post_json(
+        "/api/taxes",
+        {"code": "IVA1000", "name": "IVA 1000%", "rate": "1000", "is_active": True},
+    )
+    api.post_json(f"/api/products/{product_id}/taxes", {"tax_id": int(tax["id"])})
+
+    _open_products_list(page, api, name="Refused Cost Widget")
+    _open_product_drawer(page, product_id)
+    ladder = _ladder(page)
+
+    # As stored, the cost's gross is an ordinary figure: 10 + 10*1000/100 = 110.
+    expect(ladder.locator("[data-product-ladder-cost-refused]")).to_have_count(0)
+    amounts = _ladder_amounts(page)
+    assert amounts["Cost with tax"] == "110.00 USD", amounts
+
+    # 1e26 spelled out: the endpoint parses a grouped decimal, NOT scientific
+    # notation, so "1e26" would come back as the unreadable-field fallback and
+    # would prove nothing about the cost's refusal.
+    form = _edit_form(page)
+    form.locator('input[name="cost_price"]').fill("100000000000000000000000000")
+    with page.expect_response(_response_for(_LADDER_PATH)):
+        form.locator('input[name="cost_price"]').blur()
+
+    expect(ladder.locator("[data-product-ladder-cost-refused]")).to_be_visible()
+    expect(ladder.locator("[data-product-ladder-cost-refused]")).to_contain_text(
+        "the line amount is too large to calculate its taxes"
+    )
+    # The whole invariant in one read: `_ladder_amounts` keys the row by its
+    # label, so a cell carrying a formatted `Decimal::ZERO` is visible right here.
+    refused = _ladder_amounts(page)
+    assert refused["Cost with tax"] == "—", refused
+    assert not any(character.isdigit() for character in refused["Cost with tax"])
+
+    # And the net's own refusal is NOT what happened: two facts, two slots, and a
+    # cost that cannot be priced with tax does not cost the product its price.
+    expect(ladder.locator("[data-product-ladder-net-refused]")).to_have_count(0)
+    assert refused["Net price"] == "42.00 USD", refused
+    assert refused["Price with tax"] == "462.00 USD", refused
 
 
 def test_the_ladder_says_a_refused_price_instead_of_showing_one(

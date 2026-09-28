@@ -208,6 +208,12 @@ struct ProductPriceLadderPartial {
     /// HERE, by the one shared mapping, so the fragment never renders a refusal
     /// in a language of its own.
     net_refusal_message: Option<String>,
+    /// The COST half's own refusal, in the active locale, for the same reason and
+    /// through the same mapping. A separate field rather than a second refusal
+    /// inside this one: the two are answers about two different numbers and both
+    /// can be populated at the same time, so folding them into one `Option`
+    /// would make the ladder publish at most one of the two facts.
+    cost_refusal_message: Option<String>,
     /// True when this product has no positive cost AND no markup, so its net
     /// price is manual and there is nothing for a markup to be a percentage OF.
     ///
@@ -232,16 +238,37 @@ fn ladder_refusal_message(
         .map(|refusal| price_refusal_message(&refusal, localization))
 }
 
+/// The refusal the ladder states about the COST, as the active locale words it.
+///
+/// The sibling of `ladder_refusal_message`, reading the other refusal slot, and
+/// deliberately the same SHAPE rather than a `match` over both: a manual-price
+/// product may legitimately cost more than it sells for, so the cost's
+/// arithmetic can refuse while the net's succeeds, and a single combined mapping
+/// could only ever report one of them.
+fn ladder_cost_refusal_message(
+    ladder: &ProductPriceLadder,
+    localization: &LocalizationContext,
+) -> Option<String> {
+    ladder
+        .cost_refusal
+        .map(|refusal| price_refusal_message(&refusal, localization))
+}
+
 fn product_price_ladder_html(
     localization: &LocalizationContext,
     ladder: ProductPriceLadder,
 ) -> AppResult<Html<String>> {
     let net_refusal_message = ladder_refusal_message(&ladder, localization);
+    // The cost half's own sentence, resolved the same way and in the same place:
+    // one function, so the standalone preview endpoint and the drawer's embedded
+    // fragment cannot word the same refusal two different ways.
+    let cost_refusal_message = ladder_cost_refusal_message(&ladder, localization);
     ProductPriceLadderPartial {
         localization: localization.clone(),
         markup_not_derivable: markup_not_derivable(&ladder),
         ladder,
         net_refusal_message,
+        cost_refusal_message,
     }
     .render()
     .map(Html)
@@ -376,6 +403,11 @@ struct ProductDetailPartial {
     /// that fragment, so the sentence it states is resolved by the same shared
     /// mapping rather than by a rendering rule of its own.
     net_refusal_message: Option<String>,
+    /// And the same field again for the cost half, for the same reason: the
+    /// embedded fragment reads it, so a cost refusal is worded identically
+    /// whether it arrives through the preview endpoint or through the drawer's
+    /// own first render.
+    cost_refusal_message: Option<String>,
     /// The same field again, for the same reason: the embedded fragment reads
     /// it, so the drawer's first render and the preview endpoint cannot disagree
     /// about whether a markup is derivable from a cost.
@@ -1490,6 +1522,12 @@ async fn product_detail_html(
     // shared mapping the product save form also goes through.
     let ladder = state.tax_service.product_price_ladder(id, None).await?;
     let net_refusal_message = ladder_refusal_message(&ladder, localization);
+    // The cost half's sentence, from the same ladder and through the same shared
+    // mapping. Resolved HERE as well as in the preview endpoint because the
+    // embedded fragment reads a field of THIS struct: a refusal worded on one
+    // render path and silent on the other is the defect this second field exists
+    // to prevent.
+    let cost_refusal_message = ladder_cost_refusal_message(&ladder, localization);
     let markup_not_derivable = markup_not_derivable(&ladder);
     // The level resolved for the drawer, the same way the picker row resolves it:
     // the amount, or the sentence in its place. Two fields, because the template
@@ -1523,6 +1561,7 @@ async fn product_detail_html(
         ladder,
         // The embedded ladder fragment reads this.
         net_refusal_message,
+        cost_refusal_message,
         markup_not_derivable,
         supplier_costs,
         suppliers,
@@ -5624,6 +5663,77 @@ mod tests {
         }
     }
 
+    /// The inner HTML of every `<td>` of the ladder row that OWNS `label`, in
+    /// order, or `None` when no row does.
+    ///
+    /// Hand-rolled, and only for one reason: the load-bearing property of a
+    /// ladder row is its CELL COUNT, not its text. `e2e/tests/test_products.py`'s
+    /// `_ladder_amounts` keys every figure by `td[0]`, reads `td[3]` and
+    /// `continue`s past any row with fewer than four cells — so a three-cell row
+    /// is invisible to every browser test while the suite stays green. A Rust
+    /// test that only asserted `html.contains(label)` would ship that row
+    /// broken, so these tests read the cells.
+    fn ladder_row_cells<'a>(html: &'a str, label: &str) -> Option<Vec<&'a str>> {
+        // A `<tr` split keeps each row with its own cells, and the row that owns
+        // the label is the first chunk carrying it: a label is unique per row.
+        let mut rest = html.split("<tr").find(|row| row.contains(label))?;
+        let mut cells = Vec::new();
+        while let Some(open) = rest.find("<td") {
+            rest = &rest[open..];
+            let inner = &rest[rest.find('>')? + 1..];
+            let close = inner.find("</td>")?;
+            cells.push(inner[..close].trim());
+            rest = &inner[close..];
+        }
+        Some(cells)
+    }
+
+    /// The cost's OWN refusal, proven to be the only thing published beside the
+    /// cost row: no amount at all, and the save path's sentence rather than a
+    /// fragment's own wording.
+    ///
+    /// The cost-side counterpart of `assert_publishes_no_tax_money`, and it
+    /// exists because the two refusals are independent facts in independent
+    /// slots: a net refusal says nothing about whether the cost's figure can be
+    /// computed, and a refused cost publishes no money even on a ladder whose
+    /// net side is perfectly healthy. Asserting the amount cell is the em dash
+    /// rather than "not the label" is deliberate — a zero formatted as money
+    /// would sail past a label check, and it is precisely the failure this row
+    /// exists to prevent.
+    fn assert_publishes_no_cost_money(
+        localization: &crate::localization::LocalizationContext,
+        html: &str,
+    ) {
+        assert!(
+            html.contains("data-product-ladder-cost-refused"),
+            "the ladder must state the COST's own refusal, not a figure: {html}"
+        );
+        let cells = ladder_row_cells(html, "Cost with tax")
+            .unwrap_or_else(|| panic!("the cost row must still be published: {html}"));
+        // Not `cells[3] == "—"`: the net row's dash is wrapped in a span, and
+        // matching that markup would make this test a hostage to the styling.
+        // The invariant is that the cell carries NO DIGIT AT ALL, which is what
+        // "publishes no money" means — and which a formatted zero sails straight
+        // past, because that zero is the value the field actually holds.
+        assert!(
+            !cells[3].chars().any(|character| character.is_ascii_digit()),
+            "a refused cost publishes no amount, and the amount it carries is a \
+             Decimal::ZERO byte-identical to a real zero's, so a formatted zero \
+             is the exact thing this guard exists to prevent: {html}"
+        );
+        assert!(
+            cells[3].contains('—'),
+            "and the placeholder in its place is a dash, not a figure: {html}"
+        );
+        let sentence =
+            localization.tr(crate::localization::MessageKey::PriceRefusalTaxArithmeticTooLarge);
+        assert!(
+            html.contains(sentence),
+            "through the one shared mapping, so a preview cannot word it in a \
+             language the save would not: {html}"
+        );
+    }
+
     /// The drawer's stored net price, read straight from the row so a test can
     /// prove a derived figure never became a stored one. Compared as a
     /// `Decimal`, because the stored TEXT scale is the repository's business and
@@ -6068,6 +6178,179 @@ mod tests {
             dec("42"),
             "and the refusal writes nothing"
         );
+    }
+
+    /// The cost's tax-inclusive figure is the ladder's SECOND of four prices —
+    /// cost net, cost gross, sale net, sale gross — and T-A computed it while no
+    /// row published it, so a ladder whose entire job is to let an operator
+    /// sanity-check a price was showing three of the four.
+    ///
+    /// The cell COUNT is asserted, not just the text, because it is the part that
+    /// fails silently: `e2e/tests/test_products.py::_ladder_amounts` reads
+    /// `td[3]` and skips any row with fewer than four cells without failing, so a
+    /// three- or five-cell row would ship invisible to all six browser tests.
+    #[tokio::test]
+    async fn product_price_ladder_states_the_cost_with_tax_figure_in_a_four_cell_row() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        // `product_with_taxes` stores a cost of 5 and a manual net of 42.
+        let product_id = product_with_taxes(&state, "LADDER-12", "42").await;
+        let iva = link_tax(&state, "IVA21", "IVA 21%", "21").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, iva)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) =
+            preview(app, product_id, "cost_price=5&markup_pct=&sale_price=42").await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+
+        let cells = ladder_row_cells(&html, "Cost with tax").unwrap_or_else(|| {
+            panic!("the ladder must publish the cost's tax-inclusive figure: {html}")
+        });
+        assert_eq!(
+            cells.len(),
+            4,
+            "the row must be a FOUR-cell <tr>: the browser helper reads td[3] and \
+             SILENTLY skips any row with fewer cells, so a row of any other width \
+             is invisible to every browser test while the suite stays green: {html}"
+        );
+        assert_eq!(
+            cells[0], "Cost with tax",
+            "the step that owns the figure: {html}"
+        );
+        assert_eq!(
+            cells[3],
+            money(&localization, "6.05"),
+            "5 * 1.21 = 6.05, the cost's OWN half of the ladder: {html}"
+        );
+        assert_eq!(cells[2], "—", "the row states no rate of its own: {html}");
+        // Derived, never stored: `cost_total` is recomputed on every render, so a
+        // "stored" chip beside it would be a claim the schema does not support.
+        assert!(
+            cells[1]
+                .contains(localization.tr(crate::localization::MessageKey::ProductLadderDerived)),
+            "the chip must say the figure is derived, like the breakdown and the \
+             tfoot rows do: {html}"
+        );
+        assert!(
+            !cells[1]
+                .contains(localization.tr(crate::localization::MessageKey::ProductLadderStored)),
+            "and never that it is stored: {html}"
+        );
+        // The cost row reads the COST's figure. A ladder that rendered the net
+        // here would agree with the sale's row on a product whose two bases
+        // differ, which is exactly what makes the four rows worth showing.
+        assert!(
+            cells[3] != money(&localization, "50.82"),
+            "this is the cost's figure, not the net's 42 * 1.21: {html}"
+        );
+    }
+
+    /// A refused cost publishes NO AMOUNT. The refusal is the cost's own fact
+    /// about a DIFFERENT number from the net's, so the ladder states it in its
+    /// own sentence through the one shared mapping and prints a dash where the
+    /// figure would be — never the `Decimal::ZERO` it carries, which is
+    /// byte-identical to a genuine zero's.
+    ///
+    /// The fixture is the business case T-A's own doc names: `validate_effective_
+    /// prices` never compares the cost to the sale price, so a manual-price
+    /// product may cost more than it sells for, and then it is the LARGER base
+    /// whose arithmetic leaves the range while the net's succeeds. The rate is
+    /// the 1000 ceiling and the cost is 1e26, so `cost * rate` overflows
+    /// `Decimal` where `42 * rate` is nowhere near it.
+    #[tokio::test]
+    async fn product_price_ladder_publishes_no_cost_money_for_a_refused_cost() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_taxes(&state, "LADDER-13", "42").await;
+        let ceiling = link_tax(&state, "IVA1000", "IVA 1000%", "1000").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, ceiling)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        // 1e26 spelled out in digits: `parse_decimal` is a grouped-number parser
+        // and refuses scientific notation, which would send the ladder down its
+        // unreadable path and prove nothing about the cost's refusal.
+        let huge = "100000000000000000000000000";
+        let (status, html) = preview(
+            app,
+            product_id,
+            &format!("cost_price={huge}&markup_pct=&sale_price=42"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+
+        assert_publishes_no_cost_money(&localization, &html);
+        // The net side is untouched by the cost's refusal: two independent facts
+        // in two slots, and collapsing them would make the ladder lie about one.
+        assert!(
+            !html.contains("data-product-ladder-net-refused"),
+            "a refused cost is not a refused net price: {html}"
+        );
+        assert!(
+            html.contains(&money(&localization, "462")),
+            "the net's own figure is still published, 42 + 420 = 462: {html}"
+        );
+        // And the refusal published no money of the cost's own: not the zero it
+        // carries, and not any partial or stale figure either.
+        assert!(
+            !html.contains(&money(&localization, "0.00"))
+                || ladder_row_cells(&html, "Cost with tax").is_some_and(|cells| cells[3] == "—"),
+            "the cost's Decimal::ZERO must never reach the operator: {html}"
+        );
+        assert_eq!(
+            stored_net(&state, product_id).await,
+            dec("42"),
+            "a refusal publishes nothing and writes nothing"
+        );
+    }
+
+    /// The drawer's OWN first render is the second path to the same fragment,
+    /// and a refusal worded on one and silent on the other is the defect the two
+    /// separate fields exist to prevent. It is not hypothetical: the drawer
+    /// resolves its own `ProductDetailPartial`, and the compiler cannot tell a
+    /// call site that passes the ladder's real `cost_refusal_message` from one
+    /// that passes `None` — both typecheck, and only one is true.
+    ///
+    /// Reached through the STORED row rather than a form preview, because the
+    /// drawer has no form values on arrival: `cost_price` is a TEXT column, so a
+    /// 27-digit cost survives the round trip and the refusal is reachable without
+    /// a form at all.
+    #[tokio::test]
+    async fn the_drawer_states_the_cost_refusal_on_its_own_first_render() {
+        let state = test_state().await;
+        let app = crate::routes::router(state.clone());
+        let product_id = product_with_markup(
+            &state,
+            "LADDER-14",
+            "42",
+            "100000000000000000000000000",
+            None,
+        )
+        .await;
+        let ceiling = link_tax(&state, "IVA1000", "IVA 1000%", "1000").await;
+        state
+            .tax_service
+            .link_product_tax(audit_actor_id(&state).await, product_id, ceiling)
+            .await
+            .unwrap();
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+
+        let (status, html) = get_html(app, &format!("/web/products/detail/{product_id}")).await;
+        assert_eq!(status, StatusCode::OK, "{html}");
+        assert_publishes_no_cost_money(&localization, &html);
     }
 
     /// A field that is not a number is not a zero: the ladder falls back to the

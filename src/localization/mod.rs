@@ -257,6 +257,13 @@ define_message_keys! {
     ProductUnitPlaceholder => "product.unit_placeholder",
     ProductSalePrice => "product.sale_price",
     ProductCostPrice => "product.cost_price",
+    // The cost's tax-inclusive figure, the second of the ladder's four prices.
+    // Its own key rather than a tax-namespace one, because the ladder's tax
+    // vocabulary (`tax.net_price`, `tax.inclusive_price`) is one namespace on
+    // purpose and this figure is not a tax: it is the COST's price with taxes
+    // on, and reusing the sale-side key would name two different numbers the
+    // same thing.
+    ProductCostWithTax => "product.cost_with_tax",
     ProductMarkup => "product.markup",
     ProductMarkupHelp => "product.markup_help",
     ProductCategory => "product.category",
@@ -293,6 +300,13 @@ define_message_keys! {
     ProductLadderPreviewHelp => "product.ladder_preview_help",
     ProductLadderUnreadable => "product.ladder_unreadable",
     ProductLadderNetRefused => "product.ladder_net_refused",
+    // The lead-in to the COST's own refusal, the counterpart of
+    // `ProductLadderNetRefused`. Deliberately NOT a claim that a save would be
+    // refused: a refused cost is refused by the cost's own arithmetic, and the
+    // cost itself is still storable — only the derived figure is missing. A
+    // sentence borrowed from the net's would tell an operator their save would
+    // fail, which is false.
+    ProductLadderCostRefused => "product.ladder_cost_refused",
     ProductLadderNetDerived => "product.ladder_net_derived",
     ProductLadderNetManual => "product.ladder_net_manual",
     ProductLadderNoCostMarkup => "product.ladder_no_cost_markup",
@@ -1234,6 +1248,7 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductUnitPlaceholder, "un, kg, lt…", "un, kg, lt…"),
     (MessageKey::ProductSalePrice, "Sale price", "Sale price"),
     (MessageKey::ProductCostPrice, "Cost price", "Cost price"),
+    (MessageKey::ProductCostWithTax, "Cost with tax", "Cost with tax"),
     (MessageKey::ProductMarkup, "Markup %", "Markup %"),
     (MessageKey::ProductMarkupHelp, "When a markup is set, the sale price is derived from the cost. Leave it empty to set the price manually.", "When a markup is set, the sale price is derived from the cost. Leave it empty to set the price manually."),
     (MessageKey::ProductCategory, "Category", "Category"),
@@ -1266,6 +1281,7 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderPreviewHelp, "This ladder previews the values in the form above, before you save. Saving stores the net price; it never changes it because of a tax.", "This ladder previews the values in the form above, before you save. Saving stores the net price; it never changes it because of a tax."),
     (MessageKey::ProductLadderUnreadable, "The cost, the markup or the sale price in the form is not a number, so the ladder shows the last saved values instead of a preview.", "The cost, the markup or the sale price in the form is not a number, so the ladder shows the last saved values instead of a preview."),
     (MessageKey::ProductLadderNetRefused, "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:", "The net price cannot be derived from these values, so there are no taxes to show yet. Saving now would be refused:"),
+    (MessageKey::ProductLadderCostRefused, "The cost with tax cannot be computed for these values, so there is no figure to show. It is the cost's own arithmetic that refuses:", "The cost with tax cannot be computed for these values, so there is no figure to show. It is the cost's own arithmetic that refuses:"),
     (MessageKey::ProductLadderNetDerived, "Derived from the cost and the markup", "Derived from the cost and the markup"),
     (MessageKey::ProductLadderNetManual, "Manual price", "Manual price"),
     (MessageKey::ProductLadderNoCostMarkup, "The markup is not derivable without a cost, so this product's net price is a manual one.", "The markup is not derivable without a cost, so this product's net price is a manual one."),
@@ -2211,6 +2227,7 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductUnitPlaceholder, "un, kg, l…", "un, kg, l…"),
     (MessageKey::ProductSalePrice, "Precio de venta", "Precio de venta"),
     (MessageKey::ProductCostPrice, "Precio de costo", "Precio de costo"),
+    (MessageKey::ProductCostWithTax, "Costo con impuestos", "Costo con impuestos"),
     (MessageKey::ProductMarkup, "Margen %", "Margen %"),
     (MessageKey::ProductMarkupHelp, "Cuando se indica un margen, el precio de venta se deriva del costo. Déjelo vacío para configurar el precio manualmente.", "Cuando se indica un margen, el precio de venta se deriva del costo. Déjelo vacío para configurar el precio manualmente."),
     (MessageKey::ProductCategory, "Categoría", "Categoría"),
@@ -2243,6 +2260,7 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::ProductLadderPreviewHelp, "Esta escalera anticipa los valores del formulario de arriba, antes de guardar. Al guardar se almacena el precio neto; ningún impuesto lo modifica.", "Esta escalera anticipa los valores del formulario de arriba, antes de guardar. Al guardar se almacena el precio neto; ningún impuesto lo modifica."),
     (MessageKey::ProductLadderUnreadable, "El costo, el margen o el precio de venta del formulario no es un número, así que la escalera muestra los últimos valores guardados en lugar de una anticipación.", "El costo, el margen o el precio de venta del formulario no es un número, así que la escalera muestra los últimos valores guardados en lugar de una anticipación."),
     (MessageKey::ProductLadderNetRefused, "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:", "El precio neto no se puede derivar de estos valores, así que todavía no hay impuestos que mostrar. Guardar ahora sería rechazado:"),
+    (MessageKey::ProductLadderCostRefused, "El costo con impuestos no se puede calcular para estos valores, así que no hay una cifra que mostrar. Es la aritmética del costo la que rechaza:", "El costo con impuestos no se puede calcular para estos valores, así que no hay una cifra que mostrar. Es la aritmética del costo la que rechaza:"),
     (MessageKey::ProductLadderNetDerived, "Derivado del costo y del margen", "Derivado del costo y del margen"),
     (MessageKey::ProductLadderNetManual, "Precio manual", "Precio manual"),
     (MessageKey::ProductLadderNoCostMarkup, "El margen no se puede derivar sin un costo, así que el precio neto de este producto es manual.", "El margen no se puede derivar sin un costo, así que el precio neto de este producto es manual."),
