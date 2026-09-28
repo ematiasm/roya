@@ -11,10 +11,11 @@
 //!   touches it, because `validate_effective_prices` deliberately has no upper
 //!   ceiling — whether a price is plausible is a product decision, not an
 //!   arithmetic one — and an operator supplies this one.
-//! * [`tax_arithmetic_fits`] dry-runs the tax contract in checked form over the
-//!   window's extreme nets, so a rate set whose arithmetic cannot be carried is
-//!   refused rather than multiplied. Every arithmetic step that could overflow
-//!   inside the solve is checked, including building the window's own endpoints.
+//! * `tax_arithmetic_fits`, in [`gross_inverse`], dry-runs the tax contract in
+//!   checked form over the window's extreme nets, so a rate set whose arithmetic
+//!   cannot be carried is refused rather than multiplied. Every arithmetic step
+//!   that could overflow inside the solve is checked, including building the
+//!   window's own endpoints.
 //!
 //! # The tax contract is total NOW; this module's own guards stay anyway
 //!
@@ -25,7 +26,7 @@
 //! the final add included.
 //!
 //! The two mechanisms above are NOT removed, and the reason is not redundancy.
-//! [`tax_arithmetic_fits`] decides WHICH refusal a caller of this solve sees:
+//! `tax_arithmetic_fits` decides WHICH refusal a caller of this solve sees:
 //! the contract's own `TaxArithmeticTooLarge` names a document line's amount
 //! and a tax total, while `TaxRateTooLargeToPrice` names the RATE against a
 //! final price, which is the only vocabulary a person setting a final price
@@ -49,52 +50,32 @@
 //!
 //! # Why this is a solve and not a division
 //!
-//! The pricing chain is one-directional everywhere else in this application:
-//! cost and markup derive the net, and the net plus its taxes derive the final
-//! price. That direction is a formula. This module walks it backwards, and the
-//! walk is not invertible by arithmetic, because the tax contract rounds each
-//! contribution on its own ([`calculate_line_taxes`]):
-//!
-//! ```text
-//! final(net) = round2(net + SUM round2(net * rate_i / 100))
-//! ```
-//!
-//! `final` is therefore a staircase, not a line, and it has flat steps: several
-//! nets can share one final price, and some final prices are shared by no net at
-//! all. Dividing the target by `1 + SUM rate_i / 100` places an estimate within
-//! a cent or two of the answer and is wrong about the exact cent often enough to
-//! be useless — an operator who types 100 and gets a net whose final price is
-//! 100.01 has been told a lie about what they asked for. So the estimate only
-//! PLACES a window; a bounded cent search inside that window finds a net whose
-//! final price is exactly the typed value, or refuses.
+//! The reasoning that a gross does not divide into a net, and that a bounded
+//! cent search is what answers it instead, belongs to the search and travels
+//! with it: [`gross_inverse`](crate::services::gross_inverse) carries the
+//! staircase argument, the reason the
+//! division it performs is deliberate, and the proof that its window is wide
+//! enough. This module keeps the SALE half and calls that search.
 //!
 //! # What this module does NOT do
 //!
 //! It opens no connection, reads no clock and writes nothing. The net it solves
-//! is the same canonical net every document line already snapshots, so setting
-//! a final price is a one-shot conversion and not a pricing mode: changing a tax
+//! is the same canonical net every document line already snapshots, so setting a
+//! final price is a one-shot conversion and not a pricing mode: changing a tax
 //! later still moves the final price, which is the already-documented
 //! consequence of the net being the truth.
-//!
-//! # The division this introduces
-//!
-//! [`derive_net_sale_price`] states in its own comment that a percentage shift
-//! is a multiplication by `0.01` because "this project never divides a
-//! `Decimal`". That is true of the MARKUP derivation, and it is the reason the
-//! markup half of this solve inverts the formula and then VERIFIES the answer
-//! through the real deriver instead of trusting its own arithmetic. It is not
-//! true of the project as a whole: the tax contract has always computed
-//! `net * rate / 100` ([`calculate_line_taxes`]). Inverting a gross is a
-//! division by construction — there is no multiplication that lands on a
-//! staircase from the wrong side — so this module performs the first division
-//! used to DERIVE a stored price, deliberately, and says so here rather than
-//! leaving the next reader to believe the comment above applies to the crate.
 //!
 //! # Reuse
 //!
 //! * [`calculate_line_taxes`] is the ONLY definition of a final price. This
 //!   module never rounds a tax itself, so a solved net and a document line can
 //!   never disagree by a cent about the same net.
+//! * [`gross_inverse::solve_net_from_gross`](crate::services::gross_inverse::solve_net_from_gross)
+//!   is the ONLY definition of which net
+//!   grosses to a figure. This solve CALLS it at rule 4 and owns no second copy
+//!   of the staircase search, so a caller that needs a gross turned into a net
+//!   — the purchase boundary will, once a cost may include tax — reaches the
+//!   same arithmetic instead of growing its own division.
 //! * [`derive_net_sale_price`] is the ONLY definition of a markup-derived net.
 //!   The markup this module returns has been round-tripped through it, so the
 //!   stored markup and the stored net are the same pair the save path would
@@ -112,51 +93,12 @@
 //! `PriceRefusal::ALL`, which carries the attribute for the same reason.
 #![allow(dead_code)]
 
-use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::models::{PriceRefusal, ProductKind, Tax};
+use crate::services::gross_inverse::{gross_divisor, solve_net_from_gross, SolveResult, PERCENT};
 use crate::services::inventory::{derive_net_sale_price, validate_effective_prices};
-use crate::services::line_taxes::{
-    calculate_line_taxes, round_to_cents, LineTaxSnapshot, MONEY_SCALE,
-};
-
-/// What a solve can fail with. There is no other failure mode: this module
-/// returns a typed [`PriceRefusal`] or an answer, never a partial one and never
-/// a silently different price.
-pub type SolveResult<T> = Result<T, PriceRefusal>;
-
-/// One hundred, the divisor that turns a percentage rate into a factor.
-const PERCENT: Decimal = Decimal::ONE_HUNDRED;
-/// Two, as a `Decimal`. Written out rather than imported so the arithmetic in
-/// [`search_radius_cents`] reads as the fraction of a cent it is.
-const TWO: Decimal = Decimal::TWO;
-/// One hundredth, the money scale every cent-quantised candidate is built at.
-fn cent() -> Decimal {
-    Decimal::new(1, MONEY_SCALE)
-}
-
-/// Extra cents of window beyond the proven error bound.
-///
-/// The bound itself is tight — see [`search_radius_cents`] — so this is a
-/// margin against an arithmetic detail of `Decimal`'s division, not a guess.
-/// Widening it costs a few loop iterations and cannot change a correct answer,
-/// because every candidate is checked against the tax contract before it can
-/// win.
-const SEARCH_MARGIN_CENTS: i64 = 1;
-
-/// The hard cap on the window, in cents, and a TOTality guard rather than a
-/// tuning knob.
-///
-/// The proven radius is `ceil((n + 1) / 2 / divisor) + 1` cents, which grows
-/// without limit as the linked rates approach -100% in total: at a divisor of
-/// `0.0001` it asks for a window of half a million cents, and a rate set like
-/// that would turn a bounded search into a hang. Capping trades a possible
-/// FALSE REFUSAL on a pathological rate set for a guaranteed termination, and
-/// that is the right trade here: the module's rule is that an unreachable
-/// target is refused and never approximated, so the worst case of hitting the
-/// cap is a refusal an operator can act on, never a price nobody asked for.
-const MAX_SEARCH_RADIUS_CENTS: i64 = 1_000;
+use crate::services::line_taxes::{calculate_line_taxes, LineTaxSnapshot};
 
 /// The decimal places tried for the markup, coarsest first.
 ///
@@ -226,7 +168,7 @@ const MARKUP_PRECISION_LADDER: [u32; 8] = [0, 2, 4, 8, 12, 16, 20, 24];
 /// enormous rate against another that cancels it leaves the divisor near 1, so
 /// the net stays near the full final price while the enormous rate is applied at
 /// full size. No final-price bound closes that, because the overflow does not
-/// depend on the price. It is covered by [`tax_arithmetic_fits`] instead, and the
+/// depend on the price. It is covered by `tax_arithmetic_fits` instead, and the
 /// two together are what make the totality claim in the module docs true.
 ///
 /// A bound chosen by copying the largest value some other test happened to use
@@ -348,13 +290,24 @@ pub fn solve_final_price(
     // Read here, on the TYPED RATE SET and before the target is looked at, so
     // the refusal names the rates rather than blaming a price that was never the
     // problem — and handed to the search so the factor is derived once.
+    //
+    // The derivation stays at THIS position, between rules 1 and 3, and is passed
+    // down rather than re-done inside the search: these six rules are ordered,
+    // and the order decides which of several true refusals an operator is told
+    // first. Deriving the factor at the search's position instead would push
+    // `FinalPriceNotInvertible` behind rules 1 and 3, so an over-ceiling price
+    // with a bad stored markup, or a non-positive price with an uninvertible
+    // rate set, would answer with a different sentence than it does today.
     let divisor = gross_divisor(taxes).ok_or(PriceRefusal::FinalPriceNotInvertible)?;
 
     // -- rule 3: the typed price is a legal price ------------------------------
     validate_effective_prices(kind, final_price, cost_price)?;
 
     // -- rule 4: the net ------------------------------------------------------
-    let net = solve_net(final_price, taxes, divisor)?;
+    // The shared inverse, at this position in this order, with the factor derived
+    // at rule 2. See `gross_inverse::solve_net_from_gross` for why the divisor is
+    // a parameter and not derived there.
+    let net = solve_net_from_gross(final_price, taxes, divisor)?;
 
     // -- rule 5: the markup ---------------------------------------------------
     // A product with no positive cost has nothing for a markup to be a
@@ -382,186 +335,6 @@ pub fn solve_final_price(
         breakdown: calculation.taxes,
         markup,
     })
-}
-
-/// The net whose final price is EXACTLY `final_price`.
-///
-/// # The window
-///
-/// The estimate `final_price / divisor` is the centre; every candidate is a
-/// whole number of cents away from it, and the half-width is
-/// [`search_radius_cents`] — a proven bound, not a tuning parameter. The
-/// window is only a place to LOOK: nothing is believed because it is in range.
-/// Every candidate is priced through [`calculate_line_taxes`], the one tax
-/// contract, and only a candidate whose final price equals the typed value can
-/// win.
-///
-/// # The tie-break, and why it is not the loop order
-///
-/// More than one net can share a final price, because each tax contribution is
-/// rounded on its own and the resulting staircase has flat steps. The window
-/// then holds several correct answers, and something has to choose between them.
-///
-/// **The rule: the candidate CLOSEST TO THE UNROUNDED ESTIMATE wins.** The
-/// estimate is the operator's intent — "this should sell at about 0.10
-/// including tax" — and the flat step is an artefact of rounding that nobody
-/// chose. The nearest net is the one that best represents what was asked for.
-///
-/// Loop order is NOT that rule. Scanning the window upwards answers the lowest
-/// candidate and scanning it downwards answers the highest, so "whichever the
-/// loop found first" would make the stored price depend on the direction a
-/// `for` loop happens to run in — the same target, two products, two prices.
-/// That is why the candidates are scored and compared here rather than returned
-/// from inside the loop.
-///
-/// **Ties in the distance** — the estimate sitting exactly between two
-/// candidates — are broken toward the SMALLER net, because the distance is
-/// compared strictly and the window is walked from its low end, so the first
-/// candidate at the winning distance is the smaller one.
-///
-/// That secondary rule is a DETERMINISM rule and nothing more. It is not a
-/// commercial preference, and it is worth being blunt about the direction: the
-/// net is stored as `sale_price`, so the smaller net is LESS revenue before tax
-/// on every sale. It is chosen because the arithmetic genuinely cannot
-/// distinguish the two candidates — the operator's estimate sat exactly between
-/// them — and a rule that is at least fixed and explainable is worth more than
-/// an arbitrary one. If a future change makes the estimate land between two
-/// nets often enough to matter commercially, the right fix is a decision about
-/// pricing, recorded here, not an accident of iteration order.
-///
-/// **This rule is currently unreachable through the product screen.**
-/// `TaxService::validate_rate` rejects a negative rate, and with every rate
-/// non-negative each contribution is monotone in the net, so no two nets ever
-/// share a final price and the tie-break never fires. The rule exists because
-/// this function is total: it takes resolved `Tax` values, not a validated form,
-/// and a rate set that grosses BELOW the net must get an answer that does not
-/// depend on which direction a loop ran in.
-fn solve_net(final_price: Decimal, taxes: &[Tax], divisor: Decimal) -> SolveResult<Decimal> {
-    // The one deliberate division in a derivation: inverting a gross has no
-    // multiplication, and the module docs say why this is the first one here.
-    let estimate = final_price
-        .checked_div(divisor)
-        .ok_or(PriceRefusal::FinalPriceUnreachable)?;
-
-    let base = round_to_cents(estimate);
-    let radius = search_radius_cents(taxes.len(), divisor);
-
-    // PROVE the window is carryable before any candidate enters the tax
-    // contract. `|net * rate|` grows with `|net|`, so the two extreme nets of a
-    // window centred on `base` bound every candidate between them, and checking
-    // those two is enough. See `tax_arithmetic_fits` for why this has to happen
-    // here rather than being assumed.
-    //
-    // CHECKED, and that is the whole point of these two lines. `Decimal` panics
-    // on addition overflow, so building an endpoint with `base + step` could
-    // crash the request from inside the guard meant to stop one. It is
-    // reachable: a rate set that grosses the price down to a factor of 1e-11
-    // divides a final price that is INSIDE the bound straight past
-    // `Decimal::MAX`, and `base` lands on the ceiling.
-    //
-    // `cent() * Decimal::from(radius)` needs no checked form: `radius` is capped
-    // at `MAX_SEARCH_RADIUS_CENTS`, so the product is at most 10.00.
-    let step = cent() * Decimal::from(radius);
-    let low = base
-        .checked_sub(step)
-        .ok_or(PriceRefusal::NetPriceTooLarge)?;
-    let high = base
-        .checked_add(step)
-        .ok_or(PriceRefusal::NetPriceTooLarge)?;
-    if !tax_arithmetic_fits(low, taxes) || !tax_arithmetic_fits(high, taxes) {
-        return Err(PriceRefusal::TaxRateTooLargeToPrice);
-    }
-
-    let mut best: Option<(Decimal, Decimal)> = None;
-
-    for offset in -radius..=radius {
-        // Checked for the same reason as the endpoints, and kept checked even
-        // though a representable pair of endpoints makes every interior point
-        // representable: a total function should not depend on that inference
-        // holding, and the call costs one comparison per candidate.
-        let candidate = base
-            .checked_add(cent() * Decimal::from(offset))
-            .ok_or(PriceRefusal::NetPriceTooLarge)?;
-        // The two endpoints were proved carryable above, so a refusal here is
-        // the same fact stated by the contract itself. It is reported with the
-        // solve's own variant for the same reason the guard reports it that
-        // way: a machine reading a solve's refusal needs the solve's vocabulary.
-        let Ok(calculation) = calculate_line_taxes(candidate, taxes) else {
-            return Err(PriceRefusal::TaxRateTooLargeToPrice);
-        };
-        if calculation.total != final_price {
-            continue;
-        }
-        let distance = (candidate - estimate).abs();
-        match best {
-            // Strictly closer only: an equal distance keeps the candidate found
-            // first, and the window is walked from the low end, so that is the
-            // smaller net. See the tie-break note above.
-            Some((best_distance, _)) if best_distance <= distance => {}
-            _ => best = Some((distance, candidate)),
-        }
-    }
-
-    best.map(|(_, net)| net)
-        .ok_or(PriceRefusal::FinalPriceUnreachable)
-}
-
-/// Whether the shared tax contract can carry `net` against this rate set without
-/// overflowing — a faithful dry run of [`calculate_line_taxes`] with every
-/// operation in its checked form.
-///
-/// The contract is total now and would answer `Err` on its own, so the honest
-/// reason this exists is the REFUSAL it chooses, not the crash it prevents. A
-/// caller of this solve must hear `TaxRateTooLargeToPrice` — "a linked rate is
-/// too large to price this final price" — because that is the one field they
-/// can change. Letting the contract's own answer through would name a line
-/// amount and a tax total, which are not what the person typing a final price
-/// typed. A pre-check that reports the same fact in the solve's own vocabulary
-/// is worth four comparisons per window.
-///
-/// It is also cheaper, and it is checked BEFORE the window is walked: a rate
-/// set that cannot carry the search must be refused without paying for a
-/// search to discover it.
-///
-/// # Why the price bound does not make this redundant
-///
-/// [`max_solvable_final_price`] already covers every all-NON-NEGATIVE rate set,
-/// and not by a small margin: the divisor is at least 1 and scales the net down
-/// at least as fast as the rate scales the product up, so `net * rate` stays
-/// near `100 * final_price` however large the rate gets. A single rate of 1e20 is
-/// safe for exactly that reason.
-///
-/// The qualifier carries the weight, and it is not a formality. An all-NEGATIVE
-/// rate set has a divisor BELOW one, so the divisor AMPLIFIES the net and the
-/// product is bounded by nothing at all — the bound is simply the wrong tool
-/// there, and it is `validate_rate` rejecting negative rates that keeps that
-/// case off every path the product screen can reach.
-///
-/// The remaining hole is a MIXED-sign set, where the cancellation hides in the
-/// sum rather than in one product: `1e20` against `-(1e20 - 0.01)` sums to
-/// `+0.01`, the divisor stays at 1.0001, the net stays near the whole final
-/// price, and the enormous rate is applied at full size. The overflow there does
-/// not depend on the price at all, so no ceiling on the price can prevent it —
-/// only looking.
-///
-/// The steps mirror the contract one for one — multiply, divide by 100, round to
-/// cents, accumulate, add the net — so a `true` here means the real call cannot
-/// overflow and a `false` means it would have.
-fn tax_arithmetic_fits(net: Decimal, taxes: &[Tax]) -> bool {
-    let mut tax_total = Decimal::ZERO;
-    for tax in taxes {
-        let Some(raw) = net.checked_mul(tax.rate) else {
-            return false;
-        };
-        let Some(scaled) = raw.checked_div(PERCENT) else {
-            return false;
-        };
-        let Some(running) = tax_total.checked_add(round_to_cents(scaled)) else {
-            return false;
-        };
-        tax_total = running;
-    }
-    net.checked_add(tax_total).is_some()
 }
 
 /// The markup that makes [`derive_net_sale_price`] produce `net` from `cost`.
@@ -652,59 +425,10 @@ fn solve_markup(cost_price: Decimal, net: Decimal) -> SolveResult<SolvedMarkup> 
     Err(deriver_refusal.unwrap_or(PriceRefusal::FinalPriceMarkupUnreachable))
 }
 
-/// `1 + SUM rate_i / 100`: the factor that turns a net into its exact,
-/// UNROUNDED gross. `None` when the rates gross the net away entirely, which
-/// is the one rate set with no inverse at all.
-///
-/// Deliberately additive and never compounding, because that is what
-/// [`calculate_line_taxes`] does: every rate applies to the same net.
-fn gross_divisor(taxes: &[Tax]) -> Option<Decimal> {
-    let rate_sum = taxes
-        .iter()
-        .try_fold(Decimal::ZERO, |sum, tax| sum.checked_add(tax.rate))?;
-    let divisor = Decimal::ONE.checked_add(rate_sum.checked_div(PERCENT)?)?;
-    (divisor > Decimal::ZERO).then_some(divisor)
-}
-
-/// The window half-width, in cents, that is PROVABLY wide enough to contain the
-/// answer.
-///
-/// The proof: `final(net) = round2(net + SUM round2(net * rate_i / 100))`, and
-/// each of the `n + 1` roundings — one per tax plus the total — moves the exact
-/// value `net * divisor` by at most half a cent. So
-/// `|final - net * divisor| <= (n + 1) / 2` cents, and therefore
-/// `|final / divisor - net| <= (n + 1) / (2 * divisor)` cents, which is what
-/// this returns (rounded up, plus [`SEARCH_MARGIN_CENTS`]).
-///
-/// The divisor is in the formula rather than assumed away on purpose: for an
-/// all-NON-NEGATIVE rate set the divisor is at least 1 and the window is two or
-/// three cents wide, but a set that grosses BELOW the net pushes the true answer
-/// further from the estimate, and a window sized for the common case would miss
-/// it. "Grosses up" means every rate is non-negative, so `divisor >= 1`; it is
-/// NOT a claim about the divisor's value, because a mixed-sign rate set can sum
-/// above zero and still need a wide window.
-///
-/// The claim is a test, not a note: `final_price_the_window_is_sufficient_over_
-/// six_hundred_of_net` walks every net from 0.00 to 600.00 for every rate set
-/// this suite uses and fails if the computed window ever holds no net that
-/// reproduces the target.
-///
-/// [`MAX_SEARCH_RADIUS_CENTS`] then caps the result, for the reason documented
-/// there: a refusal is recoverable and a hang is not.
-fn search_radius_cents(tax_count: usize, divisor: Decimal) -> i64 {
-    let bound_cents = Decimal::from(tax_count as i64 + 1)
-        .checked_div(TWO)
-        .and_then(|half| half.checked_div(divisor))
-        .and_then(|exact| exact.ceil().to_i64())
-        .unwrap_or(MAX_SEARCH_RADIUS_CENTS);
-    bound_cents
-        .saturating_add(SEARCH_MARGIN_CENTS)
-        .min(MAX_SEARCH_RADIUS_CENTS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::line_taxes::{cent, round_to_cents, MONEY_SCALE};
     use std::str::FromStr;
 
     fn dec(value: &str) -> Decimal {
@@ -1075,7 +799,8 @@ mod tests {
     ///
     /// The condition that buys injectivity is "every rate is non-negative", NOT
     /// "the divisor is above one" — which is what the tie-break note in
-    /// `solve_net` used to claim, and which the next test refutes.
+    /// `solve_net_from_gross` used to claim, and which the next test,
+    /// `final_price_a_divisor_above_one_does_not_rule_out_a_tie`, refutes.
     #[test]
     fn final_price_the_tie_break_is_never_needed_when_every_rate_is_non_negative() {
         for rates in [
@@ -1102,7 +827,7 @@ mod tests {
     /// gross to 0.10. The positive rate's contribution grows by 0.001 per cent
     /// of net and the negative one's shrinks by 0.001, and the two cancel.
     ///
-    /// This test exists so the reason in `solve_net` cannot be quietly
+    /// This test exists so the reason in `solve_net_from_gross` cannot be quietly
     /// "simplified" back to a divisor test by a future maintainer who reads it
     /// as equivalent. It is not equivalent, and this is the difference.
     #[test]
@@ -1790,60 +1515,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // The brute-force cross-check: independent evidence, not a plausible answer
     // -----------------------------------------------------------------------
-
-    /// THE WINDOW IS SUFFICIENT, over the range the module docs claim.
-    ///
-    /// `search_radius_cents` is a proven bound, and this is the test that
-    /// produces that claim: for every net in 0.00 to 600.00, and for every rate
-    /// set the suite uses, the window the solve actually computes CONTAINS a net
-    /// whose final price is exactly that net's own final price. A radius that
-    /// were one cent too small would miss at some net in this range, and the
-    /// search would report a target that is perfectly reachable as unreachable.
-    ///
-    /// The claim in the module docs is therefore evidence in this file, not a
-    /// number from a scratch script.
-    #[test]
-    fn final_price_the_window_is_sufficient_over_six_hundred_of_net() {
-        let rate_sets: [Vec<&str>; 10] = [
-            vec![],
-            vec!["21"],
-            vec!["10"],
-            vec!["5"],
-            vec!["100"],
-            vec!["0.5"],
-            vec!["21", "10"],
-            vec!["10", "5"],
-            vec!["21", "10", "5"],
-            vec!["21", "10", "5", "2.5"],
-        ];
-
-        for rates in rate_sets {
-            let taxes = taxes(&rates);
-            let divisor = gross_divisor(&taxes).expect("a non-negative rate set inverts");
-            let radius = search_radius_cents(taxes.len(), divisor);
-
-            for cents in 0..=60_000i64 {
-                let net = Decimal::new(cents, MONEY_SCALE);
-                let target = calculate_line_taxes(net, &taxes)
-                    .expect("a non-negative rate set carries an ordinary net")
-                    .total;
-                let base = round_to_cents(target / divisor);
-
-                let in_window = (-radius..=radius).any(|offset| {
-                    calculate_line_taxes(base + cent() * Decimal::from(offset), &taxes)
-                        .expect("a non-negative rate set carries an ordinary net")
-                        .total
-                        == target
-                });
-                assert!(
-                    in_window,
-                    "{net} with {rates:?} grosses to {target} and the window \
-                     {base} +/- {radius} cents holds no net that reproduces it: \
-                     the radius is too small"
-                );
-            }
-        }
-    }
 
     /// A wide sweep: every net in a long range is asked for ITS OWN final
     /// price, and the solve has to hand back a net that re-derives to exactly

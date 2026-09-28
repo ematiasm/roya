@@ -4,6 +4,7 @@ pub mod customers;
 pub mod documents;
 pub mod final_price;
 pub mod finance_methods;
+pub mod gross_inverse;
 pub mod identity;
 pub mod inventory;
 pub mod line_taxes;
