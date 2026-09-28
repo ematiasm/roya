@@ -9,6 +9,7 @@ use axum::{
     extract::{Extension, Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
+    Json,
     routing::{get, post, put},
     Router,
 };
@@ -387,6 +388,139 @@ struct SuggestionListPartial {
     suggestions: SuggestionFigures,
     has_suggestions: bool,
     today: String,
+}
+
+// ---------------------------------------------------------------------------
+// The entry row's preview: the counterpart of whichever figure was typed
+// ---------------------------------------------------------------------------
+
+/// What the entry row's preview asks. The two costs and the basis travel as
+/// query parameters, exactly as they travel on the post, because the preview
+/// and the write must be asking about the SAME pair — a preview that resolved a
+/// different figure than the write would store is worse than no preview.
+///
+/// `product_id` and `product` are both accepted for the reason the add line
+/// accepts both: a chosen product travels as an id and a typed one as text, and
+/// the preview resolves text through the very same `resolve_product_ref` the
+/// add does, so a scan and a click cannot disagree about which product is meant.
+#[derive(Debug, Deserialize)]
+pub struct CostPreviewQuery {
+    #[serde(default)]
+    pub product_id: Option<i64>,
+    #[serde(default)]
+    pub product: String,
+    #[serde(default)]
+    pub unit_cost: String,
+    #[serde(default)]
+    pub unit_cost_gross: String,
+    #[serde(default)]
+    pub cost_basis: String,
+}
+
+/// The answer the page writes with. Three fields and no more:
+///
+/// * `field` — which of the two inputs the figure belongs in, so the client
+///   writes into the OTHER one and never into the field the operator is in.
+/// * `value` — the figure, already in the DISPLAY form of the active locale,
+///   because it goes straight into a text input the operator reads, and the
+///   write must be able to parse back what it showed.
+/// * `refusal` — the sentence, in the operator's language, when the side they
+///   typed cannot be priced. `null` figures never carry one: a refusal
+///   publishes no amount, and a figure never carries a sentence.
+#[derive(Debug, serde::Serialize)]
+pub struct CostPreview {
+    pub field: Option<&'static str>,
+    pub value: Option<String>,
+    pub refusal: Option<String>,
+}
+
+impl CostPreview {
+    /// Nothing to say. The shape the page reads as "leave both fields alone".
+    fn silent() -> CostPreview {
+        CostPreview {
+            field: None,
+            value: None,
+            refusal: None,
+        }
+    }
+}
+
+/// The entry row's preview, behind the READ gate the record page itself
+/// carries, and a GET so that "it persists nothing" is structural: there is no
+/// write verb on this path, and a POST is answered 405.
+///
+/// # A 200 even when there is nothing to say
+///
+/// The four silent states — no product chosen, a product name that resolves to
+/// nothing, no cost typed, a half-typed cost — are states an operator passes
+/// THROUGH while typing. A 404 or a 400 on any of them would be a message about
+/// their typing, raised before they finished, in the one place on the page where
+/// they are mid-sentence. The write is what refuses; the preview's job is to
+/// show the counterpart, or to say nothing at all.
+///
+/// # Where the refusal goes
+///
+/// In the body, as `refusal`, and NOT as a 4xx. A 4xx reaches
+/// `htmx:responseError`, which paints the notice box and names a failed ACTION;
+/// a preview is not an action and never completed anything, and the operator
+/// needs the sentence beside the number they typed rather than at the top of the
+/// page. The sentence itself comes from the ONE shared mapping, through
+/// `price_refusal_message`, so this surface cannot word a rule differently from
+/// the write that will enforce it.
+async fn web_preview_line_cost(
+    State(state): State<AppState>,
+    _: Require<PurchasesRead>,
+    Extension(localization): Extension<LocalizationContext>,
+    Query(query): Query<CostPreviewQuery>,
+) -> AppResult<Json<CostPreview>> {
+    // An unreadable figure is the silent state, not a refusal: the operator is
+    // still typing, and the write is where a typo becomes a 400 naming the
+    // field. Anything else is left to propagate.
+    let Ok(typed) = TypedCost::read(
+        &query.unit_cost,
+        &query.unit_cost_gross,
+        &query.cost_basis,
+        &localization,
+    ) else {
+        return Ok(Json(CostPreview::silent()));
+    };
+    if matches!(
+        purchase_cost::cost_ask(typed.basis, typed.net, typed.gross),
+        purchase_cost::CostAsk::Unstated
+    ) {
+        return Ok(Json(CostPreview::silent()));
+    }
+    // The product, resolved the way the add resolves it: a chosen id wins, and
+    // text goes through the inventory service. A text that resolves to nothing
+    // is the silent state too — the operator is still typing a product.
+    let product_id = match query.product_id.filter(|id| *id > 0) {
+        Some(id) => id,
+        None => match state
+            .inventory_service
+            .resolve_product_ref(&query.product)
+            .await
+        {
+            Ok(product) => product.id,
+            Err(_) => return Ok(Json(CostPreview::silent())),
+        },
+    };
+    match typed_counterpart(&state, product_id, &typed).await {
+        Ok((basis, Some(value))) => Ok(Json(CostPreview {
+            field: Some(match basis {
+                CostBasis::Net => "net",
+                CostBasis::Gross => "gross",
+            }),
+            value: Some(localization.format_decimal(value)),
+            refusal: None,
+        })),
+        Ok((_, None)) => Ok(Json(CostPreview::silent())),
+        Err(AppError::PriceRefused(refusal)) => Ok(Json(CostPreview {
+            field: None,
+            value: None,
+            refusal: Some(crate::routes::price_refusal_message(&refusal, &localization)),
+        })),
+        Err(other) => Err(other),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,6 +1541,19 @@ async fn web_add_line_impl(
 
 /// Collection adapter: the typed-id form posts the purchase id in the body and
 /// delegates to the path-based handler, so both URL shapes keep working.
+/// Collection adapter for the preview, for the same reason the add line has
+/// one: a caller that addresses the purchase by id in the body rather than in
+/// the path gets the same answer from the same handler. The preview takes no
+/// body, so the adapter simply delegates — the gate and the reads are identical.
+async fn web_preview_line_cost_collection(
+    State(state): State<AppState>,
+    gate: Require<PurchasesRead>,
+    Extension(localization): Extension<LocalizationContext>,
+    Query(query): Query<CostPreviewQuery>,
+) -> AppResult<Json<CostPreview>> {
+    web_preview_line_cost(State(state), gate, Extension(localization), Query(query)).await
+}
+
 async fn web_add_line_collection(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
@@ -1912,6 +2059,11 @@ pub fn router() -> Router<AppState> {
             get(web_purchase_detail).delete(web_delete_draft),
         )
         .route("/web/purchases/{id}/lines", post(web_add_line))
+        .route("/web/purchases/{id}/lines/cost", get(web_preview_line_cost))
+        .route(
+            "/web/purchases/lines/cost",
+            get(web_preview_line_cost_collection),
+        )
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}",
             put(web_update_line)
@@ -7550,6 +7702,247 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("the refusal body has no error message: {body}"))
             .to_string()
+    }
+
+    /// The entry row's preview, read as JSON. A preview is a 200 even when it
+    /// has nothing to say, so a half-typed cost never raises a notice: what the
+    /// operator needs then is silence, and the write is the thing that refuses.
+    async fn preview_cost(
+        app: axum::Router,
+        uri: &str,
+        cookie: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// THE MIRROR, both directions, over HTTP. A gross typed into the entry row
+    /// answers the net; a net typed into it answers the gross. The answer names
+    /// WHICH field it belongs in, so the page writes into the other one without
+    /// having to infer a direction the client cannot know.
+    #[tokio::test]
+    async fn the_entry_row_preview_answers_the_counterpart_in_both_directions() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+        let localization = crate::localization::load_context(&state.pool)
+            .await
+            .unwrap();
+        let base = format!("/web/purchases/{}/lines/cost", entry.purchase_id);
+
+        let (status, json) = preview_cost(
+            app.clone(),
+            &format!(
+                "{base}?product_id={}&unit_cost=&unit_cost_gross=6.05&cost_basis=gross",
+                entry.product_id
+            ),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["field"], "net", "{json}");
+        let shown = json["value"].as_str().unwrap_or_else(|| panic!("{json}"));
+        assert_eq!(
+            localization.parse_decimal(shown).unwrap(),
+            dec_web("5.00"),
+            "{json}: the answer is a figure, and it reads back as the exact net — whatever the \
+             locale's rendering is, the number under it is the stored one"
+        );
+        assert_eq!(json["refusal"], serde_json::Value::Null, "{json}");
+
+        let (status, json) = preview_cost(
+            app,
+            &format!(
+                "{base}?product_id={}&unit_cost=5.00&unit_cost_gross=&cost_basis=net",
+                entry.product_id
+            ),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["field"], "gross",
+            "{json}: the net's counterpart is the gross"
+        );
+        assert_eq!(
+            localization
+                .parse_decimal(json["value"].as_str().unwrap_or_else(|| panic!("{json}")))
+                .unwrap(),
+            dec_web("6.05"),
+            "{json}: 5,00 at 21% grosses to exactly 6,05"
+        );
+    }
+
+    /// A staircase gap is reported as a REFUSAL in the body, not as a 400 and
+    /// not as silence: the operator typed a figure, and the answer to that is a
+    /// sentence, not an error box about a failed request.
+    #[tokio::test]
+    async fn the_preview_reports_a_staircase_gap_as_a_refusal_in_its_body() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+
+        let (status, json) = preview_cost(
+            app,
+            &format!(
+                "/web/purchases/{}/lines/cost?product_id={}&unit_cost=&unit_cost_gross=0.03&cost_basis=gross",
+                entry.purchase_id, entry.product_id
+            ),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["value"], serde_json::Value::Null, "{json}");
+        assert_eq!(
+            json["refusal"],
+            crate::models::PriceRefusal::CostUnreachable.as_str(),
+            "{json}"
+        );
+    }
+
+    /// A preview with nothing to solve against answers nothing, and says so with
+    /// a 200: no product chosen yet, no cost typed yet, a half-typed cost, and a
+    /// product name that resolves to nothing. All four are states an operator
+    /// passes THROUGH while typing, and an error box on any of them would be a
+    /// message about their typing rather than about their document.
+    #[tokio::test]
+    async fn the_preview_is_silent_while_there_is_nothing_to_solve() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+        let base = format!("/web/purchases/{}/lines/cost", entry.purchase_id);
+
+        for query in [
+            // No product at all: the picker has not chosen one.
+            format!("{base}?unit_cost=&unit_cost_gross=6.05&cost_basis=gross"),
+            // A product name that resolves to nothing.
+            format!("{base}?product=not-a-product&unit_cost_gross=6.05&cost_basis=gross"),
+            // No cost typed.
+            format!("{base}?product_id={}&unit_cost=&unit_cost_gross=", entry.product_id),
+            // A half-typed cost: the operator is still typing it.
+            format!("{base}?product_id={}&unit_cost=&unit_cost_gross=6.&cost_basis=gross", entry.product_id),
+        ] {
+            let (status, json) =
+                preview_cost(app.clone(), &query, test_support::TEST_COOKIE).await;
+            assert_eq!(status, StatusCode::OK, "{query}: {json}");
+            assert_eq!(json["value"], serde_json::Value::Null, "{query}: {json}");
+            assert_eq!(
+                json["refusal"],
+                serde_json::Value::Null,
+                "{query}: a half-typed cost is not a refusal: {json}"
+            );
+        }
+    }
+
+    /// The preview's answer is the DISPLAY form of the figure, because it goes
+    /// straight into a text input the operator reads. Under a comma-decimal
+    /// locale the number it writes is the one that locale's parser reads back —
+    /// the round trip through the form, which is the only trip that matters.
+    #[tokio::test]
+    async fn the_preview_answers_the_displayed_figure_and_reads_back_through_the_write() {
+        let state = test_state().await;
+        set_locale(&state, "es-AR", "es").await;
+        let entry = cost_entry(&state).await;
+        let app = crate::routes::router(state.clone());
+        let base = format!("/web/purchases/{}/lines/cost", entry.purchase_id);
+
+        let (status, json) = preview_cost(
+            app.clone(),
+            &format!(
+                "{base}?product_id={}&unit_cost=&unit_cost_gross=6%2C05&cost_basis=gross",
+                entry.product_id
+            ),
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let shown = json["value"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{json}"))
+            .to_string();
+        let locale = crate::localization::load_context(&state.pool).await.unwrap();
+        assert_eq!(
+            shown,
+            locale.format_decimal(
+                crate::services::purchase_cost::solve_net_cost_from_gross(
+                    dec_web("6.05"),
+                    &state
+                        .tax_service
+                        .list_active_for_product(entry.product_id)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap(),
+            ),
+            "the answer is rendered through the SAME formatter the net field uses, so a figure \
+             cannot look like one thing here and another there: {json}"
+        );
+        assert!(
+            !shown.contains('.'),
+            "a comma-decimal locale must not receive a dot: {shown}"
+        );
+
+        // And posting that exact string back is what the page does next.
+        let (status, body) = add_cost_line(
+            app,
+            entry.purchase_id,
+            &format!(
+                "product_id={}&qty=1&unit_cost={shown}&unit_cost_gross=&cost_basis=net",
+                entry.product_id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:.400}");
+        assert_eq!(
+            stored_unit_cost(&state, entry.purchase_id, entry.product_id).await,
+            dec_web("5.00"),
+            "the figure the preview showed is the figure the write stored"
+        );
+    }
+
+    /// The preview is a READ, so it is gated on the READ permission and answers
+    /// both registered URL shapes with the full-page refusal card for a
+    /// principal that cannot open the page it belongs to. A preview that
+    /// computed for a principal who cannot see the document would be a way to
+    /// read a product's tax set through a page the gate hides.
+    #[tokio::test]
+    async fn the_cost_preview_is_gated_on_the_purchases_read_permission() {
+        let state = test_state().await;
+        let entry = cost_entry(&state).await;
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        for uri in [
+            format!(
+                "/web/purchases/{}/lines/cost?product_id={}&unit_cost_gross=6.05",
+                entry.purchase_id, entry.product_id
+            ),
+            format!(
+                "/web/purchases/lines/cost?product_id={}&unit_cost_gross=6.05",
+                entry.product_id
+            ),
+        ] {
+            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.300}");
+            assert!(
+                html.contains("Action not permitted") && html.contains("purchases.read"),
+                "{uri} must refuse naming purchases.read: {html:.400}"
+            );
+        }
     }
 
     /// A product of its own, for a rate set that only one refusal test links.
