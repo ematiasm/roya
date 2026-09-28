@@ -1272,8 +1272,19 @@ pub struct AddLineForm {
     /// barcode, then exact SKU (case-insensitive), then a numeric id.
     #[serde(default)]
     pub product: String,
+    /// The quantity, and it is OPTIONAL because the entry row stopped asking for
+    /// one: a bare scan or a bare accept posts no quantity at all, and the
+    /// operator's intent there is unambiguous — "one, and tell me about it".
+    ///
+    /// The default is `None` -> `Decimal::ONE` in the ROUTE, never inside
+    /// `add_or_increment_line`, and the reason is a caller this form is not: the
+    /// JSON API's `AddLineRequest` requires an explicit quantity, and the
+    /// service's `qty > 0` is the guard that refuses a machine client's zero.
+    /// A default reached from the service would turn that 400 into a line for
+    /// every caller. So the form is looser than the service, on purpose and in
+    /// exactly one place.
     #[serde(default)]
-    pub qty: String,
+    pub qty: Option<String>,
     /// The net cost. Optional here, as it has always been: an empty cost falls
     /// back to the supplier's satellite and then to the product column.
     #[serde(default)]
@@ -1460,7 +1471,21 @@ async fn web_add_line_impl(
     id: i64,
     form: AddLineForm,
 ) -> AppResult<Response> {
-    let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
+    let qty = match form.qty.as_deref() {
+        Some(raw) => parse_required_decimal(raw, "qty", &localization)?,
+        // THE DEFAULT, and the one place it exists. The entry row carries only
+        // the product search, so a scan or an accept posts no quantity and
+        // arrives here as `None`; "one" answers a request nobody made, and the
+        // line is where the operator corrects it if that is wrong.
+        //
+        // It resolves BEFORE the product, as it always did, and for the same
+        // reason: an unreadable quantity is still the sentence the operator sees
+        // before anything else is read. A STATED zero is not the absent case and
+        // is not softened here — it parses, and the service's `qty > 0` refuses
+        // it. See [`AddLineForm::qty`] for why the default cannot live lower
+        // down.
+        None => Decimal::ONE,
+    };
     // An explicit product id (a clicked result) wins over the typed text; a scan
     // or an Enter carries only the value and resolves through inventory. It is
     // resolved BEFORE the cost because the cost's tax set belongs to the
@@ -5614,8 +5639,95 @@ mod tests {
         assert_entry_row_is_empty_and_focused(&added);
     }
 
-    /// AC10 (clicked result): a result is its own add action; the request includes
-    /// the picker form, so the quantity travels, and supplies the product id
+    /// THE DEFAULT, and the reason the entry row can lose its quantity input.
+    ///
+    /// `value="1"` on that input was MARKUP: the server had no default, so the
+    /// form posted a quantity the operator never chose. This posts the add form
+    /// with no `qty` field AT ALL — the exact body a bare scan produces once the
+    /// input is gone — and requires the line to arrive at one unit, priced by
+    /// the same resolution an empty cost has always used.
+    ///
+    /// The default lives at the FORM boundary, in this route, and nowhere else.
+    /// `add_or_increment_line` keeps `qty: Decimal` and its `qty > 0` guard
+    /// absolutely: that guard is what refuses a machine client's zero-quantity
+    /// line, and a default reached from inside the service would quietly turn
+    /// that 400 into a line for EVERY caller, JSON API included. The third
+    /// assertion below is what holds that line — a web post that states
+    /// `qty=0` is still a refusal, so "absent" and "zero" cannot be one thing.
+    #[tokio::test]
+    async fn a_scan_with_no_quantity_field_at_all_adds_one_unit() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let scanned = seed_extra_product(&state, "SCAN-DEFAULT", Some("7791234567892")).await;
+        let app = crate::routes::router(state.clone());
+
+        // A bare scan: the typed value and nothing else. No `qty`, no cost.
+        let (status, _, added) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            "product=7791234567892&unit_cost=",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an absent quantity is one unit, not a 400: {added}"
+        );
+
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        let line = detail
+            .lines
+            .iter()
+            .find(|line| line.product_id == scanned.id)
+            .expect("the scan adds its own line");
+        assert_eq!(
+            line.qty,
+            Decimal::ONE,
+            "the default IS one: the operator never chose a quantity"
+        );
+        assert_eq!(
+            line.unit_cost,
+            Decimal::from(10),
+            "and the cost is still resolved, not defaulted: an empty cost is the product column here, \
+             because this supplier has no satellite row"
+        );
+
+        // The default is for an ABSENT field only. A stated zero is a refusal,
+        // and it stays one: this is the assertion that would fail if the
+        // default were reached from inside the service instead of from the form.
+        let (status, _, refused) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            "product=7791234567892&unit_cost=&qty=0",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`qty > 0` is the service's invariant and the default must not loosen it: {refused}"
+        );
+        assert_eq!(
+            state
+                .purchases_service
+                .get_detail(fixture.purchase_id)
+                .await
+                .unwrap()
+                .lines
+                .len(),
+            2,
+            "the refused add stored nothing: only the fixture's own line and the scan's"
+        );
+    }
+
+    /// AC10 (clicked result): a result is its own add action; the request carries
+    /// the quantity on the wire, which is where it has lived since the entry row
+    /// stopped rendering a field for it, and the result supplies the product id
     /// itself. The typed text is not an exact match on purpose.
     #[tokio::test]
     async fn n4_purchase_line_clicked_result_uses_the_picker_quantity() {
