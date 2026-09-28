@@ -450,6 +450,8 @@ where
                     net_price,
                     net_is_derived: net_refusal.is_none() && markup_pct.is_some(),
                     net_refusal,
+                    cost_total: Decimal::ZERO,
+                    cost_refusal: None,
                     inputs_unreadable: false,
                     from_form: true,
                     breakdown: Vec::new(),
@@ -468,6 +470,8 @@ where
                 net_price: Decimal::ZERO,
                 net_is_derived: false,
                 net_refusal: Some(refusal),
+                cost_total: Decimal::ZERO,
+                cost_refusal: None,
                 inputs_unreadable: false,
                 from_form: true,
                 breakdown: Vec::new(),
@@ -523,6 +527,42 @@ where
                 Err(refusal) => ladder.net_refusal = Some(refusal),
             }
         }
+
+        // And then the COST half, DELIBERATELY UNGUARDED — not
+        // `net_refusal.is_none()`, and not a condition of any kind. The price
+        // half is guarded because a breakdown computed from a price that does
+        // not exist would be a fabrication, and that is a fact about the NET. It
+        // says nothing about the cost, for a business reason rather than a
+        // technical one: `validate_effective_prices` never compares
+        // `cost_price` to the sale price, so a manual-price product may
+        // legitimately carry `cost > net` — a clearance, a stale price, a
+        // deliberate loss leader — and the save accepts it. On such a product the
+        // cost is the LARGER of the two bases, so it is the cost's arithmetic
+        // that can refuse while the net's succeeds. Inheriting the guard here
+        // would blank the figure on exactly the products whose margin is most
+        // worth reading, and would blank it for a refusal that is not the cost's
+        // to answer. The same argument runs the other way: a markup that fails
+        // derivation leaves a product with no net price and a perfectly
+        // storable cost, and that cost is a figure the operator is editing.
+        //
+        // So this is its own half, on its own base, over the SAME product-scoped
+        // tax set resolved once at the top of this function, and its refusal goes
+        // in its OWN slot. Two refusals may be populated at the same time, and
+        // neither hides the other: they are answers about two different numbers,
+        // and collapsing them would make the ladder lie about one of them.
+        //
+        // A refused cost publishes NO AMOUNT. The amount is a `Decimal` beside
+        // `cost_refusal`, the same shape as the net beside `net_refusal`, so the
+        // ZERO it carries on refusal is not distinguishable from a real zero by
+        // looking at the amount: the REFUSAL is the only discriminator, and the
+        // presentation layer has to guard on it exactly as it does for the net.
+        // That guard is the price of this field being a `Decimal` rather than
+        // something empty — see the field's own doc comment.
+        match calculate_line_taxes(ladder.cost_price, &taxes) {
+            Ok(calc) => ladder.cost_total = calc.total,
+            Err(refusal) => ladder.cost_refusal = Some(refusal),
+        }
+
         Ok(ladder)
     }
 }
@@ -537,6 +577,8 @@ fn stored_ladder(product: &crate::models::Product, unreadable: bool) -> ProductP
         net_price: product.sale_price,
         net_is_derived: product.markup_pct.is_some(),
         net_refusal: None,
+        cost_total: Decimal::ZERO,
+        cost_refusal: None,
         inputs_unreadable: unreadable,
         from_form: false,
         breakdown: Vec::new(),
@@ -1048,6 +1090,231 @@ mod tests {
             .await
             .unwrap()
             .id
+    }
+
+    /// THE MISSING FIGURE. This ladder published four figures about the SALE and
+    /// nothing about the COST, which is a half answer to the only question a
+    /// margin is made of. The arithmetic is not new: it is the SAME contract
+    /// called on `cost_price` instead of on the net, over the SAME resolved tax
+    /// set, so the two halves cannot disagree about which taxes apply or about
+    /// a cent.
+    #[tokio::test]
+    async fn price_ladder_publishes_the_costs_tax_inclusive_figure() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+
+        let ladder = s.product_price_ladder(product_id, None).await.unwrap();
+        // The contract is CALLED HERE, in the test, on the tax set the ladder
+        // itself resolves. A hand-written "6.05" would only prove the assertion
+        // agrees with itself; this pins the figure to the definition of a gross.
+        let taxes = s.list_active_for_product(product_id).await.unwrap();
+        let expected = calculate_line_taxes(dec("5"), &taxes).unwrap().total;
+        assert_eq!(expected, dec("6.05"), "5 plus 21% of 5");
+        assert_eq!(ladder.cost_total, expected);
+        assert_ne!(
+            ladder.cost_total,
+            dec("5"),
+            "the figure is the GROSS of the cost, not the net the ladder already published"
+        );
+        assert!(ladder.cost_refusal.is_none());
+    }
+
+    /// No linked tax is the state PRODUCTION is in — migrations seed no tax
+    /// catalogue — and it is the state in which a figure equal to its own base
+    /// looks like a bug rather than an answer. It is also the state where the
+    /// ladder must not invent a second tax the product does not have.
+    #[tokio::test]
+    async fn price_ladder_publishes_the_cost_unchanged_when_no_tax_is_linked() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+
+        let ladder = s.product_price_ladder(product_id, None).await.unwrap();
+        assert!(
+            ladder.breakdown.is_empty(),
+            "the product has no tax, so the ladder must not invent one"
+        );
+        assert_eq!(
+            ladder.cost_total,
+            dec("5"),
+            "an untaxed cost publishes the cost itself, to the cent"
+        );
+        assert!(ladder.cost_refusal.is_none());
+    }
+
+    /// THE CASE THE FIGURE EXISTS FOR. `validate_effective_prices` never compares
+    /// the cost to the price, so a manual-price product may legitimately carry
+    /// `cost > net` — a clearance, a stale price, a deliberate loss leader — and
+    /// the save accepts it. On such a product the cost is the LARGER of the two
+    /// bases, so the cost's arithmetic is the one that can overflow, and a cost
+    /// half that inherited the price half's guard would be blank on precisely the
+    /// products whose margin is worth reading.
+    #[tokio::test]
+    async fn price_ladder_publishes_the_cost_figure_when_a_manual_price_costs_more_than_it_sells_for(
+    ) {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+
+        let ladder = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("10"),
+                    cost_price: dec("50"),
+                    markup_pct: None,
+                }),
+            )
+            .await
+            .unwrap();
+        // The markup is not what produced this net — the operator typed it — and
+        // the price rule says nothing at all about a cost above the price.
+        assert!(ladder.net_refusal.is_none(), "{ladder:?}");
+        assert!(!ladder.net_is_derived);
+        assert_eq!(ladder.net_price, dec("10"));
+        assert_eq!(ladder.tax_total, dec("2.10"));
+        assert_eq!(ladder.total, dec("12.10"));
+        // 50 plus 21% of 50, over the same tax set: the LARGER base is the one
+        // that has to be published, not the smaller one.
+        assert_eq!(ladder.cost_total, dec("60.50"));
+        assert!(ladder.cost_refusal.is_none());
+    }
+
+    /// THE INDEPENDENCE, one direction: a refused COST is not an answer about
+    /// the price, so it must leave every net figure exactly as it was. Guarding
+    /// the cost half on `net_refusal` would not be caught by any of the tests
+    /// above, where both halves succeed — it is caught by the arithmetic of this
+    /// one, where a net of 10 carries the ceiling rate comfortably while a cost
+    /// of 1e26 does not.
+    #[tokio::test]
+    async fn price_ladder_refuses_the_cost_without_touching_the_net_figures() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        // The ceiling rate, which is a storable rate and not a fabricated one:
+        // `Decimal` carries 28 significant digits, so 1e26 x 1000% leaves the
+        // range while 10 x 1000% does not.
+        let huge = link(&s, "IVA1000", "1000").await;
+        s.link_product_tax(1, product_id, huge).await.unwrap();
+
+        let ladder = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("10"),
+                    cost_price: dec("1e26"),
+                    markup_pct: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ladder.cost_refusal,
+            Some(PriceRefusal::TaxArithmeticTooLarge),
+            "the cost's own arithmetic, on the product's own tax set"
+        );
+        // The amount beside a refusal is `Decimal::ZERO` — the same value a cost
+        // that really is zero produces, which is precisely why it is the REFUSAL
+        // and never the amount that answers "was there a cost figure here".
+        assert_eq!(ladder.cost_total, Decimal::ZERO);
+        // And the net is untouched: same net, same breakdown, same total.
+        assert!(ladder.net_refusal.is_none(), "{ladder:?}");
+        assert_eq!(ladder.net_price, dec("10"));
+        assert_eq!(ladder.breakdown.len(), 1);
+        assert_eq!(ladder.breakdown[0].amount, dec("100"));
+        assert_eq!(ladder.tax_total, dec("100"));
+        assert_eq!(ladder.total, dec("110"));
+    }
+
+    /// THE INDEPENDENCE, the other direction, and the arm that proves the
+    /// independence is not a lucky ordering. This is the form-shape refusal: the
+    /// operator emptied the manual price, so there is no net to show, and the
+    /// arm carries the cost precisely so the rung being edited stays visible.
+    /// If the cost figure were derived from the net, this refusal would take the
+    /// cost with it — the operator would be told their price was wrong AND lose
+    /// the cost they were in the middle of typing.
+    #[tokio::test]
+    async fn price_ladder_publishes_the_cost_figure_on_a_refused_net() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let iva = link(&s, "IVA21", "21").await;
+        s.link_product_tax(1, product_id, iva).await.unwrap();
+
+        let ladder = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Refused {
+                    refusal: PriceRefusal::SalePriceRequired,
+                    cost_price: dec("5"),
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ladder.net_refusal, Some(PriceRefusal::SalePriceRequired));
+        assert!(ladder.breakdown.is_empty(), "the net side is refused");
+        assert_eq!(ladder.tax_total, Decimal::ZERO);
+        assert_eq!(ladder.total, Decimal::ZERO);
+        // The cost side is not, and says so with a figure.
+        assert_eq!(ladder.cost_total, dec("6.05"));
+        assert!(ladder.cost_refusal.is_none());
+    }
+
+    /// A REFUSED FIGURE is the refusal plus a `Decimal::ZERO` beside it, and the
+    /// test below proves the pair is the whole answer: the amount on a refusal is
+    /// the SAME value a cost that genuinely is zero produces, so the amount
+    /// cannot answer the question on its own and only the refusal can. That is
+    /// the net's `Decimal` + `Option<PriceRefusal>` shape, deliberately, and the
+    /// presentation layer guards on the refusal exactly as it already does for
+    /// the net — a zero beside a refusal is a number a careless template WILL
+    /// print, and the guard is what stops it.
+    #[tokio::test]
+    async fn price_ladder_a_refused_cost_figure_carries_its_refusal_beside_a_zero_amount() {
+        let (s, _pool, product_id) = svc_with_product("100").await;
+        let huge = link(&s, "IVA1000", "1000").await;
+        s.link_product_tax(1, product_id, huge).await.unwrap();
+
+        // The refused cost: the arithmetic leaves the range, so there is no amount.
+        let refused = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("10"),
+                    cost_price: dec("1e26"),
+                    markup_pct: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.cost_refusal,
+            Some(PriceRefusal::TaxArithmeticTooLarge),
+            "the refusal is what says there is no figure, and it is the cost's own"
+        );
+        assert_eq!(refused.cost_total, Decimal::ZERO);
+
+        // A cost that REALLY is zero, over the same tax set, succeeds. Its amount
+        // is the same `Decimal::ZERO` — which is the point: the old `""` assertion
+        // could tell a refusal from a real zero only because the two had different
+        // SHAPES, and that is a weaker guarantee than being able to read the
+        // difference off the refusal itself.
+        let zero_cost = s
+            .product_price_ladder(
+                product_id,
+                Some(LadderInput::Form {
+                    kind: None,
+                    sale_price: dec("10"),
+                    cost_price: dec("0"),
+                    markup_pct: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(zero_cost.cost_refusal, None, "a zero cost is not a refusal");
+        assert_eq!(zero_cost.cost_total, Decimal::ZERO);
+        assert_eq!(
+            refused.cost_total, zero_cost.cost_total,
+            "the two amounts are indistinguishable, which is exactly why the refusal \
+             is the answer and never the amount"
+        );
     }
 
     /// An unknown product is a 404, not a silent zero ladder: the drawer already
