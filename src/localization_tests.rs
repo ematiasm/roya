@@ -376,6 +376,252 @@ fn formatting_preserves_every_stored_decimal_place_and_uses_the_business_timezon
     );
 }
 
+/// The two number conventions this repo ships, side by side: `en-US` groups
+/// with `,` and separates the fraction with `.`, an `es` locale does the
+/// opposite. Every money assertion runs in BOTH, because a comma-decimal locale
+/// is where a hand-rolled fraction pad is most likely to be wrong — the group
+/// character and the decimal character are the SAME character there and
+/// different characters here, so an implementation that reuses one for the other
+/// passes in half the locales and lies in the other half.
+fn money_contexts() -> [(&'static str, LocalizationContext); 2] {
+    [
+        (
+            "en-US",
+            resolve_context(
+                Some(&{
+                    let mut value = settings("en-US");
+                    value.currency_code = "USD".into();
+                    value
+                }),
+                &[locale("en-US", "en", true)],
+            ),
+        ),
+        (
+            "es-AR",
+            resolve_context(Some(&settings("es-AR")), &[locale("es-AR", "es", true)]),
+        ),
+    ]
+}
+
+fn dec(text: &str) -> Decimal {
+    Decimal::from_str(text).unwrap()
+}
+
+/// The context of ONE of the two conventions, by its locale code. Every money
+/// assertion states its expected text PER LOCALE rather than per value,
+/// because the fraction is written in the locale's own decimal character and a
+/// table that said `"5.00"` for both would be asserting the wrong thing for one
+/// of them.
+fn money_context(locale_code: &str) -> LocalizationContext {
+    money_contexts()
+        .into_iter()
+        .find(|(code, _)| *code == locale_code)
+        .map(|(_, context)| context)
+        .unwrap_or_else(|| panic!("{locale_code} is not one of the two conventions"))
+}
+
+/// THE DEFECT, in one line: two `Decimal`s that are the same NUMBER render as
+/// two different figures, so a form shows the operator one cost at two scales
+/// side by side and the row reads as two prices. A net solved from a typed
+/// gross arrives at whatever scale the solve produced; a hand-typed cost
+/// arrives at whatever the operator typed. Neither is wrong, and that is
+/// exactly the problem: the display, not the storage, is where they disagree.
+///
+/// `format_decimal` is asserted beside this on purpose. It is NOT fixed here —
+/// see `format_money`'s own doc comment for why it is a separate change with
+/// its own review — and a test that quietly stopped checking it would let that
+/// gap close by accident.
+#[test]
+fn money_renders_the_same_number_at_the_same_scale_whatever_scale_it_carries() {
+    for (label, carried, expected) in [
+        ("en-US", "5", "5.00"),
+        ("en-US", "5.5", "5.50"),
+        ("en-US", "5.00", "5.00"),
+        ("es-AR", "5", "5,00"),
+        ("es-AR", "5.5", "5,50"),
+        ("es-AR", "5.00", "5,00"),
+    ] {
+        let context = money_context(label);
+        let value = dec(carried);
+        assert_eq!(
+            context.format_money(value),
+            format!("{expected} {}", context.currency_code),
+            "a scale-{} {label} value renders at the currency's scale",
+            value.scale()
+        );
+    }
+
+    // The invariance, said outright: the scale a value CARRIES is not part of
+    // what a reader is shown. These two are one number.
+    for (label, context) in money_contexts() {
+        assert_eq!(
+            context.format_money(dec("5")),
+            context.format_money(dec("5.00")),
+            "{label}: a scale-0 and a scale-2 rendering of one number are one \
+             figure, or a form shows one price at two scales"
+        );
+    }
+
+    let (label, context) = &money_contexts()[0];
+    assert_eq!(
+        context.format_decimal(dec("5")),
+        "5",
+        "the general formatter still renders at the scale it carries, in {label} \
+         and everywhere else: changing it is a separate change with its own review"
+    );
+}
+
+/// NEVER TRUNCATE, NEVER ROUND. A value carrying more decimals than the
+/// currency has is not a value to shorten — `"1.234"` printed as `"1.23"` is a
+/// DIFFERENT NUMBER, and printing it is a lie about what the line costs. So the
+/// fraction is shown whole, at every place it carries.
+///
+/// Truncation is what a `Decimal::round_dp` or a truncating pad would do here,
+/// and both are caught by this: a truncating pad shortens the scale-3 value to
+/// two places, and `round_dp` shortens it to the same two places by a different
+/// road. Neither is allowed, so the assertion is on all three places.
+#[test]
+fn money_keeps_every_decimal_place_a_fraction_longer_than_the_currency_carries() {
+    for (label, carried, expected) in [
+        ("en-US", "1.234", "1.234"),
+        ("en-US", "1.2345", "1.2345"),
+        ("es-AR", "1.234", "1,234"),
+        ("es-AR", "1.2345", "1,2345"),
+    ] {
+        let context = money_context(label);
+        assert_eq!(
+            context.format_money(dec(carried)),
+            format!("{expected} {}", context.currency_code),
+            "a scale-{} {label} value is rendered whole, never shortened",
+            dec(carried).scale()
+        );
+    }
+}
+
+/// The sign, and the two separators, in both conventions. Grouping is asserted
+/// on a whole part long enough to need it more than once, because a pad that
+/// builds the group character from the decimal character — or reuses the pad's
+/// separator for the group — passes on a two-digit whole part and fails here.
+#[test]
+fn money_keeps_its_sign_and_its_locale_separators() {
+    let cases = [
+        ("en-US", "-1234.5", "-1,234.50 USD"),
+        ("es-AR", "-1234.5", "-1.234,50 ARS"),
+        ("en-US", "1234567", "1,234,567.00 USD"),
+        ("es-AR", "1234567", "1.234.567,00 ARS"),
+    ];
+    for (label, carried, expected) in cases {
+        let context = money_context(label);
+        assert_eq!(
+            context.format_money(dec(carried)),
+            expected,
+            "the {label} conventions: sign first, then the group character, then \
+             the decimal character"
+        );
+    }
+}
+
+/// The type's own limits, in both locales.
+///
+/// The mechanical reason the padding rule is a TEXT rule: it only ever appends
+/// a character to a string, and a string has no maximum. `Decimal::MAX` and
+/// `Decimal::MIN` are the values a formatter is most likely to overflow on, and
+/// they render here in full with the sign intact. Asserted per locale because a
+/// formatter that hard-coded `.` for the fraction would pass `en-US` and fail
+/// `es-AR` on the very same value.
+#[test]
+fn money_renders_the_extremes_of_the_decimal_type_without_overflowing() {
+    let cases = [
+        ("en-US", "79,228,162,514,264,337,593,543,950,335.00 USD"),
+        ("es-AR", "79.228.162.514.264.337.593.543.950.335,00 ARS"),
+    ];
+    for (label, expected) in cases {
+        let context = money_context(label);
+        assert_eq!(
+            context.format_money(Decimal::MAX),
+            expected,
+            "the largest {label} Decimal renders in full"
+        );
+        assert_eq!(
+            context.format_money(Decimal::MIN),
+            expected.replacen("79", "-79", 1),
+            "the smallest {label} Decimal renders in full, sign intact"
+        );
+    }
+}
+
+/// The scale is a number in TWO modules, and it is two rather than one because
+/// of LAYERING rather than duplication: `localization` is a leaf and must not
+/// depend on `services`, so the formatter cannot reach
+/// `services::line_taxes::MONEY_SCALE` — reaching for it would invert the
+/// dependency and make a formatting concern the reason a leaf knows a tax
+/// service exists. The compiler therefore cannot check that these two agree, so
+/// this test is what checks them.
+///
+/// It is the same shape and the same intent as the tax-rate ceiling's
+/// `tax_rate_ceiling_number_is_the_same_in_the_constant_the_marker_and_both_
+/// catalogs`: a number that must be one number, pinned together in the test a
+/// maintainer changing either one will hit. The second assertion is here
+/// because a formatter that ignored its own constant would pass the first.
+#[test]
+fn money_scale_is_the_same_in_the_formatter_and_the_line_tax_service() {
+    assert_eq!(
+        crate::localization::MONEY_SCALE,
+        crate::services::line_taxes::MONEY_SCALE,
+        "the formatter pads to the scale the tax service stores and rounds to, or \
+         a stored-and-shown figure would not be the figure that was stored"
+    );
+    assert_eq!(
+        crate::localization::LocalizationContext::fallback().format_money(dec("5")),
+        format!(
+            "5.{} USD",
+            "0".repeat(usize::try_from(crate::localization::MONEY_SCALE).unwrap())
+        ),
+        "and the formatter renders at exactly that many places, so the constant \
+         above is the one doing the work"
+    );
+}
+
+/// THE ROUND TRIP: the rendered text parses back, in BOTH locales, to the very
+/// number that went in. This is the test that actually proves the formatter did
+/// not change the value — every other test here compares text, and text can be
+/// wrong in a way a reader has to catch. Parsing it back cannot: a pad that
+/// rounded, a pad that truncated, a pad that dropped the sign and a pad that
+/// put the group character where the decimal character belongs all fail here,
+/// in whichever locale the mistake lives.
+#[test]
+fn money_renders_as_text_that_parses_back_to_the_same_number_in_every_locale() {
+    for value in [
+        dec("5"),
+        dec("5.00"),
+        dec("5.5"),
+        dec("0"),
+        dec("-1234.5"),
+        dec("-0.01"),
+        dec("1.234"),
+        Decimal::MAX,
+        Decimal::MIN,
+    ] {
+        for (label, context) in money_contexts() {
+            let rendered = context.format_money(value);
+            let number = rendered
+                .strip_suffix(context.currency_code.as_str())
+                .and_then(|text| text.strip_suffix(' '))
+                .unwrap_or_else(|| {
+                    panic!("{rendered} must end with the currency code and one space")
+                });
+            assert_eq!(
+                context.parse_decimal(number).unwrap_or_else(|error| panic!(
+                    "{label} could not read back {number}: {error}"
+                )),
+                value,
+                "{label} rendered {value} as {rendered} and reading it back must be \
+                 the same number"
+            );
+        }
+    }
+}
+
 #[test]
 fn decimal_input_parsing_is_locale_aware_and_rejects_ambiguous_grouping() {
     let es = resolve_context(Some(&settings("es-AR")), &[locale("es-AR", "es", true)]);
