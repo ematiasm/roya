@@ -647,7 +647,19 @@ async fn locale_presentation_customer_statement_and_detail_localize_derived_fact
     let (app, _pool) = localized_app().await;
     let product_id = seed_localized_product(&app, "LOC-CUSTOMER-DETAIL").await;
     let customer_id = seed_localized_customer(&app).await;
-    let today = chrono::Local::now().date_naive();
+    // The statement is dated in the BUSINESS timezone — the page reads
+    // `today_iso()`, which is `Utc::now()` rendered in `settings.timezone` — so
+    // the expectation has to be built from that same clock, not from the
+    // machine's. Reading `chrono::Local::now()` here compared two different
+    // days: on a UTC host between 00:00 and 03:00 UTC, Buenos Aires is still on
+    // the previous calendar day, the page printed that day and this expected the
+    // current one. The seeded dates move with the same value, so the ageing
+    // buckets are cut against the same `as_of` the handler will use.
+    let context = resolve_context(Some(&settings("es-AR")), &[locale("es-AR", "es", true)]);
+    let today: chrono::NaiveDate = context
+        .today_iso()
+        .parse()
+        .expect("today_iso is a canonical ISO date");
     let sale_date = today - chrono::Duration::days(70);
     let due_date = today - chrono::Duration::days(65);
     let sale_id =
@@ -666,11 +678,7 @@ async fn locale_presentation_customer_statement_and_detail_localize_derived_fact
     assert!(page.contains("<html lang=\"es-AR\">"), "{page:.500}");
     assert!(page.contains("Límite 1.234,50 ARS"), "credit limit: {page}");
     assert!(
-        page.contains(&format!(
-            "Saldo al {}",
-            resolve_context(Some(&settings("es-AR")), &[locale("es-AR", "es", true)],)
-                .format_date(today)
-        )),
+        page.contains(&format!("Saldo al {}", context.format_date(today))),
         "statement date: {page}"
     );
     assert!(page.contains("26,25 ARS"), "ageing/balance: {page}");
