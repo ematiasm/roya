@@ -551,10 +551,13 @@ where
         // neither hides the other: they are answers about two different numbers,
         // and collapsing them would make the ladder lie about one of them.
         //
-        // A refused cost publishes NO AMOUNT, which is why `cost_total` is a
-        // `String` and the refusal leaves it empty rather than zeroing it: a
-        // zero beside a refusal is a number a template can print, and the ladder
-        // promises that a refused figure is never one.
+        // A refused cost publishes NO AMOUNT. The amount is a `Decimal` beside
+        // `cost_refusal`, the same shape as the net beside `net_refusal`, so the
+        // ZERO it carries on refusal is not distinguishable from a real zero by
+        // looking at the amount: the REFUSAL is the only discriminator, and the
+        // presentation layer has to guard on it exactly as it does for the net.
+        // That guard is the price of this field being a `Decimal` rather than
+        // something empty — see the field's own doc comment.
         match calculate_line_taxes(ladder.cost_price, &taxes) {
             Ok(calc) => ladder.cost_total = calc.total,
             Err(refusal) => ladder.cost_refusal = Some(refusal),
@@ -1263,7 +1266,7 @@ mod tests {
     /// the net — a zero beside a refusal is a number a careless template WILL
     /// print, and the guard is what stops it.
     #[tokio::test]
-    async fn a_refused_cost_figure_carries_its_refusal_beside_a_zero_amount() {
+    async fn price_ladder_a_refused_cost_figure_carries_its_refusal_beside_a_zero_amount() {
         let (s, _pool, product_id) = svc_with_product("100").await;
         let huge = link(&s, "IVA1000", "1000").await;
         s.link_product_tax(1, product_id, huge).await.unwrap();

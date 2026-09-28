@@ -582,9 +582,17 @@ pub struct ProductPriceLadder {
     /// the SAME product-scoped tax set, so the two halves of this ladder can
     /// never disagree about which taxes apply or be a cent apart on one rate.
     ///
-    /// Canonical decimal text, ungrouped and unlocalized: the money formatting
+    /// Canonical decimal, ungrouped and unlocalized: the money formatting
     /// belongs to the presentation layer, exactly as it does for every other
     /// figure on this ladder.
+    ///
+    /// It is a `Decimal` beside `cost_refusal` rather than something that can
+    /// hold "no amount", because every sibling figure here is a `Decimal`
+    /// rendered through `format_currency`, and a figure that cannot be rendered
+    /// like the other four is a figure that will be rendered wrong. The cost of
+    /// that choice is that the amount alone cannot express a refusal — it reads
+    /// `ZERO` either way — so the presentation layer MUST guard on `cost_refusal`
+    /// before printing it, exactly as it already does for `net_refusal`.
     pub cost_total: Decimal,
     /// The COST half's own refusal — a DIFFERENT FACT from `net_refusal`, in its
     /// own slot precisely because the two fail independently.
