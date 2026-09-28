@@ -4,6 +4,9 @@
 
 **Design closed. Four decisions taken; four tasks to build.**
 
+**Progress: T-A is implemented, mutation-proved and awaiting its PR. T-B, T-C
+and T-D are untouched.**
+
 The feature went through two rewrites. The first put a `prices_include_taxes`
 flag on the purchase with a pre-fill on the supplier. The second dropped the flag
 entirely. This is the third revision, and it is the one the user's answers
@@ -27,7 +30,7 @@ an accountant.**
 
 | question | answer | this repo |
 | --- | --- | --- |
-| must prices be entered net? | **yes** — with gross prices the system must run the inverse, "y ese cálculo puede generar valores que no sean exactos, ::= affecting the fiscal information sent | agrees (`line_taxes.rs`: "both are net") |
+| must prices be entered net? | **yes** — with gross prices the system must run the inverse, which "puede generar valores que no sean exactos", affecting the fiscal information sent | agrees (`line_taxes.rs`: "both are net") |
 | do the rate sets cascade? | **no** — internal taxes on the net, IVA on the net *excluding* internal taxes | agrees — "deliberately additive and never compounding" |
 | is the midpoint rounding method fixed? | **no** — the taxpayer determines and documents it, subject to fiscal neutrality | agrees — `MidpointAwayFromZero`, "the single half-up money rule" |
 | may the document total differ from the sum of its components? | **no** — the Libro de IVA Digital rejects it | agrees — `total == net + Σ round2(net·rate_i/100)`, no adjustment line |
@@ -124,13 +127,16 @@ and a refusal on the gross side has somewhere to render.
 
 ## Tasks
 
-- [ ] **T-A — the cost's tax-inclusive figure.** `ProductPriceLadder.cost_total`,
-  filled from `calculate_line_tasks(cost_price, &taxes).total`. **Zero new
-  arithmetic** — the contract exists and the ladder already calls it for the sale.
-  A refused cost publishes no amount, as an empty `String`, so a template cannot
-  print a number that is not there. It is a *different fact* from the net's
-  refusal: a manual-price product may legitimately carry `cost > net`, and the
-  cost gross can overflow where the net gross does not.
+- [x] **T-A — the cost's tax-inclusive figure.** `ProductPriceLadder.cost_total`,
+  a `Decimal` beside `net_total` and `total`, filled from
+  `calculate_line_taxes(cost_price, &taxes).total`. **Zero new arithmetic** — the
+  contract exists and the ladder already calls it for the sale. The computation is
+  unconditional and independent of `net_refusal`, because the cost gross is a
+  *different fact* from the net's refusal: a manual-price product may legitimately
+  carry `cost > net`, and the cost gross can overflow where the net gross does
+  not. A refused cost carries no amount — `Decimal::ZERO` plus a distinct
+  `cost_refusal: Option<PriceRefusal>` — so the template guards on the refusal and
+  never prints the zero. Landed in `bf637db`, `dc7cf6d`, `05fd08c`.
 - [ ] **T-B — the ladder row.** In `templates/partials/product_price_ladder.html`
   as a **4-`<td>` `<tr>`**. `e2e/tests/test_products.py::_ladder_amounts` keys every
   figure by `td[0]`, reads `td[3]`, and **silently skips rows with fewer cells** — a
