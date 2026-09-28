@@ -43,24 +43,38 @@
   <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-document-total-refusal>{{ total_refusal_message }}</div>
   {% endif %}
 
-  {# The entry row (S5a): one persistent flex row above the lines — product,
-     qty, cost and the Add button — so the results appearing below can never
-     push the button around. The whole row lives inside `#purchase-record-
-     money` and carries the same ids the shared picker macro used, because
-     htmx re-focuses the swapped-in product field by id after the money-region
-     swap: renaming any of these ids breaks the quantity travelling or the
-     focus contract, silently. `hx-disinherit` stays as belt-and-braces, the
-     way the shared picker macro keeps it: this form's request attributes
-     still leak into its controls by htmx inheritance, and the qty and cost
-     inputs should inherit nothing at all if a verb is ever added there. The
-     row is the PICKER ISLAND's shell (static/picker.js mounts into
-     `[data-picker]`): the field carries no `hx-get`/`hx-trigger`/`hx-target`
-     /`hx-vals` because the island reads `/web/product-search.json` itself,
-     and the hidden `product_id` the island sets from its own state (the
-     hidden-id defect died because that state moved from markup to the
-     island) makes the markup-carried `hx-vals` obsolete. It is NOT out of
-     band: the add-line response swaps this region and the row is re-rendered
-     inside it, empty and focused, ready for the next scan.
+  {# The entry row (S5a; search-only from purchase-search-only-entry T2): one
+     persistent flex row above the lines carrying THE PRODUCT SEARCH and the
+     Add button, and nothing else. The results appearing below can never push
+     the button around.
+
+     Why it is only a search: the operator used to be asked for a quantity and
+     a cost BEFORE the product was even accepted, which made them decide a
+     quantity before they had decided they wanted the product — so the number
+     got typed twice, a repeat scan re-opened the question when the only intent
+     was "one more", and the cost was asked for in a place where the product's
+     own cost was not visible even though `resolve_line_cost` already had it.
+     A bare scan or a bare accept now adds the product as a line at quantity 1
+     and the resolved cost, and BOTH figures are edited on that line, where the
+     product is already visible and the money is a second pass. See
+     `AddLineForm::qty` for where the "1" comes from, and
+     `web_add_line_impl` for the resolution that fills the cost.
+
+     The whole row lives inside `#purchase-record-money` and carries the same
+     ids the shared picker macro used, because htmx re-focuses the swapped-in
+     product field by id after the money-region swap: renaming that id breaks
+     the focus contract, silently. `hx-disinherit` stays as belt-and-braces, the
+     way the shared picker macro keeps it: this form's request attributes still
+     leak into its controls by htmx inheritance, and the search should inherit
+     nothing at all if a verb is ever added to it. The row is the PICKER
+     ISLAND's shell (static/picker.js mounts into `[data-picker]`): the field
+     carries no `hx-get`/`hx-trigger`/`hx-target`/`hx-vals` because the island
+     reads `/web/product-search.json` itself, and the hidden `product_id` the
+     island sets from its own state (the hidden-id defect died because that
+     state moved from markup to the island) makes the markup-carried `hx-vals`
+     obsolete. It is NOT out of band: the add-line response swaps this region
+     and the row is re-rendered inside it, empty and focused, ready for the
+     next scan.
 
      `entry_row_focus` adds `autofocus` only on the add-line response, so
      the swapped-in row claims focus for the next scan; the page renders
@@ -75,27 +89,14 @@
        data-picker-match-count-many="{{ localization.tr_count(crate::localization::MessageKey::PickerMatchCount, 2) }}"
        data-picker-cost-label="{{ localization.tr(crate::localization::MessageKey::PickerCostLabel) }}"
        data-picker-stock-label="{{ localization.tr(crate::localization::MessageKey::PickerStockLabel) }}">
-  {# THE PAIR, as a container rather than as the form: the page shell finds both
-     cost fields and the refusal slot through this ancestor, and a slot OUTSIDE
-     the form is not inside it. #}
-  <div data-cost-pair>
-    <form id="line-add-form" class="flex flex-wrap items-end gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesAddLine) }}"
-          hx-post="/web/purchases/{{ record.purchase.id }}/lines"
-          hx-disinherit="hx-select hx-target hx-swap"
-          hx-target="#purchase-record-money" hx-swap="outerHTML" hx-select="#purchase-record-money">
+  <form id="line-add-form" class="flex flex-wrap items-end gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesAddLine) }}"
+        hx-post="/web/purchases/{{ record.purchase.id }}/lines"
+        hx-disinherit="hx-select hx-target hx-swap"
+        hx-target="#purchase-record-money" hx-swap="outerHTML" hx-select="#purchase-record-money">
       {# Island-owned: set from state.selectedProductId on a click, disabled
          while nothing is selected so the typed-name Enter path never competes
          with a stale id. #}
       <input type="hidden" name="product_id" disabled class="field" />
-      {# WHICH FIELD THE OPERATOR TYPED INTO LAST (cost-with-taxes T-C). One
-         piece of form state for the whole pair, and it is the only thing that
-         keeps the two fields from driving each other: the mirror below writes
-         into the OTHER one, never into this. Empty whenever the page did not
-         say — a browser with no JavaScript, a REST client — and then the NET
-         wins, which is exactly the form this pair replaced. The value is one of
-         the two fixed tokens `net` and `gross`; anything else is read as no
-         basis at all rather than guessed. #}
-      <input type="hidden" id="line-cost-basis" name="cost_basis" data-cost-basis value="" />
       <div class="min-w-[150px] flex-1">
         <label for="product-picker" class="field-label">{{ localization.tr(crate::localization::MessageKey::PickerProduct) }}</label>
         <input type="text" id="product-picker" name="product" required autocomplete="off"
@@ -104,60 +105,8 @@
                aria-describedby="product-search-status"
                {% if entry_row_focus %}autofocus{% endif %} class="field" />
       </div>
-      <div class="w-20">
-        <label for="line-qty" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesQuantity) }}</label>
-        <input type="text" inputmode="decimal" id="line-qty" name="qty" step="0.01" min="0.01" required value="1" class="field" />
-      </div>
-      {# The pair (cost-with-taxes T-C). Two fields for ONE figure, and whichever
-         the operator types into is the input. Neither of them computes anything:
-         each asks the server to solve the other side and then writes down the
-         answer it was given, so the money arithmetic stays in
-         `services::purchase_cost` and the tax contract.
-
-         `hx-swap="none"` is the whole reason this is not a fragment swap: a swap
-         would destroy the field the operator is standing in and the row they
-         have half-filled, and the answer belongs in the OTHER input, not in a
-         region. The response is JSON and the page shell reads it; a refusal
-         comes back in the BODY rather than as a 4xx, because a preview is not a
-         failed action and the notice box would name one.
-
-         `hx-include` carries the rest of the pair and the product, so the server
-         answers about the same pair and the same product the post will use. The
-         product travels as the TYPED TEXT (`#product-picker`) rather than the
-         island's hidden id, because that text is what the add resolves too —
-         the picker has no selection until a result is clicked, and a click
-         submits the line at once, so the text is the only field that is ever
-         filled at the moment a cost is typed.
-
-         The own `hx-get` also settles the inherited verb: htmx resolves a verb
-         by asking for each in turn, and the form's `hx-post` cannot win over an
-         attribute the input carries itself. #}
-      <div class="min-w-[110px]">
-        <label for="line-unit-cost" class="field-label">{{ localization.tr(crate::localization::MessageKey::PurchasesUnitCostSupplier) }}</label>
-        <input type="text" inputmode="decimal" id="line-unit-cost" name="unit_cost" step="0.01" min="0" data-cost-field="net"
-               placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesNoSupplierCost) }}" class="field"
-               hx-get="/web/purchases/{{ record.purchase.id }}/lines/cost"
-               hx-trigger="change delay:400ms" hx-swap="none"
-               hx-include="#line-unit-cost-gross, #line-cost-basis, #product-picker" />
-      </div>
-      <div class="min-w-[110px]">
-        <label for="line-unit-cost-gross" class="field-label">{{ localization.tr(crate::localization::MessageKey::PurchasesUnitCostWithTaxes) }}</label>
-        <input type="text" inputmode="decimal" id="line-unit-cost-gross" name="unit_cost_gross" step="0.01" min="0" data-cost-field="gross" class="field"
-               hx-get="/web/purchases/{{ record.purchase.id }}/lines/cost"
-               hx-trigger="change delay:400ms" hx-swap="none"
-               hx-include="#line-unit-cost, #line-cost-basis, #product-picker" />
-      </div>
       <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesAddLine) }}</button>
-    </form>
-    {# WHERE A REFUSAL LANDS, beside the number that caused it. Not the notice
-       region: that box names a failed ACTION at the top of the page, and a
-       figure the operator cannot be converted from is not a failed action — it
-       is a sentence about the field they are standing in. `textContent` is set
-       by the page shell from the server's own words, and the element is hidden
-       until there is something to say. One slot per pair, so the two fields
-       cannot show two different sentences. #}
-    <p id="line-cost-refusal" data-cost-refusal class="mt-2 text-[13px] text-danger" role="alert" hidden></p>
-  </div>
+  </form>
   {# Same busy cue and live region the shared picker macro renders. The
      island owns both now: it toggles the busy cue's `htmx-request` class
      from its own status while its search fetch is in flight, and the polite

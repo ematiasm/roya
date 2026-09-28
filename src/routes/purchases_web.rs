@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post, put},
-    Json, Router,
+    Router,
 };
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -390,142 +390,6 @@ struct SuggestionListPartial {
 }
 
 // ---------------------------------------------------------------------------
-// The entry row's preview: the counterpart of whichever figure was typed
-// ---------------------------------------------------------------------------
-
-/// What the entry row's preview asks. The two costs and the basis travel as
-/// query parameters, exactly as they travel on the post, because the preview
-/// and the write must be asking about the SAME pair — a preview that resolved a
-/// different figure than the write would store is worse than no preview.
-///
-/// `product_id` and `product` are both accepted for the reason the add line
-/// accepts both: a chosen product travels as an id and a typed one as text, and
-/// the preview resolves text through the very same `resolve_product_ref` the
-/// add does, so a scan and a click cannot disagree about which product is meant.
-#[derive(Debug, Deserialize)]
-pub struct CostPreviewQuery {
-    #[serde(default)]
-    pub product_id: Option<i64>,
-    #[serde(default)]
-    pub product: String,
-    #[serde(default)]
-    pub unit_cost: String,
-    #[serde(default)]
-    pub unit_cost_gross: String,
-    #[serde(default)]
-    pub cost_basis: String,
-}
-
-/// The answer the page writes with. Three fields and no more:
-///
-/// * `field` — which of the two inputs the figure belongs in, so the client
-///   writes into the OTHER one and never into the field the operator is in.
-/// * `value` — the figure, already in the DISPLAY form of the active locale,
-///   because it goes straight into a text input the operator reads, and the
-///   write must be able to parse back what it showed.
-/// * `refusal` — the sentence, in the operator's language, when the side they
-///   typed cannot be priced. `null` figures never carry one: a refusal
-///   publishes no amount, and a figure never carries a sentence.
-#[derive(Debug, serde::Serialize)]
-pub struct CostPreview {
-    pub field: Option<&'static str>,
-    pub value: Option<String>,
-    pub refusal: Option<String>,
-}
-
-impl CostPreview {
-    /// Nothing to say. The shape the page reads as "leave both fields alone".
-    fn silent() -> CostPreview {
-        CostPreview {
-            field: None,
-            value: None,
-            refusal: None,
-        }
-    }
-}
-
-/// The entry row's preview, behind the READ gate the record page itself
-/// carries, and a GET so that "it persists nothing" is structural: there is no
-/// write verb on this path, and a POST is answered 405.
-///
-/// # A 200 even when there is nothing to say
-///
-/// The four silent states — no product chosen, a product name that resolves to
-/// nothing, no cost typed, a half-typed cost — are states an operator passes
-/// THROUGH while typing. A 404 or a 400 on any of them would be a message about
-/// their typing, raised before they finished, in the one place on the page where
-/// they are mid-sentence. The write is what refuses; the preview's job is to
-/// show the counterpart, or to say nothing at all.
-///
-/// # Where the refusal goes
-///
-/// In the body, as `refusal`, and NOT as a 4xx. A 4xx reaches
-/// `htmx:responseError`, which paints the notice box and names a failed ACTION;
-/// a preview is not an action and never completed anything, and the operator
-/// needs the sentence beside the number they typed rather than at the top of the
-/// page. The sentence itself comes from the ONE shared mapping, through
-/// `price_refusal_message`, so this surface cannot word a rule differently from
-/// the write that will enforce it.
-async fn web_preview_line_cost(
-    State(state): State<AppState>,
-    _: Require<PurchasesRead>,
-    Extension(localization): Extension<LocalizationContext>,
-    Query(query): Query<CostPreviewQuery>,
-) -> AppResult<Json<CostPreview>> {
-    // An unreadable figure is the silent state, not a refusal: the operator is
-    // still typing, and the write is where a typo becomes a 400 naming the
-    // field. Anything else is left to propagate.
-    let Ok(typed) = TypedCost::read(
-        &query.unit_cost,
-        &query.unit_cost_gross,
-        &query.cost_basis,
-        &localization,
-    ) else {
-        return Ok(Json(CostPreview::silent()));
-    };
-    if matches!(
-        purchase_cost::cost_ask(typed.basis, typed.net, typed.gross),
-        purchase_cost::CostAsk::Unstated
-    ) {
-        return Ok(Json(CostPreview::silent()));
-    }
-    // The product, resolved the way the add resolves it: a chosen id wins, and
-    // text goes through the inventory service. A text that resolves to nothing
-    // is the silent state too — the operator is still typing a product.
-    let product_id = match query.product_id.filter(|id| *id > 0) {
-        Some(id) => id,
-        None => match state
-            .inventory_service
-            .resolve_product_ref(&query.product)
-            .await
-        {
-            Ok(product) => product.id,
-            Err(_) => return Ok(Json(CostPreview::silent())),
-        },
-    };
-    match typed_counterpart(&state, product_id, &typed).await {
-        Ok((basis, Some(value))) => Ok(Json(CostPreview {
-            field: Some(match basis {
-                CostBasis::Net => "net",
-                CostBasis::Gross => "gross",
-            }),
-            value: Some(localization.format_decimal(value)),
-            refusal: None,
-        })),
-        Ok((_, None)) => Ok(Json(CostPreview::silent())),
-        Err(AppError::PriceRefused(refusal)) => Ok(Json(CostPreview {
-            field: None,
-            value: None,
-            refusal: Some(crate::routes::price_refusal_message(
-                &refusal,
-                &localization,
-            )),
-        })),
-        Err(other) => Err(other),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers (mirror sales_web)
 // ---------------------------------------------------------------------------
 
@@ -680,43 +544,6 @@ async fn typed_line_cost(
         // this into its required-field refusal, which is the asymmetry between
         // the two paths and not an accident of where the branch sits.
         purchase_cost::CostAsk::Unstated => Ok(None),
-    }
-}
-
-/// The counterpart figure the entry row's preview shows beside the field the
-/// operator typed into: the net's gross, or the gross's net, through the same
-/// two service calls the write uses. `None` when the pair states no basis, and
-/// `Err` with a refusal when the side the operator typed cannot be priced.
-async fn typed_counterpart(
-    state: &AppState,
-    product_id: i64,
-    typed: &TypedCost,
-) -> AppResult<(CostBasis, Option<Decimal>)> {
-    match purchase_cost::cost_ask(typed.basis, typed.net, typed.gross) {
-        purchase_cost::CostAsk::Net(net) => {
-            let taxes = state
-                .tax_service
-                .list_active_for_product(product_id)
-                .await?;
-            purchase_cost::gross_cost_from_net(net, &taxes)
-                .map(|gross| (CostBasis::Gross, Some(gross)))
-                .map_err(AppError::PriceRefused)
-        }
-        purchase_cost::CostAsk::Gross(gross) => {
-            let taxes = state
-                .tax_service
-                .list_active_for_product(product_id)
-                .await?;
-            purchase_cost::solve_net_cost_from_gross(gross, &taxes)
-                .map(|net| (CostBasis::Net, Some(net)))
-                .map_err(AppError::PriceRefused)
-        }
-        purchase_cost::CostAsk::Unstated => {
-            // Nothing to preview. Not a refusal and not an error: the operator
-            // has not typed a cost, and the entry row's placeholder is the
-            // honest state of the other field.
-            Ok((CostBasis::Net, None))
-        }
     }
 }
 
@@ -1272,8 +1099,19 @@ pub struct AddLineForm {
     /// barcode, then exact SKU (case-insensitive), then a numeric id.
     #[serde(default)]
     pub product: String,
+    /// The quantity, and it is OPTIONAL because the entry row stopped asking for
+    /// one: a bare scan or a bare accept posts no quantity at all, and the
+    /// operator's intent there is unambiguous — "one, and tell me about it".
+    ///
+    /// The default is `None` -> `Decimal::ONE` in the ROUTE, never inside
+    /// `add_or_increment_line`, and the reason is a caller this form is not: the
+    /// JSON API's `AddLineRequest` requires an explicit quantity, and the
+    /// service's `qty > 0` is the guard that refuses a machine client's zero.
+    /// A default reached from the service would turn that 400 into a line for
+    /// every caller. So the form is looser than the service, on purpose and in
+    /// exactly one place.
     #[serde(default)]
-    pub qty: String,
+    pub qty: Option<String>,
     /// The net cost. Optional here, as it has always been: an empty cost falls
     /// back to the supplier's satellite and then to the product column.
     #[serde(default)]
@@ -1460,7 +1298,21 @@ async fn web_add_line_impl(
     id: i64,
     form: AddLineForm,
 ) -> AppResult<Response> {
-    let qty = parse_required_decimal(&form.qty, "qty", &localization)?;
+    let qty = match form.qty.as_deref() {
+        Some(raw) => parse_required_decimal(raw, "qty", &localization)?,
+        // THE DEFAULT, and the one place it exists. The entry row carries only
+        // the product search, so a scan or an accept posts no quantity and
+        // arrives here as `None`; "one" answers a request nobody made, and the
+        // line is where the operator corrects it if that is wrong.
+        //
+        // It resolves BEFORE the product, as it always did, and for the same
+        // reason: an unreadable quantity is still the sentence the operator sees
+        // before anything else is read. A STATED zero is not the absent case and
+        // is not softened here — it parses, and the service's `qty > 0` refuses
+        // it. See [`AddLineForm::qty`] for why the default cannot live lower
+        // down.
+        None => Decimal::ONE,
+    };
     // An explicit product id (a clicked result) wins over the typed text; a scan
     // or an Enter carries only the value and resolves through inventory. It is
     // resolved BEFORE the cost because the cost's tax set belongs to the
@@ -1543,19 +1395,6 @@ async fn web_add_line_impl(
 
 /// Collection adapter: the typed-id form posts the purchase id in the body and
 /// delegates to the path-based handler, so both URL shapes keep working.
-/// Collection adapter for the preview, for the same reason the add line has
-/// one: a caller that addresses the purchase by id in the body rather than in
-/// the path gets the same answer from the same handler. The preview takes no
-/// body, so the adapter simply delegates — the gate and the reads are identical.
-async fn web_preview_line_cost_collection(
-    State(state): State<AppState>,
-    gate: Require<PurchasesRead>,
-    Extension(localization): Extension<LocalizationContext>,
-    Query(query): Query<CostPreviewQuery>,
-) -> AppResult<Json<CostPreview>> {
-    web_preview_line_cost(State(state), gate, Extension(localization), Query(query)).await
-}
-
 async fn web_add_line_collection(
     State(state): State<AppState>,
     _: Require<PurchasesCreate>,
@@ -2058,11 +1897,6 @@ pub fn router() -> Router<AppState> {
             get(web_purchase_detail).delete(web_delete_draft),
         )
         .route("/web/purchases/{id}/lines", post(web_add_line))
-        .route("/web/purchases/{id}/lines/cost", get(web_preview_line_cost))
-        .route(
-            "/web/purchases/lines/cost",
-            get(web_preview_line_cost_collection),
-        )
         .route(
             "/web/purchases/{purchase_id}/lines/{line_id}",
             put(web_update_line)
@@ -2367,12 +2201,29 @@ mod tests {
             !input_tag.contains("value="),
             "the entry row must come back empty: {input_tag}"
         );
-        for id in ["id=\"line-qty\"", "id=\"line-unit-cost\""] {
+        for id in [
+            "id=\"line-qty\"",
+            "id=\"line-unit-cost\"",
+            "id=\"line-unit-cost-gross\"",
+            "id=\"line-cost-basis\"",
+            "id=\"line-cost-refusal\"",
+        ] {
             assert!(
-                row.contains(id),
-                "the entry row carries the qty and the cost field: {id}: {row:.600}"
+                !row.contains(id),
+                "the entry row is search-only: it must not carry {id}. An operator is asked for a \
+                 quantity and a cost on the LINE, after they have decided they want the product: \
+                 {row:.600}"
             );
         }
+        // What the entry row keeps is the picker island's own contract: the
+        // search, the hidden `product_id` the island writes, and the submit that
+        // carries a chosen result in one step.
+        assert!(
+            row.contains("id=\"product-picker\"")
+                && row.contains("name=\"product_id\"")
+                && row.contains("type=\"submit\""),
+            "the search, the island's hidden product id and the submit all stay: {row:.600}"
+        );
     }
 
     /// Everything a record-page test needs to address the seeded document.
@@ -4256,14 +4107,17 @@ mod tests {
             !html.contains("id=\"add-line\""),
             "the bar carries no drawer button and the page no drawer anchor: {html:.400}"
         );
-        // The entry row is persistent: product, qty, cost and the Add action
-        // render without any click, inside the money region adds swap.
+        // The entry row is persistent and search-only: the product field, the
+        // island's hidden id and the Add action render without any click, inside
+        // the money region adds swap. Quantity and money are asked on the LINE,
+        // where the product is already a line the operator can see.
         assert!(
             html.contains("id=\"line-picker\"")
                 && html.contains("id=\"product-picker\"")
-                && html.contains("id=\"line-qty\"")
-                && html.contains("id=\"line-unit-cost\""),
-            "the entry row renders its fields persistent: {html:.600}"
+                && !html.contains("id=\"line-qty\"")
+                && !html.contains("id=\"line-unit-cost\""),
+            "the entry row renders its search persistent, and asks for no quantity and no cost: \
+             {html:.600}"
         );
         for dialog in ["confirm-purchase", "discard-purchase"] {
             assert!(
@@ -5488,8 +5342,9 @@ mod tests {
             "the form carries the island-owned hidden product id: {picker}"
         );
         assert!(
-            picker.contains("name=\"qty\"") && picker.contains("value=\"1\""),
-            "a scan and a click must both carry the default quantity: {picker}"
+            !picker.contains("name=\"qty\""),
+            "the entry row asks for no quantity: a scan and a click both add ONE, resolved by the \
+             server, and the operator corrects it on the line: {picker}"
         );
 
         // The field carries no declarative search transport: the island owns
@@ -5614,8 +5469,95 @@ mod tests {
         assert_entry_row_is_empty_and_focused(&added);
     }
 
-    /// AC10 (clicked result): a result is its own add action; the request includes
-    /// the picker form, so the quantity travels, and supplies the product id
+    /// THE DEFAULT, and the reason the entry row can lose its quantity input.
+    ///
+    /// `value="1"` on that input was MARKUP: the server had no default, so the
+    /// form posted a quantity the operator never chose. This posts the add form
+    /// with no `qty` field AT ALL — the exact body a bare scan produces once the
+    /// input is gone — and requires the line to arrive at one unit, priced by
+    /// the same resolution an empty cost has always used.
+    ///
+    /// The default lives at the FORM boundary, in this route, and nowhere else.
+    /// `add_or_increment_line` keeps `qty: Decimal` and its `qty > 0` guard
+    /// absolutely: that guard is what refuses a machine client's zero-quantity
+    /// line, and a default reached from inside the service would quietly turn
+    /// that 400 into a line for EVERY caller, JSON API included. The third
+    /// assertion below is what holds that line — a web post that states
+    /// `qty=0` is still a refusal, so "absent" and "zero" cannot be one thing.
+    #[tokio::test]
+    async fn a_scan_with_no_quantity_field_at_all_adds_one_unit() {
+        use rust_decimal::Decimal;
+
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        let scanned = seed_extra_product(&state, "SCAN-DEFAULT", Some("7791234567892")).await;
+        let app = crate::routes::router(state.clone());
+
+        // A bare scan: the typed value and nothing else. No `qty`, no cost.
+        let (status, _, added) = post_form_response(
+            app.clone(),
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            "product=7791234567892&unit_cost=",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an absent quantity is one unit, not a 400: {added}"
+        );
+
+        let detail = state
+            .purchases_service
+            .get_detail(fixture.purchase_id)
+            .await
+            .unwrap();
+        let line = detail
+            .lines
+            .iter()
+            .find(|line| line.product_id == scanned.id)
+            .expect("the scan adds its own line");
+        assert_eq!(
+            line.qty,
+            Decimal::ONE,
+            "the default IS one: the operator never chose a quantity"
+        );
+        assert_eq!(
+            line.unit_cost,
+            Decimal::from(10),
+            "and the cost is still resolved, not defaulted: an empty cost is the product column here, \
+             because this supplier has no satellite row"
+        );
+
+        // The default is for an ABSENT field only. A stated zero is a refusal,
+        // and it stays one: this is the assertion that would fail if the
+        // default were reached from inside the service instead of from the form.
+        let (status, _, refused) = post_form_response(
+            app,
+            &format!("/web/purchases/{}/lines", fixture.purchase_id),
+            "product=7791234567892&unit_cost=&qty=0",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "`qty > 0` is the service's invariant and the default must not loosen it: {refused}"
+        );
+        assert_eq!(
+            state
+                .purchases_service
+                .get_detail(fixture.purchase_id)
+                .await
+                .unwrap()
+                .lines
+                .len(),
+            2,
+            "the refused add stored nothing: only the fixture's own line and the scan's"
+        );
+    }
+
+    /// AC10 (clicked result): a result is its own add action; the request carries
+    /// the quantity on the wire, which is where it has lived since the entry row
+    /// stopped rendering a field for it, and the result supplies the product id
     /// itself. The typed text is not an exact match on purpose.
     #[tokio::test]
     async fn n4_purchase_line_clicked_result_uses_the_picker_quantity() {
@@ -7522,10 +7464,20 @@ mod tests {
     //
     // The form carries two figures for one cost: the net and the supplier's
     // tax-inclusive gross. Whichever the operator typed into is the input and
-    // the other is solved — on create, on the inline edit, and in the entry
-    // row's preview. The arithmetic is `purchase_cost`'s, which delegates to
-    // the shared inverse and to the one tax contract; nothing here computes
-    // money.
+    // the other is solved — on create and on the inline edit. The arithmetic is
+    // `purchase_cost`'s, which delegates to the shared inverse and to the one
+    // tax contract; nothing here computes money.
+    //
+    // THE ENTRY ROW'S PREVIEW IS GONE with the entry row's money fields
+    // (purchase-search-only-entry T3): it had no caller, so the endpoint, its
+    // collection twin and `typed_counterpart` went with it, and the mirror that
+    // read its answers went with those. What the operator loses is LIVE
+    // typing-time feedback; what they keep is both figures, server-computed, on
+    // the line — where the PUT's answer IS the record re-read from storage,
+    // which is the stronger server-authoritative shape T-C already chose for
+    // that row. The three figures on the wire are unchanged, so the create-path
+    // tests below post `unit_cost` and `unit_cost_gross` exactly as they always
+    // did, and a REST client is none the worse.
     //
     // Every form value below is written with a `.` decimal point, which is what
     // `parse_decimal` reads under this suite's default locale. The one test that
@@ -7709,254 +7661,6 @@ mod tests {
             .to_string()
     }
 
-    /// The entry row's preview, read as JSON. A preview is a 200 even when it
-    /// has nothing to say, so a half-typed cost never raises a notice: what the
-    /// operator needs then is silence, and the write is the thing that refuses.
-    async fn preview_cost(
-        app: axum::Router,
-        uri: &str,
-        cookie: &str,
-    ) -> (StatusCode, serde_json::Value) {
-        let req = Request::builder()
-            .method("GET")
-            .uri(uri)
-            .header("cookie", cookie)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        let status = resp.status();
-        let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
-        )
-    }
-
-    /// THE MIRROR, both directions, over HTTP. A gross typed into the entry row
-    /// answers the net; a net typed into it answers the gross. The answer names
-    /// WHICH field it belongs in, so the page writes into the other one without
-    /// having to infer a direction the client cannot know.
-    #[tokio::test]
-    async fn the_entry_row_preview_answers_the_counterpart_in_both_directions() {
-        let state = test_state().await;
-        let entry = cost_entry(&state).await;
-        let app = crate::routes::router(state.clone());
-        let localization = crate::localization::load_context(&state.pool)
-            .await
-            .unwrap();
-        let base = format!("/web/purchases/{}/lines/cost", entry.purchase_id);
-
-        let (status, json) = preview_cost(
-            app.clone(),
-            &format!(
-                "{base}?product_id={}&unit_cost=&unit_cost_gross=6.05&cost_basis=gross",
-                entry.product_id
-            ),
-            test_support::TEST_COOKIE,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["field"], "net", "{json}");
-        let shown = json["value"].as_str().unwrap_or_else(|| panic!("{json}"));
-        assert_eq!(
-            localization.parse_decimal(shown).unwrap(),
-            dec_web("5.00"),
-            "{json}: the answer is a figure, and it reads back as the exact net — whatever the \
-             locale's rendering is, the number under it is the stored one"
-        );
-        assert_eq!(json["refusal"], serde_json::Value::Null, "{json}");
-
-        let (status, json) = preview_cost(
-            app,
-            &format!(
-                "{base}?product_id={}&unit_cost=5.00&unit_cost_gross=&cost_basis=net",
-                entry.product_id
-            ),
-            test_support::TEST_COOKIE,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(
-            json["field"], "gross",
-            "{json}: the net's counterpart is the gross"
-        );
-        assert_eq!(
-            localization
-                .parse_decimal(json["value"].as_str().unwrap_or_else(|| panic!("{json}")))
-                .unwrap(),
-            dec_web("6.05"),
-            "{json}: 5,00 at 21% grosses to exactly 6,05"
-        );
-    }
-
-    /// A staircase gap is reported as a REFUSAL in the body, not as a 400 and
-    /// not as silence: the operator typed a figure, and the answer to that is a
-    /// sentence, not an error box about a failed request.
-    #[tokio::test]
-    async fn the_preview_reports_a_staircase_gap_as_a_refusal_in_its_body() {
-        let state = test_state().await;
-        let entry = cost_entry(&state).await;
-        let app = crate::routes::router(state.clone());
-
-        let (status, json) = preview_cost(
-            app,
-            &format!(
-                "/web/purchases/{}/lines/cost?product_id={}&unit_cost=&unit_cost_gross=0.03&cost_basis=gross",
-                entry.purchase_id, entry.product_id
-            ),
-            test_support::TEST_COOKIE,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        assert_eq!(json["value"], serde_json::Value::Null, "{json}");
-        assert_eq!(
-            json["refusal"],
-            crate::models::PriceRefusal::CostUnreachable.as_str(),
-            "{json}"
-        );
-    }
-
-    /// A preview with nothing to solve against answers nothing, and says so with
-    /// a 200: no product chosen yet, no cost typed yet, a half-typed cost, and a
-    /// product name that resolves to nothing. All four are states an operator
-    /// passes THROUGH while typing, and an error box on any of them would be a
-    /// message about their typing rather than about their document.
-    #[tokio::test]
-    async fn the_preview_is_silent_while_there_is_nothing_to_solve() {
-        let state = test_state().await;
-        let entry = cost_entry(&state).await;
-        let app = crate::routes::router(state.clone());
-        let base = format!("/web/purchases/{}/lines/cost", entry.purchase_id);
-
-        for query in [
-            // No product at all: the picker has not chosen one.
-            format!("{base}?unit_cost=&unit_cost_gross=6.05&cost_basis=gross"),
-            // A product name that resolves to nothing.
-            format!("{base}?product=not-a-product&unit_cost_gross=6.05&cost_basis=gross"),
-            // No cost typed.
-            format!(
-                "{base}?product_id={}&unit_cost=&unit_cost_gross=",
-                entry.product_id
-            ),
-            // A half-typed cost: the operator is still typing it.
-            format!(
-                "{base}?product_id={}&unit_cost=&unit_cost_gross=6.&cost_basis=gross",
-                entry.product_id
-            ),
-        ] {
-            let (status, json) = preview_cost(app.clone(), &query, test_support::TEST_COOKIE).await;
-            assert_eq!(status, StatusCode::OK, "{query}: {json}");
-            assert_eq!(json["value"], serde_json::Value::Null, "{query}: {json}");
-            assert_eq!(
-                json["refusal"],
-                serde_json::Value::Null,
-                "{query}: a half-typed cost is not a refusal: {json}"
-            );
-        }
-    }
-
-    /// The preview's answer is the DISPLAY form of the figure, because it goes
-    /// straight into a text input the operator reads. Under a comma-decimal
-    /// locale the number it writes is the one that locale's parser reads back —
-    /// the round trip through the form, which is the only trip that matters.
-    #[tokio::test]
-    async fn the_preview_answers_the_displayed_figure_and_reads_back_through_the_write() {
-        let state = test_state().await;
-        set_locale(&state, "es-AR", "es").await;
-        let entry = cost_entry(&state).await;
-        let app = crate::routes::router(state.clone());
-        let base = format!("/web/purchases/{}/lines/cost", entry.purchase_id);
-
-        let (status, json) = preview_cost(
-            app.clone(),
-            &format!(
-                "{base}?product_id={}&unit_cost=&unit_cost_gross=6%2C05&cost_basis=gross",
-                entry.product_id
-            ),
-            test_support::TEST_COOKIE,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{json}");
-        let shown = json["value"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{json}"))
-            .to_string();
-        let locale = crate::localization::load_context(&state.pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            shown,
-            locale.format_decimal(
-                crate::services::purchase_cost::solve_net_cost_from_gross(
-                    dec_web("6.05"),
-                    &state
-                        .tax_service
-                        .list_active_for_product(entry.product_id)
-                        .await
-                        .unwrap(),
-                )
-                .unwrap(),
-            ),
-            "the answer is rendered through the SAME formatter the net field uses, so a figure \
-             cannot look like one thing here and another there: {json}"
-        );
-        assert!(
-            !shown.contains('.'),
-            "a comma-decimal locale must not receive a dot: {shown}"
-        );
-
-        // And posting that exact string back is what the page does next.
-        let (status, body) = add_cost_line(
-            app,
-            entry.purchase_id,
-            &format!(
-                "product_id={}&qty=1&unit_cost={shown}&unit_cost_gross=&cost_basis=net",
-                entry.product_id
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body:.400}");
-        assert_eq!(
-            stored_unit_cost(&state, entry.purchase_id, entry.product_id).await,
-            dec_web("5.00"),
-            "the figure the preview showed is the figure the write stored"
-        );
-    }
-
-    /// The preview is a READ, so it is gated on the READ permission and answers
-    /// both registered URL shapes with the full-page refusal card for a
-    /// principal that cannot open the page it belongs to. A preview that
-    /// computed for a principal who cannot see the document would be a way to
-    /// read a product's tax set through a page the gate hides.
-    #[tokio::test]
-    async fn the_cost_preview_is_gated_on_the_purchases_read_permission() {
-        let state = test_state().await;
-        let entry = cost_entry(&state).await;
-        let probe = test_support::seed_session_with_permissions(&state.pool, &["customers.read"])
-            .await
-            .unwrap();
-        let cookie = test_support::cookie_for(&probe);
-        let app = crate::routes::router(state);
-
-        for uri in [
-            format!(
-                "/web/purchases/{}/lines/cost?product_id={}&unit_cost_gross=6.05",
-                entry.purchase_id, entry.product_id
-            ),
-            format!(
-                "/web/purchases/lines/cost?product_id={}&unit_cost_gross=6.05",
-                entry.product_id
-            ),
-        ] {
-            let (status, html) = get_html_as(app.clone(), &uri, Some(&cookie)).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {html:.300}");
-            assert!(
-                html.contains("Action not permitted") && html.contains("purchases.read"),
-                "{uri} must refuse naming purchases.read: {html:.400}"
-            );
-        }
-    }
-
     /// A product of its own, for a rate set that only one refusal test links.
     /// A separate product per case because the tax set belongs to the product —
     /// sharing one would make the four cases interfere.
@@ -7986,122 +7690,64 @@ mod tests {
             .id
     }
 
-    /// A GROSS typed into the entry row stores the EXACT net whose gross is that
-    /// figure, and the stored line is priced by the same tax contract.
+    /// THE PREVIEW ROUTE IS GONE (search-only entry T3).
     ///
-    /// 6,05 under 21% solves to 5,00, and 5,00 grosses back to 6,05 with no
-    /// drift: the second half of the assertion is the one that matters, because
-    /// a net that is a cent out would still BE a plausible-looking number.
+    /// The entry row's money fields were its only caller, and the fields are
+    /// gone, so the endpoint went with them. This is worth a test rather than a
+    /// grep because the path is not inert: it was a READ that answered a SOLVED
+    /// figure about a product's tax set, and leaving it registered would leave
+    /// exactly that reachable from a page whose gate hides it.
+    ///
+    /// The two URL shapes are gone for DIFFERENT reasons and each is pinned to
+    /// its own, because a blanket "not 200" would pass on a handler that is
+    /// still there and refusing for some unrelated reason:
+    ///
+    /// * `/{id}/lines/cost` still MATCHES a route — the line route
+    ///   `/{purchase_id}/lines/{line_id}`, whose `line_id` reads "cost" fine and
+    ///   which serves no GET. So the answer is 405, and the body is empty. That
+    ///   is the real proof here: re-registering `get(web_preview_line_cost)`
+    ///   turns this into a 200 carrying a solved figure.
+    /// * `/lines/cost` matches nothing at all, so it is the router's own
+    ///   fallback: 404 with its distinctive body.
     #[tokio::test]
-    async fn a_gross_typed_into_the_entry_row_stores_the_exact_net_it_solves_to() {
+    async fn the_entry_row_cost_preview_route_is_gone() {
         let state = test_state().await;
         let entry = cost_entry(&state).await;
-        let app = crate::routes::router(state.clone());
+        let app = crate::routes::router(state);
 
-        let (status, body) = add_cost_line(
-            app,
-            entry.purchase_id,
-            &format!(
-                "product_id={}&qty=2&unit_cost=&unit_cost_gross=6.05&cost_basis=gross",
-                entry.product_id
-            ),
+        let matched_by_the_line_route = format!("/web/purchases/{}/lines/cost", entry.purchase_id);
+        let (status, body) = get_html_as(
+            app.clone(),
+            &matched_by_the_line_route,
+            Some(test_support::TEST_COOKIE),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body:.400}");
-
-        let net = stored_unit_cost(&state, entry.purchase_id, entry.product_id).await;
         assert_eq!(
-            net,
-            dec_web("5.00"),
-            "6,05 at 21% is the gross of exactly 5,00"
+            status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "no handler may serve a GET on the preview path: {matched_by_the_line_route}: {body:.300}"
         );
-        let taxes = state
-            .tax_service
-            .list_active_for_product(entry.product_id)
-            .await
-            .unwrap();
-        assert_eq!(
-            crate::services::line_taxes::calculate_line_taxes(net, &taxes)
-                .unwrap()
-                .total,
-            dec_web("6.05"),
-            "and the stored net grosses back to the typed figure, so nothing was approximated"
+        assert!(
+            body.is_empty(),
+            "a 405 carries the preview's answer in no form: {body:.300}"
         );
-    }
 
-    /// The same net typed directly is stored as typed, with no solve in the way:
-    /// the gross field is a second way in, never a filter on the first.
-    #[tokio::test]
-    async fn a_net_typed_into_the_entry_row_is_stored_as_typed() {
-        let state = test_state().await;
-        let entry = cost_entry(&state).await;
-        let app = crate::routes::router(state.clone());
-
-        let (status, body) = add_cost_line(
+        let (status, body) = get_html_as(
             app,
-            entry.purchase_id,
-            &format!(
-                "product_id={}&qty=1&unit_cost=5.00&unit_cost_gross=&cost_basis=net",
-                entry.product_id
-            ),
+            "/web/purchases/lines/cost",
+            Some(test_support::TEST_COOKIE),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{body:.400}");
         assert_eq!(
-            stored_unit_cost(&state, entry.purchase_id, entry.product_id).await,
-            dec_web("5.00")
+            status,
+            StatusCode::NOT_FOUND,
+            "the collection twin must be a routing miss: {body:.300}"
         );
-    }
-
-    /// THE STAIRCASE GAP. 0,03 at 21% is the gross of no net at all: 0,01 and
-    /// 0,02 both gross to themselves and 0,03 is skipped by the per-contribution
-    /// rounding. The write refuses and stores NOTHING — not a rounded net, not a
-    /// line at the product's cost, not a line at the satellite.
-    #[tokio::test]
-    async fn a_gross_that_is_the_gross_of_no_net_refuses_and_stores_nothing() {
-        let state = test_state().await;
-        let entry = cost_entry(&state).await;
-        state
-            .supplier_service
-            .record_cost(
-                audit_actor(&state).await,
-                entry.product_id,
-                entry.supplier_id,
-                dec_web("9.50"),
-                chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
-            )
-            .await
-            .unwrap();
-        let app = crate::routes::router(state.clone());
-
-        let (status, body) = add_cost_line(
-            app,
-            entry.purchase_id,
-            &format!(
-                "product_id={}&qty=1&unit_cost=&unit_cost_gross=0.03&cost_basis=gross",
-                entry.product_id
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:.400}");
         assert_eq!(
             refusal_sentence(&body),
-            crate::models::PriceRefusal::CostUnreachable.as_str(),
-            "the refusal is the shared sentence for a staircase gap, through the one mapping; \
-             `a_cost_refusal_renders_in_the_active_locale` proves the same body in another \
-             language"
-        );
-        let detail = state
-            .purchases_service
-            .get_detail(entry.purchase_id)
-            .await
-            .unwrap();
-        assert!(
-            !detail
-                .lines
-                .iter()
-                .any(|line| line.product_id == entry.product_id),
-            "a refused gross must store no line at all, and above all not the satellite: {detail:?}"
+            "route not found",
+            "and the router's own fallback body, so this cannot pass on a handler that still \
+             answers here for some reason of its own: {body:.300}"
         );
     }
 
