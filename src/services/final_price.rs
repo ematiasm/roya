@@ -428,8 +428,7 @@ fn solve_markup(cost_price: Decimal, net: Decimal) -> SolveResult<SolvedMarkup> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::gross_inverse::{cent, search_radius_cents};
-    use crate::services::line_taxes::{round_to_cents, MONEY_SCALE};
+    use crate::services::line_taxes::{cent, MONEY_SCALE};
     use std::str::FromStr;
 
     fn dec(value: &str) -> Decimal {
@@ -455,12 +454,6 @@ mod tests {
             created_at: midnight,
             updated_at: midnight,
         }
-    }
-
-    /// A generated rate set as the borrowed slice the solve takes, so a test can
-    /// build one with a repetition count instead of writing it out.
-    fn as_strs(rates: &[String]) -> Vec<&str> {
-        rates.iter().map(String::as_str).collect()
     }
 
     /// The linked taxes of a rate set, in the order they are written.
@@ -513,15 +506,6 @@ mod tests {
             Ok(answer) => panic!("expected a refusal, got the net {}", answer.net_price),
             Err(err) => err,
         }
-    }
-
-    /// What the naive approach does: divide the target by the gross factor and
-    /// round. In the test suite rather than in the solve, because the whole
-    /// point of the search is that this is not the answer — every test that
-    /// compares against it is a test about a real, verified disagreement.
-    fn naive_division(final_price: &str, rates: &[&str]) -> Decimal {
-        let divisor = gross_divisor(&taxes(rates)).unwrap();
-        round_to_cents(dec(final_price) / divisor)
     }
 
     /// The final price of a net through the ONE tax contract, so no test in
@@ -606,192 +590,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // THE CASES A DIVISION ALONE GETS WRONG
-    // -----------------------------------------------------------------------
-
-    /// The pinned fixture, found by exhaustively comparing the division against
-    /// the equation over nets 0.00 to 300.00: with 10% and 5% linked, a typed
-    /// `100.00` divides to `86.96`, and `86.96` grosses to `100.01`. The
-    /// operator would have been told their product sells at 100.01.
-    ///
-    /// The disagreement is one cent and it is not a rounding artefact of the
-    /// test: `86.96` is a real net whose real final price is `100.01`.
-    #[test]
-    fn final_price_where_the_naive_division_misses_by_a_cent() {
-        let rates = ["10", "5"];
-
-        let naive = naive_division("100.00", &rates);
-        assert_eq!(naive, dec("86.96"), "the fixture: division lands on 86.96");
-        assert_eq!(
-            final_of(&naive.to_string(), &rates),
-            dec("100.01"),
-            "and 86.96 grosses to 100.01, so the division's answer is a price \
-             the operator did not ask for"
-        );
-
-        let answer = solve("100.00", "5", None, &rates).unwrap();
-        assert_eq!(
-            answer.net_price,
-            dec("86.95"),
-            "the search must land on the net that grosses to exactly 100.00"
-        );
-        assert_eq!(
-            final_of(&answer.net_price.to_string(), &rates),
-            dec("100.00")
-        );
-        assert_ne!(
-            answer.net_price, naive,
-            "the two answers differ, which is the entire reason this is a search"
-        );
-    }
-
-    /// The same class of miss on a second rate set and on a small target, so
-    /// the first fixture cannot be dismissed as one lucky pair.
-    #[test]
-    fn final_price_where_the_division_misses_on_more_than_one_rate_set() {
-        // The division's answer, the price it actually grosses to, and the net
-        // that grosses to exactly what was typed. The middle column is pinned
-        // per case because the division misses in BOTH directions: a rate set
-        // with two taxes can leave the division a cent high or a cent low.
-        for (target, rates, division_net, division_gross, exact_net) in [
-            ("100.00", ["21", "5"].as_slice(), "79.37", "100.01", "79.36"),
-            ("0.23", ["21", "10"].as_slice(), "0.18", "0.24", "0.17"),
-            ("0.08", ["21", "5"].as_slice(), "0.06", "0.07", "0.07"),
-        ] {
-            assert_eq!(
-                naive_division(target, rates),
-                dec(division_net),
-                "{target} with {rates:?}: the division's answer"
-            );
-            assert_eq!(
-                final_of(division_net, rates),
-                dec(division_gross),
-                "{target} with {rates:?}: the price the division's net really sells at"
-            );
-            assert_ne!(
-                dec(division_gross),
-                dec(target),
-                "{target} with {rates:?}: and it is not the price that was typed"
-            );
-            let answer = solve(target, "5", None, rates).unwrap();
-            assert_eq!(
-                answer.net_price,
-                dec(exact_net),
-                "{target} with {rates:?}: the searched net"
-            );
-            assert_eq!(final_of(exact_net, rates), dec(target));
-        }
-    }
-
-    /// THE GUARD PROVES NOTHING.
-    ///
-    /// The obvious cheap guard is "is the division's answer within a cent of the
-    /// target?". It passes on the fixture above — `100.01` is within one cent of
-    /// `100.00` — and the answer is still wrong, because the operator asked for
-    /// a price that grosses to exactly what they typed. A tolerance guard can
-    /// only ever return a price that is off by up to the tolerance, and this
-    /// feature's whole claim is that it is not.
-    ///
-    /// This test exists to fail loudly if someone replaces the exact search with
-    /// a tolerance check: it asserts that the tolerance is satisfied by the
-    /// wrong net and NOT by the right one.
-    #[test]
-    fn final_price_a_within_a_cent_tolerance_guard_would_prove_nothing() {
-        let rates = ["10", "5"];
-
-        let wrong = naive_division("100.00", &rates);
-        let right = solve("100.00", "5", None, &rates).unwrap().net_price;
-
-        // The guard a lazy implementation would write, satisfied by the wrong
-        // net...
-        assert!(
-            (final_of(&wrong.to_string(), &rates) - dec("100.00")).abs() <= cent(),
-            "the tolerance guard passes on the WRONG net, so passing it proves nothing"
-        );
-        // ...and it cannot tell the two apart, because it is the same number
-        // for both.
-        assert_ne!(wrong, right, "and the two nets are genuinely different");
-        assert_eq!(
-            (final_of(&wrong.to_string(), &rates) - dec("100.00")).abs() <= cent(),
-            (final_of(&right.to_string(), &rates) - dec("100.00")).abs() <= cent(),
-            "the guard accepts both, so it cannot be the thing that decides"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // The tie-break: proximity to the estimate, never loop order
     // -----------------------------------------------------------------------
-
-    /// More than one net can produce the same final price, because the tax
-    /// contract's per-contribution rounding makes the final price a staircase
-    /// with flat steps. When that happens the answer is the net CLOSEST TO THE
-    /// UNROUNDED ESTIMATE, because the estimate is the operator's intent
-    /// ("this is about 0.10 including tax") and the flat step is an artefact of
-    /// rounding, not a choice anybody made.
-    ///
-    /// The fixture is chosen so that BOTH loop orders are wrong: scanning the
-    /// window upwards would answer 0.09, scanning it downwards 0.11, and only
-    /// the distance to the estimate answers 0.10. An implementation that
-    /// returned "whichever the loop found first" would pass this test only by
-    /// accident.
-    #[test]
-    fn final_price_ties_are_resolved_by_proximity_to_the_estimate() {
-        let rates = ["-60", "-10"];
-        let divisor = gross_divisor(&taxes(&rates)).unwrap();
-        let estimate = dec("0.03") / divisor;
-        assert_eq!(estimate, dec("0.10"), "the fixture: the estimate is 0.10");
-
-        let candidates = every_net_with_final("0.03", &rates, 50);
-        assert_eq!(
-            candidates,
-            vec![dec("0.09"), dec("0.10"), dec("0.11")],
-            "the fixture: three nets share this final price"
-        );
-
-        let answer = solve("0.03", "5", None, &rates).unwrap();
-        assert_eq!(answer.net_price, dec("0.10"), "the tie-break, not the loop");
-        assert_ne!(
-            answer.net_price,
-            *candidates.iter().min().expect("candidates are non-empty"),
-            "an upward scan would have answered the lowest candidate"
-        );
-        assert_ne!(
-            answer.net_price,
-            *candidates.iter().max().expect("candidates are non-empty"),
-            "a downward scan would have answered the highest candidate"
-        );
-    }
-
-    /// The tie-break is proximity, not "the middle one" and not "the biggest
-    /// one". Here the estimate falls between the second and third candidate and
-    /// the third is nearer, so a "pick the middle" or "pick the largest net"
-    /// implementation would answer 0.09 or 0.11 and be wrong.
-    #[test]
-    fn final_price_a_tie_picks_the_candidate_nearest_the_estimate_not_the_extreme() {
-        let rates = ["-79"];
-        let divisor = gross_divisor(&taxes(&rates)).unwrap();
-        let estimate = dec("0.02") / divisor;
-        let candidates = every_net_with_final("0.02", &rates, 50);
-        assert_eq!(
-            candidates,
-            vec![dec("0.08"), dec("0.09"), dec("0.10"), dec("0.11")],
-            "the fixture: four nets share this final price"
-        );
-
-        let answer = solve("0.02", "5", None, &rates).unwrap();
-        let nearest = candidates
-            .iter()
-            .min_by(|left, right| {
-                let left = (*left - estimate).abs();
-                let right = (*right - estimate).abs();
-                left.partial_cmp(&right).expect("finite distances")
-            })
-            .copied()
-            .expect("candidates are non-empty");
-        assert_eq!(answer.net_price, nearest, "the answer IS the nearest");
-        assert_ne!(answer.net_price, dec("0.08"), "and not the lowest");
-        assert_ne!(answer.net_price, dec("0.11"), "and not the highest");
-    }
 
     /// With EVERY rate non-negative, no two nets share a final price, so the
     /// tie-break never has to fire. This is the state the application is
@@ -800,7 +600,9 @@ mod tests {
     ///
     /// The condition that buys injectivity is "every rate is non-negative", NOT
     /// "the divisor is above one" — which is what the tie-break note in
-    /// `solve_net_from_gross` used to claim, and which the next test refutes.
+    /// `solve_net_from_gross` used to claim, and which
+    /// `gross_inverse_a_divisor_above_one_does_not_rule_out_a_tie` refutes
+    /// beside the search that owns the note.
     #[test]
     fn final_price_the_tie_break_is_never_needed_when_every_rate_is_non_negative() {
         for rates in [
@@ -818,40 +620,6 @@ mod tests {
                 assert_eq!(answer.net_price, net, "the net is its own answer");
             }
         }
-    }
-
-    /// THE COUNTEREXAMPLE to "a divisor above one means no ties".
-    ///
-    /// Rates of -5% and 10% sum to +5, so the divisor is 1.05 — comfortably
-    /// above one — and yet two nets share a final price: 0.09 and 0.10 both
-    /// gross to 0.10. The positive rate's contribution grows by 0.001 per cent
-    /// of net and the negative one's shrinks by 0.001, and the two cancel.
-    ///
-    /// This test exists so the reason in `solve_net_from_gross` cannot be quietly
-    /// "simplified" back to a divisor test by a future maintainer who reads it
-    /// as equivalent. It is not equivalent, and this is the difference.
-    #[test]
-    fn final_price_a_divisor_above_one_does_not_rule_out_a_tie() {
-        let rates = ["-5", "10"];
-        let divisor = gross_divisor(&taxes(&rates)).unwrap();
-        assert!(
-            divisor > Decimal::ONE,
-            "the fixture: the divisor IS above one, {divisor}"
-        );
-
-        let candidates = every_net_with_final("0.10", &rates, 50);
-        assert_eq!(
-            candidates,
-            vec![dec("0.09"), dec("0.10")],
-            "the fixture: a divisor above one, and still two nets for one final price"
-        );
-
-        let answer = solve("0.10", "5", None, &rates).unwrap();
-        assert_eq!(
-            answer.net_price,
-            dec("0.10"),
-            "the estimate is 0.095238..., and 0.10 is the nearer candidate"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -1196,102 +964,6 @@ mod tests {
         );
     }
 
-    /// THE GUARD ITSELF MUST NOT PANIC.
-    ///
-    /// The window endpoints were built with the raw `+`/`-` operators, and
-    /// `Decimal` panics on addition overflow — so the guard introduced to
-    /// prevent a panic could produce one.
-    ///
-    /// It takes a rate set that grosses the price almost to nothing. Exactly 100
-    /// taxes at `-0.99999999999` sum to `-99.999999999`, so the divisor is
-    /// `1e-11`, and a final price of `Decimal::MAX * 1e-11` — comfortably
-    /// INSIDE the 1e18 bound, so the price guard passes — divides straight back
-    /// to `Decimal::MAX`. `base` lands on the ceiling and adding the window's
-    /// step to it overflows.
-    ///
-    /// The low endpoint does not rescue it: `base - step` is representable, the
-    /// dry run on it succeeds, and the `||` reaches the high endpoint anyway.
-    /// Only checked arithmetic at both sites closes this.
-    #[test]
-    fn final_price_a_window_that_cannot_be_built_is_refused_not_a_panic() {
-        let many = |n: usize| -> Vec<String> {
-            std::iter::repeat("-0.99999999999".to_string())
-                .take(n)
-                .collect()
-        };
-
-        // The exact shape that reaches the window: the divisor is positive and
-        // tiny, so the solve gets as far as building the endpoints.
-        let rates = many(100);
-        let linked = taxes(&as_strs(&rates));
-        let divisor = gross_divisor(&linked).expect("a divisor of 1e-11 still inverts");
-        assert_eq!(
-            divisor,
-            Decimal::new(1, 11),
-            "the fixture: 100 such taxes gross the price down by exactly 1e-11"
-        );
-        let estimate = dec("792281625142643375.93543950335")
-            .checked_div(divisor)
-            .expect("the repro's estimate divides");
-        assert_eq!(
-            estimate,
-            Decimal::MAX,
-            "and dividing the typed price by 1e-11 lands on Decimal::MAX exactly"
-        );
-        assert_eq!(
-            round_to_cents(estimate),
-            Decimal::MAX,
-            "which survives rounding to cents, so `base + step` is the overflow"
-        );
-
-        assert_eq!(
-            refusal(solve(
-                "792281625142643375.93543950335",
-                "5",
-                None,
-                &as_strs(&rates)
-            )),
-            PriceRefusal::NetPriceTooLarge,
-            "the window cannot be built, so the solve must refuse rather than              overflow while guarding against an overflow"
-        );
-
-        let fewer = many(50);
-
-        // One more tax and the divisor is no longer positive, so the rate set is
-        // refused by rule 2 and never reaches the window at all. Pinned because
-        // it is the boundary of the case above, and because "150 also panicked"
-        // would be the wrong way to describe it.
-        for n in [150usize, 200] {
-            assert_eq!(
-                refusal(solve(
-                    "792281625142643375.93543950335",
-                    "5",
-                    None,
-                    &as_strs(&many(n))
-                )),
-                PriceRefusal::FinalPriceNotInvertible,
-                "{n} such taxes sum below -100, so the divisor is not positive"
-            );
-        }
-
-        // And fewer taxes leave plenty of room: the estimate is nowhere near the
-        // ceiling, so this is a boundary and not a blanket refusal. (The target
-        // itself carries more decimals than a cent-quantised net can reproduce, so
-        // the answer here is a gap in the staircase — what matters is that it is
-        // NOT a window failure.)
-        assert_ne!(
-            refusal(solve(
-                "792281625142643375.93543950335",
-                "5",
-                None,
-                &as_strs(&fewer)
-            )),
-            PriceRefusal::NetPriceTooLarge,
-            "50 such taxes halve the net, which is comfortably representable, so \\
-             the window is built and the solve gets past it"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // Typed refusals: every state the solve cannot honour
     // -----------------------------------------------------------------------
@@ -1515,60 +1187,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // The brute-force cross-check: independent evidence, not a plausible answer
     // -----------------------------------------------------------------------
-
-    /// THE WINDOW IS SUFFICIENT, over the range the module docs claim.
-    ///
-    /// `search_radius_cents` is a proven bound, and this is the test that
-    /// produces that claim: for every net in 0.00 to 600.00, and for every rate
-    /// set the suite uses, the window the solve actually computes CONTAINS a net
-    /// whose final price is exactly that net's own final price. A radius that
-    /// were one cent too small would miss at some net in this range, and the
-    /// search would report a target that is perfectly reachable as unreachable.
-    ///
-    /// The claim in the module docs is therefore evidence in this file, not a
-    /// number from a scratch script.
-    #[test]
-    fn final_price_the_window_is_sufficient_over_six_hundred_of_net() {
-        let rate_sets: [Vec<&str>; 10] = [
-            vec![],
-            vec!["21"],
-            vec!["10"],
-            vec!["5"],
-            vec!["100"],
-            vec!["0.5"],
-            vec!["21", "10"],
-            vec!["10", "5"],
-            vec!["21", "10", "5"],
-            vec!["21", "10", "5", "2.5"],
-        ];
-
-        for rates in rate_sets {
-            let taxes = taxes(&rates);
-            let divisor = gross_divisor(&taxes).expect("a non-negative rate set inverts");
-            let radius = search_radius_cents(taxes.len(), divisor);
-
-            for cents in 0..=60_000i64 {
-                let net = Decimal::new(cents, MONEY_SCALE);
-                let target = calculate_line_taxes(net, &taxes)
-                    .expect("a non-negative rate set carries an ordinary net")
-                    .total;
-                let base = round_to_cents(target / divisor);
-
-                let in_window = (-radius..=radius).any(|offset| {
-                    calculate_line_taxes(base + cent() * Decimal::from(offset), &taxes)
-                        .expect("a non-negative rate set carries an ordinary net")
-                        .total
-                        == target
-                });
-                assert!(
-                    in_window,
-                    "{net} with {rates:?} grosses to {target} and the window \
-                     {base} +/- {radius} cents holds no net that reproduces it: \
-                     the radius is too small"
-                );
-            }
-        }
-    }
 
     /// A wide sweep: every net in a long range is asked for ITS OWN final
     /// price, and the solve has to hand back a net that re-derives to exactly
