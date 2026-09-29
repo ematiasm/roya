@@ -1304,14 +1304,43 @@ where
 
         // Pre-check strict stock to avoid sequence gap + partial moves.
         if !self.inventory.allow_negative_stock {
+            // AGGREGATED PER PRODUCT, not per line. A document may legitimately
+            // carry the same product twice (2 units at one price and 1 at
+            // another on the same ticket) — unlike a purchase, where
+            // `product_supplier_costs` is UNIQUE (product_id, supplier_id) and
+            // duplicates are undefined rather than unusual. Nothing is written
+            // while this loop runs, so a per-LINE read gives every line of a
+            // product the SAME unmutated level: 6 + 6 of a level of 10 passes
+            // twice (10 - 6 = 4), the number is then burned, the first movement
+            // is committed, and the second is refused downstream — leaving a
+            // movement row whose reference names no sale, a burned number, and
+            // a Draft that `cancel` will not release. What the document demands
+            // is the SUM, so the sum is what the level is compared against, and
+            // the level is read once per product rather than once per line.
+            //
+            // The sum is CHECKED, not `Iterator::sum`: each line qty is a single
+            // bounded write, and the sum of a set of them is not bounded — two
+            // free lines (unit_price 0, so the document total above stays at 0
+            // and never trips) of 5e28 each are 1e29 together, which rust_decimal's
+            // `+` panics on. `checked_money_add` is the same refusal the total
+            // fold above already uses, and a line qty is bounded by nothing else.
+            let mut demanded: BTreeMap<i64, Decimal> = BTreeMap::new();
             for (line, _) in &tracked {
+                let sum = demanded
+                    .get(&line.product_id)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                *demanded.entry(line.product_id).or_insert(Decimal::ZERO) =
+                    checked_money_add(sum, line.qty).map_err(AppError::PriceRefused)?;
+            }
+            for (product_id, qty) in &demanded {
                 // The STRICT level: this is a decision, so it may not proceed on
                 // a figure nobody can state.
-                let current = self.inventory.stock_for_decision(line.product_id).await?;
-                if current - line.qty < Decimal::ZERO {
+                let current = self.inventory.stock_for_decision(*product_id).await?;
+                if current - *qty < Decimal::ZERO {
                     return Err(AppError::Validation(format!(
                         "insufficient stock: {current} would become {}",
-                        current - line.qty
+                        current - *qty
                     )));
                 }
             }
@@ -2991,6 +3020,73 @@ mod tests {
         let d = s.get_detail(sale.id).await.unwrap();
         assert_eq!(d.sale.status, crate::models::SaleStatus::Draft);
         assert!(d.sale.sale_number.is_none());
+    }
+
+    /// Two lines of the SAME tracked product are a legitimate document shape
+    /// (two units at one price and one at another on the same ticket), so the
+    /// strict pre-check cannot refuse the duplicate: it has to add the demands
+    /// up per product. Checked per LINE, both lines read the same unmutated
+    /// level (10 - 6 = 4, twice) and both pass, and the document then burns its
+    /// number and commits the FIRST movement before the second is refused
+    /// downstream — leaving a movement row whose reference names no sale, a
+    /// burned number, and a Draft that `cancel` will not release.
+    #[tokio::test]
+    async fn strict_stock_refuses_duplicate_product_lines_before_moving_anything() {
+        // NOT svc(): that builds with allow_stock = true, so the strict branch
+        // would never run and this test would pass for the wrong reason.
+        let (s, pool) = svc_with_flags(false, false).await;
+        let prod = seed_product(&s, "DUP-LINES", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-dup").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let walkin = walkin_of(&s).await;
+        let sale = draft_with_line(&s, walkin.id, PaymentType::Cash, None, prod.id, "6").await;
+        s.add_line(sale.id, prod.id, dec("6"), None).await.unwrap();
+
+        let movements_before = movement_count(&pool).await;
+        let txs_before = tx_count(&pool).await;
+        let sequence_before = sale_sequence_last(&pool).await;
+
+        // The document demands 6 + 6 = 12 of a level of 10.
+        let err = s
+            .confirm(audit_actor(&s).await, sale.id, Some(cash))
+            .await
+            .unwrap_err();
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        assert!(
+            msg.contains("insufficient stock"),
+            "message must name the stock rule: {msg}"
+        );
+
+        // Nothing below the number is written: the refusal is the PRE-CHECK's,
+        // before the document claims anything at all.
+        let detail = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(
+            detail.sale.status,
+            crate::models::SaleStatus::Draft,
+            "a refused document must stay Draft"
+        );
+        assert!(detail.sale.sale_number.is_none());
+        assert_eq!(
+            movement_count(&pool).await,
+            movements_before,
+            "a refused document must not have moved stock: the summed demand \
+             (12) exceeds the level (10), so the pre-check owns this refusal"
+        );
+        assert_eq!(tx_count(&pool).await, txs_before);
+        assert_eq!(sale_sequence_last(&pool).await, sequence_before);
+
+        // The level in the message is the UNMUTATED one (10 -> -2, i.e. 10 - 12).
+        // Were the second movement the thing that refused, it would report the
+        // level it found after the first one: 4 -> -2.
+        assert!(
+            msg.contains("10 would become"),
+            "the summed demand must be what the message subtracts: {msg}"
+        );
     }
 
     #[tokio::test]
