@@ -14,12 +14,38 @@
 // guarded by allow flags. Service / untracked lines sellable without stock
 // moves. Decimal-as-TEXT via repos.
 //
-// Atomicity note: true shared SQLite tx across services would require
-// changing finance/inventory services (forbidden here). Instead we
-// pre-validate (accounts, stock availability, balances) before any mutation,
-// then mutate in order sequence -> stock -> finance -> sale row. The only
-// expected side effect on failure after validation is a sequence gap
-// (abandoned number), which matches ticket reality. Single-user, no races.
+// Atomicity: there is NO shared transaction. A true one would require changing
+// the finance/inventory services (out of scope when this was written). Instead
+// we pre-validate (accounts, stock availability, balances) before any
+// mutation, then mutate in order sequence -> stock -> finance -> sale row, each
+// step on its own autocommit connection. A failure after the pre-validation
+// therefore leaves a PARTIAL WRITE, and the residue is measured, not assumed —
+// see the failure-window tests in this module's test block, and
+// odd/tasks/confirm-failure-injection-and-state-predicates.md. What a partial
+// write can leave, all of it observed:
+//
+//   W1  number -> 1st movement   Draft, number NULL, no rows written
+//   W2  2nd of N movements      Draft, number NULL, ONE Out committed (stock
+//                               already deducted, reference matches no sale)
+//   W3  finance -> payment      Draft, number NULL, an orphan Income carrying
+//                               the burned number and the full total
+//   W4  set_confirmed           Draft, number NULL, orphan Income AND a
+//                               payment row — get_detail reports this Draft
+//                               as Paid, paid=total, due=0
+//
+// W4 is the alarming one: the books show a full collection against a document
+// still editable as a Draft. `cancel` cannot release it, because cancel is a
+// hard no-op on a Draft (it is gated behind Confirmed), and the residue has no
+// parent document to reverse from.
+//
+// The pre-check reduces the windows but does not close them, and the number is
+// spent in every one. The predicate on set_confirmed refuses a duplicate
+// submission of an already-confirmed document; it does NOT make a failed
+// confirm safe to retry, because a failed attempt leaves the document in Draft
+// and the retry therefore re-passes the very same predicate. Only the shared
+// transaction removes the residue, and it also removes the sequence gap for
+// free, since `UPDATE last_number = last_number + 1` is already a
+// transactional write.
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, NaiveDate};
@@ -1304,14 +1330,43 @@ where
 
         // Pre-check strict stock to avoid sequence gap + partial moves.
         if !self.inventory.allow_negative_stock {
+            // AGGREGATED PER PRODUCT, not per line. A document may legitimately
+            // carry the same product twice (2 units at one price and 1 at
+            // another on the same ticket) — unlike a purchase, where
+            // `product_supplier_costs` is UNIQUE (product_id, supplier_id) and
+            // duplicates are undefined rather than unusual. Nothing is written
+            // while this loop runs, so a per-LINE read gives every line of a
+            // product the SAME unmutated level: 6 + 6 of a level of 10 passes
+            // twice (10 - 6 = 4), the number is then burned, the first movement
+            // is committed, and the second is refused downstream — leaving a
+            // movement row whose reference names no sale, a burned number, and
+            // a Draft that `cancel` will not release. What the document demands
+            // is the SUM, so the sum is what the level is compared against, and
+            // the level is read once per product rather than once per line.
+            //
+            // The sum is CHECKED, not `Iterator::sum`: each line qty is a single
+            // bounded write, and the sum of a set of them is not bounded — two
+            // free lines (unit_price 0, so the document total above stays at 0
+            // and never trips) of 5e28 each are 1e29 together, which rust_decimal's
+            // `+` panics on. `checked_money_add` is the same refusal the total
+            // fold above already uses, and a line qty is bounded by nothing else.
+            let mut demanded: BTreeMap<i64, Decimal> = BTreeMap::new();
             for (line, _) in &tracked {
+                let sum = demanded
+                    .get(&line.product_id)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                *demanded.entry(line.product_id).or_insert(Decimal::ZERO) =
+                    checked_money_add(sum, line.qty).map_err(AppError::PriceRefused)?;
+            }
+            for (product_id, qty) in &demanded {
                 // The STRICT level: this is a decision, so it may not proceed on
                 // a figure nobody can state.
-                let current = self.inventory.stock_for_decision(line.product_id).await?;
-                if current - line.qty < Decimal::ZERO {
+                let current = self.inventory.stock_for_decision(*product_id).await?;
+                if current - *qty < Decimal::ZERO {
                     return Err(AppError::Validation(format!(
                         "insufficient stock: {current} would become {}",
-                        current - line.qty
+                        current - *qty
                     )));
                 }
             }
@@ -2007,6 +2062,30 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    /// The document's payments, counted in the database rather than through the
+    /// detail view: the duplicate-submission tests must see the raw residue,
+    /// including a payment a refused second call managed to leave behind.
+    async fn payment_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM sale_payments")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// The document's stored `(status, sale_number)`, read straight from the
+    /// row. The failure-window tests must see what the database actually kept,
+    /// never what a service view would reconstruct for them.
+    async fn row_state(pool: &sqlx::SqlitePool, sale_id: i64) -> (String, Option<String>) {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, sale_number FROM sales WHERE id = ?",
+        )
+        .bind(sale_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     // -- AC1 ------------------------------------------------------------------
@@ -2991,6 +3070,73 @@ mod tests {
         let d = s.get_detail(sale.id).await.unwrap();
         assert_eq!(d.sale.status, crate::models::SaleStatus::Draft);
         assert!(d.sale.sale_number.is_none());
+    }
+
+    /// Two lines of the SAME tracked product are a legitimate document shape
+    /// (two units at one price and one at another on the same ticket), so the
+    /// strict pre-check cannot refuse the duplicate: it has to add the demands
+    /// up per product. Checked per LINE, both lines read the same unmutated
+    /// level (10 - 6 = 4, twice) and both pass, and the document then burns its
+    /// number and commits the FIRST movement before the second is refused
+    /// downstream — leaving a movement row whose reference names no sale, a
+    /// burned number, and a Draft that `cancel` will not release.
+    #[tokio::test]
+    async fn strict_stock_refuses_duplicate_product_lines_before_moving_anything() {
+        // NOT svc(): that builds with allow_stock = true, so the strict branch
+        // would never run and this test would pass for the wrong reason.
+        let (s, pool) = svc_with_flags(false, false).await;
+        let prod = seed_product(&s, "DUP-LINES", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-dup").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let walkin = walkin_of(&s).await;
+        let sale = draft_with_line(&s, walkin.id, PaymentType::Cash, None, prod.id, "6").await;
+        s.add_line(sale.id, prod.id, dec("6"), None).await.unwrap();
+
+        let movements_before = movement_count(&pool).await;
+        let txs_before = tx_count(&pool).await;
+        let sequence_before = sale_sequence_last(&pool).await;
+
+        // The document demands 6 + 6 = 12 of a level of 10.
+        let err = s
+            .confirm(audit_actor(&s).await, sale.id, Some(cash))
+            .await
+            .unwrap_err();
+        let msg = match &err {
+            AppError::Validation(m) => m.clone(),
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        assert!(
+            msg.contains("insufficient stock"),
+            "message must name the stock rule: {msg}"
+        );
+
+        // Nothing below the number is written: the refusal is the PRE-CHECK's,
+        // before the document claims anything at all.
+        let detail = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(
+            detail.sale.status,
+            crate::models::SaleStatus::Draft,
+            "a refused document must stay Draft"
+        );
+        assert!(detail.sale.sale_number.is_none());
+        assert_eq!(
+            movement_count(&pool).await,
+            movements_before,
+            "a refused document must not have moved stock: the summed demand \
+             (12) exceeds the level (10), so the pre-check owns this refusal"
+        );
+        assert_eq!(tx_count(&pool).await, txs_before);
+        assert_eq!(sale_sequence_last(&pool).await, sequence_before);
+
+        // The level in the message is the UNMUTATED one (10 -> -2, i.e. 10 - 12).
+        // Were the second movement the thing that refused, it would report the
+        // level it found after the first one: 4 -> -2.
+        assert!(
+            msg.contains("10 would become"),
+            "the summed demand must be what the message subtracts: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -5866,6 +6012,439 @@ mod tests {
                 .total(),
             SetMoney::refused(PriceRefusal::DocumentTotalTooLarge),
             "and the statement reads the same ageing the page does"
+        );
+    }
+
+    // -- Duplicate confirm (T2) ------------------------------------------------
+
+    /// A duplicate confirm SUBMISSION of the same document is refused, and the
+    /// refusal writes nothing at all: no second stock movement, no second
+    /// finance row, no second payment, and no second number burned.
+    ///
+    /// This is the end-to-end form of the guarantee. It reaches the service's
+    /// own `status == Confirmed` guard at `confirm`'s first read, which is what
+    /// refuses it here — the repository's own DRAFT predicate is the backstop
+    /// underneath that, proven separately, because a read is not a lock.
+    #[tokio::test]
+    async fn duplicate_confirm_submission_is_refused_and_writes_nothing() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "DUP-CONFIRM", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-dup").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(&s, WALKIN_ID, PaymentType::Cash, None, prod.id, "2").await;
+        let actor = audit_actor(&s).await;
+
+        let first = s.confirm(actor, sale.id, Some(cash)).await.unwrap();
+        let movements = movement_count(&pool).await;
+        let transactions = tx_count(&pool).await;
+        let payments = payment_count(&pool).await;
+        assert_eq!(
+            movements, 2,
+            "one seeding movement in, one Out by the confirm"
+        );
+        assert_eq!(transactions, 1, "a cash confirm posts one Income");
+        assert_eq!(payments, 1, "a cash confirm posts one payment");
+        assert_eq!(sale_sequence_last(&pool).await, Some(1));
+
+        // The duplicate submission.
+        let err = s.confirm(actor, sale.id, Some(cash)).await.unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert_eq!(
+                msg, "sale already confirmed",
+                "the refusal keeps its own wording"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        assert_eq!(
+            movement_count(&pool).await,
+            movements,
+            "the refused duplicate must not deduct a second time"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            transactions,
+            "the refused duplicate must not post a second Income"
+        );
+        assert_eq!(
+            payment_count(&pool).await,
+            payments,
+            "the refused duplicate must not post a second payment"
+        );
+        assert_eq!(
+            sale_sequence_last(&pool).await,
+            Some(1),
+            "the refused duplicate must not burn a second number"
+        );
+        assert_eq!(
+            first.sale.sale_number.as_deref(),
+            Some("2024-SALE-000001"),
+            "the one number the first confirm burned is the one that stands"
+        );
+    }
+
+    /// The SAME duplicate submission, arriving the way a race delivers it: while
+    /// this confirm is between its number and its movement, another writer has
+    /// already confirmed the document. `confirm`'s opening read saw a Draft, so
+    /// every guard above the final write passes — and only the repository's own
+    /// `AND status = 'Draft'` can still refuse the second stamp.
+    ///
+    /// The trigger is the standing technique in this repo for putting a second
+    /// writer inside another's statement (`tax_snapshot_tests.rs:747`), used
+    /// here to make the interleaving deterministic instead of timed.
+    ///
+    /// Strict stock is ON (`svc_with_flags(false, false)`), so the refusal is
+    /// proven under the production posture and not under a relaxed flag.
+    #[tokio::test]
+    async fn duplicate_confirm_that_reaches_the_final_write_is_refused_by_the_predicate() {
+        let (s, pool) = svc_with_flags(false, false).await;
+        let prod = seed_product(&s, "RACE-CONFIRM", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-race").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(&s, WALKIN_ID, PaymentType::Cash, None, prod.id, "2").await;
+        let actor = audit_actor(&s).await;
+        let prod_id = prod.id;
+        let sale_id = sale.id;
+
+        // Another writer confirms the document underneath this one, exactly
+        // between this confirm's `next_number` and its first movement.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER racing_confirm BEFORE INSERT ON stock_movements \
+             WHEN NEW.reason = 'Sale' AND NEW.product_id = {prod_id} \
+             BEGIN UPDATE sales SET status = 'Confirmed', sale_number = '2024-SALE-000099', \
+               confirmed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = {sale_id}; END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, sale.id, Some(cash)).await.unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("Confirmed"),
+                    "the refusal must name the state the write saw: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        let after = s.sales.find_sale(sale.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.sale_number.as_deref(),
+            Some("2024-SALE-000099"),
+            "the winning writer's number stands; the second one is never stamped"
+        );
+
+        // The honest residue: the predicate refuses the DOCUMENT, not the work
+        // that ran before it. Everything `confirm` wrote before `set_confirmed`
+        // is still there, because there is no shared transaction to unwind it.
+        assert_eq!(
+            movement_count(&pool).await,
+            2,
+            "the seeding movement in, and the Out this confirm already committed"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            1,
+            "the Income this confirm already committed"
+        );
+        assert_eq!(
+            payment_count(&pool).await,
+            1,
+            "the payment this confirm already committed"
+        );
+        assert_eq!(
+            sale_sequence_last(&pool).await,
+            Some(1),
+            "and the number it burned is still burned"
+        );
+    }
+
+    // -- confirm failure windows (T3) ----------------------------------------
+    //
+    // `confirm` writes the sequence, the stock movements, the finance row, the
+    // payment and the document on separate autocommit connections. Each
+    // statement is atomic; the SEQUENCE is not. So a failure between any two of
+    // them leaves everything already committed exactly where it was, and there
+    // is nothing in the codebase that can unwind it.
+    //
+    // These tests do not try to make that residue disappear — making it
+    // disappear is the shared transaction, which is out of scope here. They pin
+    // the residue instead, window by window, so the truth is on the record and
+    // the assertions that must keep passing once the transaction lands are
+    // already written. Every one of them runs with STRICT STOCK ON
+    // (`svc_with_flags(false, false)`), so the injected failure is provably the
+    // thing that stopped the confirm and not the stock pre-check above it.
+
+    /// WINDOW 1 — between `next_number` and the FIRST stock movement. The
+    /// residue is the narrowest one there is: a burned number and nothing else.
+    /// This is the case the atomicity note at the top of this file used to
+    /// describe as the ONLY possible one.
+    #[tokio::test]
+    async fn confirm_failure_between_the_number_and_the_first_movement_burns_only_a_number() {
+        let (s, pool) = svc_with_flags(false, false).await;
+        let prod = seed_product(&s, "T3-W1", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-t3w1").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(&s, WALKIN_ID, PaymentType::Cash, None, prod.id, "2").await;
+        let actor = audit_actor(&s).await;
+        let prod_id = prod.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t3_w1 BEFORE INSERT ON stock_movements \
+             WHEN NEW.reason = 'Sale' AND NEW.product_id = {prod_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected first-movement failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, sale.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected first-movement failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            sale_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent: `doc_sequences` was updated and never rolled back"
+        );
+        assert_eq!(
+            movement_count(&pool).await,
+            1,
+            "only the seeding movement in — the Out was aborted before it landed"
+        );
+        assert_eq!(tx_count(&pool).await, 0, "finance never started");
+        assert_eq!(payment_count(&pool).await, 0, "no payment was written");
+        assert_eq!(
+            row_state(&pool, sale.id).await,
+            ("Draft".to_string(), None),
+            "the document is still a Draft and was never given a number"
+        );
+    }
+
+    /// WINDOW 2 — on the SECOND movement of a two-line sale. Two DIFFERENT
+    /// products, each with stock to spare, so the strict per-product demand
+    /// pre-check above the loop has nothing to say and the confirm reaches the
+    /// loop with both lines eligible.
+    ///
+    /// The residue is the first proof that a partial write is not a sequence
+    /// gap: the first line's Out is committed and real, while the document
+    /// stays a Draft with no number. That stock is now deducted from a
+    /// document nobody can see, and `delete_draft` will take the Draft away
+    /// without giving the units back.
+    #[tokio::test]
+    async fn confirm_failure_on_the_second_movement_keeps_the_first_one_on_a_draft() {
+        let (s, pool) = svc_with_flags(false, false).await;
+        let first = seed_product(&s, "T3-W2A", "10").await;
+        seed_stock(&s, first.id, "10").await;
+        let second = seed_product(&s, "T3-W2B", "10").await;
+        seed_stock(&s, second.id, "10").await;
+        let acc = seed_account(&s, "caja-t3w2").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(&s, WALKIN_ID, PaymentType::Cash, None, first.id, "2").await;
+        // Lines are loaded in id order, so `first`'s Out is written before
+        // `second`'s — this is the SECOND movement that fails.
+        s.add_line(sale.id, second.id, dec("3"), None)
+            .await
+            .unwrap();
+        let actor = audit_actor(&s).await;
+        let second_id = second.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t3_w2 BEFORE INSERT ON stock_movements \
+             WHEN NEW.reason = 'Sale' AND NEW.product_id = {second_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected second-movement failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, sale.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected second-movement failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            sale_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent"
+        );
+        assert_eq!(
+            movement_count(&pool).await,
+            3,
+            "two seeding movements in, plus the first line's committed Out"
+        );
+        assert_eq!(tx_count(&pool).await, 0, "finance never started");
+        assert_eq!(payment_count(&pool).await, 0, "no payment was written");
+        assert_eq!(
+            row_state(&pool, sale.id).await,
+            ("Draft".to_string(), None),
+            "half the stock left the building on a Draft nobody can see"
+        );
+        let level: (String,) = sqlx::query_as(
+            "SELECT qty FROM stock_movements WHERE product_id = ? AND reason = 'Sale'",
+        )
+        .bind(first.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            Decimal::from_str(&level.0).unwrap(),
+            dec("2"),
+            "and the committed movement really did deduct the first line's units"
+        );
+    }
+
+    /// WINDOW 3 — between the Income row and the payment row. The residue is
+    /// the orphan: a `transactions` row stamped with the sale's reference that
+    /// no payment claims, inflating an account while the sale is a Draft and
+    /// stays unpaid forever. `check_payment_links_are_traceable` detects this
+    /// shape, but only inside its own test module.
+    #[tokio::test]
+    async fn confirm_failure_between_the_income_and_the_payment_leaves_an_orphan_income() {
+        let (s, pool) = svc_with_flags(false, false).await;
+        let prod = seed_product(&s, "T3-W3", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-t3w3").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(&s, WALKIN_ID, PaymentType::Cash, None, prod.id, "2").await;
+        let actor = audit_actor(&s).await;
+        let sale_id = sale.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t3_w3 BEFORE INSERT ON sale_payments \
+             WHEN NEW.sale_id = {sale_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected payment-row failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, sale.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected payment-row failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            sale_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent"
+        );
+        assert_eq!(movement_count(&pool).await, 2, "the Out was committed");
+        assert_eq!(tx_count(&pool).await, 1, "the Income was committed");
+        assert_eq!(
+            payment_count(&pool).await,
+            0,
+            "the payment never landed, so the Income is claimed by nobody"
+        );
+        assert_eq!(
+            row_state(&pool, sale.id).await,
+            ("Draft".to_string(), None),
+            "the document is still a Draft with no number"
+        );
+
+        let orphan: (i64, String, String) = sqlx::query_as(
+            "SELECT id, kind, reference FROM transactions t \
+             WHERE NOT EXISTS (SELECT 1 FROM sale_payments sp WHERE sp.transaction_id = t.id \
+                               OR sp.refund_transaction_id = t.id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphan.1, "Income");
+        assert_eq!(
+            orphan.2, "2024-SALE-000001",
+            "the orphan still carries the number the failed attempt burned"
+        );
+        let amount: (String,) = sqlx::query_as("SELECT amount FROM transactions WHERE id = ?")
+            .bind(orphan.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            Decimal::from_str(&amount.0).unwrap(),
+            dec("20"),
+            "and it carries the full document total"
+        );
+    }
+
+    /// WINDOW 4 — on `set_confirmed` itself. This is the LAST write, so the
+    /// residue is the largest: a Draft that has already moved stock, already
+    /// posted an Income and already collected a payment. The money is in, the
+    /// units are gone, and the document is still editable as a Draft.
+    #[tokio::test]
+    async fn confirm_failure_on_set_confirmed_leaves_a_paid_draft() {
+        let (s, pool) = svc_with_flags(false, false).await;
+        let prod = seed_product(&s, "T3-W4", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "caja-t3w4").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = draft_with_line(&s, WALKIN_ID, PaymentType::Cash, None, prod.id, "2").await;
+        let actor = audit_actor(&s).await;
+        let sale_id = sale.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t3_w4 BEFORE UPDATE ON sales WHEN NEW.id = {sale_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected set-confirmed failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, sale.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected set-confirmed failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            sale_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent"
+        );
+        assert_eq!(movement_count(&pool).await, 2, "the Out was committed");
+        assert_eq!(tx_count(&pool).await, 1, "the Income was committed");
+        assert_eq!(
+            payment_count(&pool).await,
+            1,
+            "the payment was committed: the shop has the money and no document"
+        );
+        assert_eq!(
+            row_state(&pool, sale.id).await,
+            ("Draft".to_string(), None),
+            "the document is still a Draft and was never given a number"
+        );
+        let detail = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(
+            detail.payment_status,
+            crate::models::PaymentStatus::Paid,
+            "the document reports itself PAID: the payment row is on the Draft, and \
+             `get_detail` reads the payments table, not the document's status"
+        );
+        assert_eq!(
+            detail.paid,
+            dec("20"),
+            "so the shop's books show the full total collected against a document \
+             that is still editable as a Draft"
+        );
+        assert_eq!(
+            detail.due,
+            dec("0"),
+            "with nothing outstanding, on a document nobody can reconcile to a number"
         );
     }
 }

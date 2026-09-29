@@ -163,6 +163,17 @@ pub trait SaleRepository: Send + Sync {
     /// Update Draft header fields (service guarantees Draft status).
     async fn update_draft(&self, id: i64, actor: i64, patch: &UpdateSaleDraft) -> AppResult<Sale>;
     /// Transition Draft -> Confirmed with assigned number.
+    ///
+    /// The Draft precondition is this statement's own WHERE, not the service's
+    /// up-front read: a document that is not a Draft is refused with a
+    /// [`AppError::Validation`] naming the state it was found in. So a duplicate
+    /// submission of an already-Confirmed sale cannot stamp a second number,
+    /// even if the caller's status check were relaxed or raced.
+    ///
+    /// It does NOT make a failed confirmation retryable. A confirm writes on
+    /// several autocommit connections, so a failure part-way leaves the document
+    /// in Draft with part of its work committed — and the retry re-passes this
+    /// predicate and writes again. Only a shared transaction removes that.
     async fn set_confirmed(&self, id: i64, actor: i64, sale_number: &str) -> AppResult<Sale>;
     /// Transition Draft/Confirmed -> Cancelled.
     async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale>;
@@ -449,6 +460,28 @@ impl SqliteSaleRepository {
             Err(error) => AppError::Database(error),
         }
     }
+
+    /// Why a confirm write matched no row: either the sale does not exist, or it
+    /// exists and is no longer a Draft. Read back so the refusal names the state
+    /// the document actually rests in, and so the two cases stay
+    /// distinguishable — a missing document is a 404, a frozen one is a
+    /// validation the caller can explain. Same contract as
+    /// [`SqliteSaleRepository::refuse_line`], read outside a transaction because
+    /// `set_confirmed` runs on the pool's autocommit, exactly as the write it
+    /// refuses did.
+    async fn refuse_confirm(pool: &SqlitePool, id: i64) -> AppError {
+        match sqlx::query_scalar::<_, String>("SELECT status FROM sales WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(None) => AppError::NotFound(format!("sale {id} not found")),
+            Ok(Some(status)) => AppError::Validation(format!(
+                "sale {id} is {status}: only a Draft sale can be confirmed"
+            )),
+            Err(error) => AppError::Database(error),
+        }
+    }
 }
 
 #[async_trait]
@@ -711,21 +744,53 @@ impl SaleRepository for SqliteSaleRepository {
     }
 
     async fn set_confirmed(&self, id: i64, actor: i64, sale_number: &str) -> AppResult<Sale> {
-        let row = sqlx::query(
+        // The DRAFT predicate is this statement's own WHERE, the same backstop
+        // `delete_line` and `delete_draft` already carry. A document that is
+        // not a Draft matches nothing, and a zero-row match is a refusal that
+        // names the state the statement saw — never a `RowNotFound` for
+        // `map_db_err` to guess about.
+        //
+        // WHAT IT REFUSES: a duplicate submission of a document that has already
+        // been confirmed (or cancelled). `confirm` reads the status once, up
+        // front, and that read is not a lock — between it and this write another
+        // writer can confirm the same document, and without the predicate this
+        // statement would stamp a second number over the first and report a
+        // success the caller must never be told about.
+        //
+        // WHAT IT DOES NOT DO: it does not make a failed confirmation safe to
+        // retry. `confirm` writes the sequence, the stock movements, the finance
+        // row and the payment on separate autocommit connections, so a failure
+        // part-way leaves the document in Draft with part of its work already
+        // committed. The retry re-passes this very predicate and writes again.
+        // The residue a partial write leaves is not something a WHERE clause can
+        // reach; only the shared transaction — one unit per user action, the way
+        // Odoo holds a cursor for the whole request — removes it.
+        let res = sqlx::query(
             r#"UPDATE sales
                SET sale_number = ?, status = 'Confirmed',
                    updated_by = ?,
                    confirmed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
+               WHERE id = ?
+                 AND status = 'Draft'"#,
         )
         .bind(sale_number)
         .bind(actor)
         .bind(id)
-        .fetch_one(&self.pool)
+        .execute(&self.pool)
         .await
         .map_err(map_db_err)?;
-        Ok(row_to_sale(row))
+        if res.rows_affected() == 0 {
+            return Err(Self::refuse_confirm(&self.pool, id).await);
+        }
+        // The row the UPDATE just wrote, read back through the same read the
+        // rest of the layer uses. `find_sale` cannot return `None` here in
+        // practice — a just-confirmed row is not deletable — but the branch is
+        // written out rather than unwrapped so a future caller never sees a
+        // panic from a repository method.
+        self.find_sale(id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("sale {id} not found")))
     }
 
     async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale> {
@@ -2273,5 +2338,83 @@ mod tests {
         let pool = migrated_pool().await;
         let repo = SqliteSaleRepository::new(pool.clone());
         assert!(!repo.delete_draft(999_999).await.unwrap());
+    }
+
+    // -- set_confirmed (the confirm write's own DRAFT predicate) ---------------
+
+    /// THE backstop proof for the confirm write, on the same shape as the
+    /// delete proof above: the repository is called DIRECTLY on an already
+    /// Confirmed sale — no service guard in the way — and must refuse, because
+    /// `AND status = 'Draft'` is what makes a duplicate confirmation impossible
+    /// even if the service's read-then-write check were relaxed or raced.
+    #[tokio::test]
+    async fn set_confirmed_called_directly_on_a_confirmed_sale_is_refused_naming_the_state() {
+        let pool = migrated_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let sale =
+            seed_sale_with_status(&pool, "Draft", "Confirm Buyer", d(2024, 5, 2), actor).await;
+
+        // The first confirmation is the only one that may write.
+        let confirmed = repo
+            .set_confirmed(sale, actor, "2024-SALE-000001")
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status, crate::models::SaleStatus::Confirmed);
+        assert_eq!(confirmed.sale_number.as_deref(), Some("2024-SALE-000001"));
+
+        // The duplicate submission is refused, and the refusal names the state
+        // the statement actually saw rather than a generic "already exists".
+        let err = repo
+            .set_confirmed(sale, actor, "2024-SALE-000002")
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("Confirmed"),
+                    "the refusal must name the state the document was found in: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // Nothing was rewritten: the FIRST number survives, so a refused
+        // duplicate did not stamp a second one over the confirmed document.
+        let after = repo.find_sale(sale).await.unwrap().unwrap();
+        assert_eq!(
+            after.sale_number.as_deref(),
+            Some("2024-SALE-000001"),
+            "the refused duplicate must leave the confirmed number untouched"
+        );
+        assert_eq!(after.confirmed_at, confirmed.confirmed_at);
+    }
+
+    /// The same refusal for a Cancelled document: only a Draft may be confirmed,
+    /// so a cancelled sale is refused too — and it is named as Cancelled, not
+    /// Confirmed, because that is the state the row rests in.
+    #[tokio::test]
+    async fn set_confirmed_called_directly_on_a_cancelled_sale_is_refused_naming_cancelled() {
+        let pool = migrated_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqliteSaleRepository::new(pool.clone());
+        let sale =
+            seed_sale_with_status(&pool, "Cancelled", "Annulled Buyer", d(2024, 5, 2), actor).await;
+
+        let err = repo
+            .set_confirmed(sale, actor, "2024-SALE-000003")
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("Cancelled"),
+                    "the refusal must name the state the document was found in: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let after = repo.find_sale(sale).await.unwrap().unwrap();
+        assert_eq!(after.sale_number, None, "the cancelled sale kept no number");
     }
 }
