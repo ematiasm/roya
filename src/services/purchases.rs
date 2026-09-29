@@ -20,10 +20,39 @@
 // per originating account; a refund is money entering, so it is never blocked
 // by the negative-balance guard.
 //
-// Atomicity note: mirrors sales. No shared SQLite tx across services; we
-// pre-validate everything, then mutate in order sequence -> stock -> finance ->
-// document -> satellite. The only expected side effect on a late failure is an
-// abandoned sequence number.
+// Atomicity: mirrors sales, and its residue table is in this module's test
+// block. There is NO shared transaction; we pre-validate everything, then
+// mutate in order sequence -> stock -> finance -> document -> satellite, each
+// step on its own autocommit connection. A late failure therefore leaves a
+// PARTIAL WRITE, and the only expected side effect is NOT an abandoned number.
+// Measured, per window:
+//
+//   W1  number -> 1st movement   Draft, number NULL, nothing written
+//   W2  2nd of N movements      Draft, number NULL, ONE In committed (stock
+//                               already inflated, reference matches no purchase)
+//   W3  finance -> payment      Draft, number NULL, an orphan Expense carrying
+//                               the burned number and the full total
+//   W4  set_confirmed           Draft, number NULL, orphan Expense AND a
+//                               payment row
+//   W5  record_cost             Confirmed, number SET, money and stock fully
+//                               applied, but only SOME of the lines have their
+//                               supplier cost recorded
+//
+// W5 is the worst of the five and it belongs to purchases alone, because
+// record_cost runs AFTER set_confirmed rather than inside the same unit. The
+// document is legitimately Confirmed, so no state predicate can reach it: there
+// is nothing for a Draft gate to refuse, and the retry is correctly refused by
+// the opening read. The result is a Confirmed, numbered, FULLY PAID purchase
+// whose supplier cost history is silently wrong for the remaining lines, and
+// nothing the operator can do through this service repairs it. The satellites
+// are the app's input for cost freshness and reorder suggestions, so a stale
+// cost there propagates into every later suggestion.
+//
+// The sequence is spent in every window. The predicate on set_confirmed
+// refuses a duplicate submission of an already-confirmed document; it does NOT
+// make a failed confirm safe to retry, because a failed attempt leaves the
+// document in Draft and the retry re-passes the same predicate. Only the shared
+// transaction removes the residue, and it removes the sequence gap for free.
 use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashSet};
@@ -1820,6 +1849,51 @@ mod tests {
             .await
             .unwrap()
             .0
+    }
+
+    /// The purchase sequence, read the way the sales tests read theirs: what
+    /// `next_number` actually spent, which a failed confirm cannot give back.
+    async fn purchase_sequence_last(pool: &sqlx::SqlitePool) -> Option<i64> {
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT last_number FROM doc_sequences WHERE doc_type = 'PURCH'",
+        )
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        .map(|r| r.0)
+    }
+
+    /// The document's payments, counted in the database rather than through the
+    /// detail view, so the failure-window tests see the raw residue.
+    async fn payment_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM purchase_payments")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// The satellite cost rows, counted directly: `record_cost` runs after
+    /// `set_confirmed`, so a purchase can be Confirmed with only SOME of its
+    /// lines' costs recorded, and nothing else in the layer shows that.
+    async fn cost_count(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM product_supplier_costs")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// The document's stored `(status, purchase_number)`, read straight from
+    /// the row.
+    async fn row_state(pool: &sqlx::SqlitePool, purchase_id: i64) -> (String, Option<String>) {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT status, purchase_number FROM purchases WHERE id = ?",
+        )
+        .bind(purchase_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     async fn draft_cash(s: &Svc, supplier_id: i64) -> Purchase {
@@ -5519,5 +5593,386 @@ mod tests {
         assert!(record.lines[0].taxes.is_empty());
         assert_eq!(record.lines[0].tax_total, dec("0"));
         assert_eq!(record.lines[0].total, dec("20"));
+    }
+
+    // -- confirm failure windows (T4) ----------------------------------------
+    //
+    // `PurchasesService::confirm` writes the sequence, the stock movements, the
+    // finance row, the payment, the document and THEN the supplier costs, each
+    // on its own autocommit connection. Every statement is atomic; the sequence
+    // is not. So a failure between any two of them leaves everything already
+    // committed in place, and nothing in the codebase can unwind it.
+    //
+    // These tests pin the residue instead of removing it — the shared
+    // transaction is out of scope here. All five run on `svc()`, whose
+    // `allow_balance = true` is REQUIRED rather than incidental: with the M0
+    // overdraft guard on, every Cash confirm below would be refused with
+    // "insufficient funds" against a fresh empty account and the injected
+    // trigger would never fire.
+
+    /// WINDOW 1 — between `next_number` and the FIRST stock movement. The
+    /// narrowest residue: a burned number and nothing else.
+    #[tokio::test]
+    async fn purchase_confirm_failure_between_the_number_and_the_first_movement_burns_only_a_number(
+    ) {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T4-W1", "5").await;
+        let sup = seed_supplier(&s, "T4 W1 Supplier").await;
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        let acc = seed_account(&s, "caja-t4w1").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let actor = audit_actor(&s).await;
+        let prod_id = prod.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t4_w1 BEFORE INSERT ON stock_movements \
+             WHEN NEW.reason = 'Purchase' AND NEW.product_id = {prod_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected first-movement failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, purchase.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected first-movement failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            purchase_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent: `doc_sequences` was updated and never rolled back"
+        );
+        assert_eq!(movement_count(&pool).await, 0, "no stock came in");
+        assert_eq!(tx_count(&pool).await, 0, "finance never started");
+        assert_eq!(payment_count(&pool).await, 0, "no payment was written");
+        assert_eq!(
+            row_state(&pool, purchase.id).await,
+            ("Draft".to_string(), None),
+            "the document is still a Draft and was never given a number"
+        );
+    }
+
+    /// WINDOW 2 — on the SECOND movement of a two-line purchase. Two DIFFERENT
+    /// products so the loop is reached with both lines eligible, and a failure
+    /// that lands after the first In is committed.
+    #[tokio::test]
+    async fn purchase_confirm_failure_on_the_second_movement_keeps_the_first_one_on_a_draft() {
+        let (s, pool) = svc().await;
+        let first = seed_product(&s, "T4-W2A", "5").await;
+        let second = seed_product(&s, "T4-W2B", "7").await;
+        let sup = seed_supplier(&s, "T4 W2 Supplier").await;
+        let purchase = draft_cash(&s, sup.id).await;
+        // Lines are loaded in id order, so `first`'s In is written first.
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            first.id,
+            dec("2"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            second.id,
+            dec("3"),
+            Some(dec("7")),
+        )
+        .await
+        .unwrap();
+        let acc = seed_account(&s, "caja-t4w2").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let actor = audit_actor(&s).await;
+        let second_id = second.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t4_w2 BEFORE INSERT ON stock_movements \
+             WHEN NEW.reason = 'Purchase' AND NEW.product_id = {second_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected second-movement failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, purchase.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected second-movement failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            purchase_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent"
+        );
+        assert_eq!(
+            movement_count(&pool).await,
+            1,
+            "the first line's In was committed and the second never landed"
+        );
+        assert_eq!(tx_count(&pool).await, 0, "finance never started");
+        assert_eq!(payment_count(&pool).await, 0, "no payment was written");
+        assert_eq!(
+            row_state(&pool, purchase.id).await,
+            ("Draft".to_string(), None),
+            "half the goods came in on a Draft nobody can see"
+        );
+    }
+
+    /// WINDOW 3 — between the Expense row and the payment row. The orphan: a
+    /// `transactions` row stamped with the purchase's reference that no payment
+    /// claims, so an account carries an expense the document never recorded.
+    #[tokio::test]
+    async fn purchase_confirm_failure_between_the_expense_and_the_payment_leaves_an_orphan_expense()
+    {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T4-W3", "5").await;
+        let sup = seed_supplier(&s, "T4 W3 Supplier").await;
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        let acc = seed_account(&s, "caja-t4w3").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let actor = audit_actor(&s).await;
+        let purchase_id = purchase.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t4_w3 BEFORE INSERT ON purchase_payments \
+             WHEN NEW.purchase_id = {purchase_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected payment-row failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, purchase.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected payment-row failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            purchase_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent"
+        );
+        assert_eq!(movement_count(&pool).await, 1, "the In was committed");
+        assert_eq!(tx_count(&pool).await, 1, "the Expense was committed");
+        assert_eq!(
+            payment_count(&pool).await,
+            0,
+            "the payment never landed, so the Expense is claimed by nobody"
+        );
+        assert_eq!(
+            row_state(&pool, purchase.id).await,
+            ("Draft".to_string(), None),
+            "the document is still a Draft with no number"
+        );
+        let orphan: (i64, String, String) = sqlx::query_as(
+            "SELECT id, kind, reference FROM transactions t \
+             WHERE NOT EXISTS (SELECT 1 FROM purchase_payments pp WHERE pp.transaction_id = t.id \
+                               OR pp.refund_transaction_id = t.id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphan.1, "Expense");
+        assert_eq!(
+            orphan.2, "2024-PURCH-000001",
+            "the orphan still carries the number the failed attempt burned"
+        );
+    }
+
+    /// WINDOW 4 — on `set_confirmed` itself. The residue is a Draft that has
+    /// already taken the goods in and already paid the supplier.
+    #[tokio::test]
+    async fn purchase_confirm_failure_on_set_confirmed_leaves_a_paid_draft() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T4-W4", "5").await;
+        let sup = seed_supplier(&s, "T4 W4 Supplier").await;
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        let acc = seed_account(&s, "caja-t4w4").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let actor = audit_actor(&s).await;
+        let purchase_id = purchase.id;
+
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t4_w4 BEFORE UPDATE ON purchases WHEN NEW.id = {purchase_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected set-confirmed failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, purchase.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected set-confirmed failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        assert_eq!(
+            purchase_sequence_last(&pool).await,
+            Some(1),
+            "the number is spent"
+        );
+        assert_eq!(movement_count(&pool).await, 1, "the In was committed");
+        assert_eq!(tx_count(&pool).await, 1, "the Expense was committed");
+        assert_eq!(
+            payment_count(&pool).await,
+            1,
+            "the payment was committed: the supplier was paid and no document says so"
+        );
+        assert_eq!(
+            row_state(&pool, purchase.id).await,
+            ("Draft".to_string(), None),
+            "the document is still a Draft and was never given a number"
+        );
+        assert_eq!(
+            cost_count(&pool).await,
+            0,
+            "and `record_cost` never ran — it is after `set_confirmed`"
+        );
+    }
+
+    /// WINDOW 5 — the one purchases has and sales does not: `record_cost` runs
+    /// in a loop AFTER `set_confirmed` succeeded. A failure there leaves the
+    /// document Confirmed, numbered and fully paid, with only SOME of its lines'
+    /// supplier costs recorded.
+    ///
+    /// This residue is worse than the four above, because unlike them it cannot
+    /// be retried: the retry is refused at `confirm`'s opening read ("purchase
+    /// already confirmed") and by the statement's own predicate. The missing cost
+    /// is permanent until somebody opens the supplier drawer and types it in, and
+    /// nothing in the document records that it is missing.
+    #[tokio::test]
+    async fn purchase_confirm_failure_in_record_cost_leaves_a_confirmed_purchase_with_one_cost() {
+        let (s, pool) = svc().await;
+        let first = seed_product(&s, "T4-W5A", "5").await;
+        let second = seed_product(&s, "T4-W5B", "7").await;
+        let sup = seed_supplier(&s, "T4 W5 Supplier").await;
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            first.id,
+            dec("2"),
+            Some(dec("5")),
+        )
+        .await
+        .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            second.id,
+            dec("3"),
+            Some(dec("7")),
+        )
+        .await
+        .unwrap();
+        let acc = seed_account(&s, "caja-t4w5").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let actor = audit_actor(&s).await;
+        let second_id = second.id;
+
+        // Installed AFTER the lines: `add_line` only READS the satellite, so a
+        // trigger here would not have tripped on the draft either — but a
+        // trigger that can only mean "the confirm's own record_cost" is the
+        // one that documents the window.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER t4_w5 BEFORE INSERT ON product_supplier_costs \
+             WHEN NEW.product_id = {second_id} \
+             BEGIN SELECT RAISE(ABORT, 'injected record-cost failure'); END"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s.confirm(actor, purchase.id, Some(cash)).await.unwrap_err();
+        assert!(
+            err.to_string().contains("injected record-cost failure"),
+            "expected the injected failure to surface, got {err}"
+        );
+
+        // Everything the document needed had already committed.
+        assert_eq!(
+            row_state(&pool, purchase.id).await,
+            (
+                "Confirmed".to_string(),
+                Some("2024-PURCH-000001".to_string())
+            ),
+            "the document IS confirmed and numbered"
+        );
+        assert_eq!(movement_count(&pool).await, 2, "both goods came in");
+        assert_eq!(tx_count(&pool).await, 1, "the Expense was committed");
+        assert_eq!(payment_count(&pool).await, 1, "the payment was committed");
+        assert_eq!(
+            cost_count(&pool).await,
+            1,
+            "but only the FIRST line's supplier cost was recorded"
+        );
+
+        let recorded: (i64,) = sqlx::query_as("SELECT product_id FROM product_supplier_costs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded.0, first.id,
+            "and it is the first line's, not the second's"
+        );
+        assert!(
+            s.suppliers
+                .find_cost(second.id, sup.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the second line's cost is simply absent, with no marker anywhere \
+             that the purchase was supposed to record it"
+        );
+
+        // And the retry is refused: this residue is permanent from the
+        // document's own point of view.
+        let retry = s.confirm(actor, purchase.id, Some(cash)).await.unwrap_err();
+        match retry {
+            AppError::Validation(msg) => assert_eq!(msg, "purchase already confirmed"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(
+            cost_count(&pool).await,
+            1,
+            "and the refused retry recorded no further cost"
+        );
     }
 }
