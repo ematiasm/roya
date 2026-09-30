@@ -64,24 +64,33 @@ pub trait ProductSupplierCostRepository: Send + Sync {
         when: NaiveDate,
     ) -> AppResult<ProductSupplierCost>;
 
-    /// [`Self::create_cost`] inside a transaction the CALLER owns, and the first
-    /// of the three satellite writes `PurchasesService::confirm` performs after
-    /// `set_confirmed` has already succeeded
-    /// (`src/services/purchases.rs:1197-1207`).
+    /// [`Self::create_cost`] inside a transaction the CALLER owns, and the
+    /// first of the three satellite writes `PurchasesService::confirm` performs
+    /// after `set_confirmed_in` has already succeeded — in the SAME unit
+    /// (`src/services/purchases.rs:1240-1252`, inside the unit opened at 1167
+    /// and committed at 1253).
     ///
-    /// That loop is WINDOW 5, and it is the one failure window in this
-    /// repository with no recovery path at all: `record_cost` runs once per line
-    /// AFTER the document is Confirmed, numbered and paid, so a failure part way
-    /// through the loop leaves a finished purchase carrying only SOME of its
-    /// supplier costs. Nothing recovers it — the retry is refused at `confirm`'s
-    /// own opening read ("purchase already confirmed"), and nothing on the
-    /// document records that a cost is missing, while the satellite is what
-    /// feeds cost freshness and reorder suggestions. Measured by
-    /// `purchase_confirm_failure_in_record_cost_leaves_a_confirmed_purchase_with_one_cost`
-    /// (`src/services/purchases.rs:5880`).
+    /// That LOOP is WINDOW 5, and it is why this write belongs to the confirm
+    /// unit at all. It used to be the one failure window in this repository with
+    /// no recovery path: `record_cost` ran once per line on its own autocommit
+    /// connection AFTER the document was already Confirmed, numbered and paid,
+    /// so a failure part way through the loop left a finished purchase carrying
+    /// only SOME of its supplier costs — and nothing could put that right. The
+    /// retry was refused at `confirm`'s own opening read ("purchase already
+    /// confirmed"), and nothing on the document recorded that a cost was
+    /// missing, even though the satellite is what feeds cost freshness and
+    /// reorder suggestions.
     ///
-    /// Nothing opens a transaction yet. This is the door; `confirm` does not
-    /// walk through it until a later commit of Phase A does.
+    /// With the write inside the unit that residue is gone: a failure there
+    /// takes the whole document back — a Draft, unnumbered, unpaid, and with NO
+    /// costs at all, the first line's cost written before the failure going
+    /// back with the second. Measured by
+    /// `purchase_confirm_failure_in_record_cost_leaves_a_clean_draft_and_no_costs`
+    /// (`src/services/purchases.rs:5980`).
+    ///
+    /// So `confirm` DOES walk through this door. The public twin still opens a
+    /// unit of its own and delegates to this method, so a cost typed into the
+    /// supplier drawer is unchanged.
     async fn create_cost_in(
         &self,
         tx: &mut sqlx::SqliteConnection,
@@ -121,8 +130,14 @@ pub trait ProductSupplierCostRepository: Send + Sync {
     /// statement touches exactly one row, selected by the
     /// `UNIQUE(product_id, supplier_id)` pair, and folds no money.
     ///
-    /// Nothing opens a transaction yet. This is the door; `confirm` does not
-    /// walk through it until a later commit of Phase A does.
+    /// `confirm` DOES walk through this door: `record_cost_in` takes this branch
+    /// when a confirmed purchase re-prices a pair the satellite already holds
+    /// (`src/services/suppliers.rs:351-355`), inside the same unit as the
+    /// document. The displacement described above is therefore inside a unit
+    /// that a later failure rolls back, rather than committed on a connection
+    /// of its own — the `shift_cost_in_*` test below proves the rollback half of
+    /// exactly that. The public twin still opens a unit of its own, so a shift
+    /// typed into the supplier drawer is unchanged.
     async fn shift_cost_in(
         &self,
         tx: &mut sqlx::SqliteConnection,
@@ -156,8 +171,13 @@ pub trait ProductSupplierCostRepository: Send + Sync {
     /// Same shape as `shift_cost_in`: `fetch_optional`, the explicit `NotFound`,
     /// no read-back, one copy of the SQL.
     ///
-    /// Nothing opens a transaction yet. This is the door; `confirm` does not
-    /// walk through it until a later commit of Phase A does.
+    /// `confirm` DOES walk through this door, and this is the branch that keeps
+    /// the derived price-change alert honest under the transaction: it is taken
+    /// when a confirmed purchase re-states a price the satellite already holds,
+    /// so the write that `shift_cost_in` would have displaced never happens, and
+    /// moving `previous_cost` here would make the alert read "Unchanged"
+    /// forever. The public twin still opens a unit of its own, so a cost typed
+    /// into the supplier drawer is unchanged.
     async fn refresh_cost_date_in(
         &self,
         tx: &mut sqlx::SqliteConnection,
@@ -186,6 +206,11 @@ pub trait ProductSupplierCostRepository: Send + Sync {
     /// exists. The same reasoning as `stock_for_product_in` and
     /// `balance_for_account_in`.
     ///
+    /// Inside `confirm` this is not hypothetical: the loop calls `record_cost_in`
+    /// once per line on the caller's unit (`src/services/purchases.rs:1240-1252`),
+    /// so the read has to see the previous line's cost the unit just wrote or
+    /// every line after the first is branched against stale state.
+    ///
     /// The public twin wraps THIS method in a transaction rather than sharing a
     /// second copy of the SELECT, which is why there is no `find_cost_raw` free
     /// function here the way `purchase_repo` has `find_purchase_raw`. There,
@@ -194,8 +219,8 @@ pub trait ProductSupplierCostRepository: Send + Sync {
     /// exist on two executors. Here `find` is nothing but the wrapper of this
     /// method, so one copy of the SQL is one executor too.
     ///
-    /// Nothing opens a transaction yet. This is the door; `confirm` does not
-    /// walk through it until a later commit of Phase A does.
+    /// So `confirm` DOES walk through this door. `find_cost` still answers from
+    /// the pool, which is the only behaviour it has ever had.
     async fn find_in(
         &self,
         tx: &mut sqlx::SqliteConnection,
@@ -634,10 +659,13 @@ mod tests {
     // thing here `confirm` does NOT reach; it is a separate slice and is
     // deliberately left alone.
     //
-    // Nothing here opens a transaction across a service call. Phase A installs
-    // the doors; `confirm` does not walk through them until a later commit, and
-    // the last test pins that all four public wrappers are untouched in the
-    // meantime.
+    // The doors are now WALKED. `confirm` opens one unit
+    // (`src/services/purchases.rs:1167`) and every write and read above runs
+    // inside it, the cost loop included, so a failure anywhere in the confirm
+    // takes the satellite back with the document. What is still true here is
+    // only that no method on this repository opens a transaction across a
+    // service call: each `_in` joins the caller's unit and each public twin
+    // still opens one of its own, which the last test pins.
 
     /// The write must land in the caller's unit, not in one of its own: a cost
     /// created inside a transaction and rolled back with it is GONE, and one

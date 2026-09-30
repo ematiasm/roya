@@ -149,6 +149,26 @@ where
 
 #[async_trait]
 pub trait SaleRepository: Send + Sync {
+    /// The connection pool behind this repository, so a caller that owns a
+    /// WORKING UNIT can open the transaction the `_in` methods join. It is the
+    /// one non-`async` method here: it hands out the pool rather than borrowing
+    /// it, so nothing about it can be awaited and `#[async_trait]` leaves it
+    /// alone.
+    ///
+    /// Why it exists at all. `SalesService` is generic over repository TRAITS and
+    /// holds no `SqlitePool` of its own — by design, so the service layer cannot
+    /// grow SQL. Until this method the traits were pure data access, and
+    /// `confirm` could not open the unit its five writes need. The alternative
+    /// was a `pool` field on the service, which would have changed four
+    /// construction sites and broken the dependency injection the whole test
+    /// suite builds its fixtures through. A field read in one impl line is the
+    /// smaller change, and it keeps the service holding no SQL handle.
+    ///
+    /// It is a WIDENING of the trait's surface and nothing else: the service
+    /// that receives it is the caller, and every read and write below still goes
+    /// through the repository's own methods.
+    fn pool(&self) -> &SqlitePool;
+
     /// `customer_name` is the snapshot resolved by the service through
     /// `CustomerService`; this layer never reads the `customers` table.
     async fn create_sale(
@@ -193,31 +213,57 @@ pub trait SaleRepository: Send + Sync {
     /// submission of an already-Confirmed sale cannot stamp a second number,
     /// even if the caller's status check were relaxed or raced.
     ///
-    /// It does NOT make a failed confirmation retryable. A confirm writes on
-    /// several autocommit connections, so a failure part-way leaves the document
-    /// in Draft with part of its work committed — and the retry re-passes this
-    /// predicate and writes again. Only a shared transaction removes that.
+    /// It does NOT make a failed confirmation retryable BY ITSELF, and that is
+    /// still true: a WHERE clause cannot reach residue. What changed is that
+    /// there is no residue left to reach. `confirm` now opens ONE transaction
+    /// immediately before `next_number` and commits after the last write
+    /// (`src/services/sales.rs:1402-1469`), so a failure anywhere in between
+    /// rolls back the sequence number, every stock movement, the `Income`, the
+    /// `sale_payments` row and the confirmation together. The document is still
+    /// `("Draft", None)` — a Draft with no number, no money, and nothing the
+    /// predicates below were written to distrust — and once the cause is fixed
+    /// the same retry succeeds. The removal of that residue is measured, not
+    /// assumed, by the `confirm_failure_*` tests in `src/services/sales.rs`.
+    ///
+    /// This public twin still opens a unit of its own and delegates, so a caller
+    /// that reaches for it directly gets exactly the old behaviour: the single
+    /// statement, atomically, with no sibling writes.
     async fn set_confirmed(&self, id: i64, actor: i64, sale_number: &str) -> AppResult<Sale>;
 
     /// [`Self::set_confirmed`] inside a transaction the CALLER owns.
     ///
     /// This is the write that decides whether a document exists as far as the
     /// shop is concerned, and the last of the five `confirm` performs
-    /// (`src/services/sales.rs:1377-1435`). Everything before it — the sequence
-    /// number, a stock movement per tracked line, the `Income`, the
-    /// `sale_payments` row — is already committed by the time it runs, which is
-    /// precisely why a unit that does not include this statement cannot be
-    /// atomic.
+    /// (`src/services/sales.rs:1402-1469`). It is also the write that made the
+    /// surrounding unit worth opening: when every other statement ran on its own
+    /// autocommit connection, a failure HERE left the sequence number spent, the
+    /// stock movements committed, the `Income` committed and a `sale_payments`
+    /// row committed on a document still reading `("Draft", NULL)` — a paid
+    /// draft, and a residue no WHERE clause could reach.
+    ///
+    /// `confirm` now opens ONE unit immediately before `next_number` and commits
+    /// after this statement (`src/services/sales.rs:1402-1469`), so that
+    /// residue cannot be produced by a failure at this step: the `?` drops the
+    /// `Transaction` and sqlx rolls the whole run back, including the burned
+    /// number. The document stays a Draft with no number, `get_detail` derives
+    /// it as Unpaid again, and the retry works once the cause is fixed. The
+    /// `delete_draft` hazard that residue created — its CASCADE taking the
+    /// payment while the unparented `Income` survived — is gone with it.
     ///
     /// The DRAFT predicate is unchanged and is still this statement's own
     /// `WHERE`: a non-Draft matches nothing and the refusal is read back
     /// through the SAME connection, so it names the state the write saw. That
     /// read-back is the trap in this file, and it is called out on
     /// [`SqliteSaleRepository::refuse_confirm`] — the helper's executor is part
-    /// of what moves, not an implementation detail of it.
+    /// of what moves, not an implementation detail of it. Inside the unit, the
+    /// predicate's remaining job is that the statement, the read-back and
+    /// `refuse_confirm` all have to stay on the connection the caller was
+    /// handed; it still refuses a duplicate submission of an already-Confirmed
+    /// document, and it does so without the pool ever being involved.
     ///
-    /// Nothing opens a transaction yet. This is the door; `confirm` does not
-    /// walk through it until a later commit of Phase A does.
+    /// `confirm` DOES walk through this door now. The public twin still opens a
+    /// unit of its own and delegates to this method, so both shapes remain and
+    /// the twin's behaviour is unchanged.
     async fn set_confirmed_in(
         &self,
         tx: &mut sqlx::SqliteConnection,
@@ -312,20 +358,29 @@ pub trait SaleRepository: Send + Sync {
     ///
     /// The `sale_payments` row is written FOURTH of five, after the `Income` it
     /// records, and it is the row the paid/unpaid state of the document is
-    /// derived from. A confirm that dies between them leaves an `Income` with
-    /// no payment naming it; a confirm that dies AFTER them leaves a `Draft`
-    /// that has been paid — measured by
-    /// `confirm_failure_on_set_confirmed_leaves_a_paid_draft`
-    /// (`src/services/sales.rs:6389`), whose own assertion reads *"the shop has
-    /// the money and no document"*. Neither residue is reachable from a WHERE
-    /// clause; only the shared transaction removes it.
+    /// derived from. That made it the hinge of the old residue: a confirm that
+    /// died between the two left an `Income` with no payment naming it, and a
+    /// confirm that died AFTER them left a Draft that reported itself Paid —
+    /// measured, at the time, by what used to be called a "paid draft" and what
+    /// its own assertion read as *"the shop has the money and no document"*.
+    ///
+    /// Neither shape is reachable any more. `confirm` holds ONE unit across both
+    /// writes and this statement (`src/services/sales.rs:1402-1469`), so a
+    /// failure on either side of the pair rolls back both, and the measurement
+    /// is now the ABSENCE: `confirm_failure_on_set_confirmed_leaves_a_clean_draft_that_reports_unpaid`
+    /// (`src/services/sales.rs:6461`) asserts zero `Income`, zero payments, an
+    /// unspent number, and a `get_detail` that reports `Unpaid` with the whole
+    /// total outstanding. The same holds for the window between the two writes.
     ///
     /// Unlike `set_confirmed_in` this write has no read-back and no refusal
     /// helper, which makes it the straight case: the statement moves to the
     /// caller's executor and `map_db_err` moves with it, unchanged.
     ///
-    /// Nothing opens a transaction yet. This is the door; `confirm` does not
-    /// walk through it until a later commit of Phase A does.
+    /// `confirm` DOES walk through this door now. The public twin still opens a
+    /// unit of its own and delegates, and the two production callers that
+    /// collect against an already-Confirmed document
+    /// (`record_payment_with_receipt`) are unchanged — this doc describes the
+    /// confirm path, not the only two paths to the insert.
     async fn create_payment_in(
         &self,
         tx: &mut sqlx::SqliteConnection,
@@ -552,14 +607,22 @@ impl SqliteSaleRepository {
     /// reason: the refusal is read through the CALLER'S transaction, so it
     /// describes the same state the write saw.
     ///
-    /// This signature used to be hard-coded to `&SqlitePool`, written when
-    /// `set_confirmed` ran on autocommit, and it is the trap in this file. The
-    /// refusal is reached ONLY when the DRAFT predicate matched no row, so a
-    /// migration that moves the UPDATE and forgets this helper passes every
-    /// happy-path test and fails only on refusal — where it would stall for
-    /// sqlx's 30s acquire timeout inside the caller's transaction and answer
-    /// `PoolTimedOut` instead of a `Validation` the operator is waiting for.
-    /// The mapping below is unchanged: `NotFound`, `Validation`, `Database`.
+    /// This signature USED to be hard-coded to `&SqlitePool`, written when
+    /// `set_confirmed` ran on autocommit. That history is why it reads the way
+    /// it does, but it is not a statement about current behaviour: `confirm`
+    /// holds ONE unit (`src/services/sales.rs:1402-1469`) and calls this helper
+    /// on the connection it was handed, so the connection is now load-bearing
+    /// rather than historical.
+    ///
+    /// The trap is unchanged, and reverting this signature to `&SqlitePool` is
+    /// what the test
+    /// `set_confirmed_in_refuses_a_non_draft_document_without_ever_reaching_for_the_pool`
+    /// catches. The refusal is reached ONLY when the DRAFT predicate matched no
+    /// row, so a regression here passes every happy-path test in this file and
+    /// fails only on refusal — where it would stall for sqlx's 30s acquire
+    /// timeout inside the caller's transaction and answer `PoolTimedOut` instead
+    /// of a `Validation` the operator is waiting for. The mapping below is
+    /// unchanged: `NotFound`, `Validation`, `Database`.
     async fn refuse_confirm(conn: &mut SqliteConnection, id: i64) -> AppError {
         match sqlx::query_scalar::<_, String>("SELECT status FROM sales WHERE id = ?")
             .bind(id)
@@ -577,6 +640,12 @@ impl SqliteSaleRepository {
 
 #[async_trait]
 impl SaleRepository for SqliteSaleRepository {
+    /// A field read: the struct's `pool` is already `pub` and is already what
+    /// every other method on this impl borrows.
+    fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     async fn create_sale(
         &self,
         actor: i64,
@@ -863,14 +932,22 @@ impl SaleRepository for SqliteSaleRepository {
         // statement would stamp a second number over the first and report a
         // success the caller must never be told about.
         //
-        // WHAT IT DOES NOT DO: it does not make a failed confirmation safe to
-        // retry. `confirm` writes the sequence, the stock movements, the finance
-        // row and the payment on separate autocommit connections, so a failure
-        // part-way leaves the document in Draft with part of its work already
-        // committed. The retry re-passes this very predicate and writes again.
-        // The residue a partial write leaves is not something a WHERE clause can
-        // reach; only the shared transaction — one unit per user action, the way
-        // Odoo holds a cursor for the whole request — removes it.
+        // WHAT IT STILL DOES NOT DO: it does not make a failed confirmation safe
+        // to retry ON ITS OWN. A WHERE clause cannot reach residue; that is
+        // what the shared unit is for. `confirm` now opens ONE transaction
+        // immediately before `next_number` and commits after this statement
+        // (`src/services/sales.rs:1402-1469`), so the sequence, the movements,
+        // the `Income` and the payment are no longer separate autocommit
+        // connections. A failure at this step rolls the whole run back: the
+        // number is UNSPENT, no movement survives, no finance row is orphaned,
+        // the document is still `("Draft", None)` and the retry re-passes this
+        // predicate and succeeds once the cause is fixed.
+        //
+        // So the predicate is no longer asked to cover that case — the unit is.
+        // What it is still asked to cover, and still covers, is the duplicate
+        // submission above, and getting THAT refusal out of this statement is
+        // why the read-back and `refuse_confirm` below must both stay on
+        // `tx`.
         let res = sqlx::query(
             r#"UPDATE sales
                SET sale_number = ?, status = 'Confirmed',
@@ -1018,42 +1095,46 @@ impl SaleRepository for SqliteSaleRepository {
         // reference it). That much the predicate decides, and it decides it
         // soundly.
         //
-        // WHAT THE PREDICATE DOES NOT ESTABLISH is that the row is clean. This
-        // statement used to claim a discarded sale "never touched stock or
-        // finance", and that is false, measured rather than inferred. `confirm`
-        // writes, in order: the sequence number, a movement per tracked line, the
-        // `Income`, the `sale_payments` row, and `set_confirmed` LAST
-        // (`src/services/sales.rs:1377-1435`). The sale row is only stamped at
-        // the very end, so every earlier write is already committed while the
-        // document still reads `("Draft", NULL)`.
+        // WHAT THE PREDICATE DOES NOT ESTABLISH, and never did, is integrity.
+        // It is a backstop on STATUS, not a cleanliness check: it answers "may
+        // this row be removed", and it says nothing about what else is pointing
+        // at that row.
         //
-        // The window that matters is a failure AT `set_confirmed`, which leaves a
-        // Draft carrying a committed `sale_payments` row and an orphan `Income`
-        // whose `reference` is the burned number. The characterization test is
-        // `confirm_failure_on_set_confirmed_leaves_a_paid_draft`
-        // (`src/services/sales.rs:6389`), and its own assertion is the sentence
-        // this comment used to contradict: "the payment was committed: the shop
-        // has the money and no document".
+        // That distinction mattered most when a Draft could be DIRTY. It used
+        // to: `confirm` wrote the sequence number, a movement per tracked line,
+        // the `Income`, the `sale_payments` row, and `set_confirmed` LAST, each
+        // on its own autocommit connection, so every earlier write was already
+        // committed while the document still read `("Draft", NULL)`. A failure
+        // AT `set_confirmed` left a Draft carrying a committed payment row and
+        // an orphan `Income` whose `reference` was the burned number — and such
+        // a Draft MATCHES the first branch. `sale_payments.sale_id` CASCADEs
+        // from `sales`, so the delete took the payment row with it, while the
+        // `Income` has no foreign key to `sales` at all and survived, pointing
+        // at a number no document carried any more: the delete removed the
+        // document and kept the money. Discarding such a row did not dodge it
+        // either — Draft -> Cancelled is explicitly a no-op for stock and
+        // finance (`src/services/sales.rs:1618`), and it assigns no number, so
+        // the row arrived at the SECOND branch still carrying both.
         //
-        // Such a Draft MATCHES the first branch. `sale_payments.sale_id` CASCADEs
-        // from `sales`, so the delete takes the payment row with it — while the
-        // `Income` has no foreign key to `sales` at all and survives, pointing at
-        // a number no document carries any more. The delete removes the document
-        // and keeps the money.
+        // THAT RESIDUE NO LONGER EXISTS. `confirm` opens one transaction
+        // immediately before `next_number` and commits after the last write
+        // (`src/services/sales.rs:1402-1469`), so a failure at any step leaves
+        // the row a Draft with no number, no payments, no movements and no
+        // ledger entry — measured by
+        // `confirm_failure_on_set_confirmed_leaves_a_clean_draft_that_reports_unpaid`
+        // (`src/services/sales.rs:6461`), whose assertions are the ABSENCE of
+        // every shape listed above. The history is kept here because it is why
+        // the transaction exists and because the guard below still has to be
+        // read as a backstop rather than as a proof.
         //
-        // Discarding such a residue row does not dodge this. The Draft ->
-        // Cancelled step is explicitly a no-op for stock and finance
-        // (`src/services/sales.rs:1574-1581`), and it does not assign a number,
-        // so the row arrives at the SECOND branch still carrying its payment and
-        // its `Income`. Purchases are symmetric
-        // (`src/repositories/purchase_repo.rs`, same hazard).
-        //
-        // So the guard is not this WHERE and never was. Status is not a
-        // cleanliness proof: before treating a Draft as safe to delete, check for
-        // payments, movements or an `Income`. This method deliberately keeps
-        // answering from the predicate alone, because changing that answer is a
-        // behaviour decision with its own test and its own migration story — not
-        // a comment's business, and not this commit's.
+        // The method keeps answering from the predicate alone. Widening or
+        // narrowing what it deletes is a behaviour decision with its own test
+        // and its own migration story, and it is not a comment's business. Note
+        // the corollary for any future reader tempted to close the window here
+        // instead: `create_payment` must NOT grow a `Draft` gate, because two
+        // production callers collect against an already-Confirmed document. The
+        // fix for "a Draft might be dirty" was `confirm`, and that is where it
+        // went.
         let res = sqlx::query(
             r#"DELETE FROM sales
                WHERE id = ?
@@ -2608,16 +2689,22 @@ mod tests {
     //
     // `set_confirmed` is the trap, and the trap is NOT in `set_confirmed` — it is
     // in a private helper called only on the refusal path. `refuse_confirm`'s
-    // signature was hard-coded to `&SqlitePool` because `set_confirmed` ran on
+    // signature WAS hard-coded to `&SqlitePool`, because `set_confirmed` ran on
     // autocommit, exactly as `refuse_line`'s had to be changed when
-    // `rewrite_draft_line_taxes` moved. A migration that misses it passes every
-    // happy-path test in this file and fails only the refusal ones, which is why
-    // there is a test below that drives the refusal by NAME rather than
-    // incidentally.
+    // `rewrite_draft_line_taxes` moved. It is a `&mut SqliteConnection` now
+    // because `confirm` holds one unit and calls the helper on the connection it
+    // was handed. Reverting it is a real regression and not a cosmetic one: a
+    // migration that misses it passes every happy-path test in this file and
+    // fails only the refusal ones, which is why there is a test below that
+    // drives the refusal by NAME rather than incidentally.
     //
-    // Nothing here opens a transaction across a service call. Phase A installs
-    // the doors; `confirm` does not walk through them until a later commit, and
-    // the last test pins that both public wrappers are untouched in the meantime.
+    // The doors are now WALKED. `confirm` opens one unit
+    // (`src/services/sales.rs:1402`) and both of these writes run inside it, so
+    // a failure anywhere in the confirm rolls back the number, the movements,
+    // the `Income` and the payment with the confirmation. What is still true
+    // here is only that no method on this repository opens a transaction across
+    // a service call: each `_in` joins the caller's unit and each public twin
+    // still opens one of its own, which the last test pins.
 
     /// The write must land in the caller's unit, not in one of its own: a payment
     /// created inside a transaction and rolled back with it is GONE, and one that
