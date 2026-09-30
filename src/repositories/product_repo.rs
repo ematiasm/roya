@@ -13,6 +13,49 @@ use crate::models::{NewProduct, Product, ProductBarcode, ProductKind};
 pub trait ProductRepository: Send + Sync {
     async fn create(&self, actor: i64, input: &NewProduct) -> AppResult<Product>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Product>>;
+
+    /// [`Self::find_by_id`] inside a transaction the CALLER owns, and the WEAKEST
+    /// reason in the closure — stated that way on purpose, because a doc comment
+    /// that borrowed `stock_for_product_in`'s argument would be borrowing a claim
+    /// this method cannot make.
+    ///
+    /// There is no correctness argument here. `confirm` writes `doc_sequences`,
+    /// `stock_movements`, `transactions`, `sale_payments` and `sales` (plus
+    /// `product_supplier_costs` on the purchase side) — never `products`. Nothing
+    /// this read validates is ever written by the transaction that will hold it,
+    /// so reading it from the caller's connection buys no fresher truth than
+    /// reading it from the pool. Contrast `stock_for_product_in`, which folds rows
+    /// the same document is still writing and genuinely cannot answer correctly
+    /// from a snapshot.
+    ///
+    /// What this read does need is a CONNECTION it was handed. `confirm` reaches
+    /// `find_by_id` from three places, all of them `InventoryService::get_product`
+    /// (`src/services/inventory.rs:523`) or `record_movement`'s own guard
+    /// (`src/services/inventory.rs:732`):
+    ///
+    /// * the validation loop, once per line — `sales.rs:1249`, `purchases.rs:1039`;
+    /// * the strict stock pre-check, once per distinct product, through
+    ///   `stock_for_decision` — `sales.rs:1365` → `inventory.rs:831`;
+    /// * `record_movement`, once per tracked movement, INSIDE the write phase —
+    ///   `sales.rs:1384`, `purchases.rs:1141`.
+    ///
+    /// The first two sit before any write, so whether they fall inside confirm's
+    /// transaction depends on where Phase B opens the BEGIN, and that placement is
+    /// not this commit's decision. The third does not: a transaction that makes
+    /// the write phase atomic has to hold `record_movement`, and a pool-based read
+    /// under it would stall for sqlx's 30s acquire timeout and answer
+    /// `PoolTimedOut` on a one-connection pool — or, on a many-connection pool,
+    /// take a second connection and read outside the unit while holding the first.
+    /// That is the whole argument: this read is a door, not a correctness fix.
+    ///
+    /// Nothing opens a transaction yet. This is the door; the confirm path does
+    /// not walk through it until a later commit of Phase A does.
+    async fn find_by_id_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+    ) -> AppResult<Option<Product>>;
+
     async fn find_by_sku(&self, sku: &str) -> AppResult<Option<Product>>;
     /// Exact SKU regardless of case, used by the scanner/SKU resolution path.
     async fn find_by_sku_ci(&self, sku: &str) -> AppResult<Option<Product>>;
@@ -147,12 +190,32 @@ impl ProductRepository for SqliteProductRepository {
         Ok(row_to_product(row))
     }
 
+    /// A transaction of its own, for a caller with no larger unit to offer. The
+    /// query and the projection are `find_by_id_in`'s to inherit unchanged; all
+    /// this adds is the BEGIN/COMMIT that it deliberately leaves to someone else.
+    /// A read that opens a transaction is not a write's privilege — the caller
+    /// that owns the larger unit is the only one who can see what is in it.
     async fn find_by_id(&self, id: i64) -> AppResult<Option<Product>> {
+        let mut tx = self.pool.begin().await?;
+        let product = self.find_by_id_in(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(product)
+    }
+
+    async fn find_by_id_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+    ) -> AppResult<Option<Product>> {
+        // The executor is the caller's connection. Nothing here opens a unit of
+        // its own, so the read joins the caller's unit instead of ending one.
+        // The SQL, the bind and `row.map(row_to_product)` are byte-for-byte what
+        // `find_by_id` always ran.
         let row = sqlx::query(
             r#"SELECT id, sku, name, kind, category_id, unit, sale_price, cost_price, markup_pct, track_stock, min_stock, max_stock, location, notes, is_active, created_by, updated_by, created_at, updated_at FROM products WHERE id = ?"#,
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         Ok(row.map(row_to_product))
     }
@@ -300,6 +363,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
     async fn test_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -467,5 +531,197 @@ mod tests {
         assert_eq!(updated.markup_pct, Some(Decimal::from_str("30").unwrap()));
         let reloaded = r.find_by_id(created.id).await.unwrap().unwrap();
         assert_eq!(reloaded.markup_pct, Some(Decimal::from_str("30").unwrap()));
+    }
+
+    // -- Phase A: the transaction-joining forms ------------------------------
+    //
+    // The smallest edge in the closure: one read, no writes, no transaction of
+    // its own to unwind. Its value is that it proves the pattern holds in a file
+    // with nothing special in it, so the awkward files that follow are the only
+    // ones that can have an argument against them.
+    //
+    // Nothing here opens a transaction across a service call. Phase A installs
+    // the door; `confirm` does not walk through it until a later commit does,
+    // and the last test pins that the public `find_by_id` is untouched in the
+    // meantime.
+
+    /// THE CAPABILITY, stated precisely because it is weaker than the other reads
+    /// in this closure: `find_by_id_in` DOES read the caller's uncommitted
+    /// writes — a row inserted inside the unit and a row updated inside it are
+    /// both visible — and both disappear again when the unit rolls back.
+    ///
+    /// This is a capability, not a need, and the difference is the honest reason
+    /// this read moves. `confirm` writes `doc_sequences`, `stock_movements`,
+    /// `transactions`, `sale_payments` and `sales` (plus
+    /// `product_supplier_costs` on the purchase side) — never `products`. So
+    /// nothing this read validates is ever written by the transaction that will
+    /// hold it, and reading it from the caller's connection buys no fresher
+    /// truth than reading it from the pool. Unlike `stock_for_product_in`, which
+    /// folds rows the same document is still writing, there is no correctness
+    /// argument here and none is claimed.
+    #[tokio::test]
+    async fn find_by_id_in_reads_the_callers_uncommitted_product_and_a_rollback_hides_it_again() {
+        let r = repo().await;
+        let actor = actor(&r).await;
+        let committed = r.create(actor, &product_input("REPO-PH1")).await.unwrap();
+        assert!(committed.is_active);
+
+        let mut tx = r.pool.begin().await.unwrap();
+        // Both halves of "uncommitted": a row the unit CREATES and a row the unit
+        // CHANGES. Neither is visible to anything outside this connection.
+        let inserted: i64 = sqlx::query_scalar(
+            r#"INSERT INTO products (sku, name, kind, unit, sale_price, cost_price, track_stock, created_by)
+               VALUES ('REPO-PH2', 'created inside', 'Product', 'un', '10', '5', 1, ?)
+               RETURNING id"#,
+        )
+        .bind(actor)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE products SET is_active = 0, name = 'renamed inside' WHERE id = ?")
+            .bind(committed.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let seen_inserted = r
+            .find_by_id_in(&mut tx, inserted)
+            .await
+            .unwrap()
+            .expect("the row this transaction created is invisible to it");
+        assert_eq!(seen_inserted.sku, "REPO-PH2");
+        let seen_update = r
+            .find_by_id_in(&mut tx, committed.id)
+            .await
+            .unwrap()
+            .expect("the row this transaction changed is invisible to it");
+        assert!(
+            !seen_update.is_active && seen_update.name == "renamed inside",
+            "the read did not see the caller's own uncommitted writes, so it is answering about a different moment"
+        );
+        // And it is still a plain read by id: an unknown id is a VALUE, not an
+        // error, which is the branch `get_product` turns into `NotFound`.
+        assert!(r.find_by_id_in(&mut tx, 99999).await.unwrap().is_none());
+        tx.rollback().await.unwrap();
+
+        // The rollback took both with it, which is the other half: an
+        // `find_by_id_in` that could not see the rollback was reading something
+        // other than the caller's transaction.
+        assert!(
+            r.find_by_id(inserted).await.unwrap().is_none(),
+            "the product survived a rollback of the transaction that created it"
+        );
+        let restored = r.find_by_id(committed.id).await.unwrap().unwrap();
+        assert!(
+            restored.is_active && restored.name == "prod REPO-PH1",
+            "the update survived a rollback of the transaction that made it"
+        );
+    }
+
+    /// THE test of this commit: `find_by_id_in` must not reach for the pool AT
+    /// ALL, and the assertion is the pairing itself rather than a stopwatch.
+    ///
+    /// `max_connections(1)` is the lever. While `tx` is open it holds the only
+    /// connection the pool owns, so `try_acquire` answering `None` is not a
+    /// timing accident — it is the pool stating, at that instant, that it has
+    /// nothing to hand. A door that reached for the pool could not answer on this
+    /// pool at all, ever: it would sit on sqlx's 30s acquire timeout and come
+    /// back as `PoolTimedOut`. This test therefore cannot pass by being slow, and
+    /// the timing bound below is corroboration rather than the proof.
+    #[tokio::test]
+    async fn find_by_id_in_answers_while_the_callers_transaction_holds_the_only_connection() {
+        let r = repo().await;
+        let actor = actor(&r).await;
+        let product = r.create(actor, &product_input("REPO-PH3")).await.unwrap();
+
+        let mut tx = r.pool.begin().await.unwrap();
+        // The premise, asserted rather than assumed: the pool cannot serve a read
+        // right now, and that is a fact about the pool, not about this test's
+        // patience.
+        assert!(
+            r.pool.try_acquire().is_none(),
+            "the pool still has a spare connection, so this test would not prove anything"
+        );
+
+        let started = Instant::now();
+        let found = r.find_by_id_in(&mut tx, product.id).await;
+        let elapsed = started.elapsed();
+        let found = found
+            .expect(
+                "find_by_id_in reached for the pool; with the only connection held by the caller's transaction that is a 30s PoolTimedOut, not an answer",
+            )
+            .expect("the committed row is visible to a transaction opened after it");
+        // MEASURED, not assumed: the pairing above already decides it. Five
+        // seconds sits far above what a query on a held connection costs and far
+        // below the 30s acquire timeout it is here to rule out.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "find_by_id_in took {elapsed:?}; that is a read stalling for a connection, not one on the connection it was handed"
+        );
+        assert_eq!(found.sku, "REPO-PH3");
+        // The caller's transaction is still ALIVE and still holds its lock: a
+        // second statement on the same connection answers. An `find_by_id_in`
+        // that had ended, committed or rolled back the unit it was given could
+        // not leave this true.
+        assert!(r
+            .find_by_id_in(&mut tx, product.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(r.find_by_id_in(&mut tx, 99999).await.unwrap().is_none());
+        tx.rollback().await.unwrap();
+
+        // The pool is answerable again now that the unit is over, so the stall
+        // above was the transaction and not the connection.
+        assert!(r.find_by_id(product.id).await.unwrap().is_some());
+    }
+
+    /// The additive claim, proved rather than asserted: the public `find_by_id`
+    /// still answers exactly what it always answered, in both directions. The
+    /// caller distinguishes "product missing" from "error" —
+    /// `InventoryService::get_product` turns the first into `AppError::NotFound`
+    /// and propagates the second, so `Ok(None)` is an answer this rewrite must
+    /// not turn into anything else.
+    #[tokio::test]
+    async fn the_public_find_by_id_answers_exactly_as_before_including_the_missing_product() {
+        let r = repo().await;
+        let actor = actor(&r).await;
+        let first = r.create(actor, &product_input("REPO-PH4")).await.unwrap();
+        let second = r.create(actor, &product_input("REPO-PH5")).await.unwrap();
+
+        // The wrapper opens a unit of its own now, and that unit is invisible:
+        // the row is readable immediately afterwards, by the same repository and
+        // by anything else on the pool.
+        let read = r
+            .find_by_id(first.id)
+            .await
+            .unwrap()
+            .expect("committed row");
+        assert_eq!(read.sku, "REPO-PH4");
+        assert_eq!(read.name, "prod REPO-PH4");
+        assert_eq!(read.kind, ProductKind::Product);
+        assert_eq!(read.unit, "un");
+        assert_eq!(read.sale_price, Decimal::from_str("10").unwrap());
+        assert_eq!(read.cost_price, Decimal::from_str("5").unwrap());
+        assert!(read.track_stock);
+        assert_eq!(read.min_stock, Some(Decimal::from_str("5").unwrap()));
+        assert_eq!(read.max_stock, Some(Decimal::from_str("50").unwrap()));
+        assert!(read.is_active);
+        assert_eq!(read.created_by, actor);
+        // Per id, not "is the table non-empty": a wrapper that dropped its bind
+        // would answer the second read with the first.
+        assert_eq!(
+            r.find_by_id(second.id).await.unwrap().unwrap().sku,
+            "REPO-PH5"
+        );
+        // The not-found branch is a VALUE, not an error.
+        assert!(matches!(r.find_by_id(99999).await, Ok(None)));
+        assert!(matches!(r.find_by_id(0).await, Ok(None)));
+        // And the wrapper leaves no unit behind: it is answerable again
+        // immediately, and the row it read is still the row it found.
+        assert_eq!(
+            r.find_by_id(first.id).await.unwrap().unwrap().sku,
+            "REPO-PH4"
+        );
     }
 }

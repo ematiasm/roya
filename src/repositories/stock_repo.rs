@@ -34,11 +34,55 @@ fn like_needle(raw: &str) -> String {
 #[async_trait]
 pub trait StockMovementRepository: Send + Sync {
     async fn create(&self, actor: i64, input: &NewMovement) -> AppResult<StockMovement>;
+    /// [`Self::create`] inside a transaction the CALLER owns, so a whole
+    /// document can be one unit. The movement is committed when the caller's
+    /// transaction commits, and a confirmation that rolls back therefore leaves
+    /// no movement behind — the `W2` residue in
+    /// `odd/tasks/confirm-failure-injection-and-state-predicates.md`, where a
+    /// Draft nobody can reconcile has already had stock deducted from it.
+    ///
+    /// The SQL, the binds and the projected row are `create`'s to inherit
+    /// unchanged; all this adds is somewhere to put them. `create` above is
+    /// this method wrapped in a transaction of its own, for the callers that
+    /// have no larger unit to offer.
+    async fn create_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        input: &NewMovement,
+    ) -> AppResult<StockMovement>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<StockMovement>>;
     async fn list_by_product(&self, product_id: i64) -> AppResult<Vec<StockMovement>>;
     async fn count_by_product(&self, product_id: i64) -> AppResult<i64>;
     /// Derived stock = SUM of signed qty in Rust (Decimal precision).
     async fn stock_for_product(&self, product_id: i64) -> AppResult<Decimal>;
+
+    /// [`Self::stock_for_product`] inside a transaction the CALLER owns — and
+    /// it is a READ that has to move for the same reason the write does.
+    ///
+    /// `InventoryService::record_movement` reads the level, decides, and only
+    /// then writes. In a document with two lines of the same product, the
+    /// second read therefore has to see the first line's movement, or the
+    /// pre-check is folding a pre-transaction snapshot: `10` where the shop
+    /// holds `4`, and a 6-unit sale is waved through. Joining the caller's
+    /// transaction is what makes a sequence of movements in one document see
+    /// its own writes, in the same order it wrote them — which is also what the
+    /// `ORDER BY id` below is folding.
+    ///
+    /// The same argument applies to `balance_for_account` in
+    /// `transaction_repo.rs`: it is read before each transaction row is written
+    /// to validate against, so two lines against the same account in one
+    /// document need the second read to see the first write. That read moves in
+    /// its own commit, because a second file is a second commit — not because
+    /// the argument is weaker there.
+    ///
+    /// Nothing opens a transaction yet. This is the door; the confirm path does
+    /// not walk through it until a later commit of Phase A does.
+    async fn stock_for_product_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        product_id: i64,
+    ) -> AppResult<Decimal>;
 
     /// The STOCK family of the documents index (documents-index): the stored
     /// movement projected to the feed's facts. The only family with a quantity
@@ -122,7 +166,26 @@ impl SqliteStockMovementRepository {
 
 #[async_trait]
 impl StockMovementRepository for SqliteStockMovementRepository {
+    /// A transaction of its own, for a caller with no larger unit to offer. The
+    /// SQL, the binds and the projection are `create_in`'s to inherit
+    /// unchanged; all this adds is the BEGIN/COMMIT that it deliberately leaves
+    /// to someone else.
     async fn create(&self, actor: i64, input: &NewMovement) -> AppResult<StockMovement> {
+        let mut tx = self.pool.begin().await?;
+        let movement = self.create_in(&mut tx, actor, input).await?;
+        tx.commit().await?;
+        Ok(movement)
+    }
+
+    async fn create_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        input: &NewMovement,
+    ) -> AppResult<StockMovement> {
+        // The executor is the caller's connection, so the movement is theirs to
+        // commit or to roll back, and nothing here opens a transaction of its
+        // own.
         let row = sqlx::query(
             r#"INSERT INTO stock_movements (product_id, qty, type, reason, reference, date, created_by)
                VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -135,7 +198,7 @@ impl StockMovementRepository for SqliteStockMovementRepository {
         .bind(&input.reference)
         .bind(input.date)
         .bind(actor)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
         Ok(row_to_movement(row))
     }
@@ -171,7 +234,22 @@ impl StockMovementRepository for SqliteStockMovementRepository {
         Ok(row.0)
     }
 
+    /// A transaction of its own, for a caller with no larger unit to offer. The
+    /// query and the fold are `stock_for_product_in`'s to inherit unchanged; all
+    /// this adds is the BEGIN/COMMIT that it deliberately leaves to someone
+    /// else.
     async fn stock_for_product(&self, product_id: i64) -> AppResult<Decimal> {
+        let mut tx = self.pool.begin().await?;
+        let level = self.stock_for_product_in(&mut tx, product_id).await?;
+        tx.commit().await?;
+        Ok(level)
+    }
+
+    async fn stock_for_product_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        product_id: i64,
+    ) -> AppResult<Decimal> {
         // `ORDER BY id` is load-bearing, for the same reason as the account
         // balance fold: the check below is on the running sum, so the row order
         // decides which prefixes it sees, and without an `ORDER BY` the
@@ -183,12 +261,14 @@ impl StockMovementRepository for SqliteStockMovementRepository {
         // (`7.9 / 7.85 / 7.9`) while a date-ordered fold walks
         // `0.05 / 7.95 → 7.95e28`, refusing a level the pre-check approved. `id`
         // order IS the write order, and the sort is over the product's own rows on
-        // a column the planner already filters on.
+        // a column the planner already filters on. Run on the caller's
+        // connection it also folds the rows that caller has written but not yet
+        // committed, which is the point of the `_in` form.
         let rows = sqlx::query(
             r#"SELECT qty, type FROM stock_movements WHERE product_id = ? ORDER BY id"#,
         )
         .bind(product_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         // A stock level is a SET SUM over the product's movements, and every one of
         // them was written from a request's quantity: a bounded movement says
@@ -772,5 +852,206 @@ mod tests {
             .unwrap();
         assert!(rows.is_empty());
         assert_eq!(repo.read_count(), 1, "the joined read is one query");
+    }
+
+    // -- Phase A: the transaction-joining forms ------------------------------
+    //
+    // Every repository write here runs on `&self.pool`, so a document that
+    // moves stock five times sends five statements to whatever connection is
+    // free and can land on five different ones. Each method therefore gains a
+    // paired `_in(&mut SqliteConnection)` twin holding the real SQL, and the
+    // public method becomes a wrapper that opens a transaction of its own.
+    //
+    // These three tests are the deliverable. Phase A opens no transaction
+    // anywhere: the wrappers must behave exactly as they did, which the third
+    // test pins, and the `_in` twins must be real doors rather than painted
+    // ones, which is what the first two measure.
+
+    /// The write must join the caller's transaction, so that a document which
+    /// rolls back leaves NO movement behind — the residue window W2 in
+    /// `odd/tasks/confirm-failure-injection-and-state-predicates.md` is exactly
+    /// one committed `Out` on a Draft nobody can reconcile.
+    ///
+    /// The shape matters, and `max_connections(1)` is why. The rollback happens
+    /// BEFORE the assertion, and the table is read only afterwards: a read
+    /// issued while `tx` holds the only connection would stall for sqlx's
+    /// acquire timeout instead of answering. A door that committed on its own
+    /// cannot pass this test either way, but not the way one would guess — it
+    /// cannot acquire a second connection here at all, so it surfaces as
+    /// `PoolTimedOut` after 30s rather than as a stray row.
+    #[tokio::test]
+    async fn create_in_writes_into_the_callers_transaction_and_a_rollback_leaves_nothing() {
+        let pool = memory_pool().await;
+        let repo = SqliteStockMovementRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let product = seed_product(&pool, actor).await;
+        let input = NewMovement {
+            product_id: product,
+            qty: dec("5"),
+            movement_type: MovementType::In,
+            reason: MovementReason::Purchase,
+            reference: "2024-SALE-000001".into(),
+            date: d(2024, 5, 2),
+        };
+
+        let mut tx = pool.begin().await.unwrap();
+        let written = repo.create_in(&mut tx, actor, &input).await.unwrap();
+        // Read back INSIDE the transaction, off the value RETURNING projected —
+        // no pool acquisition, so nothing here can stall. The INSERT ran on the
+        // caller's own connection and its commit is the caller's to make.
+        assert_eq!(written.qty, dec("5"));
+        assert_eq!(written.product_id, product);
+        assert_eq!(written.created_by, actor);
+        tx.rollback().await.unwrap();
+
+        assert_eq!(
+            repo.count_by_product(product).await.unwrap(),
+            0,
+            "the movement was committed even though the transaction was rolled back"
+        );
+        assert!(
+            repo.find_by_id(written.id).await.unwrap().is_none(),
+            "the RETURNING id came from a row that survived the rollback"
+        );
+    }
+
+    /// The oversell guard, and the reason this READ moves in the same commit as
+    /// the write.
+    ///
+    /// `InventoryService::record_movement` reads the level, decides, and only
+    /// then writes — so in a document with two lines of the same product the
+    /// second read has to see the first line's movement. Read from the pool it
+    /// sees a pre-transaction snapshot, `10` instead of `4`, and waves a
+    /// 6-unit sale through a shop holding four.
+    ///
+    /// It cannot be written through the public wrappers, and that is the point
+    /// of the test: on a `max_connections(1)` pool the public
+    /// `stock_for_product` would have to acquire the one connection `tx` is
+    /// holding, and would stall until sqlx's acquire timeout expires. The
+    /// assertion is only reachable at all because the read has a door onto the
+    /// caller's transaction.
+    #[tokio::test]
+    async fn stock_for_product_in_reads_the_callers_uncommitted_movements() {
+        let pool = memory_pool().await;
+        let repo = SqliteStockMovementRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let product = seed_product(&pool, actor).await;
+        let receiving = NewMovement {
+            product_id: product,
+            qty: dec("10"),
+            movement_type: MovementType::In,
+            reason: MovementReason::Purchase,
+            reference: String::new(),
+            date: d(2024, 5, 2),
+        };
+        let shipping = NewMovement {
+            product_id: product,
+            qty: dec("6"),
+            movement_type: MovementType::Out,
+            reason: MovementReason::Sale,
+            reference: "2024-SALE-000001".into(),
+            date: d(2024, 5, 2),
+        };
+
+        let mut tx = pool.begin().await.unwrap();
+        // The document's two lines, both written into the caller's transaction.
+        repo.create_in(&mut tx, actor, &receiving).await.unwrap();
+        repo.create_in(&mut tx, actor, &shipping).await.unwrap();
+
+        // What the second line's pre-check folds: 10 in, 6 out, so 4. Off the
+        // caller's connection it already reflects the first line; off the pool
+        // it would still answer 10.
+        let level = repo.stock_for_product_in(&mut tx, product).await.unwrap();
+        assert_eq!(
+            level,
+            dec("4"),
+            "the read did not see the caller's own writes"
+        );
+        // And that is the whole guard: a second 6-unit line is now visibly an
+        // oversell, which against a stale 10 it would not have been.
+        assert!(
+            level - dec("6") < Decimal::ZERO,
+            "a second 6-unit Out must be refused, not waved through"
+        );
+        tx.rollback().await.unwrap();
+
+        // The rollback took both lines with it, which is the write test above
+        // seen from the read side.
+        assert_eq!(repo.count_by_product(product).await.unwrap(), 0);
+    }
+
+    /// The additive claim, proved rather than asserted: the public wrappers
+    /// still commit their own work and still read it back, exactly as before.
+    /// Phase A changes plumbing and nothing else.
+    #[tokio::test]
+    async fn the_public_wrappers_commit_and_read_back_exactly_as_before() {
+        let pool = memory_pool().await;
+        let repo = SqliteStockMovementRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let product = seed_product(&pool, actor).await;
+
+        let written = repo
+            .create(
+                actor,
+                &NewMovement {
+                    product_id: product,
+                    qty: dec("5"),
+                    movement_type: MovementType::In,
+                    reason: MovementReason::Purchase,
+                    reference: "2024-SALE-000001".into(),
+                    date: d(2024, 5, 2),
+                },
+            )
+            .await
+            .unwrap();
+        // Committed: the row is there for the next statement, and RETURNING
+        // projected the same fields it always did.
+        assert_eq!(repo.count_by_product(product).await.unwrap(), 1);
+        let stored = repo.find_by_id(written.id).await.unwrap().unwrap();
+        assert_eq!(stored.id, written.id);
+        assert_eq!(stored.product_id, product);
+        assert_eq!(stored.qty, dec("5"));
+        assert_eq!(stored.movement_type, MovementType::In);
+        assert_eq!(stored.reason, MovementReason::Purchase);
+        assert_eq!(stored.reference, "2024-SALE-000001");
+        assert_eq!(stored.date, d(2024, 5, 2));
+        assert_eq!(stored.created_by, actor);
+        assert_eq!(
+            stored.updated_by, None,
+            "an append-only movement has no editor"
+        );
+
+        // The read wrapper folds the committed row like it always did.
+        assert_eq!(repo.stock_for_product(product).await.unwrap(), dec("5"));
+        repo.create(
+            actor,
+            &NewMovement {
+                product_id: product,
+                qty: dec("2"),
+                movement_type: MovementType::Out,
+                reason: MovementReason::Sale,
+                reference: String::new(),
+                date: d(2024, 5, 3),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(repo.stock_for_product(product).await.unwrap(), dec("3"));
+
+        // A product with no movements folds to zero, not an error. `seed_product`
+        // reuses one sku, so this one is inserted by hand.
+        let untouched: i64 = sqlx::query_scalar(
+            r#"INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by)
+               VALUES ('DOC-EMPTY', 'no movements', 'Product', 'un', '10', 1, ?)
+               RETURNING id"#,
+        )
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.stock_for_product(untouched).await.unwrap(),
+            Decimal::ZERO
+        );
     }
 }

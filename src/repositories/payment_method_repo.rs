@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqliteConnection, SqlitePool};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{PaymentMethod, PaymentMethodWithAccount};
@@ -12,6 +12,71 @@ use crate::models::{PaymentMethod, PaymentMethodWithAccount};
 pub trait PaymentMethodRepository: Send + Sync {
     async fn list_methods(&self) -> AppResult<Vec<PaymentMethod>>;
     async fn find_method(&self, id: i64) -> AppResult<Option<PaymentMethod>>;
+
+    /// [`Self::find_method`] inside a transaction the CALLER owns, and the
+    /// WEAKEST reason in the closure — stated that way on purpose, because a doc
+    /// comment that borrowed `stock_for_product_in`'s argument would be borrowing
+    /// a claim this method cannot make.
+    ///
+    /// **The deadlock alone, not correctness.** `confirm` writes
+    /// `doc_sequences`, `stock_movements`, `transactions`, `sale_payments`,
+    /// `sales`, `purchase_*` and `product_supplier_costs` — it never writes
+    /// `payment_methods`, and that is traced rather than assumed: the only
+    /// production writers of this table are `set_method_account` and
+    /// `create_in_account` in this file, the three `routes/*_api.rs` HTTP
+    /// handlers, and the deactivate at `src/services/finance_methods.rs:453`.
+    /// None of them is on the confirm path. So nothing this read validates is
+    /// ever written by the transaction that will hold it, and reading it from
+    /// the caller's connection buys no fresher truth than reading it from the
+    /// pool. Contrast `stock_for_product_in`, which folds rows the same document
+    /// is still writing and genuinely cannot answer correctly from a snapshot.
+    ///
+    /// What this read does need is a CONNECTION it was handed, and where it is
+    /// reached is narrower than a casual grep suggests:
+    ///
+    /// * `SalesService::confirm`, the `PaymentType::Cash` arm —
+    ///   `src/services/sales.rs:1281` → `resolve_method_account` → this;
+    /// * `PurchasesService::confirm`, the `PaymentType::Cash` arm —
+    ///   `src/services/purchases.rs:1092` → `resolve_account` → this.
+    ///
+    /// The `Credit` arm of both returns `None` for `cash_account_id` without
+    /// resolving anything, so this is a Cash-path read and only a Cash-path
+    /// read. That cuts both ways for a test suite: a test that builds a Credit
+    /// document never reaches this door at all, which is why the sibling
+    /// customer-side `find_by_id_in` needs its own coverage rather than being
+    /// assumed covered by these two.
+    ///
+    /// The production failure is worth stating honestly, because the single
+    /// connection these tests use would make it look like a timeout. The pool is
+    /// `max_connections(5)` (`src/db.rs`), not 1, so a pool-reaching read there
+    /// is not a `PoolTimedOut` at all: it takes a SECOND connection and answers
+    /// from a snapshot while the unit holds the first. That is the silent
+    /// split-brain, and it is the whole argument. This read is a door, not a
+    /// correctness fix.
+    ///
+    /// Three callers reach it OUTSIDE `confirm` and are the reason the deadlock
+    /// argument does not depend on where Phase B opens its BEGIN:
+    /// `record_payment_with_receipt` (`sales.rs:1482`), `record_payment`
+    /// (`purchases.rs:1236`) and its own guard at `purchases.rs:1301` all
+    /// collect against an already-**Confirmed** document, and
+    /// `src/services/customer_receipts.rs:224` resolves a receipt's method
+    /// while writing the receipt. Those are separate units today and stay
+    /// separate; this door does not close them.
+    ///
+    /// One copy of the SQL, on one executor: the public twin is nothing but
+    /// BEGIN/delegate/COMMIT around this method, so there is no `find_method_raw`
+    /// free function here the way `purchase_repo` has `find_purchase_raw`. There,
+    /// `find_purchase` is a method in its own right with its own many callers
+    /// and has to keep running on the pool, so the statement genuinely had to
+    /// exist on two executors. Here it does not.
+    ///
+    /// Nothing opens a transaction yet. This is the door; `confirm` does not
+    /// walk through it until a later commit of Phase A does.
+    async fn find_method_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+    ) -> AppResult<Option<PaymentMethod>>;
     /// First row with this name by id. Names repeat across accounts, so this is
     /// only a seed-order convenience; account-scoped reads use
     /// `find_method_in_account` / `find_unassigned_by_name`.
@@ -116,10 +181,33 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         Ok(rows.into_iter().map(row_to_method).collect())
     }
 
+    /// A transaction of its own, for a caller with no larger unit to offer. The
+    /// query and the projection are `find_method_in`'s to inherit unchanged; all
+    /// this adds is the BEGIN/COMMIT that it deliberately leaves to someone else.
+    /// A read that opens a transaction is not a write's privilege — the caller
+    /// that owns the larger unit is the only one who can see what is in it.
     async fn find_method(&self, id: i64) -> AppResult<Option<PaymentMethod>> {
+        let mut tx = self.pool.begin().await?;
+        let found = self.find_method_in(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(found)
+    }
+
+    async fn find_method_in(
+        &self,
+        tx: &mut SqliteConnection,
+        id: i64,
+    ) -> AppResult<Option<PaymentMethod>> {
+        // The executor is the caller's connection and nothing here opens a unit
+        // of its own, so this read joins the caller's unit instead of ending
+        // one. The SQL, the bind and the `Ok(row.map(row_to_method))` mapping are
+        // byte-for-byte what `find_method` always ran — including the
+        // unfiltered projection, because `resolve_account_for` branches on
+        // `is_active` and on `account_id` being NULL and must be handed the row
+        // as it stands, not a row this statement pre-judged.
         let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE id = ?"#)
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         Ok(row.map(row_to_method))
     }
@@ -241,6 +329,7 @@ mod tests {
     use crate::security::test_support;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
     /// A valid acting user for the repo-level fixture calls: the migration's
     /// sentinel account. The audit-attribution tests live in the services.
@@ -508,5 +597,281 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+
+    // -- Phase A: the transaction-joining forms ------------------------------
+    //
+    // ONE method of the eleven here gets an `_in` twin, and the reason it is
+    // this one is a reachability fact rather than a judgement about importance.
+    // `SalesService::confirm` and `PurchasesService::confirm` reach it from the
+    // `PaymentType::Cash` arm and nowhere else — `sales.rs:1281`,
+    // `purchases.rs:1092`. The `Credit` arm returns `None` for
+    // `cash_account_id` without resolving anything, so a test that reaches this
+    // door by building a Credit document never touches it, and a test that
+    // reaches it by building a Cash document never touches the customer-side
+    // `find_by_id`. Half the suite therefore proves nothing about either unless
+    // the `_in` form is exercised DIRECTLY, which is what the three tests below
+    // do. The door is covered whichever branch a future test happens to take.
+    //
+    // Why it moves is the DEADLOCK ALONE, and the trait doc says so plainly
+    // rather than borrowing the correctness argument that `find_by_id_in` and
+    // `stock_for_product_in` legitimately make. `confirm` writes
+    // `doc_sequences`, `stock_movements`, `transactions`, `sale_payments`,
+    // `sales`, `purchase_*` and `product_supplier_costs` — traced, not assumed:
+    // the only production writers of `payment_methods` are `set_method_account`
+    // and `create_in_account` in this file, the three `routes/*_api.rs` HTTP
+    // handlers, and the deactivate at `finance_methods.rs:453`. None of them is
+    // on the confirm path.
+    //
+    // Every other method in this file is left alone, and the audit is in the
+    // commit message: the ten siblings are reached only by the read-only GET
+    // surface (`list`, `methods_with_accounts`, `unassigned`,
+    // `accounts_without_methods`) or by the account-setup flow
+    // (`ensure_defaults_for_account`, `replace_account_methods`), plus
+    // `customer_receipts`. None is reached by `confirm`.
+    //
+    // Nothing here opens a transaction across a service call. Phase A installs
+    // the door; `confirm` does not walk through it until a later commit, and
+    // the last test pins that the public `find_method` is untouched meanwhile.
+
+    /// One account, created committed, so both the method and the account it
+    /// points at exist before any transaction is opened.
+    async fn seed_account(repo: &SqlitePaymentMethodRepository, name: &str, actor: i64) -> i64 {
+        sqlx::query_scalar("INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id")
+            .bind(name)
+            .bind(actor)
+            .fetch_one(&repo.pool)
+            .await
+            .unwrap()
+    }
+
+    /// `find_method_in` must answer from the connection it was HANDED, and the
+    /// two fields it must see move are the two `resolve_account_for` branches
+    /// on: `account_id` (assigned vs unassigned) and `is_active`
+    /// (`finance_methods.rs:228-243`). A read that answered from a snapshot
+    /// would hand the Cash path a different DECISION than the one the
+    /// transaction has already committed to.
+    ///
+    /// The fixture is the file's own `migrated_pool()`, so `max_connections(1)`
+    /// — the lever the next test needs — is inherited rather than restated.
+    #[tokio::test]
+    async fn find_method_in_reads_the_callers_uncommitted_method_and_a_rollback_hides_it_again() {
+        let pool = migrated_pool().await;
+        let repo = SqlitePaymentMethodRepository::new(pool.clone());
+        let actor = audit_actor(&repo).await;
+        let acc = seed_account(&repo, "PM-PH-A Cash", actor).await;
+        // Seeded methods are unassigned and active on a fresh DB.
+        let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
+        assert_eq!(
+            (cash.account_id, cash.is_active),
+            (None, true),
+            "the fixture must start with the method unassigned and active, or this test proves nothing"
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        // Both halves of "uncommitted": a row the unit CREATES, and the two
+        // columns the unit CHANGES on a committed row. Neither is visible to
+        // anything outside this connection.
+        let inserted: i64 = sqlx::query_scalar(
+            "INSERT INTO payment_methods (name, account_id, is_active, created_by) \
+             VALUES ('Created Inside', ?, 1, ?) RETURNING id",
+        )
+        .bind(acc)
+        .bind(actor)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE payment_methods SET account_id = ?, is_active = 0 WHERE id = ?")
+            .bind(acc)
+            .bind(cash.id)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+
+        let seen_inserted = repo
+            .find_method_in(&mut tx, inserted)
+            .await
+            .unwrap()
+            .expect("the row this transaction created is invisible to it");
+        assert_eq!(seen_inserted.name, "Created Inside");
+        assert_eq!(seen_inserted.account_id, Some(acc));
+        assert!(seen_inserted.is_active);
+
+        let seen_update = repo
+            .find_method_in(&mut tx, cash.id)
+            .await
+            .unwrap()
+            .expect("the row this transaction changed is invisible to it");
+        assert_eq!(
+            seen_update.account_id,
+            Some(acc),
+            "the read did not see the caller's own uncommitted writes, so it would resolve the Cash account from a different moment than the one the transaction holds"
+        );
+        assert!(
+            !seen_update.is_active,
+            "the read missed the caller's own deactivation: the inactive-method refusal is one of the two branches this row drives"
+        );
+        // And it is still a plain read by id: an unknown id is a VALUE, not an
+        // error, which is the branch `resolve_account_for` turns into
+        // `NotFound`.
+        assert!(repo
+            .find_method_in(&mut tx, 9_999_999)
+            .await
+            .unwrap()
+            .is_none());
+        tx.rollback().await.unwrap();
+
+        // The rollback took both with it, which is the other half: a
+        // `find_method_in` that could not see the rollback was reading
+        // something other than the caller's transaction.
+        assert!(
+            repo.find_method(inserted).await.unwrap().is_none(),
+            "the payment method survived a rollback of the transaction that created it"
+        );
+        let restored = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert_eq!(
+            (restored.account_id, restored.is_active),
+            (None, true),
+            "the reassignment or the deactivation survived a rollback of the transaction that made it"
+        );
+    }
+
+    /// THE test of this commit: `find_method_in` must not reach for the pool AT
+    /// ALL, and the assertion is the pairing itself rather than a stopwatch.
+    ///
+    /// `max_connections(1)` is the lever. While `tx` is open it holds the only
+    /// connection the pool owns, so `try_acquire` answering `None` is not a
+    /// timing accident — it is the pool stating, at that instant, that it has
+    /// nothing to hand. A door that reached for the pool could not answer on
+    /// this pool at all, ever: it would sit on sqlx's 30s acquire timeout and
+    /// come back as `PoolTimedOut`. This test therefore cannot pass by being
+    /// slow, and the timing bound below is corroboration rather than the proof.
+    #[tokio::test]
+    async fn find_method_in_answers_while_the_callers_transaction_holds_the_only_connection() {
+        let pool = migrated_pool().await;
+        let repo = SqlitePaymentMethodRepository::new(pool.clone());
+        let actor = audit_actor(&repo).await;
+        let acc = seed_account(&repo, "PM-PH-B Cash", actor).await;
+        let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
+        repo.set_method_account(actor, cash.id, Some(acc))
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        // The premise, asserted rather than assumed: the pool cannot serve a
+        // read right now, and that is a fact about the pool, not about this
+        // test's patience.
+        assert!(
+            pool.try_acquire().is_none(),
+            "the pool still has a spare connection, so this test would not prove anything"
+        );
+
+        let started = Instant::now();
+        let found = repo.find_method_in(&mut tx, cash.id).await;
+        let elapsed = started.elapsed();
+        let found = found
+            .expect(
+                "find_method_in reached for the pool; with the only connection held by the caller's transaction that is a 30s PoolTimedOut, not an answer",
+            )
+            .expect("the committed row is visible to a transaction opened after it");
+        // MEASURED, not assumed: the pairing above already decides it. Five
+        // seconds sits far above what a query on a held connection costs and far
+        // below the 30s acquire timeout it is here to rule out.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "find_method_in took {elapsed:?}; that is a read stalling for a connection, not one on the connection it was handed"
+        );
+        assert_eq!(found.name, "Cash");
+        assert_eq!(found.account_id, Some(acc));
+        // The caller's transaction is still ALIVE and still holds its lock: a
+        // second statement on the same connection answers. A `find_method_in`
+        // that had ended, committed or rolled back the unit it was given could
+        // not leave this true.
+        assert!(repo
+            .find_method_in(&mut tx, cash.id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(repo
+            .find_method_in(&mut tx, 9_999_999)
+            .await
+            .unwrap()
+            .is_none());
+        tx.rollback().await.unwrap();
+
+        // The pool is answerable again now that the unit is over, so the stall
+        // above was the transaction and not the connection.
+        assert!(repo.find_method(cash.id).await.unwrap().is_some());
+    }
+
+    /// The additive claim, proved rather than asserted: the public `find_method`
+    /// still answers exactly what it always answered, in every branch its callers
+    /// actually distinguish. `resolve_account_for` (`finance_methods.rs:228-243`)
+    /// draws THREE outcomes from this one read — unknown id becomes `NotFound`,
+    /// `!is_active` becomes a `Validation`, and `account_id = None` becomes a
+    /// different `Validation` naming the fix — so a rewrite that collapsed any
+    /// two of them into one would change a refusal a Cash document can receive.
+    /// The three are asserted as the raw VALUES the service branches on, because
+    /// calling `services::finance_methods` from a `repositories/` test module
+    /// would import `services::` downward and invert the layering rule.
+    #[tokio::test]
+    async fn the_public_find_method_answers_exactly_as_before_including_the_unassigned_method() {
+        let pool = migrated_pool().await;
+        let repo = SqlitePaymentMethodRepository::new(pool.clone());
+        let actor = audit_actor(&repo).await;
+        let acc = seed_account(&repo, "PM-PH-C Cash", actor).await;
+        let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
+        let transfer = repo.find_method_by_name("Transfer").await.unwrap().unwrap();
+
+        // UNASSIGNED is a value, not an error: the method row exists, so this is
+        // `Ok(Some(..))` carrying `account_id = None`, which is the "method not
+        // assigned" case and is NOT the same answer as the unknown-id case.
+        let unassigned = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert_eq!(unassigned.name, "Cash");
+        assert_eq!(unassigned.account_id, None);
+        assert!(unassigned.is_active);
+        assert_eq!(unassigned.created_by, actor);
+
+        // The same row once assigned: the wrapper's own unit is invisible, so
+        // the read is correct immediately after it.
+        repo.set_method_account(actor, cash.id, Some(acc))
+            .await
+            .unwrap();
+        let assigned = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert_eq!(assigned.account_id, Some(acc));
+        assert_eq!(assigned.name, "Cash");
+
+        // Deactivated is a THIRD value: the read does not filter, so `is_active`
+        // reaches the service as `false` rather than as a missing row.
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
+            .bind(cash.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let inactive = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert!(
+            !inactive.is_active,
+            "the read filtered the deactivated method out instead of reporting it"
+        );
+        assert_eq!(
+            inactive.account_id,
+            Some(acc),
+            "the wrapper lost the ownership it had committed a moment earlier"
+        );
+
+        // Per id, not "is the table non-empty": a wrapper that dropped its bind
+        // would answer the second read with the first.
+        assert_eq!(
+            repo.find_method(transfer.id).await.unwrap().unwrap().name,
+            "Transfer"
+        );
+        // The unknown-id branch is a VALUE, not an error — and it stays one.
+        assert!(matches!(repo.find_method(9_999_999).await, Ok(None)));
+        assert!(matches!(repo.find_method(0).await, Ok(None)));
+        // And the wrapper leaves no unit behind: it is answerable again
+        // immediately, and the row it read is still the row it found.
+        let again = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert_eq!(again.account_id, Some(acc));
+        assert!(!again.is_active);
     }
 }

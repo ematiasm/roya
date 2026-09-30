@@ -116,8 +116,52 @@ fn map_db_err(e: sqlx::Error) -> AppError {
     }
 }
 
+/// One purchase by id, over whichever connection the caller offers.
+///
+/// `set_confirmed` reads its own row back after the UPDATE, so this statement
+/// runs on two executors the moment a transaction-joining form of that write
+/// exists: the caller's `&mut SqliteConnection` when a unit holds the confirm,
+/// and the pool when the public wrapper owns the unit. ONE copy of the SQL,
+/// generic over the executor — the same shape and the same reason as
+/// `transaction_repo::balance_for_account_raw`. Two copies would be able to
+/// drift on the projection, and a drift here is the worst kind: the read-back
+/// would answer about a different row shape than the write it is confirming.
+async fn find_purchase_raw<'e, E>(executor: E, id: i64) -> AppResult<Option<Purchase>>
+where
+    E: sqlx::Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query(
+        r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM purchases WHERE id = ?"#,
+    )
+    .bind(id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.map(row_to_purchase))
+}
+
 #[async_trait]
 pub trait PurchaseRepository: Send + Sync {
+    /// The connection pool behind this repository, so a caller that owns a
+    /// WORKING UNIT can open the transaction the `_in` methods join. It is the
+    /// one non-`async` method here: it hands out the pool rather than borrowing
+    /// it, so nothing about it can be awaited and `#[async_trait]` leaves it
+    /// alone.
+    ///
+    /// Why it exists at all. `PurchasesService` is generic over repository
+    /// TRAITS and holds no `SqlitePool` of its own — by design, so the service
+    /// layer cannot grow SQL. Until this method the traits were pure data
+    /// access, and `confirm` could not open the unit its SIX writes need, the
+    /// sixth being the per-line supplier cost. The alternative was a `pool`
+    /// field on the service, which would have changed four construction sites
+    /// and broken the dependency injection the whole test suite builds its
+    /// fixtures through. A field read in one impl line is the smaller change,
+    /// and it keeps the service holding no SQL handle.
+    ///
+    /// It is a WIDENING of the trait's surface and nothing else: the service
+    /// that receives it is the caller, and every read and write below still goes
+    /// through the repository's own methods.
+    fn pool(&self) -> &SqlitePool;
+
     /// `actor` is the acting user's id the service resolved from its request;
     /// it becomes the row's `created_by` and nothing the request itself can
     /// supply names it.
@@ -154,13 +198,73 @@ pub trait PurchaseRepository: Send + Sync {
     /// submission of an already-Confirmed purchase cannot stamp a second number,
     /// even if the caller's status check were relaxed or raced.
     ///
-    /// It does NOT make a failed confirmation retryable. A confirm writes on
-    /// several autocommit connections — and on this side `record_cost` runs
-    /// AFTER this write, so a failure there leaves a Confirmed purchase with
-    /// only some of its costs recorded — and a retry re-passes this predicate
-    /// and writes again. Only a shared transaction removes that.
+    /// It does NOT make a failed confirmation retryable BY ITSELF, and that is
+    /// still true: a WHERE clause cannot reach residue. What changed is that
+    /// there is no residue left to reach. `confirm` now opens ONE transaction
+    /// immediately before `next_number` and commits after the last write
+    /// (`src/services/purchases.rs:1167-1253`), and `record_cost` is INSIDE
+    /// that unit rather than after it. A failure anywhere in the run rolls back
+    /// the sequence number, every stock movement, the `Expense`, the
+    /// `purchase_payments` row, the confirmation AND the per-line supplier
+    /// cost. The document is still `("Draft", None)` — a Draft with no number,
+    /// no money and no costs — and once the cause is fixed the same retry
+    /// succeeds. The absence of that residue is measured, not assumed, by the
+    /// `purchase_confirm_failure_*` tests in `src/services/purchases.rs`; the
+    /// one this sentence used to be false about is
+    /// `purchase_confirm_failure_in_record_cost_leaves_a_clean_draft_and_no_costs`
+    /// (`src/services/purchases.rs:5980`), which used to leave a CONFIRMED,
+    /// numbered, fully paid purchase with only some of its costs recorded — the
+    /// single failure window with no recovery path, because the retry was refused
+    /// as a duplicate.
+    ///
+    /// This public twin still opens a unit of its own and delegates, so a caller
+    /// that reaches for it directly gets exactly the old behaviour: the single
+    /// statement, atomically, with no sibling writes.
     async fn set_confirmed(
         &self,
+        id: i64,
+        actor: i64,
+        purchase_number: &str,
+    ) -> AppResult<Purchase>;
+
+    /// [`Self::set_confirmed`] inside a transaction the CALLER owns.
+    ///
+    /// This is the write that decides whether a document exists as far as the
+    /// shop is concerned, and the last of the five `confirm` performs
+    /// (`src/services/purchases.rs:1167-1253`). On this side it was also the
+    /// write that made the unit worth opening, for two reasons at once: the
+    /// statements before it were separate autocommit commits, and the cost
+    /// satellite loop that follows it used to run AFTER it, on a connection of
+    /// its own — so a failure in that loop left a Confirmed, numbered, fully
+    /// paid purchase carrying only SOME of its supplier costs, and the retry was
+    /// refused as a duplicate. That was the one residue in this path with no
+    /// recovery path at all.
+    ///
+    /// `confirm` now opens ONE unit immediately before `next_number` and commits
+    /// after the cost loop (`src/services/purchases.rs:1167-1253`), so that
+    /// residue cannot be produced. This statement is called at 1232, the cost
+    /// loop still runs last at 1240-1252, and both are inside the same unit: a
+    /// failure at any point rolls back the number, the movements, the `Expense`,
+    /// the payment and every cost row, and the document is a Draft again with no
+    /// number, no money and no costs — retryable once the cause is fixed.
+    ///
+    /// The DRAFT predicate is unchanged and is still this statement's own
+    /// `WHERE`: a non-Draft matches nothing and the refusal is read back
+    /// through the SAME connection, so it names the state the write saw. That
+    /// read-back is the trap in this file, and it is called out on
+    /// [`SqlitePurchaseRepository::refuse_confirm`] — the helper's executor is
+    /// part of what moves, not an implementation detail of it. Inside the unit,
+    /// the predicate's remaining job is that the statement, the read-back and
+    /// `refuse_confirm` all have to stay on the connection the caller was
+    /// handed; it still refuses a duplicate submission of an already-Confirmed
+    /// document, and it does so without the pool ever being involved.
+    ///
+    /// `confirm` DOES walk through this door now. The public twin still opens a
+    /// unit of its own and delegates to this method, so both shapes remain and
+    /// the twin's behaviour is unchanged.
+    async fn set_confirmed_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
         id: i64,
         actor: i64,
         purchase_number: &str,
@@ -233,6 +337,49 @@ pub trait PurchaseRepository: Send + Sync {
     /// the acting user of the request that produced it (AC18).
     async fn create_payment(
         &self,
+        actor: i64,
+        purchase_id: i64,
+        account_id: i64,
+        method_id: i64,
+        amount: Decimal,
+        date: NaiveDate,
+        transaction_id: Option<i64>,
+    ) -> AppResult<PurchasePayment>;
+
+    /// [`Self::create_payment`] inside a transaction the CALLER owns, and the
+    /// reason this write belongs to the confirm unit is sharper than for most.
+    ///
+    /// The `purchase_payments` row is written FOURTH of five, after the
+    /// `Expense` it records, and it is the row the paid/unpaid state of the
+    /// document is derived from. That made it the hinge of the old residue: a
+    /// confirm that died between the two left an `Expense` with no payment
+    /// naming it, and a confirm that died AFTER them left a Draft that reported
+    /// itself Paid — measured, at the time, by what used to be called a "paid
+    /// draft" and what its own assertion read as *"the payment was committed:
+    /// the supplier was paid and no document says so"*.
+    ///
+    /// Neither shape is reachable any more. `confirm` holds ONE unit across both
+    /// writes and this statement (`src/services/purchases.rs:1167-1253`), so a
+    /// failure on either side of the pair rolls back both, and the measurement is
+    /// now the ABSENCE:
+    /// `purchase_confirm_failure_on_set_confirmed_leaves_a_clean_draft_that_reports_unpaid`
+    /// (`src/services/purchases.rs:5890`) asserts zero `Expense`, zero payments,
+    /// zero goods, an unspent number, and a `get_detail` that reports `Unpaid`
+    /// with nothing collected. The same holds for the window between the two
+    /// writes.
+    ///
+    /// Unlike `set_confirmed_in` this write has no read-back and no refusal
+    /// helper, which makes it the straight case: the statement moves to the
+    /// caller's executor and `map_db_err` moves with it, unchanged.
+    ///
+    /// `confirm` DOES walk through this door now. The public twin still opens a
+    /// unit of its own and delegates, and `record_payment` — the production
+    /// caller that collects against an already-Confirmed document — is
+    /// unchanged. This doc describes the confirm path, not the only path to the
+    /// insert.
+    async fn create_payment_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
         actor: i64,
         purchase_id: i64,
         account_id: i64,
@@ -431,13 +578,30 @@ impl SqlitePurchaseRepository {
     /// state the document actually rests in, and so the two cases stay
     /// distinguishable — a missing document is a 404, a frozen one is a
     /// validation the caller can explain. Same contract as
-    /// [`SqlitePurchaseRepository::refuse_line`], read outside a transaction
-    /// because `set_confirmed` runs on the pool's autocommit, exactly as the
-    /// write it refuses did.
-    async fn refuse_confirm(pool: &SqlitePool, id: i64) -> AppError {
+    /// [`SqlitePurchaseRepository::refuse_line`], and the same executor for the
+    /// same reason: the refusal is read through the CALLER'S transaction, so it
+    /// describes the same state the write saw.
+    ///
+    /// This signature USED to be hard-coded to `&SqlitePool`, written when
+    /// `set_confirmed` ran on autocommit. That history is why it reads the way
+    /// it does, but it is not a statement about current behaviour: `confirm`
+    /// holds ONE unit (`src/services/purchases.rs:1167-1253`) and calls this
+    /// helper on the connection it was handed, so the connection is now
+    /// load-bearing rather than historical.
+    ///
+    /// The trap is unchanged, and reverting this signature to `&SqlitePool` is
+    /// what the test
+    /// `set_confirmed_in_refuses_a_non_draft_document_without_ever_reaching_for_the_pool`
+    /// catches. The refusal is reached ONLY when the DRAFT predicate matched no
+    /// row, so a regression here passes every happy-path test in this file and
+    /// fails only on refusal — where it would stall for sqlx's 30s acquire
+    /// timeout inside the caller's transaction and answer `PoolTimedOut` instead
+    /// of a `Validation` the operator is waiting for. The mapping below is
+    /// unchanged: `NotFound`, `Validation`, `Database`.
+    async fn refuse_confirm(conn: &mut SqliteConnection, id: i64) -> AppError {
         match sqlx::query_scalar::<_, String>("SELECT status FROM purchases WHERE id = ?")
             .bind(id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut *conn)
             .await
         {
             Ok(None) => AppError::NotFound(format!("purchase {id} not found")),
@@ -451,6 +615,12 @@ impl SqlitePurchaseRepository {
 
 #[async_trait]
 impl PurchaseRepository for SqlitePurchaseRepository {
+    /// A field read: the struct's `pool` is already `pub` and is already what
+    /// every other method on this impl borrows.
+    fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     async fn create_purchase(&self, actor: i64, input: &NewPurchase) -> AppResult<Purchase> {
         let invoice = input.supplier_invoice_no.clone().and_then(|s| {
             let t = s.trim().to_string();
@@ -481,13 +651,13 @@ impl PurchaseRepository for SqlitePurchaseRepository {
     }
 
     async fn find_purchase(&self, id: i64) -> AppResult<Option<Purchase>> {
-        let row = sqlx::query(
-            r#"SELECT id, purchase_number, supplier_id, status, payment_type, purchase_date, due_date, supplier_invoice_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at FROM purchases WHERE id = ?"#,
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(row_to_purchase))
+        // Unchanged in every observable way: same SQL, same bind, same
+        // projection, same pool. The statement moved into `find_purchase_raw`
+        // only because `set_confirmed_in` now has to run this SAME query on a
+        // caller's connection, and one copy of a statement is the rule. No read
+        // counter lives here — `find_purchase` never carried a `tick()`, so
+        // nothing about this refactor has to decide where one goes.
+        find_purchase_raw(&self.pool, id).await
     }
 
     async fn find_purchase_by_number(&self, number: &str) -> AppResult<Option<Purchase>> {
@@ -630,6 +800,21 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         actor: i64,
         purchase_number: &str,
     ) -> AppResult<Purchase> {
+        let mut tx = self.pool.begin().await?;
+        let confirmed = self
+            .set_confirmed_in(&mut tx, id, actor, purchase_number)
+            .await?;
+        tx.commit().await?;
+        Ok(confirmed)
+    }
+
+    async fn set_confirmed_in(
+        &self,
+        tx: &mut SqliteConnection,
+        id: i64,
+        actor: i64,
+        purchase_number: &str,
+    ) -> AppResult<Purchase> {
         // The DRAFT predicate is this statement's own WHERE, the same backstop
         // `delete_line` and `delete_draft` already carry. A document that is
         // not a Draft matches nothing, and a zero-row match is a refusal that
@@ -643,14 +828,24 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         // statement would stamp a second number over the first and report a
         // success the caller must never be told about.
         //
-        // WHAT IT DOES NOT DO: it does not make a failed confirmation safe to
-        // retry. `confirm` writes the sequence, the stock movements, the finance
-        // row and the payment on separate autocommit connections — and then
-        // runs `record_cost` for every line in a loop AFTER this write, so a
-        // failure in that loop leaves a Confirmed, fully paid purchase with only
-        // some of its supplier costs recorded. None of that is reachable from a
-        // WHERE clause; only the shared transaction — one unit per user action,
-        // the way Odoo holds a cursor for the whole request — removes it.
+        // WHAT IT STILL DOES NOT DO: it does not make a failed confirmation safe
+        // to retry ON ITS OWN. A WHERE clause cannot reach residue; that is
+        // what the shared unit is for. `confirm` now opens ONE transaction
+        // immediately before `next_number` and commits after the last write
+        // (`src/services/purchases.rs:1167-1253`), so the sequence, the
+        // movements, the `Expense`, the payment and — the reason this side is
+        // the harder one — the per-line `record_cost` loop that used to run
+        // after this statement on a connection of its own are no longer separate
+        // units. A failure at this step, or anywhere after it, rolls the whole
+        // run back: the number is UNSPENT, no movement survives, no `Expense` is
+        // orphaned, the document is still `("Draft", None)` and no supplier cost
+        // is recorded, so the retry re-passes this predicate and succeeds once
+        // the cause is fixed.
+        //
+        // So the predicate is no longer asked to cover that case — the unit is.
+        // What it is still asked to cover, and still covers, is the duplicate
+        // submission above, and getting THAT refusal out of this statement is
+        // why the read-back and `refuse_confirm` below must both stay on `tx`.
         let res = sqlx::query(
             r#"UPDATE purchases
                SET purchase_number = ?, status = 'Confirmed',
@@ -663,18 +858,23 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .bind(purchase_number)
         .bind(actor)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(map_db_err)?;
         if res.rows_affected() == 0 {
-            return Err(Self::refuse_confirm(&self.pool, id).await);
+            return Err(Self::refuse_confirm(&mut *tx, id).await);
         }
-        // The row the UPDATE just wrote, read back through the same read the
-        // rest of the layer uses. `find_purchase` cannot return `None` here in
-        // practice — a just-confirmed row is not deletable — but the branch is
-        // written out rather than unwrapped so a future caller never sees a
-        // panic from a repository method.
-        self.find_purchase(id)
+        // The row the UPDATE just wrote, read back through the SAME statement
+        // `find_purchase` runs and on the SAME connection — not the pool. This is
+        // load-bearing rather than tidy: a read-back that reached for the pool
+        // here would not be merely slow, it would be unable to answer at all
+        // while the caller holds the only connection, and the error it returned
+        // (`PoolTimedOut`) would be a driver failure standing in for a document
+        // that had in fact just been confirmed correctly. It cannot return
+        // `None` in practice — a just-confirmed row is not deletable — but the
+        // branch is written out rather than unwrapped so a future caller never
+        // sees a panic from a repository method.
+        find_purchase_raw(&mut *tx, id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("purchase {id} not found")))
     }
@@ -809,10 +1009,60 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         // undeletable document impossible even if the service check were
         // relaxed: the statement simply matches nothing and the answer is
         // `false`. Deletable = a Draft, OR a Cancelled row whose
-        // `purchase_number` is NULL — a purchase discarded before confirm,
-        // which never touched stock or finance. A Cancelled row WITH a
-        // number was confirmed first and is permanent audit trail (return
-        // movements and refund transactions reference it).
+        // `purchase_number` is NULL. A Cancelled row WITH a number was confirmed
+        // first and is permanent audit trail (return movements and refund
+        // transactions reference it). That much the predicate decides, and it
+        // decides it soundly.
+        //
+        // WHAT THE PREDICATE DOES NOT ESTABLISH, and never did, is integrity.
+        // It is a backstop on STATUS, not a cleanliness check: it answers "may
+        // this row be removed", and it says nothing about what else is pointing
+        // at that row.
+        //
+        // That distinction mattered most when a Draft could be DIRTY. It used
+        // to: `confirm` wrote the sequence number, a movement per tracked line,
+        // the `Expense`, the `purchase_payments` row, and `set_confirmed` LAST,
+        // each on its own autocommit connection, so every earlier write was
+        // already committed while the document still read `("Draft", NULL)`. A
+        // failure AT `set_confirmed` left a Draft carrying a committed payment
+        // row and an orphan `Expense` whose `reference` was the burned number —
+        // and such a Draft MATCHES the first branch.
+        // `purchase_payments.purchase_id` CASCADEs from `purchases`
+        // (`migrations/20240101000017_create_purchase_payments.sql:8`), so the
+        // delete took the payment row with it, while the `Expense` has no
+        // foreign key to `purchases` at all and survived, pointing at a number
+        // no document carried any more: the delete removed the document and
+        // kept the money. Discarding such a row did not dodge it either — Draft
+        // -> Cancelled is explicitly a no-op for stock, finance and the cost
+        // satellite (`src/services/purchases.rs:1452`), and it assigns no
+        // number, so the row arrived at the SECOND branch still carrying both.
+        //
+        // THAT RESIDUE NO LONGER EXISTS. `confirm` opens one transaction
+        // immediately before `next_number` and commits after the last write
+        // (`src/services/purchases.rs:1167-1253`), so a failure at any step
+        // leaves the row a Draft with no number, no payments, no movements, no
+        // ledger entry and no supplier costs — measured by
+        // `purchase_confirm_failure_on_set_confirmed_leaves_a_clean_draft_that_reports_unpaid`
+        // (`src/services/purchases.rs:5890`), whose assertions are the ABSENCE
+        // of every shape listed above. The history is kept here because it is
+        // why the transaction exists and because the guard below still has to be
+        // read as a backstop rather than as a proof.
+        //
+        // The other window purchases have and sales do not — a `record_cost`
+        // failure landing on a Confirmed, numbered, fully paid purchase with
+        // only some of its costs recorded, on a row that is not deletable at
+        // all — is closed by the same unit, and
+        // `purchase_confirm_failure_in_record_cost_leaves_a_clean_draft_and_no_costs`
+        // (`src/services/purchases.rs:5980`) is the measurement.
+        //
+        // The method keeps answering from the predicate alone. Widening or
+        // narrowing what it deletes is a behaviour decision with its own test
+        // and its own migration story, and it is not a comment's business. Note
+        // the corollary for any future reader tempted to close the window here
+        // instead: `create_payment` must NOT grow a `Draft` gate, because
+        // `record_payment` collects against an already-Confirmed document. The
+        // fix for "a Draft might be dirty" was `confirm`, and that is where it
+        // went.
         let res = sqlx::query(
             r#"DELETE FROM purchases
                WHERE id = ?
@@ -835,6 +1085,34 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         date: NaiveDate,
         transaction_id: Option<i64>,
     ) -> AppResult<PurchasePayment> {
+        let mut tx = self.pool.begin().await?;
+        let payment = self
+            .create_payment_in(
+                &mut tx,
+                actor,
+                purchase_id,
+                account_id,
+                method_id,
+                amount,
+                date,
+                transaction_id,
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(payment)
+    }
+
+    async fn create_payment_in(
+        &self,
+        tx: &mut SqliteConnection,
+        actor: i64,
+        purchase_id: i64,
+        account_id: i64,
+        method_id: i64,
+        amount: Decimal,
+        date: NaiveDate,
+        transaction_id: Option<i64>,
+    ) -> AppResult<PurchasePayment> {
         let row = sqlx::query(
             r#"INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, transaction_id, created_by)
                VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -847,7 +1125,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .bind(date)
         .bind(transaction_id)
         .bind(actor)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_payment(row))
@@ -1115,6 +1393,7 @@ mod tests {
     use chrono::NaiveDate;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
     async fn memory_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -2034,5 +2313,558 @@ mod tests {
             after.purchase_number, None,
             "the cancelled purchase kept no number"
         );
+    }
+
+    // -- Phase A: the transaction-joining forms ------------------------------
+    //
+    // Two WRITES, and the asymmetry between them is the reason this commit is
+    // worth a separate slice at all.
+    //
+    // `create_payment` is the straight pattern: one INSERT, `RETURNING`, no
+    // read-back, no refusal helper. Moving it is a copy of the statement onto a
+    // different executor and nothing else.
+    //
+    // `set_confirmed` is the trap, and the trap is NOT in `set_confirmed` — it is
+    // in a private helper called only on the refusal path. `refuse_confirm`'s
+    // signature WAS hard-coded to `&SqlitePool`, because `set_confirmed` ran on
+    // autocommit, exactly as `refuse_line`'s had to be changed when
+    // `rewrite_draft_line_taxes` moved. It is a `&mut SqliteConnection` now
+    // because `confirm` holds one unit and calls the helper on the connection it
+    // was handed. Reverting it is a real regression and not a cosmetic one: a
+    // migration that misses it passes every happy-path test in this file and
+    // fails only the refusal ones, which is why there is a test below that
+    // drives the refusal by NAME rather than incidentally.
+    //
+    // The doors are now WALKED. `confirm` opens one unit
+    // (`src/services/purchases.rs:1167`) and both of these writes run inside
+    // it, so a failure anywhere in the confirm rolls back the number, the
+    // movements, the `Expense` and the payment with the confirmation. What is
+    // still true here is only that no method on this repository opens a
+    // transaction across a service call: each `_in` joins the caller's unit and
+    // each public twin still opens one of its own, which the last test pins.
+
+    /// The write must land in the caller's unit, not in one of its own: a payment
+    /// created inside a transaction and rolled back with it is GONE, and one that
+    /// escaped into a private unit would be visible to the pool the moment it
+    /// committed.
+    ///
+    /// This is the rollback half. A payment that survived the rollback would mean
+    /// `create_payment_in` opened and committed a unit behind the caller's back,
+    /// and a single-connection pool is what makes that visible instead of merely
+    /// likely: there is no spare connection for a nested `begin()` to take.
+    #[tokio::test]
+    async fn create_payment_in_writes_into_the_callers_transaction_and_a_rollback_takes_it_away() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let purchase =
+            seed_purchase_with_status(&pool, "Draft", "In-Tx Supplier", d(2024, 5, 2), actor).await;
+        // The account and the method are looked up BEFORE the unit opens: they
+        // are fixture reads, and the pool is the only thing that can answer them.
+        let (account, method) = account_and_method(&pool, actor).await;
+        assert!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchase_payments WHERE purchase_id = ?",
+                purchase
+            )
+            .await
+                == 0,
+            "the fixture must start with no payments, or this test proves nothing"
+        );
+
+        let mut tx = pool.begin().await.unwrap();
+        let payment = repo
+            .create_payment_in(
+                &mut tx,
+                actor,
+                purchase,
+                account,
+                method,
+                dec("10"),
+                d(2024, 5, 2),
+                None,
+            )
+            .await
+            .expect("create_payment_in could not run while it held the caller's connection");
+        // The RETURNING projection is the row the INSERT wrote, read inside the
+        // same unit, so a payment that answered from a private connection would
+        // have had to guess this id.
+        assert_eq!(payment.purchase_id, purchase);
+        assert_eq!(payment.account_id, account);
+        assert_eq!(payment.method_id, method);
+        assert_eq!(payment.amount, dec("10"));
+        assert_eq!(payment.transaction_id, None);
+        assert_eq!(payment.refund_transaction_id, None);
+        tx.rollback().await.unwrap();
+
+        // Every assertion that touches the pool is AFTER the rollback, and it
+        // says the row is not there. This is the assertion that fails if the
+        // `_in` form committed a unit of its own.
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchase_payments WHERE purchase_id = ?",
+                purchase
+            )
+            .await,
+            0,
+            "the payment survived a rollback of the transaction that created it, so create_payment_in opened and committed a unit of its own"
+        );
+        assert!(
+            repo.list_payments(purchase).await.unwrap().is_empty(),
+            "list_payments still sees a payment the caller's rollback removed"
+        );
+        // And the unit left no residue on the document it named.
+        let after = repo.find_purchase(purchase).await.unwrap().unwrap();
+        assert_eq!(after.status, crate::models::PurchaseStatus::Draft);
+    }
+
+    /// `create_payment_in` must not reach for the pool AT ALL, and the assertion
+    /// is the pairing itself rather than a stopwatch.
+    ///
+    /// `max_connections(1)` is the lever. While `tx` is open it holds the only
+    /// connection the pool owns, so `try_acquire` answering `None` is not a
+    /// timing accident — it is the pool stating, at that instant, that it has
+    /// nothing to hand. A door that reached for the pool could not answer on this
+    /// pool at all, ever: it would sit on sqlx's 30s acquire timeout and come
+    /// back as `PoolTimedOut`. The timing bound below is corroboration; the
+    /// premise is the proof.
+    #[tokio::test]
+    async fn create_payment_in_answers_while_the_callers_transaction_holds_the_only_connection() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let purchase =
+            seed_purchase_with_status(&pool, "Draft", "Held-Conn Supplier", d(2024, 5, 3), actor)
+                .await;
+        let (account, method) = account_and_method(&pool, actor).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        // The premise, asserted rather than assumed: the pool cannot serve a read
+        // right now, and that is a fact about the pool, not about this test's
+        // patience.
+        assert!(
+            pool.try_acquire().is_none(),
+            "the pool still has a spare connection, so this test would not prove anything"
+        );
+
+        let started = Instant::now();
+        let payment = repo
+            .create_payment_in(
+                &mut tx,
+                actor,
+                purchase,
+                account,
+                method,
+                dec("25"),
+                d(2024, 5, 3),
+                None,
+            )
+            .await;
+        let elapsed = started.elapsed();
+        let payment = payment.expect(
+            "create_payment_in reached for the pool; with the only connection held by the caller's transaction that is a 30s PoolTimedOut, not an answer",
+        );
+
+        assert_eq!(payment.amount, dec("25"));
+        // MEASURED, not assumed: the pairing above already decides it, and this
+        // bound is the corroboration. Five seconds sits four orders of magnitude
+        // above what an INSERT on a held connection costs and six below the 30s
+        // acquire timeout it is here to rule out.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "create_payment_in took {elapsed:?}; that is a write stalling for a connection, not one on the connection it was handed"
+        );
+        // The caller's transaction is still ALIVE and still holds its lock: a
+        // second write on the same connection answers. A `create_payment_in` that
+        // had ended, committed or rolled back the unit it was given could not
+        // leave this true.
+        let second = repo
+            .create_payment_in(
+                &mut tx,
+                actor,
+                purchase,
+                account,
+                method,
+                dec("5"),
+                d(2024, 5, 3),
+                None,
+            )
+            .await
+            .expect("a second write on the same connection could not run");
+        assert_ne!(second.id, payment.id, "both writes returned the same row");
+        tx.rollback().await.unwrap();
+
+        // The pool is answerable again now that the unit is over, so the premise
+        // above was the transaction and not the connection.
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchase_payments WHERE purchase_id = ?",
+                purchase
+            )
+            .await,
+            0
+        );
+        assert!(repo
+            .create_payment(
+                actor,
+                purchase,
+                account,
+                method,
+                dec("7"),
+                d(2024, 5, 3),
+                None
+            )
+            .await
+            .is_ok());
+    }
+
+    /// The confirm write is the one that MATTERS, because it is the statement
+    /// that turns a Draft into a numbered document. Inside the caller's unit, a
+    /// rollback must leave the document exactly as it found it: still a Draft,
+    /// still unnumbered, with no `confirmed_at` to mislead a later read.
+    ///
+    /// This is also the only test in the commit that would catch a
+    /// `set_confirmed_in` which stamped the number through a private committed
+    /// unit: the number would be visible on the pool the moment the statement
+    /// returned, and the rollback could not take it back.
+    #[tokio::test]
+    async fn set_confirmed_in_stamps_the_number_in_the_callers_unit_and_a_rollback_leaves_the_draft_untouched(
+    ) {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let purchase =
+            seed_purchase_with_status(&pool, "Draft", "Rollback Supplier", d(2024, 5, 4), actor)
+                .await;
+        let before = repo.find_purchase(purchase).await.unwrap().unwrap();
+        assert_eq!(before.status, crate::models::PurchaseStatus::Draft);
+        assert_eq!(before.purchase_number, None);
+        assert_eq!(before.confirmed_at, None);
+
+        let mut tx = pool.begin().await.unwrap();
+        let confirmed = repo
+            .set_confirmed_in(&mut tx, purchase, actor, "2024-PURCH-IN-0001")
+            .await
+            .expect("set_confirmed_in could not run while it held the caller's connection");
+        // The read-back is the row the UPDATE wrote, seen through the SAME unit:
+        // the number, the status and the stamp all belong to this transaction.
+        assert_eq!(confirmed.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(
+            confirmed.purchase_number.as_deref(),
+            Some("2024-PURCH-IN-0001")
+        );
+        assert!(
+            confirmed.confirmed_at.is_some(),
+            "the confirmed document carries no confirmed_at stamp"
+        );
+        // While the unit is open the pool is still blind to all of it, which is
+        // the other half: an answer identical to the committed one would mean the
+        // write had already escaped the caller's transaction.
+        tx.rollback().await.unwrap();
+
+        let after = repo.find_purchase(purchase).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            crate::models::PurchaseStatus::Draft,
+            "the document was confirmed by a unit the caller's rollback could not reach"
+        );
+        assert_eq!(
+            after.purchase_number, None,
+            "the number survived a rollback of the transaction that stamped it"
+        );
+        assert_eq!(
+            after.confirmed_at, None,
+            "the confirmed_at stamp survived a rollback of the transaction that wrote it"
+        );
+        // And the draft is still confirmable, so the rollback restored the state
+        // rather than corrupting the row.
+        let again = repo
+            .set_confirmed(purchase, actor, "2024-PURCH-IN-0002")
+            .await
+            .unwrap();
+        assert_eq!(again.status, crate::models::PurchaseStatus::Confirmed);
+    }
+
+    /// THE test of this commit. `set_confirmed_in` must not reach for the pool on
+    /// EITHER of the two paths that run inside the caller's unit — and the
+    /// assertion is the pairing itself rather than a stopwatch.
+    ///
+    /// `max_connections(1)` is the lever. While `tx` is open it holds the only
+    /// connection the pool owns, so `try_acquire` answering `None` is not a
+    /// timing accident — it is the pool stating, at that instant, that it has
+    /// nothing to hand. A door that reached for the pool could not answer on this
+    /// pool at all, ever: it would sit on sqlx's 30s acquire timeout and come
+    /// back as `PoolTimedOut`. This test therefore cannot pass by being slow, and
+    /// it cannot pass by accident.
+    ///
+    /// It is the happy path that makes this interesting rather than the refusal
+    /// path, because on the happy path the read-back at the end of `set_confirmed`
+    /// runs too. A `set_confirmed_in` whose read-back still went to the pool would
+    /// pass a test that only exercised the refusal, and that is precisely the bug
+    /// a test that only exercises the refusal cannot see.
+    #[tokio::test]
+    async fn set_confirmed_in_answers_while_the_callers_transaction_holds_the_only_connection() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let purchase =
+            seed_purchase_with_status(&pool, "Draft", "Held-Conn Supplier", d(2024, 5, 5), actor)
+                .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        // The premise, asserted rather than assumed: the pool cannot serve a read
+        // right now, and that is a fact about the pool, not about this test's
+        // patience.
+        assert!(
+            pool.try_acquire().is_none(),
+            "the pool still has a spare connection, so this test would not prove anything"
+        );
+
+        let started = Instant::now();
+        let confirmed = repo
+            .set_confirmed_in(&mut tx, purchase, actor, "2024-PURCH-HELD-1")
+            .await;
+        let elapsed = started.elapsed();
+        let confirmed = confirmed.expect(
+            "set_confirmed_in reached for the pool; with the only connection held by the caller's transaction that is a 30s PoolTimedOut, not an answer",
+        );
+
+        assert_eq!(confirmed.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(
+            confirmed.purchase_number.as_deref(),
+            Some("2024-PURCH-HELD-1")
+        );
+        // MEASURED, not assumed: the pairing above already decides it, and this
+        // bound is the corroboration. Five seconds sits four orders of magnitude
+        // above what an UPDATE plus a read-back on a held connection costs and six
+        // below the 30s acquire timeout it is here to rule out.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "set_confirmed_in took {elapsed:?}; that is a write stalling for a connection, not one on the connection it was handed"
+        );
+        // The caller's transaction is still ALIVE and still holds its lock. An
+        // `_in` that had ended, committed or rolled back the unit it was given
+        // could not leave a second confirm running on it.
+        let refused = repo
+            .set_confirmed_in(&mut tx, purchase, actor, "2024-PURCH-HELD-2")
+            .await;
+        assert!(
+            matches!(refused, Err(AppError::Validation(_))),
+            "the second confirm inside the same unit must be refused by the same DRAFT predicate, and must not be a driver error: {refused:?}"
+        );
+        tx.rollback().await.unwrap();
+
+        // The pool is answerable again now that the unit is over, so the stall
+        // above was the transaction and not the connection.
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM purchases WHERE purchase_number = ?",
+                0
+            )
+            .await,
+            0
+        );
+        let after = repo.find_purchase(purchase).await.unwrap().unwrap();
+        assert_eq!(after.status, crate::models::PurchaseStatus::Draft);
+    }
+
+    /// The trap, by name: `set_confirmed_in` on a document that is NOT a Draft
+    /// must produce the refusal without the pool ever being involved.
+    ///
+    /// This is the test that catches a migration which moves the UPDATE and
+    /// forgets `refuse_confirm`. The refusal is only reached when
+    /// `rows_affected() == 0`, so every happy-path test in this file would stay
+    /// green while the helper still held `&SqlitePool` — and the defect would
+    /// only surface later, inside `confirm`'s real transaction, as a 30-second
+    /// stall on a refusal the operator is waiting for.
+    ///
+    /// The assertion is the pool's own state, not elapsed time: with
+    /// `max_connections(1)` and the unit open, a helper that reached for the pool
+    /// could not answer at all.
+    #[tokio::test]
+    async fn set_confirmed_in_refuses_a_non_draft_document_without_ever_reaching_for_the_pool() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        // A Confirmed row, seeded through raw SQL so the service's guard cannot
+        // be what refuses it: the point is that the repository's OWN DRAFT
+        // predicate is load-bearing inside the caller's transaction.
+        let purchase = seed_purchase_with_status(
+            &pool,
+            "Confirmed",
+            "Already Confirmed",
+            d(2024, 5, 6),
+            actor,
+        )
+        .await;
+
+        let mut tx = pool.begin().await.unwrap();
+        // The premise, asserted rather than assumed.
+        assert!(
+            pool.try_acquire().is_none(),
+            "the pool still has a spare connection, so this test would not prove anything"
+        );
+
+        let started = Instant::now();
+        let refused = repo
+            .set_confirmed_in(&mut tx, purchase, actor, "2024-PURCH-DUP-1")
+            .await;
+        let elapsed = started.elapsed();
+
+        // The refusal is a VALUE carrying the state it found, and it is still
+        // `Validation` — the same variant the public method has always produced.
+        let refused = refused.expect_err(
+            "confirming a Confirmed document must be refused, and a refusal that reached for the pool would be a 30s PoolTimedOut instead",
+        );
+        match refused {
+            AppError::Validation(msg) => assert!(
+                msg.contains("Confirmed"),
+                "the refusal must name the state the document was found in: {msg}"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the refusal path took {elapsed:?}; that is a read stalling for a connection, not one on the connection it was handed"
+        );
+        tx.rollback().await.unwrap();
+
+        // The refusal is a refusal, not a write: the number was not stamped over
+        // the confirmed document, and the pool agrees.
+        let after = repo.find_purchase(purchase).await.unwrap().unwrap();
+        assert_eq!(
+            after.purchase_number, None,
+            "a refused confirm stamped a number on a document it did not confirm"
+        );
+    }
+
+    /// The additive claim, proved rather than asserted: both public wrappers still
+    /// answer exactly what they always answered, in every direction — the success
+    /// path, the duplicate-submission refusal, the frozen-document refusal, the
+    /// missing-document refusal and the payment write.
+    ///
+    /// The error VARIANTS matter as much as the messages. `refuse_confirm` maps
+    /// "no such document" to `NotFound` and "exists but frozen" to `Validation`,
+    /// and a rewrite that collapsed them would still refuse — it would just refuse
+    /// in a way the HTTP layer maps to a different status.
+    #[tokio::test]
+    async fn the_public_wrappers_answer_exactly_as_before_including_every_refusal() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let repo = SqlitePurchaseRepository::new(pool.clone());
+        let (account, method) = account_and_method(&pool, actor).await;
+        let draft =
+            seed_purchase_with_status(&pool, "Draft", "Public Supplier", d(2024, 5, 7), actor)
+                .await;
+
+        // -- set_confirmed: the success path -------------------------------
+        let confirmed = repo
+            .set_confirmed(draft, actor, "2024-PUBLIC-1")
+            .await
+            .unwrap();
+        assert_eq!(confirmed.status, crate::models::PurchaseStatus::Confirmed);
+        assert_eq!(confirmed.purchase_number.as_deref(), Some("2024-PUBLIC-1"));
+        assert!(confirmed.confirmed_at.is_some());
+
+        // -- set_confirmed: the duplicate submission ------------------------
+        // `Validation`, and it names the state rather than saying "exists".
+        let err = repo
+            .set_confirmed(draft, actor, "2024-PUBLIC-2")
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(
+                msg.contains("Confirmed"),
+                "the duplicate refusal must name the state: {msg}"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The first number survives: a refused duplicate stamped nothing.
+        assert_eq!(
+            repo.find_purchase(draft)
+                .await
+                .unwrap()
+                .unwrap()
+                .purchase_number,
+            Some("2024-PUBLIC-1".to_string())
+        );
+
+        // -- set_confirmed: a frozen document -------------------------------
+        let cancelled = seed_purchase_with_status(
+            &pool,
+            "Cancelled",
+            "Cancelled Supplier",
+            d(2024, 5, 8),
+            actor,
+        )
+        .await;
+        let err = repo
+            .set_confirmed(cancelled, actor, "2024-PUBLIC-3")
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Validation(msg) => assert!(
+                msg.contains("Cancelled"),
+                "the frozen-document refusal must name the state: {msg}"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // -- set_confirmed: a document that does not exist -------------------
+        // A DIFFERENT variant, and the one a rewrite is most likely to collapse
+        // into the other: not found is a 404, not a validation failure.
+        let err = repo
+            .set_confirmed(999_999, actor, "2024-PUBLIC-4")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound for a missing document, got {err:?}"
+        );
+
+        // -- create_payment: the success path --------------------------------
+        let paid_draft =
+            seed_purchase_with_status(&pool, "Draft", "Paying Supplier", d(2024, 5, 9), actor)
+                .await;
+        let payment = repo
+            .create_payment(
+                actor,
+                paid_draft,
+                account,
+                method,
+                dec("42.50"),
+                d(2024, 5, 9),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(payment.purchase_id, paid_draft);
+        assert_eq!(payment.account_id, account);
+        assert_eq!(payment.method_id, method);
+        assert_eq!(payment.amount, dec("42.50"));
+        // The wrapper leaves no unit of its own behind: the row is readable
+        // immediately, and a second payment on the same document is a different
+        // row rather than an overwrite.
+        let listed = repo.list_payments(paid_draft).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, payment.id);
+        let second = repo
+            .create_payment(
+                actor,
+                paid_draft,
+                account,
+                method,
+                dec("1"),
+                d(2024, 5, 9),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_ne!(second.id, payment.id);
+        assert_eq!(repo.list_payments(paid_draft).await.unwrap().len(), 2);
     }
 }

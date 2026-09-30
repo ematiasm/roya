@@ -771,6 +771,91 @@ where
         self.movements.create(actor, &input).await
     }
 
+    /// [`Self::record_movement`] inside a transaction the CALLER owns. It is a
+    /// SIBLING, not a wrapper: `record_movement` above keeps running on the
+    /// pool for the callers that have no unit to offer — every stock route, the
+    /// manual movement form, and the fixtures — and opening a transaction there
+    /// would be a behaviour change with a wide blast radius. This opens nothing
+    /// at all; it hands the caller's connection to the two repository calls.
+    ///
+    /// THREE repository calls, not the two the earlier survey counted: the
+    /// product lookup, the level fold, and the write. All three take the
+    /// caller's connection. The lookup is not optional here and is not a
+    /// correctness nicety — a pool read beneath a caller's open transaction
+    /// cannot answer on a one-connection pool (30s, then `PoolTimedOut`), and
+    /// on a many-connection pool it would take a second connection and read
+    /// outside the unit while holding the first. `find_by_id_in` is the door for
+    /// it, same as `stock_for_product_in`.
+    ///
+    /// The READ is the point, and it is why the read forms moved rather than
+    /// the write alone. This method folds the level, decides, and only then
+    /// writes, so in a document with two lines of the same product the second
+    /// fold has to see the first line's movement. On the pool it re-reads the
+    /// same unmutated level every iteration: `10` where the shop holds `4`, so a
+    /// second 6-unit line is waved through — and in a strict build, twice over.
+    /// Through `stock_for_product_in` the sequence sees its own writes, in the
+    /// order it wrote them, which is also the `ORDER BY id` the repository fold
+    /// walks. Same argument one table over as
+    /// `balance_for_account_in` in `transaction_repo.rs`.
+    ///
+    /// Every validation, every refusal and the ORDER of them are
+    /// `record_movement`'s, unchanged: the qty rule before the reference length,
+    /// the product lookup before the level fold. Only the executor differs.
+    pub async fn record_movement_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        input: NewMovement,
+    ) -> AppResult<StockMovement> {
+        match input.movement_type {
+            MovementType::In | MovementType::Out => {
+                if input.qty <= Decimal::ZERO {
+                    return Err(AppError::Validation("qty must be > 0".into()));
+                }
+            }
+            MovementType::Adjust => {
+                if input.qty == Decimal::ZERO {
+                    return Err(AppError::Validation("adjust qty cannot be zero".into()));
+                }
+            }
+        }
+        if input.reference.chars().count() > 256 {
+            return Err(AppError::Validation(
+                "reference must be <= 256 chars".into(),
+            ));
+        }
+        let product = self
+            .products
+            .find_by_id_in(tx, input.product_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("product {} not found", input.product_id)))?;
+        if !product.is_active {
+            return Err(AppError::Validation("product is inactive".into()));
+        }
+        if product.kind == ProductKind::Service || !product.track_stock {
+            return Err(AppError::Validation(
+                "cannot record movement for service or untracked product".into(),
+            ));
+        }
+
+        // The same level fold `record_movement` performs, on the caller's
+        // connection. The comment above it is that method's and still true here:
+        // this buys EARLY refusal with a useful message, not reachability — the
+        // repository's fold is the guarantee.
+        let delta = Self::signed_delta(input.movement_type, input.qty);
+        let current = self.movements.stock_for_product_in(tx, product.id).await?;
+        let next = current
+            .checked_add(delta)
+            .ok_or(AppError::PriceRefused(PriceRefusal::AggregateTooLarge))?;
+        if !self.allow_negative_stock && next < Decimal::ZERO {
+            return Err(AppError::Validation(format!(
+                "insufficient stock: {current} would become {next}"
+            )));
+        }
+
+        self.movements.create_in(tx, actor, &input).await
+    }
+
     // -- derived ------------------------------------------------------------
 
     /// How much to reorder, or `None` when there is nothing to say: the product
@@ -929,6 +1014,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
+    use std::time::{Duration, Instant};
 
     type Svc = InventoryService<
         SqliteCategoryRepository,
@@ -2496,5 +2582,198 @@ mod tests {
                 ),
             }
         }
+    }
+
+    // -- Phase B: the seam that joins a caller's transaction --------------------
+
+    /// `max_connections(1)` is the lever every assertion below leans on, and it
+    /// is the fixture's own setting rather than something these tests choose.
+    /// While `tx` is open it holds the only connection the pool owns, so
+    /// `try_acquire` answering `None` is the pool stating, at that instant, that
+    /// it has nothing to hand — a fact about the pool, not about this test's
+    /// patience. A seam that reached for the pool could not answer on this pool
+    /// at all: it would sit on sqlx's 30s acquire timeout and come back
+    /// `PoolTimedOut`. The timing bound is corroboration; the premise is the
+    /// proof.
+    #[tokio::test]
+    async fn record_movement_in_writes_into_the_callers_transaction_and_a_rollback_leaves_no_movement(
+    ) {
+        let s = svc(false).await;
+        let pool = s.products.pool.clone();
+        let who = actor(&s).await;
+        let p = s
+            .create_product(who, product_input("IN-JOIN"))
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            pool.try_acquire().is_none(),
+            "the pool still has a spare connection, so this test would not prove anything"
+        );
+
+        let started = Instant::now();
+        let written = s
+            .record_movement_in(&mut tx, who, movement(p.id, "5", MovementType::In))
+            .await
+            .expect(
+                "record_movement_in reached for the pool; with the only connection held by the \
+                 caller's transaction that is a 30s PoolTimedOut, not an answer",
+            );
+        let elapsed = started.elapsed();
+
+        // The caller's transaction is still ALIVE and still holds the write: a
+        // second statement on the same connection sees it. A seam that had ended
+        // or committed the unit it was handed could not leave this true.
+        let level_inside = s
+            .movements
+            .stock_for_product_in(&mut tx, p.id)
+            .await
+            .unwrap();
+        assert!(
+            pool.try_acquire().is_none(),
+            "the seam released the connection it was handed, so it was never inside the unit"
+        );
+        tx.rollback().await.unwrap();
+
+        assert_eq!(
+            level_inside,
+            dec("5"),
+            "the caller's transaction lost the write"
+        );
+        // MEASURED in this module rather than inherited: on this pool a
+        // `pool.begin()` issued while a transaction holds the only connection
+        // returns `pool timed out while waiting for an open connection` after
+        // 30.000s. Five seconds sits four orders of magnitude above what a
+        // joined write costs and six below the failure it rules out.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "record_movement_in took {elapsed:?}; that is a nested BEGIN stalling for a connection, \
+             not a joined write"
+        );
+        assert!(s.movements.find_by_id(written.id).await.unwrap().is_none());
+        assert_eq!(s.movements.count_by_product(p.id).await.unwrap(), 0);
+        assert_eq!(
+            s.movements.stock_for_product(p.id).await.unwrap(),
+            Decimal::ZERO
+        );
+    }
+
+    /// The reason the READ moved and not only the write.
+    ///
+    /// Two lines of one document against the same product: the second pre-check
+    /// has to fold the level the first line produced, or it folds a
+    /// pre-transaction snapshot — `10` where the shop holds `4`, and a second
+    /// 6-unit sale is waved through a drawer that cannot cover it. On the pool
+    /// both lines pass; inside the unit the second is refused, and the refusal
+    /// names the figures the fold actually saw.
+    ///
+    /// The strict service (`svc(false)`) is what makes the strict branch run at
+    /// all: `svc(true)` builds with `allow_negative_stock = true`, so an
+    /// overdraw is legal there and this test would pass for the wrong reason.
+    #[tokio::test]
+    async fn record_movement_in_folds_the_level_inside_the_callers_transaction_so_two_lines_of_one_document_see_each_other(
+    ) {
+        let s = svc(false).await;
+        let pool = s.products.pool.clone();
+        let who = actor(&s).await;
+        let p = s
+            .create_product(who, product_input("IN-FOLD"))
+            .await
+            .unwrap();
+        // The committed opening level, written through the PUBLIC method.
+        s.record_movement(who, movement(p.id, "10", MovementType::In))
+            .await
+            .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        // 10 - 6 = 4: the first line of the document.
+        s.record_movement_in(&mut tx, who, movement(p.id, "6", MovementType::Out))
+            .await
+            .unwrap();
+        // 4 - 6 = -2, and only a fold that saw the first line gets there.
+        let refused = s
+            .record_movement_in(&mut tx, who, movement(p.id, "6", MovementType::Out))
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+
+        match refused {
+            AppError::Validation(msg) => assert!(
+                msg.contains("4 would become -2"),
+                "the refusal must name the figures the fold saw inside the unit, got: {msg}"
+            ),
+            other => panic!("an overdraw is a 400 Validation, not {other:?}"),
+        }
+        // And the unit is gone, so the accepted line went with the refused one.
+        assert_eq!(s.movements.count_by_product(p.id).await.unwrap(), 1);
+        assert_eq!(
+            s.movements.stock_for_product(p.id).await.unwrap(),
+            dec("10")
+        );
+    }
+
+    /// The additive claim for this seam, proved rather than asserted: the public
+    /// method is not a wrapper of the new one. It still runs on the pool, still
+    /// commits its own work, still refuses the same inputs with the same rules,
+    /// and the seam changed none of that.
+    #[tokio::test]
+    async fn the_public_record_movement_still_commits_and_refuses_exactly_as_before() {
+        let s = svc(false).await;
+        let who = actor(&s).await;
+        let p = s
+            .create_product(who, product_input("IN-PUBLIC"))
+            .await
+            .unwrap();
+
+        // Committed on the pool, with no unit of its own to lean on.
+        let written = s
+            .record_movement(who, movement(p.id, "10", MovementType::In))
+            .await
+            .unwrap();
+        assert_eq!(s.movements.count_by_product(p.id).await.unwrap(), 1);
+        assert_eq!(
+            s.movements
+                .find_by_id(written.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .qty,
+            dec("10")
+        );
+        assert_eq!(
+            s.movements.stock_for_product(p.id).await.unwrap(),
+            dec("10")
+        );
+
+        // The validations keep their order and their variants: the qty rule
+        // answers before the reference rule, and the product lookup before the
+        // level fold.
+        assert!(matches!(
+            s.record_movement(who, movement(p.id, "0", MovementType::In))
+                .await
+                .unwrap_err(),
+            AppError::Validation(_)
+        ));
+        assert!(matches!(
+            s.record_movement(who, movement(99999, "1", MovementType::In))
+                .await
+                .unwrap_err(),
+            AppError::NotFound(_)
+        ));
+        assert!(matches!(
+            s.record_movement(who, movement(p.id, "0", MovementType::Adjust))
+                .await
+                .unwrap_err(),
+            AppError::Validation(_)
+        ));
+        // The level fold still runs on the pool and still overdraws the same way.
+        assert!(matches!(
+            s.record_movement(who, movement(p.id, "11", MovementType::Out))
+                .await
+                .unwrap_err(),
+            AppError::Validation(_)
+        ));
+        assert_eq!(s.movements.count_by_product(p.id).await.unwrap(), 1);
     }
 }

@@ -1131,9 +1131,47 @@ where
             }
         }
 
+        // ---- THE WRITE UNIT -----------------------------------------------
+        //
+        // Everything from here to the COMMIT is ONE transaction: the sequence
+        // number, one stock movement per tracked line, the `Expense`, the
+        // `purchase_payments` row, `set_confirmed`, and the per-line supplier
+        // cost in the satellite. Before this line each of them was its own
+        // autocommit unit, so a failure between any two left the earlier ones
+        // committed and the document a Draft. That residue was MEASURED, not
+        // assumed (`purchase_confirm_failure_*` in this file), and every one of
+        // those tests now asserts its absence.
+        //
+        // `record_cost` is the sixth write and the reason purchases are the
+        // harder side of this change: it runs LAST, after the document was
+        // already Confirmed and numbered, so its failure used to leave a
+        // CONFIRMED, FULLY PAID, NUMBERED purchase with only SOME of its
+        // lines' costs recorded — the one residue with NO recovery path, because
+        // the retry was refused as a duplicate at `confirm`'s opening read. With
+        // it inside the unit, a failure there takes the whole document back to a
+        // clean Draft and the number back with it.
+        //
+        // The BEGIN goes HERE and not one line earlier, on purpose. Every read
+        // above it — the document, its lines, the duplicate-product guard, the
+        // per-line product lookup, the backdated-cost pre-check, the totals, the
+        // payment-method ownership, the overdraft pre-check — is a pre-check,
+        // and a pre-check buys EARLY refusal with a useful message rather than
+        // reachability: the repository's fold is the guarantee, and the folds
+        // inside the unit below now see the unit's own writes.
+        //
+        // ROLLBACK IS THE `?`. There is deliberately no explicit rollback arm
+        // and no `unwrap_or` on the way out: every `?` here drops the
+        // `Transaction`, sqlx rolls it back, and the `AppError` that caused it
+        // propagates UNCHANGED. An explicit arm would be a place to swallow a
+        // refusal, and the refusal IS the answer. Do not add one.
+        let mut tx = self.purchases.pool().begin().await?;
+
         // Assign number atomically via doc_sequences row UPDATE.
         let year = purchase.purchase_date.year();
-        let seq = self.sequences.next_number("PURCH", year).await?;
+        let seq = self
+            .sequences
+            .next_number_in(&mut tx, "PURCH", year)
+            .await?;
         let purchase_number = format_purchase_number(year, seq);
 
         // Stock In (reason Purchase) for tracked Product lines only. The
@@ -1141,7 +1179,8 @@ where
         // that stamps the finance rows — never a fresh one (AC18).
         for line in &tracked {
             self.inventory
-                .record_movement(
+                .record_movement_in(
+                    &mut tx,
                     actor,
                     NewMovement {
                         product_id: line.product_id,
@@ -1163,7 +1202,8 @@ where
             let method_id = cash_method_id.expect("validated above");
             let expense = self
                 .transactions
-                .create_with_reference(
+                .create_with_reference_in(
+                    &mut tx,
                     actor,
                     account_id,
                     crate::models::TransactionKind::Expense,
@@ -1174,7 +1214,8 @@ where
                 )
                 .await?;
             self.purchases
-                .create_payment(
+                .create_payment_in(
+                    &mut tx,
                     actor,
                     purchase_id,
                     account_id,
@@ -1188,15 +1229,18 @@ where
 
         let confirmed = self
             .purchases
-            .set_confirmed(purchase_id, actor, &purchase_number)
+            .set_confirmed_in(&mut tx, purchase_id, actor, &purchase_number)
             .await?;
 
-        // AC9: after a successful confirm, record the line cost in the satellite
-        // (one row per product/supplier pair). The uniqueness guard above means
-        // each product appears on exactly one line.
+        // AC9: after `set_confirmed`, record the line cost in the satellite (one
+        // row per product/supplier pair). The uniqueness guard above means each
+        // product appears on exactly one line. The POSITION is unchanged — this
+        // still runs last — but it is inside the unit now, so a refusal here
+        // un-confirms the document instead of stranding it.
         for line in &lines {
             self.suppliers
-                .record_cost(
+                .record_cost_in(
+                    &mut tx,
                     actor,
                     line.product_id,
                     purchase.supplier_id,
@@ -1206,6 +1250,14 @@ where
                 .await?;
         }
 
+        tx.commit().await?;
+
+        // ---- AFTER THE COMMIT, DELIBERATELY -------------------------------
+        //
+        // `detail_for` reads the document's lines and payments, and it stays on
+        // the pool on purpose: a pool read beneath an open unit cannot answer
+        // on a one-connection pool (30s, then `PoolTimedOut`), and it has no
+        // reason to be inside the unit anyway.
         self.detail_for(confirmed).await
     }
 
@@ -5598,22 +5650,26 @@ mod tests {
     // -- confirm failure windows (T4) ----------------------------------------
     //
     // `PurchasesService::confirm` writes the sequence, the stock movements, the
-    // finance row, the payment, the document and THEN the supplier costs, each
-    // on its own autocommit connection. Every statement is atomic; the sequence
-    // is not. So a failure between any two of them leaves everything already
-    // committed in place, and nothing in the codebase can unwind it.
+    // finance row, the payment, the document and THEN the supplier costs — all
+    // of it inside ONE transaction now. A failure at any point rolls the whole
+    // unit back, so the tests below assert the ABSENCE of residue: every count
+    // back to where it was, the document still a Draft, the sequence UNSPENT.
     //
-    // These tests pin the residue instead of removing it — the shared
-    // transaction is out of scope here. All five run on `svc()`, whose
-    // `allow_balance = true` is REQUIRED rather than incidental: with the M0
-    // overdraft guard on, every Cash confirm below would be refused with
-    // "insufficient funds" against a fresh empty account and the injected
-    // trigger would never fire.
+    // These assertions WERE the residue before the transaction landed, and they
+    // were right about that code: nothing in the layer could unwind it, and the
+    // sequence in particular had no way to give a number back. They are
+    // inverted because the guarantee changed.
+    //
+    // All five run on `svc()`, whose `allow_balance = true` is REQUIRED rather
+    // than incidental: with the M0 overdraft guard on, every Cash confirm below
+    // would be refused with "insufficient funds" against a fresh empty account
+    // and the injected trigger would never fire.
 
-    /// WINDOW 1 — between `next_number` and the FIRST stock movement. The
-    /// narrowest residue: a burned number and nothing else.
+    /// WINDOW 1 — between `next_number` and the FIRST stock movement. This used
+    /// to leave the narrowest residue there is: a burned number and nothing
+    /// else. The number is now unspent.
     #[tokio::test]
-    async fn purchase_confirm_failure_between_the_number_and_the_first_movement_burns_only_a_number(
+    async fn purchase_confirm_failure_between_the_number_and_the_first_movement_leaves_nothing_written(
     ) {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "T4-W1", "5").await;
@@ -5651,12 +5707,18 @@ mod tests {
 
         assert_eq!(
             purchase_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent: `doc_sequences` was updated and never rolled back"
+            None,
+            "the number was never spent: `doc_sequences` has no PURCH row at all, \
+             because the increment rolled back with the rest of the unit"
         );
         assert_eq!(movement_count(&pool).await, 0, "no stock came in");
         assert_eq!(tx_count(&pool).await, 0, "finance never started");
         assert_eq!(payment_count(&pool).await, 0, "no payment was written");
+        assert_eq!(
+            cost_count(&pool).await,
+            0,
+            "no supplier cost was recorded either"
+        );
         assert_eq!(
             row_state(&pool, purchase.id).await,
             ("Draft".to_string(), None),
@@ -5665,10 +5727,12 @@ mod tests {
     }
 
     /// WINDOW 2 — on the SECOND movement of a two-line purchase. Two DIFFERENT
-    /// products so the loop is reached with both lines eligible, and a failure
-    /// that lands after the first In is committed.
+    /// products so the loop is reached with both lines eligible. This used to
+    /// land after the first In was committed, so half the goods came in on a
+    /// Draft nobody could see. The first line's movement now rolls back with
+    /// the second one's failure.
     #[tokio::test]
-    async fn purchase_confirm_failure_on_the_second_movement_keeps_the_first_one_on_a_draft() {
+    async fn purchase_confirm_failure_on_the_second_movement_rolls_the_first_one_back_too() {
         let (s, pool) = svc().await;
         let first = seed_product(&s, "T4-W2A", "5").await;
         let second = seed_product(&s, "T4-W2B", "7").await;
@@ -5716,28 +5780,32 @@ mod tests {
 
         assert_eq!(
             purchase_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent"
+            None,
+            "the number is UNSPENT: the increment is inside the rolled-back unit"
         );
         assert_eq!(
             movement_count(&pool).await,
-            1,
-            "the first line's In was committed and the second never landed"
+            0,
+            "no goods came in: the first line's In rolled back with the failure on \
+             the second"
         );
         assert_eq!(tx_count(&pool).await, 0, "finance never started");
         assert_eq!(payment_count(&pool).await, 0, "no payment was written");
+        assert_eq!(cost_count(&pool).await, 0, "no supplier cost was recorded");
         assert_eq!(
             row_state(&pool, purchase.id).await,
             ("Draft".to_string(), None),
-            "half the goods came in on a Draft nobody can see"
+            "no goods came in on a Draft nobody can see"
         );
     }
 
-    /// WINDOW 3 — between the Expense row and the payment row. The orphan: a
-    /// `transactions` row stamped with the purchase's reference that no payment
-    /// claims, so an account carries an expense the document never recorded.
+    /// WINDOW 3 — between the Expense row and the payment row. This used to leave
+    /// the orphan: a `transactions` row stamped with the purchase's reference
+    /// that no payment claimed, so an account carried an expense the document
+    /// never recorded. There is no orphan now — the Expense rolls back with the
+    /// payment row that failed.
     #[tokio::test]
-    async fn purchase_confirm_failure_between_the_expense_and_the_payment_leaves_an_orphan_expense()
+    async fn purchase_confirm_failure_between_the_expense_and_the_payment_leaves_no_orphan_expense()
     {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "T4-W3", "5").await;
@@ -5775,40 +5843,51 @@ mod tests {
 
         assert_eq!(
             purchase_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent"
+            None,
+            "the number is UNSPENT: the increment is inside the rolled-back unit"
         );
-        assert_eq!(movement_count(&pool).await, 1, "the In was committed");
-        assert_eq!(tx_count(&pool).await, 1, "the Expense was committed");
+        assert_eq!(
+            movement_count(&pool).await,
+            0,
+            "no goods came in — the In rolled back too"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            0,
+            "the Expense rolled back with the payment row that could not be written"
+        );
         assert_eq!(
             payment_count(&pool).await,
             0,
-            "the payment never landed, so the Expense is claimed by nobody"
+            "the payment never landed, and there is now no Expense for it to orphan"
         );
+        assert_eq!(cost_count(&pool).await, 0, "no supplier cost was recorded");
         assert_eq!(
             row_state(&pool, purchase.id).await,
             ("Draft".to_string(), None),
             "the document is still a Draft with no number"
         );
-        let orphan: (i64, String, String) = sqlx::query_as(
-            "SELECT id, kind, reference FROM transactions t \
+        let orphans: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM transactions t \
              WHERE NOT EXISTS (SELECT 1 FROM purchase_payments pp WHERE pp.transaction_id = t.id \
                                OR pp.refund_transaction_id = t.id)",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(orphan.1, "Expense");
         assert_eq!(
-            orphan.2, "2024-PURCH-000001",
-            "the orphan still carries the number the failed attempt burned"
+            orphans.0, 0,
+            "no finance row is claimed by nobody: the orphan shape the confirm used \
+             to leave behind does not exist here"
         );
     }
 
-    /// WINDOW 4 — on `set_confirmed` itself. The residue is a Draft that has
-    /// already taken the goods in and already paid the supplier.
+    /// WINDOW 4 — on `set_confirmed` itself. This used to leave a Draft that had
+    /// already taken the goods in and already paid the supplier. Nothing
+    /// survives now: no goods, no expense, no payment, and the document reads
+    /// as Unpaid again.
     #[tokio::test]
-    async fn purchase_confirm_failure_on_set_confirmed_leaves_a_paid_draft() {
+    async fn purchase_confirm_failure_on_set_confirmed_leaves_a_clean_draft_that_reports_unpaid() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "T4-W4", "5").await;
         let sup = seed_supplier(&s, "T4 W4 Supplier").await;
@@ -5844,15 +5923,20 @@ mod tests {
 
         assert_eq!(
             purchase_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent"
+            None,
+            "the number is UNSPENT: the increment is inside the rolled-back unit, so \
+             `doc_sequences` has no PURCH row at all"
         );
-        assert_eq!(movement_count(&pool).await, 1, "the In was committed");
-        assert_eq!(tx_count(&pool).await, 1, "the Expense was committed");
+        assert_eq!(
+            movement_count(&pool).await,
+            0,
+            "no goods came in — the In rolled back"
+        );
+        assert_eq!(tx_count(&pool).await, 0, "the Expense rolled back");
         assert_eq!(
             payment_count(&pool).await,
-            1,
-            "the payment was committed: the supplier was paid and no document says so"
+            0,
+            "the payment rolled back: the supplier was NOT paid and no document says otherwise"
         );
         assert_eq!(
             row_state(&pool, purchase.id).await,
@@ -5862,22 +5946,38 @@ mod tests {
         assert_eq!(
             cost_count(&pool).await,
             0,
-            "and `record_cost` never ran — it is after `set_confirmed`"
+            "and `record_cost` never ran — it is after `set_confirmed` inside the unit"
+        );
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(
+            detail.payment_status,
+            crate::models::PaymentStatus::Unpaid,
+            "the document reports itself UNPAID: `get_detail` reads the payments \
+             table, and that table is empty again"
+        );
+        assert_eq!(
+            detail.paid,
+            dec("0"),
+            "nothing was collected from the supplier"
         );
     }
 
-    /// WINDOW 5 — the one purchases has and sales does not: `record_cost` runs
-    /// in a loop AFTER `set_confirmed` succeeded. A failure there leaves the
+    /// WINDOW 5 — the one purchases has and sales does not: `record_cost` runs in a
+    /// loop AFTER `set_confirmed` succeeded. A failure there used to leave the
     /// document Confirmed, numbered and fully paid, with only SOME of its lines'
-    /// supplier costs recorded.
+    /// supplier costs recorded — and, unlike the four windows above, that
+    /// residue could not be retried: the retry was refused at `confirm`'s
+    /// opening read ("purchase already confirmed") and by the statement's own
+    /// predicate, so the missing cost was permanent until somebody opened the
+    /// supplier drawer and typed it in, with nothing anywhere recording that it
+    /// was missing.
     ///
-    /// This residue is worse than the four above, because unlike them it cannot
-    /// be retried: the retry is refused at `confirm`'s opening read ("purchase
-    /// already confirmed") and by the statement's own predicate. The missing cost
-    /// is permanent until somebody opens the supplier drawer and types it in, and
-    /// nothing in the document records that it is missing.
+    /// With `record_cost` inside the confirm unit the failure takes the WHOLE
+    /// document back: a Draft, unnumbered, unpaid, with no costs at all. This is
+    /// the residue with no recovery path, and closing it is the most valuable
+    /// thing the transaction buys.
     #[tokio::test]
-    async fn purchase_confirm_failure_in_record_cost_leaves_a_confirmed_purchase_with_one_cost() {
+    async fn purchase_confirm_failure_in_record_cost_leaves_a_clean_draft_and_no_costs() {
         let (s, pool) = svc().await;
         let first = seed_product(&s, "T4-W5A", "5").await;
         let second = seed_product(&s, "T4-W5B", "7").await;
@@ -5926,31 +6026,41 @@ mod tests {
             "expected the injected failure to surface, got {err}"
         );
 
-        // Everything the document needed had already committed.
+        // The whole document came back: not the Confirmed, numbered, paid purchase
+        // with one cost of two that this window used to leave behind.
         assert_eq!(
             row_state(&pool, purchase.id).await,
-            (
-                "Confirmed".to_string(),
-                Some("2024-PURCH-000001".to_string())
-            ),
-            "the document IS confirmed and numbered"
+            ("Draft".to_string(), None),
+            "the document is a Draft again and was never given a number"
         );
-        assert_eq!(movement_count(&pool).await, 2, "both goods came in");
-        assert_eq!(tx_count(&pool).await, 1, "the Expense was committed");
-        assert_eq!(payment_count(&pool).await, 1, "the payment was committed");
+        assert_eq!(
+            movement_count(&pool).await,
+            0,
+            "no goods came in: both Ins rolled back"
+        );
+        assert_eq!(tx_count(&pool).await, 0, "the Expense rolled back");
+        assert_eq!(payment_count(&pool).await, 0, "the payment rolled back");
+        assert_eq!(
+            purchase_sequence_last(&pool).await,
+            None,
+            "and the number is UNSPENT"
+        );
         assert_eq!(
             cost_count(&pool).await,
-            1,
-            "but only the FIRST line's supplier cost was recorded"
+            0,
+            "NOT ONE supplier cost survives: the first line's cost was written \
+             before the failure and is gone with it"
         );
 
-        let recorded: (i64,) = sqlx::query_as("SELECT product_id FROM product_supplier_costs")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            recorded.0, first.id,
-            "and it is the first line's, not the second's"
+        assert!(
+            s.suppliers
+                .find_cost(first.id, sup.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the FIRST line's cost is absent too — this is the half-written \
+             satellite row that used to survive with nothing recording that its \
+             partner was missing"
         );
         assert!(
             s.suppliers
@@ -5958,21 +6068,35 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "the second line's cost is simply absent, with no marker anywhere \
-             that the purchase was supposed to record it"
+            "and the second line's is absent, as before"
         );
 
-        // And the retry is refused: this residue is permanent from the
-        // document's own point of view.
+        // And the retry is no longer refused as a duplicate: the document is a
+        // Draft again, so it reaches the write phase and fails on the SAME
+        // trigger, leaving the SAME clean state. That is what makes this residue
+        // recoverable where it was not — not that the failure goes away, but
+        // that it leaves nothing behind and can be retried once the cause is
+        // fixed.
         let retry = s.confirm(actor, purchase.id, Some(cash)).await.unwrap_err();
-        match retry {
-            AppError::Validation(msg) => assert_eq!(msg, "purchase already confirmed"),
-            other => panic!("expected Validation, got {other:?}"),
-        }
+        assert!(
+            retry.to_string().contains("injected record-cost failure"),
+            "the retry reaches the same window rather than being refused as a \
+             duplicate, got {retry}"
+        );
+        assert_eq!(
+            row_state(&pool, purchase.id).await,
+            ("Draft".to_string(), None),
+            "and still leaves a Draft with no number"
+        );
         assert_eq!(
             cost_count(&pool).await,
-            1,
-            "and the refused retry recorded no further cost"
+            0,
+            "and still records no partial cost"
+        );
+        assert_eq!(
+            purchase_sequence_last(&pool).await,
+            None,
+            "and still leaves the number unspent"
         );
     }
 }

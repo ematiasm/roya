@@ -1372,9 +1372,38 @@ where
             }
         }
 
+        // ---- THE WRITE UNIT -----------------------------------------------
+        //
+        // Everything from here to the COMMIT is ONE transaction: the sequence
+        // number, one stock movement per tracked line, the `Income`, the
+        // `sale_payments` row, and `set_confirmed`. Before this line each of
+        // them was its own autocommit unit, so a failure between any two left
+        // the earlier ones committed and the document a Draft — a burned number,
+        // stock deducted from a document nobody could see, an orphan `Income`,
+        // or a Draft that reported itself Paid with no way to reconcile it to a
+        // number. That residue was MEASURED, not assumed
+        // (`confirm_failure_*` in this file), and every one of those tests now
+        // asserts its absence.
+        //
+        // The BEGIN goes HERE and not one line earlier, on purpose. Every read
+        // above it — the document, its lines, the per-line product lookup, the
+        // totals, the payment-method ownership, the credit ledger, the strict
+        // stock pre-check — is a pre-check, and a pre-check buys EARLY refusal
+        // with a useful message rather than reachability: the repository's fold
+        // is the guarantee, and the fold inside the unit below now sees the
+        // unit's own writes. Holding a transaction open across them would also
+        // pin a connection for the whole pre-check and buy nothing.
+        //
+        // ROLLBACK IS THE `?`. There is deliberately no explicit rollback arm
+        // and no `unwrap_or` on the way out: every `?` here drops the
+        // `Transaction`, sqlx rolls it back, and the `AppError` that caused it
+        // propagates UNCHANGED. An explicit arm would be a place to swallow a
+        // refusal, and the refusal IS the answer. Do not add one.
+        let mut tx = self.sales.pool().begin().await?;
+
         // Assign number atomically via doc_sequences row UPDATE.
         let year = sale.sale_date.year();
-        let seq = self.sequences.next_number("SALE", year).await?;
+        let seq = self.sequences.next_number_in(&mut tx, "SALE", year).await?;
         let sale_number = format_sale_number(year, seq);
 
         // Stock Out (reason Sale) for tracked Product lines only.
@@ -1383,7 +1412,8 @@ where
         // argument that stamps the finance rows — never a fresh one (AC18).
         for (line, _) in &tracked {
             self.inventory
-                .record_movement(
+                .record_movement_in(
+                    &mut tx,
                     actor,
                     NewMovement {
                         product_id: line.product_id,
@@ -1405,7 +1435,8 @@ where
             let method_id = cash_method_id.unwrap();
             let income = self
                 .transactions
-                .create_with_reference(
+                .create_with_reference_in(
+                    &mut tx,
                     actor,
                     account_id,
                     crate::models::TransactionKind::Income,
@@ -1416,7 +1447,8 @@ where
                 )
                 .await?;
             self.sales
-                .create_payment(
+                .create_payment_in(
+                    &mut tx,
                     actor,
                     sale_id,
                     account_id,
@@ -1431,8 +1463,19 @@ where
 
         let confirmed = self
             .sales
-            .set_confirmed(sale_id, actor, &sale_number)
+            .set_confirmed_in(&mut tx, sale_id, actor, &sale_number)
             .await?;
+
+        tx.commit().await?;
+
+        // ---- AFTER THE COMMIT, DELIBERATELY -------------------------------
+        //
+        // `detail_for` reads the document's lines and payments, and it stays on
+        // the pool on purpose: a pool read beneath an open unit cannot answer
+        // on a one-connection pool (30s, then `PoolTimedOut`), and it has no
+        // reason to be inside the unit anyway. `confirmed` is a row this
+        // transaction wrote, so the value is already durable by the time the
+        // reads run.
         self.detail_for(confirmed).await
     }
 
@@ -6086,14 +6129,24 @@ mod tests {
     }
 
     /// The SAME duplicate submission, arriving the way a race delivers it: while
-    /// this confirm is between its number and its movement, another writer has
-    /// already confirmed the document. `confirm`'s opening read saw a Draft, so
-    /// every guard above the final write passes — and only the repository's own
-    /// `AND status = 'Draft'` can still refuse the second stamp.
+    /// this confirm is between its number and its movement, the document has
+    /// already been confirmed underneath it. `confirm`'s opening read saw a
+    /// Draft, so every guard above the final write passes — and only the
+    /// repository's own `AND status = 'Draft'` can still refuse the second
+    /// stamp.
     ///
     /// The trigger is the standing technique in this repo for putting a second
     /// writer inside another's statement (`tax_snapshot_tests.rs:747`), used
     /// here to make the interleaving deterministic instead of timed.
+    ///
+    /// WHAT THIS TEST NO LONGER SIMULATES, stated plainly because the name
+    /// overclaims: a trigger runs on the writer's OWN connection, so with the
+    /// confirm unit in place the racing UPDATE is a statement INSIDE that unit,
+    /// not a second connection beside it. The refusal by the predicate is real
+    /// and still proven. The claim that the racing stamp SURVIVES is not, and
+    /// the rollback takes that stamp back too. A genuine second connection is
+    /// what this test would need to prove the race, and SQLite's single-writer
+    /// locking would then decide the outcome, not this code.
     ///
     /// Strict stock is ON (`svc_with_flags(false, false)`), so the refusal is
     /// proven under the production posture and not under a relaxed flag.
@@ -6133,60 +6186,71 @@ mod tests {
             other => panic!("expected Validation, got {other:?}"),
         }
 
+        // The racing stamp never became durable. It ran on this confirm's own
+        // connection, so it is a statement INSIDE the unit rather than a second
+        // writer, and the rollback took it back with the rest. Read straight
+        // from the row, not through the service.
         let after = s.sales.find_sale(sale.id).await.unwrap().unwrap();
         assert_eq!(
+            after.status,
+            crate::models::SaleStatus::Draft,
+            "the document is a Draft again: the racing UPDATE was inside the unit"
+        );
+        assert_eq!(
             after.sale_number.as_deref(),
-            Some("2024-SALE-000099"),
-            "the winning writer's number stands; the second one is never stamped"
+            None,
+            "so neither the racing number nor this confirm's number was stamped"
         );
 
-        // The honest residue: the predicate refuses the DOCUMENT, not the work
-        // that ran before it. Everything `confirm` wrote before `set_confirmed`
-        // is still there, because there is no shared transaction to unwind it.
+        // The refusal, and the shape it leaves behind. The trigger's own UPDATE runs
+        // on this confirm's own connection, so it is part of the unit and the
+        // rollback takes it back too: the simulated "other writer" was never a
+        // separate writer, it was a statement inside this transaction. What
+        // survives is nothing — not the work that ran before the predicate, and
+        // not the racing stamp.
         assert_eq!(
             movement_count(&pool).await,
-            2,
-            "the seeding movement in, and the Out this confirm already committed"
-        );
-        assert_eq!(
-            tx_count(&pool).await,
             1,
-            "the Income this confirm already committed"
+            "only the seeding movement in — the Out rolled back with the refusal"
         );
-        assert_eq!(
-            payment_count(&pool).await,
-            1,
-            "the payment this confirm already committed"
-        );
+        assert_eq!(tx_count(&pool).await, 0, "the Income rolled back");
+        assert_eq!(payment_count(&pool).await, 0, "the payment rolled back");
         assert_eq!(
             sale_sequence_last(&pool).await,
-            Some(1),
-            "and the number it burned is still burned"
+            None,
+            "and the number is UNSPENT"
+        );
+        assert_eq!(
+            row_state(&pool, sale.id).await,
+            ("Draft".to_string(), None),
+            "the document is a Draft with no number: the racing stamp was inside \
+             the same unit, so it rolled back with everything else"
         );
     }
 
     // -- confirm failure windows (T3) ----------------------------------------
     //
     // `confirm` writes the sequence, the stock movements, the finance row, the
-    // payment and the document on separate autocommit connections. Each
-    // statement is atomic; the SEQUENCE is not. So a failure between any two of
-    // them leaves everything already committed exactly where it was, and there
-    // is nothing in the codebase that can unwind it.
+    // payment and the document inside ONE transaction. A failure at any point in
+    // that run rolls the whole unit back, so the tests below assert the ABSENCE
+    // of residue, window by window: every count is back to where it was before
+    // the confirm, the document is still a Draft, and the sequence is UNSPENT.
     //
-    // These tests do not try to make that residue disappear — making it
-    // disappear is the shared transaction, which is out of scope here. They pin
-    // the residue instead, window by window, so the truth is on the record and
-    // the assertions that must keep passing once the transaction lands are
-    // already written. Every one of them runs with STRICT STOCK ON
-    // (`svc_with_flags(false, false)`), so the injected failure is provably the
-    // thing that stopped the confirm and not the stock pre-check above it.
+    // These assertions were the residue itself before the transaction landed.
+    // They were RIGHT about that code — the residue they measured was real, and
+    // `doc_sequences` had no way to give a number back. They are inverted here
+    // because the guarantee changed, not because they were wrong.
+    //
+    // Every one of them runs with STRICT STOCK ON (`svc_with_flags(false, false)`),
+    // so the injected failure is provably the thing that stopped the confirm and
+    // not the stock pre-check above it.
 
-    /// WINDOW 1 — between `next_number` and the FIRST stock movement. The
-    /// residue is the narrowest one there is: a burned number and nothing else.
-    /// This is the case the atomicity note at the top of this file used to
-    /// describe as the ONLY possible one.
+    /// WINDOW 1 — between `next_number` and the FIRST stock movement. This used
+    /// to leave the narrowest residue there is: a burned number and nothing else,
+    /// and this is the case the atomicity note at the top of this file used to
+    /// describe as the ONLY possible one. The number is now unspent.
     #[tokio::test]
-    async fn confirm_failure_between_the_number_and_the_first_movement_burns_only_a_number() {
+    async fn confirm_failure_between_the_number_and_the_first_movement_leaves_nothing_written() {
         let (s, pool) = svc_with_flags(false, false).await;
         let prod = seed_product(&s, "T3-W1", "10").await;
         seed_stock(&s, prod.id, "10").await;
@@ -6214,13 +6278,14 @@ mod tests {
 
         assert_eq!(
             sale_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent: `doc_sequences` was updated and never rolled back"
+            None,
+            "the number was never spent: `doc_sequences` has no row for SALE at all, \
+             because the increment rolled back with the rest of the unit"
         );
         assert_eq!(
             movement_count(&pool).await,
             1,
-            "only the seeding movement in — the Out was aborted before it landed"
+            "only the seeding movement in — the Out rolled back with everything else"
         );
         assert_eq!(tx_count(&pool).await, 0, "finance never started");
         assert_eq!(payment_count(&pool).await, 0, "no payment was written");
@@ -6236,13 +6301,14 @@ mod tests {
     /// pre-check above the loop has nothing to say and the confirm reaches the
     /// loop with both lines eligible.
     ///
-    /// The residue is the first proof that a partial write is not a sequence
-    /// gap: the first line's Out is committed and real, while the document
-    /// stays a Draft with no number. That stock is now deducted from a
-    /// document nobody can see, and `delete_draft` will take the Draft away
-    /// without giving the units back.
+    /// This used to be the first proof that a partial write is not a sequence
+    /// gap: the first line's Out was committed and real while the document
+    /// stayed a Draft with no number, so that stock was deducted from a
+    /// document nobody could see and `delete_draft` would take the Draft away
+    /// without giving the units back. The first line's movement now rolls back
+    /// with the second one's failure.
     #[tokio::test]
-    async fn confirm_failure_on_the_second_movement_keeps_the_first_one_on_a_draft() {
+    async fn confirm_failure_on_the_second_movement_rolls_the_first_one_back_too() {
         let (s, pool) = svc_with_flags(false, false).await;
         let first = seed_product(&s, "T3-W2A", "10").await;
         seed_stock(&s, first.id, "10").await;
@@ -6277,42 +6343,44 @@ mod tests {
 
         assert_eq!(
             sale_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent"
+            None,
+            "the number is UNSPENT: the increment is inside the rolled-back unit"
         );
         assert_eq!(
             movement_count(&pool).await,
-            3,
-            "two seeding movements in, plus the first line's committed Out"
+            2,
+            "only the two seeding movements in — the first line's Out rolled back \
+             with the failure on the second"
         );
         assert_eq!(tx_count(&pool).await, 0, "finance never started");
         assert_eq!(payment_count(&pool).await, 0, "no payment was written");
         assert_eq!(
             row_state(&pool, sale.id).await,
             ("Draft".to_string(), None),
-            "half the stock left the building on a Draft nobody can see"
+            "no stock left the building on a Draft nobody can see"
         );
-        let level: (String,) = sqlx::query_as(
-            "SELECT qty FROM stock_movements WHERE product_id = ? AND reason = 'Sale'",
+        let still_sold: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM stock_movements WHERE product_id = ? AND reason = 'Sale'",
         )
         .bind(first.id)
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
-            Decimal::from_str(&level.0).unwrap(),
-            dec("2"),
-            "and the committed movement really did deduct the first line's units"
+            still_sold.0, 0,
+            "the first line's Out is GONE: it is not in the table at all, so the \
+             units never left stock for a document that was never confirmed"
         );
     }
 
-    /// WINDOW 3 — between the Income row and the payment row. The residue is
+    /// WINDOW 3 — between the Income row and the payment row. This used to leave
     /// the orphan: a `transactions` row stamped with the sale's reference that
-    /// no payment claims, inflating an account while the sale is a Draft and
-    /// stays unpaid forever. `check_payment_links_are_traceable` detects this
-    /// shape, but only inside its own test module.
+    /// no payment claimed, inflating an account while the sale stayed a Draft
+    /// and unpaid forever. `check_payment_links_are_traceable` detects that
+    /// shape, but only inside its own test module. There is no orphan to detect
+    /// now — the Income rolls back with the payment row that failed.
     #[tokio::test]
-    async fn confirm_failure_between_the_income_and_the_payment_leaves_an_orphan_income() {
+    async fn confirm_failure_between_the_income_and_the_payment_leaves_no_orphan_income() {
         let (s, pool) = svc_with_flags(false, false).await;
         let prod = seed_product(&s, "T3-W3", "10").await;
         seed_stock(&s, prod.id, "10").await;
@@ -6340,15 +6408,23 @@ mod tests {
 
         assert_eq!(
             sale_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent"
+            None,
+            "the number is UNSPENT: the increment is inside the rolled-back unit"
         );
-        assert_eq!(movement_count(&pool).await, 2, "the Out was committed");
-        assert_eq!(tx_count(&pool).await, 1, "the Income was committed");
+        assert_eq!(
+            movement_count(&pool).await,
+            1,
+            "only the seeding movement in — the Out rolled back too"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            0,
+            "the Income rolled back with the payment row that could not be written"
+        );
         assert_eq!(
             payment_count(&pool).await,
             0,
-            "the payment never landed, so the Income is claimed by nobody"
+            "the payment never landed, and there is now no Income for it to orphan"
         );
         assert_eq!(
             row_state(&pool, sale.id).await,
@@ -6356,37 +6432,33 @@ mod tests {
             "the document is still a Draft with no number"
         );
 
-        let orphan: (i64, String, String) = sqlx::query_as(
-            "SELECT id, kind, reference FROM transactions t \
+        let orphans: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM transactions t \
              WHERE NOT EXISTS (SELECT 1 FROM sale_payments sp WHERE sp.transaction_id = t.id \
                                OR sp.refund_transaction_id = t.id)",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(orphan.1, "Income");
         assert_eq!(
-            orphan.2, "2024-SALE-000001",
-            "the orphan still carries the number the failed attempt burned"
-        );
-        let amount: (String,) = sqlx::query_as("SELECT amount FROM transactions WHERE id = ?")
-            .bind(orphan.0)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            Decimal::from_str(&amount.0).unwrap(),
-            dec("20"),
-            "and it carries the full document total"
+            orphans.0, 0,
+            "no finance row is claimed by nobody: the orphan shape the confirm used \
+             to leave behind does not exist here"
         );
     }
 
-    /// WINDOW 4 — on `set_confirmed` itself. This is the LAST write, so the
-    /// residue is the largest: a Draft that has already moved stock, already
-    /// posted an Income and already collected a payment. The money is in, the
-    /// units are gone, and the document is still editable as a Draft.
+    /// WINDOW 4 — on `set_confirmed` itself. This is the LAST write, so this used
+    /// to be the largest residue: a Draft that had already moved stock, already
+    /// posted an Income and already collected a payment. The money was in, the
+    /// units were gone, and the document was still editable as a Draft — which
+    /// made it the residue with no recovery path, since `delete_draft` admits a
+    /// Draft and its CASCADE took the payment while the `Income` survived.
+    ///
+    /// Now nothing survives. The Draft reads as UNPAID, because `get_detail`
+    /// derives the paid/unpaid state from the payments table and that table is
+    /// back to empty.
     #[tokio::test]
-    async fn confirm_failure_on_set_confirmed_leaves_a_paid_draft() {
+    async fn confirm_failure_on_set_confirmed_leaves_a_clean_draft_that_reports_unpaid() {
         let (s, pool) = svc_with_flags(false, false).await;
         let prod = seed_product(&s, "T3-W4", "10").await;
         seed_stock(&s, prod.id, "10").await;
@@ -6413,15 +6485,20 @@ mod tests {
 
         assert_eq!(
             sale_sequence_last(&pool).await,
-            Some(1),
-            "the number is spent"
+            None,
+            "the number is UNSPENT: the increment is inside the rolled-back unit, so \
+             `doc_sequences` has no SALE row at all"
         );
-        assert_eq!(movement_count(&pool).await, 2, "the Out was committed");
-        assert_eq!(tx_count(&pool).await, 1, "the Income was committed");
+        assert_eq!(
+            movement_count(&pool).await,
+            1,
+            "only the seeding movement in — the Out rolled back"
+        );
+        assert_eq!(tx_count(&pool).await, 0, "the Income rolled back");
         assert_eq!(
             payment_count(&pool).await,
-            1,
-            "the payment was committed: the shop has the money and no document"
+            0,
+            "the payment rolled back: the shop does NOT have the money and has no document"
         );
         assert_eq!(
             row_state(&pool, sale.id).await,
@@ -6431,20 +6508,20 @@ mod tests {
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(
             detail.payment_status,
-            crate::models::PaymentStatus::Paid,
-            "the document reports itself PAID: the payment row is on the Draft, and \
-             `get_detail` reads the payments table, not the document's status"
+            crate::models::PaymentStatus::Unpaid,
+            "the document reports itself UNPAID: `get_detail` reads the payments \
+             table, and that table is empty again"
         );
         assert_eq!(
             detail.paid,
-            dec("20"),
-            "so the shop's books show the full total collected against a document \
-             that is still editable as a Draft"
+            dec("0"),
+            "so the shop's books show nothing collected against the Draft"
         );
         assert_eq!(
             detail.due,
-            dec("0"),
-            "with nothing outstanding, on a document nobody can reconcile to a number"
+            dec("20"),
+            "with the whole total still outstanding, which is what a Draft with no \
+             payment means"
         );
     }
 }

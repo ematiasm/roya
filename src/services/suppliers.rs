@@ -289,6 +289,73 @@ where
         }
     }
 
+    /// [`Self::record_cost`] inside a transaction the CALLER owns. A SIBLING,
+    /// not a wrapper: `record_cost` above keeps running on the pool for the
+    /// route, the confirm loop and every fixture, and opening a transaction
+    /// there would be a behaviour change with a wide blast radius. This opens
+    /// nothing — it hands the caller's connection to the four repository forms.
+    ///
+    /// THE READ IS THE POINT, and a later reader will get this wrong if the
+    /// doc does not say it: moving only the three WRITES would leave `find` on
+    /// the pool, and a rollback would still work while the BRANCH was decided
+    /// against stale state. The branch is not decoration — it is chosen from
+    /// what `find` returns:
+    ///
+    /// * `None` takes `create_cost`, so a stale `None` for a pair the same unit
+    ///   just created takes the create branch against a row that exists, and the
+    ///   UNIQUE pair answers instead of the shift that was wanted.
+    /// * a stale `current_cost_date` refuses a legitimate confirmation as
+    ///   backdated, because `when < existing.current_cost_date` is compared
+    ///   against a date the unit has not written yet.
+    ///
+    /// So all four forms move together. One more step back, this is the same
+    /// argument as `stock_for_product_in` and `balance_for_account_in`: a
+    /// pre-check that reads a level and then writes against it must see the
+    /// rows the same unit is writing.
+    ///
+    /// Every refusal and the ORDER of them are `record_cost`'s, unchanged: the
+    /// `cost >= 0` check first, then `find`, then the backdating refusal, then
+    /// the same-cost-no-shift rule. Only the executor differs.
+    pub async fn record_cost_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        product_id: i64,
+        supplier_id: i64,
+        cost: Decimal,
+        when: NaiveDate,
+    ) -> AppResult<ProductSupplierCost> {
+        if cost < Decimal::ZERO {
+            return Err(AppError::Validation("cost must be >= 0".into()));
+        }
+        match self.costs.find_in(tx, product_id, supplier_id).await? {
+            None => {
+                self.costs
+                    .create_cost_in(tx, actor, product_id, supplier_id, cost, when)
+                    .await
+            }
+            Some(existing) => {
+                if when < existing.current_cost_date {
+                    return Err(AppError::Validation(
+                        "cost date cannot precede the current cost date".into(),
+                    ));
+                }
+                if existing.current_cost == cost {
+                    // Same price: do not shift, or the last genuinely different
+                    // previous would be lost and the derived alert would always
+                    // read Unchanged. Only refresh the confirmation date.
+                    self.costs
+                        .refresh_cost_date_in(tx, actor, product_id, supplier_id, when)
+                        .await
+                } else {
+                    self.costs
+                        .shift_cost_in(tx, actor, product_id, supplier_id, cost, when)
+                        .await
+                }
+            }
+        }
+    }
+
     pub async fn find_cost(
         &self,
         product_id: i64,
@@ -1399,5 +1466,180 @@ mod tests {
 
         let resolved = s.resolve_supplier_name("perez & hijos").await.unwrap();
         assert_eq!(resolved.id, perez.id);
+    }
+
+    // -- Phase B: the seam that joins a caller's transaction --------------------
+
+    /// The branch, not the write, is what this seam is for. `record_cost` picks
+    /// between create, refresh and shift FROM WHAT `find` RETURNS, so a `find`
+    /// left on the pool would decide a caller's uncommitted unit against
+    /// pre-transaction state: a `None` for a pair the same unit just created
+    /// (taking `create_cost` against a row that exists), or a stale
+    /// `current_cost_date` for a pair the same unit just wrote (refusing a
+    /// legitimate confirmation as backdated).
+    ///
+    /// Three lines of one unit, and every branch reads the previous line's
+    /// uncommitted write. On the pool the second line would answer `None` and
+    /// hit the UNIQUE pair instead.
+    #[tokio::test]
+    async fn record_cost_in_reads_its_own_units_writes_so_the_branch_is_chosen_against_them() {
+        let (s, pool) = svc().await;
+        let who = audit_actor(&s).await;
+        let p = seed_product(&pool, "SEAM-READ", "5").await;
+        let sup = seed_supplier(&s, "SEAM READ SUP").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert!(
+            pool.try_acquire().is_none(),
+            "the pool still has a spare connection, so this test would not prove anything"
+        );
+
+        let started = std::time::Instant::now();
+        // None -> create_cost
+        let created = s
+            .record_cost_in(&mut tx, who, p, sup.id, dec("10"), d(2024, 5, 1))
+            .await
+            .expect(
+                "record_cost_in reached for the pool; with the only connection held by the \
+                 caller's transaction that is a 30s PoolTimedOut, not an answer",
+            );
+        // Same cost -> refresh_cost_date, which only a find that sees `created`
+        // can choose.
+        let refreshed = s
+            .record_cost_in(&mut tx, who, p, sup.id, dec("10"), d(2024, 5, 2))
+            .await
+            .expect("the same-cost branch needs the unit's own row to find");
+        // Different cost -> shift_cost, displacing the row the unit wrote.
+        let shifted = s
+            .record_cost_in(&mut tx, who, p, sup.id, dec("12.25"), d(2024, 5, 10))
+            .await
+            .expect("the shift branch needs the unit's own row to find");
+        let elapsed = started.elapsed();
+        tx.rollback().await.unwrap();
+
+        assert_eq!(created.current_cost, dec("10"));
+        assert_eq!(created.previous_cost, None);
+        assert_eq!(
+            refreshed.current_cost_date,
+            d(2024, 5, 2),
+            "the same-cost confirmation moved only the date"
+        );
+        assert_eq!(
+            refreshed.previous_cost, None,
+            "a same-cost confirmation must not displace a previous price"
+        );
+        assert_eq!(shifted.current_cost, dec("12.25"));
+        assert_eq!(
+            shifted.previous_cost,
+            Some(dec("10")),
+            "the shift displaced the price this same unit wrote"
+        );
+        assert_eq!(shifted.previous_cost_date, Some(d(2024, 5, 2)));
+        // MEASURED in this module rather than inherited: 30.000s is sqlx's
+        // acquire timeout on this one-connection pool, and five seconds is four
+        // orders of magnitude above what three joined statements cost.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "record_cost_in took {elapsed:?}; that is a nested BEGIN stalling for a connection, \
+             not three joined writes"
+        );
+        // Nothing escaped the rollback.
+        assert!(s.find_cost(p, sup.id).await.unwrap().is_none());
+        assert_eq!(s.costs.count_by_supplier(sup.id).await.unwrap(), 0);
+    }
+
+    /// The backdating refusal is judged against the unit's own date. `when <
+    /// existing.current_cost_date` compares two writes this seam performed, so
+    /// a `find` on the pool would compare against a row that does not exist and
+    /// take the create branch instead of refusing.
+    #[tokio::test]
+    async fn record_cost_in_refuses_a_backdated_cost_against_the_date_the_unit_itself_wrote() {
+        let (s, pool) = svc().await;
+        let who = audit_actor(&s).await;
+        let p = seed_product(&pool, "SEAM-BACKDATE", "5").await;
+        let sup = seed_supplier(&s, "SEAM BACKDATE SUP").await;
+
+        let mut tx = pool.begin().await.unwrap();
+        s.record_cost_in(&mut tx, who, p, sup.id, dec("10"), d(2024, 5, 10))
+            .await
+            .unwrap();
+
+        let refused = s
+            .record_cost_in(&mut tx, who, p, sup.id, dec("11"), d(2024, 5, 1))
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+
+        match refused {
+            AppError::Validation(msg) => {
+                assert!(msg.contains("cost date cannot precede"), "got: {msg}")
+            }
+            other => panic!("a backdated cost is a 400 Validation, not {other:?}"),
+        }
+        assert!(s.find_cost(p, sup.id).await.unwrap().is_none());
+    }
+
+    /// The additive claim, proved rather than asserted: `record_cost` is not a
+    /// wrapper of the new one and opens nothing. All four outcomes keep their
+    /// rules — the `cost >= 0` refusal, the backdating refusal, the create, and
+    /// the same-cost refresh that must NOT shift.
+    #[tokio::test]
+    async fn the_public_record_cost_still_commits_and_keeps_all_four_outcomes() {
+        let (s, pool) = svc().await;
+        let who = audit_actor(&s).await;
+        let p = seed_product(&pool, "SEAM-PUBLIC", "5").await;
+        let sup = seed_supplier(&s, "SEAM PUBLIC SUP").await;
+
+        assert!(matches!(
+            s.record_cost(who, p, sup.id, dec("-1"), d(2024, 5, 1))
+                .await
+                .unwrap_err(),
+            AppError::Validation(_)
+        ));
+
+        let first = s
+            .record_cost(who, p, sup.id, dec("10"), d(2024, 5, 1))
+            .await
+            .unwrap();
+        assert_eq!(first.current_cost, dec("10"));
+        assert_eq!(first.previous_cost, None);
+
+        // The backdating refusal, on the pool, unchanged: an earlier `when`
+        // than the stored current cost date refuses before any branch is taken.
+        assert!(matches!(
+            s.record_cost(who, p, sup.id, dec("11"), d(2024, 4, 30))
+                .await
+                .unwrap_err(),
+            AppError::Validation(_)
+        ));
+
+        // The same-cost refresh does not shift, and the row is committed.
+        let same = s
+            .record_cost(who, p, sup.id, dec("10"), d(2024, 5, 2))
+            .await
+            .unwrap();
+        assert_eq!(same.current_cost_date, d(2024, 5, 2));
+        assert_eq!(same.previous_cost, None);
+
+        let raised = s
+            .record_cost(who, p, sup.id, dec("12"), d(2024, 5, 3))
+            .await
+            .unwrap();
+        assert_eq!(raised.current_cost, dec("12"));
+        assert_eq!(raised.previous_cost, Some(dec("10")));
+        assert_eq!(raised.price_alert(), PriceAlert::Raised);
+
+        let stored = s.find_cost(p, sup.id).await.unwrap().unwrap();
+        assert_eq!(stored.current_cost, dec("12"));
+        assert_eq!(stored.updated_by, Some(who));
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM product_supplier_costs WHERE product_id = ? AND supplier_id = ?",
+        )
+        .bind(p)
+        .bind(sup.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "the public method commits one row, on the pool");
     }
 }
