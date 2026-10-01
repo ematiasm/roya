@@ -1261,3 +1261,521 @@ def _active_id(page: Page) -> str:
     return page.evaluate(
         "() => document.activeElement ? (document.activeElement.id || '') : ''"
     )
+
+
+@pytest.mark.parametrize("family", _FAMILIES, ids=lambda f: f["id"])
+def test_the_first_quantity_input_holds_focus_when_the_page_opens(
+    page: Page, api: ApiClient, family: dict
+) -> None:
+    """The operator opens the document and can type without reaching for a mouse.
+
+    One row, so the claim is not about which row: it is that SOMETHING in the
+    editor is focused and it is the quantity control. The control is the only
+    editable field on a draft apart from the date and the notes, and none of
+    them is where a counter operator's hands belong first.
+    """
+    seeded = _family_seed(api, family, tag=f"FOCUS-{family['id']}")
+    _start_from_the_parent_record(
+        page, family, seeded["parent_id"], api.base_url
+    )
+
+    assert _active_id(page) == f"return-qty-{seeded['line_id']}", (
+        f"the page opened with focus on {_active_id(page)!r}, expected the first "
+        f"quantity input 'return-qty-{seeded['line_id']}'. Nothing in the page "
+        f"asks the browser to focus it: the editor's rows carry no autofocus "
+        f"and no script asks for focus."
+    )
+
+
+@pytest.mark.parametrize("family", _FAMILIES, ids=lambda f: f["id"])
+def test_enter_on_a_quantity_commits_it_and_lands_on_the_next_row(
+    page: Page, api: ApiClient, family: dict
+) -> None:
+    """Enter is commit-and-advance, and the commit really happened.
+
+    Both halves are asserted, because either alone is a plausible-looking lie: a
+    handler that only moves focus passes a focus assertion while the document
+    never changed, and a handler that only commits passes a stored-figure
+    assertion while the operator has to reach for the mouse again.
+
+    The stored figure is read from the DOM's own "On this return" cell rather
+    than from the input's value: the value is what the operator typed, so it
+    would be satisfied by a handler that never posted anything.
+    """
+    seeded = _two_line_confirmed_purchase(api, family, tag=f"NEXT-{family['id']}")
+    _start_from_the_parent_record(
+        page, family, seeded["parent_id"], api.base_url
+    )
+
+    first = f"#return-qty-{seeded['line_id']}"
+    second = f"#return-qty-{seeded['other_line_id']}"
+    page.locator(first).fill("2")
+
+    with page.expect_response(
+        _matching_response("POST", "/lines"), timeout=20000
+    ) as posted:
+        page.locator(first).press("Enter")
+    assert posted.value.status == 200, (
+        f"Enter did not commit: the post answered {posted.value.status}"
+    )
+
+    # The `#` is load-bearing: `line_row_prefix` is a bare string, so without
+    # it this is a tag-name selector and matches nothing.
+    row = page.locator(f"#{family['line_row_prefix']}{seeded['line_id']}")
+    expect(row).to_have_attribute("data-on-this-return", "true")
+    expect(row).to_contain_text("2")
+
+    # The advance. htmx replaces the money region on every commit, so this is
+    # the REBUILT input rather than the one that was typed into — which is the
+    # point: the flow has to survive the swap, not merely move focus in a page
+    # that is about to be replaced.
+    expect(page.locator(second)).to_be_focused()
+
+
+@pytest.mark.parametrize("family", _FAMILIES, ids=lambda f: f["id"])
+def test_enter_skips_a_row_that_cannot_be_added(
+    page: Page, api: ApiClient, family: dict
+) -> None:
+    """A row whose allowance is gone is stepped over, not landed on.
+
+    The editor renders `disabled` on a parent line already consumed by confirmed
+    returns (`can_add` in the wiring layer), because offering a quantity the
+    service would refuse is worse than offering none. Advancing into a disabled
+    control would put the operator's caret somewhere they cannot type and give
+    no feedback about why, so the advance skips it.
+
+    A two-row parent cannot show this: with one row disabled the only other row
+    is either first or last, and both positions pass a naive "next row" check.
+    Three rows with the MIDDLE one consumed is the only arrangement where a
+    naive `index + 1` lands on the disabled input.
+    """
+    seeded = _three_line_confirmed_purchase(api, family, tag=f"SKIP-{family['id']}")
+    parent_id, first_line, blocked_line, third_line = (
+        seeded["parent_id"],
+        seeded["line_id"],
+        seeded["blocked_line_id"],
+        seeded["third_line_id"],
+    )
+
+    # A CONFIRMED return of the same family consuming the middle parent line in
+    # full, so its allowance is zero on every draft that follows. It has to be
+    # the same family: a return names the document it reverses, and a credit
+    # note created from a purchase id would land on a sale record.
+    _start_from_the_parent_record(page, family, parent_id, api.base_url)
+    _type_return_quantity(page, family, blocked_line, "8")
+    _confirm_the_return(page, family)
+
+    # The next draft renders the middle row disabled.
+    _start_from_the_parent_record(page, family, parent_id, api.base_url)
+    expect(page.locator(f"#return-qty-{blocked_line}")).to_be_disabled()
+
+    page.locator(f"#return-qty-{first_line}").fill("1")
+    with page.expect_response(_matching_response("POST", "/lines"), timeout=20000):
+        page.locator(f"#return-qty-{first_line}").press("Enter")
+
+    # Past the disabled row, not on it.
+    expect(page.locator(f"#return-qty-{third_line}")).to_be_focused()
+
+
+@pytest.mark.parametrize("family", _FAMILIES, ids=lambda f: f["id"])
+def test_enter_on_the_last_row_commits_and_leaves_focus_where_it_can_be_used(
+    page: Page, api: ApiClient, family: dict
+) -> None:
+    """The last row is the end of a sequence, not a trap.
+
+    The commit still happens — that is the half a "just stop moving focus"
+    handler gets wrong. And focus does not VANISH: the money region was replaced
+    by the swap, so whatever held it is gone, and a browser that drops focus to
+    `document.body` has put the operator back at the top of the document with no
+    caret anywhere.
+
+    The landing spot is asserted by PROPERTY rather than by id, because the
+    choice of control is an interface decision and the thing under test is that
+    the decision is a usable one: focus is held by an element that is still in
+    the document, is focusable, and is not disabled. `to_be_focused` against
+    one named control would pass on a build that lands focus correctly on a
+    DIFFERENT control and fail on one that lands it correctly on this one —
+    the test would be pinning the answer instead of the question.
+    """
+    seeded = _family_seed(api, family, tag=f"LAST-{family['id']}")
+    _start_from_the_parent_record(
+        page, family, seeded["parent_id"], api.base_url
+    )
+    line_id = seeded["line_id"]
+    field = page.locator(f"#return-qty-{line_id}")
+
+    field.fill("2")
+    with page.expect_response(
+        _matching_response("POST", "/lines"), timeout=20000
+    ) as posted:
+        field.press("Enter")
+    assert posted.value.status == 200, (
+        f"Enter on the last row did not commit: {posted.value.status}"
+    )
+
+    # The commit happened.
+    row = page.locator(f"#{family['line_row_prefix']}{line_id}")
+    expect(row).to_have_attribute("data-on-this-return", "true")
+
+    # The wait is not politeness, it is the shape of the thing. htmx delivers the
+    # response BEFORE it settles the swap, and the flow moves focus from
+    # `htmx:afterSettle`, so sampling `activeElement` the moment the response
+    # lands reads the state htmx has already passed through on its way to the
+    # answer — focus sits on nothing at that instant by construction. Waiting on
+    # the settle is also what makes this a claim about the operator's experience
+    # rather than about one instant inside htmx's own pipeline.
+    page.wait_for_function(
+        "() => document.activeElement && document.activeElement !== document.body",
+        timeout=10000,
+    )
+    landed = page.evaluate(
+        """() => {
+            const el = document.activeElement;
+            if (!el) return {state: 'none'};
+            return {
+              state: el === document.body ? 'body' : 'element',
+              id: el.id || '',
+              tag: el.tagName,
+              disabled: el.disabled === true,
+              inDocument: document.body.contains(el),
+              insideRecord: !!el.closest('[data-purchase-return-record],'
+                                    + '[data-customer-return-record]'),
+            };
+        }"""
+    )
+    assert landed["state"] == "element", (
+        f"Enter on the last row dropped focus to {landed['state']!r}: the money "
+        f"region was replaced by the commit's swap, so whatever held focus is "
+        f"gone and the browser falls back to the body. An operator who has just "
+        f"described the whole return now has no caret anywhere."
+    )
+    assert landed["inDocument"], "focus landed on an element outside the document"
+    assert not landed["disabled"], (
+        f"focus landed on a DISABLED control ({landed['id'] or landed['tag']}): "
+        f"that is a caret that cannot receive the next keystroke, which is the "
+        f"same trap wearing a different hat"
+    )
+    assert landed["insideRecord"], (
+        f"focus landed outside the record ({landed['id'] or landed['tag']}): an "
+        f"operator who just finished the return should still be on the return"
+    )
+
+
+@pytest.mark.parametrize("family", _FAMILIES, ids=lambda f: f["id"])
+def test_shift_enter_goes_back_a_row_without_committing_it(
+    page: Page, api: ApiClient, family: dict
+) -> None:
+    """A miscount is one keystroke to correct, not one to undo.
+
+    Shift+Enter moves UP and does not commit. The commit is the reason this is
+    not free: htmx's trigger for the control is `change`, and moving focus away
+    is exactly what raises `change`, so an up-move that moved focus naively
+    would post the figure the operator is trying to correct.
+
+    The order matters and is what the second half checks. Go forward and back
+    with a WRONG figure typed on the way back:
+    * moving up from the second row lands on the first;
+    * the second row carries no line, because nothing was posted for it;
+    * the first row's own committed figure is untouched, because going back
+      must not disturb what was already stored.
+    """
+    seeded = _two_line_confirmed_purchase(api, family, tag=f"BACK-{family['id']}")
+    _start_from_the_parent_record(
+        page, family, seeded["parent_id"], api.base_url
+    )
+    first_id, second_id = seeded["line_id"], seeded["other_line_id"]
+    first, second = f"#return-qty-{first_id}", f"#return-qty-{second_id}"
+
+    # Forward: commit the first row and arrive at the second.
+    page.locator(first).fill("2")
+    with page.expect_response(_matching_response("POST", "/lines"), timeout=20000):
+        page.locator(first).press("Enter")
+    expect(page.locator(second)).to_be_focused()
+
+    # Back: a wrong figure on the second row, corrected by going up.
+    page.locator(second).fill("9")
+    page.locator(second).press("Shift+Enter")
+
+    expect(page.locator(first)).to_be_focused()
+
+    blocked = page.locator(f"#{family['line_row_prefix']}{second_id}")
+    assert blocked.get_attribute("data-on-this-return") is None, (
+        "Shift+Enter posted the row it moved away from: the wrong figure the "
+        "operator typed is now a line on the document, and moving focus raises "
+        "the same `change` htmx commits on"
+    )
+    stored = page.locator(f"#{family['line_row_prefix']}{first_id}")
+    expect(stored).to_contain_text("2")
+
+
+# ---------------------------------------------------------------------------
+# 7. The permission gate
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _visitor(browser: Browser, context_args: dict) -> Iterator[Page]:
+    """A browser context of its own, with whatever session it logs in for.
+
+    The shared `page` fixture injects the harness administrator's session, so a
+    test that needs a differently-privileged operator builds its own context
+    rather than logging the shared one out. Built from the same
+    `browser_context_args` the suite's own fixture uses, so a viewport or
+    locale change applies here too.
+    """
+    context: BrowserContext = browser.new_context(**context_args)
+    visitor = context.new_page()
+    try:
+        yield visitor
+    finally:
+        context.close()
+
+
+def _create_role_holding(
+    page: Page, *, base_url: str, role_code: str, role_name: str, permission_codes: list[str]
+) -> None:
+    """Create a role and tick exactly `permission_codes` in its matrix editor.
+
+    Through the real screens, because there is no test-only auth bypass in this
+    application: `test_identity.py` builds its limited principals this way and
+    the seed here does the same. Ticking the matrix is what makes the principal
+    real, and a new role holding no permissions is why the edit step is needed
+    at all rather than an optional tightening.
+    """
+    page.goto(f"{base_url}/roles")
+    page.get_by_role("button", name=e2e_copy("new_role")).click()
+    dialog = page.locator("#new-role-dialog")
+    dialog.locator('input[name="code"]').fill(role_code)
+    dialog.locator('input[name="name"]').fill(role_name)
+    dialog.locator('input[name="description"]').fill("Browser-suite permission gate.")
+    with page.expect_response(_response_for("/web/roles", "POST")):
+        dialog.get_by_role("button", name=e2e_copy("create_role")).click()
+    expect(page.locator("#role-list")).to_contain_text(role_code)
+
+    row = page.locator("#role-list-inner > div > div", has_text=role_code)
+    row.locator(f'button[aria-label="{e2e_copy("edit_role")}"]').click()
+    edit = page.locator("#role-edit-dialog")
+    for permission in permission_codes:
+        edit.locator("label", has_text=permission).locator(
+            'input[name="permission_ids"]'
+        ).check()
+    with page.expect_response(_response_for("/web/roles/matrix", "POST")):
+        edit.get_by_role("button", name=e2e_copy("save_permissions")).click()
+
+
+def test_a_principal_with_the_parents_permission_can_return_and_one_without_it_is_refused(
+    page: Page,
+    api: ApiClient,
+    live_server: LiveServer,
+    browser: Browser,
+    browser_context_args: dict,
+) -> None:
+    """The gate, both directions, for both families, through the real screens.
+
+    Two principals, built the way `tests/test_identity.py` builds its own — a
+    role whose matrix is ticked on the roles screen, a user created on the
+    users screen, the role assigned through its Roles dialog, the first login
+    confined to the password change and the change completed. No bypass, no
+    fixture that grants a permission the interface cannot.
+
+    The AUTHORIZED principal holds each family's read code and its create code
+    — the parent's own tier, because a return reuses it: there is no
+    `purchase_returns.create` to hold, which is why this needs no migration. It
+    sees the action on the record page and completes a real return through the
+    UI, so the gate is not "refuse everyone".
+
+    The RESTRICTED principal holds only the read codes. It sees neither action —
+    the screen never offers one the route would refuse — and a post issued
+    anyway is refused with `403` naming the missing code, for BOTH families. A
+    gate one family honours is a gate half built, so both are exercised and the
+    codes are asserted separately.
+    """
+    authorised_codes = [
+        "purchases.read",
+        "purchases.create",
+        "sales.read",
+        "sales.create",
+    ]
+    restricted_codes = ["purchases.read", "sales.read"]
+
+    # A returnable parent for each family, created through the shared
+    # administrator's session so the seeded documents are real documents.
+    seeds = {
+        family["id"]: _family_seed(api, family, tag=f"GATE-{family['id']}")
+        for family in _FAMILIES
+    }
+
+    _create_role_holding(
+        page, base_url=api.base_url, role_code="gate_autorizado",
+        role_name="Gate autorizado", permission_codes=authorised_codes,
+    )
+    _create_role_holding(
+        page, base_url=api.base_url, role_code="gate_solo_lectura",
+        role_name="Gate solo lectura", permission_codes=restricted_codes,
+    )
+
+    for username, role_name in (
+        ("autorizado1", "Gate autorizado"),
+        ("restringido1", "Gate solo lectura"),
+    ):
+        page.goto(f"{api.base_url}/users")
+        _create_user_through_the_screen(
+            page,
+            username=username,
+            display_name=role_name,
+            password=INITIAL_PASSWORD,
+        )
+        _assign_role_through_the_screen(page, username=username, role_name=role_name)
+
+    # -- the authorised operator completes a return of each family ------------
+    with _visitor(browser, browser_context_args) as visitor:
+        _log_in_through_the_form(visitor, live_server, "autorizado1", INITIAL_PASSWORD)
+        expect(visitor).to_have_url(f"{live_server.url}/password")
+        _change_confined_password(
+            visitor, current=INITIAL_PASSWORD, new=CHANGED_PASSWORD
+        )
+
+        for family in _FAMILIES:
+            seed = seeds[family["id"]]
+            action = visitor.locator(f"{family['action_form']} button[type=submit]")
+            visitor.goto(f"{live_server.url}{family['parent_path']}/{seed['parent_id']}")
+            expect(action).to_have_text(family["action_button"])
+            action.click()
+            visitor.wait_for_url(f"**{family['id']}/*", timeout=20000)
+            _type_return_quantity(visitor, family, seed["line_id"], "1")
+            _confirm_the_return(visitor, family)
+
+    # Two documents exist, one per family, and both are the authorised
+    # principal's work — the positive half of the gate, read from storage.
+    for family in _FAMILIES:
+        documents = read_rows_in_database(
+            live_server.db_path,
+            f"SELECT status FROM {family['document_table']} ORDER BY id",
+        )
+        assert documents == [("Confirmed",)], (
+            f"the authorised principal's {family['name']} is not stored as "
+            f"Confirmed: {documents!r}"
+        )
+
+    # -- the restricted operator is offered nothing and refused anyway --------
+    with _visitor(browser, browser_context_args) as visitor:
+        _log_in_through_the_form(visitor, live_server, "restringido1", INITIAL_PASSWORD)
+        expect(visitor).to_have_url(f"{live_server.url}/password")
+        _change_confined_password(
+            visitor, current=INITIAL_PASSWORD, new=CHANGED_PASSWORD
+        )
+        # The post-change landing is the refused dashboard: this principal holds
+        # no dashboard code, which is the screen the login redirect picks.
+        expect(visitor.locator("[data-notice='error']")).to_contain_text(
+            "dashboard.read"
+        )
+
+        for family in _FAMILIES:
+            seed = seeds[family["id"]]
+            # The screen offers no action it would refuse.
+            visitor.goto(f"{live_server.url}{family['parent_path']}/{seed['parent_id']}")
+            expect(visitor.locator(family["action_form"])).to_have_count(0)
+
+            # And the route refuses anyway, naming the code. Sent with the
+            # `HX-Request` header the operator's own form carries, so the body
+            # is the one the notice box would render.
+            response = visitor.request.post(
+                f"{live_server.url}{family['create_path']}",
+                form={
+                    family["parent_field"]: str(seed["parent_id"]),
+                    "return_date": "2024-05-02",
+                    "notes": "",
+                },
+                headers={"HX-Request": "true"},
+            )
+            assert response.status == 403, (
+                f"a principal without {family['create_code']} must be refused, got "
+                f"{response.status}"
+            )
+            assert family["create_code"] in response.text(), (
+                f"the refusal does not name {family['create_code']}: "
+                f"{response.text()[:300]!r}"
+            )
+
+        # The refused posts created nothing: still exactly the one document the
+        # authorised principal made, in each family.
+        for family in _FAMILIES:
+            (count,) = read_rows_in_database(
+                live_server.db_path, f"SELECT COUNT(*) FROM {family['document_table']}"
+            )[0]
+            assert count == 1, (
+                f"a refused post created a {family['name']}: the table holds "
+                f"{count} rows"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Visual evidence (opt-in)
+# ---------------------------------------------------------------------------
+
+# The same one-shot shape as the harness artifact probe and the two screenshot
+# probes that already exist: opt-in, skipped by default, no effect on a normal
+# run. It writes the screens a person needs to LOOK at to judge this work, which
+# is the reason this module exists — every defect it pins was invisible to 1613
+# passing tests and obvious the moment somebody opened the page.
+SCREENSHOT_PROBE_ENV = "ROYA_E2E_RETURNS_SCREENSHOT_PROBE"
+
+
+@pytest.mark.skipif(
+    os.environ.get(SCREENSHOT_PROBE_ENV) != "1",
+    reason=(
+        "opt-in probe: set "
+        f"{SCREENSHOT_PROBE_ENV}=1 to write the return screenshots"
+    ),
+)
+def test_return_screenshots_probe(page: Page, api: ApiClient) -> None:
+    """Write full-page PNGs of the return screens for a human to open.
+
+    Skipped by default, like the other probes. It walks the two families'
+    journeys the way an operator would — the parent record, the draft, the
+    confirmed return, the list — and writes one PNG per state under
+    ``e2e/.artifacts/returns/`` (git-ignored).
+    """
+    directory = ARTIFACTS_ROOT / "returns"
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+
+    def shot(name: str) -> None:
+        path = directory / f"{name}.png"
+        page.screenshot(path=str(path), full_page=True)
+        written.append(str(path.resolve()))
+
+    for family, tag in ((_PURCHASE_RETURN, "PR"), (_CREDIT_NOTE, "CN")):
+        seeded = _family_seed(api, family, tag=f"SHOT-{tag}")
+        page.goto(f"{api.base_url}{family['parent_path']}/{seeded['parent_id']}")
+        page.wait_for_load_state("networkidle")
+        shot(f"{tag.lower()}-01-parent-record")
+
+        return_url = _start_from_the_parent_record(
+            page, family, seeded["parent_id"], api.base_url
+        )
+        return_id = _return_id_from_url(return_url)
+        shot(f"{tag.lower()}-02-draft")
+
+        _type_return_quantity(page, family, seeded["line_id"], "2")
+        shot(f"{tag.lower()}-03-draft-with-line")
+
+        page.locator(family["confirm_button"]).click()
+        page.locator(f"{family['confirm_dialog']} button[type=submit]").click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(400)
+        shot(f"{tag.lower()}-04-confirmed")
+
+        # The confirmed record as a fresh load, not the swapped fragment: the
+        # fragment leaves the page header stale (the pre-existing, house-wide
+        # `page_header.html` issue), and this is the picture that shows it.
+        page.goto(f"{api.base_url}/{family['id']}/{return_id}")
+        page.wait_for_load_state("networkidle")
+        shot(f"{tag.lower()}-05-confirmed-reloaded")
+
+        _click_through_the_sidebar(page, family["nav_label"], family["list_path"])
+        shot(f"{tag.lower()}-06-list")
+
+    print(f"\nreturn screenshots: {len(written)}")
+    for path in written:
+        print(f"  {path}")
