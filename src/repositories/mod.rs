@@ -4,12 +4,14 @@ pub mod business_config_repo;
 pub mod category_repo;
 pub mod customer_receipt_repo;
 pub mod customer_repo;
+pub mod customer_return_repo;
 pub mod doc_sequence_repo;
 pub mod payment_method_repo;
 pub mod permission_repo;
 pub mod product_repo;
 pub mod product_supplier_cost_repo;
 pub mod purchase_repo;
+pub mod purchase_return_repo;
 // role_repo's first production consumer is the S2 bootstrap: the identity
 // service holds the repository and grants the protected role (services/identity.rs),
 // so the re-exports are wired now; the S3 user admin and the S4 roles admin
@@ -56,6 +58,7 @@ pub use business_config_repo::{
 pub use category_repo::{CategoryRepository, SqliteCategoryRepository};
 pub use customer_receipt_repo::{CustomerReceiptRepository, SqliteCustomerReceiptRepository};
 pub use customer_repo::{CustomerRepository, SqliteCustomerRepository};
+pub use customer_return_repo::{CustomerReturnRepository, SqliteCustomerReturnRepository};
 pub use doc_sequence_repo::{DocSequenceRepository, SqliteDocSequenceRepository};
 pub use payment_method_repo::{PaymentMethodRepository, SqlitePaymentMethodRepository};
 pub use permission_repo::{PermissionRepository, SqlitePermissionRepository};
@@ -64,6 +67,7 @@ pub use product_supplier_cost_repo::{
     ProductSupplierCostRepository, SqliteProductSupplierCostRepository,
 };
 pub use purchase_repo::{PurchaseRepository, SqlitePurchaseRepository};
+pub use purchase_return_repo::{PurchaseReturnRepository, SqlitePurchaseReturnRepository};
 pub use role_repo::{RoleRepository, SqliteRoleRepository};
 pub use sale_repo::{SaleRepository, SqliteSaleRepository};
 pub use session_repo::{SessionRepository, SqliteSessionRepository};
