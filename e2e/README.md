@@ -202,6 +202,46 @@ screens (customers list, customer drawer, customer create modal, suppliers list,
 supplier drawer, supplier edit modal) under `e2e/.artifacts/design/`
 (git-ignored) for a human to open.
 
+Slice PR #130 is the return families, in `tests/test_returns.py`. It exists
+because of what that work unit's own commit message records: 1479 Rust tests
+and 134 browser tests passed while a person could not create a return at all.
+Four defects were invisible to every one of them, and all four are statements
+about what somebody sees:
+
+- both list pages answered 200 with no console errors and no sidebar entry, so
+  they were reachable only by typing a URL. The tests walk the sidebar and
+  click, because a test that navigates by URL passes against that build;
+- the creation action posted a hidden parent id nothing filled, so its only
+  reachable outcome was a 422. The journeys click the action on the confirmed
+  purchase or sale and wait for the URL to move;
+- that 422 said `Failed to deserialize form body: purchase_id: cannot parse
+  integer from empty string` to the operator. The refusal test asserts the
+  ABSENCE of `deserialize`, `cannot parse` and any Rust type name, so a test
+  that only checked "a refusal happened" would pass against the defect;
+- the action was in the wrong place. It is now on the parent document, where
+  the operator already is.
+
+Two conventions in that module are worth naming for the next person:
+
+- **The facts are read from the database, not the DOM.** Neither family has a
+  JSON API, so `read_rows_in_database` in that module is the only machine-
+  readable account of what a confirmation wrote — the status, the number, the
+  parent id, the stock movement's direction, reason, quantity and reference. It
+  refuses any statement that is not a `SELECT`, so seeding still goes through
+  the API and a broken endpoint still fails the seed loudly. It is a read of the
+  throwaway file the spawned server already owns, the same file
+  `expire_session_in_database` writes.
+- **`wait_for_url`, not `wait_for_load_state`, after a create.** The action
+  posts with `hx-swap="none"` and the route answers `HX-Redirect`, which htmx
+  turns into a navigation of its own. A `networkidle` wait straight after the
+  click resolves against the page still on screen — the PARENT's — so the
+  screenshot taken then showed a purchase record with the return already created
+  behind it. Measured, not assumed.
+
+What the module deliberately does NOT do: it does not test the JSON API (there
+is none), and it does not re-check the business rules. The refusal tests pin
+that a message is a sentence and not a serde internal, not which rule fired.
+
 It deliberately does **not** verify business rules: balances, stock deduction,
 payment traceability, numbering and the rest stay in the Rust suite, which is
 faster and already thorough. Keeping that boundary sharp is what stops the

@@ -614,8 +614,6 @@ define_message_keys! {
     PurchaseReturnsDate => "purchase_returns.date",
     PurchaseReturnsDateRequired => "purchase_returns.date_required",
     PurchaseReturnsSaved => "purchase_returns.saved",
-    PurchaseReturnsChooseLine => "purchase_returns.choose_line",
-    PurchaseReturnsAddLine => "purchase_returns.add_line",
     PurchaseReturnsRemoveLine => "purchase_returns.remove_line",
     PurchaseReturnsParentQty => "purchase_returns.parent_qty",
     PurchaseReturnsAlreadyReturned => "purchase_returns.already_returned",
@@ -647,8 +645,6 @@ define_message_keys! {
     CustomerReturnsDate => "customer_returns.date",
     CustomerReturnsDateRequired => "customer_returns.date_required",
     CustomerReturnsSaved => "customer_returns.saved",
-    CustomerReturnsChooseLine => "customer_returns.choose_line",
-    CustomerReturnsAddLine => "customer_returns.add_line",
     CustomerReturnsRemoveLine => "customer_returns.remove_line",
     CustomerReturnsParentQty => "customer_returns.parent_qty",
     CustomerReturnsAlreadyCredited => "customer_returns.already_credited",
@@ -1662,12 +1658,6 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::PurchaseReturnsDate, "Return date", "Return date"),
     (MessageKey::PurchaseReturnsDateRequired, "Enter a return date", "Enter a return date"),
     (MessageKey::PurchaseReturnsSaved, "Saved", "Saved"),
-    (
-        MessageKey::PurchaseReturnsChooseLine,
-        "Choose a line of the purchase to send back. It shows how much is left to return.",
-        "Choose a line of the purchase to send back. It shows how much is left to return.",
-    ),
-    (MessageKey::PurchaseReturnsAddLine, "Add to return", "Add to return"),
     (MessageKey::PurchaseReturnsRemoveLine, "Take off return", "Take off return"),
     (MessageKey::PurchaseReturnsParentQty, "Bought", "Bought"),
     (
@@ -1782,12 +1772,6 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
         "Enter a return date",
     ),
     (MessageKey::CustomerReturnsSaved, "Saved", "Saved"),
-    (
-        MessageKey::CustomerReturnsChooseLine,
-        "Choose a line of the sale to take back. It shows how much is still creditable.",
-        "Choose a line of the sale to take back. It shows how much is still creditable.",
-    ),
-    (MessageKey::CustomerReturnsAddLine, "Add to return", "Add to return"),
     (MessageKey::CustomerReturnsRemoveLine, "Take off return", "Take off return"),
     (MessageKey::CustomerReturnsParentQty, "Sold", "Sold"),
     (
@@ -2902,16 +2886,6 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     ),
     (MessageKey::PurchaseReturnsSaved, "Guardado", "Guardado"),
     (
-        MessageKey::PurchaseReturnsChooseLine,
-        "Elegí una línea de la compra para devolver. Muestra cuánto queda por devolver.",
-        "Elegí una línea de la compra para devolver. Muestra cuánto queda por devolver.",
-    ),
-    (
-        MessageKey::PurchaseReturnsAddLine,
-        "Agregar a la devolución",
-        "Agregar a la devolución",
-    ),
-    (
         MessageKey::PurchaseReturnsRemoveLine,
         "Quitar de la devolución",
         "Quitar de la devolución",
@@ -3050,16 +3024,6 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
         "Ingresá una fecha de devolución",
     ),
     (MessageKey::CustomerReturnsSaved, "Guardado", "Guardado"),
-    (
-        MessageKey::CustomerReturnsChooseLine,
-        "Elegí una línea de la venta para devolver. Muestra cuánto queda por acreditar.",
-        "Elegí una línea de la venta para devolver. Muestra cuánto queda por acreditar.",
-    ),
-    (
-        MessageKey::CustomerReturnsAddLine,
-        "Agregar a la nota",
-        "Agregar a la nota",
-    ),
     (
         MessageKey::CustomerReturnsRemoveLine,
         "Quitar de la nota",
