@@ -2,7 +2,7 @@
 
 Local business manager for a polirrubro (goods and services): sales of products and services, stock, purchases from suppliers with per-supplier cost history, customers with credit and receivable ageing, and the money behind all of it. One SQLite file, a REST API and an HTMX web interface, no cloud and no internet required.
 
-Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite → Postgres) + Askama + HTMX 1.9.12 + Tailwind CSS 4.3.3 + rust_decimal + chrono**.
+Stack: **Rust + Axum 0.8.9 + Tokio + SQLx 0.9 (SQLite) + Askama + HTMX 1.9.12 + Tailwind CSS 4.3.3 + rust_decimal + chrono**.
 
 The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4.3.3** stylesheet and the product picker island (**`static/picker.js`**, plain JavaScript) are vendored under `static/` and served by Axum, so there is no CDN, no npm and no runtime network dependency. The island is the one client-side widget: the product line picker's client state (its query, its matches, its focus, its selected product) has one owner, one state object and one render function, instead of being spread across the DOM, `base.html` and `hx-vals`. See [Styles & local assets](#styles--local-assets).
 
@@ -15,8 +15,8 @@ The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4
   (`/users`, `/roles`), a protected `admin` role and last-administrator guarantees enforced by
   database triggers, the navigation rendering only the entries the principal may read, and role
   grants recording who granted them (`user_roles.granted_by`/`granted_at`). Every department route
-  declares the permission its action needs; the kernel answers — see
-  `openspec/specs/identity/spec.md` for the complete route → permission table.
+  declares the permission its action needs; the kernel answers — the route → permission
+  table is this file's `## Web UI` section, one line per screen.
 - **Actor audit (M5 Phase B)** — every mutation of the business tables and the identity tables
   records who made it happen: `created_by` (`NOT NULL`, FK to `users`, `ON DELETE RESTRICT`) and
   `updated_by` (nullable) on `accounts`, `transactions`, `payment_methods`, `categories`,
@@ -31,9 +31,10 @@ The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4
   pre-audit rows to one would invent history. The interface shows the actor as a display name,
   never an id ("Registrado por" / "Actualizado por" in the detail views, "el sistema" for the
   NULL `users` columns, and the grant trail "«rol»: otorgado por «nombre» el «fecha»" on the
-  users screen) — see `openspec/specs/identity/spec.md` ("The actor audit") for the rules.
+  users screen) — the `created_by`/`updated_by` columns above carry the rules.
 - **Documents index (`/documents`)** — one screen over the documents the shop produces: sales,
-  sale payments, purchases, purchase payments, stock movements and customer receipts, newest first,
+  sale payments, purchases, purchase payments, purchase returns, credit notes, stock movements and
+  customer receipts, newest first,
   with a text search (document number/reference and counterpart name) and filters by type, acting
   user and inclusive date range. The index itself writes nothing; every row opens the document page
   that already owns it, and the drawer additionally re-presents each document's own real actions
@@ -147,6 +148,29 @@ The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4
   - The method's owning account is resolved (400 when unassigned/inactive)
     before any stock/sequence/finance touch; `purchase_number` UNIQUE, immutable,
     NULL only while Draft (or cancelled before ever being confirmed).
+- **Purchase returns and credit notes** — two mirrored families, three tables each
+  (`purchase_returns` / `purchase_return_lines` / `purchase_return_payments`, and the
+  `customer_returns` twin). A return reverses ONE parent document and is always at the
+  **parent's price**: quantities vary, prices never do, so the return form has no price
+  field at all. Numbers are `YYYY-PRET-NNNNNN` and `YYYY-SRET-NNNNNN`, assigned on
+  confirm, UNIQUE and NULL while Draft.
+  - Lines point at the **parent LINE**, never at a product, so a line cannot claim to
+    return something the parent line did not carry.
+  - Confirm is ONE transaction (number → one movement per line → one finance row per
+    refund → the payment rows → `set_confirmed`). A failure anywhere rolls the whole run
+    back, and the ticket number is returned rather than burned, so a retry takes the
+    first number. It writes **nothing** to the `product_supplier_costs` satellite.
+  - The refund is capped at what the parent actually collected, per originating account.
+    A confirmed-but-unpaid parent collects nothing, so the goods go back with no money
+    moved. A return worth more than was collected ⇒ 400 naming both figures. The
+    part-paid case is **refused outright**, so a return is never partly refunded.
+  - The returnable allowance is the parent's quantity minus what confirmed returns of
+    that line already took. Drafts reserve nothing, so two drafts may both claim the same
+    units and the loser is refused at its confirm.
+  - Permission reuses the parent's tier (`purchases.*` / `sales.*`); the action lives on
+    the confirmed purchase and sale records. Cancel reverses stock and money and refuses
+    a double cancel. REST: `GET/POST /web/purchase-returns`,
+    `GET/POST /web/customer-returns` and their `:id` sub-resources.
 - **Sugerido (purchase suggestion)** — low-stock tracked products with suggested
   qty = `max_stock − stock`, the chosen supplier (preferred satellite row, else cheapest
   current cost), satellite cost and subtotal. Products without a satellite row are
@@ -184,7 +208,7 @@ The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4
 handler (routes/) -> service (services/) -> repository trait (repositories/) -> db
 ```
 
-No SQL inside handlers. Repositories are `trait`-based so swapping SQLite for Postgres requires only a new trait impl, not rewriting handlers/services.
+No SQL inside handlers. Repositories are `trait`-based, which is what makes a second backend architecturally possible: it would be a new trait impl rather than a rewrite of handlers/services. It is *not* a configuration change today — `sqlx` carries only the `sqlite` feature, and money is stored as `TEXT` because SQLite's `NUMERIC` affinity would silently truncate it, so a `NUMERIC` backend needs its own set of migrations.
 
 ```
 src/
@@ -247,87 +271,6 @@ DATABASE_URL=sqlite://roya.db sqlx migrate run
 # Info
 sqlx migrate info --source migrations
 ```
-
-Current migrations:
-
-- `20240101000001_create_accounts.sql` — `accounts`
-- `20240101000002_create_transactions.sql` — `transactions` (FK, indexes, CHECK kind)
-- `20240101000003_create_categories.sql` — `categories` (self-FK, UNIQUE parent+name)
-- `20240101000004_create_products.sql` — `products` (UNIQUE sku, category FK SET NULL)
-- `20240101000005_create_product_barcodes.sql` — `product_barcodes` (CASCADE, UNIQUE code)
-- `20240101000006_create_stock_movements.sql` — `stock_movements` (RESTRICT, CHECK type/reason)
-- `20240101000007_create_doc_sequences.sql` — `doc_sequences` PK(doc_type, year)
-- `20240101000008_create_sales.sql` — `sales` (UNIQUE sale_number NULL-distinct, CHECKs)
-- `20240101000009_create_sale_lines.sql` — `sale_lines` (CASCADE sale, RESTRICT product)
-- `20240101000010_create_sale_payments.sql` — `sale_payments` (CASCADE sale, RESTRICT account)
-- `20240101000011_expand_stock_reason_sale_return.sql` — adds `Sale-return` reason
-- `20240101000012_payment_methods.sql` — `payment_methods` + `account_payment_methods`
-  allowlist + `sale_payments.method_id` + seeds (`Cash,Transfer,Debit,CreditCard,QR`;
-  sensible combos `Caja→Cash`, `Banco→Transfer,Debit,CreditCard`, `MP→QR,Transfer`
-  applied where those accounts exist, plus `ensure_defaults_for_account` helper)
-- `20240101000013_create_suppliers.sql` — `suppliers` (UNIQUE name, index on `is_active`)
-- `20240101000014_create_product_supplier_costs.sql` — `product_supplier_costs`
-  (UNIQUE product+supplier, one-preferred-per-product partial index)
-- `20240101000015_create_purchases.sql` — `purchases` (UNIQUE purchase_number NULL-distinct,
-  CHECKs, indexes on status/supplier/purchase_date)
-- `20240101000016_create_purchase_lines.sql` — `purchase_lines` (CASCADE purchase, RESTRICT product)
-- `20240101000017_create_purchase_payments.sql` — `purchase_payments` (CASCADE purchase,
-  RESTRICT account/method)
-- `20240101000018_expand_stock_reason_purchase_return.sql` — adds `Purchase-return` reason
-- `20240101000019_link_payments_to_transactions.sql` — `transactions.reference`
-  (backfilled only from descriptions that exactly match the document number
-  shape) plus `sale_payments` / `purchase_payments` `transaction_id` and
-  `refund_transaction_id` FKs to `transactions(id)` RESTRICT
-- `20240101000020_create_customers.sql` — `customers` (indexes on `is_active` and
-  `is_walkin`, guarded walk-in seed, triggers protecting the walk-in)
-- `20240101000021_add_sales_customer.sql` — `sales.customer_id` NOT NULL (backfill
-  to the walk-in, table rebuild) + index; `customer_name` stays the frozen snapshot
-- `20240101000022_create_customer_receipts.sql` — `customer_receipts` (FKs RESTRICT,
-  indexes on `customer_id` and `date`)
-- `20240101000023_add_sale_payments_receipt.sql` — `sale_payments.receipt_id`
-  (RESTRICT, indexed) + triggers refusing a payment grouped under another
-  customer's receipt
-- `20240101000024_payment_methods_single_account.sql` — `payment_methods.account_id`
-  (NULL = unassigned, RESTRICT) + `UNIQUE(account_id, name)` replacing the dropped
-  `account_payment_methods` allowlist; shared methods split into one row per account,
-  orphans stay NULL, method ids stable (history untouched). Runs `-- no-transaction`
-  with `PRAGMA foreign_keys=OFF` for the parent-table swap (a deferred violation from
-  `DROP TABLE` cannot be healed before COMMIT).
-- `20240101000025_create_identity_users.sql` — `users` (S1a identity kernel: the
-  login key with a lowercase-COLLATE unique index, argon2id `password_hash` never
-  returned by any read path, `is_active` deactivation, `must_change_password` flag,
-  seeded `admin`)
-- `20240101000026_create_identity_sessions.sql` — `sessions` (S1a: one row per login,
-  only the sha256 digest of the cookie token is stored, validity decided in SQL,
-  permanent revocation guarded by a trigger)
-- `20240101000027_create_identity_rbac.sql` — `roles`, `permissions` (the 23-code seeded
-  catalog), `role_permissions`, `user_roles` with the `granted_by`/`granted_at` grant trail;
-  seeded `admin` (protected, holds the whole catalog) plus `vendedor`, `cajero`, `deposito`
-  with their matrices, every insert guarded so re-running cannot duplicate
-- `20240101000028_create_identity_guards.sql` — the lockout triggers: a protected role cannot be
-  deleted, renamed or have its permission rows removed; the last active holder of the protected
-  role cannot be deactivated or lose its grant
-- `20240101000029_clarify_identity_permission_descriptions.sql` — corrected seeded descriptions
-  for the two `identity.*` manage codes (they now say exactly what the gate allows; the AC12 drift
-  test compares descriptions as well as codes)
-- `20240101000030_add_audit_finance.sql` — the actor audit begins (Phase B): `created_by` NOT NULL
-  + `updated_by` on `accounts`, `transactions`, `payment_methods`; creates the sentinel account
-  `sistema` (inactive, roleless, deliberately malformed hash) and attributes every pre-existing row
-  to it — an honest attribution, never a person's name on rows nobody's screen created
-- `20240101000031_add_audit_inventory.sql` — audit columns on `categories`, `products`,
-  `stock_movements`; reuses the sentinel (its own guarded insert is defensive only)
-- `20240101000032_add_audit_sales_customers.sql` — audit columns on `sales`, `sale_payments`,
-  `customer_receipts` and `customers`; `sale_lines` gains no columns (a line inherits its sale's
-  actor), and a sale's payments carry the confirming request's actor
-- `20240101000033_add_audit_purchases_suppliers.sql` — audit columns on `purchases`,
-  `purchase_payments`, `suppliers`, `product_supplier_costs`; `purchase_lines` inherit, a line
-  change stamps the draft's `updated_by`
-- `20240101000034_add_audit_identity_tables.sql` — the audit reaches the identity tables:
-  `roles`/`permissions` rebuilt with NOT NULL `created_by` (the seven identity guard triggers
-  dropped and recreated byte-identically; `permissions.updated_by` has no runtime writer — the
-  catalog is never written at runtime), `users` ALTERed with nullable self-referencing columns
-  (NULL = the system, rendered "el sistema"), `role_permissions` inheriting the role's actor and
-  the matrix edit stamping the role's `updated_by`
 
 ## REST API
 
@@ -817,7 +760,7 @@ The entrypoint imports Tailwind, scans `templates/` and `static/picker.js` (`@so
 
 | Env | Default | Meaning |
 |---|---|---|
-| `DATABASE_URL` | `sqlite://roya.db` | SQLite file (or `postgres://...`) |
+| `DATABASE_URL` | `sqlite://roya.db` | SQLite file. No other backend is supported. |
 | `ALLOW_NEGATIVE_BALANCE` | `false` | If `false`, Expense that would make balance negative is rejected (also on edit/delete of Income) |
 | `ALLOW_NEGATIVE_STOCK` | `true` | If `false`, Out that would make stock negative is rejected (400, stock unchanged); if `true`, Out succeeds (201) and product appears in negative list |
 | `ENFORCE_CREDIT_LIMIT` | `true` | If `true`, confirming a credit sale whose projected debt exceeds the customer's `credit_limit` is rejected (400); a null limit is unlimited either way. If `false`, the sale is confirmed and the interface reports the customer as over limit |
@@ -896,187 +839,10 @@ The entrypoint imports Tailwind, scans `templates/` and `static/picker.js` (`@so
   own customer (service guard + database trigger), and deleting a referenced receipt is
   refused (RESTRICT). A payment without a receipt is still a direct payment on one sale.
 
-## SQLite → Postgres Migration (without rewriting logic)
-
-The codebase is designed to migrate via **trait swap**. Only `repositories/` and `db.rs` change; `services/` and `routes/` stay untouched.
-
-**1. Cargo.toml**
-
-```toml
-# From
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "chrono", "rust_decimal"] }
-# To
-sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "sqlite", "chrono", "rust_decimal", "migrate"] }
-# Optional: keep sqlite for tests/dev
-```
-
-`rust_decimal` stays `serde-with-str` only; `sqlx` with `rust_decimal` feature provides `Decimal` impl for Postgres (`NUMERIC` → Decimal natively, no TEXT hack needed).
-
-**2. DATABASE_URL**
-
-```bash
-DATABASE_URL=postgres://user:pass@localhost:5432/roya
-# .env
-```
-
-**3. Migrations**
-
-Postgres uses real `NUMERIC(20,2)` / `DECIMAL` and `SERIAL`/`BIGSERIAL`:
-
-```sql
--- migrations/*_create_accounts_pg.sql
-CREATE TABLE accounts (
-  id BIGSERIAL PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE,
-  cached_balance NUMERIC(20,2) NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE TABLE transactions (
-  id BIGSERIAL PRIMARY KEY,
-  account_id BIGINT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  kind TEXT NOT NULL CHECK (kind IN ('Income','Expense')),
-  amount NUMERIC(20,2) NOT NULL CHECK (amount > 0),
-  description TEXT NOT NULL DEFAULT '',
-  date DATE NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-```
-
-Run:
-
-```bash
-DATABASE_URL=postgres://... sqlx migrate run
-# or let embedded migrate run at startup (same macro works for Postgres)
-```
-
-**4. db.rs**
-
-```rust
-// Before: SqlitePool
-use sqlx::postgres::{PgPool, PgPoolOptions};
-
-pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
-    let pool = PgPoolOptions::new().max_connections(5).connect(database_url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    Ok(pool)
-}
-```
-
-**5. Repositories**
-
-Implement the same traits for Postgres:
-
-```rust
-pub struct PgAccountRepository { pub pool: PgPool }
-#[async_trait]
-impl AccountRepository for PgAccountRepository { /* use $1, $2 Postgres binds + NUMERIC directly as Decimal */ }
-
-pub struct PgTransactionRepository { pub pool: PgPool }
-#[async_trait]
-impl TransactionRepository for PgTransactionRepository { /* same */ }
-```
-
-Then in `routes::AppState::new` swap `Sqlite*` for `Pg*`:
-
-```rust
-let acc_repo = PgAccountRepository::new(pool.clone());
-let tx_repo = PgTransactionRepository::new(pool.clone());
-```
-
-No change to `AccountService`/`TransactionService` or handlers — they depend only on the traits.
-
-**Why TEXT for SQLite?** SQLite’s `NUMERIC` affinity silently converts `TEXT '1.2345678901234567890'` → `REAL 1.23456789012346` (15 digits), which would defeat `rust_decimal`. So SQLite stores `amount`/`cached_balance` as `TEXT` and сумме в Rust. Postgres’s `NUMERIC` is exact, so the trait impl can bind `Decimal` natively and use `SUM()` in SQL if desired.
-
 ## Code in English, Errors
 
 - All code/comments in English.
 - `thiserror` + `IntoResponse`: `AppError::NotFound / Validation / Conflict / Database` map to 404/400/409/500 with `{error: ...}`.
-
-## Project Structure (as requested)
-
-```
-src/main.rs
-src/models.rs
-src/db.rs
-src/error.rs
-src/services/account.rs
-src/services/transaction.rs
-src/services/inventory.rs
-src/services/sales.rs      — Draft/Confirm/Pay/Cancel orchestrator (calls Inventory + Transaction services, never SQLs their tables)
-                           — also exposes the derived customer receivable (balance, statement, ageing)
-src/services/customers.rs  — customer CRUD, walk-in protection, duplicate-name warning
-src/services/customer_receipts.rs — collect oldest-first: one receipt grouping one payment per covered sale
-src/services/suppliers.rs  — supplier CRUD + product/supplier satellite cost rule
-src/services/purchases.rs  — Draft/Confirm/Pay/Cancel + suggestion builder (orchestrates stock, finance, satellite)
-src/services/documents.rs   — the cross-department documents index: composes the four families'
-                             reads, merges newest-first, caps the page at 200 and reports when it cut
-src/services/identity.rs   — identity: bootstrap admin, login with constant-time verification and
-                             the generic failure, the in-memory throttle, session mint/resolve/
-                             renew/revoke, password change, the users and roles tier rules
-src/repositories/account_repo.rs
-src/repositories/transaction_repo.rs
-src/repositories/category_repo.rs
-src/repositories/product_repo.rs
-src/repositories/barcode_repo.rs
-src/repositories/stock_repo.rs
-src/repositories/sale_repo.rs          — Sale/SaleLine/SalePayment SQLite impl
-src/repositories/customer_repo.rs      — Customer SQLite impl (RESTRICT-aware delete)
-src/repositories/customer_receipt_repo.rs — receipt document + allocations read
-src/repositories/supplier_repo.rs      — Supplier SQLite impl (RESTRICT-aware delete)
-src/repositories/product_supplier_cost_repo.rs — satellite cost SQLite impl
-src/repositories/purchase_repo.rs      — Purchase/PurchaseLine/PurchasePayment SQLite impl
-src/repositories/user_repo.rs          — User SQLite impl (NOCASE username, active flag)
-src/repositories/session_repo.rs       — Session SQLite impl (SQL-decided validity, sliding renewal)
-src/repositories/role_repo.rs          — Role SQLite impl (holders, grant replacement)
-src/repositories/permission_repo.rs    — Permission SQLite impl (catalog, role matrix)
-src/repositories/doc_sequence_repo.rs  — atomic YYYY-SALE-NNNNNN / YYYY-PURCH-NNNNNN numbering
-src/routes/api.rs
-src/routes/web.rs
-src/routes/inventory_api.rs
-src/routes/inventory_web.rs
-src/routes/sales_api.rs    — REST /api/sales, lines, payments, confirm/cancel, debt
-src/routes/sales_web.rs    — Web /sales Askama + HTMX
-src/routes/customers_api.rs — REST /api/customers, statement, ageing, /api/customer-receipts
-src/routes/customers_web.rs — Web /customers + statement Askama + HTMX
-src/routes/purchases_api.rs — REST /api/suppliers, /api/product-supplier-costs, /api/purchases
-src/routes/purchases_web.rs — Web /purchases Askama + HTMX (incl. Sugerido)
-src/routes/suppliers_web.rs — Web /suppliers Askama + HTMX
-src/routes/identity_web.rs — GET/POST /login, POST /logout, GET/POST /password
-src/routes/identity_api.rs — POST/DELETE /api/sessions (JSON session API)
-src/routes/users_web.rs    — Web /users: list, create, deactivate/activate, password reset, roles
-src/routes/roles_web.rs    — Web /roles: list, create, edit, delete, permission matrix
-src/routes/documents_web.rs — Web /documents: the cross-department index page + its list fragment (any-of read gate)
-src/routes/mod.rs
-templates/base.html
-templates/dashboard.html
-templates/account_detail.html
-templates/login.html
-templates/password.html
-templates/forbidden.html   — the full-page 403 card (navigation obeys the same rule)
-templates/users.html
-templates/roles.html
-templates/products.html
-templates/sales.html
-templates/customers.html
-templates/purchases.html
-templates/suppliers.html
-templates/documents.html
-templates/partials/*.html  — incl. sale_list.html, sale_detail.html, purchase_list.html,
-                             purchase_detail.html, supplier_list.html, suggestion_list.html,
-                             customer_list.html, customer_statement.html, receipt_list.html,
-                             sidebar.html (the permission-gated navigation), user_list.html,
-                             role_list.html, user_roles_form.html, user_password_form.html,
-                             document_list.html
-migrations/*.sql
-assets/tailwind.css        — Tailwind v4 entrypoint (@source templates/ + static/picker.js,
-                             @theme palette)
-static/tailwind.css        — compiled stylesheet (committed; rebuild via scripts/build-css.sh)
-static/htmx.min.js         — HTMX 1.9.12 served locally (no CDN)
-static/picker.js           — the product picker island (plain JS, no dependency, no build step)
-scripts/build-css.sh       — regenerates static/tailwind.css with the standalone CLI
-```
-
-`src/templates/` placeholder exists for spec compliance; Askama loads from `templates/` at crate root (standard).
 
 ## No Heavy ORM / No Docker
 
@@ -1096,116 +862,11 @@ scripts/build-css.sh       — regenerates static/tailwind.css with the standalo
   renders only the entries the principal may read.
 - `tower-http` trace + cors + static file serving (`ServeDir`).
 
-## Tests (manual)
+## Development
 
-```bash
-# Run server then in another shell:
-curl -X POST http://localhost:3000/api/accounts -H "Content-Type: application/json" -d '{"name":"Cash"}'
-curl -X POST http://localhost:3000/api/transactions -H "Content-Type: application/json" -d '{"account_id":1,"type":"Income","amount":"500","description":"test","date":"2024-01-01"}'
-curl "http://localhost:3000/api/transactions?account_id=1"
-```
-
-## Tests (Rust smoke suite)
-
-`cargo test` runs the unit suites plus the HTTP smoke suite in
-`src/smoke_tests.rs`. The smoke tests build the app exactly like `main` does
-(in-memory SQLite with the real migrations + `AppState::new`) and drive the full
-router, form extraction and Askama rendering.
-
-- **Business flows** (one per test): account with payment methods, tracked
-  product and supplier cost; cash sale confirm (stock down, exactly one linked
-  Income); credit sale pay/overpay/cancel (stock re-entered, linked refund, the
-  original transaction link kept); purchase from the suggestion endpoint
-  (confirm Cash, linked Expense, cancel reversal); the no-methods payment guard;
-  and the account-balance + payment-traceability invariants (every payment's
-  `transaction_id` and, when present, its `refund_transaction_id` resolve to a
-  real transaction whose `reference` is the document number; a refund must also
-  reverse its own payment: same account, opposite kind and equal amount; and
-  globally no transaction id may be claimed by two payments, so equal-amount
-  cross-payment swaps fail even though every fact matches. That ownership rule
-  is only reachable through direct database tampering: the application always
-  creates a fresh refund per payment and no route accepts
-  `refund_transaction_id`). The invariant also rejects orphan document
-  movements: any transaction whose `reference` looks like `YYYY-SALE-NNNNNN`
-  or `YYYY-PURCH-NNNNNN` must be claimed by some payment as `transaction_id`
-  or `refund_transaction_id`, so a failure between creating the movement and
-  inserting the payment row cannot hide, and the offending ids are reported.
-- **Customer receipts (Slice L)**: a receipt's amount is derived from the
-  payments it groups, and database triggers refuse to group a payment under a
-  receipt of another customer on insert and on update alike, so no code path can
-  make a receipt claim money its own collection never applied. A service-level
-  refusal maps that trigger abort to a clean 400, and no route accepts a receipt
-  id: the collect request carries only the customer, the amount, the account and
-  the method. Ungrouped payments and same-customer groupings are unaffected.
-- **Customers collection flow (Slice M)**: the suite creates a customer through
-  the web form, sells 3 × 25 on credit, collects 30 through
-  `POST /web/customer-receipts`, then asserts the derived balance (45), the
-  ageing bucket (`overdue_1_30 = 45` against `as_of=2024-06-20`), the
-  receivables view, the receipt's derived total equal to the sum of its
-  allocations, each grouped payment's `transaction_id`, and the
-  money-traceability invariant over the whole database the flow built.
-- **Generic form-wiring guard**: for the seeded `/`, `/accounts/{id}`,
-  `/products`, `/sales`, `/purchases`, `/suppliers` and `/customers` pages (plus
-  the sale and purchase detail fragments and the `/customers/{id}` statement) it extracts every `hx-get`, `hx-post`, `hx-put`,
-  `hx-patch` and `hx-delete` target with the HTTP verb htmx will send, the
-  native `action`/`onsubmit` wiring of rendered forms, and the application URLs
-  written inside `hx-on` bodies and inline scripts (verb from
-  `htmx.ajax('POST', ...)`, GET by default) after decoding HTML entities and
-  unwrapping single- or double-quoted attributes and plain backticks, then
-  probes each target against the router with that real verb. Selectors (`#...`),
-  event names and non-path string literals are ignored. A URL built dynamically
-  (concatenation or `${}` template interpolation around an application path) is
-  rejected with a message that asks for a plain quoted literal, so it cannot
-  hide from static verification.
-- **Routing oracle and verb check**: unmatched paths answer
-  `404 {"error":"route not found"}` and a registered path probed with the wrong
-  verb answers `405`; both fail the guard. A dead target masked by a path-param
-  route (`hx-post="/web/sales/does-not-exist"`) and a GET-only path used as an
-  `hx-post` target are caught. Handler-level 404s keep their own message, and
-  the guard probes against its own freshly seeded app instance so the real
-  handlers it may run cannot mutate the apps used by the flow assertions.
-- **Typed-id shells**: `/`, `/sales`, `/purchases` and `/customers` are the
-  pages where the user types the id into the form, so a concrete numeric path
-  segment in a form-bound target is rejected (`/web/sales/1/confirm`) while
-  data-bound record links such as the list View buttons stay valid. A `:` is a
-  placeholder marker only in the path, so `datetime` query values pass.
-- **Native forms**: a `this.action=` rewrite inside `onsubmit` fails the guard
-  (htmx ignores the form action property), and native `action=` targets are
-  probed with their form method like any other target.
-- **Referenced-id guard**: every seeded page is scanned for `product #`,
-  `account #`, `method #`, `customer #` and `supplier #` followed by digits, so a
-  list or fragment can never leak the internal id of a referenced entity. A
-  document's own id stays allowed (`draft #12`, `2024-SALE-000012`), and the scan
-  is pinned by a page-copy mutation test. The receipt list resolves account and
-  method names through the finance read paths, and the guard fixture collects a
-  receipt so the customer statement renders that list and the rule covers it.
-
-## Tests (browser suite)
-
-A second toolchain lives in `e2e/`: a Playwright browser suite that drives the
-real interface, because interaction, focus, navigation and dialogs are only
-honest in a browser. One command runs it, it never touches `roya.db`, and it
-needs nothing installed or managed for Node (Playwright's Python driver bundles
-its own Node runtime inside the suite's virtual environment):
-
-```bash
-scripts/e2e.sh          # headless; see e2e/README.md for setup and options
-```
-
-The suite currently covers 68 tests (plus 4 opt-in probes — two screenshot probes and two
-artifact probes — that skip by default, `ROYA_E2E_*_PROBE=1`). It builds the binary once, spawns it
-against a throwaway SQLite file on a free port whose isolation it proves from the server's own
-log, seeds data through
-the HTTP API reading each step's effect back, and writes a Playwright trace,
-screenshot and server log only when a test fails. Because the login gate is
-deny-by-default, the harness spawns the binary with a fixed test
-`ROYA_ADMIN_PASSWORD` and logs in once per server: the HTTP-API seeder and every
-browser context share that session cookie, so no test handles login itself
-(the gate's own behaviour is covered in `e2e/tests/test_identity.py`).
-`cargo test` stays independent
-of it and keeps its current speed; business rules remain in the Rust suite. The
-one-time Chromium download, the covered flows and the deliberate boundary are
-documented in [`e2e/README.md`](e2e/README.md).
+Test and build commands are in [`AGENTS.md`](AGENTS.md), along with the conventions and
+the traps that this file does not cover. CI runs `cargo test --locked` and
+`scripts/e2e.sh`; those are the only two gates.
 
 ## License
 
