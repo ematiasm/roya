@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Roya — {{ page_title }}{% endblock %}
+{% block content %}
+{# page_title, the breadcrumb and the action slot are struct fields, so the
+   shared page-header component reads them without locals. #}
+{% include "partials/page_header.html" %}
+<div id="customer-return-record" data-saved-label="{{ localization.tr(crate::localization::MessageKey::CustomerReturnsSaved) }}">
+  {% include "partials/customer_return_detail.html" %}
+</div>
+{# The record shell's interactions. It lives in the PAGE SHELL, not in the record
+   fragment: the fragment is swapped by every action response, and a script inside
+   swapped content would re-register the document-level listeners on every swap. #}
+<script>
+  function openReturnDialog(id) {
+    var dlg = document.getElementById(id);
+    if (dlg) dlg.showModal();
+  }
+  document.addEventListener('click', function (evt) {
+    if (!evt.target || !evt.target.closest) return;
+    if (evt.target.closest('a[href="#customer-return-record"]')) {
+      evt.preventDefault();
+      openReturnDialog('confirm-customer-return');
+    }
+  });
+</script>
+{% endblock %}

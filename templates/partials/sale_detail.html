@@ -237,6 +237,35 @@
       </div>
       {% endif %}
 
+      {# ISSUE CREDIT NOTE, and the only way to start one. It is here because a
+         credit note names the sale it credits and the operator is already
+         holding that sale; the removed dialog asked for a sale number above a
+         field with no picker behind it and posted an empty `sale_id`, so only the
+         JSON API could create one. The id is RENDERED onto the form, filled in —
+         `create_draft` resolves the parent by id alone, so an unfilled control
+         posts nothing.
+
+         No dialog: the parent is this page's document, the date is today unless
+         the operator changes it on the note's own header form, and every line is
+         refunded at the price this sale charged. `hx-swap="none"` plus the
+         route's `HX-Redirect` is a real navigation, so Back keeps working. #}
+      {% if can_credit %}
+      <form id="sale-credit-note-action" class="rounded-2xl border border-border bg-card p-4 flex flex-col gap-2.5"
+            data-action="{{ localization.tr(crate::localization::MessageKey::CustomerReturnsIssueCreditNoteAction) }}"
+            hx-post="/web/customer-returns" hx-swap="none">
+        <h2 class="mb-1 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsIssueCreditNoteAction) }}</h2>
+        {# WHAT IT DOES, in one sentence: stock comes IN and the money goes OUT
+           from the accounts the sale was paid into. The operator is about to
+           reverse money, and the direction is the thing they must not have to
+           infer — it is the opposite of the purchase family's action, and a
+           button labelled the same way on both record pages would hide that. #}
+        <p class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsCreateHelp) }}</p>
+        <input type="hidden" name="sale_id" value="{{ record.sale.id }}" />
+        <input type="hidden" name="return_date" value="{{ today }}" />
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsIssueCreditNoteAction) }}</button>
+      </form>
+      {% endif %}
+
       <div class="rounded-2xl border border-border bg-card p-4" id="cancel-sale">
         <h2 class="mb-3 text-base font-semibold">{{ localization.tr(crate::localization::MessageKey::SalesCancel) }}</h2>
         <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::SalesCancel) }}"

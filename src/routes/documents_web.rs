@@ -632,6 +632,60 @@ async fn web_document_detail(
     Ok(Html(html))
 }
 
+/// The two RETURN families the drawer opens, resolved from the `{kind}` segment
+/// BEFORE `DocumentKind::parse` sees it.
+///
+/// **They are not `DocumentKind` variants, and that is a boundary rather than an
+/// oversight.** `DocumentKind` is the feed's own vocabulary: it names the six
+/// families `DocumentService` reads for the INDEX LIST, and it is closed by the
+/// `read_code` agreement test in `models.rs`. A return has no row in that feed —
+/// nothing lists it — so adding a variant would make the index's own closed key
+/// set name two families it cannot render, and it would mean editing `models.rs`,
+/// `services/documents.rs` and two repositories to say so.
+///
+/// What the return families DO need from the drawer is the ability to OPEN a
+/// document the operator is already looking at, under a permission code of their
+/// own. That is what this route-local enum carries, and it is why the permission
+/// narrowing is spelled out here rather than inherited from `permitted_kinds`:
+/// `purchases.read` opens a purchase return and `sales.read` opens a credit note,
+/// the parent's own code, so a principal who can annul a sale can credit it and
+/// one who can confirm a purchase can return it. No new permission code, so no new
+/// migration and nothing in the catalog that gates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReturnDrawerKind {
+    PurchaseReturn,
+    CustomerReturn,
+}
+
+impl ReturnDrawerKind {
+    /// The `{kind}` segment's token for a purchase return. Named, because the 404
+    /// lists every token this route accepts and must not hand-write one it does
+    /// not parse.
+    const PURCHASE_RETURN_TOKEN: &'static str = "purchase_return";
+    /// And for a credit note.
+    const CUSTOMER_RETURN_TOKEN: &'static str = "customer_return";
+
+    /// Parse a token. The same family names the document pages use
+    /// (`/purchase-returns/{id}`, `/customer-returns/{id}`), so a link and a URL
+    /// agree on one word.
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            Self::PURCHASE_RETURN_TOKEN => Some(Self::PurchaseReturn),
+            Self::CUSTOMER_RETURN_TOKEN => Some(Self::CustomerReturn),
+            _ => None,
+        }
+    }
+
+    /// The catalog code that READS this family — the parent's read code, for the
+    /// reason the type's doc gives.
+    fn read_code(&self) -> &'static str {
+        match self {
+            Self::PurchaseReturn => PurchasesRead::CODE,
+            Self::CustomerReturn => SalesRead::CODE,
+        }
+    }
+}
+
 /// The drawer payload for one document: resolve the family, narrow by
 /// permission, then assemble. Missing/unknown documents are the standard 404
 /// with the family's name in the message.
@@ -642,14 +696,36 @@ async fn document_detail(
     id: i64,
     localization: &LocalizationContext,
 ) -> AppResult<DocumentDetailPartial> {
+    // The two return families resolve first: they are not `DocumentKind`
+    // variants, so letting `DocumentKind::parse` see their tokens would 404 every
+    // one of them.
+    if let Some(kind) = ReturnDrawerKind::parse(kind_token) {
+        if !principal.has(kind.read_code()) {
+            return Err(AppError::Forbidden(format!(
+                "Se necesita el permiso «{}» para ver este documento",
+                kind.read_code()
+            )));
+        }
+        return match kind {
+            ReturnDrawerKind::PurchaseReturn => {
+                purchase_return_drawer(state, principal, id, localization).await
+            }
+            ReturnDrawerKind::CustomerReturn => {
+                customer_return_drawer(state, principal, id, localization).await
+            }
+        };
+    }
+    // The 404's token list names the return families TOO, because this route is
+    // the one that accepts them: a caller who typed `purchase_returns` deserves to
+    // be told the singular token the route knows, not a list that silently omits
+    // the two families it resolves two branches above.
     let kind = DocumentKind::parse(kind_token).ok_or_else(|| {
+        let mut tokens: Vec<&str> = DocumentKind::ALL.iter().map(|k| k.token()).collect();
+        tokens.push(ReturnDrawerKind::PURCHASE_RETURN_TOKEN);
+        tokens.push(ReturnDrawerKind::CUSTOMER_RETURN_TOKEN);
         AppError::NotFound(format!(
-            "unknown document kind \"{kind_token}\": the index knows {tokens}",
-            tokens = DocumentKind::ALL
-                .iter()
-                .map(|k| k.token())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "unknown document kind \"{kind_token}\": the drawer knows {tokens}",
+            tokens = tokens.join(", ")
         ))
     })?;
     if !permitted_kinds(principal).contains(&kind) {
@@ -823,13 +899,37 @@ fn draft_lines_phrase(n: usize, localization: &LocalizationContext) -> (String, 
 }
 
 /// The SALE drawer's action block, per state and permission. Real actions
-/// only — the drawer never invents one: the delete exists for a DRAFT (a
-/// draft never touched stock, money or a customer's debt, so nothing
-/// dangles), Anular/Descartar re-present the tested `cancel` endpoint, and a
-/// cancelled sale re-offers the delete ONLY while it was discarded before
-/// confirm (`sale_number` still NULL: same nothing-posted argument as the
-/// draft) — a cancelled sale that carries a number was confirmed first and
-/// offers nothing because its inverse already happened.
+/// only — the drawer never invents one: Anular/Descartar re-present the tested
+/// `cancel` endpoint, and a cancelled sale re-offers the delete ONLY while it was
+/// discarded before confirm (`sale_number` still NULL) — a cancelled sale that
+/// carries a number was confirmed first and offers nothing because its inverse
+/// already happened.
+///
+/// **WHY A DRAFT IS DELETABLE — the corrected premise.** The wording here used to
+/// be "a draft never touched stock, money or a customer's debt, so nothing
+/// dangles". That was never a property of the status; it was an ASSUMPTION, and
+/// it was FALSE. `confirm` used to write the sequence number, one movement per
+/// tracked line, the `Income` and the `sale_payments` row on separate autocommit
+/// connections, with `set_confirmed` LAST. A failure at that last step left the row
+/// still reading `("Draft", NULL)` — a draft that had already committed a payment
+/// row and an orphan `Income` naming the burned number. Such a Draft MATCHED the
+/// deletable predicate (`status = 'Draft' OR (status = 'Cancelled' AND
+/// `sale_number IS NULL)`, `sale_repo.rs`), and deleting it took the payment row
+/// with it through the CASCADE while the `Income` had no foreign key to `sales` at
+/// all and survived: the document was lost and the money kept.
+///
+/// **THAT RESIDUE NO LONGER EXISTS, and not because the delete grew a
+/// cleanliness check — it never will.** `confirm` is now ONE transaction, opened
+/// immediately before `next_number` and committed after the last write, so a
+/// failure at any step rolls the whole run back and the row is a Draft with no
+/// number, no movements, no finance entry and no payment. The measured proof is
+/// the absence asserted by `confirm_failure_*` in `services/sales.rs` and
+/// `services/purchases.rs`.
+///
+/// So the honest statement of the rule is: the predicate is a backstop on STATUS,
+/// and the Draft behind it is CLEAN because confirm is atomic. Delete the
+/// transaction and this block is wrong again — which is why the reason is written
+/// here rather than left to be inferred from the SQL.
 async fn sale_actions(
     state: &AppState,
     principal: &Principal,
@@ -1210,6 +1310,581 @@ async fn purchase_actions(
                         &[("lines", lines_phrase.as_str())],
                     )),
                 });
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// The PURCHASE-RETURN family: the drawer for a document that reverses part or
+/// all of a confirmed purchase.
+///
+/// It is the purchase drawer's shape with the return's own facts, and the two
+/// directions stated rather than assumed: stock goes OUT and the money comes
+/// back IN, which is why the money row reads "received from the supplier" and not
+/// "paid". The parent is shown as a sub-block with a link to the purchase, because
+/// a return is evidence ABOUT a document and the operator's next question is
+/// always "which one".
+///
+/// The delete action is offered ONLY for a draft and for a return discarded while
+/// still draft. **A draft is deletable because `confirm` is ONE transaction, not
+/// because "a draft never touched money"** — see the note on `sale_actions`, which
+/// this mirrors word for word.
+async fn purchase_return_drawer(
+    state: &AppState,
+    principal: &Principal,
+    id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<DocumentDetailPartial> {
+    let detail = state.purchase_return_service.get_detail(id).await?;
+    let purchase_return = &detail.purchase_return;
+    let supplier = state
+        .supplier_service
+        .get_supplier(purchase_return.supplier_id)
+        .await?;
+    let parent = state
+        .purchases_service
+        .get_record(purchase_return.purchase_id)
+        .await?;
+    let (created_by, updated_by) = actor_facts(
+        state,
+        purchase_return.created_by,
+        purchase_return.updated_by,
+        localization,
+    )
+    .await?;
+
+    let mut facts = vec![
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsSupplier,
+            ),
+            &supplier.name,
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(purchase_return.return_date),
+        ),
+        // The refund is money ENTERING the shop. The verb is the family's own and
+        // it is the reason this row does not read "paid".
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::PurchaseReturnsReceived,
+            ),
+            localization.format_currency(detail.paid),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::CustomerTotal),
+            localization.format_currency(detail.total),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsBalance,
+            ),
+            localization.format_currency(detail.due),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsPaymentStatus,
+            ),
+            status_copy(localization, &detail.payment_status.to_string()),
+        ),
+    ];
+    facts.extend(DrawerFact::when_non_empty(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsNotes,
+        ),
+        Some(purchase_return.notes.clone()).filter(|n| !n.is_empty()),
+    ));
+    facts.extend(DrawerFact::when_non_empty(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsCancellationReason,
+        ),
+        purchase_return.cancel_reason.clone(),
+    ));
+    facts.push(created_by);
+    facts.extend(updated_by);
+
+    // One line row per return line, resolved THROUGH the parent line for the
+    // product's identity: a return line stores no product of its own, so the name
+    // and the SKU come from the purchase line it names. A parent line that has
+    // gone missing is not reachable through a RESTRICT foreign key, so the
+    // `.get()` is over a key the document cannot hold.
+    let lines: Vec<DrawerTableRow> = detail
+        .lines
+        .iter()
+        .map(|line| {
+            let parent_line = parent.lines.iter().find(|p| p.id == line.purchase_line_id);
+            DrawerTableRow {
+                cells: vec![
+                    parent_line
+                        .map(|p| p.product_name.clone())
+                        .unwrap_or_default(),
+                    localization.format_quantity(line.qty),
+                    // The FROZEN cost, rendered and never typed: a return is
+                    // always at the purchase price, so this figure is a fact about
+                    // the parent line rather than something the return chose.
+                    // `format_currency` and not `format_money`: this column sits
+                    // beside the document's own Total, Balance and payment-status
+                    // facts, and every one of those renders at the drawer's scale.
+                    // Mixing the two here would put `7.00 USD` next to `21 USD` on
+                    // one screen for no reason but a formatter difference.
+                    localization.format_currency(line.unit_cost),
+                    localization.format_currency(line.subtotal()),
+                ],
+                href: None,
+            }
+        })
+        .collect();
+
+    Ok(DocumentDetailPartial {
+        localization: localization.clone(),
+        kind_label: copy(
+            localization,
+            crate::localization::MessageKey::PurchaseReturnsTitle,
+        ),
+        title: document_title(
+            purchase_return.return_number.as_deref(),
+            purchase_return.id,
+            localization,
+        ),
+        status_line: status_copy(localization, &purchase_return.status.to_string()),
+        facts,
+        tables: vec![DrawerTable {
+            title: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsLines,
+            ),
+            headers: vec![
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsProduct,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsQuantityShort,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsUnitCost,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::TaxNetSubtotal,
+                ),
+            ],
+            rows: lines,
+        }],
+        parent: Some(DrawerParent {
+            label: copy(
+                localization,
+                crate::localization::MessageKey::PurchaseReturnsParentPurchase,
+            ),
+            title: document_title(
+                parent.purchase.purchase_number.as_deref(),
+                parent.purchase.id,
+                localization,
+            ),
+            status_line: status_copy(localization, &parent.purchase.status.to_string()),
+            facts: vec![DrawerFact::new(
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsSupplier,
+                ),
+                &parent.supplier_name,
+            )],
+            href: format!("/purchases/{}", parent.purchase.id),
+        }),
+        actions: purchase_return_actions(state, principal, &detail, localization).await?,
+        notice: Some(edit_affordance_notice(
+            &purchase_return.status.to_string(),
+            localization,
+        )),
+        links: vec![edit_affordance_link(
+            &purchase_return.status.to_string(),
+            format!("/purchase-returns/{}", purchase_return.id),
+            localization,
+        )],
+    })
+}
+
+/// The purchase return's action block: a draft may be discarded and (before
+/// confirmation) deleted, a confirmed return may be cancelled, and a confirmed
+/// return offers NO delete — it is reversed instead.
+///
+/// **THE PREMISE THE DELETE RESTS ON, corrected.** The reasoning "a draft never
+/// touched stock, money or a customer's debt, so nothing dangles" was FALSE when
+/// it was written and it is false now for a different reason than it was then.
+/// Before the confirm-atomicity refactor, a Draft could be DIRTY: `confirm`
+/// wrote the sequence number, the movements, the finance row and the payment row
+/// on separate autocommit connections, so a failure at the last step left a row
+/// still reading `("Draft", NULL)` with a committed payment behind it — and such a
+/// Draft MATCHED the deletable predicate. Deleting it removed the document and kept
+/// the money.
+///
+/// That residue no longer exists, and not because the delete got smarter:
+/// `confirm` opens ONE transaction immediately before taking the number and
+/// commits after the last write, so a Draft of a return has nothing committed
+/// behind it — no number, no movement, no finance row, no payment. The delete
+/// predicate is a backstop on STATUS, never a cleanliness check, and this family
+/// relies on the transaction rather than on the predicate. The wording below
+/// therefore says WHY the draft is safe, so the next reader does not re-derive it
+/// from the predicate.
+async fn purchase_return_actions(
+    state: &AppState,
+    principal: &Principal,
+    detail: &crate::models::PurchaseReturnDetail,
+    localization: &LocalizationContext,
+) -> AppResult<Vec<DrawerAction>> {
+    let purchase_return = &detail.purchase_return;
+    let mut actions = Vec::new();
+    let deletable = |status: &crate::models::PurchaseReturnStatus| {
+        status == &crate::models::PurchaseReturnStatus::Draft
+            || (status == &crate::models::PurchaseReturnStatus::Cancelled
+                && purchase_return.return_number.is_none())
+    };
+    match purchase_return.status {
+        crate::models::PurchaseReturnStatus::Draft => {
+            if principal.has(PurchasesCreate::CODE) {
+                let n = detail.lines.len();
+                let (lines_phrase, listed) = draft_lines_phrase(n, localization);
+                actions.push(DrawerAction {
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
+                    method: "delete".to_string(),
+                    path: format!("/web/purchase-returns/{}", purchase_return.id),
+                    fields: vec![],
+                    reason: false,
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
+                    impact: vec![
+                        localization.tr_with(
+                            if n == 1 {
+                                crate::localization::MessageKey::DocumentsDeleteDraftImpactOne
+                            } else {
+                                crate::localization::MessageKey::DocumentsDeleteDraftImpactMany
+                            },
+                            &[("count", &n.to_string()), ("listed", listed.as_str())],
+                        ),
+                        copy(
+                            localization,
+                            crate::localization::MessageKey::DocumentsNeverConfirmed,
+                        ),
+                    ],
+                    confirm: Some(localization.tr_with(
+                        crate::localization::MessageKey::DocumentsDeleteDraftConfirm,
+                        &[("lines", lines_phrase.as_str())],
+                    )),
+                });
+            }
+        }
+        crate::models::PurchaseReturnStatus::Confirmed => {
+            if principal.has(PurchasesCancel::CODE) {
+                actions.push(DrawerAction {
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::PurchaseReturnsCancel,
+                    ),
+                    method: "post".to_string(),
+                    path: format!("/web/purchase-returns/{}/cancel", purchase_return.id),
+                    fields: vec![],
+                    reason: true,
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::PurchaseReturnsCancel,
+                    ),
+                    // Stock comes back In and the refund is taken back OUT as an
+                    // Expense, which is the one direction on this family where a
+                    // reversal can be refused for want of funds.
+                    impact: vec![copy(
+                        localization,
+                        crate::localization::MessageKey::PurchaseReturnsCancelConfirm,
+                    )],
+                    confirm: None,
+                });
+            }
+        }
+        crate::models::PurchaseReturnStatus::Cancelled => {
+            if deletable(&purchase_return.status) && principal.has(PurchasesCreate::CODE) {
+                actions.push(drawer_discard_delete(
+                    format!("/web/purchase-returns/{}", purchase_return.id),
+                    localization,
+                ));
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// The shared "this discarded document posted nothing, delete it" action, so the
+/// sale, purchase, purchase-return and credit-note drawers state the impact in the
+/// same words instead of four of them drifting apart.
+fn drawer_discard_delete(path: String, localization: &LocalizationContext) -> DrawerAction {
+    DrawerAction {
+        label: copy(localization, crate::localization::MessageKey::CommonDelete),
+        method: "delete".to_string(),
+        path,
+        fields: vec![],
+        reason: false,
+        data_action: copy(localization, crate::localization::MessageKey::CommonDelete),
+        impact: vec![copy(
+            localization,
+            crate::localization::MessageKey::DocumentsNeverConfirmed,
+        )],
+        confirm: None,
+    }
+}
+
+/// The CUSTOMER-RETURN family: the credit note, the mirror of
+/// [`purchase_return_drawer`] with the nouns and the two directions swapped. Stock
+/// comes IN and the refund goes OUT, so the money row reads "refunded to the
+/// customer" and the cancel's impact says the goods go back out.
+async fn customer_return_drawer(
+    state: &AppState,
+    principal: &Principal,
+    id: i64,
+    localization: &LocalizationContext,
+) -> AppResult<DocumentDetailPartial> {
+    let detail = state.customer_return_service.get_detail(id).await?;
+    let customer_return = &detail.customer_return;
+    let customer = state
+        .customer_service
+        .get_customer(customer_return.customer_id)
+        .await?;
+    let parent = state
+        .sales_service
+        .get_record(customer_return.sale_id)
+        .await?;
+    let (created_by, updated_by) = actor_facts(
+        state,
+        customer_return.created_by,
+        customer_return.updated_by,
+        localization,
+    )
+    .await?;
+
+    let mut facts = vec![
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsCustomer,
+            ),
+            &customer.name,
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::DocumentsDate),
+            localization.format_date(customer_return.return_date),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::CustomerReturnsRefunded,
+            ),
+            localization.format_currency(detail.paid),
+        ),
+        DrawerFact::new(
+            copy(localization, crate::localization::MessageKey::CustomerTotal),
+            localization.format_currency(detail.total),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsBalance,
+            ),
+            localization.format_currency(detail.due),
+        ),
+        DrawerFact::new(
+            copy(
+                localization,
+                crate::localization::MessageKey::DocumentsPaymentStatus,
+            ),
+            status_copy(localization, &detail.payment_status.to_string()),
+        ),
+    ];
+    facts.extend(DrawerFact::when_non_empty(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsNotes,
+        ),
+        Some(customer_return.notes.clone()).filter(|n| !n.is_empty()),
+    ));
+    facts.extend(DrawerFact::when_non_empty(
+        copy(
+            localization,
+            crate::localization::MessageKey::DocumentsCancellationReason,
+        ),
+        customer_return.cancel_reason.clone(),
+    ));
+    facts.push(created_by);
+    facts.extend(updated_by);
+
+    // Product identity read THROUGH the parent sale line, exactly as the purchase
+    // return's: a credit-note line stores no product.
+    let lines: Vec<DrawerTableRow> = detail
+        .lines
+        .iter()
+        .map(|line| {
+            let parent_line = parent.lines.iter().find(|p| p.id == line.sale_line_id);
+            DrawerTableRow {
+                cells: vec![
+                    parent_line
+                        .map(|p| p.product_name.clone())
+                        .unwrap_or_default(),
+                    localization.format_quantity(line.qty),
+                    localization.format_currency(line.unit_price),
+                    localization.format_currency(line.subtotal()),
+                ],
+                href: None,
+            }
+        })
+        .collect();
+
+    Ok(DocumentDetailPartial {
+        localization: localization.clone(),
+        kind_label: copy(
+            localization,
+            crate::localization::MessageKey::CustomerReturnsTitle,
+        ),
+        title: document_title(
+            customer_return.credit_note_number.as_deref(),
+            customer_return.id,
+            localization,
+        ),
+        status_line: status_copy(localization, &customer_return.status.to_string()),
+        facts,
+        tables: vec![DrawerTable {
+            title: copy(
+                localization,
+                crate::localization::MessageKey::DocumentsLines,
+            ),
+            headers: vec![
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsProduct,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsQuantityShort,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::SalesUnitPrice,
+                ),
+                copy(
+                    localization,
+                    crate::localization::MessageKey::TaxNetSubtotal,
+                ),
+            ],
+            rows: lines,
+        }],
+        parent: Some(DrawerParent {
+            label: copy(
+                localization,
+                crate::localization::MessageKey::CustomerReturnsParentSale,
+            ),
+            title: document_title(
+                parent.sale.sale_number.as_deref(),
+                parent.sale.id,
+                localization,
+            ),
+            status_line: status_copy(localization, &parent.sale.status.to_string()),
+            facts: vec![DrawerFact::new(
+                copy(
+                    localization,
+                    crate::localization::MessageKey::DocumentsCustomer,
+                ),
+                &parent.sale.customer_name,
+            )],
+            href: format!("/sales/{}", parent.sale.id),
+        }),
+        actions: customer_return_actions(state, principal, &detail, localization).await?,
+        notice: Some(edit_affordance_notice(
+            &customer_return.status.to_string(),
+            localization,
+        )),
+        links: vec![edit_affordance_link(
+            &customer_return.status.to_string(),
+            format!("/customer-returns/{}", customer_return.id),
+            localization,
+        )],
+    })
+}
+
+/// The credit note's action block, mirroring
+/// [`purchase_return_actions`] with `SalesCreate` / `SalesCancel` in place of the
+/// purchases codes. The delete premise is the same one, and the same reason: a
+/// draft is clean because `confirm` is ONE transaction.
+async fn customer_return_actions(
+    state: &AppState,
+    principal: &Principal,
+    detail: &crate::models::CustomerReturnDetail,
+    localization: &LocalizationContext,
+) -> AppResult<Vec<DrawerAction>> {
+    let customer_return = &detail.customer_return;
+    let mut actions = Vec::new();
+    match customer_return.status {
+        crate::models::CustomerReturnStatus::Draft => {
+            if principal.has(SalesCreate::CODE) {
+                actions.push(DrawerAction {
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
+                    method: "delete".to_string(),
+                    path: format!("/web/customer-returns/{}", customer_return.id),
+                    fields: vec![],
+                    reason: false,
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsDeleteDraft,
+                    ),
+                    impact: vec![copy(
+                        localization,
+                        crate::localization::MessageKey::DocumentsNeverConfirmed,
+                    )],
+                    confirm: None,
+                });
+            }
+        }
+        crate::models::CustomerReturnStatus::Confirmed => {
+            if principal.has(SalesCancel::CODE) {
+                actions.push(DrawerAction {
+                    label: copy(
+                        localization,
+                        crate::localization::MessageKey::CustomerReturnsCancel,
+                    ),
+                    method: "post".to_string(),
+                    path: format!("/web/customer-returns/{}/cancel", customer_return.id),
+                    fields: vec![],
+                    reason: true,
+                    data_action: copy(
+                        localization,
+                        crate::localization::MessageKey::CustomerReturnsCancel,
+                    ),
+                    impact: vec![copy(
+                        localization,
+                        crate::localization::MessageKey::CustomerReturnsCancelConfirm,
+                    )],
+                    confirm: None,
+                });
+            }
+        }
+        crate::models::CustomerReturnStatus::Cancelled => {
+            if customer_return.credit_note_number.is_none() && principal.has(SalesCreate::CODE) {
+                actions.push(drawer_discard_delete(
+                    format!("/web/customer-returns/{}", customer_return.id),
+                    localization,
+                ));
             }
         }
     }
@@ -3607,6 +4282,428 @@ mod tests {
             first_row_cell_count(&html, "Líneas"),
             headers.len(),
             "the data row must align with its headers: {html:.800}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // M-purchase returns: the two return families in the drawer.
+    //
+    // They are NOT `DocumentKind` variants (see `ReturnDrawerKind`'s doc), so
+    // these tests are what prove the drawer route resolves their tokens at all
+    // and narrows them by the PARENT's read code.
+    // -----------------------------------------------------------------------
+
+    /// A confirmed purchase with a line, and a draft purchase return against it.
+    /// Returns `(purchase_id, return_id, product_id)`.
+    async fn seed_purchase_return(state: &AppState) -> (i64, i64, i64) {
+        use crate::models::{NewProduct, NewPurchase, NewSupplier, PaymentType, ProductKind};
+        use rust_decimal::Decimal;
+
+        let actor = audit_actor(state).await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "DRAW-PR".into(),
+                    name: "Drawer return product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(20),
+                    cost_price: Decimal::from(5),
+                    markup_pct: None,
+                    track_stock: true,
+                    min_stock: Some(Decimal::ONE),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (_, _, cash) = seed_purchase_kit(state).await;
+        let supplier = state
+            .supplier_service
+            .create_supplier(
+                actor,
+                NewSupplier {
+                    name: "Drawer Return Supplier".into(),
+                    phone: None,
+                    due_days: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let purchase = state
+            .purchases_service
+            .create_draft(
+                actor,
+                NewPurchase {
+                    supplier_id: supplier.id,
+                    payment_type: PaymentType::Cash,
+                    purchase_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+                    due_date: None,
+                    supplier_invoice_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .add_line(
+                actor,
+                purchase.id,
+                product.id,
+                Decimal::from(5),
+                Some(Decimal::from(7)),
+            )
+            .await
+            .unwrap();
+        state
+            .purchases_service
+            .confirm(actor, purchase.id, Some(cash))
+            .await
+            .unwrap();
+        let purchase_return = state
+            .purchase_return_service
+            .create_draft(
+                actor,
+                purchase.id,
+                chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+                &None,
+            )
+            .await
+            .unwrap();
+        let parent_line = state
+            .purchases_service
+            .get_record(purchase.id)
+            .await
+            .unwrap()
+            .lines[0]
+            .id;
+        state
+            .purchase_return_service
+            .add_line(actor, purchase_return.id, parent_line, Decimal::from(2))
+            .await
+            .unwrap();
+        (purchase.id, purchase_return.id, product.id)
+    }
+
+    /// The purchase side of the same kit: an account with a Cash method and an
+    /// opening balance, so a confirmed purchase's cash Expense can post.
+    async fn seed_purchase_kit(state: &AppState) -> (i64, i64, i64) {
+        let actor = audit_actor(state).await;
+        let account = state
+            .account_service
+            .create(actor, "Caja-Drawer")
+            .await
+            .unwrap();
+        state
+            .payment_method_service
+            .ensure_defaults_for_account(actor, account.id, "Caja")
+            .await
+            .unwrap();
+        let cash = state
+            .payment_method_service
+            .methods_with_accounts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "Cash" && m.account_id == Some(account.id))
+            .unwrap()
+            .id;
+        state
+            .transaction_service
+            .create(
+                actor,
+                account.id,
+                crate::models::TransactionKind::Income,
+                "10000".parse().unwrap(),
+                None,
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            )
+            .await
+            .unwrap();
+        (account.id, cash, cash)
+    }
+
+    /// A confirmed sale with a line, and a draft credit note against it.
+    async fn seed_customer_return(state: &AppState) -> (i64, i64, i64) {
+        use crate::models::{NewProduct, NewSale, PaymentType, ProductKind};
+        use rust_decimal::Decimal;
+
+        let actor = audit_actor(state).await;
+        let product = state
+            .inventory_service
+            .create_product(
+                actor,
+                NewProduct {
+                    sku: "DRAW-CR".into(),
+                    name: "Drawer credit product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(20),
+                    cost_price: Decimal::from(5),
+                    markup_pct: None,
+                    track_stock: true,
+                    min_stock: Some(Decimal::ONE),
+                    max_stock: Some(Decimal::from(100)),
+                    location: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        // Stock in, so the sale has something to sell.
+        state
+            .inventory_service
+            .record_movement(
+                actor,
+                crate::models::NewMovement {
+                    product_id: product.id,
+                    qty: Decimal::from(20),
+                    movement_type: crate::models::MovementType::In,
+                    reason: crate::models::MovementReason::Initial,
+                    reference: String::new(),
+                    date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let (_, _, cash) = seed_purchase_kit(state).await;
+        let customer = state
+            .customer_service
+            .create_customer(
+                actor,
+                crate::models::NewCustomer {
+                    name: "Drawer Credit Customer".into(),
+                    phone: None,
+                    address: None,
+                    tax_id: None,
+                    notes: None,
+                    is_walkin: false,
+                    credit_limit: None,
+                    due_days: None,
+                },
+            )
+            .await
+            .unwrap()
+            .customer
+            .id;
+        let sale = state
+            .sales_service
+            .create_draft(
+                actor,
+                NewSale {
+                    customer_id: customer,
+                    payment_type: PaymentType::Cash,
+                    sale_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+                    due_date: None,
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .add_line(
+                sale.id,
+                product.id,
+                Decimal::from(5),
+                Some(Decimal::from(9)),
+            )
+            .await
+            .unwrap();
+        state
+            .sales_service
+            .confirm(actor, sale.id, Some(cash))
+            .await
+            .unwrap();
+        let customer_return = state
+            .customer_return_service
+            .create_draft(
+                actor,
+                sale.id,
+                chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+                &None,
+            )
+            .await
+            .unwrap();
+        let parent_line = state.sales_service.get_record(sale.id).await.unwrap().lines[0].id;
+        state
+            .customer_return_service
+            .add_line(actor, customer_return.id, parent_line, Decimal::from(2))
+            .await
+            .unwrap();
+        (sale.id, customer_return.id, product.id)
+    }
+
+    /// **The drawer opens a purchase return for a principal holding the PARENT's
+    /// read code, and refuses it otherwise.**
+    ///
+    /// The refusal has to name the code, or an operator who was refused cannot
+    /// tell which tier to ask an administrator for.
+    #[tokio::test]
+    async fn the_documents_drawer_opens_a_purchase_return_under_purchases_read_and_refuses_it_otherwise(
+    ) {
+        let state = test_state().await;
+        let (_purchase_id, return_id, _product) = seed_purchase_return(&state).await;
+
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/purchase_return/{return_id}"),
+            &test_support::cookie_for(&probe),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains("Devoluciones de compra"),
+            "the family is named, not rendered as an unknown kind: {html:.1200}"
+        );
+        assert!(
+            html.contains("Drawer Return Supplier"),
+            "the supplier's NAME, never the id: {html:.1200}"
+        );
+        assert!(
+            html.contains("Drawer return product"),
+            "the line's product identity is read THROUGH the parent purchase line: {html:.1600}"
+        );
+        // The frozen cost is SHOWN and there is no control to change it: the
+        // drawer is a read surface, and the price is a fact about the parent.
+        // `format_currency` is the drawer's house formatter (`format_money` is the
+        // record page's), and at scale 0 it renders `7 USD`.
+        assert!(
+            html.contains("7 USD"),
+            "the frozen cost renders as text: {html:.2000}"
+        );
+        assert!(
+            !html.contains("unit_cost") && !html.contains("name=\"qty\""),
+            "the drawer renders no price input and no line editor: {html:.2000}"
+        );
+        assert!(
+            !html.contains("Eliminar borrador"),
+            "a purchases.read-ONLY principal sees NO delete: the drawer offers an \
+             action only for the code its endpoint requires, and the delete needs \
+             purchases.create: {html:.2000}"
+        );
+
+        // And a principal that DOES hold the write code is offered the delete.
+        let writer = test_support::seed_session_with_permissions(
+            &state.pool,
+            &["purchases.read", "purchases.create"],
+        )
+        .await
+        .unwrap();
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/purchase_return/{return_id}"),
+            &test_support::cookie_for(&writer),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains("Eliminar borrador"),
+            "a purchases.create principal is offered the draft delete: {html:.2000}"
+        );
+
+        let other = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/purchase_return/{return_id}"),
+            &test_support::cookie_for(&other),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html:.600}");
+        assert!(
+            html.contains("purchases.read"),
+            "the refusal names the code the principal lacks: {html:.600}"
+        );
+    }
+
+    /// The credit-note twin, under `sales.read`.
+    #[tokio::test]
+    async fn the_documents_drawer_opens_a_credit_note_under_sales_read_and_refuses_it_otherwise() {
+        let state = test_state().await;
+        let (_sale_id, return_id, _product) = seed_customer_return(&state).await;
+
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+        let (status, html) = get_drawer(
+            app.clone(),
+            &format!("/web/documents/detail/customer_return/{return_id}"),
+            &test_support::cookie_for(&probe),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.600}");
+        assert!(
+            html.contains("Notas de crédito"),
+            "the Spanish name is the specific term, decision 4: {html:.1200}"
+        );
+        assert!(
+            html.contains("Drawer Credit Customer"),
+            "the customer's NAME, never the id: {html:.1200}"
+        );
+        assert!(
+            html.contains("Drawer credit product"),
+            "the line's product identity is read THROUGH the parent sale line: {html:.1600}"
+        );
+        assert!(
+            html.contains("9 USD"),
+            "the frozen price renders as text, at the drawer's own scale: {html:.2000}"
+        );
+        assert!(
+            !html.contains("unit_price") && !html.contains("name=\"qty\""),
+            "the drawer renders no price input and no line editor: {html:.2000}"
+        );
+
+        let other = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+        let (status, html) = get_drawer(
+            app,
+            &format!("/web/documents/detail/customer_return/{return_id}"),
+            &test_support::cookie_for(&other),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html:.600}");
+        assert!(
+            html.contains("sales.read"),
+            "the refusal names the code the principal lacks: {html:.600}"
+        );
+    }
+
+    /// An unknown kind token is still the standard 404 naming the known tokens —
+    /// the return families must not have widened the set into anything vague.
+    #[tokio::test]
+    async fn the_documents_drawer_still_404s_an_unknown_kind_token() {
+        let state = test_state().await;
+        let app = crate::routes::router(state);
+        let (status, body) = get_drawer(
+            app,
+            "/web/documents/detail/not_a_family/1",
+            test_support::TEST_COOKIE,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body:.400}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let message = json["error"].as_str().unwrap();
+        assert!(
+            message.contains("sale") && message.contains("purchase_return"),
+            "the 404 names the known tokens, both the DocumentKind ones and the \
+             return ones: {message}"
         );
     }
 }

@@ -433,6 +433,42 @@
     <button type="button" class="btn-primary"
             onclick="openRecordDialog('record-payment')">+ {{ localization.tr(crate::localization::MessageKey::SalesRecordPayment) }}</button>
     {% endif %}
+
+    {# RETURN GOODS, and the only way to start one. The action is on the record
+       page because a return names the document it reverses and the operator is
+       already holding that document — making them navigate to a list and type a
+       number they can see on screen is the defect this replaces. The id is
+       RENDERED onto the form, filled in: `create_draft` resolves the parent by id
+       alone, so an unfilled control would post nothing and fail with a message
+       about a form rather than a document.
+
+       `data-picker` is deliberately absent: the picker island searches PRODUCTS
+       and resolves a product id, and there is no island in the app that resolves
+       a purchase number to a purchase id. The removed dialog wrapped a purchase
+       field in `data-picker="product"` and posted an empty `purchase_id`; the
+       decoration looked like a picker and was not one.
+
+       It posts directly, without a dialog, because there is nothing to decide:
+       the parent is this page's document, the date is today unless the operator
+       changes it on the return's own header form, and every line returns at the
+       price this purchase recorded. `hx-swap="none"` and the route's
+       `HX-Redirect` perform a real navigation, so Back keeps working — the same
+       arrangement every other create action in the app uses. #}
+    {% if can_return %}
+    <form id="purchase-return-action" class="flex items-center gap-2.5"
+          data-action="{{ localization.tr(crate::localization::MessageKey::PurchaseReturnsReturnGoodsAction) }}"
+          hx-post="/web/purchase-returns" hx-swap="none">
+      <input type="hidden" name="purchase_id" value="{{ record.purchase.id }}" />
+      <input type="hidden" name="return_date" value="{{ return_date }}" />
+      <button type="submit" class="btn-secondary">{{ localization.tr(crate::localization::MessageKey::PurchaseReturnsReturnGoodsAction) }}</button>
+      {# The sentence the removed dialog carried: stock goes OUT and the money
+         comes back, per the account the purchase paid from. The bar has room for
+         it beside the button and the direction is the thing an operator must not
+         have to infer. #}
+      <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::PurchaseReturnsCreateHelp) }}</span>
+    </form>
+    {% endif %}
+
     <div class="relative ml-auto">
       <button type="button" id="record-menu-toggle" aria-label="{{ localization.tr(crate::localization::MessageKey::PurchasesMoreActions) }}"
               aria-haspopup="true" aria-expanded="false"

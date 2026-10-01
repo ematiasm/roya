@@ -521,6 +521,26 @@ const NAV_ENTRIES: &[NavEntry] = &[
         visibility: NavVisibility::All(&[PurchasesRead::CODE]),
         group: "operation",
     },
+    // The two return families sit IMMEDIATELY AFTER the document family they
+    // reverse, in that order, and that placement is the argument: an operator
+    // reads "Sales, Customer returns" as two halves of one loop — sell, then
+    // credit — and "Purchases, Purchase returns" the same for buying. A separate
+    // group would claim they are their own department, which they are not: the
+    // permission is the parent's, the record page is the parent's, and the number
+    // derives from the parent's. Each declares its parent's OWN read code, the
+    // code the route's `Require<PurchasesRead>` / `Require<SalesRead>` names, so a
+    // principal that can open the family can open its returns and one that cannot
+    // never sees an entry it would be refused.
+    NavEntry {
+        key: "customer-returns",
+        visibility: NavVisibility::All(&[SalesRead::CODE]),
+        group: "operation",
+    },
+    NavEntry {
+        key: "purchase-returns",
+        visibility: NavVisibility::All(&[PurchasesRead::CODE]),
+        group: "operation",
+    },
     // `documents` is the first any-of row: four departments' read tiers each
     // open part of the same screen — sales.read the sale documents,
     // purchases.read the purchases, inventory.read the stock movements,

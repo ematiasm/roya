@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Roya — {{ localization.tr(crate::localization::MessageKey::CustomerReturnsTitle) }}{% endblock %}
+{% block content %}
+{% let page_title = localization.tr(crate::localization::MessageKey::CustomerReturnsTitle) %}
+{% let page_breadcrumb_label = localization.tr(crate::localization::MessageKey::NavigationSales) %}
+{% let page_breadcrumb_href = "/sales" %}
+{% include "partials/page_header.html" %}
+<div class="rounded-2xl border border-border bg-card p-5">
+  {# HOW TO START ONE, in one sentence. The dialog this replaced asked for a sale
+     NUMBER over a field with no picker behind it and posted a hidden `sale_id`
+     nothing filled, so only the JSON API could create a credit note. A credit
+     note names the sale it credits, so the action is on that sale's own record
+     page with the id already on it; this sentence says where. #}
+  <div class="mb-3 text-[13px] text-muted" data-return-start-hint>
+    {{ localization.tr(crate::localization::MessageKey::CustomerReturnsStartFromSale) }}
+  </div>
+  {# The shared list-filter bar; see `partials/list_filters_open.html` for the
+     `filter_module` / `filter_list` contract. #}
+  {% let filter_module = "customer-return" %}
+  {% let filter_list = "customer-returns" %}
+  {% include "partials/list_filters_open.html" %}
+    <select class="field min-w-[110px] flex-1" name="status">
+      <option value="">{{ localization.tr(crate::localization::MessageKey::PurchasesFilterStatus) }}</option>
+      <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</option>
+      <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}</option>
+      <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}</option>
+    </select>
+    <input class="field min-w-[120px] flex-1" type="text" name="customer" placeholder="{{ localization.tr(crate::localization::MessageKey::SalesCustomer) }}" value="{{ filter_customer }}" />
+    <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesNumber) }}" value="{{ filter_number }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+  {% include "partials/list_filters_close.html" %}
+  <div id="customer-return-list"
+       hx-history-elt
+       hx-get="/web/customer-returns"
+       hx-trigger="refresh from:body, load"
+       hx-include="#customer-return-filters"
+       hx-swap="innerHTML">
+    {% include "partials/customer_return_list.html" %}
+  </div>
+</div>
+
+<script>
+  // The list refresh is a LIST concern with a target of its own, so it stays here
+  // rather than in the shared shell.
+  document.body.addEventListener('customer-return-changed', function(){ htmx.trigger('#customer-return-list','refresh'); });
+</script>
+{% endblock %}

@@ -1,0 +1,27 @@
+<div id="purchase-return-list-inner">
+  <div class="mb-2.5 text-[13px] text-muted">{{ title }} • {{ localization.tr_count(crate::localization::MessageKey::PurchaseReturnsCount, returns.len()) }}</div>
+  {% if returns.is_empty() %}
+    <div class="empty">{{ localization.tr(crate::localization::MessageKey::PurchaseReturnsNothing) }}</div>
+  {% else %}
+    {% for v in returns %}
+    {# One row, three zones in reading order: identifier → supplier → money.
+       `received` is money BACK from the supplier, so the Paid chip means
+       received in full and the pending figure is what has not arrived — the
+       direction is the purchase's mirror and the words are its own. #}
+    <a class="mb-2 grid grid-cols-1 gap-1 rounded-[10px] border border-border bg-surface px-3.5 py-3 text-text sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)_minmax(0,10rem)] sm:items-center sm:gap-4" id="purchase-return-{{ v.purchase_return.id }}" href="/purchase-returns/{{ v.purchase_return.id }}">
+      <span class="font-semibold tabular-nums">{% if let Some(n) = v.purchase_return.return_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }} #{{ v.purchase_return.id }}{% endif %}</span>
+      <span class="min-w-0">
+        <span class="block truncate font-semibold">{{ v.supplier_name }}</span>
+        <span class="block truncate text-[13px] text-muted">{{ localization.format_date(v.purchase_return.return_date.clone()) }} · {{ localization.tr_count(crate::localization::MessageKey::PurchasesItems, v.line_count.clone()) }}{% if v.parent_number != "" %} · {{ localization.tr(crate::localization::MessageKey::PurchaseReturnsParentPurchase) }} {{ v.parent_number }}{% endif %}</span>
+      </span>
+      <span class="flex items-center justify-between gap-2 sm:flex-col sm:items-end sm:justify-center">
+        {% if v.purchase_return.status.to_string() == "Draft" %}<span class="chip border-border text-muted">{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</span>{% else if v.purchase_return.status.to_string() == "Cancelled" %}<span class="chip border-border text-muted">{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}</span>{% else if v.received_in_full %}<span class="chip chip-income">{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}</span>{% else %}<span class="chip chip-warning">{{ localization.tr(crate::localization::MessageKey::PurchaseReturnsPending) }} {{ localization.format_currency(v.pending.clone()) }}</span>{% endif %}
+        <span class="text-right">
+          <span class="block font-bold tabular-nums text-text">{{ localization.format_currency(v.total.clone()) }}</span>
+          <span class="block text-[11px] uppercase tracking-[0.04em] text-muted sm:hidden">{{ localization.tr(crate::localization::MessageKey::DocumentsAmount) }}</span>
+        </span>
+      </span>
+    </a>
+    {% endfor %}
+  {% endif %}
+</div>
