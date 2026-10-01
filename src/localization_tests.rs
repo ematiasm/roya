@@ -173,6 +173,15 @@ fn non_count_catalog_rows_do_not_mix_singular_and_plural_languages() {
         MessageKey::DocumentsCount,
         MessageKey::SupplierPickerMatchCount,
         MessageKey::IdentityUserCount,
+        // The two return families' list counts. They were added carrying an
+        // IDENTICAL singular and plural ("Returns ({count})" for both), which
+        // kept the pair off this list and made every list header read
+        // "Purchase returns • Returns (0)" — the family name twice, once in the
+        // plural that does not fit a count of one. They are here because the
+        // count is a COUNT: the singular differs, so the rule applies and the
+        // catalog must say so.
+        MessageKey::PurchaseReturnsCount,
+        MessageKey::CustomerReturnsCount,
     ];
     let violations: Vec<_> = EN_CATALOG
         .iter()

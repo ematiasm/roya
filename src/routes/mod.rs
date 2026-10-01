@@ -1,4 +1,5 @@
 pub mod api;
+pub mod customer_returns_web;
 pub mod customers_api;
 pub mod customers_web;
 pub mod documents_web;
@@ -6,6 +7,7 @@ pub mod identity_api;
 pub mod identity_web;
 pub mod inventory_api;
 pub mod inventory_web;
+pub mod purchase_returns_web;
 pub mod purchases_api;
 pub mod purchases_web;
 pub mod roles_web;
@@ -38,9 +40,10 @@ use crate::models::PriceRefusal;
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteBusinessConfigurationRepository,
     SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
-    SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqliteProductRepository,
-    SqliteProductSupplierCostRepository, SqliteProductTaxRepository, SqlitePurchaseRepository,
-    SqliteRoleRepository, SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
+    SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
+    SqliteProductRepository, SqliteProductSupplierCostRepository, SqliteProductTaxRepository,
+    SqlitePurchaseRepository, SqlitePurchaseReturnRepository, SqliteRoleRepository,
+    SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
     SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxRepository,
     SqliteTaxSnapshotRepository, SqliteTransactionRepository, SqliteUserRepository,
 };
@@ -48,9 +51,10 @@ use crate::routes::setup_web::setup_gate;
 use crate::security::auth_middleware;
 use crate::services::identity::{SystemClock, ThrottleConfig};
 use crate::services::{
-    AccountService, CustomerReceiptService, CustomerService, DocumentService, IdentityService,
-    InventoryService, PaymentMethodService, PurchasesService, SalesService, SettingsService,
-    SetupService, SupplierService, TaxService, TransactionService,
+    customer_return::CustomerReturnService, purchase_return::PurchaseReturnService, AccountService,
+    CustomerReceiptService, CustomerService, DocumentService, IdentityService, InventoryService,
+    PaymentMethodService, PurchasesService, SalesService, SettingsService, SetupService,
+    SupplierService, TaxService, TransactionService,
 };
 
 pub type InventorySvc = InventoryService<
@@ -110,6 +114,38 @@ pub type TaxSvc =
 
 pub type SupplierSvc =
     SupplierService<SqliteSupplierRepository, SqliteProductSupplierCostRepository>;
+
+/// Purchase returns (M-purchase returns): the business sends goods BACK to a
+/// supplier. It takes the same `InventoryService` and `TransactionService`
+/// instances the purchases service holds, and that is deliberate rather than an
+/// oversight — see the construction below for why a return must not get its own
+/// flag-configured copies.
+pub type PurchaseReturnSvc = PurchaseReturnService<
+    SqlitePurchaseReturnRepository,
+    SqliteDocSequenceRepository,
+    SqlitePurchaseRepository,
+    SqliteCategoryRepository,
+    SqliteProductRepository,
+    SqliteBarcodeRepository,
+    SqliteStockMovementRepository,
+    SqliteAccountRepository,
+    SqliteTransactionRepository,
+>;
+
+/// Credit notes (M-purchase returns): the customer sends goods BACK to the
+/// business. Same instance-sharing decision as the purchase return, opposite
+/// stock and money direction.
+pub type CustomerReturnSvc = CustomerReturnService<
+    SqliteCustomerReturnRepository,
+    SqliteDocSequenceRepository,
+    SqliteSaleRepository,
+    SqliteCategoryRepository,
+    SqliteProductRepository,
+    SqliteBarcodeRepository,
+    SqliteStockMovementRepository,
+    SqliteAccountRepository,
+    SqliteTransactionRepository,
+>;
 
 pub type PurchasesSvc = PurchasesService<
     SqlitePurchaseRepository,
@@ -271,6 +307,13 @@ pub struct AppState {
     pub tax_service: TaxSvc,
     pub supplier_service: SupplierSvc,
     pub purchases_service: PurchasesSvc,
+    /// Purchase returns (`/purchase-returns`): stock Out with reason
+    /// `Purchase-return`, refunds as `Income` per originating account.
+    pub purchase_return_service: PurchaseReturnSvc,
+    /// Credit notes (`/customer-returns`): stock In with reason `Sale-return`,
+    /// refunds as `Expense` per originating account — the one direction where
+    /// the overdraft guard fires.
+    pub customer_return_service: CustomerReturnSvc,
     /// Identity kernel service (S1b): the single session-validity opinion the
     /// guard and the login/logout routes share.
     pub identity_service: IdentitySvc,
@@ -407,6 +450,57 @@ impl AppState {
             PaymentMethodService::new(method_repo),
             SqliteTaxSnapshotRepository::new(pool.clone()),
         );
+        // M-purchase returns. THE FLAGS ARE THE PARENT'S, and deliberately so:
+        // both return services take the SAME `inventory_service` and
+        // `transaction_service` instances the purchases and sales services hold,
+        // so `ALLOW_NEGATIVE_STOCK` and `ALLOW_NEGATIVE_BALANCE` are the app's
+        // and were chosen once.
+        //
+        // It would be tempting to give a return its own configured copy, and the
+        // direction argument is even superficially reasonable: a purchase return
+        // moves stock OUT where its parent moved it IN, so `ALLOW_NEGATIVE_STOCK`
+        // "should" be tighter. That is the wrong read, twice over.
+        //
+        // First, the flag is not a per-direction knob: `InventoryService` builds
+        // it once and applies it to every movement it records, so a separate
+        // instance with a different value would make "can stock go negative"
+        // depend on WHICH DOCUMENT moved it. A purchase return that refuses to
+        // take goods back while a purchase of the same goods was accepted at a
+        // negative level is not a stricter policy, it is two shops in one
+        // database. The stock level is a single fact about a product; the rule
+        // that reads it must be single too.
+        //
+        // Second, `ALLOW_NEGATIVE_BALANCE` reaches the return through
+        // `TransactionService`, and a return's money uses the SAME
+        // `create_with_reference_in` the parent did. A purchase return's refund is
+        // an `Income`, which never consults a balance at all, so the flag is
+        // unreachable on that path by construction; a CREDIT NOTE's refund is an
+        // `Expense` and DOES consult it. Both live behind one `TransactionService`
+        // instance, and that instance also serves every transaction form in the
+        // app. A second instance with its own balance rule would let the same
+        // account answer two different ways to "may this be spent", which is
+        // worse than either answer alone.
+        //
+        // `ENFORCE_CREDIT_LIMIT` is deliberately ABSENT: no return service takes
+        // it. A credit note cannot increase a customer's debt — it reduces what
+        // was sold and refunds what was collected — so the ceiling a credit sale
+        // is measured against has nothing to say about one. Adding the flag to
+        // the constructor would be a parameter that can never change an outcome,
+        // and a flag nobody can act on is how a guard rots.
+        let purchase_return_service = PurchaseReturnService::new(
+            SqlitePurchaseReturnRepository::new(pool.clone()),
+            SqliteDocSequenceRepository::new(pool.clone()),
+            SqlitePurchaseRepository::new(pool.clone()),
+            inventory_service.clone(),
+            transaction_service.clone(),
+        );
+        let customer_return_service = CustomerReturnService::new(
+            SqliteCustomerReturnRepository::new(pool.clone()),
+            SqliteDocSequenceRepository::new(pool.clone()),
+            SqliteSaleRepository::new(pool.clone()),
+            inventory_service.clone(),
+            transaction_service.clone(),
+        );
         // The documents index composes the four families' read paths; it holds
         // only reads, so wiring it never moves write ownership.
         let document_service = DocumentService::new(
@@ -433,6 +527,8 @@ impl AppState {
             tax_service,
             supplier_service,
             purchases_service,
+            purchase_return_service,
+            customer_return_service,
             identity_service,
             setup_service,
             settings_service,
@@ -572,6 +668,8 @@ pub fn router(state: AppState) -> Router {
         .merge(sales_web::router())
         .merge(purchases_api::router())
         .merge(purchases_web::router())
+        .merge(purchase_returns_web::router())
+        .merge(customer_returns_web::router())
         .merge(documents_web::router())
         .merge(suppliers_web::router())
         .merge(users_web::router())

@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Roya — {{ localization.tr(crate::localization::MessageKey::PurchaseReturnsTitle) }}{% endblock %}
+{% block content %}
+{% let page_title = localization.tr(crate::localization::MessageKey::PurchaseReturnsTitle) %}
+{% let page_breadcrumb_label = localization.tr(crate::localization::MessageKey::NavigationPurchases) %}
+{% let page_breadcrumb_href = "/purchases" %}
+{% include "partials/page_header.html" %}
+<div class="rounded-2xl border border-border bg-card p-5">
+  {# HOW TO START ONE, in one sentence, and the row it applies to. There is no
+     "New return" button here and there never was a working one: the dialog this
+     replaced asked for a purchase NUMBER above a picker that does not exist (the
+     picker island searches PRODUCTS) and posted a hidden `purchase_id` nothing
+     filled, so the only caller of `create_draft` was the JSON API. A return names
+     the document it reverses, so the action is on that document's own record
+     page with the id already on it. This sentence says where. It sits INSIDE the
+     card, above the filters: the operator looking for a creation control reads
+     the top of the card first, and a hint below the results would be read only
+     after concluding there is nothing to do. #}
+  <div class="mb-3 text-[13px] text-muted" data-return-start-hint>
+    {{ localization.tr(crate::localization::MessageKey::PurchaseReturnsStartFromPurchase) }}
+  </div>
+  {# The shared list-filter bar: `filter_module` is the singular form-id and
+     list-target prefix, `filter_list` the plural endpoint path segment and the
+     Clear href. The two partials own the form shell, the Clear anchor and the
+     Refresh control; this page keeps only its own field block between them. #}
+  {% let filter_module = "purchase-return" %}
+  {% let filter_list = "purchase-returns" %}
+  {% include "partials/list_filters_open.html" %}
+    <select class="field min-w-[110px] flex-1" name="status">
+      <option value="">{{ localization.tr(crate::localization::MessageKey::PurchasesFilterStatus) }}</option>
+      <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</option>
+      <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}</option>
+      <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}</option>
+    </select>
+    <input class="field min-w-[120px] flex-1" type="text" name="supplier" placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesSupplier) }}" value="{{ filter_supplier }}" />
+    <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesNumber) }}" value="{{ filter_number }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+  {% include "partials/list_filters_close.html" %}
+  {# `hx-history-elt` snapshots only the list on a history push, so Back restores
+     the previous list instead of re-fetching it from a filter form that already
+     holds the newer value. #}
+  <div id="purchase-return-list"
+       hx-history-elt
+       hx-get="/web/purchase-returns"
+       hx-trigger="refresh from:body, load"
+       hx-include="#purchase-return-filters"
+       hx-swap="innerHTML">
+    {% include "partials/purchase_return_list.html" %}
+  </div>
+</div>
+
+<script>
+  // The list refresh is a LIST concern with a target of its own, so it stays
+  // here rather than in the shared shell.
+  document.body.addEventListener('purchase-return-changed', function(){ htmx.trigger('#purchase-return-list','refresh'); });
+</script>
+{% endblock %}

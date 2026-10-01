@@ -1,0 +1,247 @@
+{# Credit note record body.
+
+   Rendered both by `/customer-returns/{id}` inside the shell and standalone by
+   every action response that swaps `#customer-return-record`, so the same context
+   travels with the fragment either way. The status gate below is presentation
+   only: the service stays the authority and refuses edits to a confirmed note.
+
+   THE LINE EDITOR, and decision 1 of the design expressed as markup.
+
+   A credit-note line names a PARENT sale line and carries no product of its own —
+   `CustomerReturnLine` stores no `product_id` on purpose, so the product, the
+   quantity sold and the frozen price are all read THROUGH the parent line. That
+   is why every row here is a parent line: it shows what was sold, how much of it
+   confirmed notes already took, what is still creditable, and the frozen unit
+   price.
+
+   **AND THERE IS NO PRICE INPUT ANYWHERE IN THIS FILE.** Not a hidden one, not a
+   disabled one, not a readonly one. The price is RENDERED AS TEXT in its own
+   column and the only control on the row is the quantity. A disabled input would
+   still be an input: the next person to touch this template would re-enable it,
+   and the service would then silently ignore it, because `add_line` and
+   `update_line` have no price parameter at all.
+   `a_draft_customer_return_renders_with_no_price_input` asserts on the rendered
+   HTML, so a price field added here fails the suite rather than the design. #}
+<div id="customer-return-record-inner" data-customer-return-record>
+  <div class="mb-3 flex flex-wrap items-center gap-2">
+    <span class="chip {% if record.detail.customer_return.status.to_string() == "Confirmed" %}chip-income{% else if record.detail.customer_return.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{% if record.detail.customer_return.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if record.detail.customer_return.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
+    <span class="chip {% if record.detail.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}" data-customer-return-payment-status>{% if record.detail.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if record.detail.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>
+    <span class="text-base font-bold">
+      {% if let Some(n) = record.detail.customer_return.credit_note_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::CustomerReturnsDraft) }}{% endif %}
+    </span>
+  </div>
+
+  {# The parent: the sale this note reverses. It is a link so the operator can see
+     what is being credited without leaving the note. #}
+  <div class="mb-1 text-[13px] text-muted">
+    {{ record.customer_name }} • {{ localization.tr(crate::localization::MessageKey::CustomerReturnsParentSale) }} <a class="link" href="{{ parent_href }}">{{ record.parent_number }}</a> • {{ localization.format_date(record.detail.customer_return.return_date.clone()) }}
+  </div>
+  <div class="text-[13px] text-muted" data-customer-return-actor>{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ editor }}{% endif %}</div>
+  {% if !record.detail.customer_return.notes.is_empty() %}
+    <div class="text-[13px] text-muted">{{ record.detail.customer_return.notes }}</div>
+  {% endif %}
+  {% if let Some(c) = record.detail.customer_return.cancel_reason %}
+    <div class="my-2 rounded-[10px] border border-danger/30 bg-danger/12 px-3 py-2.5 text-[13px] text-danger" data-cancel-reason>{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}: {{ c }}</div>
+  {% endif %}
+
+  {# Sticky action bar, outside the money region so the add-line response can
+     refresh it out of band. #}
+  {% if record.detail.customer_return.status.to_string() == "Draft" %}
+  <div id="customer-return-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
+       class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
+    <button type="button" id="open-confirm-note" class="btn-primary"{% if record.detail.lines.is_empty() %} disabled{% endif %}
+            onclick="openReturnDialog('confirm-customer-return')">{{ localization.tr(crate::localization::MessageKey::SalesConfirmAction) }} ▾</button>
+  </div>
+  {% else if record.detail.customer_return.status.to_string() == "Confirmed" %}
+  <div id="customer-return-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
+       class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
+    <button type="button" class="btn-secondary px-3.5 py-2 text-base"
+            onclick="openReturnDialog('cancel-customer-return')">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsCancel) }}</button>
+  </div>
+  {% else if record.detail.customer_return.status.to_string() == "Cancelled" && record.detail.customer_return.credit_note_number.is_none() %}
+  {# A note discarded while still Draft: `credit_note_number` never got assigned,
+     so nothing was posted and the row is garbage — offer its delete with the
+     native confirm the destructive controls use. #}
+  <div class="mt-3 mb-1">
+    <button type="button"
+            class="btn-danger"
+            data-action="{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}"
+            hx-delete="/web/customer-returns/{{ record.detail.customer_return.id }}"
+            hx-confirm="{{ localization.tr(crate::localization::MessageKey::CustomerReturnsDeleteDiscarded) }}"
+            hx-target="#customer-return-record" hx-swap="innerHTML">{{ localization.tr(crate::localization::MessageKey::CommonDelete) }}</button>
+  </div>
+  {% endif %}
+
+  <div id="customer-return-record-money">
+    <div class="my-2 text-2xl font-bold">{{ localization.format_currency(record.detail.total.clone()) }} <span class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsRefunded) }} {{ localization.format_currency(record.detail.paid.clone()) }} • {{ localization.tr(crate::localization::MessageKey::CustomerReturnsPending) }} {{ localization.format_currency(record.detail.due.clone()) }}</span></div>
+
+    {# THE HEADER FIELDS, on a draft only. The customer is absent by design: the
+       service COPIES it off the parent sale, so there is nothing to choose and
+       nothing that could disagree with the document the money goes back to. #}
+    {% if record.detail.customer_return.status.to_string() == "Draft" %}
+    <form id="customer-return-header-form" class="mt-2 mb-3 flex flex-wrap items-end gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::ActionSaveHeader) }}" data-silent-save
+          hx-trigger="change"
+          hx-post="{{ header_action }}"
+          hx-swap="none" hx-sync="this:replace">
+      <div>
+        <label for="record-return-date" class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsDate) }}</label>
+        <input type="date" id="record-return-date" name="return_date" required value="{{ record.detail.customer_return.return_date }}" class="field" />
+        <p id="record-return-date-error" class="mt-1 text-[13px] text-danger" hidden>
+          {{ localization.tr(crate::localization::MessageKey::CustomerReturnsDateRequired) }}
+        </p>
+      </div>
+      <div class="flex-1">
+        <label for="record-return-notes" class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }}</label>
+        <input type="text" id="record-return-notes" name="notes" maxlength="512" value="{{ record.detail.customer_return.notes }}" class="field" />
+      </div>
+    </form>
+    {% endif %}
+
+    {# THE LINE EDITOR. Every row is a PARENT sale line, because a credit-note line
+       names a parent line and stores no product of its own. The row's ONLY control
+       is the quantity. #}
+    <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr_count(crate::localization::MessageKey::PurchasesLines, record.detail.lines.len()) }}</div>
+    <div class="overflow-x-auto">
+      <table class="w-full border-collapse text-sm">
+        <thead>
+          <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+            <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::SalesProduct) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::SalesQuantity) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsParentQty) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsAlreadyCredited) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsRemaining) }}</th>
+            {# THE FROZEN PRICE COLUMN. Rendered, never entered. #}
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsFrozenPrice) }}</th>
+            <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::TaxNetSubtotal) }}</th>
+            {% if record.detail.customer_return.status.to_string() == "Draft" %}<th class="py-2"></th>{% endif %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for option in record.options %}
+          {% let on_draft = option.on_this_draft.is_some() %}
+          <tr class="border-b border-border/60" id="customer-return-parent-line-{{ option.sale_line_id }}"{% if on_draft %} data-on-this-return="true"{% endif %}>
+            <td class="py-2.5 pr-3">
+              <span class="font-semibold">{{ option.product_name }}</span>
+              <span class="text-[13px] text-muted"> · {{ option.product_sku }}</span>
+              {% if let Some(claimed) = option.on_this_draft %}
+              <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsAlreadyOnDraft) }}: <span class="tabular-nums">{{ localization.format_quantity(claimed.clone()) }}</span></div>
+              {% endif %}
+            </td>
+            {% if record.detail.customer_return.status.to_string() == "Draft" %}
+            <td class="py-2.5 pr-3 text-right">
+              {# The quantity, and the ONLY control on the row. `type="text"` with
+                 `inputmode="decimal"` is the house rule for every locale-formatted
+                 decimal control: a `type="number"` input hands the browser its own
+                 parsing and its own rounding, which is precisely what a
+                 locale-formatted figure must not do.
+                 `locale_aware_decimal_html_controls_are_reachable_text_inputs` pins
+                 the rule. #}
+              <input type="text" inputmode="decimal" id="return-qty-{{ option.sale_line_id }}" name="qty"
+                     class="field w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
+                     {% if loop.first %}{% if entry_row_focus %}autofocus{% endif %}{% endif %}
+                     {% if let Some(claimed) = option.on_this_draft %}value="{{ localization.format_quantity(claimed.clone()) }}"{% endif %}
+                     {% if !option.can_add %}disabled{% endif %}
+                     step="any" data-action="{{ localization.tr(crate::localization::MessageKey::ActionEditLine) }}"
+                     hx-post="/web/customer-returns/{{ record.detail.customer_return.id }}/lines"
+                     hx-vals='{"sale_line_id": {{ option.sale_line_id }}}'
+                     hx-target="#customer-return-record-money" hx-swap="outerHTML" />
+            </td>
+            {% else %}
+            <td class="py-2.5 pr-3 text-right tabular-nums">{% if let Some(claimed) = option.on_this_draft %}{{ localization.format_quantity(claimed.clone()) }}{% endif %}</td>
+            {% endif %}
+            <td class="py-2.5 pr-3 text-right tabular-nums" data-parent-qty>{{ localization.format_quantity(option.sold.clone()) }}</td>
+            <td class="py-2.5 pr-3 text-right tabular-nums text-muted" data-parent-taken>{{ localization.format_quantity(option.taken.clone()) }}</td>
+            <td class="py-2.5 pr-3 text-right tabular-nums" data-parent-remaining>{% if let Some(left) = option.remaining %}{{ localization.format_quantity(left.clone()) }}{% endif %}</td>
+            {# THE FROZEN PRICE. TEXT, in its own column. No input wraps it, no
+               `disabled` or `readonly` attribute exists, and none may: an operator
+               can read the price and cannot touch it. #}
+            <td class="py-2.5 pr-3 text-right tabular-nums" data-frozen-price>{{ localization.format_money(option.unit_price.clone()) }}</td>
+            <td class="py-2.5 pr-3 text-right tabular-nums">{% if let Some(claimed) = option.on_this_draft %}{{ localization.format_money(option.unit_price.clone() * claimed.clone()) }}{% endif %}</td>
+            {% if record.detail.customer_return.status.to_string() == "Draft" %}
+            {% if let Some(line_id) = option.return_line_id %}
+            <td class="py-2.5 text-right">
+              <button class="btn-secondary"
+                      hx-delete="/web/customer-returns/{{ record.detail.customer_return.id }}/lines/{{ line_id }}"
+                      hx-target="#customer-return-record" hx-swap="innerHTML"
+                      aria-label="{{ localization.tr(crate::localization::MessageKey::CustomerReturnsRemoveLine) }}">✕</button>
+            </td>
+            {% endif %}
+            {% endif %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {# The sentence that says WHY there is no price field. Without it the
+         frozen-price column reads as an oversight, and the next person to touch
+         this template adds an input. #}
+      <div class="mt-2 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsPriceIsReadOnly) }}</div>
+    </div>
+
+    <div class="mt-4 mb-1.5 font-bold text-[13px] text-muted">{{ localization.tr_count(crate::localization::MessageKey::CustomerReturnsPayments, record.refunds.len()) }}</div>
+    {% if record.refunds.is_empty() %}
+      <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsNoPayments) }}</div>
+    {% else %}
+      <div class="overflow-x-auto">
+        <table class="w-full border-collapse text-sm">
+          <thead>
+            <tr class="border-b border-border text-left text-[11px] font-semibold tracking-[0.06em] text-muted uppercase">
+              <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</th>
+              <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::NavigationAccount) }}</th>
+              <th class="py-2 pr-3">{{ localization.tr(crate::localization::MessageKey::DocumentsMethod) }}</th>
+              <th class="py-2 pr-3 text-right">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for pay in record.refunds %}
+            <tr class="border-b border-border/60" id="customer-return-payment-{{ pay.id }}">
+              <td class="py-2.5 pr-3 tabular-nums">{{ localization.format_date(pay.date.clone()) }}</td>
+              <td class="py-2.5 pr-3">{{ pay.account_name }}</td>
+              <td class="py-2.5 pr-3">{{ localization.payment_method_display_name(pay.method_name.as_str()) }}</td>
+              <td class="py-2.5 pr-3 text-right font-bold tabular-nums text-expense">{{ localization.format_currency(pay.amount.clone()) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+
+    {# Action forms as dialogs, gated by status. #}
+    {% if record.detail.customer_return.status.to_string() == "Draft" %}
+    <dialog id="confirm-customer-return" class="rounded-2xl border border-border bg-card p-5 text-text">
+      <div class="mb-3 flex items-center justify-between gap-6">
+        <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsConfirm) }}</h2>
+        <button type="button" class="btn-secondary"
+                aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}" onclick="document.getElementById('confirm-customer-return').close()">✕</button>
+      </div>
+      {# NO METHOD SELECT AND NO PAYMENT-TYPE RADIO. A credit note does not store a
+         `payment_type` (decision 7 of the design): its refunds are determined
+         entirely by the PARENT sale's payment rows, so a control here would either
+         be ignored or invent a second place for one fact to be wrong. The refund
+         leaves the account and by the method the money arrived through. #}
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::CustomerReturnsConfirm) }}"
+            hx-post="/web/customer-returns/{{ record.detail.customer_return.id }}/confirm"
+            hx-target="#customer-return-record" hx-swap="innerHTML">
+        <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SalesConfirmAction) }}</button>
+      </form>
+    </dialog>
+    {% else if record.detail.customer_return.status.to_string() == "Confirmed" %}
+    <dialog id="cancel-customer-return" class="rounded-2xl border border-border bg-card p-5 text-text">
+      <div class="mb-3 flex items-center justify-between gap-6">
+        <h2 class="text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsCancel) }}</h2>
+        <button type="button" class="btn-secondary"
+                aria-label="{{ localization.tr(crate::localization::MessageKey::AccessibilityDismiss) }}" onclick="document.getElementById('cancel-customer-return').close()">✕</button>
+      </div>
+      <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::CustomerReturnsCancel) }}"
+            hx-post="/web/customer-returns/{{ record.detail.customer_return.id }}/cancel"
+            hx-confirm="{{ localization.tr(crate::localization::MessageKey::CustomerReturnsCancelConfirm) }}"
+            hx-target="#customer-return-record" hx-swap="innerHTML">
+        <div>
+          <label for="cancel-return-reason" class="field-label">{{ localization.tr(crate::localization::MessageKey::PurchasesReason) }}</label>
+          <input type="text" id="cancel-return-reason" name="reason" maxlength="256" class="field" />
+        </div>
+        <button type="submit" class="btn-secondary px-3.5 py-2.5 text-base">{{ localization.tr(crate::localization::MessageKey::CustomerReturnsCancel) }}</button>
+      </form>
+    </dialog>
+    {% endif %}
+  </div>
+</div>

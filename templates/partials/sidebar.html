@@ -51,7 +51,15 @@
       <div class="flex flex-col gap-0.5">
         {% call nav_item("dashboard", "/", localization.tr(crate::localization::MessageKey::NavigationDashboard), "M2.25 12l8.954-8.955c.44-.439 1.152-.439 1.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75") %}
         {% call nav_item("sales", "/sales", localization.tr(crate::localization::MessageKey::NavigationSales), "M2.25 3h1.386c.51 0 .955.343 1.087.835l.383 1.437M7.5 14.25a3 3 0 00-3 3h15.75m-12.75-3h11.218c1.121-2.3 2.1-4.684 2.924-7.138a60.114 60.114 0 00-16.536-1.84M7.5 14.25L5.106 5.272M6 20.25a.75.75 0 11-1.5 0 .75.75 0 011.5 0zm12.75 0a.75.75 0 11-1.5 0 .75.75 0 011.5 0z") %}
+        {# Customer returns (credit notes) sit right under Sales and Purchase
+           returns right under Purchases, in that order: each one is the way to
+           reverse the document above it, so the pair reads as one loop rather
+           than as two departments. The declared codes in `authz.rs` are the
+           parents' own read codes, so an entry appears exactly for a principal
+           the route would let open it. #}
+        {% call nav_item("customer-returns", "/customer-returns", localization.tr(crate::localization::MessageKey::NavigationCustomerReturns), "M9 13.5l2.25 2.25L15.75 9M7.5 21h9a2.25 2.25 0 002.25-2.25V5.25A2.25 2.25 0 0016.5 3h-9A2.25 2.25 0 005.25 5.25v13.5A2.25 2.25 0 007.5 21z") %}
         {% call nav_item("purchases", "/purchases", localization.tr(crate::localization::MessageKey::NavigationPurchases), "M8.25 18.75a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h6m-9 0H3.375a1.125 1.125 0 01-1.125-1.125V14.25m17.25 4.5a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m3 0h1.125c.621 0 1.129-.504 1.09-1.124a17.902 17.902 0 00-3.213-9.193 2.056 2.056 0 00-1.58-.86H14.25M16.5 18.75h-2.25m0-11.177v-.958c0-.568-.422-1.048-.987-1.106a48.554 48.554 0 00-10.026 0 1.106 1.106 0 00-.987 1.106v7.635m12-6.677v6.677m0 4.5v-4.5m0 0h-12") %}
+        {% call nav_item("purchase-returns", "/purchase-returns", localization.tr(crate::localization::MessageKey::NavigationPurchaseReturns), "M9 14l4-4m-4 4l-4 4m8-8l4 4m-4-4l-4-4m9 15H5.25A2.25 2.25 0 013 18.75V5.25A2.25 2.25 0 015.25 3h13.5A2.25 2.25 0 0121 5.25v13.5A2.25 2.25 0 0118.75 21z") %}
         {# The documents index: the first entry whose codes are an ANY-OF —
            four departments' read tiers each open part of the same screen
            (`sales.read` the sale documents, `purchases.read` the purchases,

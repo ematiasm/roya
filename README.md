@@ -113,7 +113,10 @@ The front end is server-rendered: **HTMX 1.9.12**, the compiled **Tailwind CSS 4
   applied. More than the outstanding debt ⇒ 400; an unassigned/inactive method
   ⇒ 400; both leave no side effect. No route accepts a receipt id: the
   same-customer rule is enforced by construction in `collect`, and the database
-  triggers stay the backstop. REST: `GET/POST /api/customer-receipts`,
+  triggers stay the backstop. The receipt list resolves the account and the
+  payment method to their names through the same reads the rest of the interface
+  uses, so it never prints an internal key. REST:
+  `GET/POST /api/customer-receipts`,
   `GET /api/customer-receipts/:id` (list requires `?customer_id=`).
 - **Suppliers (M3)** — `suppliers(id, name UNIQUE, phone, notes, is_active)` plus the
   `product_supplier_costs` satellite holding the per-supplier price with its previous

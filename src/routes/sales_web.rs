@@ -90,6 +90,9 @@ struct SalePageTemplate {
     /// document totals exactly. The page includes the same record partial the
     /// action responses render, so the sentence travels with it.
     total_refusal_message: String,
+    /// Whether the acting principal holds `sales.create`. See
+    /// `SaleRecordContext::can_credit`.
+    can_credit: bool,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -171,6 +174,10 @@ struct SaleDetailPartial {
     /// `price_refusal_key` mapping, so the record page cannot word the rule
     /// differently from the add-line response or the index.
     total_refusal_message: String,
+    /// Whether the acting principal holds `sales.create`, which is the gate the
+    /// record body's "Issue credit note" action posts into. See
+    /// `SaleRecordContext::can_credit`.
+    can_credit: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -299,12 +306,19 @@ struct SaleRecordContext {
     /// document totals exactly. See [`SaleRecordContext::record`] for why the
     /// page states it instead of answering an error.
     total_refusal_message: String,
+    /// Whether this principal holds `sales.create` — the gate
+    /// `POST /web/customer-returns` declares. The "Issue credit note" action
+    /// renders only when true, so the record page never offers an action the
+    /// route would refuse. Resolved in the wiring layer from the request's own
+    /// principal, on EVERY render path including the fragment.
+    can_credit: bool,
 }
 
 async fn record_context(
     state: &AppState,
     sale_id: i64,
     localization: LocalizationContext,
+    can_credit: bool,
 ) -> AppResult<SaleRecordContext> {
     let record = state.sales_service.get_record(sale_id).await?;
     let method_options = state.payment_method_service.methods_with_accounts().await?;
@@ -327,6 +341,7 @@ async fn record_context(
         created_by_name,
         updated_by_name,
         total_refusal_message,
+        can_credit,
     })
 }
 
@@ -340,6 +355,7 @@ fn render_record(context: SaleRecordContext, oob_picker: bool) -> AppResult<Html
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
         total_refusal_message: context.total_refusal_message,
+        can_credit: context.can_credit,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -352,8 +368,9 @@ async fn changed(
     state: &AppState,
     sale_id: i64,
     localization: &LocalizationContext,
+    can_credit: bool,
 ) -> AppResult<Response> {
-    changed_with_picker(state, sale_id, localization, false).await
+    changed_with_picker(state, sale_id, localization, can_credit, false).await
 }
 
 /// Line-add response: the same body plus the out-of-band picker, empty and
@@ -362,10 +379,11 @@ async fn changed_with_picker(
     state: &AppState,
     sale_id: i64,
     localization: &LocalizationContext,
+    can_credit: bool,
     oob_picker: bool,
 ) -> AppResult<Response> {
     let html = render_record(
-        record_context(state, sale_id, localization.clone()).await?,
+        record_context(state, sale_id, localization.clone(), can_credit).await?,
         oob_picker,
     )?
     .0;
@@ -537,7 +555,13 @@ async fn sale_record_page(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
-    let context = record_context(&state, id, localization.clone()).await?;
+    let context = record_context(
+        &state,
+        id,
+        localization.clone(),
+        principal.has_permission::<SalesCreate>(),
+    )
+    .await?;
     let label = match &context.record.sale.sale_number {
         Some(number) => number.clone(),
         None => context
@@ -583,6 +607,7 @@ async fn sale_record_page(
         created_by_name: context.created_by_name,
         updated_by_name: context.updated_by_name,
         total_refusal_message: context.total_refusal_message,
+        can_credit: context.can_credit,
         nav_key: "sales",
         nav: Nav::for_principal(&principal),
     };
@@ -595,10 +620,20 @@ async fn sale_record_page(
 async fn web_sale_detail(
     State(state): State<AppState>,
     _: Require<SalesRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> Result<Html<String>, AppError> {
-    render_record(record_context(&state, id, localization).await?, false)
+    render_record(
+        record_context(
+            &state,
+            id,
+            localization,
+            principal.has_permission::<SalesCreate>(),
+        )
+        .await?,
+        false,
+    )
 }
 
 /// `DELETE /web/sales/{id}`: the documents drawer's draft delete — the
@@ -767,16 +802,26 @@ async fn web_create_sale(
 async fn web_add_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
 ) -> Result<axum::response::Response, AppError> {
-    add_line_impl(state, headers, localization, id, form).await
+    add_line_impl(
+        state,
+        principal.has_permission::<SalesCreate>(),
+        headers,
+        localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn add_line_impl(
     state: AppState,
+    can_credit: bool,
     headers: HeaderMap,
     localization: LocalizationContext,
     id: i64,
@@ -808,7 +853,7 @@ async fn add_line_impl(
         // untouched, so nothing else on this route changes.
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
-        return changed_with_picker(&state, id, &localization, true).await;
+        return changed_with_picker(&state, id, &localization, can_credit, true).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -816,6 +861,7 @@ async fn add_line_impl(
 async fn web_update_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Extension(localization): Extension<LocalizationContext>,
     Path((sale_id, line_id)): Path<(i64, i64)>,
@@ -831,7 +877,13 @@ async fn web_update_line(
         // of a draft line can carry an unrepresentable amount just as an add can.
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
-        return changed(&state, sale_id, &localization).await;
+        return changed(
+            &state,
+            sale_id,
+            &localization,
+            principal.has_permission::<SalesCreate>(),
+        )
+        .await;
     }
     Ok(Redirect::to(&format!("/sales/{sale_id}")).into_response())
 }
@@ -839,11 +891,18 @@ async fn web_update_line(
 async fn web_remove_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Extension(localization): Extension<LocalizationContext>,
     Path((sale_id, line_id)): Path<(i64, i64)>,
 ) -> Result<axum::response::Response, AppError> {
     state.sales_service.remove_line(line_id).await?;
-    changed(&state, sale_id, &localization).await
+    changed(
+        &state,
+        sale_id,
+        &localization,
+        principal.has_permission::<SalesCreate>(),
+    )
+    .await
 }
 
 async fn web_confirm_sale(
@@ -855,12 +914,22 @@ async fn web_confirm_sale(
     Path(id): Path<i64>,
     Form(form): Form<ConfirmSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    confirm_sale_impl(state, principal.user_id, headers, localization, id, form).await
+    confirm_sale_impl(
+        state,
+        principal.user_id,
+        principal.has_permission::<SalesCreate>(),
+        headers,
+        localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn confirm_sale_impl(
     state: AppState,
     actor: i64,
+    can_credit: bool,
     headers: HeaderMap,
     localization: LocalizationContext,
     id: i64,
@@ -877,7 +946,7 @@ async fn confirm_sale_impl(
         .await
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(&state, id, &localization, can_credit).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -894,12 +963,22 @@ async fn web_record_payment(
     Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
 ) -> Result<axum::response::Response, AppError> {
-    record_payment_impl(state, principal.user_id, headers, localization, id, form).await
+    record_payment_impl(
+        state,
+        principal.user_id,
+        principal.has_permission::<SalesCreate>(),
+        headers,
+        localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn record_payment_impl(
     state: AppState,
     actor: i64,
+    can_credit: bool,
     headers: HeaderMap,
     localization: LocalizationContext,
     id: i64,
@@ -915,7 +994,7 @@ async fn record_payment_impl(
         .await
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(&state, id, &localization, can_credit).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -929,12 +1008,22 @@ async fn web_cancel_sale(
     Path(id): Path<i64>,
     Form(form): Form<CancelSaleForm>,
 ) -> Result<axum::response::Response, AppError> {
-    cancel_sale_impl(state, principal.user_id, headers, localization, id, form).await
+    cancel_sale_impl(
+        state,
+        principal.user_id,
+        principal.has_permission::<SalesCreate>(),
+        headers,
+        localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn cancel_sale_impl(
     state: AppState,
     actor: i64,
+    can_credit: bool,
     headers: HeaderMap,
     localization: LocalizationContext,
     id: i64,
@@ -953,7 +1042,7 @@ async fn cancel_sale_impl(
         .await
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(&state, id, &localization, can_credit).await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -990,7 +1079,13 @@ async fn web_update_sale_header(
         )
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(
+            &state,
+            id,
+            &localization,
+            principal.has_permission::<SalesCreate>(),
+        )
+        .await;
     }
     Ok(Redirect::to(&format!("/sales/{id}")).into_response())
 }
@@ -1011,11 +1106,20 @@ async fn web_update_sale_header(
 async fn web_add_line_collection(
     state: State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     headers: HeaderMap,
     Extension(localization): Extension<LocalizationContext>,
     Form(form): Form<AddLineForm>,
 ) -> Result<axum::response::Response, AppError> {
-    add_line_impl(state.0, headers, localization, form.sale_id, form).await
+    add_line_impl(
+        state.0,
+        principal.has_permission::<SalesCreate>(),
+        headers,
+        localization,
+        form.sale_id,
+        form,
+    )
+    .await
 }
 
 async fn web_confirm_sale_collection(
@@ -1029,6 +1133,7 @@ async fn web_confirm_sale_collection(
     confirm_sale_impl(
         state.0,
         principal.user_id,
+        principal.has_permission::<SalesCreate>(),
         headers,
         localization,
         form.sale_id,
@@ -1048,6 +1153,7 @@ async fn web_record_payment_collection(
     record_payment_impl(
         state.0,
         principal.user_id,
+        principal.has_permission::<SalesCreate>(),
         headers,
         localization,
         form.sale_id,
@@ -1067,6 +1173,7 @@ async fn web_cancel_sale_collection(
     cancel_sale_impl(
         state.0,
         principal.user_id,
+        principal.has_permission::<SalesCreate>(),
         headers,
         localization,
         form.sale_id,
@@ -4001,5 +4108,99 @@ mod tests {
         );
         assert!(!row.contains(&big), "and no figure: {row:.1200}");
         let _ = ordinary;
+    }
+
+    // -- Credit note: the action that starts a customer return -----------------
+
+    /// **THE TEST THAT WOULD HAVE CAUGHT THE DEAD CREATION FLOW.** A credit note
+    /// reverses a NAMED document, so its creation post carries that document's
+    /// id, and nothing else in the app can supply one. The record page of the sale
+    /// being credited is the only place the operator is already holding it, so the
+    /// action lives there with the id rendered onto it, filled in.
+    #[tokio::test]
+    async fn a_confirmed_sale_record_offers_issue_credit_note_with_this_sale_id_already_filled() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .sales_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.sale_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/sales/{}", fixture.sale_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+
+        let form = enclosing_form(&html, "/web/customer-returns");
+        assert!(
+            form.contains(&format!("value=\"{}\"", fixture.sale_id)),
+            "the action must carry THIS sale's id, filled in: a credit note names the \
+             document it credits and nothing else can supply that id: {form:.600}"
+        );
+        // The LABEL, not just the mechanics. "Credit note" is the document's name
+        // and it replaced "Take goods back" on 2026-10-01, when decision 5 of the
+        // design was reversed: the old label named a warehouse action, and what
+        // this button starts is a document. Reversible by changing this one string
+        // and this one assertion — nothing else in the tree holds the label, and
+        // `the_customer_returns_index_renders_the_localized_title_in_both_catalogs`
+        // pins the page half of the same decision.
+        assert!(
+            form.contains("Credit note"),
+            "the action names the DOCUMENT it starts: {form:.600}"
+        );
+    }
+
+    /// The same two-sided gate the purchase twin has: the action is
+    /// `sales.create`, the parent's own write code. A principal that may read a
+    /// sale and may not create one sees no action and is refused the post.
+    #[tokio::test]
+    async fn issue_credit_note_is_gated_on_sales_create_for_both_sight_and_post() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .sales_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.sale_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["sales.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html_as(
+            app.clone(),
+            &format!("/sales/{}", fixture.sale_id),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("/web/customer-returns"),
+            "a principal without sales.create must not be shown an action the route \
+             refuses: {html:.600}"
+        );
+
+        let (status, html) = post_form_as(
+            app,
+            "/web/customer-returns",
+            &format!("sale_id={}", fixture.sale_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html:.300}");
+        assert!(
+            html.contains("sales.create"),
+            "the refusal names the code the principal lacks: {html:.600}"
+        );
     }
 }

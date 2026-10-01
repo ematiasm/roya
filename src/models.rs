@@ -2901,6 +2901,397 @@ impl ReceiptDetail {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Purchase returns and credit notes (odd/tasks/purchase-returns-and-credit-notes.md)
+//
+// Two document families that reverse part of a confirmed purchase or sale, which
+// is what the annulment path cannot express: cancel is all-or-nothing and it
+// discards the document rather than reversing part of it. They are two mirrored
+// sets of types rather than one set with a discriminator, because the repository
+// already mirrors every domain this way and a unified table would be the first
+// polymorphism in the persistence layer.
+//
+// THIS IS THE MODEL LAYER ONLY. The columns are migration 40 (purchase returns)
+// and migration 41 (credit notes); the rules about what a return DOES — the
+// refund cap, the stock movement, the freeze of the parent's price — belong to
+// the service units that follow, and the money fields below are figures a service
+// computes and hands over, never figures a model derives on its own.
+//
+// `Decimal` here is exactly what `PurchaseLine` and `SaleLine` carry: the column
+// is TEXT and the conversion happens once, at the repository boundary, through the
+// same `parse_decimal` every other money column already goes through.
+// ---------------------------------------------------------------------------
+
+/// The three states a return shares with the documents it reverses. `Display`
+/// writes the capitalized words the migration's CHECK accepts, and `FromStr`
+/// folds case and takes both spellings of cancelled, because a second dialect
+/// for the same three values would mean a row one reader wrote fails the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PurchaseReturnStatus {
+    Draft,
+    Confirmed,
+    Cancelled,
+}
+
+impl std::fmt::Display for PurchaseReturnStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Draft => write!(f, "Draft"),
+            Self::Confirmed => write!(f, "Confirmed"),
+            Self::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+impl std::str::FromStr for PurchaseReturnStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "draft" => Ok(Self::Draft),
+            "confirmed" => Ok(Self::Confirmed),
+            "cancelled" | "canceled" => Ok(Self::Cancelled),
+            _ => Err(format!("invalid purchase return status: {s}")),
+        }
+    }
+}
+
+/// The credit note's own status, a separate type from [`PurchaseReturnStatus`]
+/// rather than a shared one: the two families are two tables with two CHECKs, and
+/// a shared enum would let a `Draft` sale return be constructed at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum CustomerReturnStatus {
+    Draft,
+    Confirmed,
+    Cancelled,
+}
+
+impl std::fmt::Display for CustomerReturnStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Draft => write!(f, "Draft"),
+            Self::Confirmed => write!(f, "Confirmed"),
+            Self::Cancelled => write!(f, "Cancelled"),
+        }
+    }
+}
+
+impl std::str::FromStr for CustomerReturnStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "draft" => Ok(Self::Draft),
+            "confirmed" => Ok(Self::Confirmed),
+            "cancelled" | "canceled" => Ok(Self::Cancelled),
+            _ => Err(format!("invalid customer return status: {s}")),
+        }
+    }
+}
+
+/// A purchase return: the business sends goods BACK to a supplier. Stock goes out
+/// and money comes in, which is the only thing that distinguishes it from a
+/// purchase — the direction, and the fact that a return is partial.
+///
+/// **`payment_type` is deliberately absent.** `purchases` carries the flag and the
+/// refund cap reads it, but a return's refunds are determined entirely by the
+/// PARENT's payment rows — which account each payment came from, how much was
+/// collected, when — so a second copy here would be a value that could disagree
+/// with the rows it summarizes. The service reads the parent's. There is also no
+/// `due_date` and no `supplier_invoice_no`: a return is dated when it is made and
+/// is evidenced by the purchase it reverses, so both would be a second place for
+/// the same fact to be wrong.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurchaseReturn {
+    pub id: i64,
+    /// `YYYY-PRET-NNNNNN`, NULL only while Draft, immutable once assigned —
+    /// the same contract as `purchase_number`, because it is the same kind of
+    /// counter in the same table.
+    pub return_number: Option<String>,
+    /// Copied from the parent purchase rather than resolved through it, so the
+    /// return is self-contained on its own page. History survives: a supplier is
+    /// deactivated, not deleted.
+    pub supplier_id: i64,
+    /// The confirmed purchase this reverses. `RESTRICT` in the database: a return
+    /// is evidence ABOUT a purchase, and deleting the evidence because the subject
+    /// was deleted is the wrong direction.
+    pub purchase_id: i64,
+    pub status: PurchaseReturnStatus,
+    /// The day the return is MADE, not the parent's purchase date: the goods
+    /// leave today and the money arrives today, and dating the document to the
+    /// purchase would put stock movements in the past.
+    pub return_date: NaiveDate,
+    pub notes: String,
+    pub cancel_reason: Option<String>,
+    /// Audit actor: who created the return and who last edited it. A line adds no
+    /// columns of its own — it inherits the return's actor, as a purchase line
+    /// inherits the purchase's.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+    pub confirmed_at: Option<chrono::NaiveDateTime>,
+    pub cancelled_at: Option<chrono::NaiveDateTime>,
+}
+
+/// One line of a purchase return: a quantity OF a parent purchase line, at that
+/// line's cost.
+///
+/// **`product_id` is deliberately absent**, where `PurchaseLine` carries one: the
+/// return line names the parent LINE, and the product is one read away through it.
+/// A second copy of the product could name a different product than the line it
+/// claims to return, and nothing in the schema would notice.
+///
+/// There is also no `tax_total`, because the column does not exist. The tax
+/// snapshot is not carried onto a return, so there is nothing here to separate
+/// from the line's money.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurchaseReturnLine {
+    pub id: i64,
+    pub return_id: i64,
+    /// The parent line being returned. `RESTRICT`, and `UNIQUE` per return with
+    /// this column: the return's quantity is a quantity of THAT line, and
+    /// splitting one parent line into two return lines has no defined answer —
+    /// the same argument that makes a purchase refuse a repeated product.
+    pub purchase_line_id: i64,
+    /// Decimal qty > 0, stored as TEXT.
+    pub qty: Decimal,
+    /// Decimal unit_cost >= 0, FROZEN from the parent line when this line was
+    /// added, for the reason migration 39 froze the tax breakdown: a fact a later
+    /// rule could move must not be able to rewrite a document. A return is always
+    /// at the purchase price — `product_supplier_costs` holds one price per
+    /// (product, supplier) and that price history is the fact being recorded — so
+    /// this is a copy of a frozen value rather than a new price, and the form has
+    /// no price field at all.
+    pub unit_cost: Decimal,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+impl PurchaseReturnLine {
+    /// The line's money: the returned quantity at the frozen cost. Multiplication
+    /// only, and no rounding — a stored cost finer than two decimals is a fact
+    /// about the purchase, and the document total is a sum of these computed by a
+    /// service through a checked fold, never here.
+    pub fn subtotal(&self) -> Decimal {
+        self.qty * self.unit_cost
+    }
+}
+
+/// One refund of a purchase return: money coming BACK from the supplier, so it is
+/// an Income and the overdraft guard never fires on it.
+///
+/// **Both link columns are present from the start**, as `purchase_payments` and
+/// `sale_payments` were in migration 19, rather than adding `refund_transaction_id`
+/// by `ALTER` when the reversal path arrives. `transaction_id` is NULL for a
+/// historical row, `refund_transaction_id` is NULL until something is reversed,
+/// and a return that was itself reversed has BOTH — a state a single nullable
+/// column could not represent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurchaseReturnPayment {
+    pub id: i64,
+    pub return_id: i64,
+    pub account_id: i64,
+    pub method_id: i64,
+    /// Decimal amount > 0, stored as TEXT. Capped at what the parent purchase has
+    /// actually collected, so a return on a confirmed-but-unpaid purchase writes
+    /// no payment row at all — the return still exists to return the goods.
+    pub amount: Decimal,
+    pub date: NaiveDate,
+    /// Finance transaction this refund created (NULL for historical rows).
+    pub transaction_id: Option<i64>,
+    /// Refund transaction created when THIS RETURN was reversed, if it was.
+    pub refund_transaction_id: Option<i64>,
+    /// Audit actor: the acting user of the request that recorded the refund, and
+    /// `updated_by` the user who linked a reversal to it.
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// Aggregated purchase-return view with derived totals (never stored as truth).
+///
+/// The same shape as [`PurchaseDetail`], with the two differences the migrations
+/// force. There is no `tax_total`, and no field standing in for it: a return line
+/// freezes no tax, so `net_subtotal` and `total` are the same figure and
+/// `net_subtotal` is here so a record page has one name for "the money before
+/// tax" that does not have to change if a return ever does start freezing one.
+/// `total` is still the figure `paid`/`due` and the refund cap are measured
+/// against, as they are on a purchase.
+///
+/// `paid` is money REFUNDED to the business, which is the mirror of the parent's
+/// `paid`; the direction of the money is the only thing that changes. And there
+/// is no `payment_type` — see [`PurchaseReturn`] for why the parent's is the only
+/// copy.
+#[derive(Debug, Clone, Serialize)]
+pub struct PurchaseReturnDetail {
+    pub purchase_return: PurchaseReturn,
+    pub lines: Vec<PurchaseReturnLine>,
+    pub payments: Vec<PurchaseReturnPayment>,
+    /// `sum(line.subtotal())` — the money before tax, which here is all of it.
+    pub net_subtotal: Decimal,
+    /// The document total: the tax-inclusive figure, and with no frozen tax on a
+    /// line the same number as `net_subtotal`.
+    pub total: Decimal,
+    pub paid: Decimal,
+    pub due: Decimal,
+    pub payment_status: PaymentStatus,
+}
+
+/// A credit note: the customer sends goods BACK to the business. Stock comes in
+/// and money goes out, so the refund is an Expense and the overdraft guard DOES
+/// fire on it — the one behavioural asymmetry with the purchase return, and the
+/// reason the two are separate types rather than one parameterised over a sign.
+///
+/// **`payment_type` is deliberately absent**, for the same reason as on
+/// [`PurchaseReturn`]: the parent sale's payment rows are what a refund is
+/// computed from, and a second copy of the flag here could disagree with them.
+///
+/// The document is called `CustomerReturn` rather than `SaleReturn` on purpose.
+/// `SaleReturn` is the stock movement reason, it describes a physical event, and
+/// it keeps that name; a document and a movement must not share a word in code
+/// either, since the ambiguity is exactly what the naming decision removed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomerReturn {
+    pub id: i64,
+    /// `YYYY-SRET-NNNNNN`, NULL only while Draft. Named for the DOCUMENT rather
+    /// than for the family, because the document IS the credit note: the Spanish
+    /// label is the specific one and the identifier follows it. This is the one
+    /// field that is deliberately NOT the mirror of `return_number`.
+    pub credit_note_number: Option<String>,
+    /// Copied from the parent sale, so the credit note is self-contained on its
+    /// own page.
+    pub customer_id: i64,
+    /// The confirmed sale this reverses. `RESTRICT`, as on the purchase twin.
+    pub sale_id: i64,
+    pub status: CustomerReturnStatus,
+    /// The day the return is MADE: the goods come in today and the refund leaves
+    /// today.
+    pub return_date: NaiveDate,
+    pub notes: String,
+    pub cancel_reason: Option<String>,
+    /// Audit actor, as on [`PurchaseReturn`].
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+    pub confirmed_at: Option<chrono::NaiveDateTime>,
+    pub cancelled_at: Option<chrono::NaiveDateTime>,
+}
+
+/// One line of a credit note: a quantity OF a parent sale line, at that line's
+/// price. No `product_id` and no `tax_total`, both for the reasons given on
+/// [`PurchaseReturnLine`] — the line names its parent line, and the product and
+/// any tax are one read away through it.
+///
+/// **There is deliberately no `unit_cost` here**, and this is the one place the
+/// two families are NOT a clean mirror. What a sale was actually PROFITABLE at
+/// needs the cost the goods carried on the day they sold, and `sale_lines` freezes
+/// tax but not cost — so a future margin report would find this document unable to
+/// answer the question it exists to answer. The app computes no margin today, so
+/// nothing needs the figure; the cost snapshot is to be added when a margin report
+/// exists, once, rather than paid for speculatively here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomerReturnLine {
+    pub id: i64,
+    pub return_id: i64,
+    /// The parent sale line being returned. `RESTRICT`, and `UNIQUE` per return
+    /// with this column. Two credit note lines may still carry the SAME product,
+    /// because a sale may carry it twice — the key is about lines, not products.
+    pub sale_line_id: i64,
+    /// Decimal qty > 0, stored as TEXT.
+    pub qty: Decimal,
+    /// Decimal unit_price >= 0, FROZEN from the parent sale line when this line
+    /// was added, for the same reason the tax breakdown is frozen. A return is
+    /// always at the sale price, so the form has no price field.
+    pub unit_price: Decimal,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+impl CustomerReturnLine {
+    /// The line's money: the returned quantity at the frozen price. Multiplication
+    /// only, and no rounding, exactly as on the purchase twin.
+    pub fn subtotal(&self) -> Decimal {
+        self.qty * self.unit_price
+    }
+}
+
+/// One refund of a credit note: money going back to the customer, so it is an
+/// Expense and a refund the business cannot pay is refused rather than promised.
+///
+/// **There is deliberately no `receipt_id`**, where `SalePayment` carries one: a
+/// customer receipt groups a COLLECTION, and a credit note is a refund. Nothing
+/// about a return could be receipt-grouped, so the column would be a second thing
+/// to be NULL. Both transaction links are present from the start, as
+/// [`PurchaseReturnPayment`]'s are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomerReturnPayment {
+    pub id: i64,
+    pub return_id: i64,
+    pub account_id: i64,
+    pub method_id: i64,
+    /// Decimal amount > 0, stored as TEXT, capped at what the parent sale has
+    /// actually collected.
+    pub amount: Decimal,
+    pub date: NaiveDate,
+    /// Finance transaction this refund created (NULL for historical rows).
+    pub transaction_id: Option<i64>,
+    /// Refund transaction created when THIS CREDIT NOTE was reversed, if it was.
+    pub refund_transaction_id: Option<i64>,
+    /// Audit actor, as on [`PurchaseReturnPayment`].
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// Aggregated credit-note view with derived totals (never stored as truth).
+///
+/// [`PurchaseReturnDetail`]'s twin in every particular, including the two the
+/// migrations force: no `tax_total`, because a credit note line freezes no tax,
+/// and no `payment_type`, because the parent sale's payment rows are the authority.
+/// `paid` is money REFUNDED OUT, so the direction is the purchase return's mirror
+/// and the figure itself is the same shape.
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomerReturnDetail {
+    pub customer_return: CustomerReturn,
+    pub lines: Vec<CustomerReturnLine>,
+    pub payments: Vec<CustomerReturnPayment>,
+    /// `sum(line.subtotal())` — the money before tax, which here is all of it.
+    pub net_subtotal: Decimal,
+    /// The document total: the tax-inclusive figure, and with no frozen tax on a
+    /// line the same number as `net_subtotal`.
+    pub total: Decimal,
+    pub paid: Decimal,
+    pub due: Decimal,
+    pub payment_status: PaymentStatus,
+}
+
+/// Format `YYYY-PRET-NNNNNN` with zero-padded 6-digit sequence. The short form
+/// over `PURCH-RET` because the number is read aloud and typed by hand at a
+/// counter, and four characters is one fewer pair of hands on a keyboard. `PRET`
+/// collides with neither `SALE` nor `PURCH`, the only other consumers of
+/// `doc_sequences`.
+///
+/// `year` is the RETURN's own date year, passed in rather than read from the
+/// clock: the same reason the other families take it is an argument is that a
+/// document backdated into a past year must consume that year's counter, not
+/// this one's.
+pub fn format_purchase_return_number(year: i32, seq: i64) -> String {
+    format!("{year}-PRET-{seq:06}")
+}
+
+/// Format `YYYY-SRET-NNNNNN` with zero-padded 6-digit sequence, the credit note's
+/// twin of [`format_purchase_return_number`] — same width, same reason for it,
+/// and the same rule that `year` is the return's own date year.
+pub fn format_customer_return_number(year: i32, seq: i64) -> String {
+    format!("{year}-SRET-{seq:06}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3061,5 +3452,446 @@ mod tests {
     #[test]
     fn money_display_never_rounds_finer_than_two_decimals() {
         assert_eq!(money_display(dec("7.777")), "7.777");
+    }
+
+    // -- purchase returns and credit notes (odd/tasks/purchase-returns-and-
+    //    credit-notes.md) --------------------------------------------------
+    //
+    // The model layer only: these pin the number format, the status dialect and
+    // the shape of the two mirrored families. Every rule about what a return
+    // DOES lives in a service unit, and the columns are the migrations', so
+    // nothing here needs a database.
+
+    /// A fixed instant, so a struct can be built without a clock.
+    fn return_ts() -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 3, 4)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap()
+    }
+
+    fn purchase_return(
+        status: PurchaseReturnStatus,
+        return_number: Option<&str>,
+    ) -> PurchaseReturn {
+        PurchaseReturn {
+            id: 2,
+            return_number: return_number.map(str::to_string),
+            supplier_id: 4,
+            purchase_id: 9,
+            status,
+            return_date: NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            notes: String::new(),
+            cancel_reason: None,
+            created_by: 1,
+            updated_by: None,
+            created_at: return_ts(),
+            updated_at: return_ts(),
+            confirmed_at: None,
+            cancelled_at: None,
+        }
+    }
+
+    fn purchase_return_line(qty: &str, unit_cost: &str) -> PurchaseReturnLine {
+        PurchaseReturnLine {
+            id: 5,
+            return_id: 2,
+            purchase_line_id: 11,
+            qty: dec(qty),
+            unit_cost: dec(unit_cost),
+            created_at: return_ts(),
+        }
+    }
+
+    fn purchase_return_payment(
+        transaction_id: Option<i64>,
+        refund_transaction_id: Option<i64>,
+    ) -> PurchaseReturnPayment {
+        PurchaseReturnPayment {
+            id: 7,
+            return_id: 2,
+            account_id: 3,
+            method_id: 6,
+            amount: dec("7.50"),
+            date: NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            transaction_id,
+            refund_transaction_id,
+            created_by: 1,
+            updated_by: None,
+            created_at: return_ts(),
+            updated_at: return_ts(),
+        }
+    }
+
+    fn customer_return(
+        status: CustomerReturnStatus,
+        credit_note_number: Option<&str>,
+    ) -> CustomerReturn {
+        CustomerReturn {
+            id: 2,
+            credit_note_number: credit_note_number.map(str::to_string),
+            customer_id: 4,
+            sale_id: 9,
+            status,
+            return_date: NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            notes: String::new(),
+            cancel_reason: None,
+            created_by: 1,
+            updated_by: None,
+            created_at: return_ts(),
+            updated_at: return_ts(),
+            confirmed_at: None,
+            cancelled_at: None,
+        }
+    }
+
+    fn customer_return_line(qty: &str, unit_price: &str) -> CustomerReturnLine {
+        CustomerReturnLine {
+            id: 5,
+            return_id: 2,
+            sale_line_id: 11,
+            qty: dec(qty),
+            unit_price: dec(unit_price),
+            created_at: return_ts(),
+        }
+    }
+
+    fn customer_return_payment(
+        transaction_id: Option<i64>,
+        refund_transaction_id: Option<i64>,
+    ) -> CustomerReturnPayment {
+        CustomerReturnPayment {
+            id: 7,
+            return_id: 2,
+            account_id: 3,
+            method_id: 6,
+            amount: dec("7.50"),
+            date: NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            transaction_id,
+            refund_transaction_id,
+            created_by: 1,
+            updated_by: None,
+            created_at: return_ts(),
+            updated_at: return_ts(),
+        }
+    }
+
+    /// The exact rendered shape is asserted rather than derived, because the
+    /// number is read aloud and typed by hand at a counter: a dropped zero pad
+    /// or a long prefix is a typo the operator makes every time. The width is a
+    /// MINIMUM, not a ceiling — a seventh digit is printed, never truncated.
+    #[test]
+    fn format_purchase_return_number_pads_the_sequence_to_six_digits_under_the_short_prefix() {
+        assert_eq!(format_purchase_return_number(2026, 1), "2026-PRET-000001");
+        assert_eq!(format_purchase_return_number(2026, 42), "2026-PRET-000042");
+        assert_eq!(
+            format_purchase_return_number(2026, 1_234_567),
+            "2026-PRET-1234567"
+        );
+        // Sixteen characters, the same as a sale number and one shorter than a
+        // purchase number — the whole reason the short form was chosen. (The
+        // feature document calls these "15 characters"; a four-character prefix
+        // and a six-digit sequence make sixteen, and the relative claim is the
+        // one that decided it.)
+        assert_eq!(format_purchase_return_number(2026, 1).len(), 16);
+        assert_eq!(format_sale_number(2026, 1).len(), 16);
+        assert_eq!(format_purchase_number(2026, 1).len(), 17);
+    }
+
+    /// The customer return's twin, asserted the same way: the two families are
+    /// mirrored, and a formatter that only one of them proved is a formatter one
+    /// of them got wrong.
+    #[test]
+    fn format_customer_return_number_pads_the_sequence_to_six_digits_under_the_short_prefix() {
+        assert_eq!(format_customer_return_number(2026, 1), "2026-SRET-000001");
+        assert_eq!(format_customer_return_number(2026, 42), "2026-SRET-000042");
+        assert_eq!(
+            format_customer_return_number(2026, 1_234_567),
+            "2026-SRET-1234567"
+        );
+        assert_eq!(format_customer_return_number(2026, 1).len(), 16);
+        assert_eq!(
+            format_customer_return_number(2026, 1).len(),
+            format_purchase_return_number(2026, 1).len()
+        );
+    }
+
+    /// The prefixes are distinct, so no two families can render the same number
+    /// for the same year and sequence. `doc_sequences` keys on a free-form
+    /// `doc_type` with no CHECK, so nothing at the database would catch a
+    /// collision between two consumers that picked the same literal — this is
+    /// the only place that does.
+    #[test]
+    fn the_two_return_number_prefixes_collide_with_no_existing_document_number() {
+        let rendered = [
+            format_sale_number(2026, 7),
+            format_purchase_number(2026, 7),
+            format_purchase_return_number(2026, 7),
+            format_customer_return_number(2026, 7),
+        ];
+        for (i, a) in rendered.iter().enumerate() {
+            for b in &rendered[i + 1..] {
+                assert_ne!(a, b, "two families render the same document number: {a}");
+            }
+        }
+
+        // And the middle segment alone, so a number read aloud cannot be
+        // mistaken for one of the other three even before the sequence is said.
+        let prefixes: Vec<&str> = rendered
+            .iter()
+            .map(|n| n.split('-').nth(1).unwrap())
+            .collect();
+        assert_eq!(prefixes, vec!["SALE", "PURCH", "PRET", "SRET"]);
+    }
+
+    /// `Display` is what the repository binds into the `status` column, so it
+    /// must write exactly the three words the migration's CHECK accepts. A
+    /// fourth variant or a lowercase word would be refused by the database at
+    /// the worst possible moment: on confirm.
+    #[test]
+    fn purchase_return_status_display_writes_exactly_the_three_words_the_check_accepts() {
+        assert_eq!(PurchaseReturnStatus::Draft.to_string(), "Draft");
+        assert_eq!(PurchaseReturnStatus::Confirmed.to_string(), "Confirmed");
+        assert_eq!(PurchaseReturnStatus::Cancelled.to_string(), "Cancelled");
+    }
+
+    /// The customer return's twin of the same contract.
+    #[test]
+    fn customer_return_status_display_writes_exactly_the_three_words_the_check_accepts() {
+        assert_eq!(CustomerReturnStatus::Draft.to_string(), "Draft");
+        assert_eq!(CustomerReturnStatus::Confirmed.to_string(), "Confirmed");
+        assert_eq!(CustomerReturnStatus::Cancelled.to_string(), "Cancelled");
+    }
+
+    /// `FromStr` is the read direction of the same column, and it is the tolerant
+    /// one: it folds case and takes BOTH spellings of cancelled, because that is
+    /// what `SaleStatus` and `PurchaseStatus` already do. A new enum that parsed
+    /// only `cancelled` would be a second dialect for the same three values, and
+    /// the row written by one reader would fail the next.
+    #[test]
+    fn purchase_return_status_from_str_folds_case_and_accepts_both_spellings_of_cancelled() {
+        for (input, expected) in [
+            ("Draft", PurchaseReturnStatus::Draft),
+            ("draft", PurchaseReturnStatus::Draft),
+            ("DRAFT", PurchaseReturnStatus::Draft),
+            ("Confirmed", PurchaseReturnStatus::Confirmed),
+            ("confirmed", PurchaseReturnStatus::Confirmed),
+            ("Cancelled", PurchaseReturnStatus::Cancelled),
+            ("cancelled", PurchaseReturnStatus::Cancelled),
+            ("canceled", PurchaseReturnStatus::Cancelled),
+            ("CANCELED", PurchaseReturnStatus::Cancelled),
+        ] {
+            assert_eq!(
+                input.parse::<PurchaseReturnStatus>().unwrap(),
+                expected,
+                "parsing {input:?}"
+            );
+        }
+
+        // What `Display` writes is exactly what `FromStr` reads back: that is the
+        // whole contract with the CHECK.
+        for status in [
+            PurchaseReturnStatus::Draft,
+            PurchaseReturnStatus::Confirmed,
+            PurchaseReturnStatus::Cancelled,
+        ] {
+            assert_eq!(
+                status.to_string().parse::<PurchaseReturnStatus>().unwrap(),
+                status
+            );
+        }
+
+        // Anything else refuses and names the family, so a read of an unknown
+        // value cannot be mistaken for a Draft.
+        let err = "archived".parse::<PurchaseReturnStatus>().unwrap_err();
+        assert_eq!(err, "invalid purchase return status: archived");
+    }
+
+    /// The customer return's twin, including its own error wording — the two
+    /// families are separate types and a reader that conflates them in a log is
+    /// being told the wrong table.
+    #[test]
+    fn customer_return_status_from_str_folds_case_and_accepts_both_spellings_of_cancelled() {
+        for (input, expected) in [
+            ("Draft", CustomerReturnStatus::Draft),
+            ("draft", CustomerReturnStatus::Draft),
+            ("DRAFT", CustomerReturnStatus::Draft),
+            ("Confirmed", CustomerReturnStatus::Confirmed),
+            ("confirmed", CustomerReturnStatus::Confirmed),
+            ("Cancelled", CustomerReturnStatus::Cancelled),
+            ("cancelled", CustomerReturnStatus::Cancelled),
+            ("canceled", CustomerReturnStatus::Cancelled),
+            ("CANCELED", CustomerReturnStatus::Cancelled),
+        ] {
+            assert_eq!(
+                input.parse::<CustomerReturnStatus>().unwrap(),
+                expected,
+                "parsing {input:?}"
+            );
+        }
+
+        for status in [
+            CustomerReturnStatus::Draft,
+            CustomerReturnStatus::Confirmed,
+            CustomerReturnStatus::Cancelled,
+        ] {
+            assert_eq!(
+                status.to_string().parse::<CustomerReturnStatus>().unwrap(),
+                status
+            );
+        }
+
+        let err = "archived".parse::<CustomerReturnStatus>().unwrap_err();
+        assert_eq!(err, "invalid customer return status: archived");
+    }
+
+    /// A return is partial and its price is the parent's, frozen when the line
+    /// was added — so the amount is the RETURNED quantity at that price, not the
+    /// parent line's full quantity, and the multiplication is not rounded: a
+    /// stored cost finer than two decimals is a fact about the purchase, and
+    /// rounding it here would misstate what the supplier owes back.
+    #[test]
+    fn purchase_return_line_totals_the_returned_quantity_at_the_frozen_unit_cost() {
+        let line = purchase_return_line("3", "2.50");
+        assert_eq!(line.subtotal(), dec("7.50"));
+
+        // Not the parent line's whole quantity: sending 3 of 10 back is 7.50,
+        // and the 7 that stay are not this document's money.
+        assert_ne!(line.subtotal(), dec("25.00"));
+
+        // The finer-than-two-decimals case, the same never-lie rule the money
+        // display follows.
+        assert_eq!(purchase_return_line("2", "2.505").subtotal(), dec("5.010"));
+        assert_eq!(purchase_return_line("0", "2.50").subtotal(), dec("0"));
+    }
+
+    /// The credit note's twin, at the frozen SALE price. Same arithmetic, and
+    /// same reason there is nothing on the line that could price it differently.
+    #[test]
+    fn customer_return_line_totals_the_returned_quantity_at_the_frozen_unit_price() {
+        let line = customer_return_line("3", "2.50");
+        assert_eq!(line.subtotal(), dec("7.50"));
+
+        assert_ne!(line.subtotal(), dec("25.00"));
+        assert_eq!(customer_return_line("2", "2.505").subtotal(), dec("5.010"));
+        assert_eq!(customer_return_line("0", "2.50").subtotal(), dec("0"));
+    }
+
+    /// The detail is the document plus its children plus the money a record page
+    /// needs, and it carries no `payment_type`: the flag belongs to the parent
+    /// purchase, and a second copy here could disagree with the payment rows it
+    /// summarizes. Nothing can read it off this struct, which is the point.
+    #[test]
+    fn purchase_return_detail_carries_the_document_its_children_and_a_total_with_no_tax_parted_out()
+    {
+        let draft = PurchaseReturnDetail {
+            purchase_return: purchase_return(PurchaseReturnStatus::Draft, None),
+            lines: vec![purchase_return_line("3", "2.50")],
+            payments: vec![],
+            net_subtotal: dec("7.50"),
+            total: dec("7.50"),
+            paid: dec("0"),
+            due: dec("7.50"),
+            payment_status: PaymentStatus::Unpaid,
+        };
+
+        // A Draft carries no number, exactly as `purchase_number` does: the
+        // number is the last thing confirm assigns.
+        assert_eq!(draft.purchase_return.return_number, None);
+        assert_eq!(draft.purchase_return.purchase_id, 9);
+        assert_eq!(draft.lines.len(), 1);
+        assert_eq!(draft.payments.len(), 0);
+
+        // A return line freezes no tax, so there is nothing to separate: net and
+        // total are the same figure, and both are the line's own subtotal.
+        assert_eq!(draft.net_subtotal, draft.total);
+        assert_eq!(draft.total, draft.lines[0].subtotal());
+        assert_eq!(draft.due, draft.total - draft.paid);
+
+        let confirmed = PurchaseReturnDetail {
+            purchase_return: purchase_return(
+                PurchaseReturnStatus::Confirmed,
+                Some("2026-PRET-000001"),
+            ),
+            payments: vec![purchase_return_payment(Some(31), None)],
+            paid: dec("7.50"),
+            due: dec("0"),
+            payment_status: PaymentStatus::Paid,
+            ..draft
+        };
+        assert_eq!(
+            confirmed.purchase_return.return_number.as_deref(),
+            Some("2026-PRET-000001")
+        );
+        assert_eq!(confirmed.payments[0].transaction_id, Some(31));
+        assert_eq!(confirmed.due, Decimal::ZERO);
+    }
+
+    /// The credit note's twin. `credit_note_number` is named for the DOCUMENT
+    /// rather than the family, so the field name is deliberately not the mirror
+    /// of `return_number` — the Spanish label is the specific one and the
+    /// identifier follows it.
+    #[test]
+    fn customer_return_detail_carries_the_document_its_children_and_a_total_with_no_tax_parted_out()
+    {
+        let draft = CustomerReturnDetail {
+            customer_return: customer_return(CustomerReturnStatus::Draft, None),
+            lines: vec![customer_return_line("3", "2.50")],
+            payments: vec![],
+            net_subtotal: dec("7.50"),
+            total: dec("7.50"),
+            paid: dec("0"),
+            due: dec("7.50"),
+            payment_status: PaymentStatus::Unpaid,
+        };
+
+        assert_eq!(draft.customer_return.credit_note_number, None);
+        assert_eq!(draft.customer_return.sale_id, 9);
+        assert_eq!(draft.lines.len(), 1);
+        assert_eq!(draft.payments.len(), 0);
+        assert_eq!(draft.net_subtotal, draft.total);
+        assert_eq!(draft.total, draft.lines[0].subtotal());
+        assert_eq!(draft.due, draft.total - draft.paid);
+
+        let confirmed = CustomerReturnDetail {
+            customer_return: customer_return(
+                CustomerReturnStatus::Confirmed,
+                Some("2026-SRET-000001"),
+            ),
+            payments: vec![customer_return_payment(Some(31), None)],
+            paid: dec("7.50"),
+            due: dec("0"),
+            payment_status: PaymentStatus::Paid,
+            ..draft
+        };
+        assert_eq!(
+            confirmed.customer_return.credit_note_number.as_deref(),
+            Some("2026-SRET-000001")
+        );
+        assert_eq!(confirmed.payments[0].transaction_id, Some(31));
+        assert_eq!(confirmed.due, Decimal::ZERO);
+    }
+
+    /// Both link columns are born in the CREATE, so all three states are
+    /// representable: a payment with only its own movement, one that has been
+    /// refunded, and one that has been both — which is what reversing a return
+    /// that was itself confirmed produces. A single nullable column could not
+    /// hold the third, which is why migration 19 put both in the same table.
+    ///
+    /// There is no `receipt_id` on either: a return is a refund, and a customer
+    /// receipt groups a COLLECTION. Nothing on a return could carry one.
+    #[test]
+    fn a_return_payment_keeps_its_own_transaction_link_and_its_refund_link_independently() {
+        let paid = purchase_return_payment(Some(31), None);
+        assert_eq!(paid.transaction_id, Some(31));
+        assert_eq!(paid.refund_transaction_id, None);
+
+        let refunded = purchase_return_payment(Some(31), Some(44));
+        assert_eq!(refunded.transaction_id, Some(31));
+        assert_eq!(refunded.refund_transaction_id, Some(44));
+
+        let credit = customer_return_payment(Some(52), Some(53));
+        assert_eq!(credit.transaction_id, Some(52));
+        assert_eq!(credit.refund_transaction_id, Some(53));
     }
 }

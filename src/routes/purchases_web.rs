@@ -313,6 +313,12 @@ struct PurchasePageTemplate {
     /// action responses render, so the sentence travels with it.
     total_refusal_message: String,
     tracked_units_message: String,
+    /// Today's date, ISO — the `return_date` the record body's "Return goods"
+    /// action posts. See `PurchaseRecordContext::return_date`.
+    return_date: String,
+    /// Whether the acting principal holds `purchases.create`. See
+    /// `PurchaseRecordContext::can_return`.
+    can_return: bool,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
     nav: Nav,
@@ -378,6 +384,12 @@ struct PurchaseDetailPartial {
     /// concatenation and the codebase passes such strings from Rust.
     header_action: String,
     header_include: &'static str,
+    /// Today's date, ISO — what the "Return goods" action posts as the return's
+    /// own date. See `PurchaseRecordContext::return_date`.
+    return_date: String,
+    /// Whether the acting principal holds `purchases.create`. See
+    /// `PurchaseRecordContext::can_return`.
+    can_return: bool,
 }
 
 #[derive(Template)]
@@ -644,12 +656,26 @@ struct PurchaseRecordContext {
     /// and a unit count that leaves the range, and the effects preview has to say
     /// so rather than print a movement it cannot state.
     tracked_units_message: String,
+    /// Today's date in the active locale, ISO form — what the record page's
+    /// "Return goods" action posts as the return's own date. The return is made
+    /// on the day the operator starts it, not on the purchase's date, and the
+    /// field is a hidden input rather than a date picker because there is nothing
+    /// to decide at that moment: the return's header form edits it afterwards.
+    return_date: String,
+    /// Whether this principal holds `purchases.create` — the gate
+    /// `POST /web/purchase-returns` declares. The "Return goods" action renders
+    /// only when true, so the record page never offers an action the route would
+    /// refuse (AC21's rule for an action rather than a page entry). Resolved in
+    /// the wiring layer from the request's own principal, on EVERY render path
+    /// including the fragment: the fragment is a page too.
+    can_return: bool,
 }
 
 async fn record_context(
     state: &AppState,
     purchase_id: i64,
     localization: LocalizationContext,
+    can_return: bool,
 ) -> AppResult<PurchaseRecordContext> {
     let record = state.purchases_service.get_record(purchase_id).await?;
     let supplier = state
@@ -680,12 +706,18 @@ async fn record_context(
         record,
         confirm_due_date,
         method_options,
-        today,
+        // Cloned rather than moved: the same figure is both the entry row's
+        // `today` and the return action's `return_date`, and a field the
+        // template reads must exist on the context even when it is the same
+        // string twice.
+        today: today.clone(),
         localization,
         created_by_name,
         updated_by_name,
         total_refusal_message,
         tracked_units_message,
+        return_date: today,
+        can_return,
     })
 }
 
@@ -709,6 +741,8 @@ fn render_record(
         header_include: HEADER_SIBLING_INCLUDE,
         total_refusal_message: context.total_refusal_message,
         tracked_units_message: context.tracked_units_message,
+        return_date: context.return_date,
+        can_return: context.can_return,
     }
     .render()
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -721,8 +755,9 @@ async fn changed(
     state: &AppState,
     purchase_id: i64,
     localization: &LocalizationContext,
+    can_return: bool,
 ) -> AppResult<Response> {
-    changed_with_notice(state, purchase_id, localization, false, None).await
+    changed_with_notice(state, purchase_id, localization, can_return, false, None).await
 }
 
 /// The add-line response with an optional out-of-band server notice prepended
@@ -735,11 +770,12 @@ async fn changed_with_notice(
     state: &AppState,
     purchase_id: i64,
     localization: &LocalizationContext,
+    can_return: bool,
     entry_row_focus: bool,
     notice_html: Option<String>,
 ) -> AppResult<Response> {
     let mut html = render_record(
-        record_context(state, purchase_id, localization.clone()).await?,
+        record_context(state, purchase_id, localization.clone(), can_return).await?,
         entry_row_focus,
         true,
     )?
@@ -930,7 +966,13 @@ async fn purchase_record_page(
     let Ok(id) = raw_id.parse::<i64>() else {
         return Err(AppError::NotFound(format!("purchase {raw_id} not found")));
     };
-    let context = record_context(&state, id, localization).await?;
+    let context = record_context(
+        &state,
+        id,
+        localization,
+        principal.has_permission::<PurchasesCreate>(),
+    )
+    .await?;
     let label = match &context.record.purchase.purchase_number {
         Some(number) => number.clone(),
         None => context
@@ -974,6 +1016,8 @@ async fn purchase_record_page(
         header_include: HEADER_SIBLING_INCLUDE,
         total_refusal_message: context.total_refusal_message,
         tracked_units_message: context.tracked_units_message,
+        return_date: context.return_date,
+        can_return: context.can_return,
         nav_key: "purchases",
         nav: Nav::for_principal(&principal),
     };
@@ -1008,11 +1052,18 @@ async fn web_purchase_list(
 async fn web_purchase_detail(
     State(state): State<AppState>,
     _: Require<PurchasesRead>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     let html = render_record(
-        record_context(&state, id, localization).await?,
+        record_context(
+            &state,
+            id,
+            localization,
+            principal.has_permission::<PurchasesCreate>(),
+        )
+        .await?,
         false,
         false,
     )?
@@ -1287,12 +1338,22 @@ async fn web_add_line(
     Path(id): Path<i64>,
     Form(form): Form<AddLineForm>,
 ) -> AppResult<Response> {
-    web_add_line_impl(state, principal.user_id, headers, localization, id, form).await
+    web_add_line_impl(
+        state,
+        principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
+        headers,
+        localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn web_add_line_impl(
     state: AppState,
     actor: i64,
+    can_return: bool,
     headers: HeaderMap,
     localization: LocalizationContext,
     id: i64,
@@ -1388,7 +1449,7 @@ async fn web_add_line_impl(
             ),
             LineAddOutcome::Added(_) => None,
         };
-        return changed_with_notice(&state, id, &localization, true, notice).await;
+        return changed_with_notice(&state, id, &localization, can_return, true, notice).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1406,6 +1467,7 @@ async fn web_add_line_collection(
     web_add_line_impl(
         state,
         principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
         headers,
         localization,
         form.purchase_id,
@@ -1462,7 +1524,13 @@ async fn web_update_line(
         // Same contract, same renderer, same reason as the add.
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
-        return changed(&state, purchase_id, &localization).await;
+        return changed(
+            &state,
+            purchase_id,
+            &localization,
+            principal.has_permission::<PurchasesCreate>(),
+        )
+        .await;
     }
     Ok(Redirect::to(&format!("/purchases/{purchase_id}")).into_response())
 }
@@ -1478,7 +1546,13 @@ async fn web_remove_line(
         .purchases_service
         .remove_line(principal.user_id, line_id)
         .await?;
-    changed(&state, purchase_id, &localization).await
+    changed(
+        &state,
+        purchase_id,
+        &localization,
+        principal.has_permission::<PurchasesCreate>(),
+    )
+    .await
 }
 
 /// Cost-freshness T5 (gate corrected in T9): the stale-cost warning's action.
@@ -1559,7 +1633,13 @@ async fn web_apply_line_cost(
         // exactly what they were.
         .map_err(|error| localized_refusal_error(error, &localization))?;
     if is_htmx(&headers) {
-        return changed(&state, purchase_id, &localization).await;
+        return changed(
+            &state,
+            purchase_id,
+            &localization,
+            principal.has_permission::<PurchasesCreate>(),
+        )
+        .await;
     }
     Ok(Redirect::to(&format!("/purchases/{purchase_id}")).into_response())
 }
@@ -1573,12 +1653,22 @@ async fn web_confirm_purchase(
     Path(id): Path<i64>,
     Form(form): Form<ConfirmPurchaseForm>,
 ) -> AppResult<Response> {
-    web_confirm_purchase_impl(state, principal.user_id, headers, &localization, id, form).await
+    web_confirm_purchase_impl(
+        state,
+        principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
+        headers,
+        &localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn web_confirm_purchase_impl(
     state: AppState,
     actor: i64,
+    can_return: bool,
     headers: HeaderMap,
     localization: &LocalizationContext,
     id: i64,
@@ -1614,7 +1704,7 @@ async fn web_confirm_purchase_impl(
         .confirm(actor, id, method_id)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(&state, id, &localization, can_return).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1630,6 +1720,7 @@ async fn web_confirm_purchase_collection(
     web_confirm_purchase_impl(
         state,
         principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
         headers,
         &localization,
         form.purchase_id,
@@ -1647,12 +1738,22 @@ async fn web_record_payment(
     Path(id): Path<i64>,
     Form(form): Form<RecordPaymentForm>,
 ) -> AppResult<Response> {
-    web_record_payment_impl(state, principal.user_id, headers, localization, id, form).await
+    web_record_payment_impl(
+        state,
+        principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
+        headers,
+        localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn web_record_payment_impl(
     state: AppState,
     actor: i64,
+    can_return: bool,
     headers: HeaderMap,
     localization: LocalizationContext,
     id: i64,
@@ -1665,7 +1766,7 @@ async fn web_record_payment_impl(
         .record_payment(actor, id, form.method_id, amount, date)
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(&state, id, &localization, can_return).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1681,6 +1782,7 @@ async fn web_record_payment_collection(
     web_record_payment_impl(
         state,
         principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
         headers,
         localization,
         form.purchase_id,
@@ -1698,12 +1800,22 @@ async fn web_cancel_purchase(
     Path(id): Path<i64>,
     Form(form): Form<CancelPurchaseForm>,
 ) -> AppResult<Response> {
-    web_cancel_purchase_impl(state, principal.user_id, headers, &localization, id, form).await
+    web_cancel_purchase_impl(
+        state,
+        principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
+        headers,
+        &localization,
+        id,
+        form,
+    )
+    .await
 }
 
 async fn web_cancel_purchase_impl(
     state: AppState,
     actor: i64,
+    can_return: bool,
     headers: HeaderMap,
     localization: &LocalizationContext,
     id: i64,
@@ -1718,7 +1830,7 @@ async fn web_cancel_purchase_impl(
         .await
         .map_err(|error| localized_refusal_error(error, localization))?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(&state, id, &localization, can_return).await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -1734,6 +1846,7 @@ async fn web_cancel_purchase_collection(
     web_cancel_purchase_impl(
         state,
         principal.user_id,
+        principal.has_permission::<PurchasesCreate>(),
         headers,
         &localization,
         form.purchase_id,
@@ -1792,7 +1905,13 @@ async fn web_update_purchase_header(
         )
         .await?;
     if is_htmx(&headers) {
-        return changed(&state, id, &localization).await;
+        return changed(
+            &state,
+            id,
+            &localization,
+            principal.has_permission::<PurchasesCreate>(),
+        )
+        .await;
     }
     Ok(Redirect::to(&format!("/purchases/{id}")).into_response())
 }
@@ -8283,6 +8402,100 @@ mod tests {
             "the stored cost is untouched"
         );
         assert_eq!(line.qty, dec_web("2"), "and so is the quantity");
+    }
+
+    // -- Return goods: the action that starts a purchase return ---------------
+
+    /// **THE TEST THAT WOULD HAVE CAUGHT THE DEAD CREATION FLOW.**
+    ///
+    /// A purchase return reverses a NAMED document, so its creation post carries
+    /// that document's id — and there is no picker anywhere that could fill one
+    /// later. The only place the operator is already holding the right document
+    /// is its own record page, so the action lives there and the id is rendered
+    /// onto it, filled in. A form that renders with an empty id is a form that
+    /// cannot work, and the suite said nothing about it because no assertion ever
+    /// looked for the id.
+    #[tokio::test]
+    async fn a_confirmed_purchase_record_offers_return_goods_with_this_purchase_id_already_filled()
+    {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html(app, &format!("/purchases/{}", fixture.purchase_id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+
+        let form = enclosing_form(&html, "/web/purchase-returns");
+        assert!(
+            form.contains(&format!("value=\"{}\"", fixture.purchase_id)),
+            "the action must carry THIS purchase's id, filled in: a return names the \
+             document it reverses and nothing else can supply that id: {form:.600}"
+        );
+        assert!(
+            form.contains("Return goods"),
+            "the action states in the operator's language what it does: {form:.600}"
+        );
+    }
+
+    /// The other half of the same gate: the action is `purchases.create`, the
+    /// parent's own write code — the one `POST /web/purchase-returns` declares.
+    /// A principal that may read a purchase and may not create one must see no
+    /// action (an entry the route would refuse is worse than none) and must be
+    /// refused the post itself.
+    #[tokio::test]
+    async fn return_goods_is_gated_on_purchases_create_for_both_sight_and_post() {
+        let state = test_state().await;
+        let fixture = seed_record_fixture(&state, PaymentType::Cash).await;
+        state
+            .purchases_service
+            .confirm(
+                audit_actor(&state).await,
+                fixture.purchase_id,
+                Some(fixture.method_id),
+            )
+            .await
+            .unwrap();
+        let probe = test_support::seed_session_with_permissions(&state.pool, &["purchases.read"])
+            .await
+            .unwrap();
+        let cookie = test_support::cookie_for(&probe);
+        let app = crate::routes::router(state);
+
+        let (status, html) = get_html_as(
+            app.clone(),
+            &format!("/purchases/{}", fixture.purchase_id),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        assert!(
+            !html.contains("/web/purchase-returns"),
+            "a principal without purchases.create must not be shown an action the \
+             route refuses: {html:.600}"
+        );
+
+        let (status, html) = post_form_as(
+            app,
+            "/web/purchase-returns",
+            &format!("purchase_id={}", fixture.purchase_id),
+            &[("HX-Request", "true")],
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{html:.300}");
+        assert!(
+            html.contains("purchases.create"),
+            "the refusal names the code the principal lacks: {html:.600}"
+        );
     }
 
     /// One row of a rendered list, sliced out by its row id.

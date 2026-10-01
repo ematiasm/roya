@@ -1,5 +1,6 @@
 pub mod account;
 pub mod customer_receipts;
+pub mod customer_return;
 pub mod customers;
 pub mod documents;
 pub mod final_price;
@@ -8,6 +9,7 @@ pub mod gross_inverse;
 pub mod identity;
 pub mod inventory;
 pub mod line_taxes;
+pub mod purchase_return;
 pub mod purchases;
 pub mod sales;
 pub mod settings;
@@ -56,11 +58,13 @@ pub fn checked_money_sum<'a>(
 
 pub use account::AccountService;
 pub use customer_receipts::CustomerReceiptService;
+pub use customer_return::CustomerReturnService;
 pub use customers::CustomerService;
 pub use documents::DocumentService;
 pub use finance_methods::PaymentMethodService;
 pub use identity::IdentityService;
 pub use inventory::InventoryService;
+pub use purchase_return::PurchaseReturnService;
 pub use purchases::PurchasesService;
 pub use sales::SalesService;
 pub use settings::SettingsService;
