@@ -29,7 +29,21 @@
        "DRAFT CONFIRMED" — the sibling `customer_return_detail.html` gets this
        right, and it is the shape a reader expects here too. #}
     <span class="chip {% if record.detail.purchase_return.status.to_string() == "Confirmed" %}chip-income{% else if record.detail.purchase_return.status.to_string() == "Cancelled" %}chip-expense{% endif %}">{% if record.detail.purchase_return.status.to_string() == "Draft" %}{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}{% else if record.detail.purchase_return.status.to_string() == "Confirmed" %}{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}{% endif %}</span>
-    <span class="chip {% if record.detail.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}" data-purchase-return-payment-status>{% if record.detail.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if record.detail.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>
+    {# THE PAYMENT CHIP IS OUT OF BAND ON A COMMIT, FOR THE SAME REASON THE ACTION
+       BAR IS. It sits above the money region, so the quantity commit's swap
+       never reaches it, and a chip that still reads the document as it was at
+       page load states a figure about money that is no longer true: on a draft
+       with no lines `total` and `paid` are both zero, so `due <= 0` and it says
+       PAID — beside a line the operator has just typed. `hx-swap-oob` on the
+       commit response is what brings the fresh copy in, exactly as the action bar
+       below already does with the same flag.
+
+       The `id` is what htmx matches the out-of-band element by; the `data-`
+       attribute is what the tests and the rest of the markup address it by. #}
+    <span class="chip {% if record.detail.payment_status.to_string() == "Paid" %}chip-income{% else %}chip-expense{% endif %}"
+          id="purchase-return-payment-status"
+          {% if oob_action_bar %}hx-swap-oob="true"{% endif %}
+          data-purchase-return-payment-status>{% if record.detail.payment_status.to_string() == "Paid" %}{{ localization.tr(crate::localization::MessageKey::StatusPaid) }}{% else if record.detail.payment_status.to_string() == "Partial" %}{{ localization.tr(crate::localization::MessageKey::StatusPartial) }}{% else %}{{ localization.tr(crate::localization::MessageKey::StatusUnpaid) }}{% endif %}</span>
     <span class="text-base font-bold">
       {% if let Some(n) = record.detail.purchase_return.return_number %}{{ n }}{% else %}{{ localization.tr(crate::localization::MessageKey::PurchaseReturnsDraft) }}{% endif %}
     </span>
@@ -50,15 +64,24 @@
   {% endif %}
 
   {# Sticky action bar, outside the money region so the add-line response can
-     refresh it out of band. A cancelled record renders no bar. #}
+     refresh it out of band. A cancelled record renders no bar.
+
+     `tabindex="-1"` is what makes this a landing place. Every quantity commit
+     replaces the money region, so whichever row input held focus is destroyed by
+     the swap and the browser drops focus to `document.body` — an operator who has
+     just finished the last row of a return has no caret anywhere. The bar is the
+     one region of the record the money swap never touches, so it can hold focus
+     for the shell's counter flow to put it on. `-1` and not `0`: focusable from a
+     script, absent from the tab order, because Tab must still walk the document
+     in the order it reads. #}
   {% if record.detail.purchase_return.status.to_string() == "Draft" %}
-  <div id="purchase-return-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
+  <div id="purchase-return-action-bar" tabindex="-1"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
        class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
     <button type="button" id="open-confirm-return" class="btn-primary"{% if record.detail.lines.is_empty() %} disabled{% endif %}
             onclick="openReturnDialog('confirm-purchase-return')">{{ localization.tr(crate::localization::MessageKey::SalesConfirmAction) }} ▾</button>
   </div>
   {% else if record.detail.purchase_return.status.to_string() == "Confirmed" %}
-  <div id="purchase-return-action-bar"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
+  <div id="purchase-return-action-bar" tabindex="-1"{% if oob_action_bar %} hx-swap-oob="true"{% endif %}
        class="sticky top-14 md:top-0 z-20 mb-3 flex items-center gap-2 rounded-2xl border border-border bg-card px-3 py-2">
     <button type="button" class="btn-secondary px-3.5 py-2 text-base"
             onclick="openReturnDialog('cancel-purchase-return')">{{ localization.tr(crate::localization::MessageKey::PurchaseReturnsCancel) }}</button>
@@ -145,16 +168,43 @@
                  the browser its own parsing and its own rounding, which is
                  precisely what a locale-formatted figure must not do.
                  `locale_aware_decimal_html_controls_are_reachable_text_inputs`
-                 is the test that pins the rule. #}
+                 is the test that pins the rule.
+
+                 **`hx-select` AND `hx-swap="outerHTML"` TOGETHER, OR THE RECORD
+                 BODY RENDERS TWICE.** The response is the WHOLE record fragment,
+                 whose root is `#purchase-return-record-inner`, while the target is
+                 the money region. Swapping that response into the money region
+                 with `outerHTML` installs the entire body INSIDE the money
+                 region and leaves the page-load copy above it untouched, so the
+                 screen carries two headers, two party lines and two parent links.
+                 `hx-select` narrows the response to the money region BEFORE the
+                 swap, which is why the sibling `partials/purchase_detail.html`
+                 pairs it with `hx-swap="outerHTML"` on its own line editor and
+                 why this one must too. The duplicate was invisible to 1613
+                 passing tests because every one of them read the inner copy.
+                 `test_writing_a_quantity_leaves_exactly_one_record_body_on_the_screen`
+                 is the test that pins it.
+
+                 The stale copy is not merely a repeat, it is a CONTRADICTION:
+                 it was rendered from a document with no lines, where `total` and
+                 `paid` are both zero, so `due <= 0` and the chip reads PAID —
+                 while the fresh copy, carrying a line, reads UNPAID.
+
+                 `data-return-qty` is the marker the shell's counter flow reads
+                 the rows by. It is a hook, not a behaviour: the flow needs to
+                 address "the quantity controls of this editor" in one query and
+                 the ids alone say which document a control belongs to, not what
+                 it does. #}
               <input type="text" inputmode="decimal" id="return-qty-{{ option.purchase_line_id }}" name="qty"
                      class="field w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
                      {% if loop.first %}{% if entry_row_focus %}autofocus{% endif %}{% endif %}
                      {% if let Some(claimed) = option.on_this_draft %}value="{{ localization.format_quantity(claimed.clone()) }}"{% endif %}
                      {% if !option.can_add %}disabled{% endif %}
-                     step="any" data-action="{{ localization.tr(crate::localization::MessageKey::ActionEditLine) }}"
+                     step="any" data-return-qty
+                     data-action="{{ localization.tr(crate::localization::MessageKey::ActionEditLine) }}"
                      hx-post="/web/purchase-returns/{{ record.detail.purchase_return.id }}/lines"
                      hx-vals='{"purchase_line_id": {{ option.purchase_line_id }}}'
-                     hx-target="#purchase-return-record-money" hx-swap="outerHTML" />
+                     hx-target="#purchase-return-record-money" hx-swap="outerHTML" hx-select="#purchase-return-record-money" />
             </td>
             {% else %}
             <td class="py-2.5 pr-3 text-right tabular-nums">{% if let Some(claimed) = option.on_this_draft %}{{ localization.format_quantity(claimed.clone()) }}{% endif %}</td>

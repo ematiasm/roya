@@ -23,4 +23,179 @@
     }
   });
 </script>
+
+{# THE COUNTER FLOW. An operator at a counter types a quantity per row twenty
+   times in a row — take a row, type a quantity, commit, take the next — and the
+   commit is a blur, because htmx's trigger for the quantity control is `change`.
+   So the flow is twenty tab-and-click round trips through a mouse, for a job
+   that is one keystroke each, and nothing on the page says a row is a step in a
+   sequence at all.
+
+   **It lives in the PAGE SHELL for the reason the block above states**, and it
+   is the purchase-return shell's block with this family's ids: the two families
+   mirror each other, so a difference here is a difference both screens would
+   have to grow.
+
+   **Every destination is an ID STRING, never an element reference.** A commit
+   replaces the money region (`hx-swap="outerHTML"`), so the input that was typed
+   into and the input the operator should land on are both destroyed and rebuilt
+   by it. A reference taken before the swap would point at a detached node,
+   which accepts `.focus()` and does nothing at all.
+
+   **The swap is observed, never waited for.** htmx raises `beforeRequest` when a
+   request is actually issued and `afterSettle` when the rebuild has finished; a
+   blur dispatches `change` synchronously, so the two are the boundary between
+   "this commit is in flight" and "this commit has landed". No timer is involved,
+   and a keystroke that changes nothing raises no request at all — measured
+   against the vendored htmx 1.9.12, which skips an unchanged `change` — so the
+   two events are the only honest signal that a rebuild is or is not coming. #}
+<script>
+  (function () {
+    var ROW = '[data-return-qty]';
+    // The sentinel for "there is no next row". Not null: null means "nothing is
+    // pending", and the end of the sequence is a destination like any other.
+    var END = 'end-of-rows';
+    var CONFIRM = 'open-confirm-note';
+    var BAR = 'customer-return-action-bar';
+
+    // Where focus lands once the money region has been rebuilt, and whether a
+    // request for the row being committed is actually in flight.
+    var advanceTo = null;
+    var inFlight = false;
+    // Set for exactly one commit, by Shift+Enter. See `keydown`.
+    var suppress = false;
+
+    // The rows an operator can actually type into, in reading order. A row whose
+    // allowance is gone is rendered `disabled` by the editor — offering a
+    // quantity the service would refuse is worse than offering none — and
+    // stepping onto one would leave the caret somewhere the next keystroke goes
+    // nowhere, with nothing on screen saying why.
+    function rows() {
+      return Array.prototype.filter.call(
+        document.querySelectorAll(ROW),
+        function (input) { return !input.disabled; }
+      );
+    }
+
+    function putFocusOn(id) {
+      var el = document.getElementById(id);
+      if (el) {
+        el.focus();
+        // Selecting the figure means the next keystroke replaces it, which is
+        // what someone correcting a row means to do. On an empty row it is a
+        // no-op and the caret sits at the start.
+        if (typeof el.select === 'function') el.select();
+        return;
+      }
+      // END. The operator has described the whole note; confirming is the next
+      // thing they do, and the confirm control is OUTSIDE the money region, so
+      // the swap that just happened left it exactly where it was. It is disabled
+      // while the document holds no lines, and a caret on a disabled control is
+      // the same trap wearing a different hat — so an empty last row lands on
+      // the bar, which is always focusable and always inside the record.
+      var confirm = document.getElementById(CONFIRM);
+      if (confirm && !confirm.disabled) { confirm.focus(); return; }
+      var bar = document.getElementById(BAR);
+      if (bar) bar.focus();
+    }
+
+    // Arm or drop the pending destination as requests come and go.
+    document.body.addEventListener('htmx:beforeRequest', function (evt) {
+      var source = evt.target && evt.target.closest ? evt.target.closest(ROW) : null;
+      if (source && suppress) {
+        // The Shift+Enter case: the move up raised `change` on the row being
+        // left, and this is the moment to refuse it. Cancelling the REQUEST is
+        // the only handle there is — `change` cannot be cancelled, and the
+        // value stays in the field for the operator to keep or correct.
+        evt.preventDefault();
+        suppress = false;
+        return;
+      }
+      if (source) { inFlight = true; return; }
+      // Any other request — a confirm, a line removal, a header save — is not
+      // the commit this flow is waiting for, so a pending destination is dropped
+      // rather than spent on somebody else's swap.
+      advanceTo = null;
+      inFlight = false;
+    });
+
+    // The rebuild has landed; now the destination exists and can take focus.
+    // This runs after htmx's own focus restore, which puts focus back on the
+    // element whose id matches the requester — the row just committed — so the
+    // advance has to come after it or it would be undone.
+    document.body.addEventListener('htmx:afterSettle', function () {
+      inFlight = false;
+      if (advanceTo === null) return;
+      var id = advanceTo;
+      advanceTo = null;
+      putFocusOn(id);
+    });
+
+    // Enter commits and advances; Shift+Enter goes back without committing.
+    document.body.addEventListener('keydown', function (evt) {
+      if (evt.key !== 'Enter') return;
+      var input = evt.target && evt.target.closest ? evt.target.closest(ROW) : null;
+      if (!input || input.disabled) return;
+      var all = rows();
+      var at = all.indexOf(input);
+      if (at < 0) return;
+      // Enter inside a text field would submit a form if one ever wraps this
+      // control, and it does nothing useful here either way.
+      evt.preventDefault();
+
+      if (evt.shiftKey) {
+        if (at <= 0) return;
+        advanceTo = null;
+        suppress = true;
+        putFocusOn(all[at - 1].id);
+        // Cleared on the way out, because the focus move above — and therefore
+        // the `change` it raises, and therefore any request for the row being
+        // left — all happen inside it. Leaving the flag set would cancel the
+        // NEXT real commit instead.
+        suppress = false;
+        return;
+      }
+
+      suppress = false;
+      advanceTo = (at + 1 < all.length) ? all[at + 1].id : END;
+      // The commit IS the blur: htmx's trigger for this control is `change`, and
+      // `blur()` raises it synchronously, so by the time this returns any
+      // request is already in flight and `beforeRequest` has said so.
+      input.blur();
+      if (!inFlight) {
+        // Nothing changed, so no request and no rebuild: there is nothing to
+        // wait for, and the row is already typed.
+        var id = advanceTo;
+        advanceTo = null;
+        putFocusOn(id);
+      }
+    });
+
+    // The page opens with the first row's caret in it. An operator who has just
+    // opened a note to describe it should be able to type, and the quantity
+    // control is the only field that describes it — the date and the notes
+    // already carry values.
+    //
+    // `entry_row_focus` is NOT used for this, and the reason is worth recording.
+    // That flag adds `autofocus` to the first row, and the route sets it only on
+    // the add-line RESPONSE, never on the record page
+    // (`customer_return_record_page` passes `entry_row_focus: false`). It could
+    // not be used on the page load even if the route wanted it to: `autofocus` is
+    // honoured only while a document is being parsed, so on markup htmx inserts
+    // it does nothing at all — measured, by inserting an `autofocus` input with
+    // `innerHTML` and reading `document.activeElement`. The focus that appears
+    // after a commit is htmx's own, restoring the element whose id matches the
+    // requester's. So the page-load focus is asked for here, in script, and the
+    // flag is left exactly as the route sets it.
+    function focusTheFirstRow() {
+      var all = rows();
+      if (all.length) all[0].focus();
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', focusTheFirstRow);
+    } else {
+      focusTheFirstRow();
+    }
+  })();
+</script>
 {% endblock %}

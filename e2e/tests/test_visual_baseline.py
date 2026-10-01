@@ -241,6 +241,23 @@ def _pages(data: HarnessData) -> list[tuple[str, str]]:
         # class is covered by the computed-style test instead.
         ("settings", "/settings"),
         ("settings-taxes", "/settings?tab=taxes"),
+        # The two return lists, added for the same reason the Settings pages
+        # were and for the same shape of gap: the sidebar entries shipped with
+        # no entry in this net, so nothing here could see what those two pages
+        # actually look like. Their record pages are the richer surface and are
+        # NOT in this list — a return record is reached only after a document
+        # exists, so capturing it means seeding one, and the seed would move
+        # `documents`, `products` and the drawer captures above. The list pages
+        # are the resting state a nav entry opens, which is what the entry
+        # promises, and they cost no seed.
+        #
+        # Captured empty, deliberately, and the emptiness is the point: these
+        # are the pages a shop sees before its first return, and the empty state
+        # plus the "where to start one" sentence is the whole screen then. A
+        # seeded row would be a better picture and a worse net, because the seed
+        # would perturb the captures already in this file.
+        ("purchase-returns", "/purchase-returns"),
+        ("customer-returns", "/customer-returns"),
     ]
 
 
