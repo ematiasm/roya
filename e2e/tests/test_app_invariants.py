@@ -76,12 +76,15 @@ _ROUTE_SOURCES = [ROUTES_DIR / "web.rs", *sorted(ROUTES_DIR.glob("*_web.rs"))]
 # first `)` followed by a comma or a line end, which is how both the one-line
 # `get(a).post(b)` shape and the multi-line `post(\n  handler,\n)` shape end.
 _ROUTE_CALL = re.compile(r'\.route\(\s*"([^"]+)"\s*,\s*(.*?)\)\s*(?:,|\n)', re.S)
+_ROUTE_OPEN = re.compile(r"\.route\(")
 _HAS_GET = re.compile(r"\bget\(")
 
 # `/web/...` serves htmx fragments, not pages: they are swapped into a region of
 # a page that was already loaded, and three of them answer `400` on a bare GET
 # because they require an hx request or a query. The page is the shell.
 _FRAGMENT_PREFIX = "/web/"
+# `/api/...` is the JSON contract beside the page, not the page.
+_API_PREFIX = "/api/"
 
 # The two pages that render outside the signed-in shell. See the module
 # docstring: the exclusion is asserted, not assumed.
@@ -101,25 +104,80 @@ _PARAM_OWNER = {
 }
 
 
+def _page_routes_in(source: Path) -> list[str]:
+    """The page routes one source file registers.
+
+    A page is a full page, not an htmx fragment (`/web/...`) and not a JSON
+    endpoint (`/api/...`), so those two prefixes are the whole exclusion.
+    """
+    routes: list[str] = []
+    for match in _ROUTE_CALL.finditer(source.read_text(encoding="utf-8")):
+        path, methods = match.group(1), match.group(2)
+        if path.startswith(_FRAGMENT_PREFIX) or path.startswith(_API_PREFIX):
+            continue
+        if not _HAS_GET.search(methods):
+            continue
+        routes.append(path)
+    return routes
+
+
+def _assert_every_route_call_was_parsed() -> None:
+    """No `.route(` call may fall through the parser.
+
+    A count guard rather than a threshold, because a threshold cannot tell a
+    complete extraction from a partial one. If the registration shape changes
+    enough that the pattern stops reading a call, the parsed total drops below
+    the number of calls in the same text and this fails — instead of returning
+    a shorter route list that every sweep would then pass against.
+    """
+    for source in _ROUTE_SOURCES:
+        text = source.read_text(encoding="utf-8")
+        parsed = len(_ROUTE_CALL.findall(text))
+        declared = len(_ROUTE_OPEN.findall(text))
+        assert parsed == declared, (
+            f"{source.name} declares {declared} .route( call(s) but the parser "
+            f"read {parsed}; a registration shape this module cannot read is a "
+            "page that would silently leave every sweep"
+        )
+
+
+def _unscanned_page_route_sources() -> list[str]:
+    """Files under src/routes registering a page route this module never reads.
+
+    The source list names the route modules that exist today. A page route in a
+    file it does not name would leave the sweep blind to that page while every
+    test stayed green, which is the failure this module exists to catch — so a
+    file that registers one is an error here rather than a silent omission.
+    """
+    scanned = set(_ROUTE_SOURCES)
+    return [
+        source.name
+        for source in sorted(ROUTES_DIR.glob("*.rs"))
+        if source not in scanned and _page_routes_in(source)
+    ]
+
+
 def registered_page_routes() -> list[str]:
     """Every GET page route the application registers, from its own source.
 
     The registry is the source of truth, not a list kept here: a screen added
     tomorrow is swept tomorrow, and a screen deleted fails this module instead
-    of leaving a stale expectation. The two guards below make a broken
-    extraction fail loudly instead of returning a short list that would make
-    every sweep pass vacuously.
+    of leaving a stale expectation. Both guards below are structural — every
+    declaration read, every registering file named — so a partial miss fails
+    loudly rather than returning a short list that every sweep would pass
+    against.
     """
-    routes: list[str] = []
-    for source in _ROUTE_SOURCES:
-        text = source.read_text(encoding="utf-8")
-        for match in _ROUTE_CALL.finditer(text):
-            path, methods = match.group(1), match.group(2)
-            if path.startswith(_FRAGMENT_PREFIX):
-                continue
-            if not _HAS_GET.search(methods):
-                continue
-            routes.append(path)
+    _assert_every_route_call_was_parsed()
+    unscanned = _unscanned_page_route_sources()
+    assert not unscanned, (
+        "these files register a page route but this module never reads them: "
+        f"{unscanned}; name them in _ROUTE_SOURCES or the page they register "
+        "leaves every sweep"
+    )
+
+    routes = [
+        path for source in _ROUTE_SOURCES for path in _page_routes_in(source)
+    ]
 
     assert routes, (
         "route extraction found no page route in "
@@ -128,10 +186,6 @@ def registered_page_routes() -> list[str]:
     )
     assert "/" in routes and all(path.startswith("/") for path in routes), (
         f"route extraction produced something that is not a route: {routes}"
-    )
-    assert len(routes) >= 15, (
-        f"route extraction found only {len(routes)} page routes ({routes}); "
-        "that is too few to be the app, so the sweep would prove nothing"
     )
     return routes
 
@@ -237,9 +291,14 @@ def seed_the_shop(page: Page, api: ApiClient) -> dict[str, int]:
 
     return {
         "account_id": data.account_id,
-        "customer_id": data.customer_id,
-        "sale_id": data.sale_id,
-        "purchase_id": data.purchase_id,
+        # The CONFIRMED documents and the customer they were sold to, not the
+        # draft pair `seed_harness_data` also leaves behind: those confirmed
+        # documents carry lines, so the record pages the sweep visits are the
+        # populated ones — the state a stale money chip or a doubled body is
+        # actually legible in.
+        "customer_id": customer_id,
+        "sale_id": confirmed_sale,
+        "purchase_id": confirmed_purchase,
         "product_id": product_id,
         "purchase_return_id": purchase_return_id,
         "customer_return_id": customer_return_id,
