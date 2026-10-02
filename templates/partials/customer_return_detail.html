@@ -50,7 +50,22 @@
   <div class="mb-1 text-[13px] text-muted">
     {{ record.customer_name }} • {{ localization.tr(crate::localization::MessageKey::CustomerReturnsParentSale) }} <a class="link" href="{{ parent_href }}">{{ record.parent_number }}</a> • {{ localization.format_date(record.detail.customer_return.return_date.clone()) }}
   </div>
-  <div class="text-[13px] text-muted" data-customer-return-actor>{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ editor }}{% endif %}</div>
+  {# THE AUDIT LINE IS OUT OF BAND ON A COMMIT, FOR THE SAME REASON THE PAYMENT
+     CHIP ABOVE IS. The line write is what sets `updated_by`, so this line is a
+     statement about a DOCUMENT and it changes on the very action that made
+     somebody its editor. Rendered above the money region it kept reading
+     `Registered by X` alone — telling the operator the document has no editor at
+     the exact moment they became one.
+
+     The COUNT was always right, which is why
+     `test_writing_a_quantity_leaves_exactly_one_record_body_on_the_screen` could
+     not see it: one audit line is one stale line and one fresh line equally, and
+     the two are indistinguishable except by what they SAY.
+     `test_the_audit_line_above_the_money_region_says_who_last_edited_it` is the
+     test that pins the WORD. #}
+  <div class="text-[13px] text-muted" id="customer-return-actor"
+       {% if oob_action_bar %}hx-swap-oob="true"{% endif %}
+       data-customer-return-actor>{{ localization.tr(crate::localization::MessageKey::AuditRegisteredBy) }} {{ created_by_name.as_deref().unwrap_or("—") }}{% if let Some(editor) = updated_by_name %} • {{ localization.tr(crate::localization::MessageKey::AuditUpdatedBy) }} {{ editor }}{% endif %}</div>
   {% if !record.detail.customer_return.notes.is_empty() %}
     <div class="text-[13px] text-muted">{{ record.detail.customer_return.notes }}</div>
   {% endif %}
