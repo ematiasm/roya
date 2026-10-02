@@ -58,6 +58,12 @@ scripts/build-css.sh           # regenerates static/tailwind.css
   `CustomersResponse` / `AgeingResponse` stay in `customers_api.rs` because
   `CustomerBalanceView` and `CustomerAgeingView` do. `SetMoney` fields stay `SetMoney`:
   its `Serialize` is what publishes the refusal rule instead of a bare `null`.
+- **A JS consumer with a fallback turns a wire break into a working-looking empty
+  screen.** The picker island reads `data.products || []` (`static/picker.js`), so a
+  renamed key does not raise, does not log, and sets its status to `done` — it renders
+  an empty dropdown on the ten templates that mount it. `ProductSearchResponse` is
+  named for exactly that reason. Any `||` or `??` default on a response field hides a
+  contract break the same way; prefer a guard that says the key is missing.
 - Some `src/services/` modules are **pure** — `line_taxes`, `gross_inverse`,
   `final_price`, `purchase_cost`. Each holds the single definition of a rule. Do not
   re-derive a price or a tax split inline anywhere else; call the function.
