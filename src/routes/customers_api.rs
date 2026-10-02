@@ -116,6 +116,30 @@ pub struct CustomerAgeingView {
     pub ageing: Ageing,
 }
 
+/// The customer list, under one key.
+///
+/// The envelope lives beside the view it wraps and not in `models.rs` for the
+/// same reason the view does: a `CustomersResponse` over some other row type is
+/// not a response, it is a coincidence. Naming it is also what makes the key a
+/// contract — `customers` read by every client of this endpoint, renamed inside
+/// a `json!` literal without a compile error anywhere in this crate.
+#[derive(Serialize)]
+pub struct CustomersResponse {
+    pub customers: Vec<CustomerBalanceView>,
+}
+
+/// The receivables view, under one key.
+///
+/// Separate from the customer list rather than a flag on it: this one is the
+/// set of customers who actually owe something, with the four ageing buckets
+/// that say how long, and a client reconciling collections reads the two
+/// independently. Naming `ageing` is what keeps that from becoming a silent
+/// rename.
+#[derive(Serialize)]
+pub struct AgeingResponse {
+    pub ageing: Vec<CustomerAgeingView>,
+}
+
 /// `credit_limit` is nullable: null means no limit, so the flag can never block.
 ///
 /// A refused balance makes NO claim either way: the comparison needs a figure

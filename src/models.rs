@@ -107,6 +107,17 @@ pub struct Tax {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+/// The whole tax catalogue under one key, for the client that has to offer the
+/// rates a line may be frozen with.
+///
+/// Named because the key is the contract: renaming it inside an untyped `json!`
+/// compiles, passes every test in this crate, and breaks every client that
+/// reads it — the failure mode this type exists to make impossible.
+#[derive(Serialize)]
+pub struct TaxesResponse {
+    pub taxes: Vec<Tax>,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewTax {
     pub code: String,
@@ -161,6 +172,19 @@ pub struct ProductTaxView {
     #[serde(flatten)]
     pub link: ProductTax,
     pub tax: Tax,
+}
+
+/// The taxes linked to ONE product, each row flattened with its own tax resolved.
+///
+/// The list is a [`ProductTaxView`] and not a bare [`ProductTax`] because the
+/// link alone is not an answer: a client choosing a rate needs the code and the
+/// name, and resolving it server-side is what keeps every consumer from doing
+/// the same join and getting it differently. The `taxes` key is the same one the
+/// product-wide catalogue publishes, which is why it is named rather than
+/// inlined in a literal nobody can type-check.
+#[derive(Serialize)]
+pub struct ProductTaxesResponse {
+    pub taxes: Vec<ProductTaxView>,
 }
 
 /// One tax's contribution to the product's tax-inclusive unit price, in the
@@ -759,6 +783,17 @@ impl Transaction {
     }
 }
 
+/// The transaction list the finance JSON API returns, already narrowed by the
+/// request's [`TransactionFilter`].
+///
+/// The filter lives in the query string and the rows live under one key here;
+/// naming that key is what stops a rename from reaching production behind a
+/// green build, because a `json!` literal cannot fail to compile.
+#[derive(Serialize)]
+pub struct TransactionsResponse {
+    pub transactions: Vec<Transaction>,
+}
+
 // ---------------------------------------------------------------------------
 // DTOs / API payloads
 // ---------------------------------------------------------------------------
@@ -820,6 +855,25 @@ pub struct AccountWithBalance {
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
+}
+
+/// The account list the finance JSON API returns: the rows, plus the balance of
+/// ALL of them under one key.
+///
+/// The envelope is named because these two keys are a wire contract, and a
+/// `json!` literal is not a contract the compiler holds: rename the key and
+/// every test still passes while every consumer reading it silently reads
+/// `null`. Naming the object is what makes that rename a compile error instead.
+///
+/// `total_balance` is a [`SetMoney`], exactly like each row's `balance`, because
+/// it is a set sum over the same accounts — and it therefore keeps the three
+/// wire states it has always had: the decimal string when the sum carried, the
+/// rule when it refused, so a client can read a headline that says why it is
+/// not a number rather than one it cannot account for.
+#[derive(Serialize)]
+pub struct AccountsResponse {
+    pub accounts: Vec<AccountWithBalance>,
+    pub total_balance: SetMoney,
 }
 
 #[derive(Debug, Serialize)]
@@ -980,6 +1034,16 @@ pub struct Category {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+/// The category tree flat, under one key, for a client building its own select.
+///
+/// Named because the key is the contract. A `json!` literal is checked by
+/// nothing: renaming `categories` compiles, every test here still reads the
+/// literal it wrote itself, and the only thing that notices is the client.
+#[derive(Serialize)]
+pub struct CategoriesResponse {
+    pub categories: Vec<Category>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Product {
     pub id: i64,
@@ -1030,6 +1094,17 @@ impl Product {
     }
 }
 
+/// The product catalogue, optionally narrowed to one category, under one key.
+///
+/// The rows are the stored [`Product`]s and NOT [`ProductStock`]s: the catalogue
+/// endpoint is the one place a client reads what exists, and the derived level
+/// has its own endpoint (`/api/products/{id}/stock`) because a level is a set sum
+/// that can refuse while the product row never can.
+#[derive(Serialize)]
+pub struct ProductsResponse {
+    pub products: Vec<Product>,
+}
+
 /// Human display of a money value (product-markup T7). A stored value at
 /// scale 2 or below is normalised UP to exactly two decimals (`7.5` →
 /// `"7.50"`), so a list never mixes `$100` and `$100.00` side by side. A
@@ -1054,6 +1129,17 @@ pub struct ProductBarcode {
     pub product_id: i64,
     pub code: String,
     pub created_at: chrono::NaiveDateTime,
+}
+
+/// Every barcode of ONE product, under one key — the read side of the
+/// `add_barcode` that writes them.
+///
+/// A scanner client resolves code → product through this list, so the key is a
+/// lookup contract and not a display detail. That is exactly the class of key a
+/// `json!` literal lets you rename with a green build and a silent break.
+#[derive(Serialize)]
+pub struct BarcodesResponse {
+    pub barcodes: Vec<ProductBarcode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1083,6 +1169,16 @@ impl StockMovement {
             MovementType::Adjust => self.qty,
         }
     }
+}
+
+/// The movement ledger, scoped to one product when the request names one.
+///
+/// Named because `movements` is the key a client pages through and audits
+/// against; a literal is not a thing that can fail to compile when the contract
+/// moves underneath it.
+#[derive(Serialize)]
+pub struct MovementsResponse {
+    pub movements: Vec<StockMovement>,
 }
 
 /// Service-level input for product creation (mirrors finance request DTOs).
@@ -1153,6 +1249,24 @@ pub struct ProductStock {
     /// the level refused, because a suggestion computed from a level that does not
     /// exist would be a number with nothing behind it.
     pub suggested: Option<Decimal>,
+}
+
+/// The reorder list: tracked products at or below their minimum level.
+///
+/// Two envelopes and not one parameterised type, because `low_stock` and
+/// `negative_stock` are two published keys and a client that has to be told which
+/// one it is reading is a client that can guess wrong. Naming both makes each a
+/// contract the compiler holds.
+#[derive(Serialize)]
+pub struct LowStockResponse {
+    pub low_stock: Vec<ProductStock>,
+}
+
+/// The same rows filtered to the levels that went BELOW zero — a distinct set,
+/// not a subset flag, so it gets its own key and its own type.
+#[derive(Serialize)]
+pub struct NegativeStockResponse {
+    pub negative_stock: Vec<ProductStock>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,6 +1453,34 @@ pub struct PaymentMethod {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+/// Every payment method in the catalogue, so a client can resolve a method name
+/// to a row without first reading one account's catalog.
+///
+/// Named because `methods` is a published key: an untyped `json!` literal lets
+/// it be renamed without a single compile error, which is precisely the kind of
+/// change that reaches production with a green build and breaks every consumer.
+#[derive(Serialize)]
+pub struct MethodsResponse {
+    pub methods: Vec<PaymentMethod>,
+}
+
+/// The method set of ONE account, as both GET and PUT return it.
+///
+/// One shape for both verbs on purpose: a client that reads a set and later
+/// replaces it should not have to translate between two different answers to the
+/// same question, and a second shape is a second thing to keep in step.
+///
+/// `method_ids` is the payload a replacement PUTs back, so it travels beside the
+/// rows it names — the ids and the methods are the same fact read two ways, and
+/// a client that has only one of them cannot check a replacement against what it
+/// replaces.
+#[derive(Serialize)]
+pub struct AccountMethodsResponse {
+    pub account_id: i64,
+    pub method_ids: Vec<i64>,
+    pub methods: Vec<PaymentMethod>,
+}
+
 /// One method with its owning account resolved for display, so method-only
 /// selects render `"Name — AccountName"` without SQL in a route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1428,6 +1570,18 @@ impl SaleDetail {
             PaymentStatus::Unpaid
         }
     }
+}
+
+/// The sales list the JSON API returns: a detail per document, under one key.
+///
+/// [`SaleDetail`] and not [`SaleListRow`], because this endpoint is a machine
+/// contract: its totals are plain decimals and a document whose lines cannot be
+/// added up is an error here, while the page's row type exists precisely to
+/// render that case. The key is named so a rename cannot ship behind a green
+/// build.
+#[derive(Serialize)]
+pub struct SalesResponse {
+    pub sales: Vec<SaleDetail>,
 }
 
 /// Format `YYYY-SALE-NNNNNN` with zero-padded 6-digit sequence.
@@ -1734,6 +1888,19 @@ pub struct SaleRecord {
     pub total_refusal: Option<PriceRefusal>,
 }
 
+/// The outstanding receivables endpoint's answer: one [`SaleDetail`] per
+/// document the shop is still owed, under one key.
+///
+/// The same detail type `list_sales` returns, NOT the [`SaleRecord`] the record
+/// page uses and NOT the bounded [`DebtSummary`] the banner uses — this endpoint
+/// is the full receivable for a client that has to reconcile against it, and
+/// each row's money is a plain total or the request failed. Naming `debt` keeps
+/// the rename from reaching a consumer that a `json!` literal would never warn.
+#[derive(Serialize)]
+pub struct DebtResponse {
+    pub debt: Vec<SaleDetail>,
+}
+
 /// The sales page's debt banner: a summary, not the full receivable. `total` and
 /// `count` are exact (decimal sums in Rust) and `oldest` is the first few unpaid
 /// documents by due date, so the banner renders a bounded number of rows. The full
@@ -1775,6 +1942,17 @@ pub struct Supplier {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+/// The supplier catalogue under one key, for a client resolving a document's
+/// paying party.
+///
+/// Named because the key is a published contract, and an untyped `json!` lets it
+/// change without so much as a type error — which is the failure a type is
+/// supposed to prevent.
+#[derive(Serialize)]
+pub struct SuppliersResponse {
+    pub suppliers: Vec<Supplier>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProductSupplierCost {
     pub id: i64,
@@ -1804,6 +1982,17 @@ impl ProductSupplierCost {
     pub fn price_alert(&self) -> PriceAlert {
         PriceAlert::compare(self.previous_cost, self.current_cost)
     }
+}
+
+/// The cost satellite, filtered by product or by supplier, under one key.
+///
+/// These are the rows a purchase line's `unit_cost` is resolved from, so the key
+/// is an input contract for money: a client that reads `costs` and finds nothing
+/// writes a purchase with a cost this application cannot justify. Naming the key
+/// is what makes that rename fail the build.
+#[derive(Serialize)]
+pub struct SupplierCostsResponse {
+    pub costs: Vec<ProductSupplierCost>,
 }
 
 /// Derived price movement between the previous and current satellite costs.
@@ -1964,6 +2153,17 @@ pub struct PurchasePayment {
     pub updated_at: chrono::NaiveDateTime,
 }
 
+/// The payments one supplier handover produced, under one key.
+///
+/// A supplier payment has no grouping document (only customers have receipts),
+/// so the response IS the list: one payment per covered purchase, oldest debt
+/// first. A client reconciling the handover reads all of it, which is why the key
+/// is a named contract rather than something a literal could rename unnoticed.
+#[derive(Serialize)]
+pub struct SupplierPaymentsResponse {
+    pub payments: Vec<PurchasePayment>,
+}
+
 /// Service-level input for purchase creation (Draft).
 #[derive(Debug, Clone)]
 pub struct NewPurchase {
@@ -2011,6 +2211,17 @@ impl PurchaseDetail {
     pub fn payment_status_for(total: Decimal, paid: Decimal) -> PaymentStatus {
         SaleDetail::payment_status_for(total, paid)
     }
+}
+
+/// The purchase list the JSON API returns: a detail per document, under one key.
+///
+/// The tax mirror of the sales list, and for the same two reasons: [`PurchaseDetail`]
+/// is the machine contract whose totals are plain decimals, and the key is a
+/// published name that a `json!` literal would let a rename ship behind a green
+/// build.
+#[derive(Serialize)]
+pub struct PurchasesResponse {
+    pub purchases: Vec<PurchaseDetail>,
 }
 
 /// Derived, never stored: one purchase line's cost against the product's
@@ -2615,6 +2826,21 @@ pub struct CustomerStatement {
     pub entries: Vec<StatementEntry>,
 }
 
+/// The statement endpoint's answer: the customer the module owns beside the
+/// ledger derived for them.
+///
+/// Two keys and not one, because the statement does not carry the customer's own
+/// fields — the party name the operator reads comes from the entity, and a
+/// client that only had the ledger would have to make a second request to label
+/// what it is looking at. The statement also states its own `customer_id`, and
+/// keeping the two here is what lets a client tell whose statement it received
+/// without trusting the URL it asked for.
+#[derive(Serialize)]
+pub struct CustomerStatementResponse {
+    pub customer: Customer,
+    pub statement: CustomerStatement,
+}
+
 // ---------------------------------------------------------------------------
 // M4 customers (Slice L). A customer receipt is the document a single handover
 // of money produces: it groups one `sale_payments` row per credit sale the
@@ -2671,6 +2897,17 @@ pub struct ReceiptDetail {
     pub account_name: String,
     /// Payment-method name resolved for display through the finance read path.
     pub method_name: String,
+}
+
+/// The receipts of ONE customer, each with the payments it groups, under one key.
+///
+/// There is no unbounded receipt dump anywhere in this module — the customer is
+/// mandatory — so the key is also the scope of the answer, and a client reading
+/// it is reading exactly one customer's collections. That is why it is named:
+/// nothing in an untyped literal would notice the scope widening.
+#[derive(Serialize)]
+pub struct ReceiptsResponse {
+    pub receipts: Vec<ReceiptDetail>,
 }
 
 // ---------------------------------------------------------------------------
