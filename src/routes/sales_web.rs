@@ -2360,13 +2360,17 @@ mod tests {
             added.contains("50 USD"),
             "the running total travels with the lines: {added:.800}"
         );
-        let oob_pos = added
-            .find("hx-swap-oob=\"true\"")
-            .expect("the picker must come back out of band");
-        let tag_start = added[..oob_pos].rfind('<').unwrap();
-        let tag_end = oob_pos + added[oob_pos..].find('>').unwrap();
-        let oob_tag = &added[tag_start..=tag_end];
-        assert!(oob_tag.contains("id=\"line-picker\""), "{oob_tag}");
+        // Locate the picker by ITS OWN id, never by the first `hx-swap-oob` in
+        // the document. This response now carries more than one OOB element: the
+        // payment status chip rides out of band too, and it sits higher in the
+        // header than the picker does. "The first OOB element" therefore finds
+        // whichever happens to come first in page order — a property of the
+        // markup rather than of the behaviour under test. The same lesson is
+        // already written down in `assert_oob_picker_is_empty_and_focused`.
+        let picker_pos = added
+            .find("id=\"line-picker\"")
+            .unwrap_or_else(|| panic!("the picker must come back: {added:.600}"));
+        let tag_start = added[..picker_pos].rfind('<').unwrap();
         let oob = &added[tag_start..];
         assert!(
             oob.contains("autofocus"),
