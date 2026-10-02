@@ -180,6 +180,21 @@ struct ProductSearchRow {
     stock: String,
 }
 
+/// The island's read, named. `products` is the key the whole island rests on and
+/// it is the one this file must not lose: the island reads it as
+/// `data.products || []`, so a rename does not raise, does not log, and does not
+/// fail the response — it renders an EMPTY dropdown and reports `done`. Ten
+/// templates mount this island, so that failure would be ten screens with no
+/// visible cause.
+///
+/// Naming the object is what turns that rename into a compile error here instead
+/// of a silent emptiness in the browser.
+#[derive(Debug, Serialize)]
+struct ProductSearchResponse {
+    query: String,
+    products: Vec<ProductSearchRow>,
+}
+
 /// One satellite cost row with the supplier fields the drawer needs to render it.
 #[derive(Clone)]
 pub struct ProductCostView {
@@ -766,7 +781,7 @@ async fn web_product_search_json(
     _: Require<InventoryRead>,
     Extension(localization): Extension<LocalizationContext>,
     Query(params): Query<ProductSearchQuery>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<Json<ProductSearchResponse>, AppError> {
     let raw = resolve_search_query(&params);
     let matches = state.inventory_service.search_products(&raw).await?;
     let products: Vec<ProductSearchRow> = matches
@@ -797,10 +812,10 @@ async fn web_product_search_json(
             }
         })
         .collect();
-    Ok(Json(serde_json::json!({
-        "query": raw.trim(),
-        "products": products,
-    })))
+    Ok(Json(ProductSearchResponse {
+        query: raw.trim().to_string(),
+        products,
+    }))
 }
 
 /// `GET /web/products/detail/{id}`: the drawer fragment. Concrete ids sit last in
