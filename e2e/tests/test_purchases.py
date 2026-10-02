@@ -31,6 +31,7 @@ from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, expect
 
 from helpers import (
@@ -1634,3 +1635,269 @@ def test_editing_qty_and_gross_on_the_line_re_renders_the_pair_from_storage(
     expect(row).to_contain_text("15.00 USD")
     expect(row).to_contain_text("3.15 USD")
     expect(row).to_contain_text("18.15 USD")
+
+
+# ---------------------------------------------------------------------------
+# The header the quantity commit leaves behind
+# ---------------------------------------------------------------------------
+#
+# `test_editing_a_line_inline_keeps_every_id_on_the_page_unique` above pins the
+# half of this that PR #132 fixed on the RETURN families: the swap is narrowed
+# with `hx-select`, so the response no longer lands whole inside the money region
+# and the record body does not render twice.
+#
+# That is necessary and NOT sufficient, and the reason is a boundary neither of
+# those two declarations can move: the money chip and the audit line are rendered
+# ABOVE `#purchase-record-money`, in the header strip. Narrowing the swap fixes
+# what is INSIDE the region and leaves everything above it exactly as the page
+# load rendered it. A count assertion cannot see this — the counts were already
+# right — so the claim that fails is the WORD.
+#
+# The word, and why `Paid` is the wrong one:
+#
+#   * a credit purchase collects nothing, so `paid` is 0 whatever the lines are;
+#   * `payment_status_for` answers `due <= 0 -> Paid`, and `due = total - paid`;
+#   * at page load the draft has NO lines, so `total == 0`, so `due == 0`, so the
+#     chip is rendered reading Paid;
+#   * after a line is typed, `total > 0`, `paid == 0`, so `due > 0` and the truth
+#     is Unpaid.
+#
+# So the page shows `PAID` beside a `due 42.00 USD` it computed itself one moment
+# earlier. Measured in the browser before the fix: the chip rendered `PAID` with
+# `42.00 USD ... due 42.00 USD` in the money region directly below it.
+#
+# Same mechanism on the credit-note sibling, so the test is parameterised over
+# both families rather than written twice: they are meant to mirror each other,
+# and a fix applied to one of them and not the other is how they stopped
+# mirroring in the first place.
+
+
+def _accept_the_matched_result(page: Page, product_name: str) -> None:
+    """Choose a product from the picker's results, which is what submits the form.
+
+    The island owns the submission (`static/picker.js` calls `requestSubmit()` on
+    a clicked match), so clicking the result IS the commit. Clicking the Add-line
+    button instead would post the typed name with the island's `product_id`
+    still disabled, which is a different interaction and answers differently.
+    """
+    page.locator("#product-picker").fill(product_name)
+    page.locator("#product-search-results button", has_text=product_name).click()
+
+
+def _purchase_family(api: ApiClient) -> dict:
+    """A CREDIT purchase draft with no lines, and the product to put on it.
+
+    Credit, deliberately: a credit purchase's confirmation posts no payment, so
+    the document collects nothing for the whole test and `paid` is 0 at every
+    step — which is what makes the chip's word a function of the lines alone.
+
+    No lines at page load, so the chip is rendered from a document whose
+    `total == 0` and therefore reads Paid. That is the stale copy the commit has
+    to replace.
+    """
+    tag = "HDR-P"
+    product_id = int(
+        create_product(
+            api, sku=f"{tag}-SKU", name=f"{tag} Widget",
+            sale_price="20.00", cost_price="6.00",
+            stock="40", min_stock="1", max_stock="100",
+        )["id"]
+    )
+    supplier_id = create_supplier(api, f"{tag} Supplier")
+    purchase_id = create_purchase_draft(
+        api, supplier_id, payment_type="Credit", due_date="2024-06-01"
+    )
+    return {
+        "id": "purchases",
+        "name": "purchase",
+        "record_path": f"/purchases/{purchase_id}",
+        "lines_path": f"/web/purchases/{purchase_id}/lines",
+        "record_inner": "#purchase-record-inner",
+        "money": "#purchase-record-money",
+        "payment_status": "[data-purchase-payment-status]",
+        "actor": "[data-purchase-actor]",
+        "product_id": product_id,
+        "product_name": f"{tag} Widget",
+        "accept": _accept_the_matched_result,
+    }
+
+
+def _sale_family(api: ApiClient) -> dict:
+    """The sale family's copy of `_purchase_family`, identical in every claim.
+
+    Same reason for Credit, same reason for starting empty: the point of the
+    test is that the chip's word must FOLLOW the document, and the document
+    changes from "nothing to collect" to "something owed" on the very first
+    line.
+    """
+    tag = "HDR-S"
+    product_id = int(
+        create_product(
+            api, sku=f"{tag}-SKU", name=f"{tag} Widget",
+            sale_price="25.00", cost_price="9.00",
+            stock="40", min_stock="1", max_stock="100",
+        )["id"]
+    )
+    customer_id = create_customer(api, f"{tag} Buyer")
+    sale_id = create_sale_draft(
+        api, customer_id, payment_type="Credit", due_date="2024-06-01"
+    )
+    return {
+        "id": "sales",
+        "name": "sale",
+        "record_path": f"/sales/{sale_id}",
+        "lines_path": f"/web/sales/{sale_id}/lines",
+        "record_inner": "#sale-record-inner",
+        "money": "#sale-record-money",
+        "payment_status": "[data-sale-payment-status]",
+        "actor": "[data-sale-actor]",
+        "product_id": product_id,
+        "product_name": f"{tag} Widget",
+        "accept": _accept_the_matched_result,
+    }
+
+
+_HEADER_FAMILIES = (_purchase_family, _sale_family)
+
+
+@pytest.mark.parametrize(
+    "build_family", _HEADER_FAMILIES, ids=lambda b: b.__name__.strip("_")
+)
+def test_a_quantity_commit_refreshes_the_header_above_the_money_region(
+    page: Page, api: ApiClient, build_family
+) -> None:
+    """The chip and the audit line must FOLLOW the document, not the page load.
+
+    Four claims, and the fourth is the one that fails. The first three are
+    counts — one body, one chip, one audit line — and every one of them was
+    already TRUE before the fix, because `hx-select` had already stopped the body
+    rendering twice. A test that stopped at the counts would have stayed green
+    through the whole defect, which is precisely what happened in PR #132.
+
+    The fourth claim is the chip's WORD, and it is the only one that can tell a
+    fresh header from a stale one: both copies of the chip are one element with
+    one id, so the count is 1 either way and only the text differs. Read as
+    `text_content()` and not `inner_text()`, because the house `uppercase` class
+    would hand back `UNPAID` and an assertion written against the catalog would
+    then fail on a screen that is right. Exact, not a substring: `Paid` and
+    `Unpaid` are one of them a suffix of nothing, so a substring assertion would
+    not separate them either.
+
+    A credit document collects nothing, so with a line on it the only true word
+    is `Unpaid` — and the page load, which had no lines at all, is precisely the
+    state that produced the stale `Paid`.
+    """
+    family = build_family(api)
+    page.goto(f"{api.base_url}{family['record_path']}")
+    page.wait_for_load_state("networkidle")
+
+    body = page.locator(family["record_inner"])
+    chip = page.locator(family["payment_status"])
+    actor = page.locator(family["actor"])
+
+    assert body.count() == 1, f"{family['name']}: {body.count()} bodies at page load"
+    assert chip.count() == 1, f"{family['name']}: {chip.count()} chips at page load"
+    assert actor.count() == 1, f"{family['name']}: {actor.count()} audit lines"
+
+    # The stale copy's own figure, named rather than assumed: the page load
+    # renders the chip from a document with no lines, where due == 0. Asserting
+    # it means the test would notice if the fixture ever stopped reproducing the
+    # state the defect needs, rather than passing for the wrong reason.
+    assert chip.first.text_content().strip() == "Paid", (
+        f"{family['name']}: an empty credit draft reads "
+        f"{chip.first.text_content().strip()!r}, expected Paid — the page-load "
+        f"render is the stale copy this test is about"
+    )
+
+    # The commit: one line on the document, through the page's own control.
+    with page.expect_response(_response_for(family["lines_path"], "POST")):
+        family["accept"](page, family["product_name"])
+    expect(page.locator(family["money"])).to_contain_text("USD")
+
+    # The three counts, then the word. Ordered so a regression names itself: a
+    # duplicated body fails before the word is ever read.
+    assert body.count() == 1, (
+        f"{family['name']}: the commit left {body.count()} record bodies. The "
+        f"response carries the whole record fragment and the control swaps it "
+        f"into the money region with hx-swap=\"outerHTML\", so without "
+        f"hx-select the page-load copy above it survives."
+    )
+    assert chip.count() == 1, (
+        f"{family['name']}: {chip.count()} payment-status chips — the record "
+        f"body rendered twice"
+    )
+    assert actor.count() == 1, (
+        f"{family['name']}: {actor.count()} audit lines — the record body "
+        f"rendered twice"
+    )
+
+    chip_word = chip.first.text_content().strip()
+    assert chip_word == "Unpaid", (
+        f"{family['name']}: a credit {family['name']} carrying a line and "
+        f"collecting nothing reads {chip_word!r}. The chip sits ABOVE the money "
+        f"region, so the commit's swap never reaches it and it still shows what "
+        f"the page load computed from a document with no lines: total 0, paid 0, "
+        f"due 0, and therefore Paid."
+    )
+
+    # And the line really was written, so `Unpaid` cannot be satisfied by a page
+    # that simply never changed. The API is the authority: it is what the chip
+    # claims to be reporting on.
+    document_id = family["record_path"].rsplit("/", 1)[1]
+    stored = api.get_json(f"/api/{family['id']}/{document_id}")
+    assert len(stored["lines"]) == 1, stored
+    assert Decimal(str(stored["total"])) > 0, stored
+
+
+def test_a_quantity_commit_refreshes_the_audit_line_above_the_money_region(
+    page: Page, api: ApiClient
+) -> None:
+    """`Updated by` must appear on the commit that made somebody an editor.
+
+    The count of one audit line is what PR #132's test already asserted, and it
+    was always true. The AUDIT MEANING is what goes stale: `updated_by` is set
+    by the write, so a document nobody has edited since it was created renders
+    `Registered by X` alone, and a document that was just edited renders
+    `Registered by X • Updated by X`. If the line above the money region is not
+    refreshed out of band, the operator is told the document has no editor on the
+    very action that made one — a statement about who touched a document that is
+    false at the moment it is read.
+
+    Asserted on the WORD `Updated by`, for the same reason the chip is asserted
+    on its word: a count of one is satisfied by both the stale copy and the fresh
+    one, and the two are indistinguishable except by what they say.
+
+    A purchase is the vehicle, and it is the family's own page: `add_or_increment_line`
+    takes the acting user, so the write that adds the first line is also the
+    write that records the editor.
+    """
+    tag = "HDR-AUDIT"
+    create_product(
+        api, sku=f"{tag}-SKU", name=f"{tag} Widget",
+        sale_price="20.00", cost_price="6.00",
+        stock="40", min_stock="1", max_stock="100",
+    )
+    supplier_id = create_supplier(api, f"{tag} Supplier")
+    purchase_id = create_purchase_draft(
+        api, supplier_id, payment_type="Credit", due_date="2024-06-01"
+    )
+    page.goto(f"{api.base_url}/purchases/{purchase_id}")
+    page.wait_for_load_state("networkidle")
+
+    actor = page.locator("[data-purchase-actor]")
+    expect(actor).to_have_count(1)
+    assert "Updated by" not in actor.first.text_content(), (
+        "a document nobody has edited renders Registered by alone; the fixture "
+        f"is not reproducing the state this test needs: "
+        f"{actor.first.text_content()!r}"
+    )
+
+    with page.expect_response(_response_for(f"/web/purchases/{purchase_id}/lines", "POST")):
+        _accept_the_matched_result(page, f"{tag} Widget")
+
+    expect(actor).to_have_count(1)
+    assert "Updated by" in actor.first.text_content(), (
+        f"the commit that recorded an editor left the audit line reading "
+        f"{actor.first.text_content()!r}: it is rendered above the money region, "
+        f"which is the only region the commit's swap replaces"
+    )

@@ -1240,6 +1240,50 @@ def test_the_record_body_stays_single_across_every_action_that_swaps_it(
     assert _return_id_from_url(return_url)
 
 
+@pytest.mark.parametrize("family", _FAMILIES, ids=lambda f: f["id"])
+def test_the_audit_line_above_the_money_region_says_who_last_edited_it(
+    page: Page, api: ApiClient, family: dict
+) -> None:
+    """The audit line is a statement about a DOCUMENT, so it must follow the document.
+
+    `test_writing_a_quantity_leaves_exactly_one_record_body_on_the_screen` above
+    asserts the audit line appears ONCE, and it has always done so — a count of
+    one is satisfied by the stale copy and the fresh one alike, and the two are
+    indistinguishable except by what they SAY. PR #132 judged the line's
+    CONTENT beyond its scope and left it here. This is that.
+
+    The claim: a return nobody has edited since it was created reads `Registered
+    by X` alone, and a return that was just edited reads `Registered by X •
+    Updated by X`, because `updated_by` is written by the line write. If the line
+    is not refreshed with the commit, the operator is told the document has no
+    editor at the exact moment they became its editor.
+
+    Asserted on a WORD that is absent before the commit and present after it, so
+    a template that never rendered the clause at all cannot pass by having a
+    permanently-short line — and so a stale page-load copy, which by construction
+    lacks the clause, fails.
+    """
+    seeded = _family_seed(api, family, tag=f"AUDIT-{family['id']}")
+    _start_from_the_parent_record(page, family, seeded["parent_id"], api.base_url)
+
+    actor = page.locator(family["actor"])
+    expect(actor).to_have_count(1)
+    assert "Updated by" not in actor.first.text_content(), (
+        f"a {family['name']} nobody has edited renders Registered by alone; the "
+        f"fixture is not reproducing the state this test needs: "
+        f"{actor.first.text_content()!r}"
+    )
+
+    _type_return_quantity(page, family, seeded["line_id"], "2")
+
+    expect(actor).to_have_count(1)
+    assert "Updated by" in actor.first.text_content(), (
+        f"the commit that recorded an editor left the audit line reading "
+        f"{actor.first.text_content()!r}: it is rendered above the money "
+        f"region, which is the only region the commit's swap replaces"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 6. The counter flow: twenty rows, twenty keystrokes
 # ---------------------------------------------------------------------------
