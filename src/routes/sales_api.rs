@@ -169,12 +169,19 @@ async fn update_sale(
 async fn add_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<AddLineRequest>,
 ) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
     let line = state
         .sales_service
-        .add_line(id, payload.product_id, payload.qty, payload.unit_price)
+        .add_line(
+            principal.user_id,
+            id,
+            payload.product_id,
+            payload.qty,
+            payload.unit_price,
+        )
         .await?;
     Ok((StatusCode::CREATED, Json(serde_json::json!(line))))
 }
@@ -182,12 +189,13 @@ async fn add_line(
 async fn update_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(line_id): Path<i64>,
     Json(payload): Json<UpdateLineRequest>,
 ) -> crate::error::AppResult<Json<serde_json::Value>> {
     let line = state
         .sales_service
-        .update_line(line_id, payload.qty, payload.unit_price)
+        .update_line(principal.user_id, line_id, payload.qty, payload.unit_price)
         .await?;
     Ok(Json(serde_json::json!(line)))
 }
@@ -195,9 +203,13 @@ async fn update_line(
 async fn remove_line(
     State(state): State<AppState>,
     _: Require<SalesCreate>,
+    principal: axum::Extension<crate::security::authz::Principal>,
     Path(line_id): Path<i64>,
 ) -> crate::error::AppResult<StatusCode> {
-    state.sales_service.remove_line(line_id).await?;
+    state
+        .sales_service
+        .remove_line(principal.user_id, line_id)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

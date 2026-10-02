@@ -810,6 +810,7 @@ async fn web_add_line(
 ) -> Result<axum::response::Response, AppError> {
     add_line_impl(
         state,
+        principal.user_id,
         principal.has_permission::<SalesCreate>(),
         headers,
         localization,
@@ -819,8 +820,14 @@ async fn web_add_line(
     .await
 }
 
+/// `actor` is the authenticated principal's user id, carried here rather than
+/// read from `state`: both registered handlers (the path endpoint and the
+/// collection adapter) already hold the `Principal` extension, so this is the
+/// same `Extension` the `Require<SalesCreate>` gate was resolved from — not a
+/// second identity source, and not a fresh actor minted per call.
 async fn add_line_impl(
     state: AppState,
+    actor: i64,
     can_credit: bool,
     headers: HeaderMap,
     localization: LocalizationContext,
@@ -843,7 +850,7 @@ async fn add_line_impl(
     };
     state
         .sales_service
-        .add_line(id, product_id, qty, unit_price)
+        .add_line(actor, id, product_id, qty, unit_price)
         .await
         // A line write runs the shared tax contract, which now REFUSES an
         // amount or a tax arithmetic it cannot carry instead of panicking. The
@@ -871,7 +878,7 @@ async fn web_update_line(
     let unit_price = parse_required_decimal(&form.unit_price, "unit_price", &localization)?;
     state
         .sales_service
-        .update_line(line_id, qty, unit_price)
+        .update_line(principal.user_id, line_id, qty, unit_price)
         .await
         // Same contract, same renderer, same reason as the add: an inline edit
         // of a draft line can carry an unrepresentable amount just as an add can.
@@ -895,7 +902,10 @@ async fn web_remove_line(
     Extension(localization): Extension<LocalizationContext>,
     Path((sale_id, line_id)): Path<(i64, i64)>,
 ) -> Result<axum::response::Response, AppError> {
-    state.sales_service.remove_line(line_id).await?;
+    state
+        .sales_service
+        .remove_line(principal.user_id, line_id)
+        .await?;
     changed(
         &state,
         sale_id,
@@ -1113,6 +1123,7 @@ async fn web_add_line_collection(
 ) -> Result<axum::response::Response, AppError> {
     add_line_impl(
         state.0,
+        principal.user_id,
         principal.has_permission::<SalesCreate>(),
         headers,
         localization,
@@ -1441,7 +1452,13 @@ mod tests {
             .unwrap();
         let line = state
             .sales_service
-            .add_line(sale.id, product.id, Decimal::from(2), None)
+            .add_line(
+                audit_actor(&state).await,
+                sale.id,
+                product.id,
+                Decimal::from(2),
+                None,
+            )
             .await
             .unwrap();
         // accounts.name is UNIQUE: suffix it per fixture, and still pass the
@@ -1933,7 +1950,13 @@ mod tests {
                 .unwrap();
             state
                 .sales_service
-                .add_line(sale.id, product.id, Decimal::from(2), None)
+                .add_line(
+                    audit_actor(&state).await,
+                    sale.id,
+                    product.id,
+                    Decimal::from(2),
+                    None,
+                )
                 .await
                 .unwrap();
             state
@@ -4041,6 +4064,7 @@ mod tests {
         state
             .sales_service
             .add_line(
+                audit_actor(&state).await,
                 sale.id,
                 product.id,
                 Dec::from(1),
@@ -4205,6 +4229,219 @@ mod tests {
         assert!(
             html.contains("sales.create"),
             "the refusal names the code the principal lacks: {html:.600}"
+        );
+    }
+
+    /// The audit-attribution element's own text, and nothing else.
+    ///
+    /// Scoped deliberately: the page CHROME also renders the signed-in user's
+    /// display name, so a whole-page `contains("Test Admin")` is true before any
+    /// edit happens and would let this test pass for the wrong reason. The
+    /// assertion has to be about the attribution line alone.
+    fn sale_audit_line(html: &str) -> String {
+        let start = html
+            .find("data-sale-actor>")
+            .unwrap_or_else(|| panic!("the record page must render the attribution line"))
+            + "data-sale-actor>".len();
+        let end = html[start..]
+            .find("</div>")
+            .expect("the attribution element is a single div")
+            + start;
+        html[start..end].to_string()
+    }
+
+    /// A LINE EDIT IS ATTRIBUTED END TO END.
+    ///
+    /// The record page's audit line is a statement about a DOCUMENT, and the
+    /// action that turns an operator into that document's editor is the one
+    /// that has to change it. Before the fix the sale family never stamped the
+    /// parent on a line write, so this line kept reading `Registered by …`
+    /// alone after the operator had just edited the document — and the header
+    /// WAS refreshed (the out-of-band swap on `sale_detail.html:134` exists for
+    /// exactly this) and still named nobody.
+    ///
+    /// Two real users, because a stamp that always equalled the creator would
+    /// satisfy a single-user test: `Zoe Creadora` opens the draft, and the
+    /// request is made by the seeded session principal, `Test Admin`. The
+    /// assertion is on the NAME the page renders, because the name is what an
+    /// operator reads and what the wiring layer resolves.
+    #[tokio::test]
+    async fn a_line_edit_names_the_operator_who_made_it_in_the_rendered_audit_line() {
+        use crate::models::{NewProduct, NewSale, ProductKind};
+        use chrono::NaiveDate;
+        let state = test_state().await;
+        let creator = test_support::seed_audit_user(&state.pool, "sale-web-zoe", "Zoe Creadora")
+            .await
+            .unwrap();
+        let product = state
+            .inventory_service
+            .create_product(
+                audit_actor(&state).await,
+                NewProduct {
+                    sku: "WEB-AUDIT".into(),
+                    name: "Web Audit Product".into(),
+                    kind: ProductKind::Product,
+                    category_id: None,
+                    unit: "un".into(),
+                    sale_price: Decimal::from(25),
+                    cost_price: Decimal::from(10),
+                    track_stock: false,
+                    min_stock: None,
+                    max_stock: None,
+                    location: None,
+                    notes: None,
+                    markup_pct: None,
+                },
+            )
+            .await
+            .unwrap();
+        let customer = seed_customer(&state, "Web Audit Buyer").await;
+        let sale = state
+            .sales_service
+            .create_draft(
+                creator,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Cash,
+                    sale_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                    due_date: None,
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        let line = state
+            .sales_service
+            .add_line(creator, sale.id, product.id, Decimal::from(2), None)
+            .await
+            .unwrap();
+        let app = crate::routes::router(state.clone());
+
+        // BEFORE: the only writer so far is Zoe, so the line names her and NOT
+        // the principal who is about to edit the document.
+        let (status, html) = get_html(app.clone(), &format!("/sales/{}", sale.id)).await;
+        assert_eq!(status, StatusCode::OK, "{html:.400}");
+        let before_line = sale_audit_line(&html);
+        assert!(
+            before_line.contains("Zoe Creadora"),
+            "the record page names the draft's creator: {before_line:.300}"
+        );
+        assert!(
+            !before_line.contains("Test Admin"),
+            "and names no editor yet — nobody but Zoe has touched it: {before_line:.300}"
+        );
+
+        // THE EDIT, through the real route as the seeded principal.
+        let (status, body) = post_form_as(
+            app.clone(),
+            &format!("/web/sales/{}/lines/{}", sale.id, line.id),
+            "qty=3&unit_price=30",
+            &[("HX-Request", "true")],
+            Some(test_support::TEST_COOKIE),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the line edit: {body:.400}");
+
+        // The rendered audit line names the EDITOR. This is the assertion the
+        // defect made impossible: the same fragment, the same document, and a
+        // name that is neither the creator's nor absent.
+        let after_line = sale_audit_line(&body);
+        assert!(
+            after_line.contains("Test Admin"),
+            "the audit line names the operator who edited the line: {after_line:.300}"
+        );
+        assert!(
+            after_line.contains("Zoe Creadora"),
+            "and still names the creator: a line edit is not a re-registration: {after_line:.300}"
+        );
+        assert_ne!(
+            after_line, before_line,
+            "the same document's attribution line CHANGED: the action that made \
+             the operator its editor is the action that has to say so"
+        );
+
+        // The STORED value agrees with the rendered name: the route resolved the
+        // actor from its own `Principal`, not from the fixture.
+        let stored = state.sales_service.get_detail(sale.id).await.unwrap().sale;
+        assert_eq!(stored.created_by, creator, "the creator is never rewritten");
+        assert_ne!(
+            stored.updated_by,
+            Some(creator),
+            "the editor is not the creator: this test would pass for the wrong \
+             reason if it were"
+        );
+        // The principal's id is deliberately NOT read back here: AC20 forbids a
+        // department file from querying an identity table, and a test is still a
+        // department file — AC20 greps the whole source, comments included, so
+        // even naming the query here would fail the guard. The attribution is
+        // already pinned without it — the RENDERED line names "Test Admin",
+        // which is the seeded session's display name and which no fixture in
+        // this test created — and what the stored value adds is that the stamp
+        // is neither the creator nor the fixture's own audit actor.
+        let fixture_actor = audit_actor(&state).await;
+        assert_ne!(
+            fixture_actor, creator,
+            "the fixture's audit actor and the draft's creator must differ, \
+             otherwise the two exclusions below prove nothing"
+        );
+        assert_ne!(
+            stored.updated_by,
+            Some(fixture_actor),
+            "the document does not name the fixture's sentinel actor: the \
+             stamp came from the REQUEST's principal"
+        );
+        assert!(
+            stored.updated_by.is_some(),
+            "a successful line write leaves a document with an editor"
+        );
+
+        // And the REMOVAL, through the same route, is attributed the same way:
+        // a removal is an edit of the document too. A SECOND principal makes
+        // that leg independently load-bearing — re-using `Test Admin` would
+        // assert nothing, because the editor already IS that name from the
+        // update above, so a removal which stamped nothing would still render
+        // it. `Test Probe` can only appear here if the removal itself carried
+        // the request's actor through.
+        let editor_after_update = stored.updated_by;
+        let probe_token =
+            test_support::seed_session_with_permissions(&state.pool, &["sales.create"])
+                .await
+                .unwrap();
+        let probe_cookie = test_support::cookie_for(&probe_token);
+        let (status, body, _) = send_delete(
+            app.clone(),
+            &format!("/web/sales/{}/lines/{}", sale.id, line.id),
+            Some(&probe_cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the line removal: {body:.400}");
+        let after_removal = sale_audit_line(&body);
+        assert!(
+            after_removal.contains("Test Probe"),
+            "removing a line is an edit, so the audit line names THAT operator: \
+             the rendered line is {after_removal:.300}"
+        );
+        assert!(
+            !after_removal.contains("Test Admin"),
+            "and the previous editor is no longer named — otherwise this leg \
+             proves nothing: the rendered line is {after_removal:.300}"
+        );
+        let editor_after_removal = state
+            .sales_service
+            .get_detail(sale.id)
+            .await
+            .unwrap()
+            .sale
+            .updated_by;
+        assert_ne!(
+            editor_after_removal, editor_after_update,
+            "the STORED editor changed with the removal: this assertion is on \
+             the value, not on how long anything took"
+        );
+        assert!(
+            editor_after_removal.is_some(),
+            "and a successful removal still leaves a document with an editor"
         );
     }
 }

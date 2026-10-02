@@ -493,6 +493,7 @@ where
 
     pub async fn add_line(
         &self,
+        actor: i64,
         sale_id: i64,
         product_id: i64,
         qty: Decimal,
@@ -518,13 +519,22 @@ where
             }
             None => product.sale_price,
         };
-        self.sales
+        let line = self
+            .sales
             .create_line(sale_id, product_id, qty, price)
-            .await
+            .await?;
+        // AFTER the line write, and only because it succeeded: a refused add
+        // must leave the document claiming no editor rather than one. The
+        // restriction to drafts is the `ensure_draft` above, not a predicate
+        // here — see `SaleRepository::touch_draft` for why that placement is
+        // deliberate.
+        self.sales.touch_draft(sale_id, actor).await?;
+        Ok(line)
     }
 
     pub async fn update_line(
         &self,
+        actor: i64,
         line_id: i64,
         qty: Decimal,
         unit_price: Decimal,
@@ -546,10 +556,14 @@ where
         if unit_price < Decimal::ZERO {
             return Err(AppError::Validation("unit_price cannot be negative".into()));
         }
-        self.sales.update_line(line_id, qty, unit_price).await
+        let updated = self.sales.update_line(line_id, qty, unit_price).await?;
+        // Same rule and same order as the add: the line write is an edit of
+        // THIS document, so the document names whoever requested it.
+        self.sales.touch_draft(line.sale_id, actor).await?;
+        Ok(updated)
     }
 
-    pub async fn remove_line(&self, line_id: i64) -> AppResult<()> {
+    pub async fn remove_line(&self, actor: i64, line_id: i64) -> AppResult<()> {
         let line = self
             .sales
             .find_line(line_id)
@@ -566,6 +580,9 @@ where
         // guards above do — the `ensure_draft` check stays as the early,
         // cheap refusal and the statement is the backstop.
         self.sales.delete_line(line_id).await?;
+        // A removal is an edit too: the audit line must not keep claiming the
+        // document has no editor after the operator deleted a line from it.
+        self.sales.touch_draft(line.sale_id, actor).await?;
         Ok(())
     }
 
@@ -2077,7 +2094,7 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, product_id, dec(qty), None)
+        s.add_line(audit_actor(&s).await, sale.id, product_id, dec(qty), None)
             .await
             .unwrap();
         sale
@@ -2152,7 +2169,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
         assert_eq!(movement_count(&pool).await, 1);
         assert_eq!(tx_count(&pool).await, 0);
     }
@@ -2182,7 +2201,9 @@ mod tests {
             .await
             .unwrap();
         assert!(sale.sale_number.is_none());
-        s.add_line(sale.id, prod.id, dec("3"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("3"), None)
+            .await
+            .unwrap();
 
         let detail = s
             .confirm(audit_actor(&s).await, sale.id, Some(cash))
@@ -2247,7 +2268,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
         let detail = s
             .confirm(audit_actor(&s).await, sale.id, None)
             .await
@@ -2344,7 +2367,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 40
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -2422,25 +2447,27 @@ mod tests {
             .await
             .unwrap();
         let err = s
-            .add_line(sale.id, 99999, dec("1"), None)
+            .add_line(audit_actor(&s).await, sale.id, 99999, dec("1"), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
 
         // qty <= 0 => 400.
         let err = s
-            .add_line(sale.id, prod.id, dec("0"), None)
+            .add_line(audit_actor(&s).await, sale.id, prod.id, dec("0"), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
-            .add_line(sale.id, prod.id, dec("-1"), None)
+            .add_line(audit_actor(&s).await, sale.id, prod.id, dec("-1"), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
 
         // Unknown method on Cash confirm => 404.
-        s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         let err = s
             .confirm(audit_actor(&s).await, sale.id, Some(999_999))
             .await
@@ -2462,7 +2489,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(csale.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, csale.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         s.confirm(audit_actor(&s).await, csale.id, None)
             .await
             .unwrap();
@@ -2504,7 +2533,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         s.confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
             .unwrap();
@@ -2521,18 +2552,21 @@ mod tests {
 
         // Edit Confirmed => 400 (add / update / remove / header).
         let err = s
-            .add_line(sale.id, prod.id, dec("1"), None)
+            .add_line(audit_actor(&s).await, sale.id, prod.id, dec("1"), None)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let detail = s.get_detail(sale.id).await.unwrap();
         let line_id = detail.lines[0].id;
         let err = s
-            .update_line(line_id, dec("2"), dec("10"))
+            .update_line(audit_actor(&s).await, line_id, dec("2"), dec("10"))
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        let err = s.remove_line(line_id).await.unwrap_err();
+        let err = s
+            .remove_line(audit_actor(&s).await, line_id)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let err = s
             .update_draft(
@@ -2572,7 +2606,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("4"), None).await.unwrap(); // total 40
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("4"), None)
+            .await
+            .unwrap(); // total 40
         let confirmed = s
             .confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
@@ -2648,7 +2684,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 20
         s.confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
             .unwrap();
@@ -2703,7 +2741,7 @@ mod tests {
             )
             .await
             .unwrap();
-        s2.add_line(sale2.id, prod2.id, dec("2"), None)
+        s2.add_line(audit_actor(&s2).await, sale2.id, prod2.id, dec("2"), None)
             .await
             .unwrap();
         s2.confirm(audit_actor(&s2).await, sale2.id, Some(cash2))
@@ -2764,7 +2802,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("12"), None).await.unwrap(); // total 120
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("12"), None)
+            .await
+            .unwrap(); // total 120
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -2864,7 +2904,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("12"), None).await.unwrap(); // total 120
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("12"), None)
+            .await
+            .unwrap(); // total 120
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -2915,7 +2957,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("4"), None).await.unwrap(); // total 40
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("4"), None)
+            .await
+            .unwrap(); // total 40
         s.confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
             .unwrap();
@@ -2992,7 +3036,7 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, svc_prod.id, dec("2"), None)
+        s.add_line(audit_actor(&s).await, sale.id, svc_prod.id, dec("2"), None)
             .await
             .unwrap();
         let before = movement_count(&pool).await;
@@ -3029,7 +3073,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(a.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, a.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         let b = s
             .create_draft(
                 audit_actor(&s).await,
@@ -3044,7 +3090,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(b.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, b.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
 
         let da = s
             .confirm(audit_actor(&s).await, a.id, Some(cash))
@@ -3071,7 +3119,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(c.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, c.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         let moves_before = movement_count(&pool).await;
         let tx_before = tx_count(&pool).await;
         let cancelled = s.cancel(audit_actor(&s).await, c.id, None).await.unwrap();
@@ -3103,7 +3153,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("10"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("10"), None)
+            .await
+            .unwrap();
         let err = s
             .confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
@@ -3135,7 +3187,9 @@ mod tests {
         allow(&s, acc.id, cash).await;
         let walkin = walkin_of(&s).await;
         let sale = draft_with_line(&s, walkin.id, PaymentType::Cash, None, prod.id, "6").await;
-        s.add_line(sale.id, prod.id, dec("6"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("6"), None)
+            .await
+            .unwrap();
 
         let movements_before = movement_count(&pool).await;
         let txs_before = tx_count(&pool).await;
@@ -3215,7 +3269,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("1"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
         // Missing method => 400.
         let err = s
             .confirm(audit_actor(&s).await, sale.id, None)
@@ -3241,7 +3297,7 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(credit.id, prod.id, dec("1"), None)
+        s.add_line(audit_actor(&s).await, credit.id, prod.id, dec("1"), None)
             .await
             .unwrap();
         let err = s
@@ -3273,7 +3329,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
         let moves_before = movement_count(&pool).await;
         let tx_before = tx_count(&pool).await;
         let err = s
@@ -3314,7 +3372,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 40
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -3368,7 +3428,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 20
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -3407,7 +3469,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 20
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 20
 
         let detail = s
             .confirm(audit_actor(&s).await, sale.id, Some(cash))
@@ -3456,7 +3520,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 40
         let detail = s
             .confirm(audit_actor(&s).await, sale.id, None)
             .await
@@ -3537,7 +3603,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap(); // total 40
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 40
         let detail = s
             .confirm(audit_actor(&s).await, sale.id, None)
             .await
@@ -3613,7 +3681,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
         let detail = s
             .confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
@@ -3667,7 +3737,9 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
         s.confirm(audit_actor(&s).await, sale.id, Some(cash))
             .await
             .unwrap();
@@ -4055,7 +4127,7 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, product_id, dec(qty), None)
+        s.add_line(audit_actor(&s).await, sale.id, product_id, dec(qty), None)
             .await
             .unwrap();
         sale
@@ -4927,7 +4999,9 @@ mod tests {
             .unwrap();
         assert_eq!(sale.created_by, creator, "the draft's creator");
         assert_eq!(sale.updated_by, None, "a fresh draft has no editor");
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
 
         // Bob edits the header: the same document now names its last editor,
         // and the creator is untouched.
@@ -4981,6 +5055,260 @@ mod tests {
             "the refund link names its writer"
         );
         assert_eq!(payments[0].created_by, creator, "the creator never changes");
+    }
+
+    // -----------------------------------------------------------------------
+    // A LINE WRITE IS AN EDIT OF THE DOCUMENT
+    //
+    // A `sale_lines` row has no `created_by`/`updated_by` of its own: it
+    // inherits its parent's actor, by design. What the parent owes the operator
+    // is therefore that the DOCUMENT names whoever just edited it. The purchase
+    // family, both return families and the header/confirm/cancel tiers on this
+    // family all already do; these are the line tiers this family did not, and
+    // the record page's audit line (`templates/partials/sale_detail.html:124`)
+    // claims otherwise in a comment.
+    // -----------------------------------------------------------------------
+
+    /// Two distinct users, so an assertion about the editor cannot pass by
+    /// accident: `creator` opens the draft, `editor` changes its lines. The
+    /// sentinel `audit_actor` is deliberately NOT used here — a stamp that
+    /// always equals the system actor would satisfy every assertion below.
+    async fn two_actors(pool: &sqlx::SqlitePool) -> (i64, i64) {
+        let creator = test_support::seed_audit_user(pool, "sale-line-alice", "Alice")
+            .await
+            .unwrap();
+        let editor = test_support::seed_audit_user(pool, "sale-line-bob", "Bob")
+            .await
+            .unwrap();
+        assert_ne!(creator, editor, "the two actors must be different users");
+        (creator, editor)
+    }
+
+    /// A credit draft owned by `creator` with one line, so a line-tier test
+    /// starts from a document that HAS an editor-free history.
+    async fn line_tier_draft(
+        s: &Svc,
+        creator: i64,
+        prod: &crate::models::Product,
+    ) -> crate::models::Sale {
+        let customer = seed_customer(s, "sale-line-customer", None, None).await;
+        let sale = s
+            .create_draft(
+                creator,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(creator, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
+        sale
+    }
+
+    /// The STORED `updated_by`, read through the repository rather than a
+    /// service projection, so a test cannot pass on a derived value.
+    async fn stored_editor(s: &Svc, sale_id: i64) -> Option<i64> {
+        s.sales
+            .find_sale(sale_id)
+            .await
+            .unwrap()
+            .expect("the draft is still there")
+            .updated_by
+    }
+
+    #[tokio::test]
+    async fn add_line_stamps_the_drafts_updated_by_with_the_calling_actor() {
+        let (s, pool) = svc().await;
+        let (creator, editor) = two_actors(&pool).await;
+        let prod = seed_product(&s, "SALE-LINE-ADD", "10").await;
+        let sale = line_tier_draft(&s, creator, &prod).await;
+
+        // The opening line was the creator's, so the draft already names her.
+        assert_eq!(
+            stored_editor(&s, sale.id).await,
+            Some(creator),
+            "the creating line is an edit too"
+        );
+
+        s.add_line(editor, sale.id, prod.id, dec("1"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_editor(&s, sale.id).await,
+            Some(editor),
+            "a line write is an edit of the document, so the draft names the \
+             operator who made it"
+        );
+        let stored = s.sales.find_sale(sale.id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.created_by, creator,
+            "a line edit must never rewrite the document's creator"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_line_stamps_the_drafts_updated_by_with_the_calling_actor() {
+        let (s, pool) = svc().await;
+        let (creator, editor) = two_actors(&pool).await;
+        let prod = seed_product(&s, "SALE-LINE-UPD", "10").await;
+        let sale = line_tier_draft(&s, creator, &prod).await;
+        let line_id = s.sales.list_lines(sale.id).await.unwrap()[0].id;
+
+        s.update_line(editor, line_id, dec("5"), dec("12"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored_editor(&s, sale.id).await,
+            Some(editor),
+            "an inline quantity/price edit names its editor"
+        );
+        let stored = s.sales.find_sale(sale.id).await.unwrap().unwrap();
+        assert_eq!(stored.created_by, creator, "the creator is never rewritten");
+    }
+
+    #[tokio::test]
+    async fn remove_line_stamps_the_drafts_updated_by_with_the_calling_actor() {
+        let (s, pool) = svc().await;
+        let (creator, editor) = two_actors(&pool).await;
+        let prod = seed_product(&s, "SALE-LINE-DEL", "10").await;
+        let sale = line_tier_draft(&s, creator, &prod).await;
+        let line_id = s.sales.list_lines(sale.id).await.unwrap()[0].id;
+
+        s.remove_line(editor, line_id).await.unwrap();
+
+        assert_eq!(
+            stored_editor(&s, sale.id).await,
+            Some(editor),
+            "removing a line is an edit of the document too"
+        );
+        let stored = s.sales.find_sale(sale.id).await.unwrap().unwrap();
+        assert_eq!(stored.created_by, creator, "the creator is never rewritten");
+    }
+
+    /// The one that is easy to get wrong. A REFUSED line write must leave the
+    /// document's editor exactly as it was: stamping first would make a sale
+    /// claim an edit that never happened, and the audit line is the last thing
+    /// in this interface that should be wrong.
+    #[tokio::test]
+    async fn a_refused_line_write_leaves_the_drafts_updated_by_untouched() {
+        let (s, pool) = svc().await;
+        let (creator, editor) = two_actors(&pool).await;
+        let prod = seed_product(&s, "SALE-LINE-REFUSE", "10").await;
+        let sale = line_tier_draft(&s, creator, &prod).await;
+        let line_id = s.sales.list_lines(sale.id).await.unwrap()[0].id;
+        let before = stored_editor(&s, sale.id).await;
+        assert_eq!(before, Some(creator), "the baseline editor is the creator");
+
+        // Zero and negative quantities, and a negative price: all refused by the
+        // service's own guards, before any statement runs.
+        for (name, result) in [
+            (
+                "zero qty",
+                s.update_line(editor, line_id, dec("0"), dec("10")).await,
+            ),
+            (
+                "negative qty",
+                s.update_line(editor, line_id, dec("-1"), dec("10")).await,
+            ),
+            (
+                "negative price",
+                s.update_line(editor, line_id, dec("1"), dec("-1")).await,
+            ),
+            (
+                "zero qty on add",
+                s.add_line(editor, sale.id, prod.id, dec("0"), None).await,
+            ),
+            (
+                "unknown product",
+                s.add_line(editor, sale.id, 999_999, dec("1"), None).await,
+            ),
+        ] {
+            assert!(result.is_err(), "{name} must be refused");
+            assert_eq!(
+                stored_editor(&s, sale.id).await,
+                before,
+                "a refused {name} must not stamp the document"
+            );
+        }
+
+        // And the removal: a line that does not exist is refused, and so is
+        // nothing — the draft must still name the creator, not the editor.
+        assert!(s.remove_line(editor, 999_999).await.is_err());
+        assert_eq!(
+            stored_editor(&s, sale.id).await,
+            before,
+            "a refused removal must not stamp the document"
+        );
+    }
+
+    /// The state guard is a refusal like any other: a Confirmed sale refuses
+    /// every line write, and refusing must not rewrite its editor. Without this
+    /// the guard would be the one hole in the "stamp only after a real write"
+    /// rule, because it is the guard — not the statement — that turns a
+    /// non-Draft attempt into an error.
+    #[tokio::test]
+    async fn a_line_write_refused_because_the_sale_is_not_a_draft_leaves_the_editor_untouched() {
+        let (s, pool) = svc().await;
+        let (creator, editor) = two_actors(&pool).await;
+        let prod = seed_product(&s, "SALE-LINE-CONF", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let sale = line_tier_draft(&s, creator, &prod).await;
+        let line_id = s.sales.list_lines(sale.id).await.unwrap()[0].id;
+
+        // Bob edits the header, so the baseline editor is BOB and not the
+        // creator — otherwise a stamp of `creator` would look like "no change".
+        s.update_draft(
+            sale.id,
+            editor,
+            UpdateSaleDraft {
+                notes: Some("bob was here".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        s.confirm(editor, sale.id, None).await.unwrap();
+        let before = stored_editor(&s, sale.id).await;
+        assert_eq!(
+            before,
+            Some(editor),
+            "the baseline editor is the last writer"
+        );
+
+        assert!(s
+            .add_line(editor, sale.id, prod.id, dec("1"), None)
+            .await
+            .is_err());
+        assert!(s
+            .update_line(editor, line_id, dec("3"), dec("10"))
+            .await
+            .is_err());
+        assert!(s.remove_line(editor, line_id).await.is_err());
+
+        assert_eq!(
+            stored_editor(&s, sale.id).await,
+            before,
+            "a non-Draft sale refuses every line write, and a refusal is not an edit"
+        );
+        assert_eq!(
+            s.sales
+                .find_sale(sale.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .created_by,
+            creator,
+            "the creator survives a refused line write"
+        );
     }
 
     /// `find_payment` is the read-by-id the documents drawer uses: found
@@ -5061,7 +5389,7 @@ mod tests {
             )
             .await
             .unwrap();
-        s.add_line(sale.id, product.id, dec("2"), None)
+        s.add_line(audit_actor(&s).await, sale.id, product.id, dec("2"), None)
             .await
             .unwrap();
         sale
@@ -5222,7 +5550,9 @@ mod tests {
             .await
             .unwrap();
         // No explicit unit_price: the line takes the product's derived price.
-        s.add_line(sale.id, prod.id, dec("2"), None).await.unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
         let before = s.get_detail(sale.id).await.unwrap();
         assert_eq!(
             before.lines[0].unit_price,
@@ -5330,9 +5660,15 @@ mod tests {
         let (s, _pool) = svc().await;
         let product = stockable_product(&s, "TAX-NONE", "12.345").await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
-        s.add_line(sale.id, product.id, dec("2"), Some(dec("12.345")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("2"),
+            Some(dec("12.345")),
+        )
+        .await
+        .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(detail.net_subtotal, dec("24.69"), "2 x 12.345 is 24.69 net");
@@ -5349,9 +5685,15 @@ mod tests {
         let product = stockable_product(&s, "TAX-ONE", "50").await;
         link_tax(&pool, "IVA21", "21", product.id).await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
-        s.add_line(sale.id, product.id, dec("2"), Some(dec("50")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("2"),
+            Some(dec("50")),
+        )
+        .await
+        .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(detail.net_subtotal, dec("100"));
@@ -5369,9 +5711,15 @@ mod tests {
         link_tax(&pool, "IVA21", "21", product.id).await;
         link_tax(&pool, "IIBB10", "10", product.id).await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
-        s.add_line(sale.id, product.id, dec("1"), Some(dec("100")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(detail.net_subtotal, dec("100"));
@@ -5400,12 +5748,24 @@ mod tests {
         link_tax(&pool, "IVA21", "21", first.id).await;
         link_tax(&pool, "IVA21B", "21", second.id).await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
-        s.add_line(sale.id, first.id, dec("1"), Some(dec("10.005")))
-            .await
-            .unwrap();
-        s.add_line(sale.id, second.id, dec("1"), Some(dec("10.005")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            first.id,
+            dec("1"),
+            Some(dec("10.005")),
+        )
+        .await
+        .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            second.id,
+            dec("1"),
+            Some(dec("10.005")),
+        )
+        .await
+        .unwrap();
 
         let record = s.get_record(sale.id).await.unwrap();
         assert_eq!(record.lines.len(), 2);
@@ -5434,9 +5794,15 @@ mod tests {
         let product = stockable_product(&s, "TAX-LIMIT", "100").await;
         link_tax(&pool, "IVA21", "21", product.id).await;
         let sale = draft_sale(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit).await;
-        s.add_line(sale.id, product.id, dec("1"), Some(dec("100")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -5488,9 +5854,15 @@ mod tests {
         link_tax(&pool, "IVA21", "21", product.id).await;
         let customer = seed_customer(&s, "Taxed Debtor", None, Some(30)).await;
         let sale = draft_sale(&s, customer.id, PaymentType::Credit).await;
-        s.add_line(sale.id, product.id, dec("1"), Some(dec("100")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -5516,9 +5888,15 @@ mod tests {
         // fits if the check measures the gross, not the net.
         let customer = seed_customer(&s, "Tight Limit", Some("121"), Some(30)).await;
         let sale = draft_sale(&s, customer.id, PaymentType::Credit).await;
-        s.add_line(sale.id, product.id, dec("1"), Some(dec("100")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .expect("projected debt 121 is exactly the limit");
@@ -5528,9 +5906,15 @@ mod tests {
         let second_product = stockable_product(&s, "TAX-CREDIT-2", "100").await;
         link_tax(&pool, "IVA21B", "21", second_product.id).await;
         let second = draft_sale(&s, customer.id, PaymentType::Credit).await;
-        s.add_line(second.id, second_product.id, dec("1"), Some(dec("100")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            second.id,
+            second_product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
         let refused = s
             .confirm(audit_actor(&s).await, second.id, None)
             .await
@@ -5549,9 +5933,15 @@ mod tests {
         let product = stockable_product(&s, "TAX-FROZEN", "100").await;
         let tax_id = link_tax(&pool, "IVA21", "21", product.id).await;
         let sale = draft_sale(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit).await;
-        s.add_line(sale.id, product.id, dec("1"), Some(dec("100")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, sale.id, None)
             .await
             .unwrap();
@@ -5604,7 +5994,13 @@ mod tests {
         let tax_id = link_tax(&pool, "IVA21", "21", product.id).await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
         let line = s
-            .add_line(sale.id, product.id, dec("1"), Some(dec("100")))
+            .add_line(
+                audit_actor(&s).await,
+                sale.id,
+                product.id,
+                dec("1"),
+                Some(dec("100")),
+            )
             .await
             .unwrap();
         assert_eq!(s.get_detail(sale.id).await.unwrap().total, dec("121"));
@@ -5616,7 +6012,9 @@ mod tests {
             .await
             .unwrap();
 
-        s.update_line(line.id, dec("1"), dec("100")).await.unwrap();
+        s.update_line(audit_actor(&s).await, line.id, dec("1"), dec("100"))
+            .await
+            .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(
@@ -5635,7 +6033,13 @@ mod tests {
         let tax_id = link_tax(&pool, "IVA21", "21", product.id).await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
         let line = s
-            .add_line(sale.id, product.id, dec("1"), Some(dec("100")))
+            .add_line(
+                audit_actor(&s).await,
+                sale.id,
+                product.id,
+                dec("1"),
+                Some(dec("100")),
+            )
             .await
             .unwrap();
         assert_eq!(s.get_detail(sale.id).await.unwrap().total, dec("121"));
@@ -5643,7 +6047,9 @@ mod tests {
         let taxes = crate::repositories::SqliteTaxRepository::new(pool.clone());
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         taxes.deactivate(actor, tax_id).await.unwrap();
-        s.update_line(line.id, dec("1"), dec("100")).await.unwrap();
+        s.update_line(audit_actor(&s).await, line.id, dec("1"), dec("100"))
+            .await
+            .unwrap();
 
         let record = s.get_record(sale.id).await.unwrap();
         let money = record.money.expect("an ordinary document totals");
@@ -5661,9 +6067,15 @@ mod tests {
         link_tax(&pool, "IVA21", "21", product.id).await;
         link_tax(&pool, "IIBB10", "10", product.id).await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
-        s.add_line(sale.id, product.id, dec("1"), Some(dec("100")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("1"),
+            Some(dec("100")),
+        )
+        .await
+        .unwrap();
 
         let record = s.get_record(sale.id).await.unwrap();
         let money = record.money.expect("an ordinary document totals");
@@ -5702,9 +6114,15 @@ mod tests {
         let (s, _pool) = svc().await;
         let product = stockable_product(&s, "TAX-NOBREAK", "10").await;
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
-        s.add_line(sale.id, product.id, dec("2"), Some(dec("10")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
 
         let record = s.get_record(sale.id).await.unwrap();
         assert!(record.lines[0].taxes.is_empty());
@@ -5735,9 +6153,15 @@ mod tests {
         let sale = draft_sale(&s, WALKIN_ID, PaymentType::Cash).await;
 
         // One line: the document totals, and says nothing about the rule.
-        s.add_line(sale.id, product.id, dec("1"), Some(dec("10")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            sale.id,
+            product.id,
+            dec("1"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
         let readable = s.get_record(sale.id).await.unwrap();
         assert!(readable.money.is_some());
         assert!(readable.total_refusal.is_none());
@@ -5746,9 +6170,15 @@ mod tests {
         // Two more lines that carry the sum out of range: the document is still
         // returned, with every figure absent and the rule named.
         for _ in 0..2 {
-            s.add_line(sale.id, product.id, dec("1"), Some(dec(FOUR_E28)))
-                .await
-                .unwrap();
+            s.add_line(
+                audit_actor(&s).await,
+                sale.id,
+                product.id,
+                dec("1"),
+                Some(dec(FOUR_E28)),
+            )
+            .await
+            .unwrap();
         }
         let refused = s.get_record(sale.id).await.unwrap();
         assert!(
@@ -5785,9 +6215,15 @@ mod tests {
         // The control, asserted in the same test: ONE such document is an
         // ordinary receivable, so a refusal above can only come from the SET.
         let single = draft_sale(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit).await;
-        s.add_line(single.id, product.id, dec("1"), Some(dec(FOUR_E28)))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            single.id,
+            product.id,
+            dec("1"),
+            Some(dec(FOUR_E28)),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, single.id, None)
             .await
             .unwrap();
@@ -5798,9 +6234,15 @@ mod tests {
         );
 
         let second = draft_sale(&s, CREDIT_CUSTOMER_ID, PaymentType::Credit).await;
-        s.add_line(second.id, product.id, dec("1"), Some(dec(FOUR_E28)))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            second.id,
+            product.id,
+            dec("1"),
+            Some(dec(FOUR_E28)),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, second.id, None)
             .await
             .unwrap();
@@ -5909,9 +6351,15 @@ mod tests {
         // only be THIS customer's set and never the statement itself.
         let other = seed_customer(&s, "Statement Control", None, None).await;
         let control = draft_sale(&s, other.id, PaymentType::Credit).await;
-        s.add_line(control.id, product.id, dec("1"), Some(dec("2468")))
-            .await
-            .unwrap();
+        s.add_line(
+            audit_actor(&s).await,
+            control.id,
+            product.id,
+            dec("1"),
+            Some(dec("2468")),
+        )
+        .await
+        .unwrap();
         s.confirm(audit_actor(&s).await, control.id, None)
             .await
             .unwrap();
@@ -5952,10 +6400,16 @@ mod tests {
             .await
             .unwrap();
         let line = s
-            .add_line(sale.id, product.id, dec("1"), Some(dec(FOUR_E28)))
+            .add_line(
+                audit_actor(&s).await,
+                sale.id,
+                product.id,
+                dec("1"),
+                Some(dec(FOUR_E28)),
+            )
             .await
             .unwrap();
-        s.update_line(line.id, dec("1"), dec(FOUR_E28))
+        s.update_line(audit_actor(&s).await, line.id, dec("1"), dec(FOUR_E28))
             .await
             .unwrap();
         s.confirm(audit_actor(&s).await, sale.id, None)
@@ -6020,10 +6474,16 @@ mod tests {
                 .await
                 .unwrap();
             let line = s
-                .add_line(sale.id, product.id, dec("1"), Some(dec(FOUR_E28)))
+                .add_line(
+                    audit_actor(&s).await,
+                    sale.id,
+                    product.id,
+                    dec("1"),
+                    Some(dec(FOUR_E28)),
+                )
                 .await
                 .unwrap();
-            s.update_line(line.id, dec("1"), dec(FOUR_E28))
+            s.update_line(audit_actor(&s).await, line.id, dec("1"), dec(FOUR_E28))
                 .await
                 .unwrap();
             s.confirm(audit_actor(&s).await, sale.id, None)
@@ -6320,7 +6780,7 @@ mod tests {
         let sale = draft_with_line(&s, WALKIN_ID, PaymentType::Cash, None, first.id, "2").await;
         // Lines are loaded in id order, so `first`'s Out is written before
         // `second`'s — this is the SECOND movement that fails.
-        s.add_line(sale.id, second.id, dec("3"), None)
+        s.add_line(audit_actor(&s).await, sale.id, second.id, dec("3"), None)
             .await
             .unwrap();
         let actor = audit_actor(&s).await;
