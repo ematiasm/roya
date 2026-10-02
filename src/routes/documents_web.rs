@@ -3134,7 +3134,13 @@ mod tests {
         for _ in 0..2 {
             state
                 .sales_service
-                .add_line(sale.id, product.id, Decimal::from(1), Some(unit_price))
+                .add_line(
+                    audit_actor(&state).await,
+                    sale.id,
+                    product.id,
+                    Decimal::from(1),
+                    Some(unit_price),
+                )
                 .await
                 .unwrap();
         }
@@ -3274,7 +3280,13 @@ mod tests {
             .unwrap();
         state
             .sales_service
-            .add_line(sale.id, product_id, Decimal::from(2), None)
+            .add_line(
+                audit_actor(&state).await,
+                sale.id,
+                product_id,
+                Decimal::from(2),
+                None,
+            )
             .await
             .unwrap();
         if confirm {
@@ -4512,6 +4524,7 @@ mod tests {
         state
             .sales_service
             .add_line(
+                audit_actor(&state).await,
                 sale.id,
                 product.id,
                 Decimal::from(5),

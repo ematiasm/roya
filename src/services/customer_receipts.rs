@@ -533,7 +533,7 @@ mod tests {
             .await
             .unwrap();
         s.sales
-            .add_line(sale.id, product_id, dec(qty), None)
+            .add_line(audit_actor(s).await, sale.id, product_id, dec(qty), None)
             .await
             .unwrap();
         s.sales

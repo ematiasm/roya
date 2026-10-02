@@ -1078,7 +1078,13 @@ mod tests {
             .unwrap();
         state
             .sales_service
-            .add_line(sale.id, product.id, Decimal::from(3), None)
+            .add_line(
+                audit_actor(&state).await,
+                sale.id,
+                product.id,
+                Decimal::from(3),
+                None,
+            )
             .await
             .unwrap();
         state
@@ -1122,6 +1128,7 @@ mod tests {
         state
             .sales_service
             .add_line(
+                audit_actor(&state).await,
                 sale.id,
                 product_id,
                 Decimal::ONE,

@@ -1269,6 +1269,7 @@ mod tests {
         state
             .sales_service
             .add_line(
+                actor,
                 sale.id,
                 product_id,
                 qty.parse().unwrap(),
