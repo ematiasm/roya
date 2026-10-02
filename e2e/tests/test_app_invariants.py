@@ -28,6 +28,8 @@ What it asserts:
 5. A person can actually get there: every sidebar entry navigates to the route
    it declares, every registered page route is linked from somewhere in the
    shell, and every record page's dialog-opening action responds.
+6. Every page answers a success status. The DOM assertions above run against
+   whatever a 4xx/5xx renders, so the status itself is asserted too.
 
 **What it deliberately does not do.** It never mutates: no submit of a form
 that writes, no `hx-post`, no `hx-delete`. A net that changes the shop while it
@@ -45,11 +47,12 @@ instead of pretending the dashboard is the wizard.
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlsplit
 
-from playwright.sync_api import Page
+from playwright.sync_api import Page, Response
 
 from helpers import (
     ApiClient,
@@ -192,10 +195,13 @@ def registered_page_routes() -> list[str]:
 
 
 def _instantiate(template: str, context: dict[str, Any]) -> str:
-    """Fill a route template's `{id}` from the seeded shop.
+    """Fill a route template's parameters from the seeded shop.
 
-    A template whose first segment owns no id mapping raises: the alternative
-    is a route that silently leaves the sweep.
+    Each parameter is resolved on its own: by its own name when that name is a
+    seeded context key, and for `{id}` by the owner its route family declares.
+    Anything else raises — substituting one id for every parameter would turn a
+    future `/sales/{id}/lines/{line_id}` into a wrong URL that still answers,
+    and a route built on a wrong URL proves nothing about the real one.
     """
     first_segment = template.strip("/").split("/", 1)[0]
     if "{" in template and first_segment not in _PARAM_OWNER:
@@ -204,10 +210,23 @@ def _instantiate(template: str, context: dict[str, Any]) -> str:
             f"{first_segment!r} names no seeded entity; add it to _PARAM_OWNER "
             "so the swept route is the real one"
         )
-    key = _PARAM_OWNER.get(first_segment)
-    if key is None:
+    owner_key = _PARAM_OWNER.get(first_segment)
+    if owner_key is None:
         return template
-    return re.sub(r"\{[^}]+\}", lambda _: str(context[key]), template)
+
+    def resolve(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name in context:
+            return str(context[name])
+        if name == "id":
+            return str(context[owner_key])
+        raise AssertionError(
+            f"route {template!r} has parameter {{{name}}} that cannot be "
+            "resolved: it is not a seeded context key and it is not {id} on a "
+            f"route whose first segment ({first_segment!r}) owns one"
+        )
+
+    return re.sub(r"\{([^}]+)\}", resolve, template)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +373,7 @@ _INTERNAL_TEXT_PATTERNS = {
     "serde vocabulary": r"deserializ\w*|serializ\w*",
     "extractor sentence": r"cannot parse|missing field|invalid type",
     "panic machinery": r"\bpanicked\b|\bbacktrace\b|RUST_BACKTRACE",
-    "unwrap call": r"\bunwrap\w*\b",
+    "unwrap call": r"\bunwrap(?:_err)?\(",
     "Rust error type": r"\b[A-Z][A-Za-z0-9_]*Error\b",
     "Rust generic type": r"\b[A-Za-z_][A-Za-z0-9_:]*<[^<>\n]{1,80}>",
     "Rust enum or constructor": r"\b[A-Z][a-z][A-Za-z0-9_]*\(",
@@ -432,13 +451,44 @@ _ANCHOR_HREFS_PROBE = """
 }))
 """
 
+# Every element whose `onclick` opens a modal, not only `<button>`: the
+# promise is in the attribute, and a `<span>` or `<a>` carrying it opens
+# exactly the same dialog. `offsetParent` alone is null for `position: fixed`
+# elements too, which hides real openers, so `checkVisibility()` is preferred
+# where the browser provides it. `key` is the opener's stable identity: a
+# re-read of the page must resolve the same opener, so the loop clicks by
+# identity rather than by a DOM position that a re-render can invalidate.
 _DIALOG_OPENERS_PROBE = """
-() => Array.from(document.querySelectorAll('button[onclick*="showModal"]'))
-  .filter((el) => el.offsetParent !== null)
-  .map((el) => ({
-    id: el.id || null,
-    onclick: el.getAttribute('onclick'),
-  }))
+() => Array.from(document.querySelectorAll('[onclick*="showModal"]'))
+  .filter((el) => (el.checkVisibility ? el.checkVisibility() : el.offsetParent !== null))
+  .map((el) => {
+    const onclick = el.getAttribute('onclick');
+    return {
+      id: el.id || null,
+      onclick,
+      key: el.id || (el.tagName.toLowerCase() + '|' + onclick + '|' + (el.textContent || '').trim()),
+    };
+  })
+"""
+
+# The visible text is not the only surface a person reads. A title,
+# placeholder, field value, image alt or aria-label is on the screen too, and
+# an internal error that lands in one of them leaks just as loudly.
+_VISIBLE_ATTRIBUTES_PROBE = """
+() => {
+  const names = ['title', 'placeholder', 'value', 'alt', 'aria-label'];
+  const out = [];
+  for (const el of document.querySelectorAll(
+    '[title], [placeholder], [value], [alt], [aria-label]'
+  )) {
+    const tag = el.tagName.toLowerCase();
+    for (const attr of names) {
+      const text = el.getAttribute(attr);
+      if (text) out.push({ attr, tag, text });
+    }
+  }
+  return out;
+}
 """
 
 
@@ -465,13 +515,37 @@ class PageSignals:
         return list(self._seen)
 
 
-def _visit(page: Page, base_url: str, path: str) -> None:
-    page.goto(f"{base_url}{path}")
+def _visit(page: Page, base_url: str, path: str) -> Response | None:
+    """Navigate and settle, returning the response the navigation answered.
+
+    The response is the status boundary: every DOM assertion below runs
+    against whatever a 4xx/5xx renders, so the caller that cares about the
+    status reads it here rather than trusting the rendered body.
+    """
+    response = page.goto(f"{base_url}{path}")
     page.wait_for_load_state("networkidle")
+    return response
 
 
 def _body_text(page: Page) -> str:
     return page.locator("body").inner_text()
+
+
+def _dialog_count(page: Page, expected: int, timeout_ms: int = 2000) -> int:
+    """The number of open dialogs, polled until it matches or time runs out.
+
+    `showModal()` and Escape both take effect asynchronously from the test's
+    point of view, so reading `dialog.count()` once, immediately, races the
+    browser: a dialog that is about to open reads as zero, and one that is
+    about to close reads as one. Polling in short steps bounds the wait in
+    time without sleeping past the change.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    count = page.locator("dialog[open]").count()
+    while count != expected and time.monotonic() < deadline:
+        time.sleep(0.05)
+        count = page.locator("dialog[open]").count()
+    return count
 
 
 def _format_offenders(header: str, offenders: list[str]) -> str:
@@ -530,9 +604,24 @@ def test_no_page_renders_an_internal_error_name(page: Page, api: ApiClient) -> N
     for template, path in routes:
         _visit(page, api.base_url, path)
         text = _body_text(page)
-        for label, pattern in _INTERNAL_TEXT_PATTERNS.items():
-            for match in sorted(set(re.findall(pattern, text))):
-                offenders.append(f"{template} ({path}) [{label}]: {match!r}")
+        if not text.strip():
+            offenders.append(
+                f"{template} ({path}): rendered no visible text at all, so the "
+                "internal-error patterns had no rendered surface to scan"
+            )
+        # The rendered text is not the only surface a person reads: a title,
+        # placeholder, field value, alt or aria-label is on the screen too.
+        surfaces: list[tuple[str, str]] = [("body text", text)]
+        for attribute in page.evaluate(_VISIBLE_ATTRIBUTES_PROBE):
+            surfaces.append(
+                (f"{attribute['attr']} of <{attribute['tag']}>", attribute["text"])
+            )
+        for where, surface in surfaces:
+            for label, pattern in _INTERNAL_TEXT_PATTERNS.items():
+                for match in sorted(set(re.findall(pattern, surface))):
+                    offenders.append(
+                        f"{template} ({path}) [{label}] in {where}: {match!r}"
+                    )
 
     assert not offenders, _format_offenders(
         f"{len(offenders)} internal-error fragment(s) reached the screen:",
@@ -650,16 +739,25 @@ def test_every_sidebar_entry_navigates_to_the_route_it_declares(
             # The REST API link opens a JSON response in a new tab; it is not a
             # page of the shell and has no shell invariant to satisfy.
             continue
+        declared = urlsplit(entry["href"])
+        # Start from a shell page that is NOT the entry's own target, chosen
+        # deterministically: clicking the entry that already points at the
+        # current page proves nothing, because staying put satisfies it.
+        prelude = "/password" if declared.path != "/password" else "/settings"
+        _visit(page, api.base_url, prelude)
         page.locator(f'#sidebar a[data-nav="{entry["nav"]}"]').click()
         page.wait_for_load_state("networkidle")
         landed = urlsplit(page.url)
-        declared = urlsplit(entry["href"])
-        if landed.path != declared.path or landed.fragment != declared.fragment:
+        if (
+            landed.path != declared.path
+            or landed.query != declared.query
+            or landed.fragment != declared.fragment
+        ):
             offenders.append(
                 f"sidebar entry {entry['nav']!r} declares {entry['href']!r} "
-                f"but landed on {landed.path!r} (fragment {landed.fragment!r})"
+                f"but landed on {landed.path!r} (query {landed.query!r}, "
+                f"fragment {landed.fragment!r})"
             )
-        _visit(page, api.base_url, "/")
 
     assert not offenders, _format_offenders(
         f"{len(offenders)} sidebar entry(ies) do not open what they promise:",
@@ -750,31 +848,52 @@ def test_every_record_page_action_opens_what_it_promises(
     for template, path in record_routes:
         signals.reset()
         _visit(page, api.base_url, path)
-        count = page.locator('button[onclick*="showModal"]').count()
-        for index in range(count):
-            opener = page.evaluate(_DIALOG_OPENERS_PROBE)[index]
-            # A record page can render with its drawer already open — the deep
-            # link `/customers/{id}` IS the no-JavaScript route to the customer
-            # statement — and an open drawer overlays the list that owns the
-            # opener, so the click is refused by the overlay rather than by the
-            # button. Escape is base.html's own dismissal key for the drawer;
-            # pressing it first makes the click land on the opener.
-            page.keyboard.press("Escape")
-            page.locator('button[onclick*="showModal"]').nth(index).click()
-            openers_clicked += 1
-            dialog = page.locator("dialog[open]")
-            if dialog.count() != 1:
+        # A record page can render with its drawer already open — the deep
+        # link `/customers/{id}` IS the no-JavaScript route to the customer
+        # statement — and an open drawer overlays the list that owns the
+        # opener, so the click is refused by the overlay rather than by the
+        # button. Escape is base.html's own dismissal key for the drawer;
+        # pressing it first makes the click land on the opener. The snapshot
+        # of opener identities is taken after that Escape, so it describes the
+        # state every click runs from.
+        page.keyboard.press("Escape")
+        snapshotted = [
+            opener["key"] for opener in page.evaluate(_DIALOG_OPENERS_PROBE)
+        ]
+        for key in snapshotted:
+            # Re-read on every iteration and resolve the opener BY IDENTITY,
+            # never by position: a DOM change between two evaluations would
+            # otherwise couple an opener read from one render to a click on
+            # another, and a stale index clicks the wrong control or raises.
+            openers = page.evaluate(_DIALOG_OPENERS_PROBE)
+            index = next(
+                (i for i, opener in enumerate(openers) if opener["key"] == key),
+                None,
+            )
+            if index is None:
                 offenders.append(
-                    f"{template} ({path}): the action "
-                    f"{opener['id'] or opener['onclick']!r} left {dialog.count()} "
+                    f"{template} ({path}): the opener {key!r} was snapshotted "
+                    "but disappeared from the page before it could be clicked"
+                )
+                continue
+            page.locator('[onclick*="showModal"]').nth(index).click()
+            openers_clicked += 1
+            opened = _dialog_count(page, 1)
+            if opened != 1:
+                offenders.append(
+                    f"{template} ({path}): the action {key!r} left {opened} "
                     "open dialogs (expected 1)"
                 )
+                # Best-effort restore so one broken opener cannot leave a
+                # stray dialog open under the next one.
+                page.keyboard.press("Escape")
+                _dialog_count(page, 0)
             else:
                 page.keyboard.press("Escape")
-                if dialog.count() != 0:
+                if _dialog_count(page, 0) != 0:
                     offenders.append(
                         f"{template} ({path}): the dialog opened by "
-                        f"{opener['id'] or opener['onclick']!r} did not close on Escape"
+                        f"{key!r} did not close on Escape"
                     )
         for message in signals.seen:
             offenders.append(f"{template} ({path}): {message}")
@@ -823,3 +942,42 @@ def test_the_routes_outside_the_shell_are_registered_and_redirect(
             f"{path} rendered inside the signed-in session (landed on {landed}); "
             "the exclusion from the sweep is no longer true"
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Every page answers a success status
+# ---------------------------------------------------------------------------
+
+
+def test_every_page_answers_a_success_status(page: Page, api: ApiClient) -> None:
+    """A page answering 4xx/5xx renders, and every DOM assertion still passes.
+
+    Every other invariant here reads the page that a failed status renders:
+    a 500 with a blank shell, a 404 with the sidebar, both pass them all. The
+    status is the one property that cannot be read off the DOM, so it is read
+    off the response the navigation returned — and a response object that is
+    missing entirely is an offender too, not a pass.
+    """
+    context = seed_the_shop(page, api)
+    routes = sweepable_routes(context)
+
+    offenders: list[str] = []
+    swept = 0
+    for template, path in routes:
+        response = _visit(page, api.base_url, path)
+        swept += 1
+        if response is None or not response.ok:
+            status = (
+                "no response object" if response is None else f"status {response.status}"
+            )
+            offenders.append(f"{template} ({path}): answered {status}")
+
+    assert swept > 0, "the sweep covered no route; nothing was checked"
+    assert swept == len(routes), (
+        f"the sweep covered {swept} of {len(routes)} routes; a route that is "
+        "listed but not visited proves nothing"
+    )
+    assert not offenders, _format_offenders(
+        f"{len(offenders)} page(s) answered without a success status:",
+        offenders,
+    )
