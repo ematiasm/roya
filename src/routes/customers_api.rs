@@ -23,7 +23,10 @@ use std::collections::HashMap;
 
 use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
-use crate::models::{Ageing, Customer, NewCustomer, SetMoney, UpdateCustomer};
+use crate::models::{
+    Ageing, Customer, CustomerCreateResult, CustomerStatementResponse, NewCustomer, ReceiptDetail,
+    ReceiptsResponse, SetMoney, UpdateCustomer,
+};
 use crate::routes::AppState;
 
 // S6 enforcement (AC10): the entity and its derived receivable are read with
@@ -116,6 +119,30 @@ pub struct CustomerAgeingView {
     pub ageing: Ageing,
 }
 
+/// The customer list, under one key.
+///
+/// The envelope lives beside the view it wraps and not in `models.rs` for the
+/// same reason the view does: a `CustomersResponse` over some other row type is
+/// not a response, it is a coincidence. Naming it is also what makes the key a
+/// contract — `customers` read by every client of this endpoint, renamed inside
+/// a `json!` literal without a compile error anywhere in this crate.
+#[derive(Serialize)]
+pub struct CustomersResponse {
+    pub customers: Vec<CustomerBalanceView>,
+}
+
+/// The receivables view, under one key.
+///
+/// Separate from the customer list rather than a flag on it: this one is the
+/// set of customers who actually owe something, with the four ageing buckets
+/// that say how long, and a client reconciling collections reads the two
+/// independently. Naming `ageing` is what keeps that from becoming a silent
+/// rename.
+#[derive(Serialize)]
+pub struct AgeingResponse {
+    pub ageing: Vec<CustomerAgeingView>,
+}
+
 /// `credit_limit` is nullable: null means no limit, so the flag can never block.
 ///
 /// A refused balance makes NO claim either way: the comparison needs a figure
@@ -192,10 +219,10 @@ async fn list_customers(
     _: Require<CustomersRead>,
     Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<ListCustomersQuery>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<CustomersResponse>> {
     let customers =
         customer_views(&state, query.only_active.unwrap_or(false), &localization).await?;
-    Ok(Json(serde_json::json!({ "customers": customers })))
+    Ok(Json(CustomersResponse { customers }))
 }
 
 /// A duplicate name is not an error: the response carries the existing matches
@@ -205,22 +232,22 @@ async fn create_customer(
     _: Require<CustomersWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<NewCustomer>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> AppResult<(StatusCode, Json<CustomerCreateResult>)> {
     let created = state
         .customer_service
         .create_customer(principal.user_id, payload)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(created))))
+    Ok((StatusCode::CREATED, Json(created)))
 }
 
 async fn get_customer(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
     Path(id): Path<i64>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<CustomerBalanceView>> {
     let customer = state.customer_service.get_customer(id).await?;
     let view = customer_view(&state, customer).await?;
-    Ok(Json(serde_json::json!(view)))
+    Ok(Json(view))
 }
 
 async fn update_customer(
@@ -229,7 +256,7 @@ async fn update_customer(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateCustomerRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<CustomerBalanceView>> {
     let customer = state
         .customer_service
         .update_customer(
@@ -247,7 +274,7 @@ async fn update_customer(
         )
         .await?;
     let view = customer_view(&state, customer).await?;
-    Ok(Json(serde_json::json!(view)))
+    Ok(Json(view))
 }
 
 async fn activate_customer(
@@ -255,13 +282,13 @@ async fn activate_customer(
     _: Require<CustomersWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<CustomerBalanceView>> {
     let customer = state
         .customer_service
         .activate_customer(principal.user_id, id)
         .await?;
     let view = customer_view(&state, customer).await?;
-    Ok(Json(serde_json::json!(view)))
+    Ok(Json(view))
 }
 
 async fn deactivate_customer(
@@ -269,13 +296,13 @@ async fn deactivate_customer(
     _: Require<CustomersWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<CustomerBalanceView>> {
     let customer = state
         .customer_service
         .deactivate_customer(principal.user_id, id)
         .await?;
     let view = customer_view(&state, customer).await?;
-    Ok(Json(serde_json::json!(view)))
+    Ok(Json(view))
 }
 
 async fn delete_customer(
@@ -301,16 +328,17 @@ async fn customer_statement(
     Extension(localization): Extension<LocalizationContext>,
     Path(id): Path<i64>,
     Query(query): Query<AsOfQuery>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<CustomerStatementResponse>> {
     let customer = state.customer_service.get_customer(id).await?;
     let as_of = match query.as_of {
         Some(date) => date,
         None => today(&localization)?,
     };
     let statement = state.sales_service.customer_statement(id, as_of).await?;
-    Ok(Json(
-        serde_json::json!({ "customer": customer, "statement": statement }),
-    ))
+    Ok(Json(CustomerStatementResponse {
+        customer,
+        statement,
+    }))
 }
 
 /// Receivables view: every customer with a non-zero balance and the ageing of
@@ -320,7 +348,7 @@ async fn customer_ageing(
     _: Require<CustomersRead>,
     Extension(localization): Extension<LocalizationContext>,
     Query(query): Query<AsOfQuery>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<AgeingResponse>> {
     let as_of = match query.as_of {
         Some(date) => date,
         None => today(&localization)?,
@@ -346,7 +374,7 @@ async fn customer_ageing(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "ageing": views })))
+    Ok(Json(AgeingResponse { ageing: views }))
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +387,7 @@ async fn list_receipts(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
     Query(query): Query<ReceiptListQuery>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<ReceiptsResponse>> {
     let customer_id = query
         .customer_id
         .ok_or_else(|| AppError::Validation("customer_id is required".into()))?;
@@ -368,16 +396,16 @@ async fn list_receipts(
         .customer_receipt_service
         .list_receipts(customer_id)
         .await?;
-    Ok(Json(serde_json::json!({ "receipts": receipts })))
+    Ok(Json(ReceiptsResponse { receipts }))
 }
 
 async fn get_receipt(
     State(state): State<AppState>,
     _: Require<CustomersRead>,
     Path(id): Path<i64>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<ReceiptDetail>> {
     let detail = state.customer_receipt_service.get_receipt(id).await?;
-    Ok(Json(serde_json::json!(detail)))
+    Ok(Json(detail))
 }
 
 /// Collect one handover of money. The receipt is derived here from the customer
@@ -388,7 +416,7 @@ async fn collect_receipt(
     _: Require<CustomersCollect>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateReceiptRequest>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> AppResult<(StatusCode, Json<ReceiptDetail>)> {
     let detail = state
         .customer_receipt_service
         .collect(
@@ -400,7 +428,7 @@ async fn collect_receipt(
             payload.notes,
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(detail))))
+    Ok((StatusCode::CREATED, Json(detail)))
 }
 
 pub fn router() -> Router<AppState> {

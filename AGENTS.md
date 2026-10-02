@@ -7,7 +7,7 @@ cannot infer from the code.
 ## Commands
 
 ```bash
-cargo test --locked            # what CI runs. 1480 test attributes under src/ (2026-10-01)
+cargo test --locked            # what CI runs. 1486 test attributes under src/ (2026-10-02)
 cargo test <filter>            # test names are long descriptive sentences, so filter on a phrase
 cargo check --all-targets      # 0 errors; 75 warnings is the accepted baseline
 git diff --check               # whitespace
@@ -51,6 +51,13 @@ scripts/build-css.sh           # regenerates static/tailwind.css
   not in `services`.
 - Each repository file is trait + impl, in that order, in the same file: `#[async_trait]
   pub trait X`, then the `SqliteXRepository` struct, then `impl X for SqliteXRepository`.
+- **A JSON API handler returns a named type, never `Json<serde_json::Value>`.** The wire
+  contract is a compile-time concern here: a renamed key in a `Value` compiles, the
+  suite still passes, and only an external client breaks. Response types live beside the
+  type they wrap — an envelope whose payload is defined in `models.rs` goes there, and
+  `CustomersResponse` / `AgeingResponse` stay in `customers_api.rs` because
+  `CustomerBalanceView` and `CustomerAgeingView` do. `SetMoney` fields stay `SetMoney`:
+  its `Serialize` is what publishes the refusal rule instead of a bare `null`.
 - Some `src/services/` modules are **pure** — `line_taxes`, `gross_inverse`,
   `final_price`, `purchase_cost`. Each holds the single definition of a rule. Do not
   re-derive a price or a tax split inline anywhere else; call the function.
