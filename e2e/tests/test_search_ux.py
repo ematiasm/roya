@@ -636,3 +636,42 @@ def test_a_failed_search_resets_the_announced_state(
     expect(status).to_have_text("Search failed.")
     expect(busy).to_be_hidden()
     expect(page.locator("#notice")).to_contain_text("/web/product-search.json")
+
+
+def test_a_200_without_a_products_array_is_a_failure_not_an_empty_search(
+    page: Page, api: ApiClient
+) -> None:
+    """A broken contract must not be reportable as "no matches".
+
+    The island reads `data.products`. `|| []` used to swallow a body that has no
+    such key, so the island rendered an empty dropdown and announced the search
+    as finished — indistinguishable, to the operator and to a screen reader,
+    from a search that genuinely found nothing. A wrong response shape is a
+    failure and has to read as one; only a real empty array may say "no matches".
+    """
+    data = seed_harness_data(api)
+    page.goto(f"{api.base_url}/sales/{data.sale_id}")
+
+    picker = page.locator("#product-picker")
+    status = page.locator("#product-search-status")
+
+    picker.fill("Harness")
+    expect(status).to_have_text("2 matches.")
+
+    def wrong_shape(route) -> None:
+        # Valid JSON, HTTP 200, and not the contract: no `products` at all.
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body='{"query": "Harness Spare"}',
+        )
+
+    page.route("**/web/product-search.json*", wrong_shape)
+    with page.expect_response("**/web/product-search.json*"):
+        picker.fill("Harness Spare")
+
+    # The announcement says the search failed. The operative assertion is that
+    # it did NOT become the empty-search text: that was the whole defect.
+    expect(status).to_have_text("Search failed.")
+    expect(status).not_to_have_text("0 matches")
+    expect(page.locator("#notice")).to_contain_text("/web/product-search.json")

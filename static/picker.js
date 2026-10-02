@@ -258,7 +258,18 @@
             });
           }
           return res.json().then(function (data) {
-            state.matches = data.products || [];
+            // A 200 whose body is not the contract this island reads is a
+            // failure, not an answer. `|| []` used to make the two look
+            // identical: the `||` swallowed the absent key, the dropdown came
+            // back empty and the status said "done", so a broken contract was
+            // indistinguishable from a search that genuinely found nothing.
+            // `Array.isArray` keeps the two apart — an empty array is a real
+            // answer and still renders as no matches.
+            if (!Array.isArray(data.products)) {
+              searchFailed('');
+              return;
+            }
+            state.matches = data.products;
             state.status = 'done';
             render();
           });
