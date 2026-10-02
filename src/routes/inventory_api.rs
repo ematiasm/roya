@@ -9,7 +9,10 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::models::{
-    MovementReason, MovementType, NewMovement, NewProduct, NewTax, ProductKind, UpdateTax,
+    BarcodesResponse, CategoriesResponse, Category, LowStockResponse, MovementReason, MovementType,
+    MovementsResponse, NegativeStockResponse, NewMovement, NewProduct, NewTax, Product,
+    ProductBarcode, ProductKind, ProductStock, ProductTaxesResponse, ProductsResponse,
+    StockMovement, Tax, TaxesResponse, UpdateTax,
 };
 use crate::repositories::{
     BarcodeRepository, CategoryRepository, ProductRepository, StockMovementRepository,
@@ -192,9 +195,9 @@ pub struct MovementListQuery {
 async fn list_categories(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<CategoriesResponse>> {
     let cats = state.inventory_service.categories.list().await?;
-    Ok(Json(serde_json::json!({ "categories": cats })))
+    Ok(Json(CategoriesResponse { categories: cats }))
 }
 
 async fn create_category(
@@ -202,26 +205,26 @@ async fn create_category(
     _: Require<InventoryWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateCategoryRequest>,
-) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> crate::error::AppResult<(StatusCode, Json<Category>)> {
     let cat = state
         .inventory_service
         .create_category(principal.user_id, &payload.name, payload.parent_id)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(cat))))
+    Ok((StatusCode::CREATED, Json(cat)))
 }
 
 async fn get_category(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Path(id): Path<i64>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<Category>> {
     let cat = state
         .inventory_service
         .categories
         .find_by_id(id)
         .await?
         .ok_or_else(|| crate::error::AppError::NotFound(format!("category {id} not found")))?;
-    Ok(Json(serde_json::json!(cat)))
+    Ok(Json(cat))
 }
 
 async fn update_category(
@@ -230,7 +233,7 @@ async fn update_category(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateCategoryRequest>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<Category>> {
     let cat = state
         .inventory_service
         .update_category(
@@ -240,7 +243,7 @@ async fn update_category(
             payload.parent_id,
         )
         .await?;
-    Ok(Json(serde_json::json!(cat)))
+    Ok(Json(cat))
 }
 
 async fn delete_category(
@@ -260,7 +263,7 @@ async fn list_products(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Query(q): Query<ProductListQuery>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<ProductsResponse>> {
     let products = match q.category_id {
         Some(cid) => {
             state
@@ -271,7 +274,7 @@ async fn list_products(
         }
         None => state.inventory_service.products.list().await?,
     };
-    Ok(Json(serde_json::json!({ "products": products })))
+    Ok(Json(ProductsResponse { products }))
 }
 
 async fn create_product(
@@ -279,7 +282,7 @@ async fn create_product(
     _: Require<InventoryWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateProductRequest>,
-) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> crate::error::AppResult<(StatusCode, Json<Product>)> {
     let input = NewProduct {
         sku: payload.sku,
         name: payload.name,
@@ -301,16 +304,16 @@ async fn create_product(
         .inventory_service
         .create_product(principal.user_id, input)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(product))))
+    Ok((StatusCode::CREATED, Json(product)))
 }
 
 async fn get_product(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Path(id): Path<i64>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<Product>> {
     let product = state.inventory_service.get_product(id).await?;
-    Ok(Json(serde_json::json!(product)))
+    Ok(Json(product))
 }
 
 async fn update_product(
@@ -319,7 +322,7 @@ async fn update_product(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateProductRequest>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<Product>> {
     let product = state
         .inventory_service
         .update_product(
@@ -345,7 +348,7 @@ async fn update_product(
             },
         )
         .await?;
-    Ok(Json(serde_json::json!(product)))
+    Ok(Json(product))
 }
 
 async fn delete_product(
@@ -361,19 +364,19 @@ async fn get_stock(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Path(id): Path<i64>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<ProductStock>> {
     let ps = state.inventory_service.product_stock(id).await?;
-    Ok(Json(serde_json::json!(ps)))
+    Ok(Json(ps))
 }
 
 async fn list_barcodes(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Path(id): Path<i64>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<BarcodesResponse>> {
     state.inventory_service.get_product(id).await?;
     let codes = state.inventory_service.barcodes.list_by_product(id).await?;
-    Ok(Json(serde_json::json!({ "barcodes": codes })))
+    Ok(Json(BarcodesResponse { barcodes: codes }))
 }
 
 async fn add_barcode(
@@ -381,12 +384,12 @@ async fn add_barcode(
     _: Require<InventoryWrite>,
     Path(id): Path<i64>,
     Json(payload): Json<AddBarcodeRequest>,
-) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> crate::error::AppResult<(StatusCode, Json<ProductBarcode>)> {
     let bc = state
         .inventory_service
         .add_barcode(id, &payload.code)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(bc))))
+    Ok((StatusCode::CREATED, Json(bc)))
 }
 
 // ---------------------------------------------------------------------------
@@ -396,19 +399,17 @@ async fn add_barcode(
 async fn list_taxes(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<TaxesResponse>> {
     let taxes = state.tax_service.list_taxes().await?;
-    Ok(Json(serde_json::json!({ "taxes": taxes })))
+    Ok(Json(TaxesResponse { taxes }))
 }
 
 async fn get_tax(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Path(id): Path<i64>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
-    Ok(Json(serde_json::json!(
-        state.tax_service.get_tax(id).await?
-    )))
+) -> crate::error::AppResult<Json<Tax>> {
+    Ok(Json(state.tax_service.get_tax(id).await?))
 }
 
 async fn create_tax(
@@ -416,7 +417,7 @@ async fn create_tax(
     _: Require<SettingsManage>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateTaxRequest>,
-) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> crate::error::AppResult<(StatusCode, Json<Tax>)> {
     let tax = state
         .tax_service
         .create_tax(
@@ -429,7 +430,7 @@ async fn create_tax(
             },
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(tax))))
+    Ok((StatusCode::CREATED, Json(tax)))
 }
 
 async fn update_tax(
@@ -438,7 +439,7 @@ async fn update_tax(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTaxRequest>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<Tax>> {
     let tax = state
         .tax_service
         .update_tax(
@@ -452,7 +453,7 @@ async fn update_tax(
             },
         )
         .await?;
-    Ok(Json(serde_json::json!(tax)))
+    Ok(Json(tax))
 }
 
 async fn deactivate_tax(
@@ -460,21 +461,21 @@ async fn deactivate_tax(
     _: Require<SettingsManage>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<Tax>> {
     let tax = state
         .tax_service
         .deactivate_tax(principal.user_id, id)
         .await?;
-    Ok(Json(serde_json::json!(tax)))
+    Ok(Json(tax))
 }
 
 async fn list_product_taxes(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Path(product_id): Path<i64>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<ProductTaxesResponse>> {
     let taxes = state.tax_service.list_product_taxes(product_id).await?;
-    Ok(Json(serde_json::json!({ "taxes": taxes })))
+    Ok(Json(ProductTaxesResponse { taxes }))
 }
 
 async fn link_product_tax(
@@ -483,12 +484,12 @@ async fn link_product_tax(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(product_id): Path<i64>,
     Json(payload): Json<LinkProductTaxRequest>,
-) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> crate::error::AppResult<(StatusCode, Json<crate::models::ProductTax>)> {
     let link = state
         .tax_service
         .link_product_tax(principal.user_id, product_id, payload.tax_id)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(link))))
+    Ok((StatusCode::CREATED, Json(link)))
 }
 
 async fn unlink_product_tax(
@@ -511,7 +512,7 @@ async fn list_movements(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
     Query(q): Query<MovementListQuery>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<MovementsResponse>> {
     let movements = match q.product_id {
         Some(pid) => {
             state
@@ -535,7 +536,7 @@ async fn list_movements(
             all
         }
     };
-    Ok(Json(serde_json::json!({ "movements": movements })))
+    Ok(Json(MovementsResponse { movements }))
 }
 
 async fn create_movement(
@@ -543,7 +544,7 @@ async fn create_movement(
     _: Require<InventoryStockWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateMovementRequest>,
-) -> crate::error::AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> crate::error::AppResult<(StatusCode, Json<StockMovement>)> {
     let input = NewMovement {
         product_id: payload.product_id,
         qty: payload.qty,
@@ -556,23 +557,25 @@ async fn create_movement(
         .inventory_service
         .record_movement(principal.user_id, input)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(mov))))
+    Ok((StatusCode::CREATED, Json(mov)))
 }
 
 async fn low_stock(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<LowStockResponse>> {
     let items = state.inventory_service.low_stock().await?;
-    Ok(Json(serde_json::json!({ "low_stock": items })))
+    Ok(Json(LowStockResponse { low_stock: items }))
 }
 
 async fn negative_stock(
     State(state): State<AppState>,
     _: Require<InventoryRead>,
-) -> crate::error::AppResult<Json<serde_json::Value>> {
+) -> crate::error::AppResult<Json<NegativeStockResponse>> {
     let items = state.inventory_service.negative_stock().await?;
-    Ok(Json(serde_json::json!({ "negative_stock": items })))
+    Ok(Json(NegativeStockResponse {
+        negative_stock: items,
+    }))
 }
 
 pub fn router() -> Router<AppState> {
