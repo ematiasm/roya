@@ -53,6 +53,7 @@ from playwright.sync_api import Page
 
 from helpers import (
     ApiClient,
+    account_method_id,
     create_confirmed_credit_purchase,
     create_confirmed_credit_sale,
     create_customer,
@@ -248,6 +249,16 @@ def seed_the_shop(page: Page, api: ApiClient) -> dict[str, int]:
     sides collects nothing, so the seed writes no payment rows and the return
     it creates is the only document the sweep meets that this seed did not
     create directly.
+
+    **The collection is load-bearing, and it took a wrong finding to learn it.**
+    A receipt document is the ONE row in the documents feed whose `href` is
+    `/customers/{id}` (`document_href` maps `Receipt` to the customer's page),
+    and only `CustomerReceiptService::collect` writes a `customer_receipts` row:
+    confirming a cash sale writes a payment, not a receipt. A credit-only seed
+    therefore left the customer statement page with no click path from the
+    shell at all, and the reachability invariant reported that route as
+    orphaned — a true statement about the seed and a false one about the app.
+    Collecting part of the credit sale writes the receipt the crawl needs.
     """
     data = seed_harness_data(api)
 
@@ -270,6 +281,19 @@ def seed_the_shop(page: Page, api: ApiClient) -> dict[str, int]:
     )
     confirmed_sale = create_confirmed_credit_sale(
         api, customer_id, product_id, qty="4", unit_price="25.00"
+    )
+
+    # Dated last so the receipt sorts to the top of the documents feed, where
+    # that page's own row cap cannot hide it.
+    api.post_json(
+        "/api/customer-receipts",
+        {
+            "customer_id": customer_id,
+            "method_id": account_method_id(api, data.account_id, "Cash"),
+            "amount": "10.00",
+            "date": "2024-05-09",
+            "notes": None,
+        },
     )
 
     purchase_return_id = _create_return_through_the_parent(
