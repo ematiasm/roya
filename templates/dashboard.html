@@ -44,14 +44,14 @@
     <div class="rounded-2xl border border-border bg-card p-5" id="tx-section">
       <h2 class="mb-3 text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::DashboardRecentTransactions) }}</h2>
       <div class="mb-3 flex flex-wrap gap-2">
-        <select class="field min-w-[120px] flex-1" id="filter-account" name="account_id" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-from,#filter-to" hx-trigger="change">
+        <select class="field min-w-[120px] flex-1" id="filter-account" name="account_id" aria-label="{{ localization.tr(crate::localization::MessageKey::DashboardAccount) }}" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-from,#filter-to" hx-trigger="change">
           <option value="">{{ localization.tr(crate::localization::MessageKey::CommonAllAccounts) }}</option>
           {% for acc in accounts %}
           <option value="{{ acc.id }}">{{ acc.name }}</option>
           {% endfor %}
         </select>
-        <input class="field min-w-[120px] flex-1" id="filter-from" type="date" name="from" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardFrom) }}" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-to" hx-trigger="change" />
-        <input class="field min-w-[120px] flex-1" id="filter-to" type="date" name="to" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardTo) }}" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-from" hx-trigger="change" />
+        <input class="field min-w-[120px] flex-1" id="filter-from" type="date" name="from" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardFrom) }}" aria-label="{{ localization.tr(crate::localization::MessageKey::DashboardFrom) }}" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-to" hx-trigger="change" />
+        <input class="field min-w-[120px] flex-1" id="filter-to" type="date" name="to" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardTo) }}" aria-label="{{ localization.tr(crate::localization::MessageKey::DashboardTo) }}" hx-get="/web/transactions" hx-target="#tx-list" hx-include="#filter-account,#filter-from" hx-trigger="change" />
       </div>
       <div id="tx-list" hx-get="/web/transactions" hx-trigger="load" hx-swap="innerHTML">
         <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CommonLoading) }}</div>
@@ -65,8 +65,8 @@
       <h2 class="mb-3 text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::DashboardCreateAccount) }}</h2>
       <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::DashboardCreateAccount) }}" hx-post="/web/accounts" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
         <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
-          <input type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardAccountNamePlaceholder) }}" required maxlength="64" class="field" />
+          <label class="field-label" for="tx-name">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+          <input type="text" id="tx-name" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardAccountNamePlaceholder) }}" required maxlength="64" class="field" />
         </div>
         <fieldset class="card p-3 bg-transparent">
           <legend class="px-1 text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardAcceptedMethods) }}</legend>
@@ -92,7 +92,7 @@
       <h2 class="mb-3 text-lg font-semibold">{{ localization.tr(crate::localization::MessageKey::DashboardNewTransaction) }}</h2>
       <form class="flex flex-col gap-2.5" data-action="{{ localization.tr(crate::localization::MessageKey::DashboardAddTransaction) }}" hx-post="/web/transactions" hx-target="#account-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#tx-list','refresh'); }">
         <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardAccount) }}</label>
+          <label class="field-label" for="tx-account-select">{{ localization.tr(crate::localization::MessageKey::DashboardAccount) }}</label>
           <select name="account_id" required id="tx-account-select" class="field">
             {# The account NAME is the value; the balance is context, so a refused
                one states the rule beside it and never a figure. #}
@@ -104,24 +104,24 @@
         </div>
         <div class="flex gap-2.5 [&>*]:flex-1">
           <div>
-            <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardType) }}</label>
-            <select name="type" required class="field">
+            <label class="field-label" for="tx-type">{{ localization.tr(crate::localization::MessageKey::DashboardType) }}</label>
+            <select id="tx-type" name="type" required class="field">
               <option value="Income">{{ localization.tr(crate::localization::MessageKey::DashboardIncome) }}</option>
               <option value="Expense">{{ localization.tr(crate::localization::MessageKey::DashboardExpense) }}</option>
             </select>
           </div>
           <div>
-            <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
-            <input type="text" inputmode="decimal" name="amount" min="0.01" placeholder="100.00" required class="field" />
+            <label class="field-label" for="tx-amount">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
+            <input id="tx-amount" type="text" inputmode="decimal" name="amount" min="0.01" placeholder="100.00" required class="field" />
           </div>
         </div>
         <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::DashboardDescription) }}</label>
-          <input type="text" name="description" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardDescriptionPlaceholder) }}" maxlength="256" class="field" />
+          <label class="field-label" for="tx-description">{{ localization.tr(crate::localization::MessageKey::DashboardDescription) }}</label>
+          <input id="tx-description" type="text" name="description" placeholder="{{ localization.tr(crate::localization::MessageKey::DashboardDescriptionPlaceholder) }}" maxlength="256" class="field" />
         </div>
         <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
-          <input type="date" name="date" required value="{{ today }}" class="field" />
+          <label class="field-label" for="tx-date">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
+          <input id="tx-date" type="date" name="date" required value="{{ today }}" class="field" />
         </div>
         <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::DashboardAddTransaction) }}</button>
         <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::DashboardTransactionHelp) }}</div>

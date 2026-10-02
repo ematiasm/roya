@@ -36,16 +36,16 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldUsername) }}</label>
-      <input type="text" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityUsernamePlaceholder) }}" class="field" />
+      <label class="field-label" for="new-user-username">{{ localization.tr(crate::localization::MessageKey::FieldUsername) }}</label>
+      <input id="new-user-username" type="text" name="username" required minlength="3" maxlength="64" pattern="[a-z0-9]([a-z0-9._-]*[a-z0-9])?" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityUsernamePlaceholder) }}" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::FieldDisplayName) }}</label>
-      <input type="text" name="display_name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityDisplayNamePlaceholder) }}" class="field" />
+      <label class="field-label" for="new-user-display-name">{{ localization.tr(crate::localization::MessageKey::FieldDisplayName) }}</label>
+      <input id="new-user-display-name" type="text" name="display_name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityDisplayNamePlaceholder) }}" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::IdentityInitialPassword) }}</label>
-      <input type="password" name="password" required minlength="12" autocomplete="new-password" class="field" />
+      <label class="field-label" for="new-user-password">{{ localization.tr(crate::localization::MessageKey::IdentityInitialPassword) }}</label>
+      <input id="new-user-password" type="password" name="password" required minlength="12" autocomplete="new-password" class="field" />
     </div>
     <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::IdentityCreateUser) }}</button>
     <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::IdentityCreateUserHelp) }}</div>

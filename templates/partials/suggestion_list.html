@@ -2,8 +2,8 @@
   {# Purchase date is the only seed option; payment type is decided at confirm. #}
   <div class="mb-3 flex flex-wrap gap-2 [&>*]:flex-1" id="suggestion-seed-options">
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::PurchasesDate) }}</label>
-      <input type="date" name="purchase_date" value="{{ today }}" class="field" />
+      <label class="field-label" for="suggestion-purchase-date">{{ localization.tr(crate::localization::MessageKey::PurchasesDate) }}</label>
+      <input id="suggestion-purchase-date" type="date" name="purchase_date" value="{{ today }}" class="field" />
     </div>
   </div>
   {% if !has_suggestions %}

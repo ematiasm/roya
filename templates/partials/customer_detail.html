@@ -39,25 +39,25 @@
       <input type="hidden" name="customer_id" value="{{ c.id }}" class="field" />
       <div class="flex gap-2.5 [&>*]:flex-1">
         <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
-          <input type="text" inputmode="decimal" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
+          <label class="field-label" for="collect-amount">{{ localization.tr(crate::localization::MessageKey::CommonAmount) }}</label>
+          <input id="collect-amount" type="text" inputmode="decimal" name="amount" step="0.01" min="0.01" required placeholder="100.00" class="field" />
         </div>
         <div>
-          <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
-          <input type="date" name="date" required value="{{ today }}" class="field" />
+          <label class="field-label" for="collect-date">{{ localization.tr(crate::localization::MessageKey::CommonDate) }}</label>
+          <input id="collect-date" type="date" name="date" required value="{{ today }}" class="field" />
         </div>
       </div>
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerMethodDerived) }}</label>
-        <select name="method_id" required class="field">
+        <label class="field-label" for="collect-method">{{ localization.tr(crate::localization::MessageKey::CustomerMethodDerived) }}</label>
+        <select id="collect-method" name="method_id" required class="field">
           {% for m in method_options %}
           <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_deref()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
           {% endfor %}
         </select>
       </div>
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-        <input type="text" name="notes" placeholder="…" maxlength="256" class="field" />
+        <label class="field-label" for="collect-notes">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+        <input id="collect-notes" type="text" name="notes" placeholder="…" maxlength="256" class="field" />
       </div>
       <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CustomerCollect) }}</button>
       <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerCollectHelp) }}</div>

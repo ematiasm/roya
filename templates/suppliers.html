@@ -59,20 +59,20 @@
   </div>
   <form class="flex flex-col gap-2.5" hx-post="/web/suppliers" hx-target="#supplier-list" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersName) }}</label>
-      <input type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::SuppliersNamePlaceholder) }}" required maxlength="128" class="field" />
+      <label class="field-label" for="new-supplier-name">{{ localization.tr(crate::localization::MessageKey::SuppliersName) }}</label>
+      <input id="new-supplier-name" type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::SuppliersNamePlaceholder) }}" required maxlength="128" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersPhoneOptional) }}</label>
-      <input type="text" name="phone" placeholder="11 5555-5555" maxlength="32" class="field" />
+      <label class="field-label" for="new-supplier-phone">{{ localization.tr(crate::localization::MessageKey::SuppliersPhoneOptional) }}</label>
+      <input id="new-supplier-phone" type="text" name="phone" placeholder="11 5555-5555" maxlength="32" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersDueDays) }}</label>
-      <input type="number" name="due_days" min="0" step="1" placeholder="30" class="field" />
+      <label class="field-label" for="new-supplier-due-days">{{ localization.tr(crate::localization::MessageKey::SuppliersDueDays) }}</label>
+      <input id="new-supplier-due-days" type="number" name="due_days" min="0" step="1" placeholder="30" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::SuppliersNotesOptional) }}</label>
-      <input type="text" name="notes" placeholder="…" maxlength="512" class="field" />
+      <label class="field-label" for="new-supplier-notes">{{ localization.tr(crate::localization::MessageKey::SuppliersNotesOptional) }}</label>
+      <input id="new-supplier-notes" type="text" name="notes" placeholder="…" maxlength="512" class="field" />
     </div>
     <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::SuppliersCreate) }}</button>
     <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::SuppliersDuplicateHelp) }}</div>

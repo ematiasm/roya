@@ -211,6 +211,7 @@
                  the ids alone say which document a control belongs to, not what
                  it does. #}
               <input type="text" inputmode="decimal" id="return-qty-{{ option.purchase_line_id }}" name="qty"
+                     aria-label="{{ localization.tr(crate::localization::MessageKey::LineQuantity) }}"
                      class="field w-20 rounded-[10px] border border-border bg-card px-2 py-1 text-right tabular-nums"
                      {% if loop.first %}{% if entry_row_focus %}autofocus{% endif %}{% endif %}
                      {% if let Some(claimed) = option.on_this_draft %}value="{{ localization.format_quantity(claimed.clone()) }}"{% endif %}

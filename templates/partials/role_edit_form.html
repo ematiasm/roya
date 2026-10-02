@@ -16,12 +16,12 @@
       hx-on::after-request="if(event.detail.successful) document.getElementById('role-edit-dialog').close()">
   <input type="hidden" name="role_id" value="{{ role.id }}" class="field" />
   <div>
-    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
-    <input type="text" name="name" required maxlength="128" value="{{ role.name }}" class="field" />
+    <label class="field-label" for="edit-role-name">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+    <input id="edit-role-name" type="text" name="name" required maxlength="128" value="{{ role.name }}" class="field" />
   </div>
   <div>
-    <label class="field-label">{{ localization.tr(crate::localization::MessageKey::IdentityDescriptionOptional) }}</label>
-    <input type="text" name="description" maxlength="256" value="{{ description_value }}" class="field" />
+    <label class="field-label" for="edit-role-description">{{ localization.tr(crate::localization::MessageKey::IdentityDescriptionOptional) }}</label>
+    <input id="edit-role-description" type="text" name="description" maxlength="256" value="{{ description_value }}" class="field" />
   </div>
   <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::IdentitySaveDetails) }}</button>
 </form>

@@ -22,16 +22,16 @@
   {% let filter_module = "document" %}
   {% let filter_list = "documents" %}
   {% include "partials/list_filters_open.html" %}
-    <select class="field min-w-[130px] flex-1" name="group">
+    <select class="field min-w-[130px] flex-1" name="group" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterGroup) }}">
       <option value="">{{ localization.tr(crate::localization::MessageKey::DocumentsAllTypes) }}</option>
       {% for g in groups %}
       <option value="{{ g.token }}" data-document-group="{{ g.token }}" {% if g.selected %}selected{% endif %}>{{ g.label }}</option>
       {% endfor %}
     </select>
-    <input class="field min-w-[120px] flex-1" type="text" name="user" placeholder="{{ localization.tr(crate::localization::MessageKey::DocumentsUser) }}" value="{{ filter_user }}" />
-    <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
-    <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
-    <input class="field min-w-[150px] flex-1" type="text" name="q" placeholder="{{ localization.tr(crate::localization::MessageKey::DocumentsSearch) }}" value="{{ filter_q }}" />
+    <input class="field min-w-[120px] flex-1" type="text" name="user" placeholder="{{ localization.tr(crate::localization::MessageKey::DocumentsUser) }}" value="{{ filter_user }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterUser) }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterFrom) }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterTo) }}" />
+    <input class="field min-w-[150px] flex-1" type="text" name="q" placeholder="{{ localization.tr(crate::localization::MessageKey::DocumentsSearch) }}" value="{{ filter_q }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterSearch) }}" />
   {% include "partials/list_filters_close.html" %}
   <div id="document-list"
        hx-history-elt

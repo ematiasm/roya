@@ -19,16 +19,16 @@
   {% let filter_module = "customer-return" %}
   {% let filter_list = "customer-returns" %}
   {% include "partials/list_filters_open.html" %}
-    <select class="field min-w-[110px] flex-1" name="status">
+    <select class="field min-w-[110px] flex-1" name="status" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterStatus) }}">
       <option value="">{{ localization.tr(crate::localization::MessageKey::PurchasesFilterStatus) }}</option>
       <option value="Draft" {% if filter_status == "Draft" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusDraft) }}</option>
       <option value="Confirmed" {% if filter_status == "Confirmed" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusConfirmed) }}</option>
       <option value="Cancelled" {% if filter_status == "Cancelled" %}selected{% endif %}>{{ localization.tr(crate::localization::MessageKey::StatusCancelled) }}</option>
     </select>
-    <input class="field min-w-[120px] flex-1" type="text" name="customer" placeholder="{{ localization.tr(crate::localization::MessageKey::SalesCustomer) }}" value="{{ filter_customer }}" />
-    <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesNumber) }}" value="{{ filter_number }}" />
-    <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" />
-    <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" />
+    <input class="field min-w-[120px] flex-1" type="text" name="customer" placeholder="{{ localization.tr(crate::localization::MessageKey::SalesCustomer) }}" value="{{ filter_customer }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterCustomer) }}" />
+    <input class="field min-w-[120px] flex-1" type="text" name="number" placeholder="{{ localization.tr(crate::localization::MessageKey::PurchasesNumber) }}" value="{{ filter_number }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterNumber) }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="from" value="{{ filter_from }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterFrom) }}" />
+    <input class="field min-w-[120px] flex-1" type="date" name="to" value="{{ filter_to }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterTo) }}" />
   {% include "partials/list_filters_close.html" %}
   <div id="customer-return-list"
        hx-history-elt
