@@ -273,6 +273,14 @@ pub trait SaleRepository: Send + Sync {
     ) -> AppResult<Sale>;
     /// Transition Draft/Confirmed -> Cancelled.
     async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale>;
+    /// Stamp a sale's `updated_by`/`updated_at` after a line change: the line
+    /// inherits the sale's actor (no columns of its own), but the document was
+    /// just edited and the edit is attributed to the request. The statement
+    /// updates whatever id it is given, so the restriction to drafts lives in
+    /// the caller — stated here rather than enforced in SQL, because a
+    /// `WHERE status = 'Draft'` would turn a future misuse into a silent no-op
+    /// instead of a visible edit on the wrong document.
+    async fn touch_draft(&self, id: i64, actor: i64) -> AppResult<Sale>;
 
     /// Create a line on a DRAFT sale together with everything the feature says
     /// a line must carry: the frozen tax breakdown and the tax total that
@@ -999,6 +1007,21 @@ impl SaleRepository for SqliteSaleRepository {
                WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
         )
         .bind(clean)
+        .bind(actor)
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        Ok(row_to_sale(row))
+    }
+
+    async fn touch_draft(&self, id: i64, actor: i64) -> AppResult<Sale> {
+        let row = sqlx::query(
+            r#"UPDATE sales
+               SET updated_by = ?,
+                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               WHERE id = ? RETURNING id, sale_number, status, payment_type, customer_id, customer_name, sale_date, due_date, receipt_no, notes, cancel_reason, created_by, updated_by, created_at, updated_at, confirmed_at, cancelled_at"#,
+        )
         .bind(actor)
         .bind(id)
         .fetch_one(&self.pool)
