@@ -7,7 +7,7 @@ cannot infer from the code.
 ## Commands
 
 ```bash
-cargo test --locked            # what CI runs. 1480 test attributes under src/ (2026-10-01)
+cargo test --locked            # what CI runs. 1486 test attributes under src/ (2026-10-02)
 cargo test <filter>            # test names are long descriptive sentences, so filter on a phrase
 cargo check --all-targets      # 0 errors; 75 warnings is the accepted baseline
 git diff --check               # whitespace
