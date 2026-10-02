@@ -82,36 +82,36 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
-      <input type="text" name="name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::CustomerNamePlaceholder) }}" class="field" />
+      <label class="field-label" for="new-customer-name">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+      <input id="new-customer-name" type="text" name="name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::CustomerNamePlaceholder) }}" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerPhone) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-        <input type="text" name="phone" maxlength="32" placeholder="555-1234" class="field" />
+        <label class="field-label" for="new-customer-phone">{{ localization.tr(crate::localization::MessageKey::CustomerPhone) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+        <input id="new-customer-phone" type="text" name="phone" maxlength="32" placeholder="555-1234" class="field" />
       </div>
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerTaxId) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-        <input type="text" name="tax_id" maxlength="32" class="field" />
+        <label class="field-label" for="new-customer-tax-id">{{ localization.tr(crate::localization::MessageKey::CustomerTaxId) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+        <input id="new-customer-tax-id" type="text" name="tax_id" maxlength="32" class="field" />
       </div>
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerAddress) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-      <input type="text" name="address" maxlength="256" class="field" />
+      <label class="field-label" for="new-customer-address">{{ localization.tr(crate::localization::MessageKey::CustomerAddress) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+      <input id="new-customer-address" type="text" name="address" maxlength="256" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerCreditLimit) }}</label>
-        <input type="text" inputmode="decimal" name="credit_limit" step="0.01" min="0" placeholder="{{ localization.tr(crate::localization::MessageKey::CustomerNoLimit) }}" class="field" />
+        <label class="field-label" for="new-customer-credit-limit">{{ localization.tr(crate::localization::MessageKey::CustomerCreditLimit) }}</label>
+        <input id="new-customer-credit-limit" type="text" inputmode="decimal" name="credit_limit" step="0.01" min="0" placeholder="{{ localization.tr(crate::localization::MessageKey::CustomerNoLimit) }}" class="field" />
       </div>
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CustomerPaymentDays) }}</label>
-        <input type="number" name="due_days" min="0" step="1" placeholder="30" class="field" />
+        <label class="field-label" for="new-customer-due-days">{{ localization.tr(crate::localization::MessageKey::CustomerPaymentDays) }}</label>
+        <input id="new-customer-due-days" type="number" name="due_days" min="0" step="1" placeholder="30" class="field" />
       </div>
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-      <input type="text" name="notes" maxlength="512" class="field" />
+      <label class="field-label" for="new-customer-notes">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+      <input id="new-customer-notes" type="text" name="notes" maxlength="512" class="field" />
     </div>
     <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::CustomerCreateAction) }}</button>
     <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::CustomerCreateHelp) }}</div>

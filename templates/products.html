@@ -37,8 +37,8 @@
     {% let filter_module = "product" %}
     {% let filter_list = "products" %}
     {% include "partials/list_filters_open.html" %}
-      <input class="field min-w-[160px] flex-1" type="text" name="q" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductSearchPlaceholder) }}" value="{{ filter_q }}" />
-      <select class="field min-w-[120px] flex-1" id="filter-category" name="category_id">
+      <input class="field min-w-[160px] flex-1" type="text" name="q" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductSearchPlaceholder) }}" value="{{ filter_q }}" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterSearch) }}" />
+      <select class="field min-w-[120px] flex-1" id="filter-category" name="category_id" aria-label="{{ localization.tr(crate::localization::MessageKey::FilterCategory) }}">
         <option value="">{{ localization.tr(crate::localization::MessageKey::CommonAllCategories) }}</option>
         {% for cat in categories %}
         <option value="{{ cat.id }}" {% if filter_category == cat.id.to_string() %}selected{% endif %}>{{ cat.name }}</option>
@@ -116,12 +116,12 @@
         hx-swap="none"
         hx-on::after-request="if(event.detail.successful) { this.reset(); htmx.trigger('#product-list','refresh'); htmx.ajax('GET','/web/category-options','#filter-category'); htmx.ajax('GET','/web/category-options?empty=none','#new-product-category'); }">
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
-      <input type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductCategoryNamePlaceholder) }}" required maxlength="128" class="field" />
+      <label class="field-label" for="new-category-name">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+      <input id="new-category-name" type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductCategoryNamePlaceholder) }}" required maxlength="128" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductParentId) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-      <input type="number" name="parent_id" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductParentIdOptional) }}" min="1" class="field" />
+      <label class="field-label" for="new-category-parent">{{ localization.tr(crate::localization::MessageKey::ProductParentId) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+      <input id="new-category-parent" type="number" name="parent_id" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductParentIdOptional) }}" min="1" class="field" />
     </div>
     <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::ProductCreateCategory) }}</button>
   </form>
@@ -148,43 +148,43 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) { document.getElementById('new-product-dialog').close(); this.reset(); }">
     <div>
-      <label class="field-label">SKU</label>
-      <input type="text" name="sku" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductSkuPlaceholder) }}" required maxlength="64" class="field" />
+      <label class="field-label" for="new-product-sku">SKU</label>
+      <input id="new-product-sku" type="text" name="sku" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductSkuPlaceholder) }}" required maxlength="64" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
-      <input type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductNamePlaceholder) }}" required maxlength="128" class="field" />
+      <label class="field-label" for="new-product-name">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+      <input id="new-product-name" type="text" name="name" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductNamePlaceholder) }}" required maxlength="128" class="field" />
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductKind) }}</label>
-        <select name="kind" required class="field">
+        <label class="field-label" for="new-product-kind">{{ localization.tr(crate::localization::MessageKey::ProductKind) }}</label>
+        <select id="new-product-kind" name="kind" required class="field">
           <option value="Product">{{ localization.tr(crate::localization::MessageKey::ProductValueProduct) }}</option>
           <option value="Service">{{ localization.tr(crate::localization::MessageKey::ProductValueService) }}</option>
         </select>
       </div>
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductUnit) }}</label>
-        <input type="text" name="unit" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductUnitPlaceholder) }}" required maxlength="16" value="un" class="field" />
+        <label class="field-label" for="new-product-unit">{{ localization.tr(crate::localization::MessageKey::ProductUnit) }}</label>
+        <input id="new-product-unit" type="text" name="unit" placeholder="{{ localization.tr(crate::localization::MessageKey::ProductUnitPlaceholder) }}" required maxlength="16" value="un" class="field" />
       </div>
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductSalePrice) }}</label>
+        <label class="field-label" for="new-product-sale-price">{{ localization.tr(crate::localization::MessageKey::ProductSalePrice) }}</label>
         <input id="new-product-sale-price" type="text" inputmode="decimal" name="sale_price" step="0.01" min="0.01" placeholder="100.00" required class="field" />
       </div>
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCostPrice) }}</label>
-        <input type="text" inputmode="decimal" name="cost_price" step="0.01" min="0" placeholder="0" value="0" class="field" />
+        <label class="field-label" for="new-product-cost-price">{{ localization.tr(crate::localization::MessageKey::ProductCostPrice) }}</label>
+        <input id="new-product-cost-price" type="text" inputmode="decimal" name="cost_price" step="0.01" min="0" placeholder="0" value="0" class="field" />
       </div>
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMarkup) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+      <label class="field-label" for="new-product-markup">{{ localization.tr(crate::localization::MessageKey::ProductMarkup) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
       <input id="new-product-markup" type="text" inputmode="decimal" name="markup_pct" step="0.01" min="-99" placeholder="25" class="field" />
       <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductMarkupHelp) }}</div>
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductCategory) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+      <label class="field-label" for="new-product-category">{{ localization.tr(crate::localization::MessageKey::ProductCategory) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
       <select id="new-product-category" name="product_category_id" class="field">
         <option value="">{{ localization.tr(crate::localization::MessageKey::CommonNoCategory) }}</option>
         {% for cat in categories %}
@@ -197,21 +197,21 @@
     </div>
     <div class="flex gap-2.5 [&>*]:flex-1">
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMinStock) }}</label>
-        <input type="text" inputmode="decimal" name="min_stock" step="0.01" min="0" placeholder="5" value="5" class="field" />
+        <label class="field-label" for="new-product-min-stock">{{ localization.tr(crate::localization::MessageKey::ProductMinStock) }}</label>
+        <input id="new-product-min-stock" type="text" inputmode="decimal" name="min_stock" step="0.01" min="0" placeholder="5" value="5" class="field" />
       </div>
       <div>
-        <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductMaxStock) }}</label>
-        <input type="text" inputmode="decimal" name="max_stock" step="0.01" min="0" placeholder="50" value="50" class="field" />
+        <label class="field-label" for="new-product-max-stock">{{ localization.tr(crate::localization::MessageKey::ProductMaxStock) }}</label>
+        <input id="new-product-max-stock" type="text" inputmode="decimal" name="max_stock" step="0.01" min="0" placeholder="50" value="50" class="field" />
       </div>
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductLocation) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-      <input type="text" name="location" maxlength="64" class="field" />
+      <label class="field-label" for="new-product-location">{{ localization.tr(crate::localization::MessageKey::ProductLocation) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+      <input id="new-product-location" type="text" name="location" maxlength="64" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
-      <input type="text" name="notes" maxlength="1024" class="field" />
+      <label class="field-label" for="new-product-notes">{{ localization.tr(crate::localization::MessageKey::ProductNotes) }} ({{ localization.tr(crate::localization::MessageKey::CommonOptional) }})</label>
+      <input id="new-product-notes" type="text" name="notes" maxlength="1024" class="field" />
     </div>
     <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::ProductCreateAction) }}</button>
     <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::ProductServiceHelp) }}</div>

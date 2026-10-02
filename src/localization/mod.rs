@@ -873,6 +873,21 @@ define_message_keys! {
     DocumentGroupPurchases => "document_group.purchases",
     DocumentGroupStock => "document_group.stock",
     DocumentGroupReceipts => "document_group.receipts",
+    // Programmatically associated names for the list-filter bars and the line
+    // editors: these render as `aria-label` on controls that sit in a filter
+    // row with no `<label>` element beside them, so the key names describe
+    // what the control filters or edits, not the page that mounts it.
+    FilterFrom => "filter.from",
+    FilterTo => "filter.to",
+    FilterSearch => "filter.search",
+    FilterStatus => "filter.status",
+    FilterCustomer => "filter.customer",
+    FilterSupplier => "filter.supplier",
+    FilterNumber => "filter.number",
+    FilterGroup => "filter.group",
+    FilterUser => "filter.user",
+    FilterCategory => "filter.category",
+    LineQuantity => "line.quantity",
 }
 
 /// Each catalog row contains the plural and non-plural forms. Keeping both
@@ -2036,6 +2051,17 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::DocumentGroupPurchases, "Purchases", "Purchases"),
     (MessageKey::DocumentGroupStock, "Stock movements", "Stock movements"),
     (MessageKey::DocumentGroupReceipts, "Receipts", "Receipts"),
+    (MessageKey::FilterFrom, "From", "From"),
+    (MessageKey::FilterTo, "To", "To"),
+    (MessageKey::FilterSearch, "Search", "Search"),
+    (MessageKey::FilterStatus, "Status", "Status"),
+    (MessageKey::FilterCustomer, "Customer", "Customer"),
+    (MessageKey::FilterSupplier, "Supplier", "Supplier"),
+    (MessageKey::FilterNumber, "Document number", "Document number"),
+    (MessageKey::FilterGroup, "Document type", "Document type"),
+    (MessageKey::FilterUser, "User", "User"),
+    (MessageKey::FilterCategory, "Category", "Category"),
+    (MessageKey::LineQuantity, "Quantity", "Quantity"),
 ];
 
 pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
@@ -3308,6 +3334,17 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::DocumentGroupPurchases, "Compras", "Compras"),
     (MessageKey::DocumentGroupStock, "Movimientos de stock", "Movimientos de stock"),
     (MessageKey::DocumentGroupReceipts, "Recibos", "Recibos"),
+    (MessageKey::FilterFrom, "Desde", "Desde"),
+    (MessageKey::FilterTo, "Hasta", "Hasta"),
+    (MessageKey::FilterSearch, "Buscar", "Buscar"),
+    (MessageKey::FilterStatus, "Estado", "Estado"),
+    (MessageKey::FilterCustomer, "Cliente", "Cliente"),
+    (MessageKey::FilterSupplier, "Proveedor", "Proveedor"),
+    (MessageKey::FilterNumber, "Número de documento", "Número de documento"),
+    (MessageKey::FilterGroup, "Tipo de documento", "Tipo de documento"),
+    (MessageKey::FilterUser, "Usuario", "Usuario"),
+    (MessageKey::FilterCategory, "Categoría", "Categoría"),
+    (MessageKey::LineQuantity, "Cantidad", "Cantidad"),
 ];
 
 /// The effective presentation contract for one request.

@@ -34,16 +34,16 @@
         hx-swap="innerHTML"
         hx-on::after-request="if(event.detail.successful) this.reset()">
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::IdentityCode) }}</label>
-      <input type="text" name="code" required minlength="2" maxlength="64" pattern="[a-z][a-z0-9_]*" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityRoleCodePlaceholder) }}" class="field" />
+      <label class="field-label" for="new-role-code">{{ localization.tr(crate::localization::MessageKey::IdentityCode) }}</label>
+      <input id="new-role-code" type="text" name="code" required minlength="2" maxlength="64" pattern="[a-z][a-z0-9_]*" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityRoleCodePlaceholder) }}" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
-      <input type="text" name="name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityRoleNamePlaceholder) }}" class="field" />
+      <label class="field-label" for="new-role-name">{{ localization.tr(crate::localization::MessageKey::CommonName) }}</label>
+      <input id="new-role-name" type="text" name="name" required maxlength="128" placeholder="{{ localization.tr(crate::localization::MessageKey::IdentityRoleNamePlaceholder) }}" class="field" />
     </div>
     <div>
-      <label class="field-label">{{ localization.tr(crate::localization::MessageKey::IdentityDescriptionOptional) }}</label>
-      <input type="text" name="description" maxlength="256" placeholder="…" class="field" />
+      <label class="field-label" for="new-role-description">{{ localization.tr(crate::localization::MessageKey::IdentityDescriptionOptional) }}</label>
+      <input id="new-role-description" type="text" name="description" maxlength="256" placeholder="…" class="field" />
     </div>
     <button type="submit" class="btn-primary">{{ localization.tr(crate::localization::MessageKey::IdentityCreateRole) }}</button>
     <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::IdentityCreateRoleHelp) }}</div>
