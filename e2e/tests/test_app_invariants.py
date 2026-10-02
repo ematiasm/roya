@@ -617,8 +617,7 @@ def test_every_named_form_control_has_a_programmatic_label(
 
     assert controls_seen > 0, "no named control was on any page; nothing was checked"
     assert not offenders, _format_offenders(
-        f"{len(offenders)} of {controls_seen} named form control(s) lack a "
-        "programmatic label:",
+        f"{len(offenders)} of {controls_seen} named form control(s) lack a programmatic label:",
         offenders,
     )
 
