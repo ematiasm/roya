@@ -14,9 +14,12 @@ they came through.
   document that had collected nothing.
 
 This module does not describe any page. It derives the registered page routes
-from the router registration itself, walks them, and asserts properties that
-hold for *every* page a shop can open. A property that has to be written once
-per screen is a property that will be forgotten on the next screen.
+from the router registration itself, derives the query-parameter states those
+routes offer from the links the templates render, walks both, and asserts
+properties that hold for *every* page a shop can open. A property that has to be
+written once per screen is a property that will be forgotten on the next
+screen, and a page state written down here by hand is a state that stops being
+swept the day its href changes, with nothing failing.
 
 What it asserts:
 
@@ -75,6 +78,19 @@ ROUTES_DIR = Path(__file__).resolve().parents[2] / "src" / "routes"
 # module and is not named `*_web.rs`; the API routers (`*_api.rs`, `api.rs`)
 # register JSON endpoints under `/api/`, which are not pages.
 _ROUTE_SOURCES = [ROUTES_DIR / "web.rs", *sorted(ROUTES_DIR.glob("*_web.rs"))]
+
+# The templates are the second declaration this module reads, for the same
+# reason as the first. `/settings?tab=taxes` is not a route — it is a
+# query-parameter state of one, and the tabs that offer it are links the
+# templates render. Reading them here is what keeps that page swept without a
+# hand-kept list that would silently rot.
+TEMPLATES_DIR = Path(__file__).resolve().parents[2] / "templates"
+_TEMPLATE_SOURCES = [
+    *sorted(TEMPLATES_DIR.glob("*.html")),
+    *sorted((TEMPLATES_DIR / "partials").glob("*.html")),
+]
+# A link to a page with a query string, in either quoting style.
+_LINK_WITH_QUERY = re.compile(r"""href=["'](/[^"'?#]*)\?([^"'#]*)["']""")
 
 # One `.route("...", <methods>)` call. The non-greedy method group stops at the
 # first `)` followed by a comma or a line end, which is how both the one-line
@@ -348,13 +364,57 @@ def seed_the_shop(page: Page, api: ApiClient) -> dict[str, int]:
     }
 
 
+def _linked_page_states(routes: set[str]) -> list[str]:
+    """Every `<registered route>?<query>` a template links to, in file order.
+
+    Derived rather than listed, so a tab or a filter state added tomorrow is
+    swept tomorrow and one renamed by hand cannot leave the sweep quietly.
+
+    Two guards, because a derivation that returns nothing is worse than no
+    derivation at all: the templates must still be found, and the result must
+    not be empty. The second one is deliberate friction — if the app genuinely
+    stops offering a query-parameter state, this is where that is said out
+    loud instead of the coverage shrinking on its own.
+    """
+    assert len(_TEMPLATE_SOURCES) >= 60, (
+        f"only {len(_TEMPLATE_SOURCES)} template(s) under {TEMPLATES_DIR}; the "
+        "glob stopped finding them, so the page states derived from the links "
+        "they render are no longer being swept"
+    )
+    states: list[str] = []
+    for source in _TEMPLATE_SOURCES:
+        text = source.read_text(encoding="utf-8")
+        for path, query in _LINK_WITH_QUERY.findall(text):
+            if not query or path not in routes:
+                continue
+            state = f"{path}?{query}"
+            if state not in states:
+                states.append(state)
+    assert states, (
+        "no template links to a query-parameter state of a registered page "
+        "route. Either the app stopped offering one — in which case remove "
+        "this expectation deliberately — or this derivation stopped reading "
+        "the templates, and those states are no longer swept"
+    )
+    return states
+
+
 def sweepable_routes(context: dict[str, Any]) -> list[tuple[str, str]]:
-    """`(template, concrete path)` for every page route inside the shell."""
-    return [
-        (template, _instantiate(template, context))
+    """`(label, concrete URL)` for every page state inside the shell.
+
+    A state is a registered page route, plus every query-parameter state the
+    templates link to on one. Being reachable is a property of how the extra
+    states are found — they come from a link the shell renders — so the crawl
+    below has nothing to prove about them a second time.
+    """
+    routes = [
+        template
         for template in registered_page_routes()
         if template not in _ANONYMOUS_PAGE_ROUTES
     ]
+    states = [(template, _instantiate(template, context)) for template in routes]
+    states.extend((state, state) for state in _linked_page_states(set(routes)))
+    return states
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +842,10 @@ def test_every_registered_page_route_is_reachable_from_the_shell(
     keep their `href` as the no-JavaScript way to read the same document.
     """
     context = seed_the_shop(page, api)
-    expected = {path for _, path in sweepable_routes(context)}
+    # Only the routes are nodes the crawl can stand on. A query-parameter state
+    # was DERIVED from a link the shell renders, so its reachability is how it
+    # was found rather than a separate thing to prove.
+    expected = {path for _, path in sweepable_routes(context) if "?" not in path}
 
     reachable: set[str] = set()
     queue = ["/"]
