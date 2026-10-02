@@ -8,7 +8,9 @@ use serde::Deserialize;
 
 use crate::error::AppResult;
 use crate::models::{
-    CreateAccountRequest, CreateTransactionRequest, TransactionFilter, UpdateTransactionRequest,
+    Account, AccountDetail, AccountMethodsResponse, AccountsResponse, CreateAccountRequest,
+    CreateTransactionRequest, MethodsResponse, PaymentMethod, Transaction, TransactionFilter,
+    TransactionsResponse, UpdateTransactionRequest,
 };
 use crate::routes::AppState;
 use crate::security::authz::{FinanceMethodsManage, FinanceRead, FinanceWrite, Require};
@@ -22,15 +24,16 @@ use crate::security::authz::{FinanceMethodsManage, FinanceRead, FinanceWrite, Re
 async fn list_accounts(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<AccountsResponse>> {
     // Tolerant, like every other list in this change: an account whose balance
     // refuses travels as a row with the rule in it, and the set total refuses with
     // it, so the document still lists every OTHER account instead of collapsing
     // into one error.
     let (accounts, total) = state.account_service.list_with_balances_and_total().await?;
-    Ok(Json(
-        serde_json::json!({ "accounts": accounts, "total_balance": total }),
-    ))
+    Ok(Json(AccountsResponse {
+        accounts,
+        total_balance: total,
+    }))
 }
 
 async fn create_account(
@@ -38,21 +41,21 @@ async fn create_account(
     _: Require<FinanceMethodsManage>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateAccountRequest>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> AppResult<(StatusCode, Json<Account>)> {
     let acc = state
         .account_service
         .create(principal.user_id, &payload.name)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(acc))))
+    Ok((StatusCode::CREATED, Json(acc)))
 }
 
 async fn get_account(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
     Path(id): Path<i64>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<AccountDetail>> {
     let detail = state.account_service.get_detail(id).await?;
-    Ok(Json(serde_json::json!(detail)))
+    Ok(Json(detail))
 }
 
 /// Every payment method with its owning account, so clients can resolve a name
@@ -60,9 +63,9 @@ async fn get_account(
 async fn list_payment_methods(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<MethodsResponse>> {
     let methods = state.payment_method_service.list().await?;
-    Ok(Json(serde_json::json!({ "methods": methods })))
+    Ok(Json(MethodsResponse { methods }))
 }
 
 /// Body for `PUT /api/accounts/{id}/payment-methods`. The list replaces the
@@ -79,10 +82,10 @@ async fn get_account_payment_methods(
     State(state): State<AppState>,
     _: Require<FinanceMethodsManage>,
     Path(id): Path<i64>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<AccountMethodsResponse>> {
     state.account_service.require_exists(id).await?;
     let methods = state.payment_method_service.catalog_for_account(id).await?;
-    Ok(Json(methods_json(id, methods)))
+    Ok(Json(account_methods(id, methods)))
 }
 
 /// Replace the account's method set with `method_ids` (unknown ids => 404,
@@ -93,32 +96,32 @@ async fn put_account_payment_methods(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateAccountPaymentMethodsRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<AccountMethodsResponse>> {
     state.account_service.require_exists(id).await?;
     let methods = state
         .payment_method_service
         .replace_account_methods(principal.user_id, id, &payload.method_ids)
         .await?;
-    Ok(Json(methods_json(id, methods)))
+    Ok(Json(account_methods(id, methods)))
 }
 
 /// Shape shared by GET and PUT: the account plus its owned methods.
-fn methods_json(account_id: i64, methods: Vec<crate::models::PaymentMethod>) -> serde_json::Value {
+fn account_methods(account_id: i64, methods: Vec<PaymentMethod>) -> AccountMethodsResponse {
     let method_ids: Vec<i64> = methods.iter().map(|m| m.id).collect();
-    serde_json::json!({
-        "account_id": account_id,
-        "method_ids": method_ids,
-        "methods": methods,
-    })
+    AccountMethodsResponse {
+        account_id,
+        method_ids,
+        methods,
+    }
 }
 
 async fn list_transactions(
     State(state): State<AppState>,
     _: Require<FinanceRead>,
     Query(filter): Query<TransactionFilter>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<TransactionsResponse>> {
     let txs = state.transaction_service.list(filter).await?;
-    Ok(Json(serde_json::json!({ "transactions": txs })))
+    Ok(Json(TransactionsResponse { transactions: txs }))
 }
 
 async fn create_transaction(
@@ -126,7 +129,7 @@ async fn create_transaction(
     _: Require<FinanceWrite>,
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateTransactionRequest>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+) -> AppResult<(StatusCode, Json<Transaction>)> {
     let tx = state
         .transaction_service
         .create_with_reference(
@@ -139,7 +142,7 @@ async fn create_transaction(
             payload.date,
         )
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!(tx))))
+    Ok((StatusCode::CREATED, Json(tx)))
 }
 
 async fn update_transaction(
@@ -148,7 +151,7 @@ async fn update_transaction(
     principal: axum::Extension<crate::security::authz::Principal>,
     Path(id): Path<i64>,
     Json(payload): Json<UpdateTransactionRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> AppResult<Json<Transaction>> {
     let tx = state
         .transaction_service
         .update(
@@ -160,7 +163,7 @@ async fn update_transaction(
             payload.date,
         )
         .await?;
-    Ok(Json(serde_json::json!(tx)))
+    Ok(Json(tx))
 }
 
 async fn delete_transaction(
