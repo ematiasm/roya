@@ -3,6 +3,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::str::FromStr;
 
+use crate::error::AppResult;
+
 /// Canonical TEXT encoding for every timestamp this database stores or binds.
 ///
 /// It produces exactly the shape SQLite itself writes — the same bytes as
@@ -41,7 +43,12 @@ pub fn base_connect_options(database_url: &str) -> Result<SqliteConnectOptions, 
 }
 
 /// Create a pool from DATABASE_URL.  Falls back to `sqlite://roya.db`.
-pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+///
+/// The error is [`crate::error::AppError`] rather than `sqlx::Error` because
+/// the party-ledger backfill runs in here after the migrations and can be
+/// REFUSED as well as fail: a document total the checked fold cannot carry
+/// answers `PriceRefused`, which is a rule and not a driver fault.
+pub async fn create_pool(database_url: &str) -> AppResult<SqlitePool> {
     let opts = base_connect_options(database_url)?
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
@@ -52,7 +59,23 @@ pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> 
         .await?;
 
     // Run migrations embedded at compile time (uses `migrations/` dir)
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(sqlx::Error::from)?;
+
+    // Migration 42 created the table; THIS fills it (decision 9). It sits
+    // immediately after `migrate!` because it depends on the table existing
+    // and on nothing else having written to it yet: the guard inside is "the
+    // ledger is empty", so on a fresh database it is a no-op and on a database
+    // it has already filled it writes nothing. Document totals are derived in
+    // Rust here — SQLite would do that arithmetic over TEXT decimals in REAL —
+    // and everything runs inside ONE transaction, so a refused or failed
+    // backfill leaves the table empty rather than half-filled.
+    let backfilled = crate::repositories::party_ledger_repo::backfill_party_ledger(&pool).await?;
+    if backfilled > 0 {
+        tracing::info!(entries = backfilled, "party ledger backfilled");
+    }
 
     Ok(pool)
 }

@@ -3529,6 +3529,201 @@ pub fn format_customer_return_number(year: i32, seq: i64) -> String {
     format!("{year}-SRET-{seq:06}")
 }
 
+// ---------------------------------------------------------------------------
+// Party ledger — one signed entry table per party
+// (odd/tasks/party-ledger.md, decisions 1, 3, 7)
+// ---------------------------------------------------------------------------
+
+/// Whose ledger an entry belongs to. The value pairs with `party_id`, which
+/// carries no foreign key precisely because it means one of two tables
+/// depending on this field (migration 42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PartyType {
+    Customer,
+    Supplier,
+}
+
+impl std::fmt::Display for PartyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Customer => write!(f, "Customer"),
+            Self::Supplier => write!(f, "Supplier"),
+        }
+    }
+}
+
+impl std::str::FromStr for PartyType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "customer" => Ok(Self::Customer),
+            "supplier" => Ok(Self::Supplier),
+            _ => Err(format!("invalid party type: {s}")),
+        }
+    }
+}
+
+/// What happened, as the journal records it. The five events of decision 1's
+/// table; a row's `kind` and its stored SIGN together are the whole statement
+/// of that rule, so a reader never has to re-derive a direction from context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PartyEntryKind {
+    Charge,
+    Payment,
+    Return,
+    Refund,
+    Cancel,
+}
+
+impl PartyEntryKind {
+    /// THE SIGN RULE of decision 1, in one place so no write path can hold a
+    /// second opinion about it:
+    ///
+    /// | event | kind | sign |
+    /// |---|---|---|
+    /// | document confirmed (cash or credit) | `Charge` | `+total` |
+    /// | cash settled against the document | `Payment` | `−amount` |
+    /// | goods returned / credit note | `Return` | `−total` |
+    /// | cash handed back to the party | `Refund` | `+amount` |
+    /// | whole document annulled | `Cancel` | `−total` |
+    ///
+    /// The argument is the magnitude as the document states it — a total or a
+    /// payment amount, i.e. a figure that is already non-negative on a
+    /// well-formed document. The returned value is what gets STORED: the sign
+    /// lives in the row, and the read side is one checked sum over `amount`,
+    /// never a sign function of its own.
+    ///
+    /// Worked examples the feature document pins: a customer who owes 200 and
+    /// pays 250 folds to `−50` (a credit); a 100 credit note returned in full
+    /// before any payment folds to `+100 −100 = 0`.
+    pub fn signed_amount(self, magnitude: Decimal) -> Decimal {
+        match self {
+            Self::Charge | Self::Refund => magnitude,
+            Self::Payment | Self::Return | Self::Cancel => -magnitude,
+        }
+    }
+}
+
+impl std::fmt::Display for PartyEntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Charge => write!(f, "Charge"),
+            Self::Payment => write!(f, "Payment"),
+            Self::Return => write!(f, "Return"),
+            Self::Refund => write!(f, "Refund"),
+            Self::Cancel => write!(f, "Cancel"),
+        }
+    }
+}
+
+impl std::str::FromStr for PartyEntryKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "charge" => Ok(Self::Charge),
+            "payment" => Ok(Self::Payment),
+            "return" => Ok(Self::Return),
+            "refund" => Ok(Self::Refund),
+            "cancel" => Ok(Self::Cancel),
+            _ => Err(format!("invalid party entry kind: {s}")),
+        }
+    }
+}
+
+/// The family of the document an entry points at. The pair (kind, id) is the
+/// reference — four families, one column set, so it cannot be a foreign key
+/// (migration 42's header says why that is a property of SQLite and not a
+/// shortcut).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PartyDocumentKind {
+    Sale,
+    Purchase,
+    CustomerReturn,
+    PurchaseReturn,
+}
+
+impl std::fmt::Display for PartyDocumentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sale => write!(f, "Sale"),
+            Self::Purchase => write!(f, "Purchase"),
+            Self::CustomerReturn => write!(f, "CustomerReturn"),
+            Self::PurchaseReturn => write!(f, "PurchaseReturn"),
+        }
+    }
+}
+
+impl std::str::FromStr for PartyDocumentKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sale" => Ok(Self::Sale),
+            "purchase" => Ok(Self::Purchase),
+            "customerreturn" => Ok(Self::CustomerReturn),
+            "purchasereturn" => Ok(Self::PurchaseReturn),
+            _ => Err(format!("invalid party document kind: {s}")),
+        }
+    }
+}
+
+/// One stored ledger row.
+///
+/// `amount` is the SIGNED figure — positive is an outstanding obligation,
+/// negative is a saldo a favor (see [`PartyEntryKind::signed_amount`]) — and it
+/// is what every balance folds, so nothing downstream re-applies a sign.
+/// `entry_date` is the event's date as its document wrote it.
+///
+/// The journal never rewrites a row (decision 3): a cancel appends its own
+/// entries rather than editing the ones that exist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyLedgerEntry {
+    pub id: i64,
+    pub party_type: PartyType,
+    pub party_id: i64,
+    pub kind: PartyEntryKind,
+    /// Signed Decimal, stored as TEXT. Never `f32`/`f64`.
+    pub amount: Decimal,
+    pub document_kind: PartyDocumentKind,
+    pub document_id: i64,
+    pub entry_date: NaiveDate,
+    /// The document number, opaque: the ledger never parses it.
+    pub reference: Option<String>,
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// The write shape of [`PartyLedgerEntry`], without the row's identity or its
+/// DB-stamped `created_at`/`updated_at`.
+///
+/// `amount` arrives already signed — the caller states the magnitude through
+/// [`PartyEntryKind::signed_amount`] — so the column is written exactly once,
+/// here, and there is no second place where a direction could be applied.
+#[derive(Debug, Clone)]
+pub struct NewPartyLedgerEntry {
+    pub party_type: PartyType,
+    pub party_id: i64,
+    pub kind: PartyEntryKind,
+    /// Signed Decimal, stored as TEXT.
+    pub amount: Decimal,
+    pub document_kind: PartyDocumentKind,
+    pub document_id: i64,
+    pub entry_date: NaiveDate,
+    pub reference: Option<String>,
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
