@@ -290,6 +290,7 @@ item out as domain work rather than presentation.
       learned apply: the sale row becomes an anchor, so the tag-based e2e
       selector in `e2e/tests/test_filters.py` will break loudly, and the full
       browser suite must run for the slice that changes the row.
+      Stays unchecked (2026-10-02) — parked by decision and still absent, as intended: `templates/partials/sale_list.html:15-16,28` keeps the badge cloud and the expense-coloured total.
 - [ ] **S8 — Localization. REFRAMED by user decision (2026-09-22), deferred to
       its own planning session. This is no longer "translate the strings".** The
       user's plan: a **new database table for business settings** holding the
@@ -342,13 +343,16 @@ item out as domain work rather than presentation.
       `format_date` helper; `<input type="date">` values must stay ISO because
       that is the contract with the server and the database, and the locale the
       browser shows in the filter is the browser's, not a data inconsistency.
+      Stays unchecked (2026-10-02) — PARTIAL: the `business_settings` table and settings surface landed (`migrations/20240101000036:8-16`), but the address/phone/email/tax_id columns and explicit date/number-format settings are absent, and `format_date` derives day-first from the locale (`src/localization/mod.rs:3646`).
 - [ ] **S9 (optional) — Unified `q` search.** `PurchaseListQuery` collapses
       `supplier` + `number` into one free-text field; service + repo change.
+      Stays unchecked (2026-10-02) — genuinely not built: `PurchaseListQuery` (`src/routes/purchases_web.rs:898-909`) still has separate `supplier` and `number` fields and no `q`.
 
 ## Acceptance criteria
 
-- [ ] AC1: no page renders a `REST API` card; the shell's `REST API ↗` link still
+- [x] AC1: no page renders a `REST API` card; the shell's `REST API ↗` link still
       renders exactly once.
+      Closed 2026-10-02 **against the tree**: `grep 'REST API|/api/'` in `templates/` returns 1 hit (`partials/sidebar.html:145`), the sidebar link itself.
 - [x] AC2: `/purchases` and `/sales` render one row per record with aligned
       columns from `sm:` (640 px) up and a stacked reading order below, and no
       page scrolls horizontally at 360 px. The columns arrive at `sm:`, not at
@@ -359,20 +363,28 @@ item out as domain work rather than presentation.
       deliberately long supplier name, and polls `scrollWidth <= clientWidth`
       (nothing in the app hides horizontal overflow, so a real overflow fails
       it).
-- [ ] AC3: the list total is not colored by payment state; a status chip carries
+- [x] AC3: the list total is not colored by payment state; a status chip carries
       paid / pending / overdue color.
-- [ ] AC4: a draft row shows a stable identifier when `purchase_number` is NULL.
-- [ ] AC5: total, paid and due are printed once per row.
-- [ ] AC6: the `purchases • negative stock allowed • …` subtitle is gone from
+      Closed 2026-10-02 **against the tree**: `templates/partials/purchase_list.html:20,22` — total `text-text`, chips chip-income/warning/expense (`assets/tailwind.css:142,150`).
+- [x] AC4: a draft row shows a stable identifier when `purchase_number` is NULL.
+      Closed 2026-10-02 **against the tree**: `purchase_list.html:14` renders `Draft #{{ v.purchase.id }}`, asserted at `src/smoke_tests.rs:5955`.
+- [x] AC5: total, paid and due are printed once per row.
+      Closed 2026-10-02 **against the tree**: `purchase_list.html:17,20,22` print paid once, due once and total once; the duplicated muted money line is gone.
+- [x] AC6: the `purchases • negative stock allowed • …` subtitle is gone from
       `/purchases` and `/sales`.
-- [ ] AC7: `New purchase` opens a `<dialog>`, the `#new-purchase` card no longer
+      Closed 2026-10-02 **against the tree**: `grep 'negative stock allowed|totals derived'` in `templates/` returns 0.
+- [x] AC7: `New purchase` opens a `<dialog>`, the `#new-purchase` card no longer
       exists, and the page renders a single column.
-- [ ] AC8: creating from the dialog still navigates to `/purchases/{id}`.
+      Closed 2026-10-02 **against the tree**: `templates/purchases.html:16,97-108` defines `<dialog id="new-purchase-dialog">` opened by `showModal()` (`src/smoke_tests.rs:4032`), and no `#new-purchase` card remains.
+- [x] AC8: creating from the dialog still navigates to `/purchases/{id}`.
+      Closed 2026-10-02 **against the tree**: `src/routes/purchases_web.rs:1319-1325` answers HX-Redirect to `/purchases/{id}`, test `:3077`, `e2e/tests/test_purchases.py:662`.
 - [ ] AC9: every interface string is English and comes from the central labels
       module; read views print one date format from one helper; `<input
       type="date">` values remain ISO.
-- [ ] AC10: `cargo test` green at every slice, and the committed stylesheet is
+      Stays unchecked (2026-10-02) — PARTIAL: central labels and `format_date` landed (`src/localization/mod.rs:3646`, `src/localization_tests.rs:358`), but the shell language stays locale-driven (the Spanish shell is asserted) and hardcoded strings bypass the module (`templates/partials/sidebar.html:144`).
+- [x] AC10: `cargo test` green at every slice, and the committed stylesheet is
       up to date with the templates.
+      Closed 2026-10-02 **against the tree**: CI `checks` success on HEAD `d876e2e` (parent-verified).
 
 ## Handoff — how to resume this feature in a new session
 

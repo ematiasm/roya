@@ -48,11 +48,16 @@ commitear del rediseño customers/suppliers (rama anterior); viajan en el
 worktree, commitear por separado.
 
 ## Acceptance criteria
-- [ ] Un método pertenece a ≤1 cuenta a nivel DB (FK + UNIQUE)
-- [ ] Collect, sale confirm/payment, purchase confirm/payment: solo método
-- [ ] Combinación inválida imposible por construcción (sin 400 evitable)
-- [ ] `cargo test` full en verde, `cargo check` limpio
+- [x] Un método pertenece a ≤1 cuenta a nivel DB (FK + UNIQUE)
+      Closed 2026-10-02 **against the tree**: `migrations/20240101000024_payment_methods_single_account.sql:26` (FK), `:29` (UNIQUE) and `:51` (DROP allowlist).
+- [x] Collect, sale confirm/payment, purchase confirm/payment: solo método
+      Closed 2026-10-02 **against the tree**: `customer_receipts.rs:105`, `sales.rs:1298,1542` and `purchases.rs:1092,1288,1353` take only the method; only `name="method_id"` selects appear in `customer_detail.html:52`, `sale_detail.html:187,250` and `purchase_detail.html:611,656`.
+- [x] Combinación inválida imposible por construcción (sin 400 evitable)
+      Closed 2026-10-02 **against the tree**: ownership at `payment_method_repo.rs:90`, fixture-only allowlist at `:408` with test `:465`, and the rule is stated at `sales.rs:1286`, `purchases.rs:1080` and `finance_methods.rs:8`.
+- [x] `cargo test` full en verde, `cargo check` limpio
+      Closed 2026-10-02 **against the tree**: CI `checks` success on HEAD `d876e2e`; `cargo check --all-targets` exits 0 with 0 errors and 75 warnings.
 - [ ] README + spec finance actualizados
+      Stays unchecked (2026-10-02) — PARTIAL: `README.md:178-199` documents it and the spec was updated at `98c7194`, but the `openspec/` tree was deliberately deleted in `76d0cbb`, so the spec half cannot be satisfied in the current tree — this box needs rewriting, not ticking.
 
 ## Applicable checks
 - `cargo test` (full), `cargo check --all-targets`

@@ -39,9 +39,10 @@ The repository already has a GitHub Actions checks workflow, but no CodeQL confi
 
 - [x] T1 — Add and validate the CodeQL workflow.
       Evidence: `.github/workflows/codeql.yml` added with Rust no-build analysis, pull-request/push/weekly triggers, and least-privilege permissions; `git diff --no-index --check` passed. `actionlint` and a local YAML parser are unavailable, so GitHub-hosted execution remains pending.
-- [ ] T2 — Enable the remote code-quality merge rule with the authorized GitHub session.
+- [x] T2 — Enable the remote code-quality merge rule with the authorized GitHub session.
+      Closed 2026-10-02 **against the tree**: parent-verified via `gh api repos/ematiasm/roya/rulesets/23498167` — ruleset "main", `enforcement: active`, updated 2026-09-24, with a `code_quality` rule at `severity: errors` alongside `deletion`, `non_fast_forward` and `pull_request`.
 - [x] T3 — Record final evidence and hand off the result.
-      Evidence: PR #102 opened; GitHub-hosted CodeQL run `36063657254` passed on commit `ee4e18f`. The Code Quality setup endpoint still reports that the feature is unavailable for this repository.
+      Evidence: PR #102 opened; GitHub-hosted CodeQL run `36063657254` passed on commit `ee4e18f`. The Code Quality setup endpoint reported the feature unavailable for this repository at that time — it is active on `main` as of 2026-09-24, per T2 above.
 
 ## Acceptance criteria
 
@@ -56,10 +57,10 @@ The repository already has a GitHub Actions checks workflow, but no CodeQL confi
 - Feature document created: `odd/tasks/codeql-quality-gate.md`.
 - Commit: `d90b6d1` created locally; direct push to `main` was rejected by the active pull-request ruleset, and the commit is now published on `ci/codeql-quality-gate` for a pull request.
 - T1: completed; workflow added and local diff validation passed.
-- T2: blocked; the authorized GitHub API reports that Code Quality is not available for this repository, so `Require code quality results` cannot be enabled. The separate CodeQL workflow is ready for pull-request validation.
-- T3: completed; PR #102 is open and the GitHub-hosted CodeQL run passed. Code Quality remains unavailable for this repository, so its merge rule was not enabled.
+- T2: closed 2026-10-02; the code-quality rule is active on `main` at `severity: errors` (ruleset updated 2026-09-24). The authorized GitHub API reported Code Quality unavailable for this repository when it was first attempted, which is why this was recorded as blocked at the time.
+- T3: completed; PR #102 is open and the GitHub-hosted CodeQL run passed. Code Quality was unavailable at that time, so its merge rule was not enabled then; it is active on `main` as of 2026-09-24.
 - T3 evidence: CodeQL run `36063657254` passed on commit `ee4e18f`; PR: https://github.com/ematiasm/roya/pull/102
 
 ## Next step
 
-Merge PR #102 under the repository's normal review policy. Revisit the separate Code Quality merge rule only if GitHub makes that feature available for this repository.
+Merge PR #102 under the repository's normal review policy. The code-quality merge rule is active on `main` (severity errors, as of 2026-09-24); nothing is pending on it.

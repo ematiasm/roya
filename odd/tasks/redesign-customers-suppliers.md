@@ -34,12 +34,17 @@ Lectura rápida del catálogo y detalle bajo demanda; alta sin ruido visual.
 Rediseño visual + fragmento detalle supplier. Sin cambios de negocio.
 
 ## Acceptance criteria
-- [ ] Lista customers y suppliers muestra solo nombres (clickeable)
-- [ ] Botón "New customer/supplier" abre modal con el form de alta
-- [ ] Sin card de edición visible en ninguna de las dos páginas
-- [ ] Click en un nombre abre slide-over derecho: cabecera con datos,
+- [x] Lista customers y suppliers muestra solo nombres (clickeable)
+      Closed 2026-10-02 **against the tree**: `templates/partials/customer_list.html:10-15` and `supplier_list.html:7-12`; tests `customers_web.rs:1219`, `suppliers_web.rs:843`.
+- [x] Botón "New customer/supplier" abre modal con el form de alta
+      Closed 2026-10-02 **against the tree**: `templates/customers.html:20` with dialog `:73`; `templates/suppliers.html:20` with dialog `:55`.
+- [x] Sin card de edición visible en ninguna de las dos páginas
+      Closed 2026-10-02 **against the tree**: no edit card at `customers.html:9,48` / `suppliers.html:9,44`; test `customers_web.rs:1535-1554`.
+- [x] Click en un nombre abre slide-over derecho: cabecera con datos,
       saldo, documentos asociados (ventas / compras)
-- [ ] `cargo test` relevante en verde (customers_web, suppliers_web)
+      Closed 2026-10-02 **against the tree**: routes at `customers_web.rs:859` and `suppliers_web.rs:726`; balance+documents test `suppliers_web.rs:905`, detail tests `customers_web.rs:1192+`.
+- [x] `cargo test` relevante en verde (customers_web, suppliers_web)
+      Closed 2026-10-02 **against the tree**: CI `checks` success on HEAD `d876e2e` (parent-verified).
 
 ## Applicable checks
 - `cargo test customers_web suppliers_web` (o el filtro que corresponda)

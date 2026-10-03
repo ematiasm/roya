@@ -148,20 +148,29 @@ machine duplicated across five templates.
 
 ## Acceptance criteria
 
-- [ ] An inline line edit leaves the element counts unchanged: one
+- [x] An inline line edit leaves the element counts unchanged: one
       `#purchase-record-money`, one `#purchase-record-inner`, one
       `#purchase-header`, one `#purchase-header-form`.
-- [ ] The regression test fails before the fix and passes after, for the right
+      Closed 2026-10-02 **against the tree**: `e2e/tests/test_purchases.py:1005-1009` asserts counts `after == before` for the four ids; `purchase_detail.html:183-184,193-194,215-216` carry `hx-swap` + `hx-select`.
+- [x] The regression test fails before the fix and passes after, for the right
       reason (counts, not attributes).
-- [ ] Changing the date, invoice or notes alone persists without pressing
+      Closed 2026-10-02 **against the tree**: `e2e/tests/test_purchases.py:952-956,1005-1009` assert counts, not attributes.
+- [x] Changing the date, invoice or notes alone persists without pressing
       anything, and the field keeps focus while doing it.
-- [ ] `Save header` no longer exists on the page.
-- [ ] The supplier picker still saves the whole header (no regression).
-- [ ] An incomplete or invalid field posts nothing and reports inline.
-- [ ] The entry row has one state object; no entry-row state lives in
+      Closed 2026-10-02 **against the tree**: `templates/partials/purchase_detail.html:376-380` sets `hx-trigger="change"`, `hx-swap="none"` and `hx-sync="this:replace"`; `e2e/tests/test_purchases.py:1023,1058` check persistence and kept focus.
+- [x] `Save header` no longer exists on the page.
+      Closed 2026-10-02 **against the tree**: `e2e/tests/test_purchases.py:1038-1043` asserts count 0; the `Save header` template string survives only in comments at `purchase_detail.html:365,373`.
+- [x] The supplier picker still saves the whole header (no regression).
+      Closed 2026-10-02 **against the tree**: `src/routes/purchases_web.rs:47` `HEADER_SIBLING_INCLUDE` names the three header fields, passed at `purchase_detail.html:363` and rendered at `supplier_picker.html:45`.
+- [x] An incomplete or invalid field posts nothing and reports inline.
+      Closed 2026-10-02 **against the tree**: `purchase_detail.html:384` with `templates/purchase.html:149-156`; `e2e/tests/test_purchases.py:1135-1150` asserts `posted == []` and the error visible.
+- [x] The entry row has one state object; no entry-row state lives in
       `purchase.html`.
-- [ ] `cargo test` green; `scripts/e2e.sh` green.
+      Closed 2026-10-02 **against the tree**: `static/picker.js:72` holds a single `state` object; `purchase.html:73-78` records the entry-row mirror state as removed.
+- [x] `cargo test` green; `scripts/e2e.sh` green.
+      Closed 2026-10-02 **against the tree**: CI `checks` success on HEAD `d876e2e` (parent-verified).
 - [ ] README documents the new asset and its Tailwind scan-source status.
+      Stays unchecked (2026-10-02) — dead premise: `static/entry-row.js` was never created (only `picker.js` and `htmx.min.js` exist) because the island task that would have created it was dropped; `README.md:742,744` documents `picker.js`. The box, not the code, needs a decision.
 
 ## Applicable checks
 

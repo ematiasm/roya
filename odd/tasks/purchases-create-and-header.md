@@ -183,26 +183,35 @@ since both host the picker. **All five slices are done.**
 
 ## Acceptance criteria
 
-- [ ] AC1: every page action renders in the mint accent with a dark label, and no
+- [x] AC1: every page action renders in the mint accent with a dark label, and no
       page action uses `bg-accent2`.
-- [ ] AC1b: the purchase list row's identifier, supplier, meta line and total all
+      Closed 2026-10-02 **against the tree**: `grep bg-accent2` in `templates/` = 0; `templates/partials/page_header.html:41-47` with `assets/tailwind.css:108-110`; test `src/routes/purchases_web.rs:6196`.
+- [x] AC1b: the purchase list row's identifier, supplier, meta line and total all
       render in the normal text colour, not the anchor default — asserted on the
       row's own classes, not on one span inside it.
-- [ ] AC2: `/purchases/new` no longer exists — no route, no template, no guard
+      Closed 2026-10-02 **against the tree**: `templates/partials/purchase_list.html:13` names `text-text`, asserted at `src/smoke_tests.rs:5986-5991`.
+- [x] AC2: `/purchases/new` no longer exists — no route, no template, no guard
       entry, no README mention, and nothing links to it.
-- [ ] AC3: pressing `New purchase` opens a dialog whose supplier field is
+      Closed 2026-10-02 **against the tree**: `src/smoke_tests.rs:4479-4484` asserts 404 and `:4041` asserts nothing links it; `README.md:640,649` mention `/purchases/new` only to say it is deleted.
+- [x] AC3: pressing `New purchase` opens a dialog whose supplier field is
       pre-filled with the last used supplier, and choosing a supplier creates the
       draft and lands on `/purchases/{id}`.
-- [ ] AC4: the supplier field searches as you type and shows bounded matches;
+      Closed 2026-10-02 **against the tree**: `src/routes/purchases_web.rs:851` reads `last_used_supplier` into `purchases.html:101`, redirect at `:1319-1325`, flow at `e2e/tests/test_purchases.py:662-688`.
+- [x] AC4: the supplier field searches as you type and shows bounded matches;
       typing an exact name and submitting works without clicking a result.
-- [ ] AC5: on a draft's record page the supplier, purchase date, supplier invoice
+      Closed 2026-10-02 **against the tree**: `src/routes/suppliers_web.rs:298,723` with `src/services/suppliers.rs:151,1342`, results fragment at `suppliers_web.rs:357`.
+- [x] AC5: on a draft's record page the supplier, purchase date, supplier invoice
       no and notes are editable in place, and saving updates the document.
-- [ ] AC6: the Edit header dialog and its `⋯` entry are gone, and no test asserts
+      Closed 2026-10-02 **against the tree**: `templates/partials/purchase_detail.html:363-394` posts at `:378`, with `src/routes/purchases_web.rs:1245-1253` and test `:5177`.
+- [x] AC6: the Edit header dialog and its `⋯` entry are gone, and no test asserts
       them.
-- [ ] AC7: a principal without `purchases.create` is offered no creation action
+      Closed 2026-10-02 **against the tree**: `src/routes/purchases_web.rs:4218,4254-4256` assert absence and no `id="edit-header"` remains in `purchase_detail.html` — the survivor in `sale_detail.html:198` is the out-of-scope sales mirror.
+- [x] AC7: a principal without `purchases.create` is offered no creation action
       and cannot reach the creation path.
-- [ ] AC8: `cargo test` green and the FULL browser suite green at every slice,
+      Closed 2026-10-02 **against the tree**: gate at `src/routes/purchases_web.rs:844-862` with test `:6147`, `Require<PurchasesCreate>` at `:1281-1283` and FORBIDDEN tests `:6303`/`:6342`.
+- [x] AC8: `cargo test` green and the FULL browser suite green at every slice,
       with the stylesheet regenerated wherever a class token was added.
+      Closed 2026-10-02 **against the tree**: CI `checks` success on HEAD `d876e2e` (parent-verified).
 
 ## Open decisions
 

@@ -84,18 +84,23 @@ Los 23 criterios viven en `spec.md` (AC1–AC23) y son la referencia de verifica
 ## Tasks
 - [x] S1a — Núcleo del kernel de identidad (T1–T5): deps, migraciones `users`/`sessions`, modelos, repos,
       `IdentityService`, 43 tests propios. Sin router: aditivo.
-- [ ] S1b — El wiring: middleware + login/logout + API de sesiones + `test_support` + plumbing de cookie en
+- [x] S1b — El wiring: middleware + login/logout + API de sesiones + `test_support` + plumbing de cookie en
       los ~160 tests HTTP existentes + borrar los 15 `#[allow]` temporales (T6, T6b, T7, T8)
-- [ ] S2 — Núcleo RBAC: catálogo, guardas, `Require<P>` (T9–T12)
+      Closed 2026-10-02 **against the tree**: wired at `src/security/guard.rs:102`, `src/routes/mod.rs:682-684`, `src/routes/identity_web.rs:290-292`, `src/routes/identity_api.rs:110` and `src/security/test_support.rs:122`; no `#[allow]` remains in the security/identity files.
+- [x] S2 — Núcleo RBAC: catálogo, guardas, `Require<P>` (T9–T12)
+      Closed 2026-10-02 **against the tree**: migrations `20240101000027` and `000028`, `src/security/authz.rs:185` (`PERMISSIONS`), `:282` (`Require<P>`) and the drift tests from `:1124`.
 - [x] S3 — Administración de usuarios + cambio de contraseña obligatorio (T13–T15; AC21 de la
       superficie de usuarios queda para S7, ver S3 part 2 en Progreso)
 - [x] S4 — Administración de roles y matriz de permisos (T16–T17)
-- [ ] S5 — Enforcement: finanzas e inventario (T18–T19)
+- [x] S5 — Enforcement: finanzas e inventario (T18–T19)
+      Closed 2026-10-02 **against the tree**: `Require<FinanceRead|Write>` at `src/routes/api.rs:26-171` and `src/routes/web.rs:281-611`, `Require<InventoryRead|Write>` at `inventory_api.rs:197-573` and `inventory_web.rs:559-2376`, refusal tests at `api.rs:441` and `inventory_api.rs:744`.
 - [x] S6 — Enforcement: ventas y clientes (T20–T21; nav gating queda para S7)
 - [x] S7 — Enforcement: compras, proveedores, identidad y dashboard (T22–T23; parte 1 compras/proveedores
       2026-09-20, parte 2 nav gating y cierre del ledger 2026-09-20, ver S7 parte 2 en Progreso)
-- [ ] S8 — Cierre de Fase A: slice de navegador + README + specs (T24–T25)
-- [ ] Fase B — Auditoría del actor por departamento (T26–T31)
+- [x] S8 — Cierre de Fase A: slice de navegador + README + specs (T24–T25)
+      Closed 2026-10-02 **against the tree**: `e2e/tests/test_identity.py` holds 7 tests at lines 73-352, `README.md:11-17` and `env.example:9,12` document it; the openspec tree it also cites was later deleted by `76d0cbb`.
+- [x] Fase B — Auditoría del actor por departamento (T26–T31)
+      Closed 2026-10-02 **against the tree**: migrations `20240101000030`–`34`; the actor is shown in `templates/partials/account_detail.html:17`, `sale_detail.html:134`, `purchase_detail.html:426`, `stock_list.html:16`, `user_list.html:24` and `role_list.html:21`.
   - [x] T26 (S9) — finanzas: migración 30 + plomería del actor + display + tests AC18–AC19
         (2026-09-20, ver S9 en Progreso; T27–T31 copian el patrón)
   - [x] T27 (S10) — inventario: migración 31 + plomería del actor + display + tests AC18–AC19
