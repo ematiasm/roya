@@ -3682,8 +3682,10 @@ impl std::str::FromStr for PartyDocumentKind {
 /// is what every balance folds, so nothing downstream re-applies a sign.
 /// `entry_date` is the event's date as its document wrote it.
 ///
-/// The journal never rewrites a row (decision 3): a cancel appends its own
-/// entries rather than editing the ones that exist.
+/// The journal is append-only (decisions 3 and 10): a cancel appends its own
+/// entries rather than editing the ones that exist, and the schema itself
+/// refuses every `UPDATE` and `DELETE` on the table, so there is no audit
+/// stamp beyond `created_by`/`created_at` to drift from what happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartyLedgerEntry {
     pub id: i64,
@@ -3698,13 +3700,11 @@ pub struct PartyLedgerEntry {
     /// The document number, opaque: the ledger never parses it.
     pub reference: Option<String>,
     pub created_by: i64,
-    pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
-    pub updated_at: chrono::NaiveDateTime,
 }
 
 /// The write shape of [`PartyLedgerEntry`], without the row's identity or its
-/// DB-stamped `created_at`/`updated_at`.
+/// DB-stamped `created_at`.
 ///
 /// `amount` arrives already signed — the caller states the magnitude through
 /// [`PartyEntryKind::signed_amount`] — so the column is written exactly once,
@@ -3721,7 +3721,6 @@ pub struct NewPartyLedgerEntry {
     pub entry_date: NaiveDate,
     pub reference: Option<String>,
     pub created_by: i64,
-    pub updated_by: Option<i64>,
 }
 
 #[cfg(test)]

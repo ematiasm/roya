@@ -128,9 +128,7 @@ fn row_to_entry(row: sqlx::sqlite::SqliteRow) -> AppResult<PartyLedgerEntry> {
         entry_date: row.get("entry_date"),
         reference: row.get("reference"),
         created_by: row.get("created_by"),
-        updated_by: row.get("updated_by"),
         created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
     })
 }
 
@@ -150,9 +148,9 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let row = sqlx::query(
-        r#"INSERT INTO party_ledger_entries (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by, updated_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           RETURNING id, party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by, updated_by, created_at, updated_at"#,
+        r#"INSERT INTO party_ledger_entries (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           RETURNING id, party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by, created_at"#,
     )
     .bind(entry.party_type.to_string())
     .bind(entry.party_id)
@@ -163,7 +161,6 @@ where
     .bind(entry.entry_date)
     .bind(entry.reference.as_deref())
     .bind(entry.created_by)
-    .bind(entry.updated_by)
     .fetch_one(executor)
     .await?;
     row_to_entry(row)
@@ -216,7 +213,7 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
 {
     let rows = sqlx::query(
-        "SELECT id, party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by, updated_by, created_at, updated_at FROM party_ledger_entries WHERE party_type = ? AND party_id = ? ORDER BY id",
+        "SELECT id, party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by, created_at FROM party_ledger_entries WHERE party_type = ? AND party_id = ? ORDER BY id",
     )
     .bind(party_type.to_string())
     .bind(party_id)
@@ -462,7 +459,6 @@ async fn backfill_sales(
                 entry_date: sale_date,
                 reference: sale_number.clone(),
                 created_by,
-                updated_by: None,
             },
         )
         .await?;
@@ -490,7 +486,6 @@ async fn backfill_sales(
                     entry_date: payment_date,
                     reference: sale_number.clone(),
                     created_by: payment_by,
-                    updated_by: None,
                 },
             )
             .await?;
@@ -539,7 +534,6 @@ async fn backfill_purchases(
                 entry_date: purchase_date,
                 reference: purchase_number.clone(),
                 created_by,
-                updated_by: None,
             },
         )
         .await?;
@@ -567,7 +561,6 @@ async fn backfill_purchases(
                     entry_date: payment_date,
                     reference: purchase_number.clone(),
                     created_by: payment_by,
-                    updated_by: None,
                 },
             )
             .await?;
@@ -619,7 +612,6 @@ async fn backfill_customer_returns(
                 entry_date: return_date,
                 reference: credit_note_number.clone(),
                 created_by,
-                updated_by: None,
             },
         )
         .await?;
@@ -647,7 +639,6 @@ async fn backfill_customer_returns(
                     entry_date: refund_date,
                     reference: credit_note_number.clone(),
                     created_by: refund_by,
-                    updated_by: None,
                 },
             )
             .await?;
@@ -699,7 +690,6 @@ async fn backfill_purchase_returns(
                 entry_date: return_date,
                 reference: return_number.clone(),
                 created_by,
-                updated_by: None,
             },
         )
         .await?;
@@ -727,7 +717,6 @@ async fn backfill_purchase_returns(
                     entry_date: refund_date,
                     reference: return_number.clone(),
                     created_by: refund_by,
-                    updated_by: None,
                 },
             )
             .await?;
@@ -786,7 +775,16 @@ mod tests {
             entry_date: d(2024, 5, 1),
             reference: Some(format!("T1-DOC-{document_id}")),
             created_by: 1,
-            updated_by: None,
+        }
+    }
+
+    /// The message the database put on the refused statement — the raw text,
+    /// mapped by nothing, so the proof cannot drift from the schema (the same
+    /// shape `role_repo.rs::refusal_message` established).
+    fn refusal_message(err: sqlx::Error) -> String {
+        match err {
+            sqlx::Error::Database(db) => db.message().to_string(),
+            other => panic!("expected a refused statement, got {other:?}"),
         }
     }
 
@@ -993,10 +991,18 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let method: i64 = sqlx::query_scalar("SELECT id FROM payment_methods WHERE name = 'Cash'")
-            .fetch_one(pool)
-            .await
-            .unwrap();
+        // Migration 44 guards the (account, method) pair on the payment rows
+        // this fixture writes, so the method must be one the fixture's account
+        // OWNS (the seeded methods are unassigned on a fresh database).
+        let method: i64 = sqlx::query_scalar(
+            "INSERT INTO payment_methods (name, account_id, created_by) \
+             VALUES ('T1 ledger cash cash', ?, ?) RETURNING id",
+        )
+        .bind(account)
+        .bind(who)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         let customer: i64 = sqlx::query_scalar(
             "INSERT INTO customers (name, is_walkin, is_active, created_by)
              VALUES ('T1 Ledger Customer', 0, 1, ?) RETURNING id",
@@ -1388,6 +1394,169 @@ mod tests {
                 .unwrap(),
             balance_after_first,
             "a second run must not double a balance"
+        );
+    }
+
+    // -- integrity: the single-instance guard and append-only (decisions 10
+    //    and 11). Each refusal is proved with the raw statement any future
+    //    writer, screen or script would run, asserting the database's own
+    //    message, then asserting the state it leaves behind.
+
+    #[tokio::test]
+    async fn a_second_charge_for_the_same_document_is_refused_by_the_unique_index() {
+        let pool = test_pool().await;
+        let r = repo(&pool);
+
+        r.insert(&entry(1, PartyEntryKind::Charge, "100", 1))
+            .await
+            .unwrap();
+        let err = sqlx::query(
+            "INSERT INTO party_ledger_entries (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) VALUES ('Customer', 1, 'Charge', '100', 'Sale', 1, '2024-05-01', 'T1-DOC-1', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        let msg = refusal_message(err);
+        assert_eq!(
+            msg,
+            "UNIQUE constraint failed: party_ledger_entries.document_kind, \
+             party_ledger_entries.document_id, party_ledger_entries.kind",
+            "observed verbatim: SQLite names the COLUMNS, not the partial index"
+        );
+        // Not written: the guard protects the single instance, so the table
+        // still holds exactly one row and the balance is the first Charge's.
+        assert_eq!(r.count().await.unwrap(), 1);
+        assert_eq!(
+            r.balance_for_party(PartyType::Customer, 1).await.unwrap(),
+            dec("100")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_cancel_for_one_document_is_refused_too() {
+        let pool = test_pool().await;
+        let r = repo(&pool);
+
+        // A cancel of its own document (decision 3: every kind is written
+        // against the parent). The first Cancel lands; the second is a
+        // duplicated cancellation, not a second legitimate one.
+        r.insert(&entry(2, PartyEntryKind::Cancel, "10", 5))
+            .await
+            .unwrap();
+        let err = sqlx::query(
+            "INSERT INTO party_ledger_entries (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) VALUES ('Customer', 2, 'Cancel', '10', 'Sale', 5, '2024-05-01', 'T1-DOC-5', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert!(
+            refusal_message(err).contains("UNIQUE constraint failed"),
+            "a duplicated Cancel is the same idempotency break a duplicated Charge is"
+        );
+        assert_eq!(r.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_charges_for_two_different_documents_are_allowed() {
+        let pool = test_pool().await;
+        let r = repo(&pool);
+
+        r.insert(&entry(3, PartyEntryKind::Charge, "100", 1))
+            .await
+            .unwrap();
+        r.insert(&entry(3, PartyEntryKind::Charge, "40", 2))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.balance_for_party(PartyType::Customer, 3).await.unwrap(),
+            dec("140"),
+            "the guard is per document, not per party"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_payments_for_the_same_document_are_allowed() {
+        let pool = test_pool().await;
+        let r = repo(&pool);
+
+        // Several payments of one document settle it progressively — the
+        // reason Payment and Refund stay OUTSIDE the partial index (decision
+        // 11).
+        r.insert(&entry(4, PartyEntryKind::Payment, "100", 1))
+            .await
+            .unwrap();
+        r.insert(&entry(4, PartyEntryKind::Payment, "50", 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.balance_for_party(PartyType::Customer, 4).await.unwrap(),
+            dec("-150"),
+            "both payments folded; Payment is not single-instance"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_of_a_ledger_entry_is_refused_and_the_row_and_fold_are_unchanged() {
+        let pool = test_pool().await;
+        let r = repo(&pool);
+
+        r.insert(&entry(5, PartyEntryKind::Charge, "100", 1))
+            .await
+            .unwrap();
+        let err =
+            sqlx::query("UPDATE party_ledger_entries SET amount = '999' WHERE document_id = 1")
+                .execute(&pool)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "party ledger entries are append-only: an entry cannot be updated",
+            "the trigger's own refusal text"
+        );
+
+        // The attempted rewrite changed nothing — not the row, not the fold
+        // every balance reads.
+        let (amount,): (String,) = sqlx::query_as(
+            "SELECT amount FROM party_ledger_entries WHERE party_id = 5 AND document_id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(amount, "100", "the refused UPDATE stored its old value");
+        assert_eq!(
+            r.balance_for_party(PartyType::Customer, 5).await.unwrap(),
+            dec("100"),
+            "the fold still reads the original entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_of_ledger_entries_is_refused_and_the_row_count_is_unchanged() {
+        let pool = test_pool().await;
+        let r = repo(&pool);
+
+        r.insert(&entry(6, PartyEntryKind::Charge, "100", 1))
+            .await
+            .unwrap();
+        r.insert(&entry(6, PartyEntryKind::Payment, "40", 1))
+            .await
+            .unwrap();
+        let err = sqlx::query("DELETE FROM party_ledger_entries")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "party ledger entries are append-only: an entry cannot be deleted",
+            "the trigger's own refusal text"
+        );
+
+        // No entry left the journal, and the two attempts above (an UPDATE and
+        // a mass DELETE) must not have burned or moved even one of them.
+        assert_eq!(r.count().await.unwrap(), 2);
+        assert_eq!(
+            r.balance_for_party(PartyType::Customer, 6).await.unwrap(),
+            dec("60")
         );
     }
 }
