@@ -99,14 +99,19 @@ smoke + el test e2e. Rama `fix/filter-honest-product-mutations`. Commit por
 unidad de trabajo; push y PR son decisión del usuario.
 
 ## Acceptance criteria
-- [ ] Ninguna respuesta de mutación renderiza una lista que ignora el filtro
+- [x] Ninguna respuesta de mutación renderiza una lista que ignora el filtro
       que su caller está mirando
-- [ ] El comportamiento create-bajo-filtro está decidido (opción A) y pineado
+      Closed 2026-10-02 **against the tree**: `grep all_product_stocks` returns 0 in `src/`; the filtered renders are at `src/routes/inventory_web.rs:2009,2144,2303,2335` and the `hx-include` at `templates/products.html:146`, `templates/partials/product_detail.html:321,335,372`.
+- [x] El comportamiento create-bajo-filtro está decidido (opción A) y pineado
       por test
-- [ ] Los tests fallan si se saca el filtrado (no-vacuosos)
-- [ ] `cargo test` full en verde, `cargo check --all-targets` limpio
-- [ ] `scripts/e2e.sh -k products` verde, y el flujo create-bajo-filtro cubierto
+      Closed 2026-10-02 **against the tree**: option A pinned at `src/routes/inventory_web.rs:2016-2024`, `templates/partials/notice.html:26` and `templates/base.html:322`, with tests at `src/smoke_tests.rs:6267,6374` and `e2e/tests/test_products.py:231`.
+- [x] Los tests fallan si se saca el filtrado (no-vacuosos)
+      Closed 2026-10-02 **against the tree**: `src/smoke_tests.rs:6223-6230,6247-6254` assert the row is present, the other row absent, plus the unfiltered direction.
+- [x] `cargo test` full en verde, `cargo check --all-targets` limpio
+      Closed 2026-10-02 **against the tree**: CI `checks` success on HEAD `d876e2e` (parent-verified); `cargo check --all-targets` exits 0 with 0 errors and 75 warnings, the documented baseline.
+- [x] `scripts/e2e.sh -k products` verde, y el flujo create-bajo-filtro cubierto
       en navegador real
+      Closed 2026-10-02 **against the tree**: CI browser job success on HEAD `d876e2e`; `e2e/tests/test_products.py:231` drives the flow and `:296-299` clicks `Clear filter`.
 
 ## Applicable checks
 - `cargo test` (full), `cargo check --all-targets`

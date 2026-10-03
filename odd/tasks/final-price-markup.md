@@ -64,14 +64,16 @@ Two bounded delegated-direct ODD work units. U1 is the arithmetic and is deliber
 
 ## Work units
 
-- [ ] U1 — The pure solve, with typed refusals and a verified round trip.
+- [x] U1 — The pure solve, with typed refusals and a verified round trip.
+      Closed 2026-10-02 **against the tree**: `src/services/final_price.rs:268` `solve_final_price` and `:181` `max_solvable_final_price`, with 30 `#[test]` cases including the `naive_division` helper at `:521`.
   - Tests first, observed RED, including the cases where division alone misses.
   - Solve the net from a target final price across zero, one and several additive taxes.
   - Solve the markup from that net, then verify the round trip through the real deriver and refine precision within a bound.
   - Cover unreachable targets, zero cost with and without an existing markup, and the tie-break rule.
   - Evidence: RED/GREEN, exact commands, the brute-force cross-check, commit identity.
 
-- [ ] U2 — The ladder control and the conversion write.
+- [x] U2 — The ladder control and the conversion write.
+      Closed 2026-10-02 **against the tree**: `src/routes/inventory_web.rs:1121` (GET preview), `:1176` (POST confirm) and `:1390` (`CONFIRM_SLOT`); control at `templates/partials/product_detail.html:215-236` and `templates/product_final_price_confirm.html:23`; browser tests `e2e/tests/test_products.py:1555,1688,1755`.
   - One route, gated `InventoryWrite`, preview that never persists and a write that rewrites net and markup together.
   - The control in the ladder, the truthful post-conversion display, and the localized copy for every refusal.
   - A Playwright test that types a final price and reads the resulting ladder figures.

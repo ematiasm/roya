@@ -53,18 +53,25 @@ Rediseño visual + camino de edición de producto + superficie de costos por
 proveedor desde el producto. Sin cambios de reglas de negocio.
 
 ## Acceptance criteria
-- [ ] Alta de categoría y de producto por botón + modal; sin cards permanentes
+- [x] Alta de categoría y de producto por botón + modal; sin cards permanentes
       "New Category" / "New Product" ni card REST API.
-- [ ] Click en un producto abre el drawer derecho con stock derivado, badges y
+      Closed 2026-10-02 **against the tree**: `templates/products.html:23-24,108,138` with `e2e/tests/test_products.py:186-189`.
+- [x] Click en un producto abre el drawer derecho con stock derivado, badges y
       el form editable completo; guardar refresca el drawer y la lista.
-- [ ] El drawer lista los costos por proveedor (costo actual, previo, alerta de
+      Closed 2026-10-02 **against the tree**: `templates/partials/product_list.html:15` and `product_detail.html:38,75-79`; `e2e/tests/test_products.py:481,513` cover the save refresh.
+- [x] El drawer lista los costos por proveedor (costo actual, previo, alerta de
       precio, preferido) y permite registrar/actualizar un costo y marcar
       preferido.
-- [ ] El movimiento de stock se registra desde el drawer con el producto fijo.
-- [ ] `PUT /api/products/{id}` con semántica patch (`None` = sin cambio,
+      Closed 2026-10-02 **against the tree**: `templates/partials/product_detail.html:311-325,332-360` show current/previous/alert/preferred; `e2e/tests/test_products.py:948`.
+- [x] El movimiento de stock se registra desde el drawer con el producto fijo.
+      Closed 2026-10-02 **against the tree**: `product_detail.html:369-376` posts a hidden `product_id` to `/web/stock-movements`; `e2e/tests/test_products.py:1157`.
+- [x] `PUT /api/products/{id}` con semántica patch (`None` = sin cambio,
       `Some(None)` = limpiar).
-- [ ] `cargo test` verde y `cargo check --all-targets` sin errores.
-- [ ] `scripts/e2e.sh -k products` verde.
+      Closed 2026-10-02 **against the tree**: `src/routes/inventory_api.rs:596` with `double_option` at `:97-134`, plus null-clears and absent-keys-survive tests at `:1188,1225`.
+- [x] `cargo test` verde y `cargo check --all-targets` sin errores.
+      Closed 2026-10-02 **against the tree**: CI `checks` success on HEAD `d876e2e`; `cargo check --all-targets` exits 0 with 0 errors and 75 warnings.
+- [x] `scripts/e2e.sh -k products` verde.
+      Closed 2026-10-02 **against the tree**: CI browser job success on HEAD `d876e2e`; the full `scripts/e2e.sh` is a superset of `-k products`.
 
 ## Applicable checks
 - `cargo test` (runner del repo), `cargo check --all-targets`
