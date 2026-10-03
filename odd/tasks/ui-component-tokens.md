@@ -237,7 +237,7 @@ would record whatever the refactor produced and prove nothing.
       A latent weakness fell out: `contains("bg-accent")` also matches
       `bg-accent2`, so the smoke guard could never have caught the blue
       regression it named.
-- [ ] T2c — **Close the net's page gap.** Not a refactor task: a verification task
+- [x] T2c — **Close the net's page gap.** Not a refactor task: a verification task
       that must land before the base rules can go. The net covers nine pages plus
       the two drawers and the two record pages, and it does **not** cover `/login`,
       `/password`, `/forbidden`, or any state where a notice box renders. The five
@@ -250,6 +250,13 @@ would record whatever the refactor produced and prove nothing.
       Add the missing pages and the notice state, capture their fingerprints from
       the current tree (the rendering is correct today), and only then is the base
       removal provable.
+      Closed 2026-10-02 **against the tree**: `_STATE_NAMES` in
+      `e2e/tests/test_visual_baseline.py` holds `login`, `login-error`,
+      `password-error`, `forbidden`, `purchase-record-notice` and
+      `purchase-record-merge`; `_FIRST_RUN_PAGES` holds `setup`; and the page
+      list holds `password`. Every surface those five dismiss buttons live on is
+      fingerprinted now, and the Outcome below counts three notice states among
+      the 3,609 elements.
 - [x] T6 — **Remove the `@layer base` element rules.** Closed in `0c3491e`, plus
       the guard fix and the six rationale comments in `8dd5e33`. Four of the six
       base rules are gone; `body` and `dialog` stay. The eleven
@@ -263,14 +270,29 @@ would record whatever the refactor produced and prove nothing.
       anchors, zero of them blue** — before this refactor. The comment described
       a mechanism with no effect. Both are gone; `text-text` stays because it
       still pins real markup and the row's colour is now asserted by the net.
-- [ ] T3 — **The chip component.** `.chip` plus its four variants, 37
-      occurrences.
-- [ ] T4 — **The boxes.** `.notice` (all three copies), `.notice-success`,
-      `.notice-error`, `.empty`, `.card`.
-- [ ] T5 — **The form controls.** `label` → `.field-label`, `input` → `.field`,
+- [x] T3 — **The chip component.** `.chip` plus its four variants, 37
+      occurrences. Closed 2026-10-02 **against the tree**: `.chip`, `.chip-income`,
+      `.chip-expense`, `.chip-warning` and `.chip-muted` are in
+      `assets/tailwind.css`, the component appears 67 times across
+      `templates/`, and the 37-occurrence string it replaces greps **zero**
+      times.
+- [x] T4 — **The boxes.** `.notice` (all three copies), `.notice-success`,
+      `.notice-error`, `.empty`, `.card`. Closed 2026-10-02 **against the
+      tree**: all six classes are in `assets/tailwind.css` (plus
+      `.notice-dismiss`), the three copies carry `class="notice notice-success"`
+      — `partials/notice.html`, `partials/purchase_merge_notice.html` — or build
+      it in JS (`base.html`'s `notice()`), and the only two files still naming
+      "keep the three copies in step" cite it as the **retired** instruction.
+- [x] T5 — **The form controls.** `label` → `.field-label`, `input` → `.field`,
       across the templates. Deliberately last: it is the widest mechanical change
       and the one most likely to hide a visual difference, so it happens with the
       net already in place and everything else stable.
+      Closed 2026-10-02 **against the tree**: `.field-label` appears 147 times
+      and `.field` 355 times across `templates/`, the `label` and `input` base
+      rules are gone (T6's own evidence carries this task's result — all 27
+      hidden inputs now carry `.field`), and the net fingerprints *computed*
+      styles, so a control that lost its class cannot pass it: the browser suite
+      is green in CI.
 
 ## Delivery strategy
 
@@ -288,6 +310,18 @@ last.
 - 2026-09-24: T1 closed in `97c04de`. The net is in place and proven by mutation
   before a single class was touched, which is the only order that works: a
   baseline captured after the refactor records the refactor and proves nothing.
+- 2026-10-02: T2c, T3, T4 and T5 ticked **from the tree, not from memory**. The
+  work had landed — the Outcome section below was written when it did — and only
+  the boxes had gone stale. That is the failure mode in reverse: an unchecked box
+  reads as pending work for as long as nobody looks at the code, and the
+  deliverable list is the first thing a future session trusts. Each box now
+  carries the evidence that closed it. One shape was deliberately *not* counted
+  as a gap: nine `<div>` alerts still hand-type `rounded-[10px] border
+  border-danger/30 bg-danger/12` (`sale_detail`, `purchase_detail`, both return
+  details, `customer_statement`, `customer_list`,
+  `settings_tax_delete_confirm`). They are divs, not controls, so no task's
+  acceptance criteria covers them — they are a future `.notice` variant, not
+  unfinished work.
 
 ## Lesson: a net dimension added after changes landed records those changes as correct
 
