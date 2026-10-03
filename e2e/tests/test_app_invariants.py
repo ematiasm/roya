@@ -33,6 +33,12 @@ What it asserts:
    shell, and every record page's dialog-opening action responds.
 6. Every page answers a success status. The DOM assertions above run against
    whatever a 4xx/5xx renders, so the status itself is asserted too.
+7. Every query-parameter state the shell renders as a link is a URL the sweep
+   already visits. The derivation reads template `href`s because that is the
+   declaration the app makes; this is the rendered shell second-guessing it,
+   because a state offered by JavaScript or built at runtime is a state the
+   derivation cannot see — and every sweep would happily pass against the
+   shorter list.
 
 **What it deliberately does not do.** It never mutates: no submit of a form
 that writes, no `hx-post`, no `hx-delete`. A net that changes the shop while it
@@ -53,7 +59,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from playwright.sync_api import Page, Response
 
@@ -364,6 +370,45 @@ def seed_the_shop(page: Page, api: ApiClient) -> dict[str, int]:
     }
 
 
+def _assert_every_template_source_was_listed() -> None:
+    """Every template file on disk must be one this module reads.
+
+    The mirror of `_assert_every_route_call_was_parsed`, for the criticism
+    that produced it: a threshold cannot tell a complete derivation from a
+    partial one, because a partial list still clears a floor. This module
+    would have kept sweeping while a `templates/<subdir>/` that neither glob
+    covers sat unread, taking its links — and the page states behind them —
+    out of the sweep at any count, 74 or 700.
+
+    So the same fact is measured twice, and neither measurement can hide
+    behind a number chosen by hand: `_TEMPLATE_SOURCES` is what this module
+    believes about where templates live, and a recursive walk of
+    `TEMPLATES_DIR` is where templates actually are. A file only one of the
+    two knows about is reported by name, in both directions.
+    """
+    assert _TEMPLATE_SOURCES, (
+        f"no template matched under {TEMPLATES_DIR}; the glob stopped finding "
+        "them, so the page states derived from the links they render are no "
+        "longer being swept"
+    )
+    present = set(TEMPLATES_DIR.rglob("*.html"))
+    listed = set(_TEMPLATE_SOURCES)
+    problems = [
+        f"{path.relative_to(TEMPLATES_DIR).as_posix()} exists but is listed "
+        "by no glob, so its links are never read"
+        for path in sorted(present - listed)
+    ]
+    problems += [
+        f"{path.relative_to(TEMPLATES_DIR).as_posix()} is listed but no "
+        "longer exists"
+        for path in sorted(listed - present)
+    ]
+    assert not problems, _format_offenders(
+        "the templates this module reads are not the templates that exist:",
+        problems,
+    )
+
+
 def _linked_page_states(routes: set[str]) -> list[str]:
     """Every `<registered route>?<query>` a template links to, in file order.
 
@@ -371,16 +416,13 @@ def _linked_page_states(routes: set[str]) -> list[str]:
     swept tomorrow and one renamed by hand cannot leave the sweep quietly.
 
     Two guards, because a derivation that returns nothing is worse than no
-    derivation at all: the templates must still be found, and the result must
-    not be empty. The second one is deliberate friction — if the app genuinely
-    stops offering a query-parameter state, this is where that is said out
-    loud instead of the coverage shrinking on its own.
+    derivation at all: every template file must be one this module reads (the
+    count of them is measured against a recursive walk, not against a floor),
+    and the result must not be empty. The second one is deliberate friction —
+    if the app genuinely stops offering a query-parameter state, this is where
+    that is said out loud instead of the coverage shrinking on its own.
     """
-    assert len(_TEMPLATE_SOURCES) >= 60, (
-        f"only {len(_TEMPLATE_SOURCES)} template(s) under {TEMPLATES_DIR}; the "
-        "glob stopped finding them, so the page states derived from the links "
-        "they render are no longer being swept"
-    )
+    _assert_every_template_source_was_listed()
     states: list[str] = []
     for source in _TEMPLATE_SOURCES:
         text = source.read_text(encoding="utf-8")
@@ -1043,4 +1085,97 @@ def test_every_page_answers_a_success_status(page: Page, api: ApiClient) -> None
     assert not offenders, _format_offenders(
         f"{len(offenders)} page(s) answered without a success status:",
         offenders,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. Every query state the shell renders is a state the sweep visits
+# ---------------------------------------------------------------------------
+
+
+def test_every_query_state_the_shell_renders_is_swept(
+    page: Page, api: ApiClient
+) -> None:
+    """The derivation reads template `href`s; this reads what the shell renders.
+
+    `_linked_page_states` derives a state from an `href` a template declares,
+    and that is the design — a hand-written list is what this module exists to
+    avoid. The limit that comes with it is that a state offered only by
+    JavaScript, or assembled at runtime, is never derived and so never swept,
+    while every assertion above keeps passing against the shorter list.
+
+    So the rendered shell is the second, independent reading: every
+    same-origin anchor carrying a query string must be a URL the sweep already
+    visits, and its path must name a registered page route — the derivation
+    drops a path it does not know (`if path not in routes`) without a word,
+    which is this same gap seen from the other side.
+
+    Both failures are a decision rather than a typo to patch: make the link a
+    template `href` the derivation reads, or extend `_linked_page_states` on
+    purpose. A state no page renders during a visit — one behind an
+    interaction, or one typed into the address bar — stays outside both
+    signals; this closes what the shell *offers*, not what it can be talked
+    into.
+    """
+    context = seed_the_shop(page, api)
+    routes = sweepable_routes(context)
+    swept = {concrete for _, concrete in routes}
+    # A rendered href is concrete (`/sales/3?tab=x`) where the sweep's own
+    # label is a template (`/sales/{id}`), so the path is matched against what
+    # the sweep really visits and the template behind it is recovered for the
+    # message. Query states are excluded here: their path belongs to the route
+    # pair, which is already in the map.
+    owner_of_path = {
+        urlsplit(concrete).path: template
+        for template, concrete in routes
+        if "?" not in concrete
+    }
+    same_origin = urlsplit(api.base_url).netloc
+
+    offenders: dict[str, str] = {}
+    links_seen = 0
+    for template, path in routes:
+        _visit(page, api.base_url, path)
+        for anchor in page.evaluate(_ANCHOR_HREFS_PROBE):
+            href = anchor["href"]
+            if not href or href.startswith("#"):
+                continue
+            target = urlsplit(urljoin(page.url, href))
+            if not target.query or not target.path.startswith("/"):
+                continue
+            if target.netloc and target.netloc != same_origin:
+                continue
+            if target.path.startswith((_FRAGMENT_PREFIX, _API_PREFIX)):
+                continue
+            links_seen += 1
+            state = f"{target.path}?{target.query}"
+            if state in swept:
+                continue
+            # One line per state, not one per page that renders it: fifteen
+            # copies of the same href say no more than the first.
+            offenders.setdefault(
+                state,
+                f"{template} ({path}) renders <a href={href!r}>: {state}",
+            )
+
+    assert links_seen > 0, (
+        "no anchor on any swept page carried a query string, so this checked "
+        "nothing. Either the app stopped offering query-parameter states — in "
+        "which case remove this expectation deliberately — or the probe or "
+        "the prefix filters stopped reading the shell"
+    )
+    details: dict[str, str] = {}
+    for state, where in offenders.items():
+        owner = owner_of_path.get(urlsplit(state).path)
+        details[state] = (
+            f"{where} names no registered page route, and the derivation drops "
+            "such a path without a word — this link is offered and never swept"
+            if owner is None
+            else f"{where} is a state of {owner} the sweep never visits: make "
+            "it a template href the derivation reads, or extend "
+            "_linked_page_states deliberately"
+        )
+    assert not details, _format_offenders(
+        f"{len(details)} query state(s) the shell renders are not swept:",
+        [f"{state}: {reason}" for state, reason in sorted(details.items())],
     )
