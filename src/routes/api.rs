@@ -1173,13 +1173,36 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
+        // Migration 44 guards the (account, method) pair on the payment row,
+        // so the fixture pairs the money's account with a method it OWNS (the
+        // seeded methods are unassigned on a fresh database).
+        let method_id: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'fixture cash' AND account_id = ?",
+        )
+        .bind(acc)
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by) \
+                 VALUES ('fixture cash', ?, ?) RETURNING id",
+            )
+            .bind(acc)
+            .bind(test_support::audit_actor_id(&pool).await.unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        };
         sqlx::query(
             "INSERT INTO sale_payments \
              (sale_id, account_id, method_id, amount, date, transaction_id, created_by) \
-             VALUES (?, ?, 1, '12.50', '2024-01-15', ?, ?)",
+             VALUES (?, ?, ?, '12.50', '2024-01-15', ?, ?)",
         )
         .bind(sale_id.0)
         .bind(acc)
+        .bind(method_id)
         .bind(tx_id)
         .bind(test_support::audit_actor_id(&pool).await.unwrap())
         .execute(&pool)

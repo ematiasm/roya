@@ -286,6 +286,124 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
 
+    // -- migration 44: the (account_id, method_id) pair on a receipt is guarded
+    // by the schema. The refusals are proved with the raw statement and the
+    // trigger's own text; the full battery lives on sale_payments.
+
+    fn refusal_message(err: sqlx::Error) -> String {
+        match err {
+            sqlx::Error::Database(db) => db.message().to_string(),
+            other => panic!("expected a refused statement, got {other:?}"),
+        }
+    }
+
+    async fn owned_pair(pool: &SqlitePool, name: &str) -> (i64, i64) {
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        let method_name = format!("{name} cash");
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = ? AND account_id = ?",
+        )
+        .bind(&method_name)
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by) VALUES (?, ?, ?) RETURNING id",
+            )
+            .bind(&method_name)
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        (account, method)
+    }
+
+    async fn walkin_customer_id(pool: &SqlitePool) -> i64 {
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn a_receipt_pairing_an_account_with_a_foreign_method_is_refused() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let customer = walkin_customer_id(&pool).await;
+        let (account, _method) = owned_pair(&pool, "wallet one").await;
+        let (_, foreign_method) = owned_pair(&pool, "wallet two").await;
+        let err = sqlx::query(
+            "INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes, created_by)\n             VALUES (?, ?, ?, '2024-06-01', NULL, ?)",
+        )
+        .bind(customer)
+        .bind(account)
+        .bind(foreign_method)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "the payment method does not belong to the named account"
+        );
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customer_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "the refused row is not there");
+    }
+
+    #[tokio::test]
+    async fn a_receipt_with_a_consistent_pair_still_inserts() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let customer = walkin_customer_id(&pool).await;
+        let (account, method) = owned_pair(&pool, "wallet one").await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes, created_by)\n             VALUES (?, ?, ?, '2024-06-01', NULL, ?) RETURNING id",
+        )
+        .bind(customer)
+        .bind(account)
+        .bind(method)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (stored_account, stored_method): (i64, i64) =
+            sqlx::query_as("SELECT account_id, method_id FROM customer_receipts WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (stored_account, stored_method),
+            (account, method),
+            "the consistent pair was written"
+        );
+    }
+
     async fn memory_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
@@ -329,11 +447,16 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        let (method_id,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        // Migration 44 guards the (account, method) pair, so the method must be
+        // one THIS account owns (the seeded methods are unassigned here).
+        let (method_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO payment_methods (name, account_id, created_by) VALUES ('Caja cash', ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(test_support::audit_actor_id(&pool).await.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let err = repo
@@ -410,11 +533,27 @@ mod tests {
                 .await
                 .unwrap(),
             };
-        let (method,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        // Migration 44 guards the (account, method) pair on the receipt row,
+        // so the fixture needs a method THIS wallet owns (the seeded methods
+        // are unassigned on a fresh database).
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'doc wallet cash' AND account_id = ?",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by)\n                 VALUES ('doc wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
         (account, method)
     }
 

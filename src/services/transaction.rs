@@ -514,6 +514,35 @@ mod tests {
         NaiveDate::from_ymd_opt(2024, 5, 1).unwrap()
     }
 
+    /// A method the named account OWNS: migration 44 guards the (account_id,
+    /// method_id) pair on the payment row, and the seeded methods are
+    /// unassigned on a fresh database.
+    async fn owned_method(pool: &sqlx::SqlitePool, account_id: i64) -> i64 {
+        match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'wallet cash' AND account_id = ?",
+        )
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by) \
+                 VALUES ('wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account_id)
+            .bind(
+                crate::security::test_support::audit_actor_id(pool)
+                    .await
+                    .unwrap(),
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        }
+    }
+
     /// Raw fixture: link a transaction to a synthetic sale payment. Finance
     /// tests stay domain-agnostic and never import sales/purchases types.
     /// `customer_id` is NOT NULL by design and resolves the seeded walk-in
@@ -529,13 +558,15 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let method = owned_method(pool, account_id).await;
         sqlx::query(
             "INSERT INTO sale_payments \
              (sale_id, account_id, method_id, amount, date, transaction_id, created_by) \
-             VALUES (?, ?, 1, '10', '2024-05-01', ?, ?)",
+             VALUES (?, ?, ?, '10', '2024-05-01', ?, ?)",
         )
         .bind(sale_id.0)
         .bind(account_id)
+        .bind(method)
         .bind(tx_id)
         .bind(
             crate::security::test_support::audit_actor_id(pool)
@@ -573,13 +604,15 @@ mod tests {
         .fetch_one(pool)
         .await
         .unwrap();
+        let method = owned_method(pool, account_id).await;
         sqlx::query(
             "INSERT INTO purchase_payments \
              (purchase_id, account_id, method_id, amount, date, transaction_id, created_by) \
-             VALUES (?, ?, 1, '20', '2024-05-01', ?, ?)",
+             VALUES (?, ?, ?, '20', '2024-05-01', ?, ?)",
         )
         .bind(purchase_id.0)
         .bind(account_id)
+        .bind(method)
         .bind(tx_id)
         .bind(
             crate::security::test_support::audit_actor_id(pool)

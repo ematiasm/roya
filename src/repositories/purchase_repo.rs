@@ -1395,6 +1395,118 @@ mod tests {
     use std::str::FromStr;
     use std::time::{Duration, Instant};
 
+    // -- migration 44: the (account_id, method_id) pair on a purchase payment
+    // is guarded by the schema. The refusals are proved with the raw statement
+    // and the trigger's own text; the full battery lives on sale_payments.
+
+    fn refusal_message(err: sqlx::Error) -> String {
+        match err {
+            sqlx::Error::Database(db) => db.message().to_string(),
+            other => panic!("expected a refused statement, got {other:?}"),
+        }
+    }
+
+    async fn owned_pair(pool: &SqlitePool, name: &str) -> (i64, i64) {
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        let method_name = format!("{name} cash");
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = ? AND account_id = ?",
+        )
+        .bind(&method_name)
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by) VALUES (?, ?, ?) RETURNING id",
+            )
+            .bind(&method_name)
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        (account, method)
+    }
+
+    #[tokio::test]
+    async fn a_purchase_payment_pairing_an_account_with_a_foreign_method_is_refused() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let purchase = seed_purchase(&pool, None, "guard supplier", d(2024, 6, 1), actor).await;
+        let (account, _method) = owned_pair(&pool, "wallet one").await;
+        let (_, foreign_method) = owned_pair(&pool, "wallet two").await;
+        let err = sqlx::query(
+            "INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?)",
+        )
+        .bind(purchase)
+        .bind(account)
+        .bind(foreign_method)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "the payment method does not belong to the named account"
+        );
+        let (rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM purchase_payments WHERE purchase_id = ?")
+                .bind(purchase)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "the refused row is not there");
+    }
+
+    #[tokio::test]
+    async fn a_purchase_payment_with_a_consistent_pair_still_inserts() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let purchase = seed_purchase(&pool, None, "guard supplier", d(2024, 6, 1), actor).await;
+        let (account, method) = owned_pair(&pool, "wallet one").await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?) RETURNING id",
+        )
+        .bind(purchase)
+        .bind(account)
+        .bind(method)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (stored_account, stored_method): (i64, i64) =
+            sqlx::query_as("SELECT account_id, method_id FROM purchase_payments WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (stored_account, stored_method),
+            (account, method),
+            "the consistent pair was written"
+        );
+    }
+
     async fn memory_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
@@ -1524,11 +1636,27 @@ mod tests {
                 .await
                 .unwrap(),
             };
-        let (method,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        // Migration 44 guards the (account, method) pair on the payment row,
+        // so the fixture needs a method THIS wallet owns (the seeded methods
+        // are unassigned on a fresh database).
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'doc wallet cash' AND account_id = ?",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by)\n                 VALUES ('doc wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
         (account, method)
     }
 

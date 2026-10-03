@@ -1105,11 +1105,28 @@ mod tests {
             .unwrap()
     }
 
-    async fn cash_method(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar("SELECT id FROM payment_methods WHERE name = 'Cash'")
+    /// A method the named account OWNS. Migration 44 guards the
+    /// (account_id, method_id) pair on the payment row, and the seeded methods
+    /// are unassigned on a fresh database, so the fixture builds the pair.
+    async fn owned_method(pool: &SqlitePool, account: i64) -> i64 {
+        match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'wallet cash' AND account_id = ?",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by)\n                 VALUES ('wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account)
+            .bind(actor(pool).await)
             .fetch_one(pool)
             .await
-            .unwrap()
+            .unwrap(),
+        }
     }
 
     /// One CONFIRMED purchase carrying one line, seeded through raw SQL because
@@ -1169,9 +1186,9 @@ mod tests {
     /// not a shape the real document path ever produces.
     async fn collect(pool: &SqlitePool, purchase_id: i64, number: &str, amounts: &[(&str, &str)]) {
         let who = actor(pool).await;
-        let method = cash_method(pool).await;
         for (account_name, amount) in amounts {
             let account = seed_account(pool, account_name).await;
+            let method = owned_method(pool, account).await;
             let tx: i64 = sqlx::query_scalar(
                 r#"INSERT INTO transactions (account_id, kind, amount, description, reference, date, created_by)
                    VALUES (?, 'Expense', ?, 'paid the supplier', ?, ?, ?) RETURNING id"#,
@@ -1430,6 +1447,72 @@ mod tests {
             PurchaseReturnStatus::Confirmed
         );
         assert_eq!(pret_sequence_last(&pool).await, Some(1));
+    }
+
+    /// The refund-table EXEMPTION from migration 44, proved end to end: a
+    /// refund does not CHOOSE a pair, it REPLAYS the parent payment's pair
+    /// (`RefundPlan` copies pay.account_id / pay.method_id). After the method
+    /// is re-pointed to ANOTHER account, the return still confirms and the
+    /// money comes back out of the box it went into — the method's current
+    /// owner never receives it.
+    #[tokio::test]
+    async fn a_refund_replays_the_parent_payments_account_even_after_the_method_is_repointed() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "HISTORY",
+            "History Supplier",
+            "3",
+            "4",
+            &[("history wallet", "12")],
+            "3",
+        )
+        .await;
+        let who = actor(&pool).await;
+        // Re-point the collected method to another account: from here on the
+        // method's current owner is NOT the box the money went into.
+        sqlx::query("INSERT INTO accounts (name, created_by) VALUES ('other box', ?) RETURNING id")
+            .bind(who)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE payment_methods SET account_id = (SELECT id FROM accounts WHERE name = 'other box') WHERE name = 'wallet cash'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        s.confirm(who, p.return_id).await.unwrap();
+
+        // The refund row keeps the PARENT payment's account — the historical
+        // fact of where the money landed.
+        let (wallet_account,): (i64,) =
+            sqlx::query_as("SELECT id FROM accounts WHERE name = 'history wallet'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let (refund_account,): (i64,) =
+            sqlx::query_as("SELECT account_id FROM purchase_return_payments WHERE return_id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            refund_account, wallet_account,
+            "the money goes back out of the box it went into"
+        );
+        // The refund's own finance row lands in that same historical account.
+        let (income_account,): (i64,) =
+            sqlx::query_as("SELECT account_id FROM transactions WHERE kind = 'Income'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            income_account, wallet_account,
+            "the refund Income is stamped with the historical account"
+        );
     }
 
     /// A return is a document about a document that EXISTS. A Draft parent has

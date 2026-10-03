@@ -552,6 +552,15 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
             > "2000-01-01T00:00:00.000Z"
     );
 
+    // The payment steps below pair `method` with `account`, and migration 44
+    // guards that pair on the payment row: an UNASSIGNED method names no
+    // account, so the fixture gives the payments a freshly created method the
+    // account owns, leaving the unassignment asserted above standing.
+    let payment_method = method_repo
+        .create_in_account(actor, "T1 Payment Method", account.id)
+        .await
+        .unwrap();
+
     let transaction_repo = SqliteTransactionRepository::new(pool.clone());
     let mut transaction = transaction_repo
         .create(
@@ -632,7 +641,7 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
             actor,
             sale_id,
             account.id,
-            method.id,
+            payment_method.id,
             Decimal::from(5),
             date,
             None,
@@ -669,7 +678,7 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
             actor,
             purchase_id,
             account.id,
-            method.id,
+            payment_method.id,
             Decimal::from(5),
             date,
             None,
