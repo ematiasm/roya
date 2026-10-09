@@ -2,7 +2,10 @@
 
 ## Status
 
-**In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5, P6, P7 and P8 remain.**
+**In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5a, P5b, P6, P7 and P8 remain.**
+**P5 was re-scoped to P5a + P5b on 2026-10-09, before any code was written**: the
+journal entries do not close `balance == Σ residuals + unapplied`, so the reads cannot
+move first. Evidence and the open decision are in "P5 blocker".
 Branch `feat/party-ledger`, all pushed, at `733acc9`. **Tracker PR open as DRAFT, no merge:
 [#150](https://github.com/ematiasm/roya/pull/150)**, on issue
 [#149](https://github.com/ematiasm/roya/issues/149). Do NOT merge before P8: merging with
@@ -441,15 +444,29 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   POOL, so calling it inside a unit waits for the connection the caller already holds
   and answers `PoolTimedOut` on the `max_connections(1)` fixtures. It is a pre-check and
   it moved up with the others, before the unit opens.
-- [ ] **P5 — Reads move to the per-document residual.** `customer_balance`,
+- [ ] **P5a — The journal entries close the identity.** P5b is a READ change only if
+  the journal already says the truth, and it does not: three holes are measured
+  below. In scope: a refund that takes money back OUT of a customer must stop
+  adding to what that customer owes; an annulment must leave the party's balance
+  where the business already believes it is; and an applied credit must be visible
+  to the journal, or the identity `balance == Σ residuals + unapplied` can never
+  hold. Also in scope: `unapplied_for_party` (`Σ unapplied` over `direction='In'`
+  deliveries only — see hole 4). This task writes ledger entries and no reads.
+- [ ] **P5b — Reads move to the per-document residual.** `customer_balance`,
   `ageing_of`/`customer_ageing`/`ageing_all`, the `ENFORCE_CREDIT_LIMIT`
   projection, the `suppliers_web.rs:428` drawer fold, `outstanding_payables`,
   `customer_statement`: residual = `charge + returns of that document − Σ
   allocations to it`, unapplied credit from the payment documents. The document
-  folds are **deleted**, not left dormant. Tests: a returned credit sale lowers
-  balance, ageing and frees the credit limit; a payment applied to the oldest
-  invoice ages on the oldest invoice and is not moved by a later credit; the
-  supplier drawer reflects a confirmed return.
+  folds are **deleted**, not left dormant, and the legacy dual-write stops with
+  them (the writes are named in hole 1): a read that no longer asks for
+  `sale_payments` is what finally retires it. One fold cannot be deleted without a
+  replacement: `payment_repo.rs:270` `target_residual_due` recomputes the
+  document's own total for the allocation cap, and P5b re-bases it on the same
+  residual the reads use instead of keeping a second copy of a total. Tests: a
+  returned credit sale lowers balance, ageing and frees the credit limit; a payment
+  applied to the oldest invoice ages on the oldest invoice and is not moved by a
+  later credit; the supplier drawer reflects a confirmed return; and the identity
+  `balance == Σ residuals + unapplied` holds on the three worked examples of P5a.
 - [ ] **P6 — UI.** Collect/pay screen: pick the party, the amount, the method, and
   the documents with their amounts (oldest-first prefilled, editable); the
   unapplied remainder shown as available credit; an explicit "apply credit"
@@ -468,6 +485,68 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   edit to already-approved code, not an optional cleanup. Tests: the ledger
   backfill still reproduces balances from the new tables, and the dropped tables
   are gone from `sqlite_master`.
+
+## P5 blocker — the journal entries do not close the identity (measured 2026-10-09)
+
+P5 was declared a read change because "the ledger is already written by every path".
+The ledger is written by every path, but what it writes does not close the identity
+`balance == Σ residuals + unapplied`, which is this document's own acceptance
+criterion and the reason the reads can move at all. Four holes, each with its
+evidence. They are the reason P5 is P5a + P5b and not one read slice.
+
+1. **The legacy dual-write is still LIVE in production code, and P5b is what turns it
+   off.** `create_payment_in` (`src/repositories/sale_repo.rs:1250`) is production
+   code — `mod tests` starts at `:1574` — and it is still called from the cash leg of
+   `confirm` (`src/services/sales.rs:1556`), from `link_delivery_payment_in`
+   (`:1611`, which is the path `record_payment` and the receipt collection both
+   take), from `src/services/purchases.rs:1441` and `:1614`, and from the two cancel
+   paths at `src/services/sales.rs:1751`. The call sites say so: "The legacy row,
+   until P5 moves the reads". `paid_and_due` (`src/services/sales.rs:300`) folds THOSE
+   rows, which is why the old reads still answer correctly today and will stop the
+   moment they are deleted. Deleting the rows without moving these reads, or moving
+   the reads without deleting the rows, each leaves two homes for one fact.
+
+2. **The refund's sign is on the wrong side for a customer.** `signed_amount`
+   (`src/models.rs:3647`) is `Charge +`, `Payment −`, `Return −`, **`Refund +`**,
+   `Cancel −`. `payment_writer.rs:134-143` maps `direction='Out'` to `Refund`, and an
+   `Out` delivery is exactly a customer's refund: money that LEFT the business. So
+   every customer refund ADDS to what that customer owes. `Refund +` is correct for a
+   SUPPLIER (their refund is money coming back IN, `purchases.rs:1750`), and that is
+   the party the sign was written for; migrating the customer side onto `payments`
+   carries the inversion with it.
+
+   Measured against a test the tree already asserts: `k3_ac8_fully_paid_and_cancelled_sales_leave_the_balance`
+   (`src/services/sales.rs:5099`) confirms a 40 credit sale, collects 15, collects 25
+   and cancels, and asserts `customer_balance == 0`. The journal for that sequence
+   folds to `40 − 15 − 25 + 40 = +40`: a customer who paid in full and then had the
+   sale annulled would read as owing the whole thing, and ageing would age it.
+
+3. **`PartyEntryKind::Cancel` is written by no production path.** Its only writers are
+   the repository's own tests (`party_ledger_repo.rs:805,831,853,1443`). `cancel`
+   (`src/services/sales.rs:1785`) writes stock movements and refund deliveries and no
+   reversal of the `Charge` — which is precisely the entry the category exists for.
+   The cancel is what makes hole 2 bite the CASH case too: a cash sale's `confirm`
+   writes `Payment` for the full total, and its cancel writes `Refund +` for the same
+   total, so a cash sale that was annulled reads as a debt.
+
+4. **An applied credit is invisible to the journal.** Applying credit writes an
+   allocation and, by decision 5, no cash movement and no entry — correctly, since no
+   money moved. But `unapplied_for_party` as sketched is `Σ (payment.amount − allocated)`
+   over that party's deliveries, and an `Out` refund also carries `amount` with an
+   empty allocation vector, so its whole amount would count as available credit. That
+   read must be restricted to `direction='In'`. With that restriction the identity is
+   `balance == Σ residuals + unapplied`, and every applied credit satisfies it because
+   the residual falls by the same amount the unapplied does.
+
+**What this makes of the plan.** P5a is a journal task, not a read task, and it lands
+before P5b. The open design decision is the annulment's shape, and it is the user's
+because it is a business fact, not a wiring choice:
+
+| Shape | Balance after 30 owed / 30 collected / sale cancelled | Cost |
+|---|---|---|
+| `Cancel` as a compensating entry Reversing the `Charge` | 0 — what the tree already asserts | Needs the whole undoing history, refunds included. The `payments` table keeps it (`receipt_id`, both directions), whereas `refund_transaction_id` lived on the legacy rows |
+| Net-flow account, `Refund` signs negative | 0 | Simpler, but it erases the saldo a favor: a party's balance stops being "what they owe me" and becomes "net cash", which is the accounting claim decision 1 chose the `payments` family to make |
+| Leave the journal incomplete | +30 | The doc's own acceptance criterion fails and P5b cannot move `customer_balance` |
 
 ## Relationship to the party ledger
 
@@ -492,7 +571,8 @@ shape.
 | P2 | delegated writer | backfill + tests, same pattern as T1 |
 | P3 | delegated writer | 3 service paths + lifted refusals + tests |
 | P4 | delegated writer | mirrored supplier paths + tests |
-| P5 | delegated writer | 6 read sites across 4 files |
+| P5a | delegated writer | ledger entries + `unapplied_for_party` + tests |
+| P5b | delegated writer | 6 read sites across 4 files, plus the legacy dual-write |
 | P6 | delegated writer | route + template + JS + localization + e2e |
 | P7 | fresh verification worker | full suite + browser suite + real-binary flows |
 
@@ -554,6 +634,14 @@ decisions.
   with the history. (2) A fresh install must be able to collect money: a default
   `Caja` account with the seeded `Cash` method linked to it is seeded, tracked as T6
   of `odd/tasks/payment-method-single-account.md`.
+- 2026-10-09 — **P5 was re-scoped before any code was written: it is P5a (journal
+  entries) + P5b (reads).** Exploration for P5 measured that the ledger, though
+  written by every path, does not close `balance == Σ residuals + unapplied`: an `Out`
+  refund signs POSITIVE for a customer, no production path writes
+  `PartyEntryKind::Cancel`, an applied credit is deliberately invisible to the
+  journal, and the legacy payment rows are still written on purpose as the crutch the
+  old reads lean on. See "P5 blocker" for the evidence and the open decision. The
+  one-file-per-commit slices are untouched; nothing was implemented.
 
 ## Resume here
 
@@ -561,20 +649,23 @@ decisions.
    the ones a future agent will otherwise "improve" back into the old shape. Decision
    4 was REFINED (the cap has two homes; a payment's amount freezes once allocated)
    and the refinement is measured, not argued.
-2. **P5 is the next unit**: move the reads to the per-document residual
-   (`customer_balance`, `ageing_of`/`customer_ageing`/`ageing_all`, the
-   `ENFORCE_CREDIT_LIMIT` projection, `suppliers_web.rs` drawer fold,
-   `outstanding_payables`, `customer_statement`), with
-   `residual = charge + returns of that document − Σ allocations to it` and the
-   unapplied remainder as available credit. **It also needs `unapplied_for_party`** —
-   the per-party sum of its deliveries' unapplied amounts — which does not exist yet
-   and is what P6 needs to show the saldo a favor. The ledger is already written by
-   every path, so P5 is a READ change.
-3. **Expect three or four tests to fail on purpose when P5 lands, and they are not
+2. **P5 is the next unit, and it is TWO: P5a (the journal entries) then P5b (the
+   reads).** Read "P5 blocker" above before starting either: the ledger is written by
+   every path but does not close the identity the reads depend on, so P5b cannot land
+   first without moving `customer_balance` onto a fold that is wrong for refunds and
+   cancelled documents. `unapplied_for_party` — the per-party sum of its `In`
+   deliveries' unapplied amounts — does not exist yet and is what P6 needs to show the
+   saldo a favor; it belongs to P5a because the identity is what it completes.
+   The `In`-only restriction is not a detail: an `Out` refund carries its whole
+   amount as "unapplied" and would count as available credit.
+3. **Expect three or four tests to fail on purpose when P5b lands, and they are not
    regressions.** They were written as the reminder: the most visible is
-   `over_collection_becomes_the_customers_credit` asserting `customer_balance == 0`
-   with a comment saying P5 will make it `-1`. Read the assertion message before
-   "fixing" it.
+   `over_collection_becomes_the_customers_credit` (`src/services/customer_receipts.rs:1374`)
+   asserting `customer_balance == 0` with a comment saying P5 will make it `-1`, and
+   the same caveat in `src/routes/customers_api.rs:1147`. Read the assertion message
+   before "fixing" it. Conversely `k3_ac8_fully_paid_and_cancelled_sales_leave_the_balance`
+   (`src/services/sales.rs:5099`) already asserts the RIGHT answer for an annulled
+   document, so P5a must keep it green rather than relax it.
 4. **P8 is not a cleanup**: `backfill_party_ledger` (party-ledger T1, reviewed with its
    authority burned) READS the five legacy tables, so dropping them requires re-basing
    it onto `payments`/`payment_allocations` or the startup fails with "no such table".
