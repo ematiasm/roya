@@ -147,6 +147,7 @@ pub type CustomerReturnSvc = CustomerReturnService<
     SqliteStockMovementRepository,
     SqliteAccountRepository,
     SqliteTransactionRepository,
+    SqlitePartyLedgerRepository,
 >;
 
 pub type PurchasesSvc = PurchasesService<
@@ -515,6 +516,8 @@ impl AppState {
             SqliteSaleRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
+            // T2: the customer journal a confirmed credit note appends to.
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         // The documents index composes the four families' read paths; it holds
         // only reads, so wiring it never moves write ownership.

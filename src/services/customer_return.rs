@@ -64,7 +64,7 @@ struct RefundPlan {
 }
 
 #[derive(Clone)]
-pub struct CustomerReturnService<RR, DR, SR, C, P, B, S, A, T>
+pub struct CustomerReturnService<RR, DR, SR, C, P, B, S, A, T, PL>
 where
     RR: crate::repositories::CustomerReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -75,15 +75,21 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub returns: RR,
     pub sequences: DR,
     pub sales: SR,
     pub inventory: crate::services::InventoryService<C, P, B, S>,
     pub transactions: crate::services::TransactionService<A, T>,
+    /// The customer's signed journal (T2). A confirmed credit note appends the
+    /// `Return` that cancels the sale's `Charge`, in the SAME unit as the goods
+    /// movement. A refund's own entry is a different event on a different path
+    /// (T3b), which is why this field is used for the return and nothing else.
+    pub party_ledger: PL,
 }
 
-impl<RR, DR, SR, C, P, B, S, A, T> CustomerReturnService<RR, DR, SR, C, P, B, S, A, T>
+impl<RR, DR, SR, C, P, B, S, A, T, PL> CustomerReturnService<RR, DR, SR, C, P, B, S, A, T, PL>
 where
     RR: crate::repositories::CustomerReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -94,6 +100,7 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub fn new(
         returns: RR,
@@ -101,6 +108,7 @@ where
         sales: SR,
         inventory: crate::services::InventoryService<C, P, B, S>,
         transactions: crate::services::TransactionService<A, T>,
+        party_ledger: PL,
     ) -> Self {
         Self {
             returns,
@@ -108,6 +116,7 @@ where
             sales,
             inventory,
             transactions,
+            party_ledger,
         }
     }
 
@@ -658,7 +667,37 @@ where
                 .await?;
         }
 
-        // 5. The document exists from here.
+        // 5. The customer's journal, in the SAME unit as the goods movement (T2
+        // of odd/tasks/party-ledger.md). A credit note takes goods back, so it
+        // CANCELS part of what the sale charged: a `Return` of `−total`, which
+        // folds the customer's debt down by exactly the value of what they
+        // returned.
+        //
+        // No cash leg here, and that is the point of writing it separately from
+        // the refunds above: the goods came back whether or not money did — a
+        // parent that collected nothing legitimately produces a Return with no
+        // Refund — so the two events are two rows, and refunding is T3b's path.
+        //
+        // Written even when the refund plan is empty: the Return is about the
+        // GOODS, not about the money.
+        self.party_ledger
+            .insert_in(
+                &mut tx,
+                &crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Customer,
+                    party_id: sale.customer_id,
+                    kind: crate::models::PartyEntryKind::Return,
+                    amount: crate::models::PartyEntryKind::Return.signed_amount(total),
+                    document_kind: crate::models::PartyDocumentKind::CustomerReturn,
+                    document_id: return_id,
+                    entry_date: customer_return.return_date,
+                    reference: Some(credit_note_number.clone()),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        // 6. The document exists from here.
         let confirmed = self
             .returns
             .set_confirmed_in(&mut tx, return_id, actor, &credit_note_number)
@@ -910,6 +949,7 @@ mod tests {
         SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqliteProductRepository,
         SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
     };
+    use crate::repositories::{PartyLedgerRepository, SqlitePartyLedgerRepository};
     use crate::security::test_support;
     use crate::services::{InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -927,6 +967,7 @@ mod tests {
         SqliteStockMovementRepository,
         SqliteAccountRepository,
         SqliteTransactionRepository,
+        SqlitePartyLedgerRepository,
     >;
 
     /// `max_connections(1)` is LOAD-BEARING for every test in this module. While
@@ -972,6 +1013,7 @@ mod tests {
                 SqliteTransactionRepository::new(pool.clone()),
                 allow_balance,
             ),
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -2664,6 +2706,175 @@ mod tests {
     /// note therefore cannot touch the satellite even by accident of a
     /// mis-mapped field, and this test proves the table is untouched anyway —
     /// against a NON-EMPTY satellite, so it does not pass for the wrong reason.
+    // -- the party ledger (T2) ---------------------------------------------------
+
+    /// The journal rows this credit note wrote, as the sign rule stored them.
+    async fn ledger_rows(pool: &SqlitePool, document_id: i64) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT kind, amount FROM party_ledger_entries \
+             WHERE document_kind = 'CustomerReturn' AND document_id = ? ORDER BY id",
+        )
+        .bind(document_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// The customer's balance, through the ledger read.
+    async fn balance(pool: &SqlitePool, customer_id: i64) -> Decimal {
+        let repo = SqlitePartyLedgerRepository::new(pool.clone());
+        repo.balance_for_party(crate::models::PartyType::Customer, customer_id)
+            .await
+            .unwrap()
+    }
+
+    /// A credit note cancels part of what the sale charged: one `Return` of
+    /// `−total`, which folds the customer's debt down by what came back.
+    #[tokio::test]
+    async fn a_confirmed_credit_note_appends_one_return_that_reduces_the_debt() {
+        let (s, pool) = svc().await;
+        // Three units at 4 is 12, and the whole 12 was collected, so the refund
+        // plan is a full one and the cap is not in the way of this test.
+        let p = draft_credit_note(
+            &s,
+            &pool,
+            "LEDGER-NOTE",
+            "Ledger Note Customer",
+            "3",
+            "4",
+            &[("ledger till", "12")],
+            "3",
+        )
+        .await;
+
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, p.return_id).await,
+            vec![("Return".to_string(), "-12".to_string())],
+            "a credit note takes goods back: one Return, and no cash entry of its own"
+        );
+
+        // The balance is NEGATIVE here, and that is the correct answer rather
+        // than a mistake: this fixture plants the parent sale with raw SQL
+        // (`seed_parent`), so the sale never ran `confirm` and never wrote its
+        // own `Charge`. The only entry in the journal is the credit note's, so
+        // the fold is the Return and nothing else.
+        let customer_id: i64 =
+            sqlx::query_scalar("SELECT customer_id FROM customer_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            balance(&pool, customer_id).await,
+            dec("-12"),
+            "a Return with no Charge of its own folds to a credit: -12"
+        );
+        // And it is not written as a tautology: the Sale-side rows are ABSENT,
+        // which is the reason the fold is negative rather than zero.
+        let sale_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM party_ledger_entries WHERE document_kind = 'Sale'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sale_rows, 0,
+            "the fixture's raw-SQL parent wrote no ledger row, which is WHY the fold is negative"
+        );
+    }
+
+    /// THE case the cap exists for, and the reason the Return is written even
+    /// when the refund plan is EMPTY: a parent that collected nothing still takes
+    /// its goods back, so the customer's debt must come down while no money moves
+    /// at all. Writing the Return only when a refund happens would leave that
+    /// customer owing for goods they returned.
+    #[tokio::test]
+    async fn a_fully_unpaid_parent_still_returns_the_debt_with_no_refund() {
+        let (s, pool) = svc().await;
+        // Nothing collected: the fixture's refund plan is empty by construction.
+        let p = draft_credit_note(
+            &s,
+            &pool,
+            "LEDGER-UNPAID",
+            "Ledger Unpaid Customer",
+            "2",
+            "5",
+            &[],
+            "2",
+        )
+        .await;
+
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, p.return_id).await,
+            vec![("Return".to_string(), "-10".to_string())],
+            "the goods came back, so the debt comes down even though money did not move"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            0,
+            "and no cash entry exists: the Return is about the goods, not the money"
+        );
+
+        let customer_id: i64 =
+            sqlx::query_scalar("SELECT customer_id FROM customer_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // The parent sale is planted with raw SQL and wrote no Charge, so the
+        // journal holds only this Return: a credit of 10, which is exactly the
+        // saldo a favor a shop owes that customer for goods it took back.
+        assert_eq!(
+            balance(&pool, customer_id).await,
+            dec("-10"),
+            "the Return is the whole journal, so the customer is owed 10"
+        );
+    }
+
+    /// The write joins the caller's unit, so a failure after it takes the entry
+    /// with it.
+    #[tokio::test]
+    async fn a_failed_credit_note_confirm_rolls_its_return_entry_back() {
+        let (s, pool) = svc().await;
+        let p = draft_credit_note(
+            &s,
+            &pool,
+            "LEDGER-ROLLBACK",
+            "Ledger Rollback Customer",
+            "2",
+            "5",
+            &[("ledger till rb", "10")],
+            "2",
+        )
+        .await;
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_ledger_probe BEFORE UPDATE ON customer_returns \
+             WHEN NEW.status = 'Confirmed' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the ledger write'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .confirm(actor(&pool).await, p.return_id)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+        assert!(
+            ledger_rows(&pool, p.return_id).await.is_empty(),
+            "the entry must die with the unit that wrote it"
+        );
+    }
+
     #[tokio::test]
     async fn a_confirmed_credit_note_leaves_the_cost_satellite_byte_identical() {
         let (s, pool) = svc().await;
