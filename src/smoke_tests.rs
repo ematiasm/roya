@@ -2205,10 +2205,18 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
         .expect("expense row");
     assert_eq!(expense["kind"], json!("Expense"));
     assert_eq!(dec(&expense["amount"]), Decimal::from(135));
+    let delivered_number: String = sqlx::query_scalar(
+        "SELECT number FROM payments WHERE transaction_id = ?",
+    )
+    .bind(expense_tx)
+    .fetch_one(&pool)
+    .await
+    .expect("purchase payment has a delivery number");
     assert_eq!(
         expense["reference"].as_str(),
-        Some(purchase_number.as_str())
+        Some(delivered_number.as_str())
     );
+    assert_ne!(delivered_number, purchase_number);
 
     // Cancel the confirmed purchase: stock returns and the Expense is refunded.
     let (status, body) = post_form(
@@ -2668,14 +2676,23 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
         }
     }
 
-    let purchase_links: Vec<(i64, Option<i64>, Option<i64>, i64, String, Option<String>)> =
-        sqlx::query_as(
-            "SELECT pp.id, pp.transaction_id, pp.refund_transaction_id, pp.account_id, pp.amount, p.purchase_number
-             FROM purchase_payments pp JOIN purchases p ON p.id = pp.purchase_id",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let purchase_links: Vec<(
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT pp.id, pp.transaction_id, pp.refund_transaction_id, pp.account_id, pp.amount,
+                p.purchase_number,
+                (SELECT pay.number FROM payments pay WHERE pay.transaction_id = pp.transaction_id)
+         FROM purchase_payments pp JOIN purchases p ON p.id = pp.purchase_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     for (
         payment_id,
         transaction_id,
@@ -2683,11 +2700,15 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
         account_id,
         amount_text,
         purchase_number,
+        delivered_number,
     ) in purchase_links
     {
         let purchase_number = purchase_number.ok_or_else(|| {
             format!("purchase payment {payment_id} belongs to a purchase without a number")
         })?;
+        // As on sales, the original movement names its delivery. The purchase number
+        // is only the fallback, keeping a missing delivery attributable to this link.
+        let movement_reference = delivered_number.as_deref().unwrap_or(&purchase_number);
         let transaction_id = transaction_id
             .ok_or_else(|| format!("purchase payment {payment_id} has no transaction_id"))?;
         let payment_amount = Decimal::from_str(&amount_text).map_err(|e| {
@@ -2698,13 +2719,14 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
             "purchase",
             payment_id,
             transaction_id,
-            &purchase_number,
+            movement_reference,
         )
         .await?;
         claim_transaction(
             &mut owners,
             transaction_id,
-            format!("purchase payment {payment_id} transaction_id"),
+            // Rows of one delivery legitimately share its movement.
+            format!("purchase delivery {movement_reference} transaction_id"),
         )?;
         if let Some(refund_id) = refund_transaction_id {
             if refund_id == transaction_id {

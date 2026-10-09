@@ -16,6 +16,32 @@ use rust_decimal::Decimal;
 
 use crate::error::AppResult;
 
+/// Selects the party-ledger entry for a cash delivery. The kind records the
+/// movement in the party's obligation, not the direction cash moved:
+///
+/// | party, direction | what happened | kind |
+/// |---|---|---|
+/// | Customer, In | customer pays the shop; obligation down | `Payment` |
+/// | Customer, Out | shop refunds customer; obligation up | `Refund` |
+/// | Supplier, Out | shop pays supplier; obligation down | `Payment` |
+/// | Supplier, In | supplier refunds shop; obligation up | `Refund` |
+///
+/// Thus `Refund` applies exactly when cash flow reverses that party's normal
+/// flow: Customer/Out or Supplier/In. All other combinations are `Payment`.
+fn delivery_entry_kind(
+    party_type: crate::models::PartyType,
+    direction: crate::models::PaymentDirection,
+) -> crate::models::PartyEntryKind {
+    use crate::models::{PartyEntryKind, PartyType, PaymentDirection};
+
+    match (party_type, direction) {
+        (PartyType::Customer, PaymentDirection::Out)
+        | (PartyType::Supplier, PaymentDirection::In) => PartyEntryKind::Refund,
+        (PartyType::Customer, PaymentDirection::In)
+        | (PartyType::Supplier, PaymentDirection::Out) => PartyEntryKind::Payment,
+    }
+}
+
 /// **THE ONE WRITER of a delivery of money** (P3, decisions 5 and 8).
 ///
 /// Records a `payments` document, the ONE cash movement it produced, its
@@ -125,24 +151,15 @@ where
     }
 
     // One ledger entry per payment DOCUMENT (decision 6), not per allocation.
+    let entry_kind = delivery_entry_kind(party_type, direction);
     party_ledger
         .insert_in(
             tx,
             &crate::models::NewPartyLedgerEntry {
                 party_type,
                 party_id,
-                kind: match direction {
-                    crate::models::PaymentDirection::In => crate::models::PartyEntryKind::Payment,
-                    crate::models::PaymentDirection::Out => crate::models::PartyEntryKind::Refund,
-                },
-                amount: match direction {
-                    crate::models::PaymentDirection::In => {
-                        crate::models::PartyEntryKind::Payment.signed_amount(amount)
-                    }
-                    crate::models::PaymentDirection::Out => {
-                        crate::models::PartyEntryKind::Refund.signed_amount(amount)
-                    }
-                },
+                kind: entry_kind,
+                amount: entry_kind.signed_amount(amount),
                 // The entry names the FIRST document the delivery covers; the
                 // full set lives in the allocations. A `Payment`/`Refund` entry is
                 // legitimately multiple per document (migration 43's partial

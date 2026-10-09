@@ -67,6 +67,7 @@ use crate::models::{
 };
 use crate::services::checked_money_sum;
 use crate::services::line_taxes::tax_inclusive_total;
+use crate::repositories::payment_repo::DocumentResidualParts;
 
 /// What `add_or_increment_line` did with the request. The distinction matters
 /// because the web route announces a merge with a visible notice, while an
@@ -261,24 +262,20 @@ where
         Ok((net, tax, total))
     }
 
-    /// What a document has been paid and what is still owed, checked for the
-    /// same reason [`Self::tax_split`] is: it is a sum of stored amounts, and
-    /// `total - paid` is the subtraction every payment ceiling is measured
-    /// against, so it is a fact the code states rather than one it assumes.
+    /// The applied amount and amount still owed come from the allocation-based
+    /// residual. Both were checked by the payment repository's shared fold;
+    /// retain the line total for a document whose total cannot be stated.
     fn paid_and_due(
         total: Decimal,
-        payments: &[PurchasePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<(Decimal, Decimal), PriceRefusal> {
-        let mut paid = Decimal::ZERO;
-        for p in payments {
-            paid = paid
-                .checked_add(p.amount)
-                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+        if residual.charge == Decimal::ZERO
+            && residual.signed_returns == Decimal::ZERO
+            && residual.allocated == Decimal::ZERO
+        {
+            return Ok((Decimal::ZERO, total));
         }
-        let due = total
-            .checked_sub(paid)
-            .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
-        Ok((paid, due))
+        Ok((residual.allocated, residual.residual))
     }
 
     /// The whole document-level money as ONE value, or the rule that refused it.
@@ -288,10 +285,10 @@ where
     /// derived from a total that does not exist.
     fn document_money(
         lines: &[PurchaseLine],
-        payments: &[PurchasePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<RecordMoney, PriceRefusal> {
         let (net_subtotal, tax_total, total) = Self::tax_split(lines)?;
-        let (paid, due) = Self::paid_and_due(total, payments)?;
+        let (paid, due) = Self::paid_and_due(total, residual)?;
         Ok(RecordMoney {
             net_subtotal,
             tax_total,
@@ -311,9 +308,9 @@ where
     fn row_for(
         purchase: Purchase,
         lines: &[PurchaseLine],
-        payments: &[PurchasePayment],
+        residual: &DocumentResidualParts,
     ) -> PurchaseListRow {
-        let (money, total_refusal) = match Self::document_money(lines, payments) {
+        let (money, total_refusal) = match Self::document_money(lines, residual) {
             Ok(money) => (Some(money), None),
             Err(refusal) => (None, Some(refusal)),
         };
@@ -325,21 +322,40 @@ where
         }
     }
 
-    /// `total` is the tax-inclusive document total, so every payment ceiling,
-    /// overpayment refusal, due balance and payable figure derived here is
-    /// measured against the money actually owed.
-    fn totals(
-        lines: &[PurchaseLine],
-        payments: &[PurchasePayment],
-    ) -> Result<(Decimal, Decimal, Decimal), PriceRefusal> {
-        let money = Self::document_money(lines, payments)?;
-        Ok((money.total, money.paid, money.due))
+    async fn residual_for_read(&self, purchase: &Purchase) -> AppResult<DocumentResidualParts> {
+        self.payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Purchase, &[purchase.id])
+            .await
+            .and_then(|mut residuals| {
+                residuals.remove(&purchase.id).ok_or_else(|| {
+                    AppError::Internal("purchase residual missing from batch".into())
+                })
+            })
+            .or_else(|error| match error {
+                // The record view must remain readable when its own line total refuses;
+                // document_money independently states the same refusal.
+                AppError::PriceRefused(_) => Ok(Self::empty_residual()),
+                AppError::NotFound(_) if purchase.status != PurchaseStatus::Confirmed => {
+                    Ok(Self::empty_residual())
+                }
+                other => Err(other),
+            })
+    }
+
+    fn empty_residual() -> DocumentResidualParts {
+        DocumentResidualParts {
+            charge: Decimal::ZERO,
+            signed_returns: Decimal::ZERO,
+            allocated: Decimal::ZERO,
+            residual: Decimal::ZERO,
+        }
     }
 
     async fn detail_for(&self, purchase: Purchase) -> AppResult<PurchaseDetail> {
         let lines = self.purchases.list_lines(purchase.id).await?;
         let payments = self.purchases.list_payments(purchase.id).await?;
-        let money = Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let residual = self.residual_for_read(&purchase).await?;
+        let money = Self::document_money(&lines, &residual).map_err(AppError::PriceRefused)?;
         Ok(PurchaseDetail {
             purchase,
             lines,
@@ -749,7 +765,8 @@ where
             .ok_or_else(|| AppError::NotFound(format!("purchase {purchase_id} not found")))?;
         let lines = self.purchases.list_lines(purchase.id).await?;
         let payments = self.purchases.list_payments(purchase.id).await?;
-        self.record_from_parts(purchase, lines, payments).await
+        let residual = self.residual_for_read(&purchase).await?;
+        self.record_from_parts(purchase, lines, payments, &residual).await
     }
 
     /// The one read that renders a document whose money cannot be computed: the
@@ -763,8 +780,9 @@ where
         purchase: Purchase,
         stored_lines: Vec<PurchaseLine>,
         stored_payments: Vec<PurchasePayment>,
+        residual: &DocumentResidualParts,
     ) -> AppResult<PurchaseRecord> {
-        let (money, total_refusal) = match Self::document_money(&stored_lines, &stored_payments) {
+        let (money, total_refusal) = match Self::document_money(&stored_lines, residual) {
             Ok(money) => (Some(money), None),
             Err(refusal) => (None, Some(refusal)),
         };
@@ -908,9 +926,48 @@ where
     /// All purchases with derived totals, oldest first (repository order).
     pub async fn list_details(&self) -> AppResult<Vec<PurchaseDetail>> {
         let purchases = self.purchases.list_purchases().await?;
-        let mut out = Vec::with_capacity(purchases.len());
+        self.details_with_residuals(purchases).await
+    }
+
+    async fn details_with_residuals(&self, purchases: Vec<Purchase>) -> AppResult<Vec<PurchaseDetail>> {
+        let mut documents = Vec::with_capacity(purchases.len());
+        let mut ids = Vec::new();
         for purchase in purchases {
-            out.push(self.detail_for(purchase).await?);
+            let lines = self.purchases.list_lines(purchase.id).await?;
+            let payments = self.purchases.list_payments(purchase.id).await?;
+            let total_is_readable = Self::tax_split(&lines).is_ok();
+            if purchase.status == PurchaseStatus::Confirmed && total_is_readable {
+                ids.push(purchase.id);
+            }
+            documents.push((purchase, lines, payments, total_is_readable));
+        }
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Purchase, &ids)
+            .await?;
+        let mut out = Vec::with_capacity(documents.len());
+        for (purchase, lines, payments, total_is_readable) in documents {
+            let empty = Self::empty_residual();
+            let residual = if purchase.status == PurchaseStatus::Confirmed && total_is_readable
+            {
+                residuals.get(&purchase.id).ok_or_else(|| {
+                    AppError::Internal(format!("purchase {} residual missing from batch", purchase.id))
+                })?
+            } else {
+                &empty
+            };
+            let money = Self::document_money(&lines, residual).map_err(AppError::PriceRefused)?;
+            out.push(PurchaseDetail {
+                purchase,
+                lines,
+                payments,
+                net_subtotal: money.net_subtotal,
+                tax_total: money.tax_total,
+                total: money.total,
+                paid: money.paid,
+                due: money.due,
+                payment_status: money.payment_status,
+            });
         }
         Ok(out)
     }
@@ -923,27 +980,81 @@ where
         filter: &PurchaseListFilter,
     ) -> AppResult<Vec<PurchaseListRow>> {
         let purchases = self.filtered_purchases(filter).await?;
-        let mut out = Vec::with_capacity(purchases.len());
-        for purchase in purchases {
-            out.push(self.row_of(purchase).await?);
-        }
-        Ok(out)
+        self.rows_with_residuals(purchases).await
     }
 
     /// A LIST row, the same documents and the same derived money
-    /// [`Self::detail_for`] computes — payments INCLUDED, because a row's chip is a
+    /// [`Self::detail_for`] computes — allocation residuals INCLUDED, because a row's chip is a
     /// claim about the money: a settled document that still showed its full total as
     /// due would be a lie the operator could act on.
+    #[allow(dead_code)]
     async fn row_of(&self, purchase: Purchase) -> AppResult<PurchaseListRow> {
         let lines = self.purchases.list_lines(purchase.id).await?;
-        let payments = self.purchases.list_payments(purchase.id).await?;
-        Ok(Self::row_for(purchase, &lines, &payments))
+        let total_is_readable = Self::tax_split(&lines).is_ok();
+        let ids = if purchase.status == PurchaseStatus::Confirmed && total_is_readable {
+            vec![purchase.id]
+        } else {
+            Vec::new()
+        };
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Purchase, &ids)
+            .await?;
+        let empty = Self::empty_residual();
+        let residual = if ids.is_empty() {
+            &empty
+        } else {
+            residuals.get(&purchase.id).ok_or_else(|| {
+                AppError::Internal(format!("purchase {} residual missing from batch", purchase.id))
+            })?
+        };
+        Ok(Self::row_for(purchase, &lines, residual))
+    }
+
+    async fn rows_with_residuals(&self, purchases: Vec<Purchase>) -> AppResult<Vec<PurchaseListRow>> {
+        let mut documents = Vec::with_capacity(purchases.len());
+        let mut ids = Vec::new();
+        for purchase in purchases {
+            let lines = self.purchases.list_lines(purchase.id).await?;
+            let total_is_readable = Self::tax_split(&lines).is_ok();
+            if purchase.status == PurchaseStatus::Confirmed && total_is_readable {
+                ids.push(purchase.id);
+            }
+            documents.push((purchase, lines, total_is_readable));
+        }
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Purchase, &ids)
+            .await?;
+        let mut out = Vec::with_capacity(documents.len());
+        for (purchase, lines, total_is_readable) in documents {
+            if !total_is_readable {
+                out.push(PurchaseListRow {
+                    purchase,
+                    line_count: lines.len(),
+                    money: None,
+                    total_refusal: Some(PriceRefusal::DocumentTotalTooLarge),
+                });
+                continue;
+            }
+            let empty = Self::empty_residual();
+            let residual = if purchase.status == PurchaseStatus::Confirmed {
+                residuals.get(&purchase.id).ok_or_else(|| {
+                    AppError::Internal(format!("purchase {} residual missing from batch", purchase.id))
+                })?
+            } else {
+                &empty
+            };
+            out.push(Self::row_for(purchase, &lines, residual));
+        }
+        Ok(out)
     }
 
     /// The same derived list narrowed by the server-side list filter. The party
     /// name is resolved against the suppliers table (normalized) into ids, and the
     /// repository narrows the document query by those ids, so only matching
-    /// documents have their lines and payments loaded.
+    /// documents have their lines and payment rows loaded; residuals are then
+    /// resolved in one batch for the readable Confirmed documents.
     ///
     /// The STRICT twin of [`Self::list_rows_filtered`]: the same documents as
     /// details, so a caller that makes a decision out of a document's money gets
@@ -957,11 +1068,7 @@ where
         filter: &PurchaseListFilter,
     ) -> AppResult<Vec<PurchaseDetail>> {
         let purchases = self.filtered_purchases(filter).await?;
-        let mut out = Vec::with_capacity(purchases.len());
-        for purchase in purchases {
-            out.push(self.detail_for(purchase).await?);
-        }
-        Ok(out)
+        self.details_with_residuals(purchases).await
     }
 
     /// The list filter resolved to documents, so the strict and the tolerant read
@@ -991,7 +1098,7 @@ where
             .collect())
     }
 
-    /// Outstanding payables: Confirmed purchases with due > 0.
+    /// Outstanding payables: Confirmed purchases with allocation-derived due > 0.
     pub async fn outstanding_payables(&self) -> AppResult<Vec<PurchaseDetail>> {
         let all = self.list_details().await?;
         Ok(all
@@ -1089,9 +1196,9 @@ where
 
         // The document's money is resolved BEFORE any write below, exactly as on
         // the sales side: a confirmation that cannot state what the document
-        // costs must refuse with nothing written.
-        let (total, _, _) = Self::totals(&lines, &self.purchases.list_payments(purchase_id).await?)
-            .map_err(AppError::PriceRefused)?;
+        // costs must refuse with nothing written. It has no payment residual yet
+        // because a Draft has no party-ledger Charge.
+        let (_, _, total) = Self::tax_split(&lines).map_err(AppError::PriceRefused)?;
 
         // The cash account is derived from the method, which belongs to exactly
         // one account: an invalid combination is impossible by construction.
@@ -1156,15 +1263,15 @@ where
         // ---- THE WRITE UNIT -----------------------------------------------
         //
         // Everything from here to the COMMIT is ONE transaction: the sequence
-        // number, one stock movement per tracked line, the `Expense`, the
-        // `purchase_payments` row, `set_confirmed`, and the per-line supplier
+        // number, one stock movement per tracked line, the `Expense` and payment
+        // allocation, `set_confirmed`, and the per-line supplier
         // cost in the satellite. Before this line each of them was its own
         // autocommit unit, so a failure between any two left the earlier ones
         // committed and the document a Draft. That residue was MEASURED, not
         // assumed (`purchase_confirm_failure_*` in this file), and every one of
         // those tests now asserts its absence.
         //
-        // `record_cost` is the sixth write and the reason purchases are the
+        // `record_cost` is the fifth write and the reason purchases are the
         // harder side of this change: it runs LAST, after the document was
         // already Confirmed and numbered, so its failure used to leave a
         // CONFIRMED, FULLY PAID, NUMBERED purchase with only SOME of its
@@ -1216,39 +1323,6 @@ where
                 .await?;
         }
 
-        // Finance: Cash => 1 payment + 1 Expense now; Credit => payable only.
-        // The Expense is stamped with reference = purchase_number and linked back
-        // from the payment row it produced.
-        if purchase.payment_type == PaymentType::Cash && total > Decimal::ZERO {
-            let account_id = cash_account_id.expect("validated above");
-            let method_id = cash_method_id.expect("validated above");
-            let expense = self
-                .transactions
-                .create_with_reference_in(
-                    &mut tx,
-                    actor,
-                    account_id,
-                    crate::models::TransactionKind::Expense,
-                    total,
-                    Some(purchase_number.clone()),
-                    Some(purchase_number.clone()),
-                    purchase.purchase_date,
-                )
-                .await?;
-            self.purchases
-                .create_payment_in(
-                    &mut tx,
-                    actor,
-                    purchase_id,
-                    account_id,
-                    method_id,
-                    total,
-                    purchase.purchase_date,
-                    Some(expense.id),
-                )
-                .await?;
-        }
-
         // The supplier's journal, in the SAME unit as the document (T2 of
         // odd/tasks/party-ledger.md). A purchase is a CHARGE on the supplier
         // whichever way it is paid: the shop received goods worth `total`, so it
@@ -1277,23 +1351,47 @@ where
                 .await?;
         }
 
-        // The cash leg: the same unit, written after the charge so an
-        // intermediate reader sees the payable and then its settlement.
-        if purchase.payment_type == PaymentType::Cash && total > Decimal::ZERO {
-            self.party_ledger
-                .insert_in(
+        // Finance: Cash => one delivery and its Expense; Credit => payable only.
+        // The writer creates the cash movement, payment row, full allocation and
+        // supplier-ledger settlement together in this transaction, after the charge.
+        let cash_delivery = if purchase.payment_type == PaymentType::Cash && total > Decimal::ZERO {
+            let account_id = cash_account_id.expect("validated above");
+            let method_id = cash_method_id.expect("validated above");
+            Some(crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::Out,
+                crate::models::PartyType::Supplier,
+                purchase.supplier_id,
+                method_id,
+                account_id,
+                total,
+                purchase.purchase_date,
+                None,
+                Some(purchase_number.clone()),
+                None,
+                &[(crate::models::PartyDocumentKind::Purchase, purchase_id, total)],
+            )
+            .await?)
+        } else {
+            None
+        };
+
+        if let Some(delivery) = &cash_delivery {
+            self.purchases
+                .create_payment_in(
                     &mut tx,
-                    &crate::models::NewPartyLedgerEntry {
-                        party_type: crate::models::PartyType::Supplier,
-                        party_id: purchase.supplier_id,
-                        kind: crate::models::PartyEntryKind::Payment,
-                        amount: crate::models::PartyEntryKind::Payment.signed_amount(total),
-                        document_kind: crate::models::PartyDocumentKind::Purchase,
-                        document_id: purchase_id,
-                        entry_date: purchase.purchase_date,
-                        reference: Some(purchase_number.clone()),
-                        created_by: actor,
-                    },
+                    actor,
+                    purchase_id,
+                    cash_account_id.expect("validated above"),
+                    cash_method_id.expect("validated above"),
+                    total,
+                    purchase.purchase_date,
+                    delivery.transaction_id,
                 )
                 .await?;
         }
@@ -1343,8 +1441,8 @@ where
     ///
     /// **What it writes.** A `payments` document with `direction='Out'` (money handed
     /// over), its ONE cash movement, one allocation naming the purchase it covers, and
-    /// the `Payment` ledger entry. The legacy `purchase_payments` row stays until P5
-    /// moves the reads.
+    /// the correct party-ledger entry. The legacy row remains a write for its separate
+    /// read model; document paid/due values now come from allocation residuals.
     pub async fn record_payment(
         &self,
         actor: i64,
@@ -1372,13 +1470,14 @@ where
             .resolve_account(method_id, None)
             .await?;
         let lines = self.purchases.list_lines(purchase_id).await?;
-        let payments = self.purchases.list_payments(purchase_id).await?;
+        let residual = self.residual_for_read(&purchase).await?;
         // The ceiling is measured against the DUE BALANCE, not `paid + amount`:
         // `amount` is an operator's unbounded input and `paid + amount` is a raw
         // add, so an operator typing `4e28` against an ordinary purchase would
         // overflow here instead of being refused the overpayment they typed. The
         // message is unchanged and its figures are stated, never summed.
-        let (total, paid, due) = Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let money = Self::document_money(&lines, &residual).map_err(AppError::PriceRefused)?;
+        let (total, paid, due) = (money.total, money.paid, money.due);
         if amount > due {
             return Err(AppError::Validation(format!(
                 "overpay rejected: paid {paid} + {amount} exceeds total {total}"
@@ -1415,26 +1514,6 @@ where
             )],
         )
         .await?;
-
-        // The ledger entry for a purchase payment is a `Payment` on the SUPPLIER — the
-        // same kind as a customer's collection, because the journal signs it by the
-        // party, not by which way the cash moved.
-        self.party_ledger
-            .insert_in(
-                &mut tx,
-                &crate::models::NewPartyLedgerEntry {
-                    party_type: crate::models::PartyType::Supplier,
-                    party_id: purchase.supplier_id,
-                    kind: crate::models::PartyEntryKind::Payment,
-                    amount: crate::models::PartyEntryKind::Payment.signed_amount(amount),
-                    document_kind: crate::models::PartyDocumentKind::Purchase,
-                    document_id: purchase_id,
-                    entry_date: date,
-                    reference: Some(purchase_number.clone()),
-                    created_by: actor,
-                },
-            )
-            .await?;
 
         let legacy = self
             .purchases
@@ -1484,8 +1563,8 @@ where
             .resolve_account(method_id, None)
             .await?;
 
-        // The payable: a payment never exceeds what the supplier is owed, and
-        // the outstanding figure is what the allocation is checked against.
+        // The payable residual drives the allocation plan; the delivery itself
+        // may be larger, leaving a party credit with no document allocation.
         // Oldest first: `due_date`, then `purchase_date`, then id — the same
         // ordering rule `collect` plans with.
         let mut debts: Vec<PurchaseDetail> = self
@@ -1513,7 +1592,6 @@ where
                 supplier.name
             )));
         }
-
         let mut remaining = amount;
         let mut plan = Vec::new();
         for detail in &debts {
@@ -1581,32 +1659,8 @@ where
         )
         .await?;
 
-        // One `Payment` ledger entry for the delivery (decision 6: per payment
-        // DOCUMENT, not per invoice). The per-document residual comes from the
-        // allocations above.
-        self.party_ledger
-            .insert_in(
-                &mut tx,
-                &crate::models::NewPartyLedgerEntry {
-                    party_type: crate::models::PartyType::Supplier,
-                    party_id: supplier_id,
-                    kind: crate::models::PartyEntryKind::Payment,
-                    amount: crate::models::PartyEntryKind::Payment.signed_amount(amount),
-                    // The entry locates itself on the FIRST covered document; the full
-                    // set lives in the allocations. A `Payment` entry is legitimately
-                    // multiple per document (migration 43's partial index excludes those
-                    // kinds for exactly that reason).
-                    document_kind: crate::models::PartyDocumentKind::Purchase,
-                    document_id: plan.first().map(|(id, _)| *id).unwrap_or(0),
-                    entry_date: date,
-                    reference: Some(delivery.number.clone()),
-                    created_by: actor,
-                },
-            )
-            .await?;
-
-        // The legacy rows stay, ONE PER COVERED PURCHASE, all naming the ONE movement
-        // this delivery produced, until P5 moves the reads.
+        // One legacy row per covered document remains part of this bounded writer
+        // path; this feature changes reads, not writes.
         let mut payments = Vec::with_capacity(plan.len());
         for (purchase_id, take) in &plan {
             payments.push(
@@ -1659,7 +1713,8 @@ where
         // removes a never-confirmed document outright without reading its money.
         let lines = self.purchases.list_lines(purchase_id).await?;
         let payments = self.purchases.list_payments(purchase_id).await?;
-        Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let residual = self.residual_for_read(&purchase).await?;
+        Self::document_money(&lines, &residual).map_err(AppError::PriceRefused)?;
 
         if purchase.status == PurchaseStatus::Draft {
             // Draft -> Cancelled: discard, no stock/finance/satellite side effect.
@@ -2717,7 +2772,8 @@ mod tests {
         assert_eq!(received.qty, dec("3"));
         assert_eq!(received.reference, number);
 
-        // 1 payment + 1 Expense.
+        // 1 legacy payment + 1 Expense, with the payment allocation now visible
+        // to the residual-based paid/due read.
         let payments = s.purchases.list_payments(purchase.id).await.unwrap();
         assert_eq!(payments.len(), 1);
         assert_eq!(payments[0].amount, dec("12"));
@@ -2850,6 +2906,7 @@ mod tests {
         assert_eq!(d2.paid, dec("40"));
         assert_eq!(d2.due, Decimal::ZERO);
         assert_eq!(d2.payment_status, crate::models::PaymentStatus::Paid);
+        assert!(s.outstanding_payables().await.unwrap().is_empty());
         assert_eq!(tx_count(&pool).await, 2);
         let rows = s
             .transactions
@@ -2925,8 +2982,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // P4: still ONE legacy row per covered purchase — that is what the reads use
-        // until P5 — but they all name ONE movement now, and the handover is one
+        // P4: still ONE legacy row per covered purchase, but they all name ONE
+        // movement now, and the handover is one
         // document.
         assert_eq!(payments.len(), 2);
         assert_eq!(payments[0].purchase_id, a.id);
@@ -2983,7 +3040,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn t5_pay_supplier_overpay_rejected_with_no_side_effect() {
+    async fn t5_pay_supplier_rejects_delivery_above_the_residual_outstanding_set() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "T5-OV", "20").await;
         seed_stock(&s, prod.id, "20").await;
@@ -3015,7 +3072,8 @@ mod tests {
         .unwrap();
         s.confirm(audit_actor(&s).await, b.id, None).await.unwrap();
 
-        // Outstanding is 70: paying 71 is a 400 naming both figures.
+        // P4's writer rejects excess deliveries; this unit asserts residual-based
+        // outstanding debt and the existing 400 boundary remains unchanged.
         let err = s
             .pay_supplier(
                 audit_actor(&s).await,
@@ -5386,7 +5444,7 @@ mod tests {
 
     #[tokio::test]
     async fn link_cash_confirm_payment_carries_its_transaction_and_reference() {
-        let (s, _) = svc().await;
+        let (s, pool) = svc().await;
         let prod = seed_product(&s, "LINK-CASH", "5").await;
         seed_stock(&s, prod.id, "10").await;
         let sup = seed_supplier(&s, "LINK CASH SUP").await;
@@ -5427,7 +5485,15 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, tx_id);
         assert_eq!(rows[0].kind, TransactionKind::Expense);
-        assert_eq!(rows[0].reference.as_deref(), Some(number.as_str()));
+        let delivery_number: String = sqlx::query_scalar(
+            "SELECT number FROM payments WHERE transaction_id = ?",
+        )
+        .bind(tx_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows[0].reference.as_deref(), Some(delivery_number.as_str()));
+        assert_ne!(delivery_number, number, "cash delivery has its own number");
         assert_eq!(rows[0].description, number);
     }
 
@@ -6204,6 +6270,104 @@ mod tests {
         let settled = s.get_detail(purchase.id).await.unwrap();
         assert_eq!(settled.paid, dec("121"));
         assert_eq!(settled.due, dec("0"));
+    }
+
+    /// A confirmed purchase return is signed against its parent purchase, so its
+    /// negative Return entry reduces the allocation-based payable residual.
+    #[tokio::test]
+    async fn confirmed_purchase_return_reduces_the_parent_payable_residual() {
+        let (s, pool) = svc().await;
+        let product = stocked_product(&s, "P5-RETURN", "10").await;
+        let supplier = seed_supplier(&s, "P5 Return Supplier").await;
+        let purchase = draft_purchase(&s, supplier.id, PaymentType::Credit).await;
+        let line = s.add_line(audit_actor(&s).await, purchase.id, product.id, dec("2"), Some(dec("10"))).await.unwrap();
+        s.confirm(audit_actor(&s).await, purchase.id, None).await.unwrap();
+        let actor = audit_actor(&s).await;
+        let return_id: i64 = sqlx::query_scalar(
+            "INSERT INTO purchase_returns (return_number, supplier_id, purchase_id, status, return_date, created_by, confirmed_at) \
+             VALUES ('2024-PRET-000001', ?, ?, 'Confirmed', '2024-05-03', ?, '2024-05-03T00:00:00.000Z') RETURNING id"
+        )
+        .bind(supplier.id)
+        .bind(purchase.id)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO purchase_return_lines (return_id, purchase_line_id, qty, unit_cost) VALUES (?, ?, '1', '10')"
+        )
+        .bind(return_id)
+        .bind(line.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
+             VALUES ('Supplier', ?, 'Return', '-10', 'PurchaseReturn', ?, '2024-05-03', '2024-PRET-000001', ?)"
+        )
+        .bind(supplier.id)
+        .bind(return_id)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let detail = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(detail.total, dec("20"));
+        assert_eq!(detail.due, dec("10"), "old due 20 reduced by return 10");
+        assert_eq!(s.outstanding_payables().await.unwrap().len(), 1);
+        let account = seed_account(&s, "P5 return payment").await;
+        let method = own_method(&s, account.id, "P5 return payment").await;
+        s.record_payment(
+            audit_actor(&s).await,
+            purchase.id,
+            method,
+            dec("10"),
+            purchase_date(),
+        )
+        .await
+        .unwrap();
+        let settled = s.get_detail(purchase.id).await.unwrap();
+        assert_eq!(settled.paid, dec("10"));
+        assert_eq!(settled.due, Decimal::ZERO, "the allocation covers the reduced residual");
+        assert!(
+            s.outstanding_payables().await.unwrap().is_empty(),
+            "zero residual is not outstanding"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unallocated_supplier_payment_remainder_is_visible_as_party_credit() {
+        let (s, _) = svc().await;
+        let supplier = seed_supplier(&s, "P5 Unapplied Supplier").await;
+        let account = seed_account(&s, "P5 unapplied account").await;
+        let method = own_method(&s, account.id, "P5 unapplied method").await;
+        s.payments
+            .create(&crate::models::NewPayment {
+                number: "2024-PAY-999991".into(),
+                direction: crate::models::PaymentDirection::In,
+                party_type: crate::models::PartyType::Supplier,
+                party_id: supplier.id,
+                method_id: method,
+                account_id: account.id,
+                amount: dec("12"),
+                date: purchase_date(),
+                notes: None,
+                transaction_id: None,
+                receipt_id: None,
+                created_by: audit_actor(&s).await,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            s.payments
+                .unapplied_for_party(crate::models::PartyType::Supplier, supplier.id)
+                .await
+                .unwrap(),
+            dec("12"),
+            "the unallocated remainder remains visible as party credit"
+        );
     }
 
     /// Supplier debt is the `due` of the payable, so it inherits the
