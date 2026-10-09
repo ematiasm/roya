@@ -162,6 +162,7 @@ pub type PurchasesSvc = PurchasesService<
     SqliteTransactionRepository,
     SqlitePaymentMethodRepository,
     SqliteTaxSnapshotRepository,
+    SqlitePartyLedgerRepository,
 >;
 
 /// The identity service the deny-by-default gate and the login/logout routes
@@ -461,6 +462,8 @@ impl AppState {
             transaction_service.clone(),
             PaymentMethodService::new(method_repo),
             SqliteTaxSnapshotRepository::new(pool.clone()),
+            // T2: the supplier journal `confirm` appends to, over the same pool.
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         // M-purchase returns. THE FLAGS ARE THE PARENT'S, and deliberately so:
         // both return services take the SAME `inventory_service` and
