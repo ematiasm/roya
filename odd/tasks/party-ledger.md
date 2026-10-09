@@ -474,39 +474,31 @@ Parent does: git state, feature-doc updates, per-task spot checks, delivery deci
 
 ## Resume here
 
-0. **Four paths are intentionally UNCOMMITTED** after `0dfe5c1`:
-   `odd/tasks/party-ledger.md` (`M`), `src/models.rs` (`M`),
-   `src/repositories/party_ledger_repo.rs` (`M`) and the untracked
-   `migrations/20240101000043_party_ledger_integrity.sql`. The T1 review
-   candidate is the commit `0dfe5c1` under `--committed-only`, so its bytes stay
-   pinned and the drift does not touch it; leaving T1b uncommitted only keeps
-   `feat/party-ledger` at the reviewed boundary. Open user decision: commit T1b
-   (`fix(ledger): enforce append-only and single-instance kinds (T1b)`) plus the
-   doc with a `docs(odd):` message, or wait for the review to resolve. Note that
-   the blocked review is reviewing a schema state that migration 43 supersedes —
-   migration 42's `updated_*` columns and the missing triggers no longer describe
-   the tree.
-1. Re-run the bound STATUS (read-only) and check it still says `collect`:
+**This section was 27 commits stale and has been rewritten.** Its previous text told the
+next agent that four paths were "intentionally UNCOMMITTED" and that the first thing to do
+was re-run a blocked review lineage — both false now. T1b was committed as `0010b6a`, the
+blocked lineage is obsolete, and the work has moved to the payment-allocation plan. If a
+resume note here ever contradicts `git log`, the log wins.
 
-```
-gentle-ai review status --contract=gentle-ai.review-integration/v2 --next-transition=true --lineage=review-947422ad2ac0098e --repository-context=rctx2_f0c2737a5f1e905298e6156900b1918ba3fcb2a163108a402e3f2163a188ab88 --agent=opencode --base-ref=86c69adbb1eef4d569b0a2fe4d8412d91a16d38e --committed-only=true
-```
+**Where the work actually is**: `odd/tasks/payment-allocation.md` is the active plan and
+carries its own Status and "Resume here". Summary of this document's own tasks:
 
-2. If it returns `collect`, relaunch the lens **once**: one OpenCode Task with
-   `agent` copied exactly as `review-reliability` and `prompt` copied
-   byte-for-byte from `next_transition.collect.inputs[0].provider_task.prompt`
-   (451 chars, starts `GENTLE_AI_REVIEW_BINDING {…}`). Never rebuild the binding
-   from prose or from the arguments list.
-3. If the capture is admitted, follow the returned transitions to
-   acknowledgement (the exact acknowledgement burns the authority). If the
-   provider still refuses, the lineage stays open — decide then between waiting
-   for the provider and `gentle-ai review mode disable --scope clone`
-   (a user-owned switch; only the user may choose it).
-4. The reviewed boundary only advances once `0dfe5c1` is acknowledged; until
-   then the next assess still runs with `--base-ref main --committed-only`.
-5. After the commit decision: next implementation task is **T2** — entry writes
-   in the four `confirm` paths plus the two lifted return-cap refusals, tests
-   first. All five gaps the plan review found (Engram
-   `review/party-ledger-design-gaps`) are now closed or recorded: (a) and (b) in
-   migration 43, (c) as decision 12, (d) in the revised decision 7, (e) as the
-   Objective paragraph. Nothing about them is left to be remembered during T2.
+| task | state |
+| --- | --- |
+| T1 (migration 42 + repository + backfill) | done, `0dfe5c1`, reviewed with authority burned |
+| T1b (migration 43, append-only + single-instance) | done, `0010b6a` |
+| T2 (entry writes in the four `confirm` paths) | **half done**: the four writes are in (`ba30397`, `70c496d`, `c63f66f`, `7953b0b`); the two refund CAPS are still not lifted, deliberately |
+| T3a, T3b | reshaped into P3/P4 of payment-allocation — **done there** |
+| T4 (reads move to the ledger) | reshaped into **P5**, which is next |
+| T5 (explicit credit application in the UI) | reshaped into **P6** |
+| T6 (verification pass) | reshaped into **P7** |
+
+**The one thing this document owns that is still open**: the two refund caps of T2.
+Lifting them needs the decision nobody has written — what replaces "this app has no
+credit balance" — and lifting them before P5 moves the reads would leave a confirmed
+document that no balance reflects. Do not lift them opportunistically.
+
+**The older T1-only lineage `review-947422ad2ac0098e`** is still blocked by a provider
+failure and is obsolete in practice: T1's code is inside the branch candidate that was
+approved (`review-1288ee9534822fbc`, authority burned). Leaving it open or disabling the
+switch is the user's call, not the agent's.
