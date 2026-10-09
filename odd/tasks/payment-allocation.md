@@ -446,12 +446,12 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   it moved up with the others, before the unit opens.
 - [ ] **P5a — The journal entries close the identity.** P5b is a READ change only if
   the journal already says the truth, and it does not: three holes are measured
-  below. In scope: a refund that takes money back OUT of a customer must stop
-  adding to what that customer owes; an annulment must leave the party's balance
-  where the business already believes it is; and an applied credit must be visible
-  to the journal, or the identity `balance == Σ residuals + unapplied` can never
-  hold. Also in scope: `unapplied_for_party` (`Σ unapplied` over `direction='In'`
-  deliveries only — see hole 4). This task writes ledger entries and no reads.
+  below. In scope: an annulment writes a compensating entry that reverses what the
+  cancelled document charged (hole 3), and the refund path writes the entry its
+  mirror path already writes — `purchases.rs:1750` has it, `sales.rs:1950` does not
+  (hole 2). Also in scope: `unapplied_for_party` (`Σ unapplied` over `direction='In'`
+  deliveries only — see hole 4), and the `Cancel` sign sub-decision at the end of the
+  section. This task writes ledger entries and no reads.
 - [ ] **P5b — Reads move to the per-document residual.** `customer_balance`,
   `ageing_of`/`customer_ageing`/`ageing_all`, the `ENFORCE_CREDIT_LIMIT`
   projection, the `suppliers_web.rs:428` drawer fold, `outstanding_payables`,
@@ -494,6 +494,14 @@ The ledger is written by every path, but what it writes does not close the ident
 criterion and the reason the reads can move at all. Four holes, each with its
 evidence. They are the reason P5 is P5a + P5b and not one read slice.
 
+**An earlier revision of this section blamed the SIGN of `Refund` ("`signed_amount`
+marks `Refund +`, so every customer refund raises the debt"). That was WRONG and is
+corrected here.** `+` is right for a `Refund`: a refund entry is for money ARRIVING,
+and the customer-side writer that uses it (`customer_return.rs:899`, the cancel of a
+credit note, `direction='In'`) is money coming back in. The real defect is not the sign
+but which events write an entry at all, and the two sides of one business event do not
+agree about it.
+
 1. **The legacy dual-write is still LIVE in production code, and P5b is what turns it
    off.** `create_payment_in` (`src/repositories/sale_repo.rs:1250`) is production
    code — `mod tests` starts at `:1574` — and it is still called from the cash leg of
@@ -506,28 +514,37 @@ evidence. They are the reason P5 is P5a + P5b and not one read slice.
    moment they are deleted. Deleting the rows without moving these reads, or moving
    the reads without deleting the rows, each leaves two homes for one fact.
 
-2. **The refund's sign is on the wrong side for a customer.** `signed_amount`
-   (`src/models.rs:3647`) is `Charge +`, `Payment −`, `Return −`, **`Refund +`**,
-   `Cancel −`. `payment_writer.rs:134-143` maps `direction='Out'` to `Refund`, and an
-   `Out` delivery is exactly a customer's refund: money that LEFT the business. So
-   every customer refund ADDS to what that customer owes. `Refund +` is correct for a
-   SUPPLIER (their refund is money coming back IN, `purchases.rs:1750`), and that is
-   the party the sign was written for; migrating the customer side onto `payments`
-   carries the inversion with it.
-
-   Measured against a test the tree already asserts: `k3_ac8_fully_paid_and_cancelled_sales_leave_the_balance`
-   (`src/services/sales.rs:5099`) confirms a 40 credit sale, collects 15, collects 25
-   and cancels, and asserts `customer_balance == 0`. The journal for that sequence
-   folds to `40 − 15 − 25 + 40 = +40`: a customer who paid in full and then had the
-   sale annulled would read as owing the whole thing, and ageing would age it.
+2. **The same event is journalled differently on the two sides.** Money going back OUT
+   over a cancelled sale writes **no entry at all** (`sales.rs:1950` passes `&[]` and
+   the refund delivery adds nothing to the journal), while the mirror case — money
+   coming back IN over a cancelled purchase — writes `Refund +` (`purchases.rs:1750`).
+   So a `Refund` entry means "money arrived" on both sides, and money that LEFT is
+   represented by silence, which no reader can distinguish from a delivery that was
+   never journalled. Worse, when the cancelled document is a CREDIT NOTE its reversal
+   DOES write `Refund +` (`customer_return.rs:899`) — the same event (money out) that a
+   cancelled SALE records as nothing.
 
 3. **`PartyEntryKind::Cancel` is written by no production path.** Its only writers are
-   the repository's own tests (`party_ledger_repo.rs:805,831,853,1443`). `cancel`
-   (`src/services/sales.rs:1785`) writes stock movements and refund deliveries and no
-   reversal of the `Charge` — which is precisely the entry the category exists for.
-   The cancel is what makes hole 2 bite the CASH case too: a cash sale's `confirm`
-   writes `Payment` for the full total, and its cancel writes `Refund +` for the same
-   total, so a cash sale that was annulled reads as a debt.
+   the repository's own tests (`party_ledger_repo.rs:805,831,853,1443`). Neither
+   `cancel` (`src/services/sales.rs:1785`) nor its three siblings write a reversal of
+   the `Charge`/`Return` of the document they annul — which is precisely the entry the
+   category exists for. A voided `Charge` stays on the books forever.
+
+   Together, 2 and 3 mean the annulment is only half-journalled, and the half that is
+   missing is the one the balance depends on. The scoreboard, against the entry kinds
+   as they are:
+
+   | Sequence | Journal folds to | Truth |
+   |---|---|---|
+   | `k3_ac8`: 40 credit, collect 15 + 25, cancel | `40 − 15 − 25 = 0` ✓ | 0 — `sales.rs:5099` asserts it, and it passes because the refund writes nothing |
+   | Cash 30, confirm, cancel | `30 − 30 = 0` ✓ | 0 |
+   | 50 credit, collect 30, cancel | `50 − 30 = +20` ✗ | −30: the customer paid 30 and got it back, so the shop owes THEM |
+   | 50 credit purchase, pay 30, cancel | `50 − 30 + 30 = +50` ✗ | −30: the supplier holds 30 of the shop's money |
+
+   The third row is the one to read: the voided `Charge` (+50) and the returned money
+   (30) are both absent, and they err in the same direction, so the figure is off by
+   80% of the document. The first row passing is what hid this — a fully collected and
+   fully refunded document is the ONE case where silence happens to be right.
 
 4. **An applied credit is invisible to the journal.** Applying credit writes an
    allocation and, by decision 5, no cash movement and no entry — correctly, since no
@@ -539,14 +556,32 @@ evidence. They are the reason P5 is P5a + P5b and not one read slice.
    the residual falls by the same amount the unapplied does.
 
 **What this makes of the plan.** P5a is a journal task, not a read task, and it lands
-before P5b. The open design decision is the annulment's shape, and it is the user's
-because it is a business fact, not a wiring choice:
+before P5b. **Decision (user, 2026-10-09): the annulment gets a compensating entry.**
+With the corrected diagnosis that decision means two writes, and the SECOND one is not
+a sign change:
 
-| Shape | Balance after 30 owed / 30 collected / sale cancelled | Cost |
-|---|---|---|
-| `Cancel` as a compensating entry Reversing the `Charge` | 0 — what the tree already asserts | Needs the whole undoing history, refunds included. The `payments` table keeps it (`receipt_id`, both directions), whereas `refund_transaction_id` lived on the legacy rows |
-| Net-flow account, `Refund` signs negative | 0 | Simpler, but it erases the saldo a favor: a party's balance stops being "what they owe me" and becomes "net cash", which is the accounting claim decision 1 chose the `payments` family to make |
-| Leave the journal incomplete | +30 | The doc's own acceptance criterion fails and P5b cannot move `customer_balance` |
+- A `Cancel` entry that reverses what the annulled document charged.
+- A `Refund` entry for every refund delivery. **The purchase-cancel path already writes
+  it (`purchases.rs:1750`); the sales-cancel path is the one that is missing it.** The
+  supplier side is the template and the customer side is half-implemented, so "fix the
+  refund's sign" from the first reading of this section is retired in favour of "write
+  the entry the mirror path already writes".
+
+Checked against the scoreboard: 40/40/0 − 15 − 25 − 40 + 40 = **0**; 50 credit with 30
+collected → 50 − 30 − 50 + 30 = **0**; cash 30 → 30 − 30 − 30 + 30 = **0**; a credit
+note whose parent sale never wrote a `Charge` → −12 + 12 = **0**. All four agree with
+the business, and `k3_ac8` stays green rather than being relaxed.
+
+**One sub-decision P5a must settle, and it is why `Cancel` is not a one-line change:**
+`signed_amount` gives `Cancel` a FIXED negative sign, which reverses a `Charge`
+correctly. But annulling a CREDIT NOTE has to reverse a `Return` (also negative), so its
+compensating entry must be POSITIVE, and `Cancel` with a fixed sign cannot express that
+without being handed a negative magnitude — which breaks the "amount arrives positive"
+rule every writer in this family keeps. Either `Cancel` stays fixed-sign and an
+annulment of a return document uses `Charge` instead, or `Cancel` becomes a signed delta
+like `Adjust` (and `Adjust`'s own lesson in `AGENTS.md` — a negative delta is a
+legitimate increase — is the precedent). P5a must pick one and write the reason at the
+sign function, where the next reader will look for it.
 
 ## Relationship to the party ledger
 
@@ -636,12 +671,15 @@ decisions.
   of `odd/tasks/payment-method-single-account.md`.
 - 2026-10-09 — **P5 was re-scoped before any code was written: it is P5a (journal
   entries) + P5b (reads).** Exploration for P5 measured that the ledger, though
-  written by every path, does not close `balance == Σ residuals + unapplied`: an `Out`
-  refund signs POSITIVE for a customer, no production path writes
-  `PartyEntryKind::Cancel`, an applied credit is deliberately invisible to the
-  journal, and the legacy payment rows are still written on purpose as the crutch the
-  old reads lean on. See "P5 blocker" for the evidence and the open decision. The
-  one-file-per-commit slices are untouched; nothing was implemented.
+  written by every path, does not close `balance == Σ residuals + unapplied`: no
+  production path writes `PartyEntryKind::Cancel`, the sales-cancel refund writes no
+  entry while its purchase-cancel mirror writes one, an applied credit is deliberately
+  invisible to the journal, and the legacy payment rows are still written on purpose as
+  the crutch the old reads lean on. See "P5 blocker" for the evidence, the corrected
+  scoreboard and the `Cancel` sign sub-decision. A first revision of this section
+  blamed the sign of `Refund` and was wrong; the correction is recorded in place rather
+  than deleted, because the wrong version is the one a future reader will re-derive.
+  The one-file-per-commit slices are untouched; nothing was implemented.
 
 ## Resume here
 
@@ -652,12 +690,14 @@ decisions.
 2. **P5 is the next unit, and it is TWO: P5a (the journal entries) then P5b (the
    reads).** Read "P5 blocker" above before starting either: the ledger is written by
    every path but does not close the identity the reads depend on, so P5b cannot land
-   first without moving `customer_balance` onto a fold that is wrong for refunds and
-   cancelled documents. `unapplied_for_party` — the per-party sum of its `In`
-   deliveries' unapplied amounts — does not exist yet and is what P6 needs to show the
-   saldo a favor; it belongs to P5a because the identity is what it completes.
-   The `In`-only restriction is not a detail: an `Out` refund carries its whole
-   amount as "unapplied" and would count as available credit.
+   first without moving `customer_balance` onto a fold that loses the compensating side
+   of every annulment. The user chose the compensating entry on 2026-10-09, and the
+   correction to this section's first draft matters: it is two WRITES, not a sign
+   change. `unapplied_for_party` — the per-party sum of its `In` deliveries' unapplied
+   amounts — does not exist yet and is what P6 needs to show the saldo a favor; it
+   belongs to P5a because the identity is what it completes. The `In`-only restriction
+   is not a detail: an `Out` refund carries its whole amount as "unapplied" and would
+   count as available credit.
 3. **Expect three or four tests to fail on purpose when P5b lands, and they are not
    regressions.** They were written as the reminder: the most visible is
    `over_collection_becomes_the_customers_credit` (`src/services/customer_receipts.rs:1374`)
