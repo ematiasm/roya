@@ -94,6 +94,33 @@ pub trait PaymentRepository: Send + Sync {
         target_kind: PartyDocumentKind,
         target_id: i64,
     ) -> AppResult<Decimal>;
+
+    /// `charge + signed returns - allocations` for one Sale or Purchase. A negative
+    /// residual is returned as evidence of inconsistency (the allocation cap should
+    /// prevent it), not converted into an invented refusal.
+    async fn residual_for_document(
+        &self,
+        target_kind: PartyDocumentKind,
+        target_id: i64,
+    ) -> AppResult<Decimal>;
+
+    /// Caller-owned connection form: the allocation cap must see uncommitted rows.
+    async fn residual_for_document_in(
+        &self,
+        tx: &mut SqliteConnection,
+        target_kind: PartyDocumentKind,
+        target_id: i64,
+    ) -> AppResult<Decimal>;
+
+    /// Available credit for a party. Returns `AppResult<Decimal>` because when the
+    /// total cannot be stated safely, both the party page's saldo a favor and the
+    /// credit-limit projection must fail visibly, not show a partial balance. Each
+    /// bounded remainder is safely subtracted and their sum is checked as
+    /// `AggregateTooLarge`; bounded figures do not imply a bounded total. Only `In`
+    /// payments count: an unallocated `Out` refund would otherwise count its full
+    /// amount as false available credit.
+    async fn unapplied_for_party(&self, party_type: PartyType, party_id: i64)
+        -> AppResult<Decimal>;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +231,25 @@ where
     rows.into_iter().map(row_to_allocation).collect()
 }
 
+async fn allocated_to_target_raw<'e, E>(
+    executor: E,
+    target_kind: &str,
+    target_id: i64,
+) -> AppResult<Decimal>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT amount FROM payment_allocations WHERE target_kind = ? AND target_id = ? ORDER BY id",
+    )
+    .bind(target_kind)
+    .bind(target_id)
+    .fetch_all(executor)
+    .await?;
+    let amounts: Vec<Decimal> = rows.iter().map(|(amount,)| parse_decimal(amount)).collect();
+    checked_aggregate_sum(amounts.iter()).map_err(AppError::PriceRefused)
+}
+
 /// The cap check, shared by every write path so the rule has one home.
 ///
 /// Reads the payment and its shares on the SAME connection the caller holds, so
@@ -265,38 +311,27 @@ async fn assert_within_cap(
     Ok(())
 }
 
-/// How much a document still owes, as the legacy families compute it today.
+/// The shared document residual used by both reads and the allocation cap.
 ///
-/// This READS the parent document rather than becoming a second home for its money:
-/// until P5 moves the folds to the ledger, `due` is what `paid_and_due` derives from
-/// the document's own totals and its legacy payment rows, and asking for it here keeps
-/// the cap honest against the same figure every other read uses.
-///
-/// The totals are summed in RUST over the lines, never in SQL: they are derived
-/// (`qty * unit_price + tax_total`) and SQLite would do the arithmetic in REAL, which
-/// this project forbids for money.
-async fn target_residual_due(
+/// Document line totals are derived (`qty * price + tax_total`) and summed in Rust,
+/// never in SQL where SQLite would do money arithmetic in REAL. Signed Return ledger
+/// rows linked through the return-family parent reduce the charge; allocations then
+/// reduce it further.
+async fn residual_for_document_in(
     tx: &mut SqliteConnection,
     target_kind: PartyDocumentKind,
     target_id: i64,
 ) -> AppResult<Decimal> {
-    // `lines_sql` is the document's money; `applied_sql` is what is already applied
-    // to it. The second one reads `payment_allocations` and NOT the legacy payment
-    // tables, and that is the whole correctness of this cap: from P3 the allocations
-    // are the attribution, and reading the legacy rows instead counted the same money
-    // from two places — the first version of this function reported `due = 30` on a
-    // sale that had just been fully applied, and the cap therefore refused nothing.
-    let (lines_sql, applied_sql, missing): (&str, &str, AppError) = match target_kind {
+    // `lines_sql` supplies the one Rust-derived charge total. The linked signed
+    // Return entries below reduce it, and `payment_allocations` supplies the one
+    // attribution fold; the legacy payment tables are deliberately not consulted.
+    let (lines_sql, missing): (&str, AppError) = match target_kind {
         PartyDocumentKind::Sale => (
             "SELECT qty, unit_price, tax_total FROM sale_lines WHERE sale_id = ? ORDER BY id",
-            "SELECT amount FROM payment_allocations WHERE target_kind = 'Sale' AND target_id = ? \
-             ORDER BY id",
             AppError::NotFound(format!("sale {target_id} not found")),
         ),
         PartyDocumentKind::Purchase => (
             "SELECT qty, unit_cost, tax_total FROM purchase_lines WHERE purchase_id = ? ORDER BY id",
-            "SELECT amount FROM payment_allocations WHERE target_kind = 'Purchase' AND target_id = ? \
-             ORDER BY id",
             AppError::NotFound(format!("purchase {target_id} not found")),
         ),
         // A return family is not something money is APPLIED to: a refund replays a
@@ -327,19 +362,47 @@ async fn target_residual_due(
         return Err(missing);
     }
 
-    let paid_rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(applied_sql))
+    let (returns_sql, allocation_kind) = match target_kind {
+        PartyDocumentKind::Sale => (
+            "SELECT e.amount FROM party_ledger_entries e \
+             JOIN customer_returns r ON r.id = e.document_id \
+             WHERE e.kind = 'Return' AND e.document_kind = 'CustomerReturn' AND r.sale_id = ? \
+             ORDER BY e.id",
+            "Sale",
+        ),
+        PartyDocumentKind::Purchase => (
+            "SELECT e.amount FROM party_ledger_entries e \
+             JOIN purchase_returns r ON r.id = e.document_id \
+             WHERE e.kind = 'Return' AND e.document_kind = 'PurchaseReturn' AND r.purchase_id = ? \
+             ORDER BY e.id",
+            "Purchase",
+        ),
+        PartyDocumentKind::CustomerReturn | PartyDocumentKind::PurchaseReturn => unreachable!(),
+    };
+    let return_rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(returns_sql))
         .bind(target_id)
         .fetch_all(&mut *tx)
         .await?;
-    let mut paid = Decimal::ZERO;
-    for (amount,) in &paid_rows {
-        paid = checked_money_sum([paid, parse_decimal(amount)].iter())
-            .map_err(AppError::PriceRefused)?;
-    }
+    let signed_returns: Vec<Decimal> = return_rows
+        .iter()
+        .map(|(amount,)| parse_decimal(amount))
+        .collect();
+    let returns = checked_aggregate_sum(signed_returns.iter()).map_err(AppError::PriceRefused)?;
+    let charge_after_returns =
+        checked_money_sum([total, returns].iter()).map_err(AppError::PriceRefused)?;
 
-    total
-        .checked_sub(paid)
+    let allocated = allocated_to_target_raw(&mut *tx, allocation_kind, target_id).await?;
+    charge_after_returns
+        .checked_sub(allocated)
         .ok_or_else(|| AppError::PriceRefused(crate::models::PriceRefusal::DocumentTotalTooLarge))
+}
+
+async fn target_residual_due(
+    tx: &mut SqliteConnection,
+    target_kind: PartyDocumentKind,
+    target_id: i64,
+) -> AppResult<Decimal> {
+    residual_for_document_in(tx, target_kind, target_id).await
 }
 
 /// Does the parent document exist? Asked only when it has no lines, so the ordinary
@@ -514,16 +577,54 @@ impl PaymentRepository for SqlitePaymentRepository {
         target_kind: PartyDocumentKind,
         target_id: i64,
     ) -> AppResult<Decimal> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT amount FROM payment_allocations WHERE target_kind = ? AND target_id = ? \
-             ORDER BY id",
+        allocated_to_target_raw(&self.pool, &target_kind.to_string(), target_id).await
+    }
+
+    async fn residual_for_document(
+        &self,
+        target_kind: PartyDocumentKind,
+        target_id: i64,
+    ) -> AppResult<Decimal> {
+        let mut tx = self.pool.begin().await?;
+        let residual = residual_for_document_in(&mut tx, target_kind, target_id).await?;
+        tx.commit().await?;
+        Ok(residual)
+    }
+
+    async fn residual_for_document_in(
+        &self,
+        tx: &mut SqliteConnection,
+        target_kind: PartyDocumentKind,
+        target_id: i64,
+    ) -> AppResult<Decimal> {
+        residual_for_document_in(tx, target_kind, target_id).await
+    }
+
+    async fn unapplied_for_party(
+        &self,
+        party_type: PartyType,
+        party_id: i64,
+    ) -> AppResult<Decimal> {
+        let rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT id, amount FROM payments \
+             WHERE party_type = ? AND party_id = ? AND direction = 'In' ORDER BY id",
         )
-        .bind(target_kind.to_string())
-        .bind(target_id)
+        .bind(party_type.to_string())
+        .bind(party_id)
         .fetch_all(&self.pool)
         .await?;
-        let sums: Vec<Decimal> = rows.iter().map(|r| parse_decimal(&r.0)).collect();
-        checked_aggregate_sum(sums.iter()).map_err(AppError::PriceRefused)
+        let mut remainders = Vec::with_capacity(rows.len());
+        for (payment_id, amount) in rows {
+            let delivered = parse_decimal(&amount);
+            let allocations = list_allocations_raw(&self.pool, payment_id).await?;
+            let allocated = checked_aggregate_sum(allocations.iter().map(|a| &a.amount))
+                .map_err(AppError::PriceRefused)?;
+            let remainder = delivered.checked_sub(allocated).ok_or_else(|| {
+                AppError::PriceRefused(crate::models::PriceRefusal::AggregateTooLarge)
+            })?;
+            remainders.push(remainder);
+        }
+        checked_aggregate_sum(remainders.iter()).map_err(AppError::PriceRefused)
     }
 }
 
@@ -1056,6 +1157,167 @@ mod tests {
     /// The two shapes share ONE copy of the statement, and the pool form is the
     /// unit form wrapped in BEGIN/COMMIT — the property that stops the two from
     /// drifting on how a row is written.
+    #[tokio::test]
+    async fn residual_for_document_starts_at_the_sale_total_and_falls_by_allocations() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        assert_eq!(
+            repo.residual_for_document(PartyDocumentKind::Sale, sale)
+                .await
+                .unwrap(),
+            Decimal::from_str("100").unwrap()
+        );
+
+        let payment = seed_payment(&pool, "40").await;
+        repo.allocate(&allocation(payment, sale, "37"))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.residual_for_document(PartyDocumentKind::Sale, sale)
+                .await
+                .unwrap(),
+            Decimal::from_str("63").unwrap()
+        );
+
+        // The one-connection fixture proves this read stays on the caller's unit:
+        // see a share written in this still-open transaction without asking the pool.
+        let another_payment = seed_payment(&pool, "10").await;
+        let mut tx = pool.begin().await.unwrap();
+        repo.allocate_in(&mut tx, &allocation(another_payment, sale, "10"))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.residual_for_document_in(&mut tx, PartyDocumentKind::Sale, sale)
+                .await
+                .unwrap(),
+            Decimal::from_str("53").unwrap()
+        );
+        tx.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_credit_note_return_lowers_its_parent_sale_residual() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        let customer: i64 = sqlx::query_scalar("SELECT customer_id FROM sales WHERE id = ?")
+            .bind(sale)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let returned: i64 = sqlx::query_scalar(
+            "INSERT INTO customer_returns (customer_id, sale_id, status, return_date, created_by) \
+             VALUES (?, ?, 'Confirmed', '2024-05-02', ?) RETURNING id",
+        )
+        .bind(customer)
+        .bind(sale)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Mirrors customer_return.rs:697: one signed Return ledger entry names the return document.
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, created_by) \
+             VALUES ('Customer', ?, 'Return', '-25', 'CustomerReturn', ?, '2024-05-02', ?)",
+        )
+        .bind(customer)
+        .bind(returned)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        assert_eq!(
+            repo.residual_for_document(PartyDocumentKind::Sale, sale)
+                .await
+                .unwrap(),
+            Decimal::from_str("75").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_out_refund_does_not_count_as_available_credit_for_the_party() {
+        let pool = test_pool().await;
+        let payment = seed_payment(&pool, "45").await;
+        sqlx::query("UPDATE payments SET direction = 'Out' WHERE id = ?")
+            .bind(payment)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        assert_eq!(
+            repo.unapplied_for_party(PartyType::Customer, 1)
+                .await
+                .unwrap(),
+            Decimal::ZERO,
+            "an unallocated refund is not credit held for the party"
+        );
+    }
+
+    #[tokio::test]
+    async fn unapplied_for_party_sums_unallocated_in_payments() {
+        let pool = test_pool().await;
+        seed_payment(&pool, "12.5").await;
+        seed_payment(&pool, "7.25").await;
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        assert_eq!(
+            repo.unapplied_for_party(PartyType::Customer, 1)
+                .await
+                .unwrap(),
+            Decimal::from_str("19.75").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn allocation_cap_uses_credit_note_reduced_residual_without_widening_it() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        let customer: i64 = sqlx::query_scalar("SELECT customer_id FROM sales WHERE id = ?")
+            .bind(sale)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let returned: i64 = sqlx::query_scalar(
+            "INSERT INTO customer_returns (customer_id, sale_id, status, return_date, created_by) \
+             VALUES (?, ?, 'Confirmed', '2024-05-02', ?) RETURNING id",
+        )
+        .bind(customer)
+        .bind(sale)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Mirrors customer_return.rs:697: the signed ledger entry is linked to the return.
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, created_by) \
+             VALUES ('Customer', ?, 'Return', '-25', 'CustomerReturn', ?, '2024-05-02', ?)",
+        )
+        .bind(customer)
+        .bind(returned)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        let payment = seed_payment(&pool, "100").await;
+        repo.allocate(&allocation(payment, sale, "75"))
+            .await
+            .unwrap();
+        let err = repo
+            .allocate(&allocation(seed_payment(&pool, "100").await, sale, "1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(err.to_string().contains("owes 0"), "got {err}");
+    }
+
     #[tokio::test]
     async fn the_public_allocate_writes_exactly_what_the_in_form_writes() {
         let pool = test_pool().await;
