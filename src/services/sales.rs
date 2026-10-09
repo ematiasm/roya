@@ -71,7 +71,7 @@ use crate::services::{checked_money_add, checked_money_sum, CustomerService};
 pub const DEBT_BANNER_LIMIT: usize = 5;
 
 #[derive(Clone)]
-pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
+pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -85,6 +85,7 @@ where
     CR: CustomerRepository,
     TS: crate::repositories::TaxSnapshotRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub sales: SR,
     pub sequences: DR,
@@ -107,10 +108,15 @@ where
     /// rows, so an entry that committed separately from its document would be a
     /// balance that moved without a document, or a document with no balance.
     pub party_ledger: PL,
+    /// The `payments` family (P3): the delivery-of-money document, its shares and
+    /// its cap. A second field rather than folding it into `party_ledger`, because
+    /// they are two tables with two rules: the journal is append-only and the
+    /// balance IS its fold, while a payment's shares are mutable and capped.
+    pub payments: PY,
 }
 
-impl<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
-    SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
+impl<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
+    SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -124,6 +130,7 @@ where
     CR: CustomerRepository,
     TS: crate::repositories::TaxSnapshotRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub fn new(
         sales: SR,
@@ -135,6 +142,7 @@ where
         tax_snapshots: TS,
         enforce_credit_limit: bool,
         party_ledger: PL,
+        payments: PY,
     ) -> Self {
         Self {
             sales,
@@ -146,6 +154,7 @@ where
             customers,
             enforce_credit_limit,
             party_ledger,
+            payments,
         }
     }
 
@@ -1473,6 +1482,20 @@ where
         if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
             let account_id = cash_account_id.unwrap();
             let method_id = cash_method_id.unwrap();
+            // The cash tender is a DELIVERY of money like any other (decision 5),
+            // so it gets its own `payments` document and its movement is stamped
+            // with THAT number. The sale keeps its own number for the document and
+            // for the ledger entry; the cash row names what actually arrived.
+            //
+            // This is what makes `confirm` (cash) and `record_payment` write the
+            // same shape instead of two: before P3 one stamped the movement with
+            // the sale and the other would have stamped it with the payment.
+            let pay_year = sale.sale_date.year();
+            let pay_seq = self
+                .sequences
+                .next_number_in(&mut tx, "PAYMENT", pay_year)
+                .await?;
+            let cash_payment_number = crate::models::format_payment_number(pay_year, pay_seq);
             let income = self
                 .transactions
                 .create_with_reference_in(
@@ -1481,8 +1504,11 @@ where
                     account_id,
                     crate::models::TransactionKind::Income,
                     total,
+                    // `description` is the human label on a statement: the SALE.
                     Some(sale_number.clone()),
-                    Some(sale_number.clone()),
+                    // `reference` is the document the money is traceable to: the
+                    // DELIVERY this confirm created.
+                    Some(cash_payment_number.clone()),
                     sale.sale_date,
                 )
                 .await?;
@@ -1497,6 +1523,39 @@ where
                     sale.sale_date,
                     Some(income.id),
                     None,
+                )
+                .await?;
+
+            // The delivery document for the tender, with the sale as its one share.
+            let cash_payment = self
+                .payments
+                .create_in(
+                    &mut tx,
+                    &crate::models::NewPayment {
+                        number: cash_payment_number.clone(),
+                        direction: crate::models::PaymentDirection::In,
+                        party_type: crate::models::PartyType::Customer,
+                        party_id: sale.customer_id,
+                        method_id,
+                        account_id,
+                        amount: total,
+                        date: sale.sale_date,
+                        notes: None,
+                        transaction_id: Some(income.id),
+                        created_by: actor,
+                    },
+                )
+                .await?;
+            self.payments
+                .allocate_in(
+                    &mut tx,
+                    &crate::models::NewPaymentAllocation {
+                        payment_id: cash_payment.id,
+                        target_kind: crate::models::PartyDocumentKind::Sale,
+                        target_id: sale_id,
+                        amount: total,
+                        created_by: actor,
+                    },
                 )
                 .await?;
         }
@@ -1588,10 +1647,27 @@ where
             .await
     }
 
-    /// Record a payment on one sale. `receipt_id` groups the payment under the
-    /// customer receipt a collection produced; `None` is a direct payment on a
-    /// single sale. Either way the payment posts its own Income and keeps its
-    /// `transaction_id`; the receipt never posts a movement of its own.
+    /// Record a payment on one sale, ALL of it inside one unit (P3 of
+    /// `odd/tasks/payment-allocation.md`).
+    ///
+    /// **What this fixes.** Before P3 this method posted the `Income` in one unit
+    /// and the payment row in a second (the defect the payment-allocation plan
+    /// records as flow 5: "a failure between the two leaves cash in the box with no
+    /// document behind it"). A live defect, not a hypothetical one. Every write is
+    /// an `_in` form now and the unit opens immediately after the pre-checks, so a
+    /// failure anywhere leaves neither the money nor the row.
+    ///
+    /// **What it writes.** The delivery of money is a `payments` document with its
+    /// own number (decision 1), the ONE cash movement it produced (decision 5), one
+    /// allocation naming the sale it covers, and one `Payment` ledger entry
+    /// (decision 6: one entry per payment DOCUMENT, not per invoice). The legacy
+    /// `sale_payments` row is still written, because the reads have not moved yet
+    /// (that is P5) and dropping it now would break every list that shows a sale's
+    /// payments. Two homes for one fact is a P3 cost, named here so P5/P8 settle it.
+    ///
+    /// The account is DERIVED from the method, never stated, so the (account,
+    /// method) pair cannot disagree with itself — migration 44's guard, and from
+    /// migration 46 the same guard on `payments`.
     pub async fn record_payment_with_receipt(
         &self,
         actor: i64,
@@ -1635,22 +1711,107 @@ where
             .sale_number
             .clone()
             .ok_or_else(|| AppError::Internal("confirmed sale missing sale_number".into()))?;
-        // Each payment generates one M0 Income stamped with reference =
-        // sale_number and linked from the payment row it produced.
+        let _ = sale_number;
+
+        // ---- THE WRITE UNIT -------------------------------------------------
+        //
+        // Every read above is a pre-check: it buys an EARLY refusal with a useful
+        // message rather than reachability. The unit opens here, after all of them,
+        // and everything from the number to the legacy row commits or rolls back
+        // together.
+        let mut tx = self.sales.pool().begin().await?;
+
+        // 1. The document number, from the no-gap sequence and INSIDE the unit, so
+        // a failure below returns the number instead of burning it.
+        let year = date.year();
+        let seq = self
+            .sequences
+            .next_number_in(&mut tx, "PAYMENT", year)
+            .await?;
+        let payment_number = crate::models::format_payment_number(year, seq);
+
+        // 2. The cash movement. ONE per delivery (decision 5), stamped with the
+        // payment's own number rather than the sale's: the money arrived once and
+        // may cover several documents.
         let income = self
             .transactions
-            .create_with_reference(
+            .create_with_reference_in(
+                &mut tx,
                 actor,
                 account_id,
                 crate::models::TransactionKind::Income,
                 amount,
+                // `description` is the sale on this path (the money is collected
+                // against ONE sale); `reference` is the delivery, which is what the
+                // movement is traceable to.
                 Some(sale_number.clone()),
-                Some(sale_number),
+                Some(payment_number.clone()),
                 date,
             )
             .await?;
-        self.sales
-            .create_payment(
+
+        // 3. The payment document, carrying the movement it produced.
+        let payment = self
+            .payments
+            .create_in(
+                &mut tx,
+                &crate::models::NewPayment {
+                    number: payment_number.clone(),
+                    direction: crate::models::PaymentDirection::In,
+                    party_type: crate::models::PartyType::Customer,
+                    party_id: sale.customer_id,
+                    method_id,
+                    account_id,
+                    amount,
+                    date,
+                    notes: None,
+                    transaction_id: Some(income.id),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        // 4. The share naming which document this money covers. The cap lives in
+        // the repository (`allocate_in`), which reads the payment and its shares on
+        // THIS connection, so it sees what this unit has already written.
+        self.payments
+            .allocate_in(
+                &mut tx,
+                &crate::models::NewPaymentAllocation {
+                    payment_id: payment.id,
+                    target_kind: crate::models::PartyDocumentKind::Sale,
+                    target_id: sale_id,
+                    amount,
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        // 5. The party ledger, one entry per payment DOCUMENT (decision 6). The
+        // balance stays one fold; the per-document residual comes from step 4.
+        self.party_ledger
+            .insert_in(
+                &mut tx,
+                &crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Customer,
+                    party_id: sale.customer_id,
+                    kind: crate::models::PartyEntryKind::Payment,
+                    amount: crate::models::PartyEntryKind::Payment.signed_amount(amount),
+                    document_kind: crate::models::PartyDocumentKind::Sale,
+                    document_id: sale_id,
+                    entry_date: date,
+                    reference: Some(payment_number.clone()),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        // 6. The legacy row, until P5 moves the reads. Still `_in`, still the same
+        // unit, so the two homes of the same fact cannot disagree.
+        let legacy = self
+            .sales
+            .create_payment_in(
+                &mut tx,
                 actor,
                 sale_id,
                 account_id,
@@ -1664,8 +1825,8 @@ where
             .map_err(|e| match e {
                 // The database trigger refuses a payment grouped under another
                 // customer's receipt. Surfacing it as a Validation keeps the
-                // interface's contract a clean 400 even if a future caller passes a
-                // receipt id directly; no route offers that path.
+                // interface's contract a clean 400 even if a future caller passes
+                // a receipt id directly; no route offers that path.
                 AppError::Database(ref db)
                     if db.to_string().contains("another customer's receipt") =>
                 {
@@ -1675,7 +1836,10 @@ where
                     )
                 }
                 other => other,
-            })
+            })?;
+
+        tx.commit().await?;
+        Ok(legacy)
     }
 
     // -- Cancel / Return -----------------------------------------------------------
@@ -1898,7 +2062,10 @@ mod tests {
         SqliteSaleRepository, SqliteStockMovementRepository, SqliteTaxSnapshotRepository,
         SqliteTransactionRepository, TaxRepository,
     };
-    use crate::repositories::{PartyLedgerRepository, SqlitePartyLedgerRepository};
+    use crate::repositories::{
+        PartyLedgerRepository, PaymentRepository, SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
+    };
     use crate::security::test_support;
     use crate::services::{CustomerService, InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -1933,6 +2100,7 @@ mod tests {
         SqliteCustomerRepository,
         SqliteTaxSnapshotRepository,
         SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
     >;
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -2003,6 +2171,7 @@ mod tests {
             SqliteTaxSnapshotRepository::new(pool.clone()),
             enforce_credit_limit,
             SqlitePartyLedgerRepository::new(pool.clone()),
+            SqlitePaymentRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -3565,6 +3734,174 @@ mod tests {
         assert_eq!(d.paid, Decimal::ZERO);
     }
 
+    // -- P3: the delivery of money is one unit -----------------------------------
+
+    /// **THE test for P3a: the live atomicity defect.**
+    ///
+    /// Before P3, `record_payment` posted the `Income` in one unit and the payment
+    /// row in a second, so a failure between them left cash in the box with no
+    /// document behind it — flow 5 of the payment-allocation plan, a live defect
+    /// rather than a hypothetical one. The failure is injected AFTER the movement
+    /// and before the document, which is exactly the window that used to leak.
+    #[tokio::test]
+    async fn a_failure_after_the_movement_rolls_the_whole_delivery_back() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "P3-ATOMIC", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "p3-atomic").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("3"), None)
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        let tx_before = tx_count(&pool).await;
+
+        // The window: the money is already written, the document is not.
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_payment_document_failure BEFORE INSERT ON payments \
+             BEGIN SELECT RAISE(ABORT, 'injected failure between the cash row and the payment'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .record_payment(audit_actor(&s).await, sale.id, cash, dec("10"), sale_date())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+
+        // NOTHING survived: not the movement, not the legacy row, not the document,
+        // not the ledger entry, and the sale still shows no payment.
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the Income must die with the unit that wrote it"
+        );
+        let payments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(payments, 0);
+        let legacy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sale_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(legacy, 0, "the legacy row is in the same unit");
+        let entries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM party_ledger_entries WHERE kind = 'Payment'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(entries, 0);
+        assert_eq!(
+            s.get_detail(sale.id).await.unwrap().paid,
+            Decimal::ZERO,
+            "and the sale shows nothing paid"
+        );
+        // The number was not burned either: the sequence row only commits with the
+        // unit, so a retry takes the FIRST number.
+        let last: Option<i64> =
+            sqlx::query_scalar("SELECT last_number FROM doc_sequences WHERE doc_type = 'PAYMENT'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last, None, "a rolled-back delivery returns its number");
+    }
+
+    /// A successful direct payment writes the document, its share, its ledger entry
+    /// and the legacy row — all four, and the money moves exactly once.
+    #[tokio::test]
+    async fn a_direct_payment_writes_the_document_its_share_and_one_movement() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "P3-SHAPE", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "p3-shape").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("3"), None)
+            .await
+            .unwrap(); // total 30
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        let tx_before = tx_count(&pool).await;
+
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+
+        // ONE movement for the delivery, not one per document it covers.
+        assert_eq!(tx_count(&pool).await, tx_before + 1);
+
+        let payment = s
+            .payments
+            .list_for_party(crate::models::PartyType::Customer, CREDIT_CUSTOMER_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the delivery is a document");
+        assert_eq!(payment.amount, dec("20"));
+        assert_eq!(payment.direction, crate::models::PaymentDirection::In);
+        assert!(
+            payment.transaction_id.is_some(),
+            "and it names its movement"
+        );
+
+        // Its share names the sale, and it is exactly what the payment delivered.
+        let shares = s.payments.list_allocations(payment.id).await.unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(
+            shares[0].target_kind,
+            crate::models::PartyDocumentKind::Sale
+        );
+        assert_eq!(shares[0].target_id, sale.id);
+        assert_eq!(shares[0].amount, dec("20"));
+        assert_eq!(
+            s.payments.unapplied_for_payment(payment.id).await.unwrap(),
+            Decimal::ZERO,
+            "the whole delivery was applied"
+        );
+
+        // And the sale's residual is what the document says.
+        let detail = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(detail.paid, dec("20"));
+        assert_eq!(detail.due, dec("10"));
+    }
+
     // -- the party ledger (T2) ---------------------------------------------------
 
     /// The journal rows of one document, oldest first, as the sign rule stored
@@ -3799,7 +4136,23 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, tx_id);
-        assert_eq!(rows[0].reference.as_deref(), Some(number.as_str()));
+        // P3 (decision 5): the cash row is stamped with the DELIVERY's number.
+        // `description` still carries the sale, which is the human label on a
+        // statement; the reference is the document the money is traceable to.
+        assert!(
+            rows[0]
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "the cash confirm's movement is stamped with the delivery it created, got {:?}",
+            rows[0].reference
+        );
+        assert_ne!(
+            rows[0].reference.as_deref(),
+            Some(number.as_str()),
+            "and NOT with the sale number, which is the document's own"
+        );
         assert_eq!(rows[0].description, number);
     }
 
@@ -3856,7 +4209,25 @@ mod tests {
             .unwrap();
         let income = rows.iter().find(|t| t.id == paid_tx_id).unwrap();
         assert_eq!(income.kind, crate::models::TransactionKind::Income);
-        assert_eq!(income.reference.as_deref(), Some(number.as_str()));
+        // P3 (decision 5): the movement is stamped with the DELIVERY's number, not
+        // the sale's. The money arrived once and may cover several documents, so the
+        // cash row names the payment; the sale is named by the allocation and by the
+        // ledger entry. One movement, one document — the payment.
+        let payment_number = s
+            .payments
+            .list_for_party(crate::models::PartyType::Customer, sale.customer_id)
+            .await
+            .unwrap()
+            .first()
+            .expect("the payment document exists")
+            .number
+            .clone();
+        assert_eq!(income.reference.as_deref(), Some(payment_number.as_str()));
+        assert_ne!(
+            income.reference.as_deref(),
+            Some(number.as_str()),
+            "the sale number is no longer what the cash row is stamped with"
+        );
 
         s.cancel(audit_actor(&s).await, sale.id, Some("refund".into()))
             .await
@@ -3959,9 +4330,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .all(|t| t.reference.as_deref() == Some(number.as_str())));
+        // P3 (decision 5): each movement names the DELIVERY it belongs to, so two
+        // payments on one sale carry two different references. The sale is the
+        // allocation's and the ledger entry's subject, not the cash row's.
+        let refs: Vec<Option<String>> = rows.iter().map(|t| t.reference.clone()).collect();
+        assert!(
+            refs.iter()
+                .all(|r| r.as_deref().map(|n| n.contains("-PAY-")).unwrap_or(false)),
+            "every payment movement is stamped with a payment number, got {refs:?}"
+        );
+        assert_ne!(
+            refs[0], refs[1],
+            "two deliveries are two documents, so their cash rows cannot share a reference"
+        );
+        let _ = number;
     }
 
     #[tokio::test]
@@ -4013,7 +4395,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.description, "edited by hand");
-        assert_eq!(updated.reference.as_deref(), Some(number.as_str()));
+        // P3: the reference names the DELIVERY document, and editing the free-text
+        // description must leave that link exactly as it was.
+        assert!(
+            updated
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "the movement keeps the delivery's number, got {:?}",
+            updated.reference
+        );
+        assert_ne!(
+            updated.reference.as_deref(),
+            Some(number.as_str()),
+            "editing the description must not re-stamp it with the sale"
+        );
         assert_eq!(
             s.sales.list_payments(sale.id).await.unwrap()[0].transaction_id,
             Some(tx_id)

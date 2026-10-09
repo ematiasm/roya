@@ -41,11 +41,12 @@ use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteBusinessConfigurationRepository,
     SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
     SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqlitePartyLedgerRepository,
-    SqlitePaymentMethodRepository, SqliteProductRepository, SqliteProductSupplierCostRepository,
-    SqliteProductTaxRepository, SqlitePurchaseRepository, SqlitePurchaseReturnRepository,
-    SqliteRoleRepository, SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
-    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxRepository,
-    SqliteTaxSnapshotRepository, SqliteTransactionRepository, SqliteUserRepository,
+    SqlitePaymentMethodRepository, SqlitePaymentRepository, SqliteProductRepository,
+    SqliteProductSupplierCostRepository, SqliteProductTaxRepository, SqlitePurchaseRepository,
+    SqlitePurchaseReturnRepository, SqliteRoleRepository, SqliteSaleRepository,
+    SqliteSessionRepository, SqliteSetupRepository, SqliteStockMovementRepository,
+    SqliteSupplierRepository, SqliteTaxRepository, SqliteTaxSnapshotRepository,
+    SqliteTransactionRepository, SqliteUserRepository,
 };
 use crate::routes::setup_web::setup_gate;
 use crate::security::auth_middleware;
@@ -77,6 +78,7 @@ pub type SalesSvc = SalesService<
     SqliteCustomerRepository,
     SqliteTaxSnapshotRepository,
     SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
@@ -107,6 +109,7 @@ pub type ReceiptSvc = CustomerReceiptService<
     SqliteCustomerRepository,
     SqliteTaxSnapshotRepository,
     SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
@@ -440,6 +443,8 @@ impl AppState {
             enforce_credit_limit,
             // T2: the customer journal `confirm` appends to, over the same pool.
             SqlitePartyLedgerRepository::new(pool.clone()),
+            // P3: the delivery-of-money document `record_payment` writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         // M4: collections group the payments one handover of money produced; the
         // receipt service composes the same sales service and the finance-owned

@@ -1783,7 +1783,14 @@ async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
     );
     assert_eq!(txs[0]["kind"], json!("Income"));
     assert_eq!(txs[0]["id"].as_i64(), Some(payment_tx));
-    assert_eq!(txs[0]["reference"].as_str(), Some(sale_number.as_str()));
+    // P3 (decision 5): the movement is stamped with the DELIVERY's number, not the
+    // sale's — the money arrived once and may cover several documents.
+    let reference = txs[0]["reference"].as_str().expect("a reference");
+    assert!(
+        reference.contains("-PAY-"),
+        "the cash confirm's movement names its delivery, got {reference}"
+    );
+    assert_ne!(reference, sale_number.as_str());
     assert_eq!(dec(&txs[0]["amount"]), Decimal::from(75));
 
     // The rendered list fragment shows the confirmed, paid sale.
@@ -1832,7 +1839,11 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0]["kind"], json!("Income"));
     assert_eq!(dec(&txs[0]["amount"]), Decimal::from(30));
-    assert_eq!(txs[0]["reference"].as_str(), Some(sale_number.as_str()));
+    // P3 (decision 5): a collection's movement names the DELIVERY, and the sale is
+    // the description on the same row.
+    let reference = txs[0]["reference"].as_str().expect("a reference");
+    assert!(reference.contains("-PAY-"), "got {reference}");
+    assert_ne!(reference, sale_number.as_str());
 
     // Overpaying is rejected without touching finance.
     let (status, body) = pay_sale_via_web(&app, sale, cash, "30").await;
@@ -2472,28 +2483,61 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
     // route accepts `refund_transaction_id`. The global claim below keeps the
     // invariant honest even then.
     let mut owners: HashMap<i64, String> = HashMap::new();
-    let sale_links: Vec<(i64, Option<i64>, Option<i64>, i64, String, Option<String>)> =
-        sqlx::query_as(
-            "SELECT sp.id, sp.transaction_id, sp.refund_transaction_id, sp.account_id, sp.amount, s.sale_number
+    // P3 (decision 5): a movement is traceable to the DELIVERY it belongs to, not
+    // to the document the money pays for. So the expected reference is the payment
+    // number, read from the `payments` row whose movement this is — which is also a
+    // stronger invariant than the old sale-number comparison, because it checks the
+    // delivery EXISTS rather than that a string matches.
+    //
+    // The sale number stays on the row as the DESCRIPTION (the human label), so the
+    // sale-side facts below still assert what they always did.
+    let sale_links: Vec<(
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT sp.id, sp.transaction_id, sp.refund_transaction_id, sp.account_id, sp.amount,
+                    s.sale_number,
+                    (SELECT p.number FROM payments p WHERE p.transaction_id = sp.transaction_id)
              FROM sale_payments sp JOIN sales s ON s.id = sp.sale_id",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    for (payment_id, transaction_id, refund_transaction_id, account_id, amount_text, sale_number) in
-        sale_links
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (
+        payment_id,
+        transaction_id,
+        refund_transaction_id,
+        account_id,
+        amount_text,
+        sale_number,
+        delivered_number,
+    ) in sale_links
     {
         let sale_number = sale_number.ok_or_else(|| {
             format!("sale payment {payment_id} belongs to a sale without a number")
         })?;
+        // What the ORIGINAL movement must be stamped with: the delivery's number.
+        // The sale number is only the fallback, so a row with no delivery at all
+        // still fails with a message about the link rather than about a string.
+        let movement_reference = delivered_number.as_deref().unwrap_or(&sale_number);
         let transaction_id = transaction_id
             .ok_or_else(|| format!("sale payment {payment_id} has no transaction_id"))?;
         let payment_amount = Decimal::from_str(&amount_text).map_err(|e| {
             format!("sale payment {payment_id} has invalid amount {amount_text}: {e}")
         })?;
-        let original =
-            check_original_transaction(pool, "sale", payment_id, transaction_id, &sale_number)
-                .await?;
+        let original = check_original_transaction(
+            pool,
+            "sale",
+            payment_id,
+            transaction_id,
+            movement_reference,
+        )
+        .await?;
         claim_transaction(
             &mut owners,
             transaction_id,
@@ -2588,20 +2632,29 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
     }
 
     // Orphan movements: every transaction whose reference looks like a document
-    // number must be claimed by some payment, as original or refund. A failure
-    // between creating the movement and inserting the payment row leaves one of
-    // these (the project deliberately does not share transactions across
-    // modules), and nothing else would notice it. Manual transactions keep a
-    // NULL reference and stay exempt.
+    // number must be claimed by some payment, as original or refund.
+    //
+    // **THE GLOB HAD TO GROW, and its growth is the point.** Before P3 the pattern
+    // knew only `-SALE-` and `-PURCH-`, because those were the only families a
+    // movement was ever stamped with. From P3 a movement is stamped with the
+    // DELIVERY it belongs to (`-PAY-`), so the old pattern silently matched nothing
+    // and this check became a no-op that still reported success — the worst failure
+    // mode a guard has. The families are listed explicitly, in one place, so adding
+    // a fourth means touching this line instead of quietly losing coverage.
+    //
+    // `-SRET-` and `-PRET-` stay out of it on purpose: a return's credit note does
+    // not post a movement of its own, so a row carrying one has nothing to claim.
     let orphans: Vec<(i64,)> = sqlx::query_as(
         "SELECT t.id FROM transactions t \
          WHERE t.reference IS NOT NULL \
-           AND (t.reference GLOB '[0-9][0-9][0-9][0-9]-SALE-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+           AND (t.reference GLOB '[0-9][0-9][0-9][0-9]-PAY-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+             OR t.reference GLOB '[0-9][0-9][0-9][0-9]-SALE-[0-9][0-9][0-9][0-9][0-9][0-9]' \
              OR t.reference GLOB '[0-9][0-9][0-9][0-9]-PURCH-[0-9][0-9][0-9][0-9][0-9][0-9]') \
            AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
                            WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id) \
            AND NOT EXISTS (SELECT 1 FROM purchase_payments pp \
                            WHERE pp.transaction_id = t.id OR pp.refund_transaction_id = t.id) \
+           AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.transaction_id = t.id) \
          ORDER BY t.id",
     )
     .fetch_all(pool)
@@ -2610,7 +2663,7 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
     if !orphans.is_empty() {
         let ids: Vec<i64> = orphans.into_iter().map(|(id,)| id).collect();
         return Err(format!(
-            "transactions with a document reference are claimed by no payment: {ids:?} (every document movement must be linked as transaction_id or refund_transaction_id)"
+            "transactions with a document reference are claimed by no payment: {ids:?} (every document movement must be linked as transaction_id or refund_transaction_id, or be the movement of a payments row)"
         ));
     }
     Ok(())
@@ -2695,10 +2748,17 @@ async fn check_original_transaction(
     Ok(tx)
 }
 
-/// A refund must reverse its own payment: same document reference, the payment's
-/// account, the opposite kind of the original transaction and the payment amount.
-/// The reference alone is not enough because every payment of a document shares
-/// it, so a cross-payment swap would otherwise pass.
+/// A refund must reverse its own payment: the payment's account, the opposite kind
+/// of the original transaction and the payment amount.
+///
+/// **The reference is deliberately NOT compared to the original's.** It used to be,
+/// back when both named the document; under P3 (decision 5) the original names the
+/// DELIVERY and the refund names the document it reverses, so the two are different
+/// by design and comparing them would fail every healthy fixture. The identity a
+/// claim needs comes from the other three facts plus [`claim_transaction`]'s
+/// exactly-one-owner map — which was already the part that made a cross-payment
+/// swap fail, as the original comment admitted ("the reference alone is not
+/// enough").
 #[allow(clippy::too_many_arguments)]
 async fn check_refund_transaction(
     pool: &SqlitePool,
@@ -2711,10 +2771,12 @@ async fn check_refund_transaction(
     original: &MoneyTransaction,
 ) -> Result<(), String> {
     let refund = fetch_money_transaction(pool, label, payment_id, refund_id).await?;
-    if refund.reference.as_deref() != Some(document_number) {
+    // A refund must still BE traceable to a document — a movement with no reference
+    // at all is the anomaly this invariant exists for. It just does not have to name
+    // the same DOCUMENT as the original: the original names the delivery.
+    if refund.reference.is_none() {
         return Err(format!(
-            "{label} payment {payment_id} refund transaction {refund_id} reference {:?} != document {document_number:?}",
-            refund.reference
+            "{label} payment {payment_id} refund transaction {refund_id} carries no reference at all"
         ));
     }
     if refund.account_id != payment_account_id {
@@ -3561,10 +3623,21 @@ async fn money_invariant_catches_equal_amount_pointer_swaps() {
 }
 
 /// The payment-traceability invariant must also see movements that no payment
-/// claims: a failure between creating the finance movement and inserting the
-/// payment leaves an orphan Income that inflates the account while the sale
-/// stays unpaid. The collection is deliberately not transactional across
-/// modules, so the invariant detects the residual instead.
+/// claims, because that is what an unlinked movement looks like: an Income that
+/// inflates the account while no document behind it exists.
+///
+/// **The fixture changed, and the change is the finding.** It used to inject a
+/// failure on the `sale_payments` INSERT and then look for the movement the
+/// aborted payment had already committed — that is, it relied on the very defect P3
+/// closed. With one unit, that trigger now aborts the whole delivery and takes the
+/// movement with it, so the "orphan" the old fixture hunted cannot be produced by
+/// the application at all.
+///
+/// Which is the stronger statement, and it is two assertions instead of one: the
+/// injected failure leaves NOTHING (proved in `services::sales`, and again below),
+/// and the invariant still catches a hand-written orphan. The orphan is therefore
+/// created the only way it can still happen — direct SQL, exactly the threat model
+/// migration 44 and the cap trigger also answer to.
 #[tokio::test]
 async fn money_invariant_catches_orphan_document_movement() {
     let (app, pool) = test_app().await;
@@ -3580,7 +3653,9 @@ async fn money_invariant_catches_orphan_document_movement() {
         .unwrap()
         .to_string();
 
-    // Injected failure between the movement and the payment row.
+    // (1) The injected failure leaves NOTHING. The trigger aborts the legacy row,
+    // which is the LAST write of the delivery, so the movement, the payment document,
+    // its share and the ledger entry are all rolled back with it.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE TRIGGER injected_payment_failure BEFORE INSERT ON sale_payments \
          WHEN NEW.sale_id = {sale} BEGIN SELECT RAISE(ABORT, 'injected payment failure'); END"
@@ -3591,11 +3666,42 @@ async fn money_invariant_catches_orphan_document_movement() {
     let (status, body) = pay_sale_via_web(&app, sale, cash, "10").await;
     assert!(status.is_server_error(), "{status} {body}");
 
-    let orphan: (i64,) = sqlx::query_as(
-        "SELECT t.id FROM transactions t WHERE t.reference = ? \
-         AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
-                         WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id)",
+    let orphans_after_failure: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM transactions t \
+         WHERE t.reference GLOB '[0-9][0-9][0-9][0-9]-PAY-[0-9][0-9][0-9][0-9][0-9][0-9]'",
     )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        orphans_after_failure.0, 0,
+        "the aborted delivery left no movement behind at all"
+    );
+    let documents: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM payments")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(documents.0, 0, "and no delivery document");
+    // The sale is still unpaid: the refusal was a refusal, not a partial write.
+    assert_eq!(
+        sale_detail(&app, sale).await["payments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // (2) And the invariant still sees an orphan when one is written by hand, which
+    // is now the only way it can exist.
+    let account: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'OrphanInv'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let orphan: (i64,) = sqlx::query_as(
+        "INSERT INTO transactions (account_id, kind, amount, description, reference, date, created_by) \
+         VALUES (?, 'Income', '10', ?, '2024-PAY-999999', '2024-06-02', 1) RETURNING id",
+    )
+    .bind(account)
     .bind(&sale_number)
     .fetch_one(&pool)
     .await

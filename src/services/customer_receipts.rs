@@ -29,7 +29,7 @@ struct PlannedAllocation {
 }
 
 #[derive(Clone)]
-pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
+pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -44,17 +44,18 @@ where
     CR: CustomerRepository,
     TS: TaxSnapshotRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub receipts: RR,
     /// The receivable is read and every grouped payment is written through the
     /// sales service; receipts never touch the sales tables themselves.
-    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>,
+    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>,
     /// Finance-owned allowlist for the `(account, method)` pair.
     pub payment_methods: PaymentMethodService<PM>,
 }
 
-impl<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
-    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
+impl<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
+    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -69,10 +70,11 @@ where
     CR: CustomerRepository,
     TS: TaxSnapshotRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub fn new(
         receipts: RR,
-        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>,
+        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>,
         payment_methods: PaymentMethodService<PM>,
     ) -> Self {
         Self {
@@ -314,10 +316,11 @@ mod tests {
     };
     use crate::repositories::SqlitePartyLedgerRepository;
     use crate::repositories::{
-        SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-        SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
-        SqlitePaymentMethodRepository, SqliteProductRepository, SqliteSaleRepository,
-        SqliteStockMovementRepository, SqliteTaxSnapshotRepository, SqliteTransactionRepository,
+        PartyLedgerRepository, PaymentRepository, SqliteAccountRepository, SqliteBarcodeRepository,
+        SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
+        SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqlitePaymentRepository,
+        SqliteProductRepository, SqliteSaleRepository, SqliteStockMovementRepository,
+        SqliteTaxSnapshotRepository, SqliteTransactionRepository,
     };
     use crate::security::test_support;
     use crate::services::{CustomerService, InventoryService, TransactionService};
@@ -336,6 +339,7 @@ mod tests {
         SqliteCustomerRepository,
         SqliteTaxSnapshotRepository,
         SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
     >;
 
     async fn test_pool() -> SqlitePool {
@@ -392,6 +396,7 @@ mod tests {
             SqliteTaxSnapshotRepository::new(pool.clone()),
             true,
             SqlitePartyLedgerRepository::new(pool.clone()),
+            SqlitePaymentRepository::new(pool.clone()),
         );
         let receipts = SqliteCustomerReceiptRepository::new(pool.clone());
         let payment_methods = PaymentMethodService::new(method_repo);
@@ -649,8 +654,10 @@ mod tests {
         let amounts: Vec<Decimal> = detail.allocations.iter().map(|p| p.amount).collect();
         assert_eq!(amounts, vec![dec("30"), dec("20"), dec("30")]);
 
-        // Each grouped payment posts its own finance movement, stamped with the
-        // number of the sale it pays; the receipt itself posts none.
+        // Each grouped payment posts its own finance movement. Under P3 (decision 5)
+        // its REFERENCE names the DELIVERY and its DESCRIPTION keeps the sale, so
+        // this map is the description side; the reference is asserted as a payment
+        // number below. The receipt itself posts no movement.
         let numbers: HashMap<i64, String> = [&debts.first, &debts.second, &debts.third]
             .into_iter()
             .map(|detail| {
@@ -691,10 +698,20 @@ mod tests {
                 .unwrap();
             assert!(tx.is_income());
             assert_eq!(tx.amount, payment.amount);
-            assert_eq!(
-                tx.reference.as_deref(),
-                Some(numbers[&payment.sale_id].as_str())
+            // P3 (decision 5): the movement's REFERENCE names the delivery, and its
+            // DESCRIPTION keeps the sale. `numbers` is the sale numbers the fixture
+            // collected against, so the two assertions are the two halves of the
+            // same row: the human label is the sale, the traceable document is the
+            // payment.
+            assert!(
+                tx.reference
+                    .as_deref()
+                    .map(|r| r.contains("-PAY-"))
+                    .unwrap_or(false),
+                "the cash row is stamped with its delivery, got {:?}",
+                tx.reference
             );
+            assert_eq!(tx.description, numbers[&payment.sale_id]);
         }
         // The payments are visible from the sales they belong to.
         for payment in &detail.allocations {
@@ -1541,9 +1558,20 @@ mod tests {
             .unwrap();
         assert!(tx.is_income());
         assert_eq!(tx.amount, dec("30"));
+        // P3 (decision 5): the reference is the DELIVERY's number; the sale is the
+        // description on this same row.
+        assert!(
+            tx.reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "got {:?}",
+            tx.reference
+        );
         assert_eq!(
-            tx.reference.as_deref(),
-            debts.first.sale.sale_number.as_deref()
+            Some(tx.description.as_str()),
+            debts.first.sale.sale_number.as_deref(),
+            "the sale is the description"
         );
         assert_eq!(
             s.sales.get_detail(debts.first.sale.id).await.unwrap().due,
@@ -1555,9 +1583,17 @@ mod tests {
             "the failed allocation did not pay its sale"
         );
 
-        // The sales flow creates the movement before the payment row (no shared
-        // transaction across modules), so the aborted insert can leave an orphan
-        // movement; nothing claims it and the receipt total ignores it.
+        // **THIS ASSERTION USED TO DESCRIBE THE BUG.** Before P3 the note here read
+        // "the sales flow creates the movement before the payment row (no shared
+        // transaction across modules), so the aborted insert can leave an ORPHAN
+        // movement; nothing claims it and the receipt total ignores it" — and the
+        // test then asserted the orphan's existence. That was the live atomicity
+        // defect of the plan's flow 5, pinned as expected behaviour, cash in the box
+        // with no document behind it.
+        //
+        // It is one unit now, so the aborted payment takes its movement with it. The
+        // assertion is inverted on purpose: ONE movement, the one that was linked,
+        // and no orphan anywhere.
         let txs = s
             .sales
             .transactions
@@ -1565,16 +1601,20 @@ mod tests {
             .list_by_account(account)
             .await
             .unwrap();
-        assert_eq!(txs.len(), 2, "one linked movement plus the aborted one");
-        let orphan = txs.iter().find(|tx| tx.id != tx_id).unwrap();
-        assert_eq!(orphan.amount, dec("20"));
-        let links: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE transaction_id = ?")
-                .bind(orphan.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(links.0, 0, "no payment claims the orphan movement");
+        assert_eq!(
+            txs.len(),
+            1,
+            "the aborted payment took its movement with it: {txs:?}"
+        );
+        assert_eq!(txs[0].id, tx_id, "and the survivor is the linked one");
+        let orphans: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM transactions t
+              WHERE NOT EXISTS (SELECT 1 FROM sale_payments p WHERE p.transaction_id = t.id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphans.0, 0, "no movement exists that no payment claims");
 
         // Raw-SQL cross-check: the receipt cannot claim an amount it did not apply.
         let raw: Vec<(String,)> =
