@@ -2,21 +2,28 @@
 
 ## Status
 
-**In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5a, P5b, P6, P7 and P8 remain.**
-**P5 was re-scoped to P5a + P5b on 2026-10-09, before any code was written**: the
-journal entries do not close `balance == Σ residuals + unapplied`, so the reads cannot
-move first. Evidence and the open decision are in "P5 blocker".
+**In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5, P6, P7 and P8 remain.**
+**P5 was re-scoped on 2026-10-09 and then SIMPLIFIED by two user decisions, before any
+code was written.** The re-scope (P5a journal + P5b reads) existed because the ledger
+did not close `balance == Σ residuals + unapplied`. Two decisions removed that reason:
+the legacy dual-write is **deleted** rather than retired (a), and `cancel` **stops
+existing** as a business action (b), so there is no annulment left to journal. P5 is one
+task again — the reads, the legacy deletion and the `In`-only unapplied fold together —
+because the first fold to break when the legacy rows go is the one being replaced. See
+"P5 blocker" for the evidence and the decisions, and "Relationship" for the wall a
+credit note still hits.
 Branch `feat/party-ledger`, all pushed, at `733acc9`. **Tracker PR open as DRAFT, no merge:
 [#150](https://github.com/ematiasm/roya/pull/150)**, on issue
 [#149](https://github.com/ematiasm/roya/issues/149). Do NOT merge before P8: merging with
 the legacy tables still in place leaves two homes for the same truth, which is the disease
 this work exists to cure.
 
-**The rest of the chain is TWO STACKED BRANCHES, decided 2026-10-09.** P5 and P6 go on
-`feat/party-ledger-p5` and `feat/party-ledger-p6` (P6 targeting P5, both ultimately onto
-`feat/party-ledger`), each with its own PR — "stacked" resolves the DEPENDENCY (P6 needs
-P5), not the size: together they are ~2.000 lines by this repo's measured authoring rate,
-which is not one reviewable sitting.
+**Decision (user, 2026-10-09): ONE PR for the rest, not a stacked chain.** The
+dependency P6→P5 is real, but the size is not a reason to split: the legacy dual-write
+deletion (decision a) forces P5 and part of P8 together anyway, so the remaining slices
+ship as one PR on `feat/party-ledger`, appended to the tracker's branch and to PR
+[#150](https://github.com/ematiasm/roya/pull/150). The earlier `feat/party-ledger-p5` /
+`-p6` branch plan is dropped.
 Last green measurement: `cargo test --locked` **1554 passed / 0 failed**,
 `scripts/e2e.sh` **180 passed / 0 failed**, warnings 79 bin / 55 test.
 
@@ -444,29 +451,41 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   POOL, so calling it inside a unit waits for the connection the caller already holds
   and answers `PoolTimedOut` on the `max_connections(1)` fixtures. It is a pre-check and
   it moved up with the others, before the unit opens.
-- [ ] **P5a — The journal entries close the identity.** P5b is a READ change only if
-  the journal already says the truth, and it does not: three holes are measured
-  below. In scope: an annulment writes a compensating entry that reverses what the
-  cancelled document charged (hole 3), and the refund path writes the entry its
-  mirror path already writes — `purchases.rs:1750` has it, `sales.rs:1950` does not
-  (hole 2). Also in scope: `unapplied_for_party` (`Σ unapplied` over `direction='In'`
-  deliveries only — see hole 4), and the `Cancel` sign sub-decision at the end of the
-  section. This task writes ledger entries and no reads.
-- [ ] **P5b — Reads move to the per-document residual.** `customer_balance`,
-  `ageing_of`/`customer_ageing`/`ageing_all`, the `ENFORCE_CREDIT_LIMIT`
-  projection, the `suppliers_web.rs:428` drawer fold, `outstanding_payables`,
-  `customer_statement`: residual = `charge + returns of that document − Σ
-  allocations to it`, unapplied credit from the payment documents. The document
-  folds are **deleted**, not left dormant, and the legacy dual-write stops with
-  them (the writes are named in hole 1): a read that no longer asks for
-  `sale_payments` is what finally retires it. One fold cannot be deleted without a
-  replacement: `payment_repo.rs:270` `target_residual_due` recomputes the
-  document's own total for the allocation cap, and P5b re-bases it on the same
-  residual the reads use instead of keeping a second copy of a total. Tests: a
-  returned credit sale lowers balance, ageing and frees the credit limit; a payment
-  applied to the oldest invoice ages on the oldest invoice and is not moved by a
-  later credit; the supplier drawer reflects a confirmed return; and the identity
-  `balance == Σ residuals + unapplied` holds on the three worked examples of P5a.
+- [ ] **P5 — The reads move to the per-document residual, and the legacy rows go with
+  them.** `customer_balance`, `ageing_of`/`customer_ageing`/`ageing_all`, the
+  `ENFORCE_CREDIT_LIMIT` projection, the `suppliers_web.rs:428` drawer fold,
+  `outstanding_payables`, `customer_statement`: residual = `charge + returns of that
+  document − Σ allocations to it`, unapplied credit from the payment documents. The
+  document folds are **deleted**, not left dormant (decision a): the
+  `create_payment_in` calls that feed them go in the SAME change, because a read that no
+  longer asks for `sale_payments` is what retires it, and deleting the rows while a fold
+  still read them is the failure this avoids. Two more things ride along: the mirror of
+  `create_payment_in` for the four cancel paths disappears with the same decision, and
+  `unapplied_for_party` (`Σ unapplied` over `direction='In'` deliveries only — an `Out`
+  refund carries its whole amount as unapplied and would count as available credit) is
+  what P6 needs for the saldo a favor. One fold cannot be deleted without a replacement:
+  `payment_repo.rs:270` `target_residual_due` recomputes the document's own total for the
+  allocation cap, and P5 re-bases it on the same residual the reads use instead of keeping
+  a second copy of a total. A per-document `Return` fold is also wanted here, not in P6:
+  the link exists (`customer_returns.sale_id` / `purchase_returns.purchase_id`, NOT NULL),
+  so the residual is literal instead of a convention. Tests: a returned credit sale lowers
+  balance, ageing and frees the credit limit; a payment applied to the oldest invoice ages
+  on the oldest invoice and is not moved by a later credit; the supplier drawer reflects a
+  confirmed return; and the identity `balance == Σ residuals + unapplied` holds on the
+  four scoreboard cases of "P5 blocker".
+- [ ] **P6 — UI.** Collect/pay screen: pick the party, the amount, the method, and
+  the documents with their amounts (oldest-first prefilled, editable); the
+  unapplied remainder shown as available credit; an explicit "apply credit"
+  action; the saldo a favor visible on the party page and the statement; and
+  **reassignment** — re-pointing an allocation at another invoice, which is the
+  user's chosen mirror at the credit-note level (decision b). Reassignment is a write
+  that DOES NOT EXIST: `UPDATE payment_allocations` appears in no Rust file and in no
+  migration, while decision 3 promised it and migration 46 already built the
+  `BEFORE UPDATE` guard waiting for it. Moving a share from document A to B must
+  satisfy A's residual, B's residual and the payment's total in ONE unit, because a
+  delete-then-insert would pass through a state where the money is applied twice.
+  `MessageKey` + ES + EN. Playwright coverage; regenerate the visual baseline only
+  with proof the diff is exactly what was intended.
 - [ ] **P6 — UI.** Collect/pay screen: pick the party, the amount, the method, and
   the documents with their amounts (oldest-first prefilled, editable); the
   unapplied remainder shown as available credit; an explicit "apply credit"
@@ -618,16 +637,43 @@ own review.
 **The third level is where (b) hits a wall, and it needs a decision before the work
 starts.** A Confirmed CREDIT NOTE has no mirror: grepping `DebitNote` over `src/` and
 `migrations/` returns nothing, so "correct it with a mirror document" has no document to
-point at for a return family. Three ways out, and they are not equivalent:
+point at for a return family.
+
+**Decision (user, 2026-10-09): the mirror at the third level is not a new document — a
+credit note is corrected by REASSIGNING money, not by annulling it.** The credit note
+takes goods back and correctly reduces what the parent sale charged; what can be wrong
+afterwards is *where* the money sits. So the correction is re-pointing an existing
+allocation at another invoice of the same customer, and when cash genuinely has to move
+there is already a refund `Out` delivery for that. No fifth document family, and no
+`cancel` in any of the four services. The two rejected ways out are kept below because
+the reasoning is what a future reader will want:
 
 | Way out | What a user does to undo a credit note | Consequence |
 |---|---|---|
+| **Reassign the money (CHOSEN)** | Re-points an allocation at another invoice | Needs the one write decision 3 promised and that does not exist yet — see below |
 | A debit note document family | Issues one, which re-charges what the note credited | Biggest scope: a fifth document family in a repo whose own `AGENTS.md` says three families already mirror each other |
-| A new sale | Sells the goods back | Reuses a real document and its stock/finance paths, but the link to the original sale is lost, so "why did this happen" stops being answerable from the data |
-| Keep `cancel` ONLY for the two return families | Reverses the note through the current path | Cheapest, and it leaves the asymmetry the user is trying to remove: an annulment exists for a return and not for what it returns to |
+| Keep `cancel` ONLY for the two return families | Reverses the note through the current path | Leaves the asymmetry the user is removing: an annulment for a return and not for what it returns to |
 
-The `Cancel` journal entry stays unneeded in all three: whichever way is chosen, the
-correcting document writes its own entry.
+The `Cancel` journal entry stays unneeded in all three: the mirror is either a document
+that writes its own entry or, in the chosen shape, no document at all.
+
+**Two findings this decision turns into P6 requirements, both measured:**
+
+- **The link a per-document `Return` needs already exists.** `customer_returns.sale_id`
+  and `purchase_returns.purchase_id` are `NOT NULL REFERENCES … ON DELETE RESTRICT`
+  (`migrations/20240101000041_create_customer_returns.sql:46`,
+  `.../20240101000040_create_purchase_returns.sql:49`), so "the returns of THAT
+document" is already answerable without a new column. What is not written yet is the
+  fold that reads it, and it is what makes the P5b residual literal
+  (`charge + returns of that document − Σ allocations`) instead of a convention.
+- **Reassigning does not exist and is not a template: it is a missing write.**
+  `UPDATE payment_allocations` appears in NO Rust file and in NO migration; the trait
+  offers only `allocate_in` (an INSERT). Decision 3 explicitly promised the opposite
+  ("Reallocating is an `UPDATE` inside the owning unit") and migration 46 already built
+  the guard waiting for it, `BEFORE UPDATE` trigger with its `id <> NEW.id` clause. P6
+  needs that write, and it inherits the same cap: moving a share from document A to B
+  must satisfy A's and B's residuals and the payment's total in ONE unit, because a
+  delete-then-insert would pass through a state where the money is applied twice.
 
 ## Relationship to the party ledger
 
@@ -652,8 +698,8 @@ shape.
 | P2 | delegated writer | backfill + tests, same pattern as T1 |
 | P3 | delegated writer | 3 service paths + lifted refusals + tests |
 | P4 | delegated writer | mirrored supplier paths + tests |
-| P5a | delegated writer | ledger entries + `unapplied_for_party` + tests |
-| P5b | delegated writer | 6 read sites across 4 files, plus the legacy dual-write |
+| P5 | delegated writer | 6 read sites across 4 files, the legacy writes it deletes, and `unapplied_for_party` |
+| P6 | delegated writer | route + template + JS + localization + e2e, plus the reassignment write |
 | P6 | delegated writer | route + template + JS + localization + e2e |
 | P7 | fresh verification worker | full suite + browser suite + real-binary flows |
 
@@ -715,17 +761,21 @@ decisions.
   with the history. (2) A fresh install must be able to collect money: a default
   `Caja` account with the seeded `Cash` method linked to it is seeded, tracked as T6
   of `odd/tasks/payment-method-single-account.md`.
-- 2026-10-09 — **P5 was re-scoped before any code was written: it is P5a (journal
-  entries) + P5b (reads).** Exploration for P5 measured that the ledger, though
-  written by every path, does not close `balance == Σ residuals + unapplied`: no
-  production path writes `PartyEntryKind::Cancel`, the sales-cancel refund writes no
-  entry while its purchase-cancel mirror writes one, an applied credit is deliberately
-  invisible to the journal, and the legacy payment rows are still written on purpose as
-  the crutch the old reads lean on. See "P5 blocker" for the evidence, the corrected
-  scoreboard and the `Cancel` sign sub-decision. A first revision of this section
-  blamed the sign of `Refund` and was wrong; the correction is recorded in place rather
-  than deleted, because the wrong version is the one a future reader will re-derive.
-  The one-file-per-commit slices are untouched; nothing was implemented.
+- 2026-10-09 — **P5 was re-scoped and then simplified by two user decisions, before any
+  code was written.** Exploration measured that the ledger, though written by every
+  path, did not close `balance == Σ residuals + unapplied` (no production path wrote
+  `PartyEntryKind::Cancel`; the sales-cancel refund wrote no entry while its
+  purchase-cancel mirror wrote one; an applied credit is deliberately invisible to the
+  journal; the legacy rows were still written on purpose). A first revision of "P5
+  blocker" blamed the SIGN of `Refund` and was WRONG — the correction is recorded in
+  place, because the wrong version is the one a future reader re-derives. The user then
+  (a) deleted the legacy dual-write outright instead of retiring it in P8, since the dev
+  database is wiped, and (b) retired `cancel` as a business action entirely, a Confirmed
+  document being corrected with a mirror document. Together those removed the journal
+  blocker, so P5 is one task again and `cancel`'s retirement is a separate feature. A
+  third decision closed the wall a Confirmed credit note hit: it is corrected by
+  REASSIGNING money, not by annulling it. Nothing was implemented; the two stacked
+  branches (`feat/party-ledger-p5`/`-p6`) were dropped for one PR on `feat/party-ledger`.
 
 ## Resume here
 
@@ -733,25 +783,34 @@ decisions.
    the ones a future agent will otherwise "improve" back into the old shape. Decision
    4 was REFINED (the cap has two homes; a payment's amount freezes once allocated)
    and the refinement is measured, not argued.
-2. **P5 is the next unit, and it is TWO: P5a (the journal entries) then P5b (the
-   reads).** Read "P5 blocker" above before starting either: the ledger is written by
-   every path but does not close the identity the reads depend on, so P5b cannot land
-   first without moving `customer_balance` onto a fold that loses the compensating side
-   of every annulment. The user chose the compensating entry on 2026-10-09, and the
-   correction to this section's first draft matters: it is two WRITES, not a sign
-   change. `unapplied_for_party` — the per-party sum of its `In` deliveries' unapplied
-   amounts — does not exist yet and is what P6 needs to show the saldo a favor; it
-   belongs to P5a because the identity is what it completes. The `In`-only restriction
-   is not a detail: an `Out` refund carries its whole amount as "unapplied" and would
-   count as available credit.
-3. **Expect three or four tests to fail on purpose when P5b lands, and they are not
+2. **P5 is the next unit again, and it is ONE task: the reads, the legacy deletion and
+   `unapplied_for_party`.** Read "P5 blocker" before starting: the journal blocker was
+   real, and the two user decisions of 2026-10-09 dissolved it rather than leaving it to
+   P5. The legacy dual-write is DELETED, not retired in P8 — which is why P5 and that
+   half of P8 are the same change: the first fold to break when the rows go is the one
+   being replaced. `unapplied_for_party` must filter `direction='In'`, or an `Out` refund
+   counts its whole amount as available credit. `target_residual_due`
+   (`payment_repo.rs:270`) also has to be re-based here, since it keeps a second copy of
+   the document's total.
+3. **`cancel` is being RETIRED as a business action (user, 2026-10-09), and that is its
+   own feature, NOT part of P5.** A Confirmed document is corrected with a mirror
+   document; only a Draft is removed. Measured scope, so it is not underestimated: 4
+   service methods (206 + 155 + 145 + 142 lines), their web and API routes, the
+   `ConfirmationPolicy` wiring, 7 templates, the `sales.cancel`/`purchases.cancel`
+   permissions with their localization, 47 references to the `Cancelled` variant, 58 to
+   `cancel_reason`/`cancelled_at`, and 92 cancel-related test functions. It cannot land
+   before P5, because P5 is what proves the money model it leans on, and it removes the
+   last journal hole rather than adding to it. `delete_draft` and `cancel`-on-a-Draft do
+   the same thing today (`customer_return.rs:811`), so the work picks one.
+4. **Expect three or four tests to fail on purpose when P5 lands, and they are not
    regressions.** They were written as the reminder: the most visible is
    `over_collection_becomes_the_customers_credit` (`src/services/customer_receipts.rs:1374`)
    asserting `customer_balance == 0` with a comment saying P5 will make it `-1`, and
    the same caveat in `src/routes/customers_api.rs:1147`. Read the assertion message
    before "fixing" it. Conversely `k3_ac8_fully_paid_and_cancelled_sales_leave_the_balance`
    (`src/services/sales.rs:5099`) already asserts the RIGHT answer for an annulled
-   document, so P5a must keep it green rather than relax it.
+   document, so P5 must keep it green rather than relax it — and it will be re-derived
+   once `cancel` is retired, because the fixture that builds it stops existing.
 4. **P8 is not a cleanup**: `backfill_party_ledger` (party-ledger T1, reviewed with its
    authority burned) READS the five legacy tables, so dropping them requires re-basing
    it onto `payments`/`payment_allocations` or the startup fails with "no such table".
