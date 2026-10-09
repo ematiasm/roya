@@ -29,7 +29,7 @@ struct PlannedAllocation {
 }
 
 #[derive(Clone)]
-pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
+pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -43,17 +43,18 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub receipts: RR,
     /// The receivable is read and every grouped payment is written through the
     /// sales service; receipts never touch the sales tables themselves.
-    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>,
+    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>,
     /// Finance-owned allowlist for the `(account, method)` pair.
     pub payment_methods: PaymentMethodService<PM>,
 }
 
-impl<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
-    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
+impl<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
+    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -67,10 +68,11 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub fn new(
         receipts: RR,
-        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>,
+        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>,
         payment_methods: PaymentMethodService<PM>,
     ) -> Self {
         Self {
@@ -310,6 +312,7 @@ mod tests {
         MovementReason, MovementType, NewCustomer, NewMovement, NewProduct, NewSale, PaymentStatus,
         PaymentType, ProductKind,
     };
+    use crate::repositories::SqlitePartyLedgerRepository;
     use crate::repositories::{
         SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
         SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
@@ -332,6 +335,7 @@ mod tests {
         SqlitePaymentMethodRepository,
         SqliteCustomerRepository,
         SqliteTaxSnapshotRepository,
+        SqlitePartyLedgerRepository,
     >;
 
     async fn test_pool() -> SqlitePool {
@@ -387,6 +391,7 @@ mod tests {
             customers,
             SqliteTaxSnapshotRepository::new(pool.clone()),
             true,
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         let receipts = SqliteCustomerReceiptRepository::new(pool.clone());
         let payment_methods = PaymentMethodService::new(method_repo);

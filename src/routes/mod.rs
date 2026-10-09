@@ -40,10 +40,10 @@ use crate::models::PriceRefusal;
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteBusinessConfigurationRepository,
     SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
-    SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
-    SqliteProductRepository, SqliteProductSupplierCostRepository, SqliteProductTaxRepository,
-    SqlitePurchaseRepository, SqlitePurchaseReturnRepository, SqliteRoleRepository,
-    SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
+    SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqlitePartyLedgerRepository,
+    SqlitePaymentMethodRepository, SqliteProductRepository, SqliteProductSupplierCostRepository,
+    SqliteProductTaxRepository, SqlitePurchaseRepository, SqlitePurchaseReturnRepository,
+    SqliteRoleRepository, SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
     SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxRepository,
     SqliteTaxSnapshotRepository, SqliteTransactionRepository, SqliteUserRepository,
 };
@@ -76,6 +76,7 @@ pub type SalesSvc = SalesService<
     SqlitePaymentMethodRepository,
     SqliteCustomerRepository,
     SqliteTaxSnapshotRepository,
+    SqlitePartyLedgerRepository,
 >;
 
 pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
@@ -105,6 +106,7 @@ pub type ReceiptSvc = CustomerReceiptService<
     SqlitePaymentMethodRepository,
     SqliteCustomerRepository,
     SqliteTaxSnapshotRepository,
+    SqlitePartyLedgerRepository,
 >;
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
@@ -433,6 +435,8 @@ impl AppState {
             customer_service.clone(),
             SqliteTaxSnapshotRepository::new(pool.clone()),
             enforce_credit_limit,
+            // T2: the customer journal `confirm` appends to, over the same pool.
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         // M4: collections group the payments one handover of money produced; the
         // receipt service composes the same sales service and the finance-owned

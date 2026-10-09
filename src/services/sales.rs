@@ -71,7 +71,7 @@ use crate::services::{checked_money_add, checked_money_sum, CustomerService};
 pub const DEBT_BANNER_LIMIT: usize = 5;
 
 #[derive(Clone)]
-pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>
+pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -84,6 +84,7 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: crate::repositories::TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub sales: SR,
     pub sequences: DR,
@@ -100,9 +101,16 @@ where
     /// `ENFORCE_CREDIT_LIMIT`: when false an over-limit credit sale is confirmed
     /// and the interface reports the customer as over limit instead.
     pub enforce_credit_limit: bool,
+    /// The customer's signed journal (T2). `confirm` appends the `Charge` that
+    /// makes the sale a debt, inside the SAME unit that writes the document —
+    /// which is the whole point of the ledger: the balance is the fold of these
+    /// rows, so an entry that committed separately from its document would be a
+    /// balance that moved without a document, or a document with no balance.
+    pub party_ledger: PL,
 }
 
-impl<SR, DR, C, P, B, S, A, T, PM, CR, TS> SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>
+impl<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
+    SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -115,6 +123,7 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: crate::repositories::TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub fn new(
         sales: SR,
@@ -125,6 +134,7 @@ where
         customers: CustomerService<CR>,
         tax_snapshots: TS,
         enforce_credit_limit: bool,
+        party_ledger: PL,
     ) -> Self {
         Self {
             sales,
@@ -135,6 +145,7 @@ where
             tax_snapshots,
             customers,
             enforce_credit_limit,
+            party_ledger,
         }
     }
 
@@ -1490,6 +1501,59 @@ where
                 .await?;
         }
 
+        // The customer's journal, in the SAME unit as the document (T2 of
+        // odd/tasks/party-ledger.md). A sale is a CHARGE whichever way it is
+        // paid: the shop delivered goods worth `total`, so the customer owes
+        // `total` from this moment. A cash sale appends the Payment right after
+        // (below), and the two rows fold to zero — which is why the cash case
+        // needs no branch here and the balance stays the single fold of the
+        // journal rather than a special case per payment type.
+        //
+        // `Charge` and not a signed `±total` computed here: the sign rule lives
+        // in `PartyEntryKind::signed_amount`, one place, so no write path holds
+        // a second opinion about it.
+        if total > Decimal::ZERO {
+            self.party_ledger
+                .insert_in(
+                    &mut tx,
+                    &crate::models::NewPartyLedgerEntry {
+                        party_type: crate::models::PartyType::Customer,
+                        party_id: sale.customer_id,
+                        kind: crate::models::PartyEntryKind::Charge,
+                        amount: crate::models::PartyEntryKind::Charge.signed_amount(total),
+                        document_kind: crate::models::PartyDocumentKind::Sale,
+                        document_id: sale_id,
+                        entry_date: sale.sale_date,
+                        reference: Some(sale_number.clone()),
+                        created_by: actor,
+                    },
+                )
+                .await?;
+        }
+
+        // The cash leg: the same unit, and the `Payment` that offsets the charge
+        // above. Written AFTER the charge so a reader of this transaction's
+        // intermediate states sees a debt and then its settlement, not the
+        // reverse.
+        if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
+            self.party_ledger
+                .insert_in(
+                    &mut tx,
+                    &crate::models::NewPartyLedgerEntry {
+                        party_type: crate::models::PartyType::Customer,
+                        party_id: sale.customer_id,
+                        kind: crate::models::PartyEntryKind::Payment,
+                        amount: crate::models::PartyEntryKind::Payment.signed_amount(total),
+                        document_kind: crate::models::PartyDocumentKind::Sale,
+                        document_id: sale_id,
+                        entry_date: sale.sale_date,
+                        reference: Some(sale_number.clone()),
+                        created_by: actor,
+                    },
+                )
+                .await?;
+        }
+
         let confirmed = self
             .sales
             .set_confirmed_in(&mut tx, sale_id, actor, &sale_number)
@@ -1834,6 +1898,7 @@ mod tests {
         SqliteSaleRepository, SqliteStockMovementRepository, SqliteTaxSnapshotRepository,
         SqliteTransactionRepository, TaxRepository,
     };
+    use crate::repositories::{PartyLedgerRepository, SqlitePartyLedgerRepository};
     use crate::security::test_support;
     use crate::services::{CustomerService, InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -1867,6 +1932,7 @@ mod tests {
         SqlitePaymentMethodRepository,
         SqliteCustomerRepository,
         SqliteTaxSnapshotRepository,
+        SqlitePartyLedgerRepository,
     >;
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -1936,6 +2002,7 @@ mod tests {
             customers,
             SqliteTaxSnapshotRepository::new(pool.clone()),
             enforce_credit_limit,
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -3496,6 +3563,191 @@ mod tests {
         assert_eq!(tx_count(&pool).await, tx_before);
         let d = s.get_detail(sale.id).await.unwrap();
         assert_eq!(d.paid, Decimal::ZERO);
+    }
+
+    // -- the party ledger (T2) ---------------------------------------------------
+
+    /// The journal rows of one document, oldest first, as the sign rule stored
+    /// them. Read through SQL rather than through a service read on purpose: what
+    /// this pins is what `confirm` WROTE, and a read path of its own could agree
+    /// with the write while both disagree with the schema.
+    async fn ledger_rows(pool: &sqlx::SqlitePool, document_id: i64) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT kind, amount FROM party_ledger_entries \
+             WHERE document_kind = 'Sale' AND document_id = ? ORDER BY id",
+        )
+        .bind(document_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A confirmed CREDIT sale is a debt: one `Charge` of `+total`, no cash leg,
+    /// and the customer's balance is exactly that figure.
+    #[tokio::test]
+    async fn a_confirmed_credit_sale_appends_one_charge_for_its_total() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "LEDGER-CREDIT", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let customer = seed_customer(&s, "Ledger Credit Buyer", None, None).await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 20
+
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, sale.id).await,
+            vec![("Charge".to_string(), "20".to_string())],
+            "a credit sale owes its total: one Charge, and no cash leg"
+        );
+        assert_eq!(
+            s.party_ledger
+                .balance_for_party(crate::models::PartyType::Customer, customer.id)
+                .await
+                .unwrap(),
+            dec("20"),
+            "and the balance is the fold of that row"
+        );
+    }
+
+    /// A confirmed CASH sale is a debt settled on the spot: `+total` and
+    /// `−total` in the SAME unit, folding to zero. The two rows are the point —
+    /// a single signed row would hide that money moved, and the balance would
+    /// stop being the fold of the journal.
+    #[tokio::test]
+    async fn a_confirmed_cash_sale_appends_a_charge_and_its_settlement() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "LEDGER-CASH", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "ledger-cash").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: WALKIN_ID,
+                    payment_type: PaymentType::Cash,
+                    sale_date: sale_date(),
+                    due_date: None,
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("3"), None)
+            .await
+            .unwrap(); // total 30
+
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, sale.id).await,
+            vec![
+                ("Charge".to_string(), "30".to_string()),
+                ("Payment".to_string(), "-30".to_string()),
+            ],
+            "a cash sale charges and settles in one confirm, in that order"
+        );
+        assert_eq!(
+            s.party_ledger
+                .balance_for_party(crate::models::PartyType::Customer, WALKIN_ID)
+                .await
+                .unwrap(),
+            Decimal::ZERO,
+            "and the two rows fold to nothing owed"
+        );
+    }
+
+    /// The write joins the caller's unit, which is the whole reason it is an
+    /// `_in` call: a failure AFTER the entry rolls the entry back with the
+    /// document. The injected failure is sqlite refusing the confirmation write
+    /// — the last write in the unit — so the ledger row is already in the table
+    /// when the unit dies.
+    #[tokio::test]
+    async fn a_failed_confirm_rolls_the_ledger_entry_back_with_the_document() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "LEDGER-ROLLBACK", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let customer = seed_customer(&s, "Ledger Rollback Buyer", None, None).await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_ledger_probe BEFORE UPDATE ON sales \
+             WHEN NEW.status = 'Confirmed' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the ledger write'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+
+        assert!(
+            ledger_rows(&pool, sale.id).await.is_empty(),
+            "the entry must die with the unit that wrote it"
+        );
+        assert_eq!(
+            s.party_ledger
+                .balance_for_party(crate::models::PartyType::Customer, customer.id)
+                .await
+                .unwrap(),
+            Decimal::ZERO,
+            "and the balance must not have moved"
+        );
+        assert_eq!(
+            s.sales
+                .find_sale(sale.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .sale_number,
+            None,
+            "the sale is still a numberless Draft: nothing committed"
+        );
     }
 
     // -- money traceability: payment <-> transaction links ---------------------
