@@ -2,10 +2,25 @@
 
 ## Status
 
-**Planned.** The design decisions are settled (all dated 2026-10-03); no code
-written yet. This document **reshapes** tasks T3a, T3b, T4 and T5 of
-`odd/tasks/party-ledger.md` — see "Relationship to the party ledger". T1, T1b and
-T2 of that document are untouched by this one.
+**In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5, P6, P7 and P8 remain.**
+Branch `feat/party-ledger`, all pushed, `origin/feat/party-ledger` at `cac8eb7`.
+Last green measurement: `cargo test --locked` **1554 passed / 0 failed**,
+`scripts/e2e.sh` **180 passed / 0 failed**, warnings 79 bin / 55 test.
+
+What that means in the tree, so the next session can verify it rather than trust it:
+migration 46 (`payments` + `payment_allocations`) and 47 (`payments.receipt_id`) exist;
+`services::payment_writer::record_delivery_in` is the ONE writer of a delivery of money
+and four services call it; the four `confirm` paths write ledger entries; all four
+`cancel` paths run in one unit; a collection and a supplier payment are each ONE
+document with N allocations.
+
+**A previous version of this header said "Planned, no code written yet"** — it was 27
+commits stale. If you are reading a Status line that contradicts `git log`, the log wins.
+
+This document **reshapes** tasks T3a, T3b, T4 and T5 of `odd/tasks/party-ledger.md` —
+see "Relationship to the party ledger". T1 and T1b of that document are done; T2 is
+half done (its four entry writes are in, its two refund caps are still open by
+decision).
 
 ## Objective
 
@@ -519,6 +534,8 @@ decisions.
   (a supplier payment may cover one or several invoices) and four design questions
   answered in conversation: shared family, form first, mutable allocations, schema
   cap. No code yet.
+- 2026-10-08/09 — **P1, P3 and P4 implemented and pushed** over 20 commits; see the
+  Status header for the measured state and "Resume here" for what P5 inherits.
 - 2026-10-03 — **two decisions from the user revised the plan.** (1) The
   development database will be wiped, so nothing historical needs preserving: the
   payment backfill (P2) is cancelled, decision 8 now retires the legacy tables in a
@@ -531,9 +548,27 @@ decisions.
 ## Resume here
 
 1. Read decisions 1–9 above before touching anything: three of them (2, 8, 9) are
-   the ones a future agent will otherwise "improve" back into the old shape.
-2. P1 is the next unit: migration 46 + the repository + the two guards, tests
-   first. It starts unwired on purpose, so the warning count rising is expected
-   evidence, not a regression.
-3. Before writing P3, re-read party-ledger decisions 4, 5 and 6: lifting the
-   overpayment refusals and applying credit are the same change as allocations.
+   the ones a future agent will otherwise "improve" back into the old shape. Decision
+   4 was REFINED (the cap has two homes; a payment's amount freezes once allocated)
+   and the refinement is measured, not argued.
+2. **P5 is the next unit**: move the reads to the per-document residual
+   (`customer_balance`, `ageing_of`/`customer_ageing`/`ageing_all`, the
+   `ENFORCE_CREDIT_LIMIT` projection, `suppliers_web.rs` drawer fold,
+   `outstanding_payables`, `customer_statement`), with
+   `residual = charge + returns of that document − Σ allocations to it` and the
+   unapplied remainder as available credit. **It also needs `unapplied_for_party`** —
+   the per-party sum of its deliveries' unapplied amounts — which does not exist yet
+   and is what P6 needs to show the saldo a favor. The ledger is already written by
+   every path, so P5 is a READ change.
+3. **Expect three or four tests to fail on purpose when P5 lands, and they are not
+   regressions.** They were written as the reminder: the most visible is
+   `over_collection_becomes_the_customers_credit` asserting `customer_balance == 0`
+   with a comment saying P5 will make it `-1`. Read the assertion message before
+   "fixing" it.
+4. **P8 is not a cleanup**: `backfill_party_ledger` (party-ledger T1, reviewed with its
+   authority burned) READS the five legacy tables, so dropping them requires re-basing
+   it onto `payments`/`payment_allocations` or the startup fails with "no such table".
+5. The two refund caps of party-ledger T2 (`customer_return`, `purchase_return`) are
+   still NOT lifted, deliberately: lifting them needs a decision nobody has written
+   ("what replaces *this app has no credit balance*"). See T2 in
+   `odd/tasks/party-ledger.md`.
