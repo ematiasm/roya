@@ -67,6 +67,13 @@ pub trait PaymentRepository: Send + Sync {
     /// [`Self::allocate_in`] in a transaction of its own.
     async fn allocate(&self, allocation: &NewPaymentAllocation) -> AppResult<PaymentAllocation>;
 
+    /// The deliveries grouped under one receipt, oldest first.
+    ///
+    /// This is what makes a receipt able to state how much money it grouped: before it,
+    /// the only way was to sum its allocations, which silently drops the UNAPPLIED
+    /// remainder — the credit — because no allocation carries it.
+    async fn list_for_receipt(&self, receipt_id: i64) -> AppResult<Vec<Payment>>;
+
     /// The shares of one payment, oldest first.
     async fn list_allocations(&self, payment_id: i64) -> AppResult<Vec<PaymentAllocation>>;
 
@@ -116,6 +123,7 @@ fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> AppResult<Payment> {
         date: row.try_get("date")?,
         notes: row.try_get("notes")?,
         transaction_id: row.try_get("transaction_id")?,
+        receipt_id: row.try_get("receipt_id")?,
         created_by: row.try_get("created_by")?,
         updated_by: row.try_get("updated_by")?,
         created_at: row.try_get("created_at")?,
@@ -142,7 +150,8 @@ fn row_to_allocation(row: sqlx::sqlite::SqliteRow) -> AppResult<PaymentAllocatio
 
 const PAYMENT_COLUMNS: &str =
     "id, number, direction, party_type, party_id, method_id, account_id, \
-     amount, date, notes, transaction_id, created_by, updated_by, created_at, updated_at";
+     amount, date, notes, transaction_id, receipt_id, created_by, updated_by, created_at, \
+     updated_at";
 
 const ALLOCATION_COLUMNS: &str =
     "id, payment_id, target_kind, target_id, amount, created_by, updated_by, created_at, updated_at";
@@ -153,10 +162,10 @@ where
 {
     let row = sqlx::query(
         r#"INSERT INTO payments
-           (number, direction, party_type, party_id, method_id, account_id, amount, date, notes, transaction_id, created_by)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           (number, direction, party_type, party_id, method_id, account_id, amount, date, notes, transaction_id, receipt_id, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            RETURNING id, number, direction, party_type, party_id, method_id, account_id,
-                     amount, date, notes, transaction_id, created_by, updated_by, created_at, updated_at"#,
+                     amount, date, notes, transaction_id, receipt_id, created_by, updated_by, created_at, updated_at"#,
     )
     // The number is NOT generated here: a caller inside a unit takes it from
     // `doc_sequences` with `next_number_in`, so a rollback returns the number
@@ -171,6 +180,7 @@ where
     .bind(payment.date)
     .bind(payment.notes.as_deref())
     .bind(payment.transaction_id)
+    .bind(payment.receipt_id)
     .bind(payment.created_by)
     .fetch_one(executor)
     .await?;
@@ -202,6 +212,8 @@ where
 async fn assert_within_cap(
     tx: &mut SqliteConnection,
     payment_id: i64,
+    target_kind: PartyDocumentKind,
+    target_id: i64,
     new_amount: Decimal,
 ) -> AppResult<()> {
     let payment = sqlx::query("SELECT amount FROM payments WHERE id = ?")
@@ -221,7 +233,133 @@ async fn assert_within_cap(
             delivered - allocated
         )));
     }
+
+    // ---- THE OTHER CAP: the document's own residual -------------------------
+    //
+    // Decision 4 caps the SPLIT of a payment. This caps the OTHER end, and it is the
+    // same argument applied one level down: the per-document residual that P5 reads
+    // is `charge + returns - Σ allocations to it`, and without this it can go
+    // NEGATIVE.
+    //
+    // Why that matters, measured rather than argued: a negative residual is not one
+    // bad number, it is the document's whole accounting. `paid_and_due` computes
+    // `due = total - paid` and does not refuse a negative; `payment_status_for` calls
+    // `paid >= total` Paid; the refund cap reads `collected > 0 && total > collected`
+    // and therefore stops refusing; and every debt filter (`due > ZERO`) makes the
+    // document VANISH from the debtor list. So an over-allocation silently forgives a
+    // debt and unlocks refunding more than came in.
+    //
+    // The consequence for the operator is the feature, not a limitation: paying more
+    // than a document owes is allowed, and the excess stays UNAPPLIED on the payment —
+    // which is exactly the credit the plan calls `unapplied > 0`.
+    // `target_due` IS the headroom: it is the document's residual, which already nets
+    // everything applied to it. Adding the shares again would count the same money
+    // twice — and get it wrong in the direction that matters, refusing the operator who
+    // is paying off the remainder of an invoice.
+    let target_due = target_residual_due(&mut *tx, target_kind, target_id).await?;
+    if new_amount > target_due {
+        return Err(AppError::Validation(format!(
+            "document {target_kind} {target_id} still owes {target_due}, so a share of              {new_amount} would leave it negative. Apply at most {target_due} to it, and leave              the rest unapplied on the payment."
+        )));
+    }
     Ok(())
+}
+
+/// How much a document still owes, as the legacy families compute it today.
+///
+/// This READS the parent document rather than becoming a second home for its money:
+/// until P5 moves the folds to the ledger, `due` is what `paid_and_due` derives from
+/// the document's own totals and its legacy payment rows, and asking for it here keeps
+/// the cap honest against the same figure every other read uses.
+///
+/// The totals are summed in RUST over the lines, never in SQL: they are derived
+/// (`qty * unit_price + tax_total`) and SQLite would do the arithmetic in REAL, which
+/// this project forbids for money.
+async fn target_residual_due(
+    tx: &mut SqliteConnection,
+    target_kind: PartyDocumentKind,
+    target_id: i64,
+) -> AppResult<Decimal> {
+    // `lines_sql` is the document's money; `applied_sql` is what is already applied
+    // to it. The second one reads `payment_allocations` and NOT the legacy payment
+    // tables, and that is the whole correctness of this cap: from P3 the allocations
+    // are the attribution, and reading the legacy rows instead counted the same money
+    // from two places — the first version of this function reported `due = 30` on a
+    // sale that had just been fully applied, and the cap therefore refused nothing.
+    let (lines_sql, applied_sql, missing): (&str, &str, AppError) = match target_kind {
+        PartyDocumentKind::Sale => (
+            "SELECT qty, unit_price, tax_total FROM sale_lines WHERE sale_id = ? ORDER BY id",
+            "SELECT amount FROM payment_allocations WHERE target_kind = 'Sale' AND target_id = ? \
+             ORDER BY id",
+            AppError::NotFound(format!("sale {target_id} not found")),
+        ),
+        PartyDocumentKind::Purchase => (
+            "SELECT qty, unit_cost, tax_total FROM purchase_lines WHERE purchase_id = ? ORDER BY id",
+            "SELECT amount FROM payment_allocations WHERE target_kind = 'Purchase' AND target_id = ? \
+             ORDER BY id",
+            AppError::NotFound(format!("purchase {target_id} not found")),
+        ),
+        // A return family is not something money is APPLIED to: a refund replays a
+        // parent payment and a credit note reduces a sale. Allocating to one would be
+        // a new concept, so it is refused rather than guessed at.
+        PartyDocumentKind::CustomerReturn | PartyDocumentKind::PurchaseReturn => {
+            return Err(AppError::Validation(format!(
+                "money cannot be applied to a {target_kind} document: returns reduce their parent, they are not collected against"
+            )));
+        }
+    };
+
+    let lines: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(lines_sql))
+        .bind(target_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut total = Decimal::ZERO;
+    for (qty, price, tax) in &lines {
+        let line = parse_decimal(qty) * parse_decimal(price);
+        let line =
+            checked_money_sum([line, parse_decimal(tax)].iter()).map_err(AppError::PriceRefused)?;
+        total = checked_money_sum([total, line].iter()).map_err(AppError::PriceRefused)?;
+    }
+    // An empty line set means either a document with no lines (legitimate on a Draft,
+    // and its total is then zero) or a document that does not exist. The parent read
+    // is what tells them apart, and only that one is an error.
+    if lines.is_empty() && !document_exists(tx, target_kind, target_id).await? {
+        return Err(missing);
+    }
+
+    let paid_rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(applied_sql))
+        .bind(target_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut paid = Decimal::ZERO;
+    for (amount,) in &paid_rows {
+        paid = checked_money_sum([paid, parse_decimal(amount)].iter())
+            .map_err(AppError::PriceRefused)?;
+    }
+
+    total
+        .checked_sub(paid)
+        .ok_or_else(|| AppError::PriceRefused(crate::models::PriceRefusal::DocumentTotalTooLarge))
+}
+
+/// Does the parent document exist? Asked only when it has no lines, so the ordinary
+/// path pays no extra read.
+async fn document_exists(
+    tx: &mut SqliteConnection,
+    target_kind: PartyDocumentKind,
+    id: i64,
+) -> AppResult<bool> {
+    let sql = match target_kind {
+        PartyDocumentKind::Sale => "SELECT id FROM sales WHERE id = ?",
+        PartyDocumentKind::Purchase => "SELECT id FROM purchases WHERE id = ?",
+        PartyDocumentKind::CustomerReturn => "SELECT id FROM customer_returns WHERE id = ?",
+        PartyDocumentKind::PurchaseReturn => "SELECT id FROM purchase_returns WHERE id = ?",
+    };
+    let found: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    Ok(found.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +440,14 @@ impl PaymentRepository for SqlitePaymentRepository {
                 "an allocation amount must be positive".into(),
             ));
         }
-        assert_within_cap(&mut *tx, allocation.payment_id, allocation.amount).await?;
+        assert_within_cap(
+            &mut *tx,
+            allocation.payment_id,
+            allocation.target_kind,
+            allocation.target_id,
+            allocation.amount,
+        )
+        .await?;
         let row = sqlx::query(
             r#"INSERT INTO payment_allocations
                (payment_id, target_kind, target_id, amount, created_by)
@@ -327,6 +472,16 @@ impl PaymentRepository for SqlitePaymentRepository {
             }
         })?;
         row_to_allocation(row)
+    }
+
+    async fn list_for_receipt(&self, receipt_id: i64) -> AppResult<Vec<Payment>> {
+        let sql =
+            format!("SELECT {PAYMENT_COLUMNS} FROM payments WHERE receipt_id = ? ORDER BY id");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(receipt_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(row_to_payment).collect()
     }
 
     async fn list_allocations(&self, payment_id: i64) -> AppResult<Vec<PaymentAllocation>> {
@@ -399,6 +554,15 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
+    /// A process-wide counter for fixture names that are UNIQUE in the schema
+    /// (`products.sku`). Not derived from any table: the point is to be unique even
+    /// when nothing has been written yet.
+    fn next_fixture_seq() -> u32 {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(1);
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// The fixture's own counter for the UNIQUE `number`. It does not use
     /// `doc_sequences` because this module tests the REPOSITORY: the sequence has
     /// its own tests, and the service is what joins the two in P3.
@@ -429,6 +593,7 @@ mod tests {
         .unwrap();
         let payment = repo
             .create(&NewPayment {
+                receipt_id: None,
                 // The number comes from `doc_sequences` in production; the fixture
                 // writes the shape the sequence produces, per payment so the UNIQUE
                 // index is exercised rather than bypassed.
@@ -447,6 +612,61 @@ mod tests {
             .await
             .unwrap();
         payment.id
+    }
+
+    /// A confirmed sale owing `total`, with one line and stock so nothing else
+    /// complains. The document family is real: `target_residual_due` reads its lines.
+    async fn seed_confirmed_sale(pool: &SqlitePool, actor: i64, total: &str) -> (i64, i64) {
+        // A SKU per call: `products.sku` is UNIQUE and these tests seed several sales.
+        // A process-wide counter rather than the payments sequence: that one only moves
+        // when a payment is created, so two sales between payments collided.
+        let sku = format!("CAP-{}", next_fixture_seq());
+        let product: i64 = sqlx::query_scalar(
+            "INSERT INTO products (sku, name, kind, unit, sale_price, track_stock, created_by) \
+             VALUES (?, 'Cap', 'Product', 'unit', '1', 1, ?) RETURNING id",
+        )
+        .bind(&sku)
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO stock_movements (product_id, qty, type, reason, reference, date, created_by) \
+             VALUES (?, '100', 'In', 'Initial', '', '2024-05-01', ?)",
+        )
+        .bind(product)
+        .bind(actor)
+        .execute(pool)
+        .await
+        .unwrap();
+        let customer: i64 = sqlx::query_scalar(
+            "INSERT INTO customers (name, created_by) VALUES ('Cap Buyer', ?) RETURNING id",
+        )
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let sale: i64 = sqlx::query_scalar(
+            "INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date, created_by) \
+             VALUES ('Confirmed', 'Credit', ?, 'Cap Buyer', '2024-05-01', ?) RETURNING id",
+        )
+        .bind(customer)
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        // One line whose `qty * unit_price` is exactly `total`, no tax.
+        sqlx::query(
+            "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price, tax_total) \
+             VALUES (?, ?, ?, '1', '0')",
+        )
+        .bind(sale)
+        .bind(product)
+        .bind(total)
+        .execute(pool)
+        .await
+        .unwrap();
+        (sale, product)
     }
 
     fn allocation(payment_id: i64, target_id: i64, amount: &str) -> NewPaymentAllocation {
@@ -482,10 +702,16 @@ mod tests {
         let pool = test_pool().await;
         let id = seed_payment(&pool, "100").await;
         let repo = SqlitePaymentRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        // Three REAL sales, because the cap reads each document's own residual: a
+        // fictional target is now a 404, which is the point of the second cap.
+        let (s1, _) = seed_confirmed_sale(&pool, actor, "60").await;
+        let (s2, _) = seed_confirmed_sale(&pool, actor, "40").await;
+        let (s3, _) = seed_confirmed_sale(&pool, actor, "1").await;
 
-        repo.allocate(&allocation(id, 10, "60")).await.unwrap();
-        repo.allocate(&allocation(id, 11, "40")).await.unwrap();
-        let err = repo.allocate(&allocation(id, 12, "1")).await.unwrap_err();
+        repo.allocate(&allocation(id, s1, "60")).await.unwrap();
+        repo.allocate(&allocation(id, s2, "40")).await.unwrap();
+        let err = repo.allocate(&allocation(id, s3, "1")).await.unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         let msg = err.to_string();
         assert!(
@@ -508,7 +734,9 @@ mod tests {
             Decimal::from_str("100").unwrap(),
             "nothing allocated yet: the whole delivery is unapplied"
         );
-        repo.allocate(&allocation(id, 10, "30")).await.unwrap();
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "30").await;
+        repo.allocate(&allocation(id, sale, "30")).await.unwrap();
         assert_eq!(
             repo.unapplied_for_payment(id).await.unwrap(),
             Decimal::from_str("70").unwrap()
@@ -522,8 +750,10 @@ mod tests {
         let pool = test_pool().await;
         let id = seed_payment(&pool, "100").await;
         let repo = SqlitePaymentRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "100").await;
         for bad in ["0", "-5"] {
-            let err = repo.allocate(&allocation(id, 10, bad)).await.unwrap_err();
+            let err = repo.allocate(&allocation(id, sale, bad)).await.unwrap_err();
             assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         }
         assert!(repo.list_allocations(id).await.unwrap().is_empty());
@@ -536,8 +766,10 @@ mod tests {
         let pool = test_pool().await;
         let id = seed_payment(&pool, "100").await;
         let repo = SqlitePaymentRepository::new(pool.clone());
-        repo.allocate(&allocation(id, 10, "30")).await.unwrap();
-        let err = repo.allocate(&allocation(id, 10, "1")).await.unwrap_err();
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        repo.allocate(&allocation(id, sale, "30")).await.unwrap();
+        let err = repo.allocate(&allocation(id, sale, "1")).await.unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
     }
 
@@ -550,13 +782,16 @@ mod tests {
         let pool = test_pool().await;
         let id = seed_payment(&pool, "50").await;
         let repo = SqlitePaymentRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (s1, _) = seed_confirmed_sale(&pool, actor, "30").await;
+        let (s2, _) = seed_confirmed_sale(&pool, actor, "30").await;
 
         let mut tx = pool.begin().await.unwrap();
-        repo.allocate_in(&mut tx, &allocation(id, 10, "30"))
+        repo.allocate_in(&mut tx, &allocation(id, s1, "30"))
             .await
             .unwrap();
         let err = repo
-            .allocate_in(&mut tx, &allocation(id, 11, "30"))
+            .allocate_in(&mut tx, &allocation(id, s2, "30"))
             .await
             .unwrap_err();
         assert!(
@@ -595,6 +830,7 @@ mod tests {
         let repo = SqlitePaymentRepository::new(pool.clone());
         let err = repo
             .create(&NewPayment {
+                receipt_id: None,
                 number: "2024-PAY-900001".into(),
                 direction: PaymentDirection::In,
                 party_type: PartyType::Customer,
@@ -624,7 +860,11 @@ mod tests {
         let free = seed_payment(&pool, "50").await;
         let frozen = seed_payment(&pool, "100").await;
         let repo = SqlitePaymentRepository::new(pool.clone());
-        repo.allocate(&allocation(frozen, 10, "70")).await.unwrap();
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (target, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        repo.allocate(&allocation(frozen, target, "70"))
+            .await
+            .unwrap();
 
         sqlx::query("UPDATE payments SET amount = '55' WHERE id = ?")
             .bind(free)
@@ -651,16 +891,155 @@ mod tests {
 
     /// How much of one document is already covered, across every payment — the
     /// read P5 builds the per-document residual on.
+    /// **A payment LARGER than the document it is applied to.**
+    ///
+    /// This is the case the customer-side refusals used to forbid, and the reason they
+    /// could be lifted only with a cap at the OTHER end. The document must not go
+    /// negative: the share is capped at what the sale still owes, and the excess stays
+    /// UNAPPLIED on the payment — which is the credit the plan calls `unapplied > 0`.
+    ///
+    /// The failure this pins is not cosmetic. A negative residual makes
+    /// `paid_and_due` report a negative `due` (it does not refuse), makes
+    /// `payment_status_for` say Paid, makes the refund cap stop refusing
+    /// (`collected > 0 && total > collected` is false once collected exceeds the
+    /// total) and makes every `due > ZERO` filter drop the document from the debtor
+    /// list — one bad share, the whole accounting of that document.
+    #[tokio::test]
+    async fn a_share_cannot_exceed_what_the_document_still_owes() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        // A sale of 30, confirmed, so it owes 30 and has no payments yet.
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "30").await;
+        // A delivery of 50: MORE than the sale owes.
+        let payment = seed_payment(&pool, "50").await;
+        let repo = SqlitePaymentRepository::new(pool.clone());
+
+        // 30 is accepted: it is exactly the residual.
+        repo.allocate(&allocation(payment, sale, "30"))
+            .await
+            .unwrap();
+
+        // Asking for one more cent on the SAME payment and document is refused, and
+        // the CAP is what refuses it: the document has nothing left, so the pre-check
+        // fires before the `UNIQUE(payment, document)` index ever sees the row. The
+        // order is the honest one — a cap question is answered before a uniqueness
+        // question, because "there is nothing left to apply" is the useful message.
+        let err = repo
+            .allocate(&allocation(payment, sale, "0.01"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+        // The UNIQUE index still owns its own case, proven where the cap cannot
+        // answer first: a document with money left.
+        let (roomy, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        let third = seed_payment(&pool, "100").await;
+        repo.allocate(&allocation(third, roomy, "10"))
+            .await
+            .unwrap();
+        let err = repo
+            .allocate(&allocation(third, roomy, "5"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "one share per (payment, document) is the UNIQUE index's rule: {err:?}"
+        );
+
+        // THE CAP, measured where it is the only thing that can refuse: a SECOND
+        // payment, with plenty of its own headroom, trying to over-apply a document
+        // that is already settled. Its own cap passes (1 <= 50), so if this is refused
+        // it is refused by the DOCUMENT's residual and nothing else.
+        let second = seed_payment(&pool, "50").await;
+        let err = repo
+            .allocate(&allocation(second, sale, "1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("owes 0"), "names what it still owes: {msg}");
+        assert!(
+            msg.contains("unapplied"),
+            "and tells the operator the excess stays on the payment: {msg}"
+        );
+
+        // The document did NOT go negative, and the second payment is ALL credit.
+        assert_eq!(
+            repo.allocated_to_target(PartyDocumentKind::Sale, sale)
+                .await
+                .unwrap(),
+            Decimal::from_str("30").unwrap()
+        );
+        assert_eq!(
+            repo.unapplied_for_payment(second).await.unwrap(),
+            Decimal::from_str("50").unwrap(),
+            "a payment with nothing left to apply is entirely credit"
+        );
+        // And the FIRST payment, which delivered 50 and applied 30, holds 20 as credit:
+        // the number the receipt now reports and no allocation carries.
+        assert_eq!(
+            repo.unapplied_for_payment(payment).await.unwrap(),
+            Decimal::from_str("20").unwrap(),
+            "the excess of the first delivery is its credit"
+        );
+        assert_eq!(
+            repo.unapplied_for_payment(payment).await.unwrap(),
+            Decimal::from_str("20").unwrap(),
+            "the 20 the sale did not need is the credit, held by the PAYMENT"
+        );
+    }
+
+    /// Allocating to a document that has no lines and does not exist is a caller's
+    /// mistake, not a cap question: a 404, not a `Validation` about money.
+    #[tokio::test]
+    async fn allocating_to_a_document_that_does_not_exist_is_not_found() {
+        let pool = test_pool().await;
+        let payment = seed_payment(&pool, "50").await;
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        let err = repo
+            .allocate(&allocation(payment, 999_999, "10"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+    }
+
+    /// A return is not something money is applied to: a refund replays a parent
+    /// payment and a credit note reduces a sale, so allocating to one is refused
+    /// rather than guessed at.
+    #[tokio::test]
+    async fn money_cannot_be_applied_to_a_return_document() {
+        let pool = test_pool().await;
+        let payment = seed_payment(&pool, "50").await;
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        let err = repo
+            .allocate(&NewPaymentAllocation {
+                payment_id: payment,
+                target_kind: PartyDocumentKind::CustomerReturn,
+                target_id: 1,
+                amount: Decimal::from_str("10").unwrap(),
+                created_by: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("returns reduce their parent"),
+            "the refusal must say why: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn allocated_to_target_sums_across_payments() {
         let pool = test_pool().await;
         let a = seed_payment(&pool, "100").await;
         let b = seed_payment(&pool, "100").await;
         let repo = SqlitePaymentRepository::new(pool.clone());
-        repo.allocate(&allocation(a, 42, "30")).await.unwrap();
-        repo.allocate(&allocation(b, 42, "25")).await.unwrap();
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        repo.allocate(&allocation(a, sale, "30")).await.unwrap();
+        repo.allocate(&allocation(b, sale, "25")).await.unwrap();
         assert_eq!(
-            repo.allocated_to_target(PartyDocumentKind::Sale, 42)
+            repo.allocated_to_target(PartyDocumentKind::Sale, sale)
                 .await
                 .unwrap(),
             Decimal::from_str("55").unwrap()
@@ -682,11 +1061,14 @@ mod tests {
         let pool = test_pool().await;
         let id = seed_payment(&pool, "100").await;
         let repo = SqlitePaymentRepository::new(pool.clone());
-        let via_public = repo.allocate(&allocation(id, 10, "30")).await.unwrap();
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (s1, _) = seed_confirmed_sale(&pool, actor, "30").await;
+        let (s2, _) = seed_confirmed_sale(&pool, actor, "40").await;
+        let via_public = repo.allocate(&allocation(id, s1, "30")).await.unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let via_in = repo
-            .allocate_in(&mut tx, &allocation(id, 11, "40"))
+            .allocate_in(&mut tx, &allocation(id, s2, "40"))
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -695,7 +1077,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].amount, via_public.amount);
         assert_eq!(rows[1].amount, via_in.amount);
-        assert_eq!(rows[0].target_id, 10);
-        assert_eq!(rows[1].target_id, 11);
+        assert_eq!(rows[0].target_id, s1);
+        assert_eq!(rows[1].target_id, s2);
     }
 }

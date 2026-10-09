@@ -2899,10 +2899,23 @@ pub struct NewReceipt {
 pub struct ReceiptDetail {
     pub receipt: CustomerReceipt,
     pub allocations: Vec<SalePayment>,
-    /// Derived, never stored: `SUM(allocations.amount)`, i.e. exactly what was
-    /// handed over and applied. A stored copy could disagree with the payments;
-    /// this one is computed from them.
+    /// **What was actually handed over**: `SUM(amount)` of the deliveries this receipt
+    /// groups (migration 47's `payments.receipt_id`).
+    ///
+    /// A1: this field's MEANING changed in P3c. It used to be the sum of the
+    /// allocations, which is what was APPLIED — and those two numbers diverge the
+    /// moment a collection delivers more than the outstanding debt, because the excess
+    /// is applied to nothing and therefore appears in no allocation. A receipt that
+    /// reported 30 while the box received 50 was not a display bug, it was the receipt
+    /// being unable to see money it had grouped.
     pub total: Decimal,
+    /// What those deliveries were APPLIED to: `SUM(allocations.amount)`. Always
+    /// `<= total`.
+    pub applied: Decimal,
+    /// The credit this collection created and did not apply: `total - applied`. Never
+    /// stored, and not a separate pliegue — it is the difference between the two
+    /// numbers above, both of which come from tables that already exist.
+    pub unapplied: Decimal,
     /// Account name resolved for display through the account read path.
     pub account_name: String,
     /// Payment-method name resolved for display through the finance read path.
@@ -3128,12 +3141,31 @@ pub struct RoleMatrix {
 }
 
 impl ReceiptDetail {
-    pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>) -> Self {
-        let total = allocations.iter().map(|payment| payment.amount).sum();
+    /// Assemble from the two facts the receipt now knows: what its DELIVERIES brought
+    /// in (`received`) and what its allocations applied.
+    ///
+    /// `received` is passed in rather than derived from the allocations because it
+    /// cannot be: the unapplied remainder belongs to the delivery and appears in no
+    /// allocation. `applied` IS derived, from the same rows that have always carried
+    /// it, so there is still exactly one source for it.
+    pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>, received: Decimal) -> Self {
+        let applied = allocations
+            .iter()
+            .fold(Decimal::ZERO, |sum, payment| sum + payment.amount);
+        // `received - applied` is the credit. A negative would mean an allocation with
+        // no delivery behind it, which the cap makes unrepresentable; saturating at zero
+        // keeps the field honest instead of printing a negative to an operator.
+        let unapplied = if received > applied {
+            received - applied
+        } else {
+            Decimal::ZERO
+        };
         Self {
             receipt,
             allocations,
-            total,
+            total: received,
+            applied,
+            unapplied,
             account_name: String::new(),
             method_name: String::new(),
         }
@@ -3766,6 +3798,13 @@ pub struct Payment {
     pub date: NaiveDate,
     pub notes: Option<String>,
     pub transaction_id: Option<i64>,
+    /// The receipt that groups this delivery, when a lump-sum collection produced it
+    /// (migration 47). NULL for a direct payment on one sale.
+    ///
+    /// It lives on the DELIVERY and not on each allocation on purpose: the receipt
+    /// groups the HANDOVER of money, while the allocations say which documents that
+    /// money covered. Two facts, two places.
+    pub receipt_id: Option<i64>,
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
@@ -3791,6 +3830,8 @@ pub struct NewPayment {
     pub date: NaiveDate,
     pub notes: Option<String>,
     pub transaction_id: Option<i64>,
+    /// The receipt this delivery is grouped under, or `None` for a direct payment.
+    pub receipt_id: Option<i64>,
     pub created_by: i64,
 }
 

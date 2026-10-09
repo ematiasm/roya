@@ -112,15 +112,41 @@ where
             .await?;
         let notes = Self::clean_notes(notes)?;
 
-        // The receivable: a collection never exceeds what the customer owes, and the
-        // outstanding figure is what the allocation is checked against.
-        let outstanding = self.sales.customer_balance(customer_id).await?;
-        if amount > outstanding {
-            return Err(AppError::Validation(format!(
-                "amount {amount} exceeds the outstanding debt {outstanding} of customer {} ({customer_id})",
-                customer.name
-            )));
+        // ---- A WALK-IN CANNOT CARRY CREDIT, and that is a rule of its own --------
+        //
+        // Lifting the over-collection refusal exposed this: the walk-in is the seeded
+        // anonymous customer every cash sale uses, and its balance is zero by
+        // construction, so `amount > outstanding` used to refuse collecting against it
+        // BY ACCIDENT. With that gone, handing 10 to "Consumidor final" would succeed
+        // with `applied = 0, unapplied = 10` — money held for nobody, against a party
+        // that cannot be identified again, and which no statement can ever show.
+        //
+        // So the rule is stated instead of inherited: a walk-in collection must have a
+        // DEBT to apply to. Paying ahead is a named customer's privilege, because a
+        // credit only means something for a party you can name twice.
+        if customer.is_walkin && self.sales.customer_balance(customer_id).await? <= Decimal::ZERO {
+            return Err(AppError::Validation(
+                "the walk-in customer cannot hold a credit: collect only against a sale \
+                 of theirs, or name the customer so the balance has somewhere to live"
+                    .into(),
+            ));
         }
+
+        // ---- THE COLLECTION REFUSAL IS LIFTED (P3c) -----------------------------
+        //
+        // Collecting MORE than the customer owes is allowed now, and the excess becomes
+        // their credit instead of an error. What used to refuse it here and in
+        // `record_payment` was the only thing keeping a document from going negative;
+        // that job belongs to the cap on the SHARE now (`PaymentRepository::allocate_in`
+        // refuses a share larger than the document's residual), which is the right place
+        // for it: the operator is not paying the wrong amount, they are paying ahead.
+        //
+        // `plan_allocations` below stops on its own when the debts run out, so the split
+        // simply covers what exists and the rest stays unapplied on the delivery.
+        //
+        // The figure is still READ because the plan needs the debts, and reading it here
+        // keeps the 404 for an unknown customer ahead of any write.
+        let _outstanding = self.sales.customer_balance(customer_id).await?;
 
         // The STRICT read: a collection allocates real money against each due, so
         // a document whose due cannot be stated has nothing to allocate against.
@@ -128,9 +154,12 @@ where
         let debts = self.sales.customer_debt_details(customer_id).await?;
         let plan = Self::plan_allocations(amount, &debts);
         let planned: Decimal = plan.iter().map(|allocation| allocation.amount).sum();
-        if planned != amount {
+        // The plan may now consume LESS than the amount, and that difference IS the
+        // credit: `unapplied = amount - planned >= 0`. What must still hold is that it
+        // never consumes MORE, which would be an allocation with no delivery behind it.
+        if planned > amount {
             return Err(AppError::Internal(format!(
-                "collection plan {planned} does not consume the collected amount {amount}"
+                "collection plan {planned} exceeds the collected amount {amount}"
             )));
         }
         // The plan comes from this customer's receivable, so every sale is already
@@ -199,6 +228,10 @@ where
                 // crossed, which is what a statement reader needs.
                 None,
                 Some(customer.name.clone()),
+                // The receipt is created in this same unit just above, so the delivery
+                // names it: that is the edge that lets the receipt state how much money
+                // it grouped instead of only what it applied.
+                Some(receipt.id),
                 &allocations,
             )
             .await?;
@@ -271,7 +304,17 @@ where
 
     async fn receipt_detail(&self, receipt: CustomerReceipt) -> AppResult<ReceiptDetail> {
         let allocations = self.receipts.list_allocations(receipt.id).await?;
-        let detail = ReceiptDetail::new(receipt, allocations);
+        // What the receipt GROUPED: the deliveries that name it. This is the figure
+        // that shows the 50, including the 20 no allocation carries.
+        let received = {
+            let mut sum = Decimal::ZERO;
+            for delivery in self.sales.payments.list_for_receipt(receipt.id).await? {
+                sum = crate::services::checked_money_add(sum, delivery.amount)
+                    .map_err(AppError::PriceRefused)?;
+            }
+            sum
+        };
+        let detail = ReceiptDetail::new(receipt, allocations, received);
         // Resolve the display names through the same read paths the rest of the
         // interface uses, so the receipt list never prints an internal key.
         let account_name = self
@@ -1314,17 +1357,28 @@ mod tests {
 
     // -- Rejections leave no trace ----------------------------------------------
 
+    /// **Over-collection is now a CREDIT, not an error (P3c).**
+    ///
+    /// This test used to assert the refusal and that nothing was written. Both halves
+    /// invert: collecting 31 against a debt of 30 succeeds, the receipt reports what
+    /// came in (31) separately from what it applied (30), and the extra 1 is the
+    /// customer's credit — visible as `unapplied` on the receipt and as a negative
+    /// balance on the party.
+    ///
+    /// The number that must NOT move is `applied`: the sale is settled by 30 and no
+    /// more, which is what keeps its residual at zero. That is the cap on the SHARE
+    /// doing its job one level below the delivery.
     #[tokio::test]
-    async fn over_collection_is_rejected_and_leaves_no_receipt_or_payment_behind() {
+    async fn over_collection_becomes_the_customers_credit() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-12", "10").await;
         let customer = seed_customer(&s, "Ana").await;
         let account = seed_account(&s, "Caja").await;
         let cash = method_id(&s, "Cash").await;
         allow(&s, account, cash).await;
-        credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
+        let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
-        let err = s
+        let detail = s
             .collect(
                 audit_actor(&s).await,
                 customer,
@@ -1334,17 +1388,113 @@ mod tests {
                 None,
             )
             .await
+            .unwrap();
+
+        assert_eq!(detail.total, dec("31"), "what was handed over");
+        assert_eq!(detail.applied, dec("30"), "what found a document");
+        assert_eq!(detail.unapplied, dec("1"), "and the credit");
+
+        // One delivery, one movement, carrying the WHOLE 31: the money arrived once.
+        assert_eq!(tx_count(&pool).await, 1);
+        let movement: String = sqlx::query_scalar("SELECT amount FROM transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(movement, "31");
+
+        // The sale is settled and its residual is exactly zero, not negative.
+        let after = s.sales.get_detail(sale.sale.id).await.unwrap();
+        assert_eq!(after.paid, dec("30"));
+        assert_eq!(after.due, Decimal::ZERO);
+        assert!(
+            after.due >= Decimal::ZERO,
+            "the document must never carry a negative residual"
+        );
+
+        // **The party's BALANCE still cannot see the credit, and that is P5's job.**
+        //
+        // `customer_balance` folds the old document family (sales minus their legacy
+        // payment rows), and the legacy rows carry what was APPLIED — 30 — so the
+        // balance reads 30 - 30 = 0 while the customer is really owed 1. This is not a
+        // bug introduced here: it is the same split the plan already records, and moving
+        // those folds onto the allocations is P5. The test asserts TODAY'S truth so the
+        // day P5 lands, the assertion failing is the reminder to update it.
+        assert_eq!(
+            s.sales.customer_balance(customer).await.unwrap(),
+            Decimal::ZERO,
+            "P5 will move this fold and make it -1; until then it reads the legacy rows"
+        );
+        // The credit itself is already readable where it lives: on the delivery.
+        assert_eq!(
+            detail.unapplied,
+            dec("1"),
+            "the credit exists, it is just not folded into the party balance yet"
+        );
+
+        // The credit is APPLIABLE: a second collection that asks for nothing applied
+        // just carries it forward, which is what makes `unapplied` a number and not a
+        // decoration. Here it is spent on a new sale instead.
+        let sale_two = credit_sale(&s, customer, product, "2", d(2024, 6, 10)).await; // 20
+        let second = s
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("19"),
+                d(2024, 6, 25),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.applied,
+            dec("19"),
+            "the new collection applies everything it brought"
+        );
+        assert_eq!(second.unapplied, Decimal::ZERO);
+        let after_two = s.sales.get_detail(sale_two.sale.id).await.unwrap();
+        assert_eq!(after_two.due, dec("1"));
+        // Same caveat as above: the legacy fold sees 20 owed and 19 applied.
+        assert_eq!(
+            s.sales.customer_balance(customer).await.unwrap(),
+            dec("1"),
+            "the legacy fold reads 20 owed minus 19 applied; P5 is what nets the credit"
+        );
+    }
+
+    /// Lifting the refusal for named customers does NOT lift it for the walk-in: the
+    /// anonymous customer cannot hold a credit, because a credit only means something
+    /// for a party you can name again.
+    #[tokio::test]
+    async fn the_walkin_cannot_hold_a_credit() {
+        let (s, pool) = svc().await;
+        let account = seed_account(&s, "Caja").await;
+        let cash = method_id(&s, "Cash").await;
+        allow(&s, account, cash).await;
+        let walkin: i64 = sqlx::query_scalar("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Nothing owed, 10 handed over: refused, with the reason.
+        let err = s
+            .collect(
+                audit_actor(&s).await,
+                walkin,
+                cash,
+                dec("10"),
+                d(2024, 6, 20),
+                None,
+            )
+            .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        let msg = err.to_string();
         assert!(
-            msg.contains("30"),
-            "the outstanding figure must be quoted: {msg}"
+            err.to_string().contains("cannot hold a credit"),
+            "the refusal must say why: {err}"
         );
         assert_eq!(receipt_count(&pool).await, 0);
-        assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(tx_count(&pool).await, 0);
-        assert_eq!(s.sales.customer_balance(customer).await.unwrap(), dec("30"));
     }
 
     #[tokio::test]

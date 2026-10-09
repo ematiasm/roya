@@ -1060,7 +1060,10 @@ mod tests {
         let customer = seed_customer(&app, "Rechazos", None, None).await;
         credit_sale(&app, customer, product, "3", "2024-06-01").await; // 30
 
-        // Over the outstanding debt.
+        // **Over the outstanding debt is no longer a rejection (P3c): it is a credit.**
+        // The REST contract changed here, and the three figures below ARE the change:
+        // `total` is what came in, `applied` is what found a document, and `unapplied`
+        // is the credit. Before this, the request was a 400 and nothing was written.
         let (st, v) = post(
             &app,
             "/api/customer-receipts",
@@ -1070,12 +1073,11 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "over-collect: {v}");
-        assert!(
-            v["error"].as_str().unwrap_or_default().contains("30"),
-            "the outstanding figure must be quoted: {v}"
-        );
-        assert_eq!(receipt_count(&pool).await, 0);
+        assert_eq!(st, StatusCode::CREATED, "over-collect is a credit now: {v}");
+        assert_eq!(v["total"], json!("31"), "what was handed over: {v}");
+        assert_eq!(v["applied"], json!("30"), "what found a document: {v}");
+        assert_eq!(v["unapplied"], json!("1"), "and the credit: {v}");
+        assert_eq!(receipt_count(&pool).await, 1);
 
         // Inactive method: `account_id` is NOT NULL since migration 45, so the
         // unusable state is the deactivated one — the same refusal an operator
@@ -1102,7 +1104,10 @@ mod tests {
                 .contains("is inactive"),
             "the message must name the state: {v}"
         );
-        assert_eq!(receipt_count(&pool).await, 0);
+        // One receipt exists: the over-collection above was ACCEPTED (P3c) and created
+        // one. The inactive-method rejection below must add none, which is what the
+        // count checks after it.
+        assert_eq!(receipt_count(&pool).await, 1);
 
         // Unknown customer is a 404 before any write; unknown method too.
         let (st, _) = post(
@@ -1125,7 +1130,9 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
-        assert_eq!(receipt_count(&pool).await, 0);
+        // Still the ONE receipt from the accepted over-collection: an unknown method and
+        // an unknown customer are both refused before any write.
+        assert_eq!(receipt_count(&pool).await, 1);
 
         // A list without customer_id is a 400, not an unbounded dump.
         let (st, v) = get(&app, "/api/customer-receipts").await;
@@ -1135,9 +1142,18 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        // The receivable is untouched by every rejection.
+        // The receivable reflects the FIRST collection only: the over-collection
+        // settled the whole 30 debt, and its extra 1 is credit that this legacy fold
+        // cannot see yet (P5 moves it onto the allocations). So the balance reads 0 and
+        // the rejections below it added nothing.
+        //
+        // The 1 is not lost: it is `unapplied` on the delivery, asserted above.
         let (_, v) = get(&app, &format!("/api/customers/{customer}")).await;
-        assert_eq!(dec(&v["balance"]), dec(&json!("30")));
+        assert_eq!(
+            dec(&v["balance"]),
+            Decimal::ZERO,
+            "the 30 debt was settled; the 1 of credit waits for P5's fold"
+        );
     }
 
     // -- The interface never offers a caller-supplied receipt id ----------------

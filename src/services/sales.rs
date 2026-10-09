@@ -1543,6 +1543,7 @@ where
                     sale.sale_date,
                     None,
                     Some(sale_number.clone()),
+                    None,
                     &[(crate::models::PartyDocumentKind::Sale, sale_id, total)],
                 )
                 .await?;
@@ -1652,6 +1653,9 @@ where
         // description is whatever a person reading a statement should see, which only
         // the caller knows.
         movement_description: Option<String>,
+        // The receipt this delivery is grouped under, when a lump-sum collection
+        // produced it. `None` for a direct payment on one sale.
+        receipt_id: Option<i64>,
         allocations: &[(crate::models::PartyDocumentKind, i64, Decimal)],
     ) -> AppResult<crate::models::Payment> {
         // The no-gap number, inside the caller's unit.
@@ -1694,6 +1698,7 @@ where
                     date,
                     notes,
                     transaction_id: Some(movement.id),
+                    receipt_id,
                     created_by: actor,
                 },
             )
@@ -1863,7 +1868,16 @@ where
                 date,
                 None,
                 Some(sale_number.clone()),
-                &[(crate::models::PartyDocumentKind::Sale, sale_id, amount)],
+                // A direct payment on one sale is not grouped under a receipt.
+                None,
+                // The SHARE is what the sale still owes — never the amount typed. The
+                // difference between the two is the customer's credit, and it stays on
+                // the payment rather than inside the document.
+                &[(
+                    crate::models::PartyDocumentKind::Sale,
+                    sale_id,
+                    amount.min(due),
+                )],
             )
             .await?;
 
