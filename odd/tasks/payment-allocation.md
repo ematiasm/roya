@@ -300,7 +300,8 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   needed: the user confirmed the development database will be wiped and holds no
   production history. Its replacement is P8.
 - [ ] **P3 — Customer money paths write the new shape, in one unit.** `collect`,
-  **PARTIALLY DONE 2026-10-08: P3a and P3b are in, P3c and P3d are not.** The two
+  **P3a, P3b and P3c are IN; P3d was split out as its own task (below) after being
+  measured.** The two
   halves that landed are the ones about the SHAPE of a delivery of money; the two
   that remain are the two customer overpayment REFUSALS being lifted and the
   cancel/refund paths writing `direction='Out'`.
@@ -318,8 +319,15 @@ Out of scope (follow-ups, recorded so nobody invents them later):
     mutations proves the difference is measurable. The receipt now lives inside the
     delivery's unit, so `injected_failure_mid_collection_...` asserts six empty
     tables instead of a "coherent" partial receipt.
-  * Together: `cargo test --locked` 1543 passed, `scripts/e2e.sh` 180 passed,
-    warnings 82 bin / 53 test (a P1 peak of 97 → 82 as the layer got called).
+  * P3c — `5fafd3e`: the two customer refusals are LIFTED and the cap moved one level
+    down to the SHARE, plus migration 47 (`payments.receipt_id`) so a receipt can state
+    what it took in rather than only what it applied. `ReceiptDetail` gained `applied`
+    and `unapplied` beside a `total` that now means received. Lifting the refusals
+    exposed a rule that was enforced BY ACCIDENT — a collection against the walk-in
+    failed only because its balance is zero — which is now an explicit refusal.
+  * Together: `cargo test --locked` 1547 passed, `scripts/e2e.sh` 180 passed,
+    warnings 80 bin / 53 test (a P1 peak of 97 → 80 as the layer got called, which is
+    the evidence AGENTS.md asks for that the wiring is real).
 
   The original text follows, unchanged, as the remaining contract. `collect`,
   `record_payment`, and the customer cancel/refund paths: one `payments` row, N
@@ -330,6 +338,32 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   payment row leaves neither; collecting 3 invoices with one amount writes **one**
   `Income`; overpaying leaves `unapplied > 0` and no error; applying that credit to
   a later sale writes an allocation and **no** cash movement.
+- [ ] **P3d — The four `cancel` paths write their refund as a delivery, inside one
+  unit.** Split out of P3 on 2026-10-08 after measuring it, because it is NOT the
+  small edit the P3 line implied. Measured on the tree:
+  **all four cancellations run with no transaction at all**, and each writes its
+  refund with `create_with_reference` (a unit of its OWN) and then `set_cancelled`:
+  `sales::cancel` (`sales.rs:1922`, refund at `:2064`), `purchases::cancel`
+  (`purchases.rs:1490`), `customer_return::cancel` (`customer_return.rs:783`,
+  refund at `:880`) and `purchase_return::cancel` (`purchase_return.rs:798`).
+  That is flow 5's defect again, with money LEAVING: a failure between the `Expense`
+  and `set_cancelled` leaves the money refunded and the document still Confirmed.
+  (Contrast `customer_return::confirm`, which DOES have a unit — `:607` — so the
+  problem is specifically the four `cancel` paths.)
+  The shape to build: each refund becomes a `payments` row with `direction='Out'`,
+  the single `Expense`, and the `Refund` ledger entry (decision 9), all inside one
+  unit per cancellation. Two consequences to decide at that point, recorded here so
+  they are not discovered as surprises:
+  * **A cancelled sale then has TWO deliveries** (the `In` and the `Out`), not one
+    annulled entry — consistent with the append-only ledger, but it changes what the
+    UI shows as "that sale's payment".
+  * The refund **replays the parent payment's account** (`RefundPlan`), which is
+    exactly why the two refund tables are exempt from migration 44's guard; that
+    requirement travels with this unit.
+  Forecast: four services, one unit each, plus the `Out` document shape and the
+  legacy `*_return_payments` rows until P8. Comparable to P3a in size, not to a
+  one-line change.
+
 - [ ] **P4 — Supplier money paths, mirrored.** `pay_supplier`, purchase
   `record_payment`, purchase cancel/refund: one `payments` (`direction='Out'`) with
   N allocations. Same tests mirrored, plus: one handover of 200.000 covering four
