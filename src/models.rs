@@ -1504,15 +1504,15 @@ pub struct PaymentMethodWithAccount {
 }
 
 impl PaymentMethodWithAccount {
-    /// Owning account name. There is no `unassigned` fallback because there is
-    /// no unassigned method: the row is an INNER join on a NOT NULL foreign key.
-    pub fn account_label(&self) -> String {
-        self.account_name.clone()
-    }
-
     /// Select label: `"Transfer — Bank"`.
+    ///
+    /// One method, not two: `account_name` is `NOT NULL` (migration 45 made the
+    /// foreign key mandatory and the read an INNER join), so a separate
+    /// `account_label()` had exactly one caller and returned a clone of the field
+    /// it was given. It was the site of the old `unassigned` fallback, which no
+    /// row can reach any more.
     pub fn label(&self) -> String {
-        format!("{} — {}", self.name, self.account_label())
+        format!("{} — {}", self.name, self.account_name)
     }
 }
 
