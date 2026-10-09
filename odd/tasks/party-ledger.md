@@ -271,7 +271,33 @@ Out of scope (follow-ups, recorded here so they are not silently invented later)
   above in its message. The checkbox was left unticked when the commit landed,
   which is why this reads as pending in an earlier scan of this file; the STATE
   section of this document already listed it as committed.
-- [ ] **T2 — Entry writes in the four `confirm` paths + lift the return caps.**
+- [x] **T2 — Entry writes in the four `confirm` paths + lift the return caps.**
+  **SPLIT 2026-10-08, and the SECOND HALF IS STILL OPEN BY DECISION.** The four
+  entry writes are DONE, one work-unit commit each:
+  `ba30397` (sales), `70c496d` (purchases), `c63f66f` (customer return),
+  `7953b0b` (purchase return). Each writes its entry INSIDE the unit that owns the
+  event, reachable only through the `_in` twin — the mutation that proves it is
+  writing the entry in its own transaction, which on the `max_connections(1)`
+  fixtures is a 30s `PoolTimedOut` rather than wrong data.
+  **The two refund caps are NOT lifted, and that is deliberate.** Lifting them
+  needs the decision the cap has been waiting for ("what replaces *this app has no
+  credit balance*"), and that decision is not written anywhere yet; the plan puts
+  the collection paths that would absorb it in P3/P4 of
+  `odd/tasks/payment-allocation.md`. Lifting a cap before P5 moves the reads would
+  leave a CONFIRMED document that no balance reflects, because `customer_balance`
+  still folds the old document family. Doing the writes was safe precisely because
+  nothing reads the ledger yet; lifting the cap is not, for the same reason.
+  Observed on the four commits: `cargo test --locked` 1530 passed / 0 failed;
+  `scripts/e2e.sh` 180 passed / 0 failed; warnings **78 bin / 49 test**, one BELOW
+  the 79/49 baseline — the ledger layer stopped being dead code as it got used,
+  which is the evidence AGENTS.md asks for that the wiring is real.
+  A note on how the tests were produced, because it is the honest part: the writes
+  came first and the tests after, so RED was produced by MUTATION rather than
+  claimed — disabling the entry fails the row-list assertions, and writing it in
+  its own transaction fails the rollback one. The third mutation checked is the
+  one worth keeping: **the rollback test is VACUOUS against the disabled-write
+  mutation**, because with no write there is nothing to roll back. It only earns
+  its place against the transaction mutation.
   `sales.rs`, `purchases.rs`, `customer_return.rs`, `purchase_return.rs`, inside the
   existing units via `_in`. Remove the two `return is worth … collected …` refusals.
   Tests first (RED): confirmed credit sale → `+total`; cash sale → `+total −total`;
