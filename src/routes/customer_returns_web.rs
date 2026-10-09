@@ -638,7 +638,7 @@ async fn record_context(
                 id: payment.id,
                 date: payment.date,
                 account_name: method
-                    .and_then(|m| m.account_name.clone())
+                    .map(|m| m.account_name.clone())
                     .unwrap_or_else(|| payment.account_id.to_string()),
                 method_name: method.map(|m| m.name.clone()).unwrap_or_default(),
                 amount: payment.amount,
@@ -1321,7 +1321,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash" && m.account_id == Some(account.id))
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .expect("the default Cash method is now bound to the wallet account");
         // Fund it, so the sale's own collection and the note's refund both have a
         // real balance rather than a zero the guard would refuse against.

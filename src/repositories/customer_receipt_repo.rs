@@ -440,23 +440,21 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let (account_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO accounts (name, created_by) VALUES ('Caja', ?) RETURNING id",
-        )
-        .bind(test_support::audit_actor_id(&pool).await.unwrap())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        // Migration 44 guards the (account, method) pair, so the method must be
-        // one THIS account owns (the seeded methods are unassigned here).
-        let (method_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO payment_methods (name, account_id, created_by) VALUES ('Caja cash', ?, ?) RETURNING id",
-        )
-        .bind(account_id)
-        .bind(test_support::audit_actor_id(&pool).await.unwrap())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        // Migration 45 SEEDS the account named Caja together with the Cash method
+        // it owns, so this fixture reuses that pair instead of inserting a second
+        // Caja (which UNIQUE(accounts.name) refuses). It is also the pair
+        // migration 44's guard accepts, which is what the receipt insert below
+        // needs.
+        let (account_id,): (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = 'Caja'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (method_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM payment_methods WHERE account_id = ? AND name = 'Cash'")
+                .bind(account_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
 
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let err = repo

@@ -358,6 +358,11 @@ async fn method_id(pool: &SqlitePool, name: &str) -> i64 {
 }
 
 /// The method row one account owns (same names repeat across accounts).
+///
+/// This is the read a payment test needs since migration 45: the seeded `Cash`
+/// belongs to `Caja`, and migration 44's guard refuses a payment naming a method
+/// another account owns — so a test that means "the account's own Cash" must ask
+/// for it by OWNER and name, not by name alone.
 async fn account_method_id(pool: &SqlitePool, account_id: i64, name: &str) -> i64 {
     let row: (i64,) =
         sqlx::query_as("SELECT id FROM payment_methods WHERE account_id = ? AND name = ?")
@@ -405,6 +410,15 @@ async fn customer_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
     row.0
 }
 
+/// Create an account through the real web form with the given method ticks.
+///
+/// Ticking a method another account owns is expected to work here: the web
+/// handler routes every tick through `assign_or_duplicate`, which gives the new
+/// account its OWN row of that name (`UNIQUE(account_id, name)` permits it) and
+/// never steals the original. So this helper needs no special case — but a TEST
+/// that then wants to pay with "the" Cash must read the id THIS account owns
+/// (`method_id_in_account`), because the seeded `Cash` belongs to `Caja` since
+/// migration 45 and naming it would be refused by the design.
 async fn create_account_via_web(
     app: &Router,
     pool: &SqlitePool,
@@ -1667,16 +1681,21 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
 #[tokio::test]
 async fn web_setup_flow_persists_account_methods_product_and_supplier_cost() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "SetupWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "SetupWallet", &[seeded]).await;
     let catalog = payment_methods_catalog(&app, account).await;
+    let owned = account_method_id(&pool, account, "Cash").await;
     assert!(
         catalog["method_ids"]
             .as_array()
             .unwrap()
-            .contains(&json!(cash)),
-        "the created account must keep its allowlist: {catalog}"
+            .contains(&json!(owned)),
+        "the created account must own the methods it ticked: {catalog}"
+    );
+    assert_ne!(
+        owned, seeded,
+        "the seeded Cash stays with its seeded account: the form duplicates the name"
     );
 
     let product = create_product_via_web(&app, &pool, "SETUP-P", "2", "20").await;
@@ -1722,9 +1741,13 @@ async fn web_setup_flow_persists_account_methods_product_and_supplier_cost() {
 #[tokio::test]
 async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "CashWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "CashWallet", &[seeded]).await;
+    // The account owns its OWN Cash: the web form duplicates the name rather
+    // than stealing the seeded row from Caja, and migration 44's guard refuses a
+    // payment naming a method another account owns.
+    let cash = account_method_id(&pool, account, "Cash").await;
     let product = create_product_via_web(&app, &pool, "CASH-P", "2", "50").await;
     record_stock_via_web(&app, product, "10").await;
 
@@ -1773,9 +1796,10 @@ async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
 #[tokio::test]
 async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "CreditWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "CreditWallet", &[seeded]).await;
+    let cash = account_method_id(&pool, account, "Cash").await;
     let product = create_product_via_web(&app, &pool, "CREDIT-P", "2", "50").await;
     record_stock_via_web(&app, product, "10").await;
 
@@ -2092,9 +2116,12 @@ async fn collection_flow_derives_balance_ageing_and_receipt_total() {
 #[tokio::test]
 async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded_cash = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "PurchaseWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "PurchaseWallet", &[seeded_cash]).await;
+    // The account owns its own Cash; the purchase below is paid FROM it, so the
+    // method named must be that row (migration 44 guards the pair).
+    let cash = account_method_id(&pool, account, "Cash").await;
     let (status, body) = post_form(
         &app,
         "/web/transactions",
@@ -2199,16 +2226,24 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
     assert_eq!(refund["reference"].as_str(), Some(purchase_number.as_str()));
 }
 
-/// A method with no owning account rejects the payment with the actionable
-/// message; assigning it to the account afterwards makes the same payment
-/// succeed.
+/// Migration 45 removed "a method with no owning account": ownership is a NOT
+/// NULL column now. What replaced that broken state are the edges that ARE
+/// reachable, and each one has a different, deliberate answer:
+///
+///   (a) paying with a method another account owns is NOT an error — the account
+///       is DERIVED from the method, so the money goes to the real owner;
+///   (b) the account EDITOR refuses a foreign method outright, naming the fix;
+///   (c) an account that owns the method collects through it, which is the flow
+///       the seed makes possible on a fresh install.
+///
+/// This replaces `payment_guard_rejects_then_succeeds_after_methods_configured`,
+/// whose premise (an unassigned Cash that assigning makes usable) is no longer
+/// representable.
 #[tokio::test]
-async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
+async fn payment_guards_derive_the_owner_refuse_foreign_edits_and_stay_inert() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
 
-    // REST-created accounts own nothing and Cash is unassigned: no account can
-    // be derived, the realistic broken state.
+    // A REST-created account owns nothing.
     let (status, body) = post_json(&app, "/api/accounts", json!({ "name": "GuardAccount" })).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let account = json_body(&body)["id"].as_i64().unwrap();
@@ -2227,48 +2262,65 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
     add_sale_line_via_web(&app, sale, product, "1").await;
     confirm_sale_via_web(&app, sale, None).await;
 
-    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body.contains("not assigned to any account"),
-        "message must tell the user what to do: {body}"
+    // (a) The account follows the METHOD, not the caller's intention.
+    let foreign = method_id(&pool, "Cash").await;
+    let owner: i64 = sqlx::query_scalar("SELECT account_id FROM payment_methods WHERE id = ?")
+        .bind(foreign)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(owner, account, "the seeded Cash belongs to another account");
+    let (status, body) = pay_sale_via_web(&app, sale, foreign, "25").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        transactions_for(&app, account).await.len(),
+        0,
+        "the payment must NOT land in the account the caller had in mind"
     );
-    assert!(
-        transactions_for(&app, account).await.is_empty(),
-        "rejected payment must not touch finance"
-    );
-    assert!(
-        sale_detail(&app, sale).await["payments"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "rejected payment must not land on the sale"
+    assert_eq!(
+        transactions_for(&app, owner).await.len(),
+        1,
+        "it lands in the account that owns the method"
     );
 
-    // Configure through the same plain form the account detail page renders.
+    // (b) The EDITOR has no such freedom: it refuses a method owned elsewhere,
+    // and the message names the one action that works.
     let (status, body) = post_browser_form(
         &app,
         &format!("/accounts/{account}/payment-methods"),
-        &format!("method_ids={cash}"),
+        &format!("method_ids={foreign}"),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
-
-    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "payment after configuration: {body}"
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains(&format!("belongs to account {owner}")),
+        "the refusal must name the owning account: {body}"
     );
-    assert_eq!(
-        sale_detail(&app, sale).await["payments"]
+    assert!(
+        body.contains("create a Cash method in this account"),
+        "and the fix an operator can perform: {body}"
+    );
+    assert!(
+        payment_methods_catalog(&app, account).await["method_ids"]
             .as_array()
             .unwrap()
-            .len(),
-        1
+            .is_empty(),
+        "a refused edit must not assign anything"
     );
-    let txs = transactions_for(&app, account).await;
-    assert_eq!(txs.len(), 1);
+
+    // (c) Create-through-the-form DOES own its method (it duplicates the name),
+    // and a payment naming that row succeeds and lands in the new account.
+    let wallet = create_account_via_web(&app, &pool, "GuardWallet", &[foreign]).await;
+    let owned = account_method_id(&pool, wallet, "Cash").await;
+    assert_ne!(owned, foreign, "the form mints the account's own row");
+    let second =
+        create_sale_draft_via_web(&app, &pool, "GuardFlowBuyer2", "Credit", "2024-06-03").await;
+    add_sale_line_via_web(&app, second, product, "1").await;
+    confirm_sale_via_web(&app, second, None).await;
+    let (status, body) = pay_sale_via_web(&app, second, owned, "25").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let txs = transactions_for(&app, wallet).await;
+    assert_eq!(txs.len(), 1, "the collection lands in the wallet: {txs:?}");
     assert_eq!(txs[0]["kind"], json!("Income"));
 }
 
@@ -2278,10 +2330,17 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
 #[tokio::test]
 async fn money_invariants_hold_for_balances_and_payment_links() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded_cash = method_id(&pool, "Cash").await;
 
     // Account A: cash sale posts Income; credit sale posts Income then a refund.
-    let _account_a = create_account_via_web(&app, &pool, "InvA", &[cash]).await;
+    // Paying names the Cash THIS account owns — the seeded row belongs to Caja
+    // and migration 44's guard would refuse the pair.
+    let account_a = create_account_via_web(&app, &pool, "InvA", &[seeded_cash]).await;
+    let cash = account_method_id(&pool, account_a, "Cash").await;
+    // The seeded Caja is a third account this test did not create, so every
+    // count below is about the accounts the flow built. It is not noise: the
+    // seed is why a fresh install can collect at all, and this test is where
+    // "the fixture's accounts" and "the seed's account" first meet.
     let product_a = create_product_via_web(&app, &pool, "INV-A", "1", "50").await;
     record_stock_via_web(&app, product_a, "10").await;
     let cash_sale = create_sale_draft_via_web(&app, &pool, "InvCashBuyer", "Cash", "").await;
@@ -2346,7 +2405,11 @@ async fn money_invariants_hold_for_balances_and_payment_links() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let accounts_json = json_body(&body);
     let accounts = accounts_json["accounts"].as_array().unwrap();
-    assert_eq!(accounts.len(), 2, "{accounts:?}");
+    assert_eq!(
+        accounts.len(),
+        3,
+        "the seed's Caja plus the two accounts this flow created: {accounts:?}"
+    );
     for account in accounts {
         let account_id = account["id"].as_i64().unwrap();
         let balance = dec(&account["balance"]);
@@ -5339,8 +5402,9 @@ fn accessible_name_resolution_accepts_wrapping_and_for_labels() {
 #[tokio::test]
 async fn sale_record_controls_resolve_accessible_names() {
     let (app, pool) = test_app().await;
+    // NOT named "Caja": migration 45 seeds that name and the form answers 409.
     let cash = method_id(&pool, "Cash").await;
-    let _account = create_account_via_web(&app, &pool, "Caja", &[cash]).await;
+    let _account = create_account_via_web(&app, &pool, "A11Y Wallet", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "A11Y-L", "1", "50").await;
     let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
@@ -5421,8 +5485,11 @@ async fn referenced_id_guard_rejects_a_bare_id_added_to_a_guarded_page_copy() {
 #[tokio::test]
 async fn customer_statement_resolves_receipt_account_and_method_names() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
-    let _account = create_account_via_web(&app, &pool, "GapWallet", &[cash]).await;
+    let seed_cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "GapWallet", &[seed_cash]).await;
+    // The receipt below is collected INTO this account, so it names the Cash this
+    // account owns.
+    let cash = account_method_id(&pool, account, "Cash").await;
     let product = create_product_via_web(&app, &pool, "GAP-P", "1", "50").await;
     record_stock_via_web(&app, product, "10").await;
     let customer = seed_customer(&pool, "GapBuyer", None, None).await;
@@ -7080,7 +7147,10 @@ async fn ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel() {
             .await
             .unwrap();
     assert_eq!(accounts.0, accounts.1, "no row lost, all attributed");
-    assert_eq!(accounts.0, 1, "the legacy account survived");
+    assert_eq!(
+        accounts.0, 2,
+        "the legacy account survived, and migration 45's seeded Caja is attributed to the same sentinel"
+    );
     let transactions: (i64, i64) =
         sqlx::query_as("SELECT COUNT(*), COUNT(*) FROM transactions WHERE created_by = ?")
             .bind(sentinel.0)
@@ -7099,7 +7169,10 @@ async fn ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel() {
             .await
             .unwrap();
     assert_eq!(methods.0, methods.1, "no row lost, all attributed");
-    assert_eq!(methods.0, 6, "the five seeds plus the legacy one survived");
+    assert_eq!(
+        methods.0, 1,
+        "only the seeded Cash survives: migration 45 deletes `Legacy Method` too, because it is unowned and has no payment history"
+    );
 
     // `created_by` is NOT NULL afterwards: a write that omits the actor
     // is refused by the database, which is what makes every future insert
@@ -7448,6 +7521,44 @@ async fn ac19_the_inventory_migration_recreates_a_missing_sentinel() {
 // beyond the sentinel.
 // ---------------------------------------------------------------------------
 
+/// The `(account, method)` pair a pre-44 legacy row must name, planted before
+/// migration 44 exists and therefore before its `BEFORE INSERT` guard does.
+///
+/// The pair cannot be arbitrary: `sale_payments.method_id` carries `DEFAULT 1`,
+/// so a fixture that names only `account_id` silently pairs it with method 1 —
+/// `Cash` — and migration 44 then refuses the row when it later runs, taking the
+/// whole upgrade test down with it. Building the row's own method inside the
+/// row's own account is what makes the pair true at the moment it is written,
+/// which is the only thing the guard asks.
+///
+/// `created_by` is named explicitly because these fixtures run up to migration
+/// 31, where the audit columns do not exist yet: a column that is not there
+/// cannot be filled by a statement.
+async fn legacy_account_and_own_method(
+    pool: &sqlx::SqlitePool,
+    account_name: &str,
+    method_name: &str,
+    sentinel: i64,
+) -> (i64, i64) {
+    let account: (i64,) =
+        sqlx::query_as("INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id")
+            .bind(account_name)
+            .bind(sentinel)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let method: (i64,) = sqlx::query_as(
+        "INSERT INTO payment_methods (name, account_id, created_by) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(method_name)
+    .bind(account.0)
+    .bind(sentinel)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (account.0, method.0)
+}
+
 /// A pool with the migration chain stopped just after the inventory audit (the
 /// pre-32 sales/customers schema is real) plus legacy business rows planted
 /// the way pre-audit code wrote them: no created_by column exists to fill.
@@ -7483,13 +7594,8 @@ async fn upgraded_pool_with_legacy_sales_and_customer_rows(
         "no user beyond the sentinel before the upgrade"
     );
 
-    let account_id: (i64,) = sqlx::query_as(
-        "INSERT INTO accounts (name, created_by) VALUES ('legacy wallet', ?) RETURNING id",
-    )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (account_id, method_id) =
+        legacy_account_and_own_method(&pool, "legacy wallet", "legacy cash", sentinel.0).await;
 
     let customer_id: (i64,) = sqlx::query_as(
         "INSERT INTO customers (name, is_walkin, is_active) \
@@ -7517,19 +7623,21 @@ async fn upgraded_pool_with_legacy_sales_and_customer_rows(
     .unwrap();
     let payment_id: (i64,) = sqlx::query_as(
         "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date) \
-         VALUES (?, ?, 1, '5', '2024-05-10') RETURNING id",
+         VALUES (?, ?, ?, '5', '2024-05-10') RETURNING id",
     )
     .bind(sale_id.0)
-    .bind(account_id.0)
+    .bind(account_id)
+    .bind(method_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     let receipt_id: (i64,) = sqlx::query_as(
         "INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes) \
-         VALUES (?, ?, 1, '2024-06-20', NULL) RETURNING id",
+         VALUES (?, ?, ?, '2024-06-20', NULL) RETURNING id",
     )
     .bind(customer_id.0)
-    .bind(account_id.0)
+    .bind(account_id)
+    .bind(method_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -7966,13 +8074,13 @@ async fn upgraded_pool_with_legacy_purchases_and_supplier_rows(
     .fetch_one(&pool)
     .await
     .unwrap();
-    let account_id: (i64,) = sqlx::query_as(
-        "INSERT INTO accounts (name, created_by) VALUES ('legacy purchase wallet', ?) RETURNING id",
+    let (account_id, method_id) = legacy_account_and_own_method(
+        &pool,
+        "legacy purchase wallet",
+        "legacy purchase cash",
+        sentinel.0,
     )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    .await;
     let purchase_id: (i64,) = sqlx::query_as(
         "INSERT INTO purchases (purchase_number, supplier_id, status, payment_type, purchase_date, due_date) \
          VALUES ('2024-PURCH-000001', ?, 'Confirmed', 'Credit', '2024-05-02', '2024-06-01') RETURNING id",
@@ -7992,10 +8100,11 @@ async fn upgraded_pool_with_legacy_purchases_and_supplier_rows(
     .unwrap();
     let payment_id: (i64,) = sqlx::query_as(
         "INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date) \
-         VALUES (?, ?, 1, '5', '2024-05-10') RETURNING id",
+         VALUES (?, ?, ?, '5', '2024-05-10') RETURNING id",
     )
     .bind(purchase_id.0)
-    .bind(account_id.0)
+    .bind(account_id)
+    .bind(method_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -9511,8 +9620,11 @@ struct DrawerFixture {
 }
 
 async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
-    let cash = method_id(pool, "Cash").await;
-    let account = create_account_via_web(app, pool, "DrawerWallet", &[cash]).await;
+    let seed_cash = method_id(pool, "Cash").await;
+    let account = create_account_via_web(app, pool, "DrawerWallet", &[seed_cash]).await;
+    // The drawer names the account that owns the payment, so the payment must
+    // name THIS account's Cash — the seed's row belongs to Caja.
+    let cash = account_method_id(pool, account, "Cash").await;
     let product = create_product_via_web(app, pool, "DRAWER-P", "1", "50").await;
     record_stock_via_web(app, product, "10").await;
     let buyer = seed_customer(pool, "DrawerBuyer", None, None).await;
@@ -10269,8 +10381,12 @@ async fn due_days_supplier_cash_confirm_remains_without_a_due_date() {
         "Cash must not submit the visible Credit suggestion: {due_input}"
     );
 
-    let cash = method_id(&pool, "Cash").await;
-    let account = create_account_via_web(&app, &pool, "Due Cash Account", &[cash]).await;
+    let seeded_cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "Due Cash Account", &[seeded_cash]).await;
+    // Funded with the account's OWN Cash: this test is about the due date, and
+    // the seed's row belongs to Caja, which would make the confirm a guard
+    // refusal rather than the Cash purchase under test.
+    let cash = account_method_id(&pool, account, "Cash").await;
     let (status, body) = post_form(
         &app,
         "/web/transactions",

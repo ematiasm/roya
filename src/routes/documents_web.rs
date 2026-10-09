@@ -3041,7 +3041,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let account = state.account_service.create(actor, "Caja").await.unwrap();
+        // Named with a suffix: migration 45 seeds an account literally called
+        // "Caja", and `accounts.name` is UNIQUE. The defaults helper still takes
+        // the canonical word, because that is the rule it keys on.
+        let account = state
+            .account_service
+            .create(actor, &format!("Caja {}", test_support::fixture_seq()))
+            .await
+            .unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(actor, account.id, "Caja")
@@ -3056,7 +3063,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash")
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .expect("the account defaults include Cash");
         (product.id, account.id, method.id)
     }
@@ -4030,7 +4037,14 @@ mod tests {
             .await
             .unwrap();
         // A cash confirm needs a method the account owns.
-        let account = state.account_service.create(actor, "Caja").await.unwrap();
+        // Named with a suffix: migration 45 seeds an account literally called
+        // "Caja", and `accounts.name` is UNIQUE. The defaults helper still takes
+        // the canonical word, because that is the rule it keys on.
+        let account = state
+            .account_service
+            .create(actor, &format!("Caja {}", test_support::fixture_seq()))
+            .await
+            .unwrap();
         state
             .payment_method_service
             .ensure_defaults_for_account(actor, account.id, "Caja")
@@ -4042,7 +4056,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash")
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .expect("the account defaults include Cash");
         let purchase = state
             .purchases_service
@@ -4424,7 +4438,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash" && m.account_id == Some(account.id))
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .unwrap()
             .id;
         state

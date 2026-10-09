@@ -296,7 +296,11 @@ pub(crate) fn localized_refusal_error(
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
-    pub account_service: AccountService<SqliteAccountRepository, SqliteTransactionRepository>,
+    pub account_service: AccountService<
+        SqliteAccountRepository,
+        SqliteTransactionRepository,
+        SqlitePaymentMethodRepository,
+    >,
     pub transaction_service:
         TransactionService<SqliteAccountRepository, SqliteTransactionRepository>,
     pub inventory_service: InventorySvc,
@@ -398,7 +402,11 @@ impl AppState {
     ) -> Self {
         let acc_repo = SqliteAccountRepository::new(pool.clone());
         let tx_repo = SqliteTransactionRepository::new(pool.clone());
-        let account_service = AccountService::new(acc_repo.clone(), tx_repo.clone());
+        let account_service = AccountService::new(
+            acc_repo.clone(),
+            tx_repo.clone(),
+            SqlitePaymentMethodRepository::new(pool.clone()),
+        );
         let transaction_service =
             TransactionService::new(acc_repo.clone(), tx_repo.clone(), allow_negative);
         let inventory_service = InventoryService::new(

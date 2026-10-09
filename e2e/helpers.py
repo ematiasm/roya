@@ -305,6 +305,33 @@ class ApiClient:
             content_type="application/x-www-form-urlencoded",
         )
 
+    def try_post_json(self, path: str, payload: dict[str, Any]) -> tuple[int, Any]:
+        """POST JSON and return `(status, body)` instead of raising on 4xx.
+
+        A seed that plants a well-known name needs the STATUS: 409 means the name
+        is taken (migration 45 seeds `Caja`), and the useful answer is to reuse
+        that account rather than to treat a documented refusal as a crash. Every
+        other helper keeps the raising form, because a silent 4xx there would be
+        the bug the caller is looking for.
+        """
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.session_cookie is not None:
+            name, value = self.session_cookie
+            headers["Cookie"] = f"{name}={value}"
+        request = urllib.request.Request(
+            f"{self.base_url}{path}", data=body, headers=headers, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            try:
+                return error.code, json.loads(detail)
+            except json.JSONDecodeError:
+                return error.code, {"raw": detail}
+
     def _request(
         self,
         method: str,
@@ -375,42 +402,83 @@ class HarnessData:
 def create_account_with_methods(
     api: ApiClient, name: str = "Caja", methods: tuple[str, ...] = ("Cash",)
 ) -> int:
-    """Create an account and attach exactly `methods` to it.
+    """Create an account and make it own exactly `methods`, then verify the effect.
 
-    The account starts owning nothing (that is the API contract), so the test
-    that wants a working account must say which methods it accepts. Ticked
-    methods are assigned (or duplicated when owned elsewhere); the read-back
-    asserts the effect.
+    Two things changed with the seed and are worth knowing before editing tests:
+
+    * `accounts.name` is UNIQUE and migration 45 seeds an account called `Caja`,
+      so a test must not plant that name twice. Use a distinctive name, or reuse
+      the seeded account through `create_account_with_methods(..., name=<new>)`.
+    * the account NAME decides its defaults: `Caja` is created WITH `Cash`,
+      `Banco` with Transfer/Debit/CreditCard, `MP` with QR/Transfer. A name with
+      no rule starts owning nothing and must tick what it wants. Either way this
+      function states the set it wants and verifies it, so both paths work.
+
+    Ticked methods are assigned to the row this account gets (a name owned
+    elsewhere is duplicated, never stolen), and the read-back asserts the effect
+    rather than the 2xx: ownership gates every payment, so a silent no-op has to
+    fail here.
     """
-    created = api.post_json("/api/accounts", {"name": name})
-    account_id = int(created["id"])
-
+    # The ticks travel WITH the creation now, so the account and its methods are
+    # one request (the same shape the web form posts) and the id the API returns
+    # is already the account the ticks landed in.
     catalog = api.get_json("/api/payment-methods")["methods"]
-    method_ids = {method["name"]: method["id"] for method in catalog}
-    missing = [method for method in methods if method not in method_ids]
+    catalog_ids = {method["name"]: int(method["id"]) for method in catalog}
+    missing = [wanted for wanted in methods if wanted not in catalog_ids]
     if missing:
         raise SeedError(f"payment methods not in the catalog: {missing}")
-    wanted = [method_ids[method] for method in methods]
-    api.put_json(f"/api/accounts/{account_id}/payment-methods", {"method_ids": wanted})
+    ticked_ids = [catalog_ids[wanted] for wanted in methods]
+
+    status, created = api.try_post_json(
+        "/api/accounts", {"name": name, "method_ids": ticked_ids}
+    )
+    if status == 409:
+        # The name is taken — which happens for `Caja`, an account migration 45
+        # seeds before the test runs. Reusing it is what the seed should do: the
+        # seeded account already owns its Cash, and the account the test wants is
+        # the one that exists, not a second row with the same name.
+        account_id = _account_id_by_name(api, name)
+    elif 200 <= status < 300:
+        account_id = int(created["id"])
+    else:
+        raise SeedError(f"POST /api/accounts -> HTTP {status}: {created}")
+
+    # The read-back names are the stable claim: the ids change when a name is
+    # DUPLICATED into this account, which is exactly what ticking a foreign name
+    # does. So the ticks travel with the POST and the verification is by name.
     # Assert the effect, not merely the 2xx: re-read the account's methods. The
     # ownership gates every payment in E2 and E3, so a silent no-op must fail here.
     confirmed = api.get_json(f"/api/accounts/{account_id}/payment-methods")
-    confirmed_ids = sorted(int(method_id) for method_id in confirmed["method_ids"])
-    if sorted(wanted) != confirmed_ids and set(
-        method["name"] for method in confirmed["methods"]
-    ) != set(methods):
+    confirmed_active = sorted(
+        method["name"] for method in confirmed["methods"] if method["is_active"]
+    )
+    if confirmed_active != sorted(methods):
         raise SeedError(
             f"account {account_id} methods are {confirmed['methods']}, expected {sorted(methods)}"
         )
     return account_id
 
 
-def payment_method_id(api: ApiClient, name: str = "Cash") -> int:
-    """The global id of one payment method, so a seed can confirm a cash sale.
+def _account_id_by_name(api: ApiClient, name: str) -> int:
+    """The id of an existing account, by name (`accounts.name` is UNIQUE)."""
+    for account in api.get_json("/api/accounts")["accounts"]:
+        if account["name"] == name:
+            return int(account["id"])
+    raise SeedError(f"account {name!r} exists but is not listed")
 
-    Names repeat across accounts (one row per owner), so callers that need the
-    row one account owns must read that account's methods instead.
+
+def payment_method_id(api: ApiClient, name: str = "Cash", account_id: int | None = None) -> int:
+    """The id of one payment method — the row an ACCOUNT owns when one is named.
+
+    Names repeat across accounts on purpose (one row per owner, `UNIQUE(account_id,
+    name)`), and migration 45 seeds `Cash` on the seeded `Caja`. So a bare-name
+    lookup answers with THAT row, and confirming a payment against an account that
+    does not own it is refused by the pair guard. Passing `account_id` is how a
+    seed says which row it means; without one this still answers with the first
+    match, which is the seeded row on a fresh database.
     """
+    if account_id is not None:
+        return account_method_id(api, account_id, name)
     catalog = api.get_json("/api/payment-methods")["methods"]
     for method in catalog:
         if method["name"] == name:
@@ -856,7 +924,9 @@ class FilterDataset:
 def seed_filter_data(api: ApiClient) -> FilterDataset:
     """Seed the small sales set the filter tests narrow."""
     account_id = create_account_with_methods(api, "Filter Caja", ("Cash",))
-    method_id = payment_method_id(api, "Cash")
+    # The row THIS account owns: the seeded `Cash` belongs to the seeded `Caja`,
+    # and the sale below is paid from `Filter Caja`.
+    method_id = payment_method_id(api, "Cash", account_id)
     product = create_product(
         api,
         sku="FILTER-WIDGET",

@@ -215,9 +215,6 @@ define_message_keys! {
     AccountPaymentMethods => "account.payment_methods",
     AccountNoMethodsHelp => "account.no_methods_help",
     AccountAssignedMethods => "account.assigned_methods",
-    AccountAssignedMethodsHelp => "account.assigned_methods_help",
-    AccountUnassignedMethods => "account.unassigned_methods",
-    AccountUnassignedMethodsHelp => "account.unassigned_methods_help",
     AccountSaveHelp => "account.save_help",
     AccountSaveMethods => "account.save_methods",
     AccountHistory => "account.history",
@@ -1289,11 +1286,8 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
         "No payment methods configured — this account cannot record payments. Select at least one method and save.",
         "No payment methods configured — this account cannot record payments. Select at least one method and save.",
     ),
-    (MessageKey::AccountAssignedMethods, "This account's methods (clear to unassign)", "This account's methods (clear to unassign)"),
-    (MessageKey::AccountAssignedMethodsHelp, "Saving replaces this account's method set. An account without methods cannot record payments.", "Saving replaces this account's method set. An account without methods cannot record payments."),
-    (MessageKey::AccountUnassignedMethods, "Unassigned methods (select to assign)", "Unassigned methods (select to assign)"),
-    (MessageKey::AccountUnassignedMethodsHelp, "Methods owned by another account do not appear here. Unassign them from that account first.", "Methods owned by another account do not appear here. Unassign them from that account first."),
-    (MessageKey::AccountSaveHelp, "Saving replaces this account's method set. An account without methods cannot record payments.", "Saving replaces this account's method set. An account without methods cannot record payments."),
+    (MessageKey::AccountAssignedMethods, "This account's methods (clear to deactivate)", "This account's methods (clear to deactivate)"),
+    (MessageKey::AccountSaveHelp, "Saving replaces this account's method set. An unticked method is deactivated, not unassigned: it keeps this account and can be ticked again. An account without an active method cannot record payments.", "Saving replaces this account's method set. An unticked method is deactivated, not unassigned: it keeps this account and can be ticked again. An account without an active method cannot record payments."),
     (MessageKey::AccountSaveMethods, "Save payment methods", "Save payment methods"),
     (MessageKey::AccountHistory, "History", "History"),
     (MessageKey::AccountNoTransactions, "No transactions yet. Add one from the dashboard.", "No transactions yet. Add one from the dashboard."),
@@ -1861,7 +1855,7 @@ pub(crate) const EN_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::SuppliersOutstanding, "outstanding across Confirmed purchases", "outstanding across Confirmed purchases"),
     (MessageKey::SuppliersPay, "Pay supplier", "Pay supplier"),
     (MessageKey::SuppliersMethodDerived, "Method (the account is derived from it)", "Method (the account is derived from it)"),
-    (MessageKey::SuppliersPayHelp, "Applies oldest debt first, one payment per covered purchase. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account.", "Applies oldest debt first, one payment per covered purchase. More than the outstanding debt ⇒ 400; unassigned methods cannot be used until they belong to an account."),
+    (MessageKey::SuppliersPayHelp, "Applies oldest debt first, one payment per covered purchase. More than the outstanding debt ⇒ 400; an inactive method cannot be used until it is ticked again in its account.", "Applies oldest debt first, one payment per covered purchase. More than the outstanding debt ⇒ 400; an inactive method cannot be used until it is ticked again in its account."),
     (MessageKey::SuppliersRecordCost, "Record Product Cost", "Record Product Cost"),
     (MessageKey::SuppliersRecordCostHelp, "Unknown product ⇒ 400; a date older than the current cost date ⇒ 400. Also at POST /api/product-supplier-costs", "Unknown product ⇒ 400; a date older than the current cost date ⇒ 400. Also at POST /api/product-supplier-costs"),
     (MessageKey::SupplierPickerPlaceholder, "Type a supplier name…", "Type a supplier name…"),
@@ -2507,11 +2501,8 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
         "No hay medios de pago configurados: esta cuenta no puede registrar pagos. Seleccione al menos un medio y guarde.",
         "No hay medios de pago configurados: esta cuenta no puede registrar pagos. Seleccione al menos un medio y guarde.",
     ),
-    (MessageKey::AccountAssignedMethods, "Medios de esta cuenta (des márquelos para desasignar)", "Medios de esta cuenta (des márquelos para desasignar)"),
-    (MessageKey::AccountAssignedMethodsHelp, "Al guardar, se reemplaza el conjunto de medios de la cuenta. Una cuenta sin medios no puede registrar pagos.", "Al guardar, se reemplaza el conjunto de medios de la cuenta. Una cuenta sin medios no puede registrar pagos."),
-    (MessageKey::AccountUnassignedMethods, "Medios no asignados (márquelos para asignar)", "Medios no asignados (márquelos para asignar)"),
-    (MessageKey::AccountUnassignedMethodsHelp, "Los medios que pertenecen a otra cuenta no aparecen aquí. Desasígnelos primero desde esa cuenta.", "Los medios que pertenecen a otra cuenta no aparecen aquí. Desasígnelos primero desde esa cuenta."),
-    (MessageKey::AccountSaveHelp, "Al guardar, se reemplaza el conjunto de medios de la cuenta. Una cuenta sin medios no puede registrar pagos.", "Al guardar, se reemplaza el conjunto de medios de la cuenta. Una cuenta sin medios no puede registrar pagos."),
+    (MessageKey::AccountAssignedMethods, "Medios de esta cuenta (des márquelos para desactivar)", "Medios de esta cuenta (des márquelos para desactivar)"),
+    (MessageKey::AccountSaveHelp, "Al guardar, se reemplaza el conjunto de medios de la cuenta. Un medio desmarcado queda inactivo, no sin asignar: conserva esta cuenta y puede volver a marcarse. Una cuenta sin ningún medio activo no puede registrar pagos.", "Al guardar, se reemplaza el conjunto de medios de la cuenta. Un medio desmarcado queda inactivo, no sin asignar: conserva esta cuenta y puede volver a marcarse. Una cuenta sin ningún medio activo no puede registrar pagos."),
     (MessageKey::AccountSaveMethods, "Guardar medios de pago", "Guardar medios de pago"),
     (MessageKey::AccountHistory, "Historial", "Historial"),
     (MessageKey::AccountNoTransactions, "Todavía no hay transacciones. Agregue una desde el panel.", "Todavía no hay transacciones. Agregue una desde el panel."),
@@ -3144,7 +3135,7 @@ pub(crate) const ES_CATALOG: &[(MessageKey, &str, &str)] = &[
     (MessageKey::SuppliersOutstanding, "pendiente en compras confirmadas", "pendiente en compras confirmadas"),
     (MessageKey::SuppliersPay, "Pagar al proveedor", "Pagar al proveedor"),
     (MessageKey::SuppliersMethodDerived, "Medio (la cuenta se deriva de este valor)", "Medio (la cuenta se deriva de este valor)"),
-    (MessageKey::SuppliersPayHelp, "Se aplica primero a la deuda más antigua, con un pago por compra cubierta. Un importe mayor que la deuda genera 400; los medios no asignados no se pueden usar hasta que pertenezcan a una cuenta.", "Se aplica primero a la deuda más antigua, con un pago por compra cubierta. Un importe mayor que la deuda genera 400; los medios no asignados no se pueden usar hasta que pertenezcan a una cuenta."),
+    (MessageKey::SuppliersPayHelp, "Se aplica primero a la deuda más antigua, con un pago por compra cubierta. Un importe mayor que la deuda genera 400; un medio inactivo no se puede usar hasta volver a marcarlo en su cuenta.", "Se aplica primero a la deuda más antigua, con un pago por compra cubierta. Un importe mayor que la deuda genera 400; un medio inactivo no se puede usar hasta volver a marcarlo en su cuenta."),
     (MessageKey::SuppliersRecordCost, "Registrar costo del producto", "Registrar costo del producto"),
     (MessageKey::SuppliersRecordCostHelp, "Producto desconocido ⇒ 400; una fecha anterior a la fecha vigente del costo ⇒ 400. También disponible en POST /api/product-supplier-costs", "Producto desconocido ⇒ 400; una fecha anterior a la fecha vigente del costo ⇒ 400. También disponible en POST /api/product-supplier-costs"),
     (MessageKey::SupplierPickerPlaceholder, "Ingrese un nombre de proveedor…", "Ingrese un nombre de proveedor…"),
@@ -3452,10 +3443,12 @@ impl LocalizationContext {
     }
 
     /// Display label for a method selector without changing its canonical ID.
-    pub fn payment_method_label(&self, name: &str, account_name: Option<&str>) -> String {
-        let account =
-            account_name.unwrap_or_else(|| self.tr(MessageKey::PaymentMethodUnassignedAccount));
-        format!("{} — {}", self.payment_method_display_name(name), account)
+    pub fn payment_method_label(&self, name: &str, account_name: &str) -> String {
+        format!(
+            "{} — {}",
+            self.payment_method_display_name(name),
+            account_name
+        )
     }
 
     /// Translate one closed presentation key. Unknown language codes use the

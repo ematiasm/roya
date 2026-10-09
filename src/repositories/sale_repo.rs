@@ -1588,24 +1588,6 @@ mod tests {
     /// A method owned by NO account (`payment_methods.account_id IS NULL`):
     /// the case the `COALESCE(…, -1)` sentinel exists for, since a bare `<>`
     /// against NULL is NULL and `WHEN NULL` never aborts.
-    async fn orphan_method(pool: &SqlitePool, actor: i64) -> i64 {
-        match sqlx::query_scalar(
-            "SELECT id FROM payment_methods WHERE name = 'guard orphan' AND account_id IS NULL",
-        )
-        .fetch_optional(pool)
-        .await
-        .unwrap()
-        {
-            Some(id) => id,
-            None => sqlx::query_scalar(
-                "INSERT INTO payment_methods (name, created_by) VALUES ('guard orphan', ?) RETURNING id",
-            )
-            .bind(actor)
-            .fetch_one(pool)
-            .await
-            .unwrap(),
-        }
-    }
 
     #[tokio::test]
     async fn a_sale_payment_pairing_an_account_with_a_foreign_method_is_refused() {
@@ -1666,19 +1648,23 @@ mod tests {
         );
     }
 
+    /// A method owned by ANOTHER account, which is the pair mismatch migration 44
+    /// exists to refuse. (Before migration 45 the same guard also had to catch an
+    /// owner-less method; `account_id` is NOT NULL now, so the mismatch that is
+    /// still representable is this one.)
     #[tokio::test]
-    async fn a_sale_payment_naming_an_unassigned_method_is_refused() {
+    async fn a_sale_payment_naming_a_method_of_another_account_is_refused() {
         let pool = documents_pool().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let sale = seed_sale(&pool, None, "guard buyer", d(2024, 6, 1), actor).await;
         let (account, _) = owned_pair(&pool, "wallet one").await;
-        let orphan = orphan_method(&pool, actor).await;
+        let (_, foreign_method) = owned_pair(&pool, "wallet two").await;
         let err = sqlx::query(
             "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?)",
         )
         .bind(sale)
         .bind(account)
-        .bind(orphan)
+        .bind(foreign_method)
         .bind(actor)
         .execute(&pool)
         .await
@@ -1686,7 +1672,7 @@ mod tests {
         assert_eq!(
             refusal_message(err),
             "the payment method does not belong to the named account",
-            "the COALESCE sentinel must turn the NULL owner into a refusal, not a silent pass"
+            "a pair that names two different accounts must not be writable"
         );
     }
 

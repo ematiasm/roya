@@ -628,7 +628,7 @@ mod tests {
     async fn delete_linked_transaction_is_conflict_and_keeps_row_and_payment() {
         let (s, pool) = svc().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let acc = s.accounts.create(actor, "Caja").await.unwrap();
+        let acc = s.accounts.create(actor, "Audit Wallet").await.unwrap();
         let sale_tx = s
             .create_with_reference(
                 actor,
@@ -690,7 +690,7 @@ mod tests {
     async fn delete_unlinked_transaction_still_works() {
         let (s, pool) = svc().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let acc = s.accounts.create(actor, "Caja").await.unwrap();
+        let acc = s.accounts.create(actor, "Audit Wallet").await.unwrap();
         let tx = s
             .create_with_reference(
                 actor,
@@ -1022,7 +1022,7 @@ mod tests {
             .await
             .unwrap();
 
-        let acc = s.accounts.create(alice, "Caja").await.unwrap();
+        let acc = s.accounts.create(alice, "Audit Wallet").await.unwrap();
         assert_eq!(acc.created_by, alice, "the account records its creator");
         assert_eq!(acc.updated_by, None);
 
@@ -1072,7 +1072,7 @@ mod tests {
             .await
             .unwrap();
 
-        let acc = s.accounts.create(creator, "Caja").await.unwrap();
+        let acc = s.accounts.create(creator, "Audit Wallet").await.unwrap();
         // A manual Expense (the flow's own write path) carries the flow's
         // actor, which here differs from the account's creator.
         let tx = s

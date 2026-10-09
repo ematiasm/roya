@@ -138,9 +138,17 @@ where
         }
     }
 
-    async fn resolve_method_account(&self, method_id: i64) -> AppResult<i64> {
-        crate::services::finance_methods::resolve_account_for(&self.payment_methods, method_id)
-            .await
+    async fn resolve_method_account(
+        &self,
+        method_id: i64,
+        stated_account_id: Option<i64>,
+    ) -> AppResult<i64> {
+        crate::services::finance_methods::resolve_account_for(
+            &self.payment_methods,
+            method_id,
+            stated_account_id,
+        )
+        .await
     }
 
     // -- validation helpers -------------------------------------------------
@@ -1295,7 +1303,11 @@ where
                     ));
                 }
                 // Ownership resolved before any stock/sequence/finance touch.
-                Some(self.resolve_method_account(method_id).await?)
+                // `confirm` is handed a METHOD and nothing else — the pair on the
+                // payment row is derived from it — so there is no stated account
+                // to disagree with here. The door that DOES take a stated account
+                // is `record_payment`, and it checks the pair before writing.
+                Some(self.resolve_method_account(method_id, None).await?)
             }
             PaymentType::Credit => {
                 if cash_method_id.is_some() {
@@ -1539,7 +1551,7 @@ where
             return Err(AppError::Validation("amount must be > 0".into()));
         }
         // The account is derived from the method's owner (no finance touch yet).
-        let account_id = self.resolve_method_account(method_id).await?;
+        let account_id = self.resolve_method_account(method_id, None).await?;
         let lines = self.sales.list_lines(sale_id).await?;
         let payments = self.sales.list_payments(sale_id).await?;
         // The ceiling is measured against the DUE BALANCE, not against
@@ -2031,9 +2043,35 @@ mod tests {
             .id
     }
 
+    /// A method this account owns, created the way the product creates one.
+    ///
+    /// Migration 45 deleted the history-less seed leftovers, so a test that wants
+    /// a second method of its own has to create it instead of looking up a name
+    /// that is no longer in the table.
+    async fn own_method(s: &Svc, account_id: i64, name: &str) -> i64 {
+        s.payment_methods
+            .create_in_account(audit_actor(s).await, name, account_id)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// A method that exists but CANNOT be used: owned by the account and
+    /// deactivated. Migration 45 made "unowned" unrepresentable, so this is what
+    /// "this method cannot pay" means now — and it is the refusal the operator
+    /// sees when they untick a method in the account editor.
+    async fn inactive_method(s: &Svc, account_id: i64, name: &str) -> i64 {
+        let id = own_method(s, account_id, name).await;
+        s.payment_methods
+            .set_active(audit_actor(s).await, id, false)
+            .await
+            .unwrap();
+        id
+    }
+
     async fn allow(s: &Svc, account_id: i64, method_id: i64) {
         s.payment_methods
-            .set_method_account(audit_actor(s).await, method_id, Some(account_id))
+            .set_method_account(audit_actor(s).await, method_id, account_id)
             .await
             .unwrap()
     }
@@ -3236,15 +3274,29 @@ mod tests {
         );
     }
 
+    /// Migration 12 seeded five methods and none of them was owned; migration 45
+    /// adopts the head of that order (`Cash`) into the account it also seeds and
+    /// deletes the four that had no history to protect. `Other` is still not a
+    /// seeded name — the assertion this test has always carried.
     #[tokio::test]
     async fn red_payment_methods_seeded_without_other() {
         let (_s, pool) = svc().await;
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM payment_methods ORDER BY name")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        let names: Vec<String> = rows.into_iter().map(|r| r.0).collect();
-        assert_eq!(names, vec!["Cash", "CreditCard", "Debit", "QR", "Transfer"]);
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT name, account_id FROM payment_methods ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["Cash"],
+            "only the method the seed owns survives; the history-less leftovers are deleted"
+        );
+        assert!(!names.iter().any(|n| n == "Other"));
+        assert!(
+            rows.iter().all(|r| r.1 > 0),
+            "and every surviving method has an owner, which is what NOT NULL bought"
+        );
     }
 
     #[tokio::test]
@@ -3308,13 +3360,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn methods_unassigned_method_rejected_without_side_effects() {
+    async fn methods_inactive_method_rejected_without_side_effects() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "M-DENY", "10").await;
         seed_stock(&s, prod.id, "10").await;
-        let _acc = seed_account(&s, "m-deny").await;
-        // Cash belongs to no account: it cannot confirm.
-        let cash = cash_method(&s).await;
+        let acc = seed_account(&s, "m-deny").await;
+        // Owned by the account but DEACTIVATED, which is the only "this method
+        // cannot pay" state migration 45 left.
+        let cash = inactive_method(&s, acc.id, "Cash").await;
         let sale = s
             .create_draft(
                 audit_actor(&s).await,
@@ -3354,10 +3407,10 @@ mod tests {
         seed_stock(&s, prod.id, "10").await;
         let acc_a = seed_account(&s, "m-mix-a").await;
         let acc_b = seed_account(&s, "m-mix-b").await;
-        let cash = cash_method(&s).await;
-        let transfer = method_by_name(&s, "Transfer").await;
-        allow(&s, acc_a.id, cash).await;
-        allow(&s, acc_b.id, transfer).await;
+        // Each account gets its OWN method: migration 45 has one owner per row,
+        // so "Cash on A and Transfer on B" means two rows created here.
+        let cash = own_method(&s, acc_a.id, "Cash").await;
+        let transfer = own_method(&s, acc_b.id, "Transfer").await;
         let sale = s
             .create_draft(
                 audit_actor(&s).await,
@@ -3405,15 +3458,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn methods_record_payment_rejects_unassigned_without_finance_touch() {
+    async fn methods_record_payment_rejects_an_inactive_method_without_finance_touch() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "M-PAY-DENY", "10").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "m-pay-deny").await;
-        let cash = cash_method(&s).await;
-        let qr = method_by_name(&s, "QR").await;
-        allow(&s, acc.id, cash).await;
-        // QR belongs to no account, so it cannot pay.
+        let _cash = own_method(&s, acc.id, "Cash").await;
+        // Deactivated: the reachable "this method cannot pay" state after
+        // migration 45 removed "belongs to no account".
+        let qr = inactive_method(&s, acc.id, "QR").await;
         let sale = s
             .create_draft(
                 audit_actor(&s).await,
@@ -5812,8 +5865,7 @@ mod tests {
         assert_eq!(detail.due, dec("121"));
 
         let account = seed_account(&s, "Tax limit account").await;
-        let method = method_by_name(&s, "Transfer").await;
-        allow(&s, account.id, method).await;
+        let method = own_method(&s, account.id, "Transfer").await;
 
         s.record_payment(
             audit_actor(&s).await,

@@ -42,10 +42,22 @@ async fn create_account(
     principal: axum::Extension<crate::security::authz::Principal>,
     Json(payload): Json<CreateAccountRequest>,
 ) -> AppResult<(StatusCode, Json<Account>)> {
+    // `Caja` arrives with `Cash`, `Banco` with its card/tranfer names: the
+    // defaults are part of what creating that account MEANS, so the two surfaces
+    // that can create one agree instead of the web form being the only one that
+    // wires them.
     let acc = state
         .account_service
-        .create(principal.user_id, &payload.name)
+        .create_with_default_methods(principal.user_id, &payload.name)
         .await?;
+    // Ticked ids join on top, through the same door the web form uses: a name
+    // owned elsewhere is duplicated into this account rather than stolen.
+    for method_id in &payload.method_ids {
+        state
+            .payment_method_service
+            .assign_or_duplicate(principal.user_id, acc.id, *method_id)
+            .await?;
+    }
     Ok((StatusCode::CREATED, Json(acc)))
 }
 
@@ -69,8 +81,12 @@ async fn list_payment_methods(
 }
 
 /// Body for `PUT /api/accounts/{id}/payment-methods`. The list replaces the
-/// account's method set: ids owned by another account are a 400 (never stolen);
-/// an empty list unassigns everything (the UI warns on method-less accounts).
+/// account's SELECTABLE method set: ids owned by another account are a 400 (never
+/// stolen), and a method that was owned here and is no longer listed is
+/// DEACTIVATED rather than unassigned — migration 45 made an unowned method
+/// unrepresentable, and the owner is the historical fact a refund reads back. An
+/// empty list therefore leaves the account with nothing to collect through, which
+/// the UI warns about.
 #[derive(Debug, Deserialize)]
 struct UpdateAccountPaymentMethodsRequest {
     #[serde(default)]
@@ -270,13 +286,44 @@ mod tests {
         (status, json)
     }
 
-    async fn method_id(pool: &sqlx::SqlitePool, name: &str) -> i64 {
-        let row: (i64,) = sqlx::query_as("SELECT id FROM payment_methods WHERE name = ?")
-            .bind(name)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    /// The method an account owns under that name.
+    ///
+    /// Migration 45 made ownership NOT NULL and seeded `Cash` on `Caja`, so a
+    /// bare name lookup is ambiguous the moment two accounts have one. Every
+    /// caller here means "the method THIS account owns", because that is what the
+    /// pair guard and the editor both require.
+    async fn method_id_in_account(pool: &sqlx::SqlitePool, account_id: i64, name: &str) -> i64 {
+        let row: (i64,) =
+            sqlx::query_as("SELECT id FROM payment_methods WHERE account_id = ? AND name = ?")
+                .bind(account_id)
+                .bind(name)
+                .fetch_one(pool)
+                .await
+                .unwrap();
         row.0
+    }
+
+    /// The method THIS account owns under `name`, created through the same
+    /// `PUT` the editor drives — which duplicates a name owned elsewhere instead
+    /// of stealing it, and is the only way to end up with a second row of a name.
+    async fn own_method(app: &Router, pool: &sqlx::SqlitePool, account: i64, name: &str) -> i64 {
+        // The id does not exist yet, so the PUT cannot name it. Duplicate through
+        // the repo the same way `assign_or_duplicate` does, then read it back:
+        // this is fixture setup, and the guarantee under test is the READ and the
+        // refusal, not the duplication itself.
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO payment_methods (name, account_id, is_active, created_by) \
+             VALUES (?, ?, 1, ?)",
+        )
+        .bind(name)
+        .bind(account)
+        .bind(actor)
+        .execute(pool)
+        .await
+        .unwrap();
+        let _ = app;
+        method_id_in_account(pool, account, name).await
     }
 
     async fn create_account(app: &Router, name: &str) -> i64 {
@@ -316,6 +363,19 @@ mod tests {
             serde_json::json!({ "method_ids": ids }).to_string(),
         )
         .await
+    }
+
+    /// The names this account can actually collect through (active only).
+    fn active_names(v: &serde_json::Value) -> Vec<String> {
+        let mut names: Vec<String> = v["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["is_active"] == serde_json::json!(true))
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        names
     }
 
     fn owned_names(v: &serde_json::Value) -> Vec<String> {
@@ -540,7 +600,9 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::CREATED, "{v}");
 
-        let cash = method_id(&state.pool, "Cash").await;
+        // The probe's own account owns its own Cash; the seeded row belongs to the
+        // migration's `Caja` and `PUT` would refuse it as foreign.
+        let cash = own_method(&app, &state.pool, account_id, "Cash").await;
         let (st, _) = send_as(
             app.clone(),
             "PUT",
@@ -577,7 +639,6 @@ mod tests {
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let acc = create_account(&app, "ApiCatalog").await;
-        let cash = method_id(&pool, "Cash").await;
 
         // A fresh account owns nothing (ownership, not a full catalog).
         let (status, v) = get_methods(&app, acc).await;
@@ -591,6 +652,10 @@ mod tests {
                 && m.get("account_id").is_some()
         }));
 
+        // Minting a foreign name into this account is the editor's business, not
+        // the fixture's: `PUT` refuses a method another account owns, so the
+        // account gets its own row and the PUT names THAT.
+        let cash = own_method(&app, &pool, acc, "Cash").await;
         let (status, v) = put_methods(&app, acc, &[cash]).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(owned_names(&v), vec!["Cash"]);
@@ -614,8 +679,8 @@ mod tests {
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let acc = create_account(&app, "ApiReplace").await;
-        let cash = method_id(&pool, "Cash").await;
-        let transfer = method_id(&pool, "Transfer").await;
+        let cash = own_method(&app, &pool, acc, "Cash").await;
+        let transfer = own_method(&app, &pool, acc, "Transfer").await;
 
         let (status, v) = put_methods(&app, acc, &[cash, transfer]).await;
         assert_eq!(status, StatusCode::OK, "{v}");
@@ -625,13 +690,29 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(
             owned_names(&v),
-            vec!["Transfer"],
-            "Cash must be unassigned, not kept: {v}"
+            vec!["Cash", "Transfer"],
+            "the unticked method stays in the catalog, deactivated: {v}"
+        );
+        let cash_row = v["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == serde_json::json!(cash))
+            .expect("the deactivated method is still reported");
+        assert_eq!(
+            cash_row["is_active"],
+            serde_json::json!(false),
+            "migration 45: unticking deactivates, it does not unassign: {v}"
+        );
+        assert_eq!(
+            cash_row["account_id"],
+            serde_json::json!(acc),
+            "and the owner is kept, because the stored account is history: {v}"
         );
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!(owned_names(&v), vec!["Transfer"]);
+        assert_eq!(owned_names(&v), vec!["Cash", "Transfer"]);
     }
 
     #[tokio::test]
@@ -640,8 +721,8 @@ mod tests {
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let acc = create_account(&app, "ApiUnknown").await;
-        let cash = method_id(&pool, "Cash").await;
-        let transfer = method_id(&pool, "Transfer").await;
+        let cash = own_method(&app, &pool, acc, "Cash").await;
+        let transfer = own_method(&app, &pool, acc, "Transfer").await;
         let (status, _) = put_methods(&app, acc, &[cash]).await;
         assert_eq!(status, StatusCode::OK);
 
@@ -654,10 +735,18 @@ mod tests {
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK);
+        // What must not mutate is the SELECTABLE set. The catalog also reports the
+        // deactivated rows, and `Transfer` was already deactivated by the first PUT
+        // above, so the claim is stated over `is_active` rather than over names.
+        assert_eq!(
+            active_names(&v),
+            vec!["Cash"],
+            "a rejected PUT must not change what the account can collect through: {v}"
+        );
         assert_eq!(
             owned_names(&v),
-            vec!["Cash"],
-            "a rejected PUT must not mutate the set: {v}"
+            vec!["Cash", "Transfer"],
+            "and it must not unassign the row it refused to keep: {v}"
         );
     }
 
@@ -668,7 +757,7 @@ mod tests {
         let app = crate::routes::router(state);
         let a = create_account(&app, "ApiOwner").await;
         let b = create_account(&app, "ApiThief").await;
-        let cash = method_id(&pool, "Cash").await;
+        let cash = own_method(&app, &pool, a, "Cash").await;
         let (status, _) = put_methods(&app, a, &[cash]).await;
         assert_eq!(status, StatusCode::OK);
 
@@ -695,25 +784,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_account_payment_methods_accepts_empty_list_and_unassigns() {
+    async fn put_account_payment_methods_accepts_empty_list_and_deactivates() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let acc = create_account(&app, "ApiEmpty").await;
-        let cash = method_id(&pool, "Cash").await;
+        let cash = own_method(&app, &pool, acc, "Cash").await;
         let (status, _) = put_methods(&app, acc, &[cash]).await;
         assert_eq!(status, StatusCode::OK);
 
+        // An empty list leaves nothing SELECTABLE — the state the warning is
+        // about — while the row stays owned and inactive, so it can be ticked
+        // again instead of being re-created under a name that already exists.
         let (status, v) = put_methods(&app, acc, &[]).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert!(
-            owned_names(&v).is_empty(),
-            "empty unassigns everything: {v}"
+            v["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["is_active"] == serde_json::json!(false)),
+            "empty deactivates everything: {v}"
+        );
+        assert!(
+            v["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m["account_id"] == serde_json::json!(acc)),
+            "and nothing is unassigned: {v}"
         );
 
         let (status, v) = get_methods(&app, acc).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(owned_names(&v).is_empty());
+        assert!(v["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| { m["is_active"] == serde_json::json!(false) }));
     }
 
     // -- transaction reference (money traceability) -----------------------------

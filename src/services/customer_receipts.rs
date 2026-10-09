@@ -102,7 +102,10 @@ where
         }
         // The account is derived from the method's owner before any write
         // (400 inactive/unassigned, no side effect).
-        let account_id = self.payment_methods.resolve_account(method_id).await?;
+        let account_id = self
+            .payment_methods
+            .resolve_account(method_id, None)
+            .await?;
         let notes = Self::clean_notes(notes)?;
 
         // The receivable: a collection never exceeds what the customer owes, and the
@@ -447,7 +450,15 @@ mod tests {
         product.id
     }
 
+    /// Find-or-create by name. A plain `create` collides with migration 45's
+    /// seeded `Caja` on `UNIQUE(accounts.name)` — and more importantly, a fixture
+    /// that wants "the account with the Cash method" wants THAT account, not a
+    /// second one of the same name.
     async fn seed_account(s: &ReceiptSvc, name: &str) -> i64 {
+        let rows = s.sales.transactions.accounts.list().await.unwrap();
+        if let Some(existing) = rows.iter().find(|a| a.name == name) {
+            return existing.id;
+        }
         s.sales
             .transactions
             .accounts
@@ -492,7 +503,7 @@ mod tests {
     async fn allow(s: &ReceiptSvc, account_id: i64, method_id: i64) {
         s.sales
             .payment_methods
-            .set_method_account(audit_actor(s).await, method_id, Some(account_id))
+            .set_method_account(audit_actor(s).await, method_id, account_id)
             .await
             .unwrap();
     }
@@ -1248,12 +1259,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unassigned_method_is_rejected_without_side_effects() {
+    async fn inactive_method_is_rejected_without_side_effects() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-13", "10").await;
         let customer = seed_customer(&s, "Ana").await;
-        // Cash belongs to no account: no account can be derived for it.
+        // Deactivated: an unusable method is what migration 45 left in place of
+        // "belongs to no account", and it must refuse without touching anything.
         let cash = method_id(&s, "Cash").await;
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
+            .bind(cash)
+            .execute(&pool)
+            .await
+            .unwrap();
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
@@ -1268,7 +1285,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert!(err.to_string().contains("not assigned to any account"));
+        assert!(err.to_string().contains("is inactive"), "got {err}");
         assert_eq!(receipt_count(&pool).await, 0);
         assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(tx_count(&pool).await, 0);

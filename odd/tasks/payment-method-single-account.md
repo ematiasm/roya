@@ -97,6 +97,172 @@ worktree, commitear por separado.
   Rust-side duplicate, that every other hunk in the 15-file diff falls inside a
   test module, and — the finding that mattered — that `INSERT OR REPLACE` cannot
   bypass the guard.
+- [ ] **T6 — Seed the default pair, so a fresh install can collect** (added
+  2026-10-03 by the user: sembrar una cuenta "cash" y un método de pago "cash"
+  linkeado a la cuenta, "lo mínimo, básico y calculo que obligatorio en cualquier
+  negocio"). Today **no migration seeds an account** and `/setup` does not touch
+  accounts or methods (`routes/setup_web.rs` references neither), so a brand-new
+  installation has five seeded methods **all unassigned** and no account at all: it
+  cannot record a single collection or supplier payment until someone creates an
+  account and links a method by hand, because the services refuse an unassigned
+  method. Seed a `Caja` account plus the seeded `Cash` method owned by it, in one
+  migration, following the walk-in precedent
+  (`migrations/20240101000020_create_customers.sql:31-34`: guarded
+  `INSERT … SELECT … WHERE NOT EXISTS`) and taking `created_by` from the seeded
+  `sistema` user (`…30:58-65`). Tests: a fresh database can collect after the
+  migration; a re-run is a no-op; the seeded pair satisfies the migration-44 guard.
+  Second half of T6, and a real gap rather than a nicety: **the name-keyed default
+  assignment is test-only today.** `ensure_defaults_for_account` and
+  `default_method_names_for_account_name` (Caja→Cash, Banco→Transfer/Debit/
+  CreditCard, MP→QR/Transfer) have 24 call sites and **every one is inside a
+  `#[cfg(test)] mod tests`**; production account creation is a bare
+  `self.accounts.create(actor, trimmed)` (`services/account.rs:43`, wired at
+  `routes/mod.rs:401`). A business adding its own `Banco` account therefore gets no
+  methods — which contradicts what T4 of this document claimed to deliver. Decide:
+  wire it into account creation (recommended — three lines at the call site, and
+  "each business adds its own accounts and methods" becomes a single step), or drop
+  the helper and leave linking manual.
+
+  **UPGRADED 2026-10-03 (user decision): no orphans by design — and the design is
+  the schema.** The user's rule is *ningún método puede quedar huérfano por diseño*,
+  and the honest reading of it is stronger than the seed, because **the product
+  produces orphans from a reachable screen today**: the account's method editor
+  (`replace_account_methods`, routes `POST /web` at `routes/web.rs:480` and
+  `PUT /api` at `routes/api.rs:103`) **unassigns** whatever is unticked
+  (`services/finance_methods.rs:155` and `:205` call `set_method_account(…, None)`),
+  and there is no method delete (`ON DELETE RESTRICT` from every payment table). So
+  "quitar un método de una cuenta" only ever meant "leave it without an owner".
+
+  The shape, therefore:
+
+  1. **`payment_methods.account_id` becomes `NOT NULL`**, closing the allowance
+     migration 24 documented (`…24:2-3`, "NULL = unassigned, not usable for
+     payments"). SQLite needs the house table rebuild (the technique of
+     `…24` and `…30`: `-- no-transaction` on the first line, foreign keys off around
+     the swap, because `sale_payments`, `purchase_payments`, `customer_receipts` and
+     the two return-payment tables reference it with `ON DELETE RESTRICT`).
+     **A rebuild drops triggers: `trg_payment_methods_set_updated_at` (`…36`) must be
+     recreated**, or every `updated_at` stamp on that table silently stops.
+  2. **Seed `Caja` + `Cash`.** Find-or-create the account (`accounts.name` is
+     `UNIQUE`, so a blind `INSERT` aborts on a database that already has one), take
+     `created_by` from the seeded `sistema` user (`…30:58-65`), and attach the seeded
+     `Cash` only if it has no account — the walk-in precedent
+     (`…20:31-34`, guarded `INSERT … SELECT … WHERE NOT EXISTS`).
+  3. **The remaining orphans.** One with **no payment history** is a seed leftover:
+     delete it (on a wiped database that is `Transfer`, `Debit`, `CreditCard`,
+     `QR`). One **with** history cannot be deleted: give it the default account so
+     the schema holds **and set `is_active = 0`**, because it is a legacy artifact
+     and must never be selectable. Neither path may lose a referenced row.
+  4. **"Quitar un método de una cuenta" becomes DEACTIVATE.** `is_active = 0` — it
+     already makes `resolve_account_for` refuse the method, so the operator sees a
+     clear "inactive" refusal instead of a method that vanished into an unusable
+     state. The repository loses the `None` arm: `set_method_account(actor, id,
+     account_id: i64)` plus a `set_active(actor, id, bool)`, with every caller updated.
+  5. **Wire the defaults into production account creation** — the second half of
+     T6 above — so `Caja`/`Banco`/`MP` arrive with their methods and "each business
+     adds its own accounts" is one step instead of two.
+
+  Test rewrites this forces, named so nobody discovers them mid-flight:
+  `seeded_methods_start_unassigned_without_other`,
+  `the_public_find_method_answers_exactly_as_before_including_the_unassigned_method`,
+  `set_method_account_assigns_unassigns_and_rejects_unknowns`, and the audit-stamp
+  assertion in `src/t1_schema_tests.rs` that uses `set_method_account(…, None)` to
+  provoke an `updated_at` write. Plus the 24 test call sites of
+  `ensure_defaults_for_account`, which exist to mimic production and can now be
+  deleted where the production path does the work.
+
+  **The mirror case, decided rather than left implicit:** an **account** with no
+  methods stays allowed and stays flagged
+  (`web_create_account_without_ticked_methods_creates_flagged_account`,
+  `routes/web.rs:1384`). That is an account-level state the operator can see and
+  fix, not an orphan method sneaking out of service, and forbidding it would mean
+  inventing a method for a business that has none. Say so if you disagree.
+
+  Forecast: **~450 lines**, so T6 is a real slice and not a seed: migration +
+  repository signature + editor semantics + account-creation wiring + the rewrites.
+
+## T6 implementation log (2026-10-08) — CLOSED
+
+**State: implemented, 1518 Rust tests green, 180 browser tests green, warnings at
+the 79 bin / 49 test baseline (delta 0), `cargo fmt --check` clean, visual
+baseline regenerated after proving the diff is only the intended one.** T6 is the
+first slice of the payment chain; P1 of `odd/tasks/payment-allocation.md` is next.
+**NOT committed**: the working tree carries the change and the work-unit commit
+is the user's call, exactly as this document's own "fuera de alcance" says for
+commits. Last commit on the branch is still `7bba800` (T5).
+
+Resumed from a writer that ran out of tokens. Its tree was kept: migration 45, the
+repo service changes, its five T6 tests and the `db_err_message` helper. What was
+added on resume, and why:
+
+- **The migration never disabled foreign keys.** `PRAGMA foreign_keys = OFF;` was
+  missing at the top while the first statement is an `INSERT` into a referenced
+  table. Added, with the reason: the seed and the orphan resolution must not have
+  correctness depend on statement order. The end of the file now decides instead,
+  by measurement — a `pragma_foreign_key_check()` count folded into a temp-table
+  `CHECK (violations = 0)`, so a broken swap aborts the migration rather than
+  printing and continuing.
+- **The rebuild's trigger recovery was wrong twice over.** The file dropped
+  migration 44's three child guards *after* the parent drop; SQLite recompiles
+  their bodies on the following `ALTER TABLE RENAME` while `main.payment_methods`
+  is a dangling name, which is exactly how a product stops accepting payments.
+  They are now dropped before the parent and recreated immediately after the
+  rename. And `trg_payment_methods_set_updated_at` — which migration 36 installs
+  with `BEGIN SELECT NEW.updated_at = strftime(...); END` — is **not recreated**:
+  measured, that statement is a comparison, not an assignment, so it has never
+  stamped anything on any table 36 touched. A table rebuild drops triggers, so
+  the default on the new `updated_at` column replaces it. **Follow-up slice:** the
+  same broken idiom remains on `transactions`, `categories`, `product_supplier_costs`,
+  `sale_payments` and `purchase_payments`. Not fixed here — five tables with their
+  own evidence is its own work unit.
+- **The `RETURNING` trap is why the fix is a column DEFAULT.** A `BEFORE`-trigger
+  fix would still read back the sentinel, because `RETURNING` reports the row as
+  the INSERT left it in every case; an `AFTER INSERT` trigger writes the real value
+  but `RETURNING` does not see it either. `create_in_account` uses `RETURNING`, so
+  the only shape that is honest to its reader is the DEFAULT.
+- **The `DELETE` in step (c) is not a new rule, it is a reachable end state.**
+  `replace_account_methods` unassigns whatever is unticked, so a brand-new install
+  could reach "every method unassigned" through a screen. Under `NOT NULL` that
+  same history-less leftover is simply deletable; one that carries payment history
+  is adopted by `Caja` and deactivated.
+- **Scope added, discovered while resolving the failures: two UI surfaces die with
+  the allowance.** `account_detail.html` renders an "Unassigned methods (select to
+  assign)" block fed by `PaymentMethodService::unassigned()` (`routes/web.rs:291`),
+  with its two `MessageKey`s. With `account_id NOT NULL` the list is permanently
+  empty, so the block, the query, the service method and the keys are removed
+  rather than left as a screen that always renders nothing. `AccountSaveHelp`
+  likewise still promises "Saving replaces this account's method set" and is
+  rewritten to the deactivate semantics in both catalogs.
+- **`set_method_account` loses its `Option` arm.** Unticking now calls a new
+  `set_active(actor, method_id, false)`; the repository can no longer write a NULL
+  owner, so the type says so. The "belongs to another account" refusal stays but
+  its message changes: "unassign it there first" is no longer something an operator
+  can do.
+- **Two asymmetries the work exposed, both fixed at the source.** The first:
+  `POST /api/accounts` created a bare account while the web form wired the name's
+  defaults, so `Caja` meant two different accounts depending on the surface — the
+  DTO now carries `method_ids` and the handler routes them through the same
+  `assign_or_duplicate` the form uses. The second: `PUT .../payment-methods`
+  refuses a method another account owns, so a caller could create an account but
+  never endow it; the creation path is the door that duplicates a name, and the
+  API now offers it too. Neither is a test fix; both were latent.
+- **`record_payment` now checks the (method, stated account) pair before writing.**
+  Migration 44's trigger was the only thing refusing a mismatch, which surfaced as
+  a raw SQLite abort — a 500 with driver text for an operator's mistake. The check
+  asks the trigger's own question (`method.account_id = stated`) and answers 400.
+  The pair is still derived from the method; nothing else changed.
+- **`accounts_without_methods` counts ACTIVE methods, not rows.** With deactivation,
+  an account whose every method was unticked still has rows while being exactly the
+  account the warning is about. Counting rows would have silenced the warning at
+  the moment it became true — the find the new test `replace_account_methods_accepts_empty_and_warns`
+  produced.
+- **The 133 red tests were measured, then repaired in two classes**: three upgrade
+  fixtures inserting `sale_payments`/`customer_receipts` with a hardcoded
+  `method_id = 1` through the pre-migration 44 schema (the run-44 trigger then
+  refused the pair), and roughly 130 fixtures built on "create an account locally,
+  reuse a seeded method" or on a raw balance insert that never ran the overdraft
+  guard. The second class is the one worth remembering: those fixtures were
+  asserting behaviour the guard had never enforced.
 
 ## Progress
 - 2026-09-18: documento creado, rama `feat/payment-method-single-account`.
@@ -116,6 +282,16 @@ worktree, commitear por separado.
   verifier proved that a *refund* is born mismatched when a method has been
   re-pointed, so the guard was aborting a valid operation. The two refund tables
   were exempted rather than changing where a refund comes from.
+- 2026-10-03: **T6 opened, then upgraded the same day.** The user asked for the
+  default pair to be seeded; gathering evidence showed the gap is wider (the
+  name-keyed defaults are called only from test modules) and that the product
+  creates orphans from the account-methods editor. The user then chose the strong
+  reading of *ningún método huérfano por diseño*: `account_id NOT NULL` and
+  "remove a method" becomes **deactivate**. T6 is consequently a full slice with a
+  schema rebuild, and it is the **first** unit of this chain — before the
+  payment-allocation schema (P1 of `odd/tasks/payment-allocation.md`), because a
+  fresh install must be able to collect money before anything else is built on top
+  of it.
 
 ## Verification evidence
 - Writer: `cargo check --all-targets` 0 errores; `cargo test` full 320 passed
@@ -229,6 +405,30 @@ without joining the payment tables in the trigger, and it would encode a rule
 (`the pair must have existed before`) that nothing else in the schema can check —
 more cleverness than the invariant is worth, for two tables whose writers already
 copy a validated pair.
+
+### The defaults this document claimed, and where they actually live (2026-10-03)
+
+T4 says "Seeds/defaults con duplicación + tests + docs + verificación", and the
+acceptance criterion says an invalid combination is impossible by construction. The
+**rule** is enforced (migration 44, plus the services refusing an unassigned
+method). The **defaults** are not: `grep -rn ensure_defaults_for_account src/`
+returns 24 call sites and **not one is outside a `#[cfg(test)] mod tests`**.
+Production account creation is `self.accounts.create(actor, trimmed)`
+(`services/account.rs:43`), reached from `routes/mod.rs:401`, with no method
+assignment anywhere on that path.
+
+Visible in the product, not only in the tests:
+
+- A fresh installation has **no account at all** and five unassigned methods, so
+  nothing can be collected or paid until both are configured by hand.
+- Creating an account named `Banco` or `Caja` does **not** give it the default
+  methods the helper defines, so every account starts as manual configuration.
+- The dev database at the repository root carries an account literally named `Cash`
+  with method `Cash` linked, and `default_method_names_for_account_name` only knows
+  the exact names `Caja`, `Banco` and `MP` — so even the helper would not have fired
+  for it. That pair was linked by hand.
+
+T6 covers the seed and the wiring decision.
 
 ## Next step
 - Pulido del drawer HECHO (3 cards, contraste, botón editar por fila).

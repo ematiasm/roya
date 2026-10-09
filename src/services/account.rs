@@ -4,27 +4,31 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     Account, AccountDetail, AccountWithBalance, PriceRefusal, SetMoney, Transaction,
 };
-use crate::repositories::{AccountRepository, TransactionRepository};
+use crate::repositories::{AccountRepository, PaymentMethodRepository, TransactionRepository};
 
 #[derive(Clone)]
-pub struct AccountService<A, T>
+pub struct AccountService<A, T, P>
 where
     A: AccountRepository,
     T: TransactionRepository,
+    P: PaymentMethodRepository,
 {
     pub accounts: A,
     pub transactions: T,
+    pub methods: P,
 }
 
-impl<A, T> AccountService<A, T>
+impl<A, T, P> AccountService<A, T, P>
 where
     A: AccountRepository,
     T: TransactionRepository,
+    P: PaymentMethodRepository,
 {
-    pub fn new(accounts: A, transactions: T) -> Self {
+    pub fn new(accounts: A, transactions: T, methods: P) -> Self {
         Self {
             accounts,
             transactions,
+            methods,
         }
     }
 
@@ -41,6 +45,38 @@ where
             ));
         }
         self.accounts.create(actor, trimmed).await
+    }
+
+    /// Create the account AND give it the default methods its name implies, in
+    /// one step: `Caja` arrives with `Cash`, `Banco` with `Transfer`/`Debit`/
+    /// `CreditCard`, `MP` with `QR`/`Transfer`. Any other name gets no methods and
+    /// is flagged by the account list until the operator ticks one.
+    ///
+    /// Why this is here rather than at the four call sites: before this, the
+    /// defaults were reached only from the WEB form, so the same account name
+    /// meant a different account depending on which surface created it — a
+    /// `Banco` from `POST /api/accounts` had no methods while a `Banco` from the
+    /// form did. The rule belongs to the account's creation, not to one caller.
+    ///
+    /// The methods are created AFTER the account row exists, and that order is
+    /// deliberate: `payment_methods.account_id` is NOT NULL with a foreign key, so
+    /// there is nothing to attach before there is an account to attach it to.
+    /// Only rows THIS call creates carry these defaults; an existing account is
+    /// never touched, and no method is ever stolen from another account — a name
+    /// owned elsewhere is duplicated by `create_in_account`, which
+    /// `UNIQUE(account_id, name)` permits.
+    pub async fn create_with_default_methods(&self, actor: i64, name: &str) -> AppResult<Account> {
+        let account = self.create(actor, name).await?;
+        for method_name in
+            crate::services::finance_methods::PaymentMethodService::<P>::default_method_names_for_account_name(
+                &account.name,
+            )
+        {
+            self.methods
+                .create_in_account(actor, method_name, account.id)
+                .await?;
+        }
+        Ok(account)
     }
 
     /// 404 when the account does not exist; used by the payment-method routes.
@@ -113,7 +149,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repositories::{SqliteAccountRepository, SqliteTransactionRepository};
+    use crate::repositories::{
+        SqliteAccountRepository, SqlitePaymentMethodRepository, SqliteTransactionRepository,
+    };
     use crate::security::test_support;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
@@ -140,12 +178,15 @@ mod tests {
         let s = AccountService::new(
             SqliteAccountRepository::new(pool.clone()),
             SqliteTransactionRepository::new(pool.clone()),
+            SqlitePaymentMethodRepository::new(pool.clone()),
         );
         let alice = test_support::seed_audit_user(&pool, "audit-alice", "Alice")
             .await
             .unwrap();
 
-        let acc = s.create(alice, "Caja").await.unwrap();
+        // Not "Caja": migration 45 seeds that name, and this test is about the
+        // audit actor the create records, not about the seed's account.
+        let acc = s.create(alice, "Audit Wallet").await.unwrap();
         assert_eq!(acc.created_by, alice, "the account records its creator");
         assert_eq!(acc.updated_by, None);
     }

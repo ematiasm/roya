@@ -989,7 +989,10 @@ mod tests {
     async fn seed_fixture(state: &AppState) -> WebFixture {
         let account = state
             .account_service
-            .create(audit_actor(&state).await, "Caja")
+            .create(
+                audit_actor(&state).await,
+                &format!("Caja {}", test_support::fixture_seq()),
+            )
             .await
             .unwrap();
         state
@@ -1003,7 +1006,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash")
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .expect("Cash is seeded")
             .id;
         let product = state
@@ -1195,9 +1198,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let method_options = html.split("name=\"method_id\"").nth(1).unwrap_or(&html);
         assert!(method_options.contains("Cash — Caja"), "{method_options}");
+        // There is no "— unassigned" option any more: migration 45 deleted the
+        // history-less leftovers and made ownership NOT NULL, so every option
+        // names an owner. What this test still guards is that the label is
+        // translated AND that the id in the option stays the canonical row id.
         assert!(
-            method_options.contains("Bank transfer — unassigned"),
-            "{method_options}"
+            !method_options.contains("unassigned"),
+            "no option may advertise an owner it does not have: {method_options}"
         );
         assert!(
             html.contains(&format!("value=\"{}\"", fixture.cash)),
@@ -1210,8 +1217,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("Efectivo — Caja"), "{html:.1200}");
         assert!(
-            html.contains("Transferencia bancaria — sin asignar"),
-            "{html:.1200}"
+            !html.contains("sin asignar"),
+            "the Spanish catalog must not offer an ownerless method either: {html:.1200}"
         );
     }
 

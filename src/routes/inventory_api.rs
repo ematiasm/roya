@@ -1084,7 +1084,8 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(
             v.get("accounts").and_then(|x| x.as_array()).unwrap().len(),
-            1
+            2,
+            "the migration's seeded Caja plus the one account this test created: inventory must not touch accounts"
         );
     }
 

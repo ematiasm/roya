@@ -405,6 +405,12 @@ mod tests {
         assert_eq!(st, StatusCode::CREATED);
     }
 
+    /// Find-or-create by name. Migration 45 seeds an account named `Caja`, and
+    /// these fixtures must not fail on `resource already exists` when a test
+    /// happens to ask for that name: the account the test wants is the seeded
+    /// one, and creating a second is neither possible nor intended.
+    /// Find-or-create by name (migration 45 seeds `Caja`; a fixture asking for
+    /// that name wants the seeded account, not a `resource already exists` 409).
     async fn seed_account(app: &axum::Router, name: &str) -> i64 {
         let (st, v) = post_json(
             app.clone(),
@@ -412,8 +418,19 @@ mod tests {
             serde_json::json!({ "name": name }),
         )
         .await;
-        assert_eq!(st, StatusCode::CREATED);
-        v.get("id").and_then(|x| x.as_i64()).unwrap()
+        if st == StatusCode::CREATED {
+            return v.get("id").and_then(|x| x.as_i64()).unwrap();
+        }
+        assert_eq!(st, StatusCode::CONFLICT, "seed account {name}: {v}");
+        let (_, list) = get_json(app.clone(), "/api/accounts").await;
+        list["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("account {name} exists but is not listed: {list}"))["id"]
+            .as_i64()
+            .unwrap()
     }
 
     async fn cash_method_id(pool: &sqlx::SqlitePool) -> i64 {
@@ -1309,16 +1326,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unassigned_method_rejected_via_rest() {
+    async fn inactive_method_rejected_via_rest() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
         let pid = seed_product(&app, "M-REST", "Product").await;
         seed_stock(&app, pid, "10").await;
-        let _acc = seed_account(&app, "m-rest").await;
+        let acc = seed_account(&app, "m-rest").await;
         let cash = cash_method_id(&pool).await;
-        // Cash belongs to no account: confirming with it must be 400 with no
-        // side effects.
+        // DEACTIVATE the seeded Cash: an unusable method is what "cannot confirm
+        // with it" means since migration 45 removed the owner-less state.
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        sqlx::query("UPDATE payment_methods SET is_active = 0, updated_by = ? WHERE id = ?")
+            .bind(actor)
+            .bind(cash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let _ = acc;
         let (st, v) = post_json(
             app.clone(),
             "/api/sales",
@@ -1349,7 +1374,7 @@ mod tests {
             serde_json::json!({ "method_id": cash }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned method must be 400");
+        assert_eq!(st, StatusCode::BAD_REQUEST, "inactive method must be 400");
         let tx_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM transactions")
             .fetch_one(&pool)
             .await

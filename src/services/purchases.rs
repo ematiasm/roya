@@ -1089,7 +1089,12 @@ where
                     ));
                 }
                 // Ownership resolved before any stock/sequence/finance touch.
-                Some(self.payment_methods.resolve_account(method_id).await?)
+                // Only the method is named here; the pair is derived.
+                Some(
+                    self.payment_methods
+                        .resolve_account(method_id, None)
+                        .await?,
+                )
             }
             PaymentType::Credit => {
                 if cash_method_id.is_some() {
@@ -1285,7 +1290,10 @@ where
             return Err(AppError::Validation("amount must be > 0".into()));
         }
         // The account is derived from the method's owner (no finance touch yet).
-        let account_id = self.payment_methods.resolve_account(method_id).await?;
+        let account_id = self
+            .payment_methods
+            .resolve_account(method_id, None)
+            .await?;
         let lines = self.purchases.list_lines(purchase_id).await?;
         let payments = self.purchases.list_payments(purchase_id).await?;
         // The ceiling is measured against the DUE BALANCE, not `paid + amount`:
@@ -1350,7 +1358,9 @@ where
         }
         // The account is derived from the method's owner before any write
         // (400 inactive/unassigned, no side effect).
-        self.payment_methods.resolve_account(method_id).await?;
+        self.payment_methods
+            .resolve_account(method_id, None)
+            .await?;
 
         // The payable: a payment never exceeds what the supplier is owed, and
         // the outstanding figure is what the allocation is checked against.
@@ -1879,10 +1889,38 @@ mod tests {
             .id
     }
 
+    /// A method this account owns, created the way the product creates one.
+    ///
+    /// Migration 45 deleted the history-less seed leftovers, so a test that wants
+    /// a second method of its own has to create it instead of looking up a name
+    /// that is no longer in the table.
+    async fn own_method(s: &Svc, account_id: i64, name: &str) -> i64 {
+        s.payment_methods
+            .methods
+            .create_in_account(audit_actor(s).await, name, account_id)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// A method that exists but CANNOT be used: owned by the account and
+    /// deactivated. Migration 45 made "unowned" unrepresentable, so this is what
+    /// "this method cannot pay" means now — and it is the refusal the operator
+    /// sees when they untick a method in the account editor.
+    async fn inactive_method(s: &Svc, account_id: i64, name: &str) -> i64 {
+        let id = own_method(s, account_id, name).await;
+        s.payment_methods
+            .methods
+            .set_active(audit_actor(s).await, id, false)
+            .await
+            .unwrap();
+        id
+    }
+
     async fn allow(s: &Svc, account_id: i64, method_id: i64) {
         s.payment_methods
             .methods
-            .set_method_account(audit_actor(s).await, method_id, Some(account_id))
+            .set_method_account(audit_actor(s).await, method_id, account_id)
             .await
             .unwrap()
     }
@@ -2756,13 +2794,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn t5_pay_supplier_unassigned_method_is_400() {
+    async fn t5_pay_supplier_inactive_method_is_400() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "T5-UM", "10").await;
         seed_stock(&s, prod.id, "5").await;
         let sup = seed_supplier(&s, "T5 UM SUP").await;
-        // Cash stays unassigned: no account may derive from it.
+        // The seeded Cash, DEACTIVATED: migration 45 left no owner-less method, so
+        // "cannot pay with it" is the inactive state (the one the account editor
+        // produces when a method is unticked).
         let cash = cash_method(&s).await;
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
+            .bind(cash)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let a = draft_credit(&s, sup.id).await;
         s.add_line(audit_actor(&s).await, a.id, prod.id, dec("1"), None)
@@ -3861,14 +3906,15 @@ mod tests {
     // -- AC14: unassigned-method rejection without side effects ------------------
 
     #[tokio::test]
-    async fn ac14_unassigned_method_rejected_without_side_effects() {
+    async fn ac14_inactive_method_rejected_without_side_effects() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "AC14", "10").await;
         let sup = seed_supplier(&s, "AC14 SUP").await;
         let acc = seed_account(&s, "caja14").await;
-        let cash = cash_method(&s).await;
-        let qr = method_by_name(&s, "QR").await;
-        allow(&s, acc.id, cash).await; // QR intentionally unassigned
+        let _cash = own_method(&s, acc.id, "Cash").await;
+        // QR is owned by the account but DEACTIVATED: migration 45 removed
+        // "unassigned", so an unusable method is an inactive one.
+        let qr = inactive_method(&s, acc.id, "QR").await;
 
         // Cash confirm with an unassigned method => 400, nothing applied.
         let purchase = draft_cash(&s, sup.id).await;
@@ -4090,10 +4136,10 @@ mod tests {
         let sup = seed_supplier(&s, "TRI REFUND SUP").await;
         let acc_a = seed_account(&s, "tri-refund-a").await;
         let acc_b = seed_account(&s, "tri-refund-b").await;
-        let cash = cash_method(&s).await;
-        let transfer = method_by_name(&s, "Transfer").await;
-        allow(&s, acc_a.id, cash).await;
-        allow(&s, acc_b.id, transfer).await;
+        // One method per account: the whole point is that the refunds go back to
+        // two DIFFERENT accounts, which migration 45 expresses as two rows.
+        let cash = own_method(&s, acc_a.id, "Cash").await;
+        let transfer = own_method(&s, acc_b.id, "Transfer").await;
 
         let purchase = draft_credit(&s, sup.id).await;
         s.add_line(
@@ -5412,8 +5458,7 @@ mod tests {
         assert_eq!(detail.due, dec("121"));
 
         let account = seed_account(&s, "Purchase tax account").await;
-        let method = method_by_name(&s, "Transfer").await;
-        allow(&s, account.id, method).await;
+        let method = own_method(&s, account.id, "Transfer").await;
 
         s.record_payment(
             audit_actor(&s).await,

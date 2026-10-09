@@ -801,6 +801,15 @@ pub struct TransactionsResponse {
 #[derive(Debug, Deserialize)]
 pub struct CreateAccountRequest {
     pub name: String,
+    /// Methods to tick for the new account, the same way the web form does.
+    ///
+    /// Absent means "just the defaults this account's NAME implies" (`Caja` gets
+    /// `Cash`), which is what a caller that only wants an account should get.
+    /// Present means the operator named them: an id owned by another account is
+    /// DUPLICATED into this one, never stolen, and a method the name already
+    /// brought is simply kept — the tick and the default are the same intent.
+    #[serde(default)]
+    pub method_ids: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1443,10 +1452,12 @@ pub struct SalePayment {
 pub struct PaymentMethod {
     pub id: i64,
     pub name: String,
-    /// The owning account; NULL means unassigned and unusable for payments.
-    pub account_id: Option<i64>,
+    /// The owning account. Not `Option`: migration 45 made the column NOT NULL,
+    /// so an unowned method is not a state this schema can hold. A method taken
+    /// out of service keeps this owner and flips `is_active`.
+    pub account_id: i64,
     pub is_active: bool,
-    /// Audit actor (M5 Phase B): who created and who last reassigned the method.
+    /// Audit actor (M5 Phase B): who created and who last changed the method.
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
@@ -1487,17 +1498,16 @@ pub struct AccountMethodsResponse {
 pub struct PaymentMethodWithAccount {
     pub id: i64,
     pub name: String,
-    pub account_id: Option<i64>,
-    pub account_name: Option<String>,
+    pub account_id: i64,
+    pub account_name: String,
     pub is_active: bool,
 }
 
 impl PaymentMethodWithAccount {
-    /// Owning account name, or `unassigned` for methods no account owns yet.
+    /// Owning account name. There is no `unassigned` fallback because there is
+    /// no unassigned method: the row is an INNER join on a NOT NULL foreign key.
     pub fn account_label(&self) -> String {
-        self.account_name
-            .clone()
-            .unwrap_or_else(|| "unassigned".to_string())
+        self.account_name.clone()
     }
 
     /// Select label: `"Transfer — Bank"`.

@@ -87,7 +87,6 @@ struct AccountDetailTemplate {
     account_updated_by_name: Option<String>,
     allow_negative: bool,
     methods: Vec<PaymentMethod>,
-    unassigned: Vec<PaymentMethod>,
     has_methods: bool,
     nav_key: &'static str,
     /// The sidebar's nav view: the entries this principal may read (S7 part 2).
@@ -288,8 +287,10 @@ async fn account_detail(
     // find_with_balance for header
     let acc_with_balance = state.accounts_with_balance_lookup(id).await?;
     let methods = state.payment_method_service.catalog_for_account(id).await?;
-    let unassigned = state.payment_method_service.unassigned().await?;
-    let has_methods = !methods.is_empty();
+    // `has_methods` means "has a SELECTABLE method": the warning is about an
+    // account that cannot record payments, and a deactivated method cannot. The
+    // catalog below still lists it (unticked) so it can be reactivated.
+    let has_methods = methods.iter().any(|m| m.is_active);
     // The audit actors are resolved HERE, in the wiring layer, because a
     // department may not read identity tables (AC20) and the view must show a
     // name, never an id. One statement covers the account header and every
@@ -324,7 +325,6 @@ async fn account_detail(
         localization,
         allow_negative: state.allow_negative,
         methods,
-        unassigned,
         has_methods,
         nav_key: "accounts",
         nav: Nav::for_principal(&principal),
@@ -426,13 +426,18 @@ async fn web_create_account(
     headers: HeaderMap,
     Form(form): Form<CreateAccountForm>,
 ) -> Result<axum::response::Response, AppError> {
-    // Ticked methods join the new account: unassigned ones are assigned, ones
-    // owned elsewhere are duplicated by name (never stolen). No ticks means a
-    // method-less account, which the list flags with a warning. Every write
-    // carries the acting user (M5 Phase B): the account and the methods it
-    // gains record the same request's actor.
+    // Two steps, and the order is the rule: the account is created, and then the
+    // well-known NAME gives it its defaults (`Caja` → `Cash`, `Banco` → cards and
+    // transfer). A ticked method joins on top, and a tick is what the operator
+    // asked for explicitly, so it is applied last and its reactivation of a
+    // default wins. No ticks means a method-less account, which the list flags
+    // with a warning. Every write carries the acting user (M5 Phase B): the
+    // account and the methods it gains record the same request's actor.
     let actor = principal.user_id;
-    let acc = state.account_service.create(actor, &form.name).await?;
+    let acc = state
+        .account_service
+        .create_with_default_methods(actor, &form.name)
+        .await?;
     for method_id in &form.method_ids {
         state
             .payment_method_service
@@ -1177,13 +1182,42 @@ mod tests {
         .await
     }
 
-    async fn method_id(pool: &sqlx::SqlitePool, name: &str) -> i64 {
-        let row: (i64,) = sqlx::query_as("SELECT id FROM payment_methods WHERE name = ?")
+    /// The seeded method row (owned by the migration's `Caja`), for the few
+    /// places that need AN existing method id rather than an owned one.
+    async fn method_id_seeded(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar("SELECT id FROM payment_methods WHERE name = 'Cash'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The method THIS account owns under `name`. A bare-name lookup is ambiguous
+    /// since migration 45 seeded `Cash` on `Caja`: the pair guard and the editor
+    /// both ask by owner.
+    async fn account_method_id(pool: &sqlx::SqlitePool, account_id: i64, name: &str) -> i64 {
+        sqlx::query_scalar("SELECT id FROM payment_methods WHERE account_id = ? AND name = ?")
+            .bind(account_id)
             .bind(name)
             .fetch_one(pool)
             .await
-            .unwrap();
-        row.0
+            .unwrap()
+    }
+
+    /// Give the account its own row of `name`, the way the editor's duplicate path
+    /// does. Fixture setup: the guarantees under test are the reads and refusals.
+    async fn own_method(pool: &sqlx::SqlitePool, account_id: i64, name: &str) -> i64 {
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO payment_methods (name, account_id, is_active, created_by) \
+             VALUES (?, ?, 1, ?)",
+        )
+        .bind(name)
+        .bind(account_id)
+        .bind(actor)
+        .execute(pool)
+        .await
+        .unwrap();
+        account_method_id(pool, account_id, name).await
     }
 
     async fn account_id(pool: &sqlx::SqlitePool, name: &str) -> i64 {
@@ -1286,11 +1320,18 @@ mod tests {
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
 
-        let cash = method_id(&pool, "Cash").await;
+        // The form needs an existing method id to tick, and the only one a fresh
+        // database has is the seed's: ticking it makes the wallet duplicate the
+        // name, which is the behaviour under test.
+        let cash = method_id_seeded(&pool).await;
         // The web form attaches the ticked methods to the new account, so a
         // payment with one of them is accepted.
         let (status, body) = web_create_account(&app, "Wallet", &[cash]).await;
         assert_eq!(status, StatusCode::SEE_OTHER, "web create: {status} {body}");
+        // The form duplicates a name it does not own, so the wallet ends up with
+        // its OWN Cash: paying must name that row, not the seeded one.
+        let wallet = account_id(&pool, "Wallet").await;
+        let cash = account_method_id(&pool, wallet, "Cash").await;
 
         let pid = seed_product(&app, "REG-E2E").await;
         seed_stock(&app, pid).await;
@@ -1326,7 +1367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn payment_rejected_with_actionable_message_when_method_unassigned() {
+    async fn payment_rejected_with_actionable_message_when_method_inactive() {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
@@ -1339,7 +1380,16 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "create account: {body}");
-        let cash = method_id(&pool, "Cash").await;
+        // A method this account owns, DEACTIVATED: the reachable state that makes
+        // the collect form refuse. (Migration 45 removed "unassigned", so the old
+        // fixture of an owner-less Cash is no longer representable.)
+        let unconfigured = account_id(&pool, "Unconfigured").await;
+        let cash = own_method(&pool, unconfigured, "Cash").await;
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
+            .bind(cash)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let pid = seed_product(&app, "NO-ALLOW").await;
         seed_stock(&app, pid).await;
@@ -1368,8 +1418,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let msg = v["error"].as_str().unwrap_or_default();
         assert!(
-            msg.contains("not assigned to any account"),
-            "message must tell the user what to do, got {msg}"
+            msg.contains("is inactive"),
+            "message must name the state and the fix, got {msg}"
         );
         let payments: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
@@ -1409,13 +1459,25 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let cash = method_id(&pool, "Cash").await;
-        let transfer = method_id(&pool, "Transfer").await;
-
-        let (status, body) = web_create_account(&app, "Switcher", &[cash]).await;
+        let (status, body) = web_create_account(&app, "Switcher", &[]).await;
         assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
         let acc = account_id(&pool, "Switcher").await;
+        // The account's own two rows; the form below ticks one and untick the
+        // other, which is the round trip this test is about.
+        let cash = own_method(&pool, acc, "Cash").await;
+        let transfer = own_method(&pool, acc, "Transfer").await;
 
+        let (status, body) = send(
+            app.clone(),
+            "POST",
+            &format!("/accounts/{acc}/payment-methods"),
+            Some(FORM),
+            format!("method_ids={cash}&method_ids={transfer}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "tick both: {status} {body}");
+
+        // Untick Cash: it stays owned and rendered, unchecked and inactive.
         let (status, body) = send(
             app.clone(),
             "POST",
@@ -1436,15 +1498,26 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let owned: Vec<&str> = v["methods"]
+        let cash_row = v["methods"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|m| m["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(owned, vec!["Transfer"], "Cash must be unassigned: {body}");
+            .find(|m| m["id"] == serde_json::json!(cash))
+            .expect("the unticked method stays in the catalog: {body}");
+        assert_eq!(
+            cash_row["is_active"],
+            serde_json::json!(false),
+            "migration 45: unticking deactivates instead of unassigning: {body}"
+        );
+        assert_eq!(
+            cash_row["account_id"],
+            serde_json::json!(acc),
+            "and it keeps its owner: {body}"
+        );
 
-        // The detail page reflects the new set and clears the warning.
+        // The detail page renders one checkbox list now: the ticked method
+        // checked, the deactivated one unchecked but present so it can be ticked
+        // again. The account still has an active method, so no warning.
         let (status, page) = send(
             app.clone(),
             "GET",
@@ -1458,11 +1531,9 @@ mod tests {
             page.contains(&format!("value=\"{transfer}\" checked")),
             "Transfer must render checked"
         );
-        // Cash is now unassigned, so it renders in the unassigned section,
-        // unchecked.
         assert!(
             page.contains(&format!("value=\"{cash}\"")),
-            "Cash must still be offered as unassigned"
+            "Cash must still be offered, so the box can be ticked again"
         );
         assert!(
             !page.contains(&format!("value=\"{cash}\" checked")),
@@ -1476,7 +1547,6 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let cash = method_id(&pool, "Cash").await;
 
         let (status, body) = post_json(
             &app,
@@ -1504,6 +1574,9 @@ mod tests {
             "warning needs a machine-checkable marker"
         );
 
+        // The method offered here is the seeded Cash: creation through the form
+        // duplicates the name into the new account.
+        let cash = method_id_seeded(&pool).await;
         let (status, _) = web_create_account(&app, "ConfiguredDetail", &[cash]).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
         let configured = account_id(&pool, "ConfiguredDetail").await;
@@ -1745,8 +1818,6 @@ mod tests {
         let state = test_state().await;
         let pool = state.pool.clone();
         let app = crate::routes::router(state);
-        let cash = method_id(&pool, "Cash").await;
-
         let (status, _) = post_json(
             &app,
             "/api/accounts",
@@ -1756,6 +1827,7 @@ mod tests {
         assert_eq!(status, StatusCode::CREATED);
         let bare = account_id(&pool, "ListBare").await;
 
+        // Nothing owned yet: the account is exactly the one the warning is for.
         let (status, list) = send(app.clone(), "GET", "/web/accounts", None, String::new()).await;
         assert_eq!(status, StatusCode::OK);
         assert!(
@@ -1763,6 +1835,8 @@ mod tests {
             "list must flag the broken account: {list}"
         );
 
+        // Now give it one of its own and configure it.
+        let cash = own_method(&pool, bare, "Cash").await;
         let (status, body) = send(
             app.clone(),
             "PUT",

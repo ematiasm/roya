@@ -561,38 +561,55 @@ mod tests {
         assert_eq!(st, StatusCode::CREATED, "seed stock: {v}");
     }
 
+    /// Find-or-create by name. Migration 45 seeds an account named `Caja`, and
+    /// these fixtures must not fail on `resource already exists` when a test
+    /// happens to ask for that name: the account the test wants is the seeded
+    /// one, and creating a second is neither possible nor intended.
     async fn seed_account(app: &axum::Router, name: &str) -> i64 {
-        let (st, v) = post(app, "/api/accounts", json!({ "name": name })).await;
-        assert_eq!(st, StatusCode::CREATED, "seed account {name}: {v}");
-        v["id"].as_i64().unwrap()
+        let (status, v) = post(app, "/api/accounts", json!({ "name": name })).await;
+        if status == StatusCode::CREATED {
+            return v["id"].as_i64().unwrap();
+        }
+        assert_eq!(status, StatusCode::CONFLICT, "seed account {name}: {v}");
+        let (_, list) = get(app, "/api/accounts").await;
+        list["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == json!(name))
+            .unwrap_or_else(|| panic!("account {name} exists but is not listed: {list}"))["id"]
+            .as_i64()
+            .unwrap()
     }
 
+    /// The account's own `Cash`: reused when it already has one (the idempotence
+    /// the fixture needs when a test calls this twice), otherwise created from the
+    /// seeded row's name. Migration 45 makes the port that used to "assign the
+    /// unassigned Cash" impossible, and `UNIQUE(account_id, name)` makes a blind
+    /// duplicate a hard error — so the lookup comes first.
     async fn allow_cash(pool: &SqlitePool, account_id: i64) -> i64 {
-        let (cash,): (i64,) = sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
-        // the name when it is already owned elsewhere in this pool.
-        let assigned = sqlx::query(
-            "UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL",
+        if let Some(existing) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM payment_methods WHERE account_id = ? AND name = 'Cash'",
         )
         .bind(account_id)
-        .bind(cash)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
         .unwrap()
-        .rows_affected();
-        if assigned == 1 {
-            return cash;
+        {
+            return existing;
         }
+        let (seeded,): (i64,) =
+            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO payment_methods (name, account_id, is_active, created_by) \
              SELECT name, ?, is_active, ? FROM payment_methods WHERE id = ? RETURNING id",
         )
         .bind(account_id)
         .bind(test_support::audit_actor_id(pool).await.unwrap())
-        .bind(cash)
+        .bind(seeded)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -1060,8 +1077,10 @@ mod tests {
         );
         assert_eq!(receipt_count(&pool).await, 0);
 
-        // Unassigned method: no account can be derived, so it is a 400.
-        sqlx::query("UPDATE payment_methods SET account_id = NULL WHERE id = ?")
+        // Inactive method: `account_id` is NOT NULL since migration 45, so the
+        // unusable state is the deactivated one — the same refusal an operator
+        // gets after unticking a method in the account editor.
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
             .bind(cash)
             .execute(&pool)
             .await
@@ -1075,13 +1094,13 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned method: {v}");
+        assert_eq!(st, StatusCode::BAD_REQUEST, "inactive method: {v}");
         assert!(
             v["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("not assigned"),
-            "the message must name the fix: {v}"
+                .contains("is inactive"),
+            "the message must name the state: {v}"
         );
         assert_eq!(receipt_count(&pool).await, 0);
 

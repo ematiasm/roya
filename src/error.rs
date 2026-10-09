@@ -84,6 +84,18 @@ pub enum AppError {
     Internal(String),
 }
 
+/// The message SQLite put on the refused statement: the raw refusal, mapped by
+/// nothing, so a test's proof cannot drift from the schema. Shared by the
+/// test modules that assert a trigger's own error text (the role-guard style:
+/// the message asserted is the one the schema wrote).
+#[cfg(test)]
+pub fn db_err_message(err: &sqlx::Error) -> String {
+    match err {
+        sqlx::Error::Database(db) => db.message().to_string(),
+        other => panic!("expected a refused statement, got {other:?}"),
+    }
+}
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
