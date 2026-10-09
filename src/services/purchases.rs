@@ -1334,6 +1334,17 @@ where
 
     // -- Pay (Credit) ------------------------------------------------------------
 
+    /// Record a payment on one purchase, ALL of it inside one unit (P4 of
+    /// `odd/tasks/payment-allocation.md`).
+    ///
+    /// **What this fixes.** Before P4 this posted the `Expense` in one unit and the
+    /// payment row in a second — the purchase twin of the defect P3a closed on the sale
+    /// side. A failure in between leaves money out of the box with no document behind it.
+    ///
+    /// **What it writes.** A `payments` document with `direction='Out'` (money handed
+    /// over), its ONE cash movement, one allocation naming the purchase it covers, and
+    /// the `Payment` ledger entry. The legacy `purchase_payments` row stays until P5
+    /// moves the reads.
     pub async fn record_payment(
         &self,
         actor: i64,
@@ -1376,31 +1387,71 @@ where
         let purchase_number = purchase.purchase_number.clone().ok_or_else(|| {
             AppError::Internal("confirmed purchase missing purchase_number".into())
         })?;
-        // Each payment generates one M0 Expense stamped with reference =
-        // purchase_number and linked from the payment row it produced.
-        let expense = self
-            .transactions
-            .create_with_reference(
-                actor,
-                account_id,
-                crate::models::TransactionKind::Expense,
+
+        // ---- THE WRITE UNIT -------------------------------------------------
+        let mut tx = self.purchases.pool().begin().await?;
+
+        let delivery = crate::services::payment_writer::record_delivery_in(
+            &self.sequences,
+            &self.transactions,
+            &self.party_ledger,
+            &self.payments,
+            &mut tx,
+            actor,
+            crate::models::PaymentDirection::Out,
+            crate::models::PartyType::Supplier,
+            purchase.supplier_id,
+            method_id,
+            account_id,
+            amount,
+            date,
+            None,
+            Some(purchase_number.clone()),
+            None,
+            &[(
+                crate::models::PartyDocumentKind::Purchase,
+                purchase_id,
                 amount,
-                Some(purchase_number.clone()),
-                Some(purchase_number),
-                date,
+            )],
+        )
+        .await?;
+
+        // The ledger entry for a purchase payment is a `Payment` on the SUPPLIER — the
+        // same kind as a customer's collection, because the journal signs it by the
+        // party, not by which way the cash moved.
+        self.party_ledger
+            .insert_in(
+                &mut tx,
+                &crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Supplier,
+                    party_id: purchase.supplier_id,
+                    kind: crate::models::PartyEntryKind::Payment,
+                    amount: crate::models::PartyEntryKind::Payment.signed_amount(amount),
+                    document_kind: crate::models::PartyDocumentKind::Purchase,
+                    document_id: purchase_id,
+                    entry_date: date,
+                    reference: Some(purchase_number.clone()),
+                    created_by: actor,
+                },
             )
             .await?;
-        self.purchases
-            .create_payment(
+
+        let legacy = self
+            .purchases
+            .create_payment_in(
+                &mut tx,
                 actor,
                 purchase_id,
                 account_id,
                 method_id,
                 amount,
                 date,
-                Some(expense.id),
+                delivery.transaction_id,
             )
-            .await
+            .await?;
+
+        tx.commit().await?;
+        Ok(legacy)
     }
 
     /// Pay a supplier across their outstanding Confirmed purchases, oldest debt
@@ -1423,8 +1474,13 @@ where
             return Err(AppError::Validation("amount must be > 0".into()));
         }
         // The account is derived from the method's owner before any write
-        // (400 inactive/unassigned, no side effect).
-        self.payment_methods
+        // (400 inactive/unassigned, no side effect). It is READ here, before the unit
+        // opens, because the repository behind it answers on the POOL: calling it from
+        // inside the transaction would wait for the only connection the caller already
+        // holds, which on this crate's `max_connections(1)` fixtures is a
+        // `PoolTimedOut` rather than an answer.
+        let account_id = self
+            .payment_methods
             .resolve_account(method_id, None)
             .await?;
 
@@ -1473,22 +1529,103 @@ where
         }
         let planned =
             checked_money_sum(plan.iter().map(|(_, take)| take)).map_err(AppError::PriceRefused)?;
-        if planned != amount {
+        if planned > amount {
             return Err(AppError::Internal(format!(
-                "payment plan {planned} does not consume the paid amount {amount}"
+                "payment plan {planned} exceeds the paid amount {amount}"
             )));
         }
 
-        // One payment per covered purchase. `record_payment` revalidates the
-        // overpay per document, and no allocation exceeds its due by
-        // construction.
+        // ---- THE WRITE UNIT -----------------------------------------------------
+        //
+        // ONE delivery of money for the whole handover (P4, decisions 5 and 8), the
+        // exact mirror of `CustomerReceiptService::collect` on the supplier side: the
+        // supplier was handed ONE amount, so the shop must be able to cite ONE document
+        // for it and the money must move ONCE.
+        //
+        // It used to loop `record_payment` once per bill, which produced an `Expense`
+        // per invoice and left nothing tying them together — the same shape the sale
+        // side had and the same reason this family exists. Suppliers have no grouping
+        // document (only customers have receipts), which is why the delivery itself is
+        // the thing cited.
+        let mut tx = self.purchases.pool().begin().await?;
+
+        let allocations: Vec<(crate::models::PartyDocumentKind, i64, Decimal)> = plan
+            .iter()
+            .map(|(purchase_id, take)| {
+                (
+                    crate::models::PartyDocumentKind::Purchase,
+                    *purchase_id,
+                    *take,
+                )
+            })
+            .collect();
+        let delivery = crate::services::payment_writer::record_delivery_in(
+            &self.sequences,
+            &self.transactions,
+            &self.party_ledger,
+            &self.payments,
+            &mut tx,
+            actor,
+            crate::models::PaymentDirection::Out,
+            crate::models::PartyType::Supplier,
+            supplier_id,
+            method_id,
+            account_id,
+            amount,
+            date,
+            None,
+            // The movement's human label: the supplier this money went to.
+            Some(supplier.name.clone()),
+            None,
+            &allocations,
+        )
+        .await?;
+
+        // One `Payment` ledger entry for the delivery (decision 6: per payment
+        // DOCUMENT, not per invoice). The per-document residual comes from the
+        // allocations above.
+        self.party_ledger
+            .insert_in(
+                &mut tx,
+                &crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Supplier,
+                    party_id: supplier_id,
+                    kind: crate::models::PartyEntryKind::Payment,
+                    amount: crate::models::PartyEntryKind::Payment.signed_amount(amount),
+                    // The entry locates itself on the FIRST covered document; the full
+                    // set lives in the allocations. A `Payment` entry is legitimately
+                    // multiple per document (migration 43's partial index excludes those
+                    // kinds for exactly that reason).
+                    document_kind: crate::models::PartyDocumentKind::Purchase,
+                    document_id: plan.first().map(|(id, _)| *id).unwrap_or(0),
+                    entry_date: date,
+                    reference: Some(delivery.number.clone()),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        // The legacy rows stay, ONE PER COVERED PURCHASE, all naming the ONE movement
+        // this delivery produced, until P5 moves the reads.
         let mut payments = Vec::with_capacity(plan.len());
-        for (purchase_id, take) in plan {
+        for (purchase_id, take) in &plan {
             payments.push(
-                self.record_payment(actor, purchase_id, method_id, take, date)
+                self.purchases
+                    .create_payment_in(
+                        &mut tx,
+                        actor,
+                        *purchase_id,
+                        account_id,
+                        method_id,
+                        *take,
+                        date,
+                        delivery.transaction_id,
+                    )
                     .await?,
             );
         }
+
+        tx.commit().await?;
         Ok(payments)
     }
 
@@ -2788,11 +2925,34 @@ mod tests {
             )
             .await
             .unwrap();
+        // P4: still ONE legacy row per covered purchase — that is what the reads use
+        // until P5 — but they all name ONE movement now, and the handover is one
+        // document.
         assert_eq!(payments.len(), 2);
         assert_eq!(payments[0].purchase_id, a.id);
         assert_eq!(payments[0].amount, dec("40"));
         assert_eq!(payments[1].purchase_id, b.id);
         assert_eq!(payments[1].amount, dec("15"));
+        assert_eq!(
+            payments[0].transaction_id, payments[1].transaction_id,
+            "one handover of money is one cash movement"
+        );
+
+        // And the delivery: `Out`, the whole 55, with both invoices as its shares.
+        let delivery: (i64, String, String) =
+            sqlx::query_as("SELECT id, direction, amount FROM payments ORDER BY id")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(delivery.1, "Out");
+        assert_eq!(delivery.2, "55", "one document for the whole handover");
+        let shares: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payment_allocations WHERE payment_id = ?")
+                .bind(delivery.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(shares, 2, "one share per invoice it covered");
 
         let da = s.get_detail(a.id).await.unwrap();
         assert_eq!(da.due, Decimal::ZERO);
@@ -2800,7 +2960,7 @@ mod tests {
         let db = s.get_detail(b.id).await.unwrap();
         assert_eq!(db.paid, dec("15"));
         assert_eq!(db.due, dec("15"));
-        assert_eq!(tx_count(&pool).await, 2);
+        assert_eq!(tx_count(&pool).await, 1, "one delivery, one movement");
 
         // Pay the exact remainder: B closes, nothing more is planned.
         let rest = s
@@ -2819,6 +2979,7 @@ mod tests {
         let db = s.get_detail(b.id).await.unwrap();
         assert_eq!(db.due, Decimal::ZERO);
         assert_eq!(db.payment_status, crate::models::PaymentStatus::Paid);
+        assert_eq!(tx_count(&pool).await, 2, "and a second delivery for it");
     }
 
     #[tokio::test]
@@ -3012,6 +3173,198 @@ mod tests {
                 .status,
             crate::models::PurchaseStatus::Confirmed,
             "the purchase is still live: the refusal was a refusal"
+        );
+    }
+
+    /// **P4: the live atomicity defect on the supplier side.** `pay_supplier` looped
+    /// `record_payment` with no enclosing `begin`, and `record_payment` itself posted
+    /// the `Expense` in one unit and the row in another. A failure anywhere in the loop
+    /// left money out of the box for some invoices and no record for the rest.
+    ///
+    /// The failure is injected on the legacy payment row of the SECOND covered
+    /// purchase, which is the last write of the unit.
+    #[tokio::test]
+    async fn a_failure_while_paying_a_supplier_rolls_the_whole_handover_back() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "P4-ATOMIC", "10").await;
+        let sup = seed_supplier(&s, "P4 Atomic Supplier").await;
+        let acc = seed_account(&s, "p4-atomic").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        s.transactions
+            .create(
+                audit_actor(&s).await,
+                acc.id,
+                TransactionKind::Income,
+                dec("1000"),
+                Some("fondo".into()),
+                purchase_date(),
+            )
+            .await
+            .unwrap();
+
+        // Two credit purchases of 20 each.
+        let a = draft_credit(&s, sup.id).await;
+        s.add_line(
+            audit_actor(&s).await,
+            a.id,
+            prod.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, a.id, None).await.unwrap();
+        let b = draft_credit(&s, sup.id).await;
+        s.add_line(
+            audit_actor(&s).await,
+            b.id,
+            prod.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap();
+        s.confirm(audit_actor(&s).await, b.id, None).await.unwrap();
+
+        let tx_before = tx_count(&pool).await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER injected_payment_failure BEFORE INSERT ON purchase_payments \
+             WHEN NEW.purchase_id = {} BEGIN SELECT RAISE(ABORT, 'injected payment failure'); END",
+            b.id
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .pay_supplier(
+                audit_actor(&s).await,
+                sup.id,
+                cash,
+                dec("40"),
+                purchase_date(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected payment failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+
+        // NOTHING of the handover survived, including the FIRST purchase's payment:
+        // the whole handover is one unit.
+        assert_eq!(tx_count(&pool).await, tx_before, "no movement");
+        for (label, table) in [
+            ("deliveries", "payments"),
+            ("shares", "payment_allocations"),
+        ] {
+            let n: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(n, 0, "{label} must not survive");
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM purchase_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "and no legacy row either");
+        assert_eq!(s.get_detail(a.id).await.unwrap().due, dec("20"));
+        assert_eq!(s.get_detail(b.id).await.unwrap().due, dec("20"));
+    }
+
+    /// The document the plan asks for by name: **one handover covering four bills is
+    /// ONE document and ONE `Expense`**, with four shares.
+    #[tokio::test]
+    async fn one_handover_over_four_bills_is_one_document_and_one_expense() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "P4-FOUR", "10").await;
+        let sup = seed_supplier(&s, "P4 Four Bills").await;
+        let acc = seed_account(&s, "p4-four").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        s.transactions
+            .create(
+                audit_actor(&s).await,
+                acc.id,
+                TransactionKind::Income,
+                dec("1000"),
+                Some("fondo".into()),
+                purchase_date(),
+            )
+            .await
+            .unwrap();
+
+        // Four credit purchases of 50 each = 200 owed.
+        for due in ["2024-07-01", "2024-07-10", "2024-07-20", "2024-07-30"] {
+            let p = draft_credit_due(&s, sup.id, d(2024, 7, 1)).await;
+            let _ = due;
+            s.add_line(
+                audit_actor(&s).await,
+                p.id,
+                prod.id,
+                dec("5"),
+                Some(dec("10")),
+            )
+            .await
+            .unwrap();
+            s.confirm(audit_actor(&s).await, p.id, None).await.unwrap();
+        }
+
+        let payments = s
+            .pay_supplier(
+                audit_actor(&s).await,
+                sup.id,
+                cash,
+                dec("200"),
+                purchase_date(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(payments.len(), 4, "one legacy row per covered bill");
+
+        // ONE document, ONE movement, FOUR shares.
+        let deliveries: Vec<(String, String)> =
+            sqlx::query_as("SELECT direction, amount FROM payments ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            deliveries,
+            vec![("Out".to_string(), "200".to_string())],
+            "one handover, one document"
+        );
+        // ONE movement for the handover. The count includes the fixture's own funding
+        // Income, so the claim is stated on the movement that belongs to the delivery.
+        let movement: String = sqlx::query_scalar(
+            "SELECT t.amount FROM transactions t JOIN payments p ON p.transaction_id = t.id \
+              WHERE p.direction = 'Out'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(movement, "200", "one movement, carrying the whole handover");
+        let expenses: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM transactions WHERE kind = 'Expense'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(expenses, 1);
+        let shares: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_allocations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(shares, 4, "four invoices, four shares");
+        // And every legacy row names that ONE movement.
+        let linked: Vec<Option<i64>> =
+            sqlx::query_scalar("SELECT transaction_id FROM purchase_payments ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked.len(), 4);
+        assert!(
+            linked.iter().all(|t| *t == linked[0]),
+            "all four bills point at the same movement: {linked:?}"
         );
     }
 
@@ -5125,7 +5478,18 @@ mod tests {
             .unwrap();
         let expense = rows.iter().find(|t| t.id == paid_tx_id).unwrap();
         assert_eq!(expense.kind, TransactionKind::Expense);
-        assert_eq!(expense.reference.as_deref(), Some(number.as_str()));
+        // P4: the movement names the DELIVERY it belongs to, and the purchase stays the
+        // description. Same contract the sale side took in P3.
+        assert!(
+            expense
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "got {:?}",
+            expense.reference
+        );
+        assert_ne!(expense.reference.as_deref(), Some(number.as_str()));
 
         s.cancel(audit_actor(&s).await, purchase.id, Some("return".into()))
             .await
