@@ -392,10 +392,30 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   legacy `*_return_payments` rows until P8. Comparable to P3a in size, not to a
   one-line change.
 
-- [ ] **P4 — Supplier money paths, mirrored.** `pay_supplier`, purchase
+- [x] **P4 — Supplier money paths, mirrored.** `pay_supplier`, purchase
   `record_payment`, purchase cancel/refund: one `payments` (`direction='Out'`) with
   N allocations. Same tests mirrored, plus: one handover of 200.000 covering four
   bills is one document and one `Expense`.
+  **CLOSED 2026-10-08 — committed as `1a1b867`.** All three parts, and the third was
+  already done: **the purchase cancel/refund was covered by T3d**, which put all four
+  `cancel` paths in one unit and made the refund a delivery (`direction='In'` on this
+  side, because the money comes back to the shop).
+  * `record_payment` is one unit now — it had the purchase twin of the defect P3a
+    closed: the `Expense` in one transaction and the row in a second.
+  * `pay_supplier` is ONE delivery instead of a loop over `record_payment` with no
+    enclosing `begin`, which produced four `Expense`s for one handover of 200.000 and
+    nothing tying them together. One document, one movement, one share per covered
+    invoice, one `Payment` ledger entry.
+  * the plan's named case has a test with its name:
+    `one_handover_over_four_bills_is_one_document_and_one_expense`.
+  Observed: `cargo test --locked` 1554 passed / 0 failed; `scripts/e2e.sh` 180 passed /
+  0 failed; warnings 79 bin / 55 test. RED by mutation: restoring the loop makes the
+  atomicity test fail with "no movement", because the FIRST bill commits and the second
+  aborts — the defect reproduced as a failing assertion rather than described.
+  **One trap found and now recorded in the code**: `resolve_account` reads through the
+  POOL, so calling it inside a unit waits for the connection the caller already holds
+  and answers `PoolTimedOut` on the `max_connections(1)` fixtures. It is a pre-check and
+  it moved up with the others, before the unit opens.
 - [ ] **P5 — Reads move to the per-document residual.** `customer_balance`,
   `ageing_of`/`customer_ageing`/`ageing_all`, the `ENFORCE_CREDIT_LIMIT`
   projection, the `suppliers_web.rs:428` drawer fold, `outstanding_payables`,
