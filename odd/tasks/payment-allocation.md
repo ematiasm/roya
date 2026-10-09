@@ -480,6 +480,20 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   on the oldest invoice and is not moved by a later credit; the supplier drawer reflects a
   confirmed return; and the identity `balance == Σ residuals − Σ unapplied` holds on the
   four scoreboard cases of "P5 blocker".
+- [ ] **P5x — The return confirms journal their refund.** Found while verifying a
+  delegated writer's blocking question, and it BLOCKS P5 rather than following it: a
+  credit note or purchase return that gives cash back writes an `Expense`/`Income` and
+  its `Return` entry but NO `Refund` entry (`customer_return.rs:653` and `:697`;
+  `purchase_return.rs` the same shape), so the party's balance is wrong by the refunded
+  amount. A 12 credit sale collected 12 and then refunded in full folds to `-12` where
+  the truth is 0. The `cancel` paths already write that entry (`customer_return.rs:899`),
+  which is why the gap was invisible: agreement between the two paths was never asserted.
+  The test documenting the gap as intended,
+  `a_confirmed_credit_note_appends_one_return_that_reduces_the_debt`
+  (`customer_return.rs:2829`), is corrected here rather than relaxed. It cannot be fixed
+  by routing the refund through `record_delivery_in`: that writer infers its document
+  locator from the first allocation, and a refund carries none, so it would write
+  `document_id = 0`.
 - [ ] **P6 — UI.** Collect/pay screen: pick the party, the amount, the method, and
   the documents with their amounts (oldest-first prefilled, editable); the
   unapplied remainder shown as available credit; an explicit "apply credit"
@@ -491,12 +505,6 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   `BEFORE UPDATE` guard waiting for it. Moving a share from document A to B must
   satisfy A's residual, B's residual and the payment's total in ONE unit, because a
   delete-then-insert would pass through a state where the money is applied twice.
-  `MessageKey` + ES + EN. Playwright coverage; regenerate the visual baseline only
-  with proof the diff is exactly what was intended.
-- [ ] **P6 — UI.** Collect/pay screen: pick the party, the amount, the method, and
-  the documents with their amounts (oldest-first prefilled, editable); the
-  unapplied remainder shown as available credit; an explicit "apply credit"
-  action; the saldo a favor visible on the party page and the statement.
   `MessageKey` + ES + EN. Playwright coverage; regenerate the visual baseline only
   with proof the diff is exactly what was intended.
 - [ ] **P7 — Verification pass.** `cargo test --locked`, `cargo check --all-targets`
