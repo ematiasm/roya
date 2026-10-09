@@ -2,10 +2,14 @@
 
 ## Status
 
-**In progress.** T1 delivered and committed as `0dfe5c1` on `feat/party-ledger`;
-T2, T3a, T3b, T4, T5, T6 pending. T1's native review is granted-but-blocked — see
-Progress and Resume here. This document is itself an uncommitted change
-(`M odd/tasks/party-ledger.md`) on purpose.
+**In progress.** On `feat/party-ledger`: T1 (`0dfe5c1`), T1b (`0010b6a`) and the
+payment-method guard (`7bba800`) are committed, and the branch candidate **was
+reviewed and approved natively** (lineage `review-1288ee9534822fbc`, authority
+burned). T2 is next. **T3a, T3b, T4 and T5 are reshaped** by
+`odd/tasks/payment-allocation.md` and must not be built here first. The older
+T1-only lineage `review-947422ad2ac0098e` is still blocked by a provider failure
+and is obsolete in practice — T1's code is inside the approved candidate; disabling
+it is the user's call, not the agent's.
 
 ## Objective
 
@@ -123,6 +127,12 @@ ledger is the base that makes all four correct at once.
    product. That is a read-side join in T4, not a new column: if the join ever turns
    out to be the wrong home for the fact, the alternative is a `parent_document_id`
    on the entry, and that is a schema decision to raise then.
+
+   **Superseded 2026-10-03 for the excess.** With explicit allocations there is no
+   excess to guess at: the operator allocates and the schema caps the split, so the
+   FIFO-for-the-remainder fallback disappears entirely. See
+   `odd/tasks/payment-allocation.md`. The parent-link caveat above still stands for
+   the party ledger's own reads until P5 lands.
 
 8. **Decided 2026-10-03 — every entry is written inside the unit that owns the
    event.** The four `confirm` paths already have one; `record_payment`,
@@ -245,7 +255,7 @@ Out of scope (follow-ups, recorded here so they are not silently invented later)
   Tests: fold signs per entry kind; `_in` join proven by rollback under
   `max_connections(1)`; backfill run directly against a seeded pool gives the old
   fold ± the returns correction; re-running on a non-empty ledger is a no-op.
-- [ ] **T1b — Migration 43: append-only enforcement + the single-instance guard.**
+- [x] **T1b — Migration 43: append-only enforcement + the single-instance guard.**
   Decisions 10 and 11: `BEFORE UPDATE` / `BEFORE DELETE` triggers that abort, the
   partial unique index over the single-instance kinds, and `ALTER TABLE … DROP
   COLUMN updated_by, updated_at` (order matters: the columns must be dropped
@@ -256,6 +266,11 @@ Out of scope (follow-ups, recorded here so they are not silently invented later)
   a second `Charge` for one document is refused; so is a second `Cancel`; two
   `Payment`s on one document are allowed; the index does not reach across
   documents; `UPDATE` and `DELETE` abort and leave the row and the fold intact.
+  **CLOSED 2026-10-03 — against the tree**: committed as `0010b6a`, which carries
+  the triggers, the partial index and the two dropped columns with the reasoning
+  above in its message. The checkbox was left unticked when the commit landed,
+  which is why this reads as pending in an earlier scan of this file; the STATE
+  section of this document already listed it as committed.
 - [ ] **T2 — Entry writes in the four `confirm` paths + lift the return caps.**
   `sales.rs`, `purchases.rs`, `customer_return.rs`, `purchase_return.rs`, inside the
   existing units via `_in`. Remove the two `return is worth … collected …` refusals.
@@ -264,6 +279,9 @@ Out of scope (follow-ups, recorded here so they are not silently invented later)
   and reduces the balance; the two lifted-refusal tests are rewritten to assert the
   new outcome.
 - [ ] **T3a — Transaction units + entry writes for the collection paths.**
+  **RESHAPED 2026-10-03 — absorbed by P3/P4 of `odd/tasks/payment-allocation.md`.**
+  The cash movement moves from per-sale to per-delivery, so this layer is written
+  once, in that shape; building it here first means building it twice.
   `record_payment` (sales), `record_payment` (purchases), `pay_supplier`,
   `customer_receipts::collect`. One unit each; cash transaction + payment row +
   ledger entry commit or roll back together. Lift the four overpayment refusals.
@@ -271,6 +289,9 @@ Out of scope (follow-ups, recorded here so they are not silently invented later)
   against a 200 debt yields `−50`; receipt collection applies explicit credit then
   collects the remainder.
 - [ ] **T3b — Transaction units + entry writes for the four cancel paths.**
+  **RESHAPED 2026-10-03 — absorbed by P3/P4 (out-payments) of
+  `odd/tasks/payment-allocation.md`.** A refund becomes a `direction='Out'` payment
+  whose account is replayed from the parent payment.
   `sales::cancel`, `purchases::cancel`, `customer_return::cancel`,
   `purchase_return::cancel`: `cancel` + `refund` entries inside one unit, replacing
   today's autocommit sequence, **but only for a document that was confirmed at
@@ -280,6 +301,8 @@ Out of scope (follow-ups, recorded here so they are not silently invented later)
   row; a discarded cancelled document (the deletable one, `sale_number IS NULL`) is
   deleted with no ledger row ever written for it.
 - [ ] **T4 — Reads move to the ledger.**
+  **RESHAPED 2026-10-03 — absorbed by P5 of `odd/tasks/payment-allocation.md`.**
+  The per-document residual needs the allocations, so the reads move once, there.
   `customer_balance`, `ageing_of`/`customer_ageing`/`ageing_all`, the
   `ENFORCE_CREDIT_LIMIT` projection, `suppliers_web.rs:428` drawer fold,
   `outstanding_payables`, `customer_statement`. One `balance_for_party`. Buckets are
@@ -291,6 +314,8 @@ Out of scope (follow-ups, recorded here so they are not silently invented later)
   to the oldest invoice ages on the oldest invoice and is not moved by a later
   credit; the independent folds are deleted, not left dormant.
 - [ ] **T5 — Explicit credit application in the collection UI.**
+  **RESHAPED 2026-10-03 — absorbed by P6 of `odd/tasks/payment-allocation.md`.**
+  Applying credit is creating an allocation.
   Show available credit on the collection screen, explicit apply action, collect the
   remainder. `MessageKey` variant + ES + EN. Playwright coverage; regenerate the
   visual baseline only with proof that the diff is exactly what was intended.
@@ -414,6 +439,12 @@ Parent does: git state, feature-doc updates, per-task spot checks, delivery deci
   honest caveat that a `Return` entry names its own document and the parent link is
   read from the return family. (e) the ceiling is written into Objective: a party
   **subledger**, not a general ledger, with no verifiable double-entry invariant.
+- 2026-10-03 — **the payment-allocation unit was planned**
+  (`odd/tasks/payment-allocation.md`, nine decisions): one shared `payments` family
+  with a direction and a number, mutable allocations capped by the schema, one cash
+  movement per delivery. It absorbs T3a, T3b, T4 and T5 of this document — the user's
+  business decision was that a supplier payment also covers one or several invoices,
+  which is what made the supplier side need the same document instead of a loop.
 
 ## Resume here
 
