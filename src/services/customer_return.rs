@@ -673,6 +673,28 @@ where
                     Some(expense.id),
                 )
                 .await?;
+
+            // The money leg is a separate party obligation movement: one Refund
+            // per delivery, located on this return (not the parent payment). Its
+            // positive sign comes only from PartyEntryKind's rule; the account
+            // above remains the parent payment's historical account.
+            self.party_ledger
+                .insert_in(
+                    &mut tx,
+                    &crate::models::NewPartyLedgerEntry {
+                        party_type: crate::models::PartyType::Customer,
+                        party_id: sale.customer_id,
+                        kind: crate::models::PartyEntryKind::Refund,
+                        amount: crate::models::PartyEntryKind::Refund
+                            .signed_amount(refund.amount),
+                        document_kind: crate::models::PartyDocumentKind::CustomerReturn,
+                        document_id: return_id,
+                        entry_date: customer_return.return_date,
+                        reference: Some(credit_note_number.clone()),
+                        created_by: actor,
+                    },
+                )
+                .await?;
         }
 
         // 5. The customer's journal, in the SAME unit as the goods movement (T2
@@ -681,10 +703,10 @@ where
         // folds the customer's debt down by exactly the value of what they
         // returned.
         //
-        // No cash leg here, and that is the point of writing it separately from
-        // the refunds above: the goods came back whether or not money did — a
-        // parent that collected nothing legitimately produces a Return with no
-        // Refund — so the two events are two rows, and refunding is T3b's path.
+        // The goods leg is written independently from the refunds above: the
+        // goods came back whether or not money did — a parent that collected
+        // nothing legitimately produces a Return with no Refund. Each planned
+        // cash delivery already appended its own Refund entry in the loop.
         //
         // Written even when the refund plan is empty: the Return is about the
         // GOODS, not about the money.
@@ -2214,6 +2236,15 @@ mod tests {
         let mut amounts: Vec<Decimal> = detail.payments.iter().map(|p| p.amount).collect();
         amounts.sort();
         assert_eq!(amounts, vec![dec("4"), dec("6")]);
+        assert_eq!(
+            ledger_rows(&pool, credit_note.id).await,
+            vec![
+                ("Refund".to_string(), "4".to_string()),
+                ("Refund".to_string(), "6".to_string()),
+                ("Return".to_string(), "-10".to_string()),
+            ],
+            "the split refund plan writes one return-located Refund for each delivery"
+        );
 
         let accounts: Vec<i64> =
             sqlx::query_scalar("SELECT account_id FROM customer_return_payments ORDER BY id")
@@ -2825,8 +2856,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A credit note cancels part of what the sale charged: one `Return` of
-    /// `−total`, which folds the customer's debt down by what came back.
+    /// A credit note writes the goods and cash legs independently: one `Return`
+    /// of `−total` and one `Refund` per cash delivery.
     #[tokio::test]
     async fn a_confirmed_credit_note_appends_one_return_that_reduces_the_debt() {
         let (s, pool) = svc().await;
@@ -2848,15 +2879,16 @@ mod tests {
 
         assert_eq!(
             ledger_rows(&pool, p.return_id).await,
-            vec![("Return".to_string(), "-12".to_string())],
-            "a credit note takes goods back: one Return, and no cash entry of its own"
+            vec![
+                ("Refund".to_string(), "12".to_string()),
+                ("Return".to_string(), "-12".to_string()),
+            ],
+            "a credit note records the goods as Return -12 and the cash handed back as Refund +12"
         );
 
-        // The balance is NEGATIVE here, and that is the correct answer rather
-        // than a mistake: this fixture plants the parent sale with raw SQL
-        // (`seed_parent`), so the sale never ran `confirm` and never wrote its
-        // own `Charge`. The only entry in the journal is the credit note's, so
-        // the fold is the Return and nothing else.
+        // The parent sale and its collection are planted with raw SQL, so the
+        // fixture has no Sale Charge or Payment entries. The return's goods and
+        // money legs therefore fold to -12 + 12 = 0.
         let customer_id: i64 =
             sqlx::query_scalar("SELECT customer_id FROM customer_returns WHERE id = ?")
                 .bind(p.return_id)
@@ -2865,11 +2897,11 @@ mod tests {
                 .unwrap();
         assert_eq!(
             balance(&pool, customer_id).await,
-            dec("-12"),
-            "a Return with no Charge of its own folds to a credit: -12"
+            Decimal::ZERO,
+            "the Return reduces the debt and the Refund settles that amount"
         );
-        // And it is not written as a tautology: the Sale-side rows are ABSENT,
-        // which is the reason the fold is negative rather than zero.
+        // Sale-side rows are absent, confirming this zero is exactly the
+        // return's -12 goods leg plus its +12 refund leg.
         let sale_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM party_ledger_entries WHERE document_kind = 'Sale'",
         )
@@ -2878,8 +2910,87 @@ mod tests {
         .unwrap();
         assert_eq!(
             sale_rows, 0,
-            "the fixture's raw-SQL parent wrote no ledger row, which is WHY the fold is negative"
+            "the fixture's raw-SQL parent wrote no ledger row; the return legs alone net to zero"
         );
+    }
+
+    /// A paid credit sale followed by a cash-refunded credit note nets to zero:
+    /// Charge +12, Payment -12, Return -12 and Refund +12. The parent fixture
+    /// uses raw SQL, so seed its already-earned sale/payment journal entries here.
+    #[tokio::test]
+    async fn a_fully_collected_sale_refunded_by_credit_note_folds_to_zero() {
+        let (s, pool) = svc().await;
+        let p = draft_credit_note(
+            &s,
+            &pool,
+            "LEDGER-IDENTITY",
+            "Ledger Identity Customer",
+            "3",
+            "4",
+            &[("identity till", "12")],
+            "3",
+        )
+        .await;
+        let (sale_id, customer_id): (i64, i64) = sqlx::query_as(
+            "SELECT sale_id, customer_id FROM customer_returns WHERE id = ?",
+        )
+        .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let ledger = SqlitePartyLedgerRepository::new(pool.clone());
+        let who = actor(&pool).await;
+        for (kind, amount) in [
+            (crate::models::PartyEntryKind::Charge, dec("12")),
+            (crate::models::PartyEntryKind::Payment, dec("12")),
+        ] {
+            ledger
+                .insert(&crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Customer,
+                    party_id: customer_id,
+                    kind,
+                    amount: kind.signed_amount(amount),
+                    document_kind: crate::models::PartyDocumentKind::Sale,
+                    document_id: sale_id,
+                    entry_date: sale_date(),
+                    reference: Some("2024-SALE-LEDGER-IDENTITY".into()),
+                    created_by: who,
+                })
+                .await
+                .unwrap();
+        }
+
+        s.confirm(who, p.return_id).await.unwrap();
+
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT kind, amount, document_kind, document_id FROM party_ledger_entries \
+             WHERE party_type = 'Customer' AND party_id = ? ORDER BY id",
+        )
+        .bind(customer_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Charge".into(), "12".into(), "Sale".into(), sale_id),
+                ("Payment".into(), "-12".into(), "Sale".into(), sale_id),
+                (
+                    "Refund".into(),
+                    "12".into(),
+                    "CustomerReturn".into(),
+                    p.return_id,
+                ),
+                (
+                    "Return".into(),
+                    "-12".into(),
+                    "CustomerReturn".into(),
+                    p.return_id,
+                ),
+            ],
+            "the journal names all four obligation movements on their owning documents"
+        );
+        assert_eq!(balance(&pool, customer_id).await, Decimal::ZERO);
     }
 
     /// THE case the cap exists for, and the reason the Return is written even
@@ -2908,7 +3019,7 @@ mod tests {
         assert_eq!(
             ledger_rows(&pool, p.return_id).await,
             vec![("Return".to_string(), "-10".to_string())],
-            "the goods came back, so the debt comes down even though money did not move"
+            "the goods came back, so the debt comes down; the empty refund plan adds no Refund"
         );
         assert_eq!(
             tx_count(&pool).await,

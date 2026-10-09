@@ -687,6 +687,27 @@ where
                     Some(income.id),
                 )
                 .await?;
+
+            // One Refund per delivery, located on this return (not the parent
+            // payment). Its positive sign is PartyEntryKind's rule; the Income
+            // above replays the parent's historical account.
+            self.party_ledger
+                .insert_in(
+                    &mut tx,
+                    &crate::models::NewPartyLedgerEntry {
+                        party_type: crate::models::PartyType::Supplier,
+                        party_id: purchase.supplier_id,
+                        kind: crate::models::PartyEntryKind::Refund,
+                        amount: crate::models::PartyEntryKind::Refund
+                            .signed_amount(refund.amount),
+                        document_kind: crate::models::PartyDocumentKind::PurchaseReturn,
+                        document_id: return_id,
+                        entry_date: purchase_return.return_date,
+                        reference: Some(return_number.clone()),
+                        created_by: actor,
+                    },
+                )
+                .await?;
         }
 
         // 5. The supplier's journal, in the SAME unit as the stock movement (T2
@@ -1393,8 +1414,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A purchase return cancels part of the payable: one `Return` of `−total` on
-    /// the supplier.
+    /// A purchase return journals goods as Return and each cash delivery as Refund.
     #[tokio::test]
     async fn a_confirmed_purchase_return_appends_one_return_on_the_supplier() {
         let (s, pool) = svc().await;
@@ -1416,9 +1436,94 @@ mod tests {
 
         assert_eq!(
             ledger_rows(&pool, p.return_id).await,
-            vec![("Return".to_string(), "-10".to_string())],
-            "goods went back, so the payable comes down: one Return"
+            vec![
+                ("Refund".to_string(), "10".to_string()),
+                ("Return".to_string(), "-10".to_string()),
+            ],
+            "goods reduce the payable and cash returned settles that amount"
         );
+    }
+
+    /// A fully paid credit purchase returned in cash has four named ledger
+    /// movements and nets to zero, mirroring the customer-side identity.
+    #[tokio::test]
+    async fn a_fully_paid_purchase_refunded_by_purchase_return_folds_to_zero() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-IDENTITY",
+            "Ledger Identity Supplier",
+            "2",
+            "6",
+            &[("identity supplier till", "12")],
+            "2",
+        )
+        .await;
+        let (purchase_id, supplier_id): (i64, i64) = sqlx::query_as(
+            "SELECT purchase_id, supplier_id FROM purchase_returns WHERE id = ?",
+        )
+        .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let ledger = SqlitePartyLedgerRepository::new(pool.clone());
+        let who = actor(&pool).await;
+        for (kind, amount) in [
+            (crate::models::PartyEntryKind::Charge, dec("12")),
+            (crate::models::PartyEntryKind::Payment, dec("12")),
+        ] {
+            ledger
+                .insert(&crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Supplier,
+                    party_id: supplier_id,
+                    kind,
+                    amount: kind.signed_amount(amount),
+                    document_kind: crate::models::PartyDocumentKind::Purchase,
+                    document_id: purchase_id,
+                    entry_date: purchase_date(),
+                    reference: Some("2024-PURCH-LEDGER-IDENTITY".into()),
+                    created_by: who,
+                })
+                .await
+                .unwrap();
+        }
+
+        s.confirm(who, p.return_id).await.unwrap();
+
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT kind, amount, document_kind, document_id FROM party_ledger_entries \
+             WHERE party_type = 'Supplier' AND party_id = ? ORDER BY id",
+        )
+        .bind(supplier_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Charge".into(), "12".into(), "Purchase".into(), purchase_id),
+                ("Payment".into(), "-12".into(), "Purchase".into(), purchase_id),
+                (
+                    "Refund".into(),
+                    "12".into(),
+                    "PurchaseReturn".into(),
+                    p.return_id,
+                ),
+                (
+                    "Return".into(),
+                    "-12".into(),
+                    "PurchaseReturn".into(),
+                    p.return_id,
+                ),
+            ],
+            "the journal names all four obligation movements on their owning documents"
+        );
+        let balance = SqlitePartyLedgerRepository::new(pool.clone())
+            .balance_for_party(crate::models::PartyType::Supplier, supplier_id)
+            .await
+            .unwrap();
+        assert_eq!(balance, Decimal::ZERO);
     }
 
     /// THE case the empty refund plan exists for: a purchase confirmed but NOT
@@ -1446,12 +1551,27 @@ mod tests {
         assert_eq!(
             ledger_rows(&pool, p.return_id).await,
             vec![("Return".to_string(), "-10".to_string())],
-            "the goods went back, so the payable comes down even though money did not move"
+            "the goods went back, so the payable comes down; the empty refund plan adds no Refund"
         );
         assert_eq!(
             tx_count(&pool).await,
             0,
             "and no cash entry exists: the Return is about the goods, not the money"
+        );
+        let supplier_id: i64 =
+            sqlx::query_scalar("SELECT supplier_id FROM purchase_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let balance = SqlitePartyLedgerRepository::new(pool.clone())
+            .balance_for_party(crate::models::PartyType::Supplier, supplier_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            balance,
+            dec("-10"),
+            "without a Charge or refund, the sole Return is the supplier's balance"
         );
     }
 
@@ -2313,6 +2433,15 @@ mod tests {
         let mut amounts: Vec<Decimal> = detail.payments.iter().map(|p| p.amount).collect();
         amounts.sort();
         assert_eq!(amounts, vec![dec("4"), dec("6")]);
+        assert_eq!(
+            ledger_rows(&pool, purchase_return.id).await,
+            vec![
+                ("Refund".to_string(), "4".to_string()),
+                ("Refund".to_string(), "6".to_string()),
+                ("Return".to_string(), "-10".to_string()),
+            ],
+            "the split refund plan writes one return-located Refund for each delivery"
+        );
 
         let accounts: Vec<i64> =
             sqlx::query_scalar("SELECT account_id FROM purchase_return_payments ORDER BY id")
