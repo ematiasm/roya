@@ -925,6 +925,50 @@ STAY is the cash leg of `confirm`, which does not use the writer — and that ca
 never created a `payments` row, which is why the residual could not see a cash purchase
 at all.
 
+## P5.3b is blocked on finishing decision 9, not on moving readers (measured 2026-10-09)
+
+Sizing this as "move the two return families' readers" was wrong, and the measurement is
+in the table below. The pattern is the SAME asymmetry P5x and the cash-purchase bug had:
+an event that goes through the shared writer on one path and by hand on the other.
+
+| Document | its `confirm`'s money leg | its `cancel` |
+|---|---|---|
+| a cash sale | writer | writer |
+| a cash purchase | writer (fixed in `d921d2f`) | writer |
+| **a credit note's refund** | **`Expense` + legacy row, NO `payments`** | writer |
+| **a purchase return's refund** | **`Income` + legacy row, NO `payments`** | writer |
+
+`customer_return.rs:644-697` writes the `Expense` (`:653`) and the legacy row (`:665`) and
+never creates a `payments` row; `purchase_return.rs` mirrors it. Their own `cancel` does
+use `record_delivery_in` (`customer_return.rs:921`, `purchase_return.rs:933`). So decision
+9 — "refunds are `direction='Out'` payments ... replacing `customer_return_payments` /
+`purchase_return_payments` as the write target" — got its ledger half in `2fe1279` and
+never got its document half.
+
+**Why the writer could not just be pointed at it**, and the first thing the unit had to
+fix: `record_delivery_in` inferred the entry's locator from `allocations.first()`, and a
+refund can never carry an allocation because `residual_for_document` refuses a return
+document on purpose (`payment_repo.rs:387`, "money cannot be applied to a CustomerReturn
+document: returns reduce their parent, they are not collected against"). It would have
+written `document_id = 0`. The locator is now an explicit `(kind, id)` parameter.
+
+**Two more things P5.3b inherits, both measured:**
+
+- **`payments` has no `refund_transaction_id`.** The `cancel` reads it to refuse a
+  partially-applied reversal (`customer_return.rs:848-856`), so that link has to move
+  house before the legacy rows can go — either a column on `payments` or a derivation
+  from the journal, since the `Refund` entry the confirm writes already carries
+  `document_kind`/`document_id`.
+- **`refund_plan` reads the PARENT's legacy payments** (`customer_return.rs:570`,
+  `purchase_return.rs:573`) to replay the account and method the money came in through,
+  which decision 9 requires. Replacing it needs a read that does not exist yet: the
+  deliveries that ALLOCATED to a given document, with their account and method.
+  `allocated_to_target` returns only the folded amount.
+
+What IS free: the three `COUNT(*)` guards per repository are inside `mod tests` (the
+module starts at `customer_return_repo.rs:1086`), and `payment_account_and_method`
+(`:1174`/`:1178`) has no callers at all — dead code that goes on its own.
+
 ## Resume here
 
 1. Read decisions 1–9 above before touching anything: three of them (2, 8, 9) are
