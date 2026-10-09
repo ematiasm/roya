@@ -300,6 +300,28 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   needed: the user confirmed the development database will be wiped and holds no
   production history. Its replacement is P8.
 - [ ] **P3 — Customer money paths write the new shape, in one unit.** `collect`,
+  **PARTIALLY DONE 2026-10-08: P3a and P3b are in, P3c and P3d are not.** The two
+  halves that landed are the ones about the SHAPE of a delivery of money; the two
+  that remain are the two customer overpayment REFUSALS being lifted and the
+  cancel/refund paths writing `direction='Out'`.
+  * P3a — `d94775a`: `record_payment` writes the document, the movement, the share
+    and the ledger entry in ONE unit. This closed flow 5 of this plan, a live
+    defect: the `Income` used to commit in its own transaction before the row that
+    claimed it, and the module had a fixture that injected that exact failure and
+    ASSERTED THE ORPHAN as expected behaviour.
+  * P3b — `bef1241`: `collect` writes ONE delivery for the whole collection, and
+    `record_delivery_in` became the single writer the three `In` entry points share.
+    The traceability invariant was RE-BASED with it: it claimed "a transaction
+    belongs to exactly one payment", which under decision 5 would now call a correct
+    three-invoice collection a violation. The property that holds is about the
+    DELIVERY — no transaction is shared ACROSS deliveries — and a new test with two
+    mutations proves the difference is measurable. The receipt now lives inside the
+    delivery's unit, so `injected_failure_mid_collection_...` asserts six empty
+    tables instead of a "coherent" partial receipt.
+  * Together: `cargo test --locked` 1543 passed, `scripts/e2e.sh` 180 passed,
+    warnings 82 bin / 53 test (a P1 peak of 97 → 82 as the layer got called).
+
+  The original text follows, unchanged, as the remaining contract. `collect`,
   `record_payment`, and the customer cancel/refund paths: one `payments` row, N
   allocations, one `transactions` row, one `Payment` ledger entry, all inside the
   caller's unit; explicit allocation input (`[(sale_id, amount)]`) with the
