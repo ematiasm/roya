@@ -5,7 +5,7 @@
 **In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5, P6, P7 and P8 remain.**
 **P5 was re-scoped on 2026-10-09 and then SIMPLIFIED by two user decisions, before any
 code was written.** The re-scope (P5a journal + P5b reads) existed because the ledger
-did not close `balance == Σ residuals + unapplied`. Two decisions removed that reason:
+did not close `balance == Σ residuals − Σ unapplied`. Two decisions removed that reason:
 the legacy dual-write is **deleted** rather than retired (a), and `cancel` **stops
 existing** as a business action (b), so there is no annulment left to journal. P5 is one
 task again — the reads, the legacy deletion and the `In`-only unapplied fold together —
@@ -478,7 +478,7 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   set caller cannot disagree. Tests: a returned credit sale lowers
   balance, ageing and frees the credit limit; a payment applied to the oldest invoice ages
   on the oldest invoice and is not moved by a later credit; the supplier drawer reflects a
-  confirmed return; and the identity `balance == Σ residuals + unapplied` holds on the
+  confirmed return; and the identity `balance == Σ residuals − Σ unapplied` holds on the
   four scoreboard cases of "P5 blocker".
 - [ ] **P6 — UI.** Collect/pay screen: pick the party, the amount, the method, and
   the documents with their amounts (oldest-first prefilled, editable); the
@@ -514,9 +514,19 @@ Out of scope (follow-ups, recorded so nobody invents them later):
 
 ## P5 blocker — the journal entries do not close the identity (measured 2026-10-09)
 
+**The identity is `balance == Σ residuals − Σ unapplied`, and an earlier revision of
+this whole document wrote it with a PLUS. It is a MINUS, and the derivation is one line:
+the residual of a document is `charge − applied`, so `Σ residuals` is the debt still
+sitting ON documents, while `unapplied` is money held by the shop with no document to sit
+on. A credit makes the party's balance negative, so the credit has to be SUBTRACTED.**
+Worked on the test this document already names (`customer_receipts.rs:1374`): a 30 sale
+collected with 31 gives ledger `+30 − 31 = −1`, residuals `30 − 30 = 0`, unapplied `1`,
+and `0 − 1 = −1` agrees. The document now says MINUS everywhere, and the arithmetic is
+written here so the next reader does not restore the plus.
+
 P5 was declared a read change because "the ledger is already written by every path".
 The ledger is written by every path, but what it writes does not close the identity
-`balance == Σ residuals + unapplied`, which is this document's own acceptance
+`balance == Σ residuals − Σ unapplied`, which is this document's own acceptance
 criterion and the reason the reads can move at all. Four holes, each with its
 evidence. They are the reason P5 is P5a + P5b and not one read slice.
 
@@ -578,7 +588,7 @@ agree about it.
    over that party's deliveries, and an `Out` refund also carries `amount` with an
    empty allocation vector, so its whole amount would count as available credit. That
    read must be restricted to `direction='In'`. With that restriction the identity is
-   `balance == Σ residuals + unapplied`, and every applied credit satisfies it because
+   `balance == Σ residuals − Σ unapplied`, and every applied credit satisfies it because
    the residual falls by the same amount the unapplied does.
 
 **What this makes of the plan.** P5a is a journal task, not a read task, and it lands
@@ -727,7 +737,7 @@ decisions.
   entry.
 - The party balance is one fold over `party_ledger_entries`; the per-document
   residual is `charge + returns − allocations`; and the two agree:
-  `balance == Σ residuals + unapplied`.
+  `balance == Σ residuals − Σ unapplied`.
 - Every money path is atomic: a failure leaves no payment row, no allocation, no
   cash row and no ledger entry.
 - `cargo test --locked` and `scripts/e2e.sh` pass, with the warning delta explained.
@@ -770,7 +780,7 @@ decisions.
   of `odd/tasks/payment-method-single-account.md`.
 - 2026-10-09 — **P5 was re-scoped and then simplified by two user decisions, before any
   code was written.** Exploration measured that the ledger, though written by every
-  path, did not close `balance == Σ residuals + unapplied` (no production path wrote
+  path, did not close `balance == Σ residuals − Σ unapplied` (no production path wrote
   `PartyEntryKind::Cancel`; the sales-cancel refund wrote no entry while its
   purchase-cancel mirror wrote one; an applied credit is deliberately invisible to the
   journal; the legacy rows were still written on purpose). A first revision of "P5
@@ -792,7 +802,7 @@ decisions.
   `SalesService::tax_split` rounds each line through `line_taxes::tax_inclusive_total`;
   they diverge for any line whose product is not already at 2dp (`0.333 x 3` twice is
   `2.00` one way and `1.998` the other), and that divergence is exactly what
-  `balance == residuals + unapplied` forbids. The helper import is the precedent set by
+  `balance == residuals − unapplied` forbids. The helper import is the precedent set by
   `party_ledger_repo.rs:14`. (2) `cargo check` sits at **80 bin / 55 test**, one above the
   79 baseline, and that one warning is EXPECTED AND CORRECT: `allocated_to_target_raw` is
   reported as never used because its only caller is the `allocated_to_target` trait
@@ -805,7 +815,7 @@ decisions.
 
 ## Resume here
   code was written.** Exploration measured that the ledger, though written by every
-  path, did not close `balance == Σ residuals + unapplied` (no production path wrote
+  path, did not close `balance == Σ residuals − Σ unapplied` (no production path wrote
   `PartyEntryKind::Cancel`; the sales-cancel refund wrote no entry while its
   purchase-cancel mirror wrote one; an applied credit is deliberately invisible to the
   journal; the legacy rows were still written on purpose). A first revision of "P5
