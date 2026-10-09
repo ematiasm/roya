@@ -583,6 +583,52 @@ like `Adjust` (and `Adjust`'s own lesson in `AGENTS.md` — a negative delta is 
 legitimate increase — is the precedent). P5a must pick one and write the reason at the
 sign function, where the next reader will look for it.
 
+**Two decisions from the user (2026-10-09) dissolved part of this problem and left a
+larger one. Both are recorded here rather than in a private note, because the second
+one is a product decision that a future reader would otherwise "restore".**
+
+**(a) The legacy dual-write is DELETED outright, not retired in P8.** The development
+database is wiped, so there is no old code worth keeping alive for a read nobody will
+run. This is a REVERSAL of decision 8's staging (which kept the legacy rows as the
+crutch the old reads lean on until P5b moved them) and it makes P5b simpler: the rows,
+the `create_payment_in` calls that write them and the folds that read them go in ONE
+change instead of two, because the first thing that breaks — `paid_and_due` — is the
+very thing being replaced. P8 keeps only its other half: re-basing
+`backfill_party_ledger` off the legacy tables. Note that `delete_draft` calls
+`set_cancelled` while `cancel` on a Draft does exactly the same thing, so the two are
+redundant with each other; the deletion has to pick one and keep it.
+
+**(b) `cancel` CEASES TO EXIST as a business action: a Confirmed document is never
+annulled, it is CORRECTED with a mirror document** — a credit note for a sale, a return
+for a purchase. Only a Draft can be removed. So there is no annulment to journal, which
+is what retires the `Cancel` sign sub-decision above: the mirror document already
+writes its own `Return` (`customer_return.rs:697`, `purchase_return.rs:707`), and that
+entry is the compensating side.
+
+What (b) costs, measured, because it is much larger than the sign question it answers:
+4 service methods (206 + 155 + 145 + 142 lines, `sales.rs:1785`, `purchases.rs:1634`,
+`customer_return.rs:791`, `purchase_return.rs:806`), their routes (web + API), the
+`ConfirmationPolicy` wiring in `documents_web.rs`, 7 templates, permissions
+`sales.cancel` / `purchases.cancel` with their localization, the `Cancelled` status
+variant (47 references), `cancel_reason` / `cancelled_at` columns (58 references), 92
+cancel-related test functions, and every other service that must treat `Cancelled` as
+reachable. That is not a P5 slice; it is its own feature with its own branch and its
+own review.
+
+**The third level is where (b) hits a wall, and it needs a decision before the work
+starts.** A Confirmed CREDIT NOTE has no mirror: grepping `DebitNote` over `src/` and
+`migrations/` returns nothing, so "correct it with a mirror document" has no document to
+point at for a return family. Three ways out, and they are not equivalent:
+
+| Way out | What a user does to undo a credit note | Consequence |
+|---|---|---|
+| A debit note document family | Issues one, which re-charges what the note credited | Biggest scope: a fifth document family in a repo whose own `AGENTS.md` says three families already mirror each other |
+| A new sale | Sells the goods back | Reuses a real document and its stock/finance paths, but the link to the original sale is lost, so "why did this happen" stops being answerable from the data |
+| Keep `cancel` ONLY for the two return families | Reverses the note through the current path | Cheapest, and it leaves the asymmetry the user is trying to remove: an annulment exists for a return and not for what it returns to |
+
+The `Cancel` journal entry stays unneeded in all three: whichever way is chosen, the
+correcting document writes its own entry.
+
 ## Relationship to the party ledger
 
 | Party-ledger task | Fate | Why |
